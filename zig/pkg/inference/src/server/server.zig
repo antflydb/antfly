@@ -1480,145 +1480,6 @@ pub const Node = struct {
         self.metrics.incRequest("embed");
         defer self.metrics.decActive();
 
-        // Extract inputs from the polymorphic input field, separated by modality.
-        var texts = std.ArrayListUnmanaged([]const u8).empty;
-        defer texts.deinit(ctx.allocator);
-        var images = std.ArrayListUnmanaged([]const u8).empty; // raw decoded bytes
-        defer {
-            for (images.items) |img| ctx.allocator.free(img);
-            images.deinit(ctx.allocator);
-        }
-        var audio_clips = std.ArrayListUnmanaged(embedding_mod.EncodedAudioClip).empty;
-        defer {
-            for (audio_clips.items) |clip| ctx.allocator.free(clip.bytes);
-            audio_clips.deinit(ctx.allocator);
-        }
-
-        switch (request.input) {
-            .array => |arr| {
-                for (arr.items) |item| {
-                    switch (item) {
-                        .string => |s| try texts.append(ctx.allocator, s),
-                        .object => |obj| {
-                            // ContentPart: discriminate by "type" field
-                            const type_val = obj.get("type") orelse return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "content part missing 'type' field",
-                            });
-                            if (type_val != .string) return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "content part 'type' must be a string",
-                            });
-                            const ctype = type_val.string;
-                            if (std.mem.eql(u8, ctype, "text")) {
-                                const text_val = obj.get("text") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part missing 'text' field",
-                                });
-                                if (text_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part 'text' must be a string",
-                                });
-                                try texts.append(ctx.allocator, text_val.string);
-                            } else if (std.mem.eql(u8, ctype, "image_url")) {
-                                const url_obj = obj.get("image_url") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "image_url content part missing 'image_url' field",
-                                });
-                                const url_str = if (url_obj == .object)
-                                    if (url_obj.object.get("url")) |u| (if (u == .string) u.string else null) else null
-                                else if (url_obj == .string) url_obj.string else null;
-
-                                const url = url_str orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "image_url must contain a 'url' string",
-                                });
-                                const downloaded = downloadRemoteContent(self, ctx.allocator, url) catch
-                                    return ctx.status(400).json(.{
-                                        .@"error" = "INVALID_REQUEST",
-                                        .message = "failed to download image_url content",
-                                    });
-                                defer ctx.allocator.free(downloaded.content_type);
-                                try images.append(ctx.allocator, downloaded.data);
-                            } else if (std.mem.eql(u8, ctype, "media")) {
-                                const data_val = obj.get("data") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media content part missing 'data' field",
-                                });
-                                if (data_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media 'data' must be a base64 string",
-                                });
-                                const mime_val = obj.get("mime_type");
-                                const is_audio = if (mime_val) |mv|
-                                    (if (mv == .string) std.mem.startsWith(u8, mv.string, "audio/") else false)
-                                else
-                                    false;
-                                const is_image = if (mime_val) |mv|
-                                    (if (mv == .string) std.mem.startsWith(u8, mv.string, "image/") else false)
-                                else
-                                    false;
-
-                                const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
-                                    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
-                                const decoded = decoded_payload.data;
-                                errdefer ctx.allocator.free(decoded);
-                                if (!mediaMimeMatches(if (mime_val) |mv| if (mv == .string) mv.string else null else null, decoded_payload.mime_type)) {
-                                    ctx.allocator.free(decoded);
-                                    return ctx.status(400).json(.{
-                                        .@"error" = "INVALID_REQUEST",
-                                        .message = "media data URI mime_type does not match content part mime_type",
-                                    });
-                                }
-
-                                if (is_audio) {
-                                    const mime_str = if (mime_val) |mv| if (mv == .string) mv.string else null else null;
-                                    const decode_options = audio_mod.DecodeOptions{
-                                        .mime_hint = mime_str,
-                                    };
-                                    if (!audio_mod.canDecodeWithOptions(decoded, decode_options)) {
-                                        ctx.allocator.free(decoded);
-                                        return unsupportedAudioResponse(ctx, "unsupported audio media content");
-                                    }
-                                    try audio_clips.append(ctx.allocator, .{
-                                        .bytes = decoded,
-                                        .decode_options = decode_options,
-                                    });
-                                } else if (is_image) {
-                                    try images.append(ctx.allocator, decoded);
-                                } else {
-                                    ctx.allocator.free(decoded);
-                                    return ctx.status(400).json(.{
-                                        .@"error" = "INVALID_REQUEST",
-                                        .message = "media content part must have mime_type starting with 'audio/' or 'image/'",
-                                    });
-                                }
-                            } else {
-                                return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "unknown content part type",
-                                });
-                            }
-                        },
-                        else => return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "input array must contain strings or content part objects",
-                        }),
-                    }
-                }
-            },
-            .string => |s| try texts.append(ctx.allocator, s),
-            else => return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "'input' must be a string or array of strings/content parts",
-            }),
-        }
-
-        const total_inputs = texts.items.len + images.items.len + audio_clips.items.len;
-        if (total_inputs == 0) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "input is empty" });
-        }
-
         // Resolve and load model.
         const model_name: ?[]const u8 = if (request.model.len > 0) request.model else null;
         const model_path = self.resolveModelPath(ctx.io, model_name, "embedders") catch
@@ -1671,7 +1532,10 @@ pub const Node = struct {
             return ctx.json(response);
         }
 
-        var inputs = parseDenseEmbedInputs(self, ctx.allocator, &model.manifest, request.input) catch |err| {
+        var inputs = switch (request.error_policy) {
+            .fail_fast => parseDenseEmbedInputs(self, ctx.allocator, &model.manifest, request.input),
+            .per_item => parseDenseEmbedInputsPerItem(self, ctx.allocator, &model.manifest, request.input),
+        } catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = embedInputParseErrorMessage(err),
@@ -1698,13 +1562,6 @@ pub const Node = struct {
             });
         };
         const pipeline_start = embedTimingStart();
-        const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
-        logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
-        defer {
-            for (embeddings) |e| ctx.allocator.free(e);
-            ctx.allocator.free(embeddings);
-        }
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const response_build_start = embedTimingStart();
@@ -1712,24 +1569,61 @@ pub const Node = struct {
             countParsedDenseEmbedTextTokens(ctx.allocator, model.getTokenizer(), &inputs)
         else
             estimateParsedDenseEmbedPromptTokens(&inputs);
-        const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, prompt_tokens) catch |err| switch (err) {
-            error.InvalidEmbeddingDimensions => {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "dimensions exceeds the model embedding size",
-                });
+
+        switch (request.error_policy) {
+            .fail_fast => {
+                const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err| {
+                    const failure = embedDenseInputFailure(err);
+                    return ctx.status(failure.status).json(.{
+                        .@"error" = failure.code,
+                        .message = failure.message,
+                    });
+                };
+                logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+                defer {
+                    for (embeddings) |e| ctx.allocator.free(e);
+                    ctx.allocator.free(embeddings);
+                }
+                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, prompt_tokens) catch |err| switch (err) {
+                    error.InvalidEmbeddingDimensions => {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "dimensions exceeds the model embedding size",
+                        });
+                    },
+                    else => return err,
+                };
+                logEmbedTiming("embed.response_build", inputs.total_count, response_build_start);
+                const response_json_start = embedTimingStart();
+                const http_response = try ctx.json(response);
+                logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
+                return http_response;
             },
-            else => return err,
-        };
-        logEmbedTiming("embed.response_build", inputs.total_count, response_build_start);
-        const response_json_start = embedTimingStart();
-        const http_response = try ctx.json(response);
-        logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
-        return http_response;
+            .per_item => {
+                var partial = try embedDenseInputsPartial(ctx.allocator, &pipeline, &inputs);
+                logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+                defer partial.deinit(ctx.allocator);
+                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, prompt_tokens) catch |err| switch (err) {
+                    error.InvalidEmbeddingDimensions => {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "dimensions exceeds the model embedding size",
+                        });
+                    },
+                    else => return err,
+                };
+                logEmbedTiming("embed.response_build", inputs.total_count, response_build_start);
+                const response_json_start = embedTimingStart();
+                const http_response = try ctx.json(response);
+                logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
+                return http_response;
+            },
+        }
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ChunkRequest)) orelse
+        var parsed = (ctx.parseJson(api.ChunkRequest) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkRequestParseErrorMessage(err) })) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -1739,71 +1633,9 @@ pub const Node = struct {
         self.metrics.incRequest("chunk");
         defer self.metrics.decActive();
 
-        const input: lib_chunker.Input = blk: {
-            if (body.input) |input_val| {
-                switch (input_val) {
-                    .string => |s| break :blk .{ .text = s },
-                    .object => |obj| {
-                        if (obj.get("type")) |type_val| {
-                            if (type_val != .string) return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "content part 'type' must be a string",
-                            });
-                            if (std.mem.eql(u8, type_val.string, "text")) {
-                                const text_val = obj.get("text") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part missing 'text' field",
-                                });
-                                if (text_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part 'text' must be a string",
-                                });
-                                break :blk .{ .text = text_val.string };
-                            }
-                        }
-
-                        const data_val = obj.get("data") orelse return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media content part missing 'data' field",
-                        });
-                        if (data_val != .string) return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media 'data' must be a base64 string",
-                        });
-                        const mime_val = obj.get("mime_type") orelse return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media content part missing 'mime_type' field",
-                        });
-                        if (mime_val != .string) return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media 'mime_type' must be a string",
-                        });
-                        const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
-                            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
-                        const decoded = decoded_payload.data;
-                        errdefer ctx.allocator.free(decoded);
-                        if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
-                            ctx.allocator.free(decoded);
-                            return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "media data URI mime_type does not match content part mime_type",
-                            });
-                        }
-                        break :blk .{ .binary = .{
-                            .mime_type = mime_val.string,
-                            .data = decoded,
-                        } };
-                    },
-                    else => return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "'input' must be a string or content part object",
-                    }),
-                }
-            }
-            // Fall back to deprecated 'text' field
-            if (body.text) |t| break :blk .{ .text = t };
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "missing 'input' or 'text' field" });
-        };
+        const input = parseChunkRequestInput(ctx.allocator, body.input) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkInputParseErrorMessage(err) });
+        defer deinitChunkRequestInput(ctx.allocator, input);
 
         var config = lib_chunker.FixedChunkConfig{};
         if (body.config) |cfg| {
@@ -5999,6 +5831,106 @@ test "download remote content blocks hosts outside allowlist" {
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
 }
 
+test "chunk request requires input in generated schema" {
+    try std.testing.expectError(
+        error.MissingField,
+        std.json.parseFromSlice(api.ChunkRequest, std.testing.allocator, "{}", .{ .ignore_unknown_fields = true }),
+    );
+}
+
+test "chunk request input parser rejects invalid content parts" {
+    const cases = [_]struct {
+        name: []const u8,
+        input_json: []const u8,
+        expected_error: anyerror,
+        expected_message: []const u8,
+    }{
+        .{
+            .name = "empty text input",
+            .input_json = "\"\"",
+            .expected_error = error.ChunkInputRequired,
+            .expected_message = "missing 'input' field",
+        },
+        .{
+            .name = "missing content part type",
+            .input_json = "{\"text\":\"hello\"}",
+            .expected_error = error.UnsupportedChunkInputContentPartType,
+            .expected_message = "input content part type must be 'text' or 'media'",
+        },
+        .{
+            .name = "unsupported content part type",
+            .input_json = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.test/a.png\"}}",
+            .expected_error = error.UnsupportedChunkInputContentPartType,
+            .expected_message = "input content part type must be 'text' or 'media'",
+        },
+        .{
+            .name = "missing text",
+            .input_json = "{\"type\":\"text\"}",
+            .expected_error = error.ChunkTextContentPartMissingText,
+            .expected_message = "text content part missing 'text' field",
+        },
+        .{
+            .name = "empty text",
+            .input_json = "{\"type\":\"text\",\"text\":\"\"}",
+            .expected_error = error.ChunkTextContentPartMissingText,
+            .expected_message = "text content part missing 'text' field",
+        },
+        .{
+            .name = "missing media data",
+            .input_json = "{\"type\":\"media\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "empty media data",
+            .input_json = "{\"type\":\"media\",\"data\":\"\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "empty media data uri payload",
+            .input_json = "{\"type\":\"media\",\"data\":\"data:audio/wav;base64,\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "missing media mime",
+            .input_json = "{\"type\":\"media\",\"data\":\"AA==\"}",
+            .expected_error = error.ChunkMediaContentPartMissingMimeType,
+            .expected_message = "media content part missing 'mime_type' field",
+        },
+        .{
+            .name = "blank media mime",
+            .input_json = "{\"type\":\"media\",\"data\":\"AA==\",\"mime_type\":\"  \"}",
+            .expected_error = error.ChunkMediaContentPartMissingMimeType,
+            .expected_message = "media content part missing 'mime_type' field",
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.input_json, .{});
+        defer parsed.deinit();
+
+        try std.testing.expectError(case.expected_error, parseChunkRequestInput(std.testing.allocator, parsed.value));
+        try std.testing.expectEqualStrings(case.expected_message, chunkInputParseErrorMessage(case.expected_error));
+    }
+}
+
+test "chunk request input parser accepts valid text and media" {
+    var text_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"text\",\"text\":\"hello\"}", .{});
+    defer text_parsed.deinit();
+    const text_input = try parseChunkRequestInput(std.testing.allocator, text_parsed.value);
+    defer deinitChunkRequestInput(std.testing.allocator, text_input);
+    try std.testing.expectEqualStrings("hello", text_input.text);
+
+    var media_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"media\",\"data\":\"aGVsbG8=\",\"mime_type\":\"audio/wav\"}", .{});
+    defer media_parsed.deinit();
+    const media_input = try parseChunkRequestInput(std.testing.allocator, media_parsed.value);
+    defer deinitChunkRequestInput(std.testing.allocator, media_input);
+    try std.testing.expectEqualStrings("audio/wav", media_input.binary.mime_type);
+    try std.testing.expectEqualStrings("hello", media_input.binary.data);
+}
+
 fn dirContainsModel(path: []const u8) bool {
     var buf: [4096]u8 = undefined;
     inline for ([_][]const u8{ "/tokenizer.json", "/config.json", "/genai_config.json", "/model.onnx", "/model_i8.onnx", "/onnx/model.onnx" }) |suffix| {
@@ -6073,6 +6005,76 @@ fn jsonBytesResponse(ctx: *httpx.Context, body: []const u8) !httpx.Response {
     return ctx.response.build();
 }
 
+fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !lib_chunker.Input {
+    return switch (input) {
+        .string => |s| blk: {
+            if (s.len == 0) return error.ChunkInputRequired;
+            break :blk .{ .text = s };
+        },
+        .object => |obj| blk: {
+            const type_val = obj.get("type") orelse return error.UnsupportedChunkInputContentPartType;
+            if (type_val != .string) return error.ChunkContentPartTypeMustBeString;
+            if (std.mem.eql(u8, type_val.string, "text")) {
+                const text_val = obj.get("text") orelse return error.ChunkTextContentPartMissingText;
+                if (text_val != .string or text_val.string.len == 0) return error.ChunkTextContentPartMissingText;
+                break :blk .{ .text = text_val.string };
+            }
+            if (!std.mem.eql(u8, type_val.string, "media")) return error.UnsupportedChunkInputContentPartType;
+
+            const data_val = obj.get("data") orelse return error.ChunkMediaContentPartMissingData;
+            if (data_val != .string) return error.ChunkMediaDataMustBeBase64String;
+            if (data_val.string.len == 0) return error.ChunkMediaContentPartMissingData;
+            const mime_val = obj.get("mime_type") orelse return error.ChunkMediaContentPartMissingMimeType;
+            if (mime_val != .string) return error.ChunkMediaMimeTypeMustBeString;
+            if (std.mem.trim(u8, mime_val.string, &std.ascii.whitespace).len == 0) return error.ChunkMediaContentPartMissingMimeType;
+
+            const decoded_payload = decodeMediaData(allocator, data_val.string) catch return error.ChunkInvalidBase64Data;
+            const decoded = decoded_payload.data;
+            errdefer allocator.free(decoded);
+            if (decoded.len == 0) return error.ChunkMediaContentPartMissingData;
+            if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) return error.ChunkMediaDataMimeTypeMismatch;
+            break :blk .{ .binary = .{
+                .mime_type = mime_val.string,
+                .data = decoded,
+            } };
+        },
+        else => error.ChunkInputMustBeStringOrContentPartObject,
+    };
+}
+
+fn deinitChunkRequestInput(allocator: std.mem.Allocator, input: lib_chunker.Input) void {
+    switch (input) {
+        .binary => |binary| allocator.free(binary.data),
+        .text => {},
+    }
+}
+
+fn chunkInputParseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ChunkInputRequired => "missing 'input' field",
+        error.UnsupportedChunkInputContentPartType => "input content part type must be 'text' or 'media'",
+        error.ChunkContentPartTypeMustBeString => "content part 'type' must be a string",
+        error.ChunkTextContentPartMissingText => "text content part missing 'text' field",
+        error.ChunkMediaContentPartMissingData => "media content part missing 'data' field",
+        error.ChunkMediaDataMustBeBase64String => "media 'data' must be a base64 string",
+        error.ChunkMediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
+        error.ChunkMediaMimeTypeMustBeString => "media 'mime_type' must be a string",
+        error.ChunkInvalidBase64Data => "invalid base64 data",
+        error.ChunkMediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
+        error.ChunkInputMustBeStringOrContentPartObject => "'input' must be a string or content part object",
+        else => "invalid chunk input",
+    };
+}
+
+fn chunkRequestParseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingField => "missing required 'input' field",
+        error.SyntaxError => "request body must be valid JSON",
+        error.UnexpectedToken => "request body does not match chunk request schema",
+        else => "invalid chunk request",
+    };
+}
+
 fn validateEmbeddingEncodingFormat(encoding_format: ?[]const u8) !void {
     const value = encoding_format orelse "float";
     if (!std.mem.eql(u8, value, "float")) return error.UnsupportedEncodingFormat;
@@ -6090,7 +6092,19 @@ const ParsedEmbedRequest = struct {
     encoding_format: ?[]const u8,
     dimensions: ?i64,
     task_type: ?EmbeddingTaskType,
+    error_policy: EmbedErrorPolicy = .fail_fast,
 };
+
+const EmbedErrorPolicy = enum {
+    fail_fast,
+    per_item,
+};
+
+fn parseEmbedErrorPolicy(value: []const u8) ?EmbedErrorPolicy {
+    if (std.mem.eql(u8, value, "fail_fast")) return .fail_fast;
+    if (std.mem.eql(u8, value, "per_item")) return .per_item;
+    return null;
+}
 
 const EmbeddingTaskType = enum {
     RETRIEVAL_QUERY,
@@ -6156,6 +6170,7 @@ const ParsedDenseEmbedInputs = struct {
     texts: std.ArrayListUnmanaged(ParsedTextEmbedInput) = .empty,
     images: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
     audio: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
+    parse_errors: std.ArrayListUnmanaged(EmbedItemError) = .empty,
     total_count: usize = 0,
 
     fn deinit(self: *ParsedDenseEmbedInputs, allocator: std.mem.Allocator) void {
@@ -6164,6 +6179,7 @@ const ParsedDenseEmbedInputs = struct {
         self.images.deinit(allocator);
         for (self.audio.items) |item| allocator.free(item.bytes);
         self.audio.deinit(allocator);
+        self.parse_errors.deinit(allocator);
     }
 };
 
@@ -6200,12 +6216,18 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         return error.ConflictingEmbeddingTaskTypes;
     }
 
+    const error_policy: EmbedErrorPolicy = if (obj.get("error_policy")) |value| blk: {
+        if (value != .string) return error.ErrorPolicyMustBeString;
+        break :blk parseEmbedErrorPolicy(value.string) orelse return error.UnsupportedEmbeddingErrorPolicy;
+    } else .fail_fast;
+
     return .{
         .model = model_value.string,
         .input = input_value,
         .encoding_format = encoding_format,
         .dimensions = dimensions,
         .task_type = task_type orelse legacy_task_type,
+        .error_policy = error_policy,
     };
 }
 
@@ -6221,6 +6243,8 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
         error.InputTypeMustBeString => "input_type must be a string",
         error.UnsupportedEmbeddingInputType => "input_type must be a legacy alias for a supported embedding task type",
         error.ConflictingEmbeddingTaskTypes => "task_type and input_type specify different embedding task types",
+        error.ErrorPolicyMustBeString => "error_policy must be a string",
+        error.UnsupportedEmbeddingErrorPolicy => "error_policy must be one of fail_fast or per_item",
         else => "invalid embedding request",
     };
 }
@@ -6295,88 +6319,7 @@ fn parseDenseEmbedInputs(
             if (arr.items.len == 0) return parsed;
 
             for (arr.items, 0..) |item, index| {
-                if (item == .string) {
-                    if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
-                    try parsed.texts.append(allocator, .{ .index = index, .text = item.string });
-                    continue;
-                }
-
-                if (item != .object) return error.InputMustBeStringOrArrayOfStringsOrContentParts;
-
-                const obj = item.object;
-                const type_value = obj.get("type") orelse return error.ContentPartTypeRequired;
-                if (type_value != .string) return error.ContentPartTypeMustBeString;
-                const part_type = type_value.string;
-
-                if (std.mem.eql(u8, part_type, "text")) {
-                    if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
-                    const text_value = obj.get("text") orelse return error.TextContentPartMissingText;
-                    if (text_value != .string) return error.TextContentPartMissingText;
-                    try parsed.texts.append(allocator, .{ .index = index, .text = text_value.string });
-                    continue;
-                }
-
-                if (std.mem.eql(u8, part_type, "image_url")) {
-                    if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
-                    const image_url = obj.get("image_url") orelse return error.ImageUrlContentPartMissingImageUrl;
-                    const url = switch (image_url) {
-                        .string => image_url.string,
-                        .object => blk: {
-                            const url_value = image_url.object.get("url") orelse return error.ImageUrlContentPartMissingUrl;
-                            if (url_value != .string) return error.ImageUrlContentPartMissingUrl;
-                            break :blk url_value.string;
-                        },
-                        else => return error.ImageUrlContentPartMissingUrl,
-                    };
-
-                    const downloaded = downloadRemoteContent(self, allocator, url) catch return error.ImageUrlDownloadFailed;
-                    errdefer allocator.free(downloaded.data);
-                    defer allocator.free(downloaded.content_type);
-
-                    if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.ImageUrlMustResolveToImage;
-                    try parsed.images.append(allocator, .{
-                        .index = index,
-                        .bytes = downloaded.data,
-                        .mime_type = null,
-                    });
-                    continue;
-                }
-
-                if (std.mem.eql(u8, part_type, "media")) {
-                    const data_value = obj.get("data") orelse return error.MediaContentPartMissingData;
-                    if (data_value != .string) return error.MediaContentPartMissingData;
-                    const mime_value = obj.get("mime_type") orelse return error.MediaContentPartMissingMimeType;
-                    if (mime_value != .string) return error.MediaContentPartMissingMimeType;
-
-                    const decoded_payload = decodeMediaData(allocator, data_value.string) catch return error.InvalidMediaBase64;
-                    const decoded = decoded_payload.data;
-                    errdefer allocator.free(decoded);
-                    if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type)) return error.MediaDataMimeTypeMismatch;
-
-                    if (std.mem.startsWith(u8, mime_value.string, "image/")) {
-                        if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
-                        try parsed.images.append(allocator, .{
-                            .index = index,
-                            .bytes = decoded,
-                            .mime_type = mime_value.string,
-                        });
-                        continue;
-                    }
-
-                    if (std.mem.startsWith(u8, mime_value.string, "audio/")) {
-                        if (!model_caps.modelAcceptsInput(manifest, "audio")) return error.ModelDoesNotSupportAudioInput;
-                        try parsed.audio.append(allocator, .{
-                            .index = index,
-                            .bytes = decoded,
-                            .mime_type = mime_value.string,
-                        });
-                        continue;
-                    }
-
-                    return error.UnsupportedMediaMimeType;
-                }
-
-                return error.UnknownContentPartType;
+                try appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index);
             }
 
             parsed.total_count = arr.items.len;
@@ -6385,6 +6328,128 @@ fn parseDenseEmbedInputs(
     }
 
     return parsed;
+}
+
+fn parseDenseEmbedInputsPerItem(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+) !ParsedDenseEmbedInputs {
+    var parsed: ParsedDenseEmbedInputs = .{};
+    errdefer parsed.deinit(allocator);
+
+    switch (input) {
+        .string => |value| {
+            parsed.total_count = 1;
+            appendDenseEmbedInput(self, allocator, manifest, &parsed, .{ .string = value }, 0) catch |err| {
+                try parsed.parse_errors.append(allocator, embedInputItemFailure(0, err));
+            };
+        },
+        .array => |arr| {
+            parsed.total_count = arr.items.len;
+            for (arr.items, 0..) |item, index| {
+                appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index) catch |err| {
+                    try parsed.parse_errors.append(allocator, embedInputItemFailure(index, err));
+                };
+            }
+        },
+        else => return error.InputMustBeStringOrArrayOfStringsOrContentParts,
+    }
+
+    return parsed;
+}
+
+fn appendDenseEmbedInput(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parsed: *ParsedDenseEmbedInputs,
+    item: std.json.Value,
+    index: usize,
+) !void {
+    if (item == .string) {
+        if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
+        try parsed.texts.append(allocator, .{ .index = index, .text = item.string });
+        return;
+    }
+
+    if (item != .object) return error.InputMustBeStringOrArrayOfStringsOrContentParts;
+
+    const obj = item.object;
+    const type_value = obj.get("type") orelse return error.ContentPartTypeRequired;
+    if (type_value != .string) return error.ContentPartTypeMustBeString;
+    const part_type = type_value.string;
+
+    if (std.mem.eql(u8, part_type, "text")) {
+        if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
+        const text_value = obj.get("text") orelse return error.TextContentPartMissingText;
+        if (text_value != .string) return error.TextContentPartMissingText;
+        try parsed.texts.append(allocator, .{ .index = index, .text = text_value.string });
+        return;
+    }
+
+    if (std.mem.eql(u8, part_type, "image_url")) {
+        if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
+        const image_url = obj.get("image_url") orelse return error.ImageUrlContentPartMissingImageUrl;
+        const url = switch (image_url) {
+            .string => image_url.string,
+            .object => blk: {
+                const url_value = image_url.object.get("url") orelse return error.ImageUrlContentPartMissingUrl;
+                if (url_value != .string) return error.ImageUrlContentPartMissingUrl;
+                break :blk url_value.string;
+            },
+            else => return error.ImageUrlContentPartMissingUrl,
+        };
+
+        const downloaded = downloadRemoteContent(self, allocator, url) catch return error.ImageUrlDownloadFailed;
+        errdefer allocator.free(downloaded.data);
+        defer allocator.free(downloaded.content_type);
+
+        if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.ImageUrlMustResolveToImage;
+        try parsed.images.append(allocator, .{
+            .index = index,
+            .bytes = downloaded.data,
+            .mime_type = null,
+        });
+        return;
+    }
+
+    if (std.mem.eql(u8, part_type, "media")) {
+        const data_value = obj.get("data") orelse return error.MediaContentPartMissingData;
+        if (data_value != .string) return error.MediaContentPartMissingData;
+        const mime_value = obj.get("mime_type") orelse return error.MediaContentPartMissingMimeType;
+        if (mime_value != .string) return error.MediaContentPartMissingMimeType;
+
+        const decoded_payload = decodeMediaData(allocator, data_value.string) catch return error.InvalidMediaBase64;
+        const decoded = decoded_payload.data;
+        errdefer allocator.free(decoded);
+        if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type)) return error.MediaDataMimeTypeMismatch;
+
+        if (std.mem.startsWith(u8, mime_value.string, "image/")) {
+            if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
+            try parsed.images.append(allocator, .{
+                .index = index,
+                .bytes = decoded,
+                .mime_type = mime_value.string,
+            });
+            return;
+        }
+
+        if (std.mem.startsWith(u8, mime_value.string, "audio/")) {
+            if (!model_caps.modelAcceptsInput(manifest, "audio")) return error.ModelDoesNotSupportAudioInput;
+            try parsed.audio.append(allocator, .{
+                .index = index,
+                .bytes = decoded,
+                .mime_type = mime_value.string,
+            });
+            return;
+        }
+
+        return error.UnsupportedMediaMimeType;
+    }
+
+    return error.UnknownContentPartType;
 }
 
 fn embedInputParseErrorMessage(err: anyerror) []const u8 {
@@ -6407,6 +6472,176 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
         error.ModelDoesNotSupportAudioInput => "model does not support audio input",
         error.UnknownContentPartType => "unsupported content part type",
         else => "invalid embedding input",
+    };
+}
+
+const EmbedDenseInputFailure = struct {
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+};
+
+fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
+    return switch (err) {
+        error.ImageDecodeFailed => .{
+            .status = 400,
+            .code = "INVALID_IMAGE",
+            .message = "unsupported or corrupt image input",
+        },
+        else => .{
+            .status = 500,
+            .code = "INFERENCE_FAILED",
+            .message = @errorName(err),
+        },
+    };
+}
+
+const EmbedItemError = struct {
+    index: i64,
+    code: []const u8,
+    message: []const u8,
+    stage: []const u8,
+    retryable: bool,
+    status: u16,
+};
+
+const EmbedPartialSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
+const EmbedResponseStrict = struct {
+    object: []const u8,
+    data: []const api.EmbeddingObject,
+    model: []const u8,
+    usage: api.EmbeddingUsage,
+};
+
+const EmbedDensePartialResponse = struct {
+    object: []const u8,
+    data: []const api.EmbeddingObject,
+    model: []const u8,
+    errors: []const EmbedItemError,
+    summary: EmbedPartialSummary,
+    usage: api.EmbeddingUsage,
+};
+
+const DenseEmbedPartialResult = struct {
+    embeddings: []?[]f32,
+    errors: []EmbedItemError,
+
+    fn deinit(self: *DenseEmbedPartialResult, allocator: std.mem.Allocator) void {
+        for (self.embeddings) |maybe_embedding| {
+            if (maybe_embedding) |embedding| allocator.free(embedding);
+        }
+        allocator.free(self.embeddings);
+        allocator.free(self.errors);
+        self.* = undefined;
+    }
+
+    fn successCount(self: *const DenseEmbedPartialResult) usize {
+        var count: usize = 0;
+        for (self.embeddings) |maybe_embedding| {
+            if (maybe_embedding != null) count += 1;
+        }
+        return count;
+    }
+};
+
+fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemError {
+    return switch (err) {
+        error.ImageDecodeFailed => .{
+            .index = @intCast(index),
+            .code = "INVALID_IMAGE",
+            .message = "unsupported or corrupt image input",
+            .stage = "image_decode",
+            .retryable = false,
+            .status = 400,
+        },
+        else => .{
+            .index = @intCast(index),
+            .code = "INFERENCE_FAILED",
+            .message = @errorName(err),
+            .stage = stage,
+            .retryable = true,
+            .status = 500,
+        },
+    };
+}
+
+fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
+    return switch (err) {
+        error.ImageUrlDownloadFailed => .{
+            .index = @intCast(index),
+            .code = "IMAGE_FETCH_FAILED",
+            .message = "failed to download image_url content",
+            .stage = "fetch",
+            .retryable = true,
+            .status = 502,
+        },
+        error.ImageUrlMustResolveToImage => .{
+            .index = @intCast(index),
+            .code = "INVALID_IMAGE_URL",
+            .message = "image_url content must resolve to an image",
+            .stage = "fetch",
+            .retryable = false,
+            .status = 400,
+        },
+        error.InvalidMediaBase64,
+        error.MediaDataMimeTypeMismatch,
+        => .{
+            .index = @intCast(index),
+            .code = "INVALID_MEDIA",
+            .message = embedInputParseErrorMessage(err),
+            .stage = "parse",
+            .retryable = false,
+            .status = 400,
+        },
+        error.UnsupportedMediaMimeType => .{
+            .index = @intCast(index),
+            .code = "UNSUPPORTED_MEDIA",
+            .message = embedInputParseErrorMessage(err),
+            .stage = "parse",
+            .retryable = false,
+            .status = 400,
+        },
+        error.ModelDoesNotSupportTextInput,
+        error.ModelDoesNotSupportImageInput,
+        error.ModelDoesNotSupportAudioInput,
+        => .{
+            .index = @intCast(index),
+            .code = "UNSUPPORTED_INPUT_MODALITY",
+            .message = embedInputParseErrorMessage(err),
+            .stage = "parse",
+            .retryable = false,
+            .status = 400,
+        },
+        error.InputMustBeStringOrArrayOfStringsOrContentParts,
+        error.ContentPartTypeRequired,
+        error.ContentPartTypeMustBeString,
+        error.TextContentPartMissingText,
+        error.ImageUrlContentPartMissingImageUrl,
+        error.ImageUrlContentPartMissingUrl,
+        error.MediaContentPartMissingData,
+        error.MediaContentPartMissingMimeType,
+        error.UnknownContentPartType,
+        => .{
+            .index = @intCast(index),
+            .code = "INVALID_INPUT",
+            .message = embedInputParseErrorMessage(err),
+            .stage = "parse",
+            .retryable = false,
+            .status = 400,
+        },
+        else => .{
+            .index = @intCast(index),
+            .code = "INPUT_PREP_FAILED",
+            .message = @errorName(err),
+            .stage = "parse",
+            .retryable = true,
+            .status = 500,
+        },
     };
 }
 
@@ -6480,13 +6715,173 @@ fn embedDenseInputs(
     return embeddings;
 }
 
+fn embedDenseInputsPartial(
+    allocator: std.mem.Allocator,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    inputs: *const ParsedDenseEmbedInputs,
+) !DenseEmbedPartialResult {
+    const partial_embeddings = try allocator.alloc(?[]f32, inputs.total_count);
+    errdefer allocator.free(partial_embeddings);
+    const empty_errors = try allocator.alloc(EmbedItemError, 0);
+
+    var result = DenseEmbedPartialResult{
+        .embeddings = partial_embeddings,
+        .errors = empty_errors,
+    };
+    @memset(result.embeddings, null);
+    errdefer result.deinit(allocator);
+
+    var errors = std.ArrayListUnmanaged(EmbedItemError).empty;
+    errdefer errors.deinit(allocator);
+    try errors.appendSlice(allocator, inputs.parse_errors.items);
+
+    if (inputs.texts.items.len > 0) {
+        const texts = try allocator.alloc([]const u8, inputs.texts.items.len);
+        defer allocator.free(texts);
+        for (inputs.texts.items, 0..) |item, i| texts[i] = item.text;
+
+        if (pipeline.embed(texts)) |embeddings| {
+            defer allocator.free(embeddings);
+            for (inputs.texts.items, 0..) |item, i| {
+                result.embeddings[item.index] = embeddings[i];
+            }
+        } else |_| {
+            try embedTextInputsIndividually(allocator, pipeline, inputs.texts.items, texts, &errors, &result);
+        }
+    }
+
+    if (inputs.images.items.len > 0) {
+        const images = try allocator.alloc([]const u8, inputs.images.items.len);
+        defer allocator.free(images);
+        for (inputs.images.items, 0..) |item, i| images[i] = item.bytes;
+
+        if (pipeline.embedImages(images)) |embeddings| {
+            defer allocator.free(embeddings);
+            for (inputs.images.items, 0..) |item, i| {
+                result.embeddings[item.index] = embeddings[i];
+            }
+        } else |_| {
+            try embedImageInputsIndividually(allocator, pipeline, inputs.images.items, images, &errors, &result);
+        }
+    }
+
+    if (inputs.audio.items.len > 0) {
+        const audio_inputs = try allocator.alloc(embedding_mod.EncodedAudioClip, inputs.audio.items.len);
+        defer allocator.free(audio_inputs);
+        for (inputs.audio.items, 0..) |item, i| {
+            audio_inputs[i] = .{
+                .bytes = item.bytes,
+                .decode_options = .{ .mime_hint = item.mime_type },
+            };
+        }
+
+        if (pipeline.embedEncodedAudio(audio_inputs)) |embeddings| {
+            defer allocator.free(embeddings);
+            for (inputs.audio.items, 0..) |item, i| {
+                result.embeddings[item.index] = embeddings[i];
+            }
+        } else |_| {
+            try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
+        }
+    }
+
+    for (result.embeddings, 0..) |maybe_embedding, index| {
+        if (maybe_embedding == null) {
+            var already_reported = false;
+            for (errors.items) |item_error| {
+                if (item_error.index == @as(i64, @intCast(index))) {
+                    already_reported = true;
+                    break;
+                }
+            }
+            if (!already_reported) {
+                try errors.append(allocator, embedItemFailure(index, error.MissingEmbeddingResult, "inference"));
+            }
+        }
+    }
+
+    const owned_errors = try errors.toOwnedSlice(allocator);
+    allocator.free(result.errors);
+    result.errors = owned_errors;
+    return result;
+}
+
+fn embedTextInputsIndividually(
+    allocator: std.mem.Allocator,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    items: []const ParsedTextEmbedInput,
+    texts: []const []const u8,
+    errors: *std.ArrayListUnmanaged(EmbedItemError),
+    result: *DenseEmbedPartialResult,
+) !void {
+    for (items, 0..) |item, i| {
+        const single = pipeline.embed(texts[i .. i + 1]) catch |single_err| {
+            try errors.append(allocator, embedItemFailure(item.index, single_err, "text_inference"));
+            continue;
+        };
+        defer allocator.free(single);
+        if (single.len != 1) {
+            for (single) |embedding| allocator.free(embedding);
+            try errors.append(allocator, embedItemFailure(item.index, error.MissingEmbeddingResult, "text_inference"));
+            continue;
+        }
+        result.embeddings[item.index] = single[0];
+    }
+}
+
+fn embedImageInputsIndividually(
+    allocator: std.mem.Allocator,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    items: []const ParsedBinaryEmbedInput,
+    images: []const []const u8,
+    errors: *std.ArrayListUnmanaged(EmbedItemError),
+    result: *DenseEmbedPartialResult,
+) !void {
+    for (items, 0..) |item, i| {
+        const single = pipeline.embedImages(images[i .. i + 1]) catch |single_err| {
+            try errors.append(allocator, embedItemFailure(item.index, single_err, "image_inference"));
+            continue;
+        };
+        defer allocator.free(single);
+        if (single.len != 1) {
+            for (single) |embedding| allocator.free(embedding);
+            try errors.append(allocator, embedItemFailure(item.index, error.MissingEmbeddingResult, "image_inference"));
+            continue;
+        }
+        result.embeddings[item.index] = single[0];
+    }
+}
+
+fn embedAudioInputsIndividually(
+    allocator: std.mem.Allocator,
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    items: []const ParsedBinaryEmbedInput,
+    audio_inputs: []const embedding_mod.EncodedAudioClip,
+    errors: *std.ArrayListUnmanaged(EmbedItemError),
+    result: *DenseEmbedPartialResult,
+) !void {
+    for (items, 0..) |item, i| {
+        const single = pipeline.embedEncodedAudio(audio_inputs[i .. i + 1]) catch |single_err| {
+            try errors.append(allocator, embedItemFailure(item.index, single_err, "audio_inference"));
+            continue;
+        };
+        defer allocator.free(single);
+        if (single.len != 1) {
+            for (single) |embedding| allocator.free(embedding);
+            try errors.append(allocator, embedItemFailure(item.index, error.MissingEmbeddingResult, "audio_inference"));
+            continue;
+        }
+        result.embeddings[item.index] = single[0];
+    }
+}
+
 fn buildEmbedDenseResponse(
     arena: std.mem.Allocator,
     model_name: []const u8,
     embeddings: []const []const f32,
     requested_dimensions: ?usize,
     prompt_tokens: usize,
-) !api.EmbedResponse {
+) !EmbedResponseStrict {
     const data = try arena.alloc(api.EmbeddingObject, embeddings.len);
     for (embeddings, 0..) |emb, i| {
         const dimensions = requested_dimensions orelse emb.len;
@@ -6511,12 +6906,55 @@ fn buildEmbedDenseResponse(
     };
 }
 
+fn buildEmbedDensePartialResponse(
+    arena: std.mem.Allocator,
+    model_name: []const u8,
+    result: *const DenseEmbedPartialResult,
+    requested_dimensions: ?usize,
+    prompt_tokens: usize,
+) !EmbedDensePartialResponse {
+    const succeeded = result.successCount();
+    const data = try arena.alloc(api.EmbeddingObject, succeeded);
+    var out_index: usize = 0;
+    for (result.embeddings, 0..) |maybe_embedding, input_index| {
+        const emb = maybe_embedding orelse continue;
+        const dimensions = requested_dimensions orelse emb.len;
+        if (dimensions > emb.len) return error.InvalidEmbeddingDimensions;
+        var arr: std.json.Array = .init(arena);
+        try arr.ensureTotalCapacity(dimensions);
+        for (emb[0..dimensions]) |val| arr.appendAssumeCapacity(.{ .float = val });
+        data[out_index] = .{
+            .object = "embedding",
+            .index = @intCast(input_index),
+            .embedding = .{ .array = arr },
+        };
+        out_index += 1;
+    }
+
+    const errors = try arena.dupe(EmbedItemError, result.errors);
+    return .{
+        .object = "list",
+        .data = data,
+        .model = model_name,
+        .errors = errors,
+        .summary = .{
+            .total = @intCast(result.embeddings.len),
+            .succeeded = @intCast(succeeded),
+            .failed = @intCast(result.errors.len),
+        },
+        .usage = .{
+            .prompt_tokens = @intCast(prompt_tokens),
+            .total_tokens = @intCast(prompt_tokens),
+        },
+    };
+}
+
 fn buildEmbedSparseResponse(
     arena: std.mem.Allocator,
     model_name: []const u8,
     sparse_vecs: []const sparse_embedding_mod.SparseVector,
     prompt_tokens: usize,
-) !api.EmbedResponse {
+) !EmbedResponseStrict {
     const data = try arena.alloc(api.EmbeddingObject, sparse_vecs.len);
     for (sparse_vecs, 0..) |sv, i| {
         var indices: std.json.Array = .init(arena);
@@ -6680,6 +7118,77 @@ test "embedding request parser rejects conflicting task aliases" {
     try std.testing.expectError(error.ConflictingEmbeddingTaskTypes, parseEmbedRequest(parsed.value));
 }
 
+test "Antfly inference embed parser accepts per-item error policy" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "clipclap",
+        \\  "input": ["hello"],
+        \\  "error_policy": "per_item"
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    const request = try parseEmbedRequest(parsed.value);
+    try std.testing.expectEqual(EmbedErrorPolicy.per_item, request.error_policy);
+}
+
+test "Antfly inference embed parser rejects unknown error policy" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "clipclap",
+        \\  "input": ["hello"],
+        \\  "error_policy": "best_effort"
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.UnsupportedEmbeddingErrorPolicy, parseEmbedRequest(parsed.value));
+}
+
+test "Antfly inference per-item dense parser records invalid media and keeps siblings" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "clipclap",
+        \\  "error_policy": "per_item",
+        \\  "input": [
+        \\    "text that can still be embedded",
+        \\    {"type":"media","mime_type":"image/webp","data":"not-valid-base64-or-image"}
+        \\  ]
+        \\}
+    ;
+
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed_json.deinit();
+
+    const request = try parseEmbedRequest(parsed_json.value);
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = alloc,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+    };
+
+    var inputs = try parseDenseEmbedInputsPerItem(&node, alloc, &manifest, request.input);
+    defer inputs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), inputs.total_count);
+    try std.testing.expectEqual(@as(usize, 1), inputs.texts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), inputs.images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), inputs.parse_errors.items.len);
+    try std.testing.expectEqual(@as(i64, 1), inputs.parse_errors.items[0].index);
+    try std.testing.expectEqualStrings("INVALID_MEDIA", inputs.parse_errors.items[0].code);
+    try std.testing.expectEqualStrings("parse", inputs.parse_errors.items[0].stage);
+    try std.testing.expectEqual(false, inputs.parse_errors.items[0].retryable);
+}
+
 fn expectJsonNumber(expected: f64, value: std.json.Value) !void {
     const actual: f64 = switch (value) {
         .float => |float| float,
@@ -6709,6 +7218,49 @@ test "Antfly inference embeddings dense response supports truncation" {
     try expectJsonNumber(2.0, embedding_json[1]);
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("usage").?.object.get("prompt_tokens").?.integer);
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("usage").?.object.get("total_tokens").?.integer);
+}
+
+test "Antfly inference embeddings per-item response includes successes and indexed errors" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const first = try alloc.dupe(f32, &[_]f32{ 1.0, 2.0, 3.0 });
+    defer alloc.free(first);
+    const third = try alloc.dupe(f32, &[_]f32{ 4.0, 5.0, 6.0 });
+    defer alloc.free(third);
+    var errors = [_]EmbedItemError{
+        embedItemFailure(1, error.ImageDecodeFailed, "image_inference"),
+    };
+    var embeddings = [_]?[]f32{ first, null, third };
+    const partial = DenseEmbedPartialResult{
+        .embeddings = embeddings[0..],
+        .errors = errors[0..],
+    };
+
+    const response = try buildEmbedDensePartialResponse(arena.allocator(), "dense-model", &partial, 2, 7);
+    const body = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    const data = parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), data.len);
+    try std.testing.expectEqual(@as(i64, 0), data[0].object.get("index").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), data[1].object.get("index").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), data[0].object.get("embedding").?.array.items.len);
+
+    const response_errors = parsed.value.object.get("errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), response_errors.len);
+    try std.testing.expectEqual(@as(i64, 1), response_errors[0].object.get("index").?.integer);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", response_errors[0].object.get("code").?.string);
+    try std.testing.expectEqual(false, response_errors[0].object.get("retryable").?.bool);
+
+    const summary = parsed.value.object.get("summary").?.object;
+    try std.testing.expectEqual(@as(i64, 3), summary.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("succeeded").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("failed").?.integer);
 }
 
 test "Antfly inference embeddings sparse response uses the shared embedding field" {
@@ -6846,6 +7398,17 @@ test "Antfly inference embed media-only usage does not require text tokens" {
     try std.testing.expectEqual(@as(usize, 2), inputs.total_count);
     try std.testing.expectEqual(@as(usize, 0), inputs.texts.items.len);
     try std.testing.expectEqual(@as(usize, 0), estimateParsedDenseEmbedPromptTokens(&inputs));
+}
+
+test "embedding image decode failures are permanent client input errors" {
+    const failure = embedDenseInputFailure(error.ImageDecodeFailed);
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", failure.code);
+    try std.testing.expectEqualStrings("unsupported or corrupt image input", failure.message);
+
+    const runtime_failure = embedDenseInputFailure(error.OutOfMemory);
+    try std.testing.expectEqual(@as(u16, 500), runtime_failure.status);
+    try std.testing.expectEqualStrings("INFERENCE_FAILED", runtime_failure.code);
 }
 
 test "Antfly inference embed parser accepts data uri media payloads" {

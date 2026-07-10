@@ -18,7 +18,9 @@ const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
 const segment_mod = @import("../../segment.zig");
+const typed_dv = @import("../../section/typed_doc_values.zig");
 const analysis_mod = @import("../../search/analysis.zig");
+const geo_mod = @import("../../search/geo.zig");
 const schema_api = @import("../../schema/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const runtime_schema = @import("../schema.zig");
@@ -101,6 +103,26 @@ pub const SparseEmbeddingWrite = struct {
 pub const ObservedFieldAnalyzer = struct {
     field_name: []u8,
     analyzer_name: []u8,
+    field_type: runtime_schema.AntflyType = .text,
+    do_index: bool = true,
+    store: bool = false,
+    doc_values: bool = false,
+    sortable: bool = false,
+    missing_null_policy: runtime_schema.MissingNullPolicy = .missing_rejected,
+    include_in_all: bool = false,
+
+    pub fn mapping(self: ObservedFieldAnalyzer) runtime_schema.FieldMapping {
+        return .{
+            .field_type = self.field_type,
+            .do_index = self.do_index,
+            .store = self.store,
+            .doc_values = self.doc_values,
+            .sortable = self.sortable,
+            .missing_null_policy = self.missing_null_policy,
+            .include_in_all = self.include_in_all,
+            .analyzer = self.analyzer_name,
+        };
+    }
 };
 
 pub const BuildTextSegmentResult = struct {
@@ -124,6 +146,7 @@ pub const BuildTextSegmentsOptions = struct {
     target_segment_bytes: usize = default_text_segment_target_bytes,
     target_build_memory_bytes: ?usize = null,
     doc_scratch_retained_bytes: ?usize = null,
+    index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     profile: ?*introducer_mod.BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
@@ -183,7 +206,7 @@ pub const TextProjectionBatchBuilder = struct {
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
             try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
-        if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0) return;
+        if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         try self.text_docs.append(self.arena, .{
             .id = doc.key,
@@ -232,6 +255,10 @@ const ExtractedTextFields = struct {
     typed_fields: ?[]const introducer_mod.TypedFieldValue = null,
 };
 
+fn extractedHasTypedFields(extracted: ExtractedTextFields) bool {
+    return if (extracted.typed_fields) |fields| fields.len > 0 else false;
+}
+
 pub fn buildTextSegmentFromDocuments(
     alloc: Allocator,
     docs: []const MapperDoc,
@@ -260,6 +287,7 @@ pub fn buildTextSegmentFromDocumentsWithMetadata(
     const arena = arena_state.allocator();
 
     var observed_field_analyzers = std.ArrayListUnmanaged(ObservedFieldAnalyzer).empty;
+    try validateIndexSortForSchema(schema);
 
     const projection_batch = try buildTextProjectionBatch(arena, docs, text_analysis, schema, &observed_field_analyzers);
 
@@ -269,7 +297,10 @@ pub fn buildTextSegmentFromDocumentsWithMetadata(
             .observed_field_analyzers = try cloneObservedFieldAnalyzers(alloc, observed_field_analyzers.items),
         };
     }
-    const segment = try buildTextSegmentFromProjectionBatch(alloc, projection_batch, text_analysis);
+    const index_sort = try indexSortFieldsForSchemaAlloc(arena, schema);
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
+        .index_sort = index_sort,
+    });
     return .{
         .segment = segment,
         .observed_field_analyzers = try cloneObservedFieldAnalyzers(alloc, observed_field_analyzers.items),
@@ -288,15 +319,63 @@ pub fn buildTextSegmentsFromDocumentsWithMetadata(
     const arena = arena_state.allocator();
 
     var observed_field_analyzers = std.ArrayListUnmanaged(ObservedFieldAnalyzer).empty;
+    try validateIndexSortForSchema(schema);
     const projection_batch = try buildTextProjectionBatch(arena, docs, text_analysis, schema, &observed_field_analyzers);
 
-    const segments = try buildTextSegmentsFromProjectionBatch(alloc, projection_batch, text_analysis, options);
+    var build_options = options;
+    if (build_options.index_sort.len == 0) {
+        build_options.index_sort = try indexSortFieldsForSchemaAlloc(arena, schema);
+    }
+    const segments = try buildTextSegmentsFromProjectionBatch(alloc, projection_batch, text_analysis, build_options);
     errdefer freeTextSegments(alloc, segments);
 
     return .{
         .segments = segments,
         .observed_field_analyzers = try cloneObservedFieldAnalyzers(alloc, observed_field_analyzers.items),
     };
+}
+
+fn indexSortFieldsForSchemaAlloc(
+    alloc: Allocator,
+    schema: ?runtime_schema.TableSchema,
+) ![]const segment_mod.SegmentIndexSortField {
+    try validateIndexSortForSchema(schema);
+    const index_sort = if (schema) |s| s.index_sort else &.{};
+    if (index_sort.len == 0) return &.{};
+    const fields = try alloc.alloc(segment_mod.SegmentIndexSortField, index_sort.len);
+    for (index_sort, 0..) |field, i| {
+        fields[i] = .{
+            .field = field.field,
+            .desc = field.desc,
+        };
+    }
+    return fields;
+}
+
+fn sortFieldIsReservedId(field: []const u8) bool {
+    return std.mem.eql(u8, field, "_id");
+}
+
+fn validateIndexSortField(schema: runtime_schema.TableSchema, field: runtime_schema.IndexSortField) !void {
+    if (sortFieldIsReservedId(field.field)) return;
+    const mapping = runtime_schema.resolveDeclaredFieldType(schema, field.field) orelse return error.UnsupportedQueryRequest;
+    if (!runtime_schema.fieldTypeIsSortableScalar(mapping.field_type)) return error.UnsupportedQueryRequest;
+    if (!mapping.doc_values or !mapping.sortable) return error.UnsupportedQueryRequest;
+}
+
+fn validateIndexSortForSchema(schema: ?runtime_schema.TableSchema) !void {
+    const resolved_schema = schema orelse return;
+    const index_sort = resolved_schema.index_sort;
+    if (index_sort.len == 0) return;
+    if (!sortFieldIsReservedId(index_sort[index_sort.len - 1].field)) return error.UnsupportedQueryRequest;
+    if (index_sort[index_sort.len - 1].desc) return error.UnsupportedQueryRequest;
+    for (index_sort, 0..) |field, i| {
+        if (field.field.len == 0) return error.UnsupportedQueryRequest;
+        for (index_sort[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) return error.UnsupportedQueryRequest;
+        }
+        try validateIndexSortField(resolved_schema, field);
+    }
 }
 
 pub fn buildTextProjectionBatch(
@@ -308,6 +387,7 @@ pub fn buildTextProjectionBatch(
 ) !TextProjectionBatch {
     const source = try buildTextProjectionSourceBatchWithOptions(arena, docs, .{
         .schema_less_fast_projection = schema == null,
+        .strip_numeric_array_heuristic = schema == null,
     });
     return try buildTextProjectionBatchFromSource(arena, source.docs, text_analysis, schema, observed_field_analyzers);
 }
@@ -437,6 +517,7 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
     var build_options = introducer_mod.BuildTextOptions{
         .profile = options.profile,
         .resource_manager = options.resource_manager,
+        .index_sort = options.index_sort,
     };
     if (options.target_build_memory_bytes) |target| build_options.build_memory_target_bytes = target;
     if (options.doc_scratch_retained_bytes) |retained| build_options.doc_scratch_retained_bytes = retained;
@@ -541,6 +622,13 @@ fn cloneObservedFieldAnalyzers(
         cloned[i] = .{
             .field_name = try alloc.dupe(u8, item.field_name),
             .analyzer_name = try alloc.dupe(u8, item.analyzer_name),
+            .field_type = item.field_type,
+            .do_index = item.do_index,
+            .store = item.store,
+            .doc_values = item.doc_values,
+            .sortable = item.sortable,
+            .missing_null_policy = item.missing_null_policy,
+            .include_in_all = item.include_in_all,
         };
         initialized += 1;
     }
@@ -1502,6 +1590,8 @@ fn extractTextFieldsFromValue(
 
         var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
         defer fields.deinit(alloc);
+        var typed_fields = std.ArrayListUnmanaged(introducer_mod.TypedFieldValue).empty;
+        defer typed_fields.deinit(alloc);
 
         const document_schema = if (runtime.full_text_documents.len > 0)
             resolveFullTextDocument(runtime, root.object)
@@ -1509,12 +1599,14 @@ fn extractTextFieldsFromValue(
             null;
 
         if (document_schema) |resolved| {
-            try appendSchemaTextFields(alloc, &fields, root, resolved, text_analysis);
+            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers);
         }
         try appendDynamicSchemaTextFields(alloc, &fields, root, runtime, document_schema, text_analysis, observed_field_analyzers);
+        try appendSchemaTypedDocValueFields(alloc, &typed_fields, root, runtime);
         return .{
             .fields = if (fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, fields.items) else &.{},
             .infer_type_dynamic_paths = if (document_schema) |resolved| resolved.infer_type_dynamic_paths else &.{},
+            .typed_fields = if (typed_fields.items.len > 0) try alloc.dupe(introducer_mod.TypedFieldValue, typed_fields.items) else null,
         };
     }
 
@@ -1536,8 +1628,10 @@ fn appendSchemaTextFields(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
     root: std.json.Value,
+    schema: runtime_schema.TableSchema,
     document_schema: runtime_schema.FullTextDocument,
     text_analysis: introducer_mod.TextAnalysisConfig,
+    observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
     for (document_schema.fields) |field| {
         var values = std.ArrayListUnmanaged([]const u8).empty;
@@ -1558,6 +1652,11 @@ fn appendSchemaTextFields(
                     .text = text,
                     .analyzer = analyzer,
                 });
+            }
+        }
+        if (std.mem.eql(u8, field.path, field.emitted_name)) {
+            for (values.items) |text| {
+                try appendMappedSubfieldTextFields(alloc, fields, field.path, text, schema, text_analysis, observed_field_analyzers);
             }
         }
     }
@@ -1582,6 +1681,229 @@ fn appendDynamicSchemaTextFields(
     try collectDynamicSchemaTextFields(alloc, fields, root, "", schema, document_schema, explicit_paths.items, text_analysis, observed_field_analyzers);
 }
 
+fn appendSchemaTypedDocValueFields(
+    alloc: Allocator,
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    root: std.json.Value,
+    schema: runtime_schema.TableSchema,
+) !void {
+    try collectSchemaTypedDocValueFields(alloc, typed_fields, root, "", schema);
+}
+
+fn collectSchemaTypedDocValueFields(
+    alloc: Allocator,
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    value: std.json.Value,
+    path: []const u8,
+    schema: runtime_schema.TableSchema,
+) !void {
+    if (path.len > 0) {
+        if (mappedTypedDocValueFieldAlloc(alloc, schema, path, value)) |maybe_field| {
+            if (maybe_field) |typed_field| try typed_fields.append(alloc, typed_field);
+        } else |err| {
+            return err;
+        }
+        try appendMappedSubfieldTypedDocValueFields(alloc, typed_fields, schema, path, value);
+    }
+
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
+                const child_path = if (path.len == 0)
+                    try alloc.dupe(u8, entry.key_ptr.*)
+                else
+                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
+                defer alloc.free(child_path);
+                try collectSchemaTypedDocValueFields(alloc, typed_fields, entry.value_ptr.*, child_path, schema);
+            }
+        },
+        .array => |array| {
+            if (path.len > 0) {
+                if (resolveArrayTypedDocValueMapping(schema, path, array.items)) |mapping| {
+                    if (mapping.doc_values) {
+                        try appendSchemaTypedDocValueConflict(alloc, typed_fields, path);
+                        return;
+                    }
+                }
+                try appendMappedSubfieldTypedDocValueConflicts(alloc, typed_fields, schema, path);
+            }
+            for (array.items) |item| {
+                try collectSchemaTypedDocValueFields(alloc, typed_fields, item, path, schema);
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendMappedSubfieldTypedDocValueFields(
+    alloc: Allocator,
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    schema: runtime_schema.TableSchema,
+    path: []const u8,
+    value: std.json.Value,
+) !void {
+    for (schema.dynamic_templates) |template| {
+        const subfield_path = directMappedSubfieldPath(template, path) orelse continue;
+        const mapping = template.mapping;
+        if (!mapping.doc_values) continue;
+        const typed_value = (try typedDocValueForMappedFieldAlloc(alloc, mapping, value)) orelse continue;
+        try typed_fields.append(alloc, .{
+            .field_name = try alloc.dupe(u8, subfield_path),
+            .value_type = typedValueType(typed_value),
+            .value = typed_value,
+        });
+    }
+}
+
+fn appendMappedSubfieldTypedDocValueConflicts(
+    alloc: Allocator,
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    schema: runtime_schema.TableSchema,
+    path: []const u8,
+) !void {
+    for (schema.dynamic_templates) |template| {
+        const subfield_path = directMappedSubfieldPath(template, path) orelse continue;
+        if (!template.mapping.doc_values) continue;
+        try appendSchemaTypedDocValueConflict(alloc, typed_fields, subfield_path);
+    }
+}
+
+fn directMappedSubfieldPath(template: runtime_schema.DynamicTemplate, path: []const u8) ?[]const u8 {
+    const exact_path = runtime_schema.exactDynamicTemplatePath(template) orelse return null;
+    if (exact_path.len <= path.len + 1) return null;
+    if (!std.mem.startsWith(u8, exact_path, path)) return null;
+    if (exact_path[path.len] != '.') return null;
+    const suffix = exact_path[path.len + 1 ..];
+    if (std.mem.indexOfScalar(u8, suffix, '.') != null) return null;
+    return exact_path;
+}
+
+fn resolveArrayTypedDocValueMapping(
+    schema: runtime_schema.TableSchema,
+    path: []const u8,
+    items: []const std.json.Value,
+) ?runtime_schema.FieldMapping {
+    for (items) |item| {
+        if (runtime_schema.resolveFieldTypeForValue(schema, path, item)) |mapping| {
+            if (mapping.doc_values) return mapping;
+        }
+    }
+    return runtime_schema.resolveFieldType(schema, path);
+}
+
+fn appendSchemaTypedDocValueConflict(
+    alloc: Allocator,
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    path: []const u8,
+) !void {
+    try typed_fields.append(alloc, .{
+        .field_name = try alloc.dupe(u8, path),
+        .value_type = .bytes_val,
+        .value = .{ .bytes_val = &.{} },
+        .conflicted = true,
+    });
+}
+
+fn mappedTypedDocValueFieldAlloc(
+    alloc: Allocator,
+    schema: runtime_schema.TableSchema,
+    path: []const u8,
+    value: std.json.Value,
+) !?introducer_mod.TypedFieldValue {
+    const mapping = runtime_schema.resolveFieldTypeForValue(schema, path, value) orelse return null;
+    if (!mapping.doc_values) return null;
+    const typed_value = (try typedDocValueForMappedFieldAlloc(alloc, mapping, value)) orelse return null;
+    return .{
+        .field_name = try alloc.dupe(u8, path),
+        .value_type = typedValueType(typed_value),
+        .value = typed_value,
+    };
+}
+
+fn typedDocValueForMappedFieldAlloc(
+    alloc: Allocator,
+    mapping: runtime_schema.FieldMapping,
+    value: std.json.Value,
+) !?typed_dv.TypedValue {
+    return switch (mapping.field_type) {
+        .keyword, .link => switch (value) {
+            .string => |text| .{ .bytes_val = try alloc.dupe(u8, text) },
+            else => null,
+        },
+        .numeric => switch (value) {
+            .integer => |number| .{ .i64_val = number },
+            .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else null,
+            .number_string => |number| blk: {
+                if (std.mem.indexOfAny(u8, number, ".eE") == null) {
+                    if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .i64_val = parsed } else |_| {}
+                    if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .u64_val = parsed } else |_| {}
+                }
+                const parsed = std.fmt.parseFloat(f64, number) catch return null;
+                if (!std.math.isFinite(parsed)) return null;
+                break :blk .{ .f64_val = parsed };
+            },
+            else => null,
+        },
+        .datetime => switch (value) {
+            .string => |text| if (runtime_schema.parseDateTimeToNs(text)) |timestamp_ns| .{ .u64_val = timestamp_ns } else null,
+            .integer => |timestamp_ns| if (timestamp_ns >= 0) .{ .u64_val = @intCast(timestamp_ns) } else null,
+            .number_string => |timestamp_ns| .{ .u64_val = std.fmt.parseUnsigned(u64, timestamp_ns, 10) catch return null },
+            else => null,
+        },
+        .boolean => switch (value) {
+            .bool => |boolean| .{ .bool_val = boolean },
+            else => null,
+        },
+        .geopoint => blk: {
+            const point = jsonValueToMappedGeoPoint(value) orelse break :blk null;
+            break :blk .{ .geo_point = point };
+        },
+        else => null,
+    };
+}
+
+fn jsonValueToMappedGeoPoint(value: std.json.Value) ?typed_dv.GeoPoint {
+    if (value != .object) return null;
+    const lat_value = value.object.get("lat") orelse return null;
+    const lon_value = value.object.get("lon") orelse return null;
+    const lat = jsonValueToFiniteF64(lat_value) orelse return null;
+    const lon = jsonValueToFiniteF64(lon_value) orelse return null;
+    if (!mappedGeoLatitudeValid(lat) or !mappedGeoLongitudeValid(lon)) return null;
+    return .{ .lat = lat, .lon = lon };
+}
+
+fn jsonValueToFiniteF64(value: std.json.Value) ?f64 {
+    const number = switch (value) {
+        .integer => |integer| @as(f64, @floatFromInt(integer)),
+        .float => |float| float,
+        .number_string => |number_string| std.fmt.parseFloat(f64, number_string) catch return null,
+        else => return null,
+    };
+    if (!std.math.isFinite(number)) return null;
+    return number;
+}
+
+fn mappedGeoLatitudeValid(value: f64) bool {
+    return value >= -90.0 and value <= 90.0;
+}
+
+fn mappedGeoLongitudeValid(value: f64) bool {
+    return value >= -180.0 and value <= 180.0;
+}
+
+fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
+    return switch (value) {
+        .u64_val => .u64_val,
+        .i64_val => .i64_val,
+        .f64_val => .f64_val,
+        .bytes_val => .bytes_val,
+        .geo_point => .geo_point,
+        .bool_val => .bool_val,
+    };
+}
+
 fn collectDynamicSchemaTextFields(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
@@ -1595,6 +1917,15 @@ fn collectDynamicSchemaTextFields(
 ) !void {
     switch (value) {
         .object => |object| {
+            if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
+                if (resolveDynamicGeoPointMapping(schema, path, value)) |mapping| {
+                    try appendMappedGeoPointTextField(alloc, fields, path, value, mapping, text_analysis);
+                    if (observed_field_analyzers) |collector| {
+                        try appendObservedFieldAnalyzer(alloc, collector, path, mapping);
+                    }
+                    return;
+                }
+            }
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
@@ -1633,8 +1964,9 @@ fn collectDynamicSchemaTextFields(
             if (resolveDynamicTextMapping(schema, path, text)) |mapping| {
                 try appendMappedTextField(alloc, fields, path, text, mapping, text_analysis);
                 if (observed_field_analyzers) |collector| {
-                    try appendObservedFieldAnalyzer(alloc, collector, path, mapping.analyzer);
+                    try appendObservedFieldAnalyzer(alloc, collector, path, mapping);
                 }
+                try appendMappedSubfieldTextFields(alloc, fields, path, text, schema, text_analysis, observed_field_analyzers);
                 return;
             }
             if (document_schema) |resolved| {
@@ -1651,19 +1983,57 @@ fn collectDynamicSchemaTextFields(
     }
 }
 
+fn appendMappedSubfieldTextFields(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    path: []const u8,
+    text: []const u8,
+    schema: runtime_schema.TableSchema,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+) !void {
+    for (schema.dynamic_templates) |template| {
+        const subfield_path = directMappedSubfieldPath(template, path) orelse continue;
+        const mapping = template.mapping;
+        if (!isTextFieldType(mapping.field_type)) continue;
+        try appendMappedTextField(alloc, fields, subfield_path, text, mapping, text_analysis);
+        if (observed_field_analyzers) |collector| {
+            try appendObservedFieldAnalyzer(alloc, collector, subfield_path, mapping);
+        }
+    }
+}
+
 fn appendObservedFieldAnalyzer(
     alloc: Allocator,
     observed: *std.ArrayListUnmanaged(ObservedFieldAnalyzer),
     field_name: []const u8,
-    analyzer_name: []const u8,
+    mapping: runtime_schema.FieldMapping,
 ) !void {
     for (observed.items) |item| {
-        if (std.mem.eql(u8, item.field_name, field_name) and std.mem.eql(u8, item.analyzer_name, analyzer_name)) return;
+        if (std.mem.eql(u8, item.field_name, field_name) and observedMappingEquals(item.mapping(), mapping)) return;
     }
     try observed.append(alloc, .{
         .field_name = try alloc.dupe(u8, field_name),
-        .analyzer_name = try alloc.dupe(u8, analyzer_name),
+        .analyzer_name = try alloc.dupe(u8, mapping.analyzer),
+        .field_type = mapping.field_type,
+        .do_index = mapping.do_index,
+        .store = mapping.store,
+        .doc_values = mapping.doc_values,
+        .sortable = mapping.sortable,
+        .missing_null_policy = mapping.missing_null_policy,
+        .include_in_all = mapping.include_in_all,
     });
+}
+
+fn observedMappingEquals(left: runtime_schema.FieldMapping, right: runtime_schema.FieldMapping) bool {
+    return left.field_type == right.field_type and
+        left.do_index == right.do_index and
+        left.store == right.store and
+        left.doc_values == right.doc_values and
+        left.sortable == right.sortable and
+        left.missing_null_policy == right.missing_null_policy and
+        left.include_in_all == right.include_in_all and
+        std.mem.eql(u8, left.analyzer, right.analyzer);
 }
 
 fn resolveDynamicRule(document_schema: runtime_schema.FullTextDocument, path: []const u8) ?runtime_schema.FullTextDynamicRule {
@@ -1686,6 +2056,18 @@ fn resolveDynamicTextMapping(schema: runtime_schema.TableSchema, path: []const u
     return null;
 }
 
+fn resolveDynamicGeoPointMapping(schema: runtime_schema.TableSchema, path: []const u8, value: std.json.Value) ?runtime_schema.FieldMapping {
+    if (runtime_schema.resolveFieldTypeForValue(schema, path, value)) |mapping| {
+        if (mapping.field_type == .geopoint) return mapping;
+    }
+
+    const field_name = fieldNameFromPath(path);
+    if (runtime_schema.resolveFieldTypeForValue(schema, field_name, value)) |mapping| {
+        if (mapping.field_type == .geopoint) return mapping;
+    }
+    return null;
+}
+
 fn pathFallsUnderOpenDynamicPath(document_schema: runtime_schema.FullTextDocument, path: []const u8) bool {
     return pathFallsUnderAnyDynamicPath(document_schema.open_dynamic_paths, path);
 }
@@ -1702,6 +2084,22 @@ fn pathFallsUnderAnyDynamicPath(paths: []const []const u8, path: []const u8) boo
         if (path.len > open_path.len and path[open_path.len] == '.') return true;
     }
     return false;
+}
+
+fn appendMappedGeoPointTextField(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    path: []const u8,
+    value: std.json.Value,
+    mapping: runtime_schema.FieldMapping,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+) !void {
+    if (!mapping.do_index or mapping.field_type != .geopoint) return;
+    const point = jsonValueToMappedGeoPoint(value) orelse return;
+    const precision = geo_mod.index_geohash_precision;
+    const geohash = geo_mod.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
+    const term = try alloc.dupe(u8, geohash[0..precision]);
+    try appendNamedTextField(alloc, fields, path, term, "keyword", false, text_analysis);
 }
 
 fn appendMappedTextField(
@@ -1780,7 +2178,14 @@ fn appendDynamicSchemaLessStringTextFields(
 ) !void {
     try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
     if (observed_field_analyzers) |collector| {
-        try appendObservedFieldAnalyzer(alloc, collector, path, "standard");
+        try appendObservedFieldAnalyzer(alloc, collector, path, .{
+            .field_type = .text,
+            .do_index = true,
+            .doc_values = false,
+            .sortable = false,
+            .include_in_all = false,
+            .analyzer = "standard",
+        });
     }
     if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
 
@@ -1788,7 +2193,14 @@ fn appendDynamicSchemaLessStringTextFields(
     defer alloc.free(exact_field);
     try appendNamedTextField(alloc, fields, exact_field, text, "keyword", false, text_analysis);
     if (observed_field_analyzers) |collector| {
-        try appendObservedFieldAnalyzer(alloc, collector, exact_field, "keyword");
+        try appendObservedFieldAnalyzer(alloc, collector, exact_field, .{
+            .field_type = .keyword,
+            .do_index = true,
+            .doc_values = false,
+            .sortable = false,
+            .include_in_all = false,
+            .analyzer = "keyword",
+        });
     }
 }
 
@@ -2877,6 +3289,491 @@ test "document mapper emits schema-driven search_as_you_type variants" {
     try std.testing.expect((try reader.invertedIndex("name._index_prefix")) != null);
 }
 
+test "document mapper emits schema keyword typed doc values" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "tenant",
+            .path_match = "tenant",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"tenant\":\"acme\"}" },
+        .{ .key = "doc:2", .value = "{\"tenant\":\"beta\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const section = reader.getSection("tenant", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
+    const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
+    defer alloc.free(first);
+    const second = (try values.getBytesAlloc(1)) orelse return error.TestExpectedEqual;
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("acme", first);
+    try std.testing.expectEqualStrings("beta", second);
+}
+
+test "document mapper emits mapped keyword subfield postings and typed doc values" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "title",
+            .path_match = "title",
+            .mapping = .{
+                .field_type = .text,
+                .doc_values = false,
+                .sortable = false,
+                .analyzer = "standard",
+            },
+        },
+        .{
+            .name = "title.keyword",
+            .path_match = "title.keyword",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"title\":\"Alpha Phone\"}" },
+        .{ .key = "doc:2", .value = "{\"title\":\"Beta Phone\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("title")) != null);
+    try std.testing.expect((try reader.invertedIndex("title.keyword")) != null);
+    try std.testing.expect(reader.getSection("title", .typed_doc_values) == null);
+
+    const section = reader.getSection("title.keyword", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
+    const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
+    defer alloc.free(first);
+    const second = (try values.getBytesAlloc(1)) orelse return error.TestExpectedEqual;
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("Alpha Phone", first);
+    try std.testing.expectEqualStrings("Beta Phone", second);
+}
+
+test "document mapper emits schema-derived mapped keyword subfield coverage" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "title": {
+        \\            "type": "string",
+        \\            "x-antfly-field": {
+        \\              "type": "text",
+        \\              "fields": {
+        \\                "keyword": {"type":"keyword","sortable":true}
+        \\              }
+        \\            }
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"title\":\"Alpha Phone\"}" },
+        .{ .key = "doc:2", .value = "{\"title\":\"Beta Phone\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("title")) != null);
+    try std.testing.expect((try reader.invertedIndex("title.keyword")) != null);
+    try std.testing.expect(reader.getSection("title", .typed_doc_values) == null);
+
+    const section = reader.getSection("title.keyword", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
+    const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
+    defer alloc.free(first);
+    const second = (try values.getBytesAlloc(1)) orelse return error.TestExpectedEqual;
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("Alpha Phone", first);
+    try std.testing.expectEqualStrings("Beta Phone", second);
+}
+
+test "document mapper emits schema-derived direct keyword postings and typed doc values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "status": {
+        \\            "type": "string",
+        \\            "x-antfly-field": {"type":"keyword","sortable":true}
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"status\":\"active\"}" },
+        .{ .key = "doc:2", .value = "{\"status\":\"draft\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    var status_inv = (try reader.invertedIndex("status")) orelse return error.TestExpectedEqual;
+    try std.testing.expect((try reader.invertedIndex("status.keyword")) == null);
+    try std.testing.expect(status_inv.lookup("active") != null);
+
+    const section = reader.getSection("status", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
+    const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
+    defer alloc.free(first);
+    const second = (try values.getBytesAlloc(1)) orelse return error.TestExpectedEqual;
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("active", first);
+    try std.testing.expectEqualStrings("draft", second);
+}
+
+test "document mapper omits multi-valued mapped keyword subfield typed doc values" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "title",
+            .path_match = "title",
+            .mapping = .{
+                .field_type = .text,
+                .analyzer = "standard",
+            },
+        },
+        .{
+            .name = "title.keyword",
+            .path_match = "title.keyword",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"title\":[\"alpha\",\"beta\"]}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect(reader.getSection("title.keyword", .typed_doc_values) == null);
+}
+
+test "document mapper omits multi-valued schema keyword typed doc values" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "tags",
+            .path_match = "tags",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"tags\":[\"alpha\",\"beta\"]}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect(reader.getSection("tags", .typed_doc_values) == null);
+}
+
+test "document mapper omits multi-valued schema numeric typed doc values" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+        .{
+            .name = "body",
+            .path_match = "body",
+            .mapping = .{
+                .field_type = .text,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const docs = [_]MapperDoc{
+        .{ .key = "doc:scalar", .value = "{\"rank\":1,\"body\":\"scalar\"}" },
+        .{ .key = "doc:array", .value = "{\"rank\":[2,3],\"body\":\"array\"}" },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const projection = try buildTextProjectionBatch(arena_state.allocator(), &docs, text_analysis, schema, null);
+    try std.testing.expectEqual(@as(usize, 2), projection.docs.len);
+    const array_typed_fields = projection.docs[1].typed_fields orelse return error.TestExpectedEqual;
+    try std.testing.expect(array_typed_fields.len > 0);
+    try std.testing.expect(array_typed_fields[0].conflicted);
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &docs, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect(reader.getSection("rank", .typed_doc_values) == null);
+}
+
+test "document mapper preserves integer numeric doc values as i64" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"rank\":-9007199254740993}" },
+        .{ .key = "doc:2", .value = "{\"rank\":42}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const section = reader.getSection("rank", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.i64_val, values.value_type);
+    try std.testing.expectEqual(@as(?i64, -9007199254740993), try values.getI64(0));
+    try std.testing.expectEqual(@as(?i64, 42), try values.getI64(1));
+}
+
+test "document mapper preserves unsigned numeric doc values beyond i64 as u64" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"rank\":9223372036854775808}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const section = reader.getSection("rank", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.u64_val, values.value_type);
+    try std.testing.expectEqual(@as(?u64, 9223372036854775808), try values.getU64(0));
+}
+
+test "document mapper omits mixed numeric typed doc value domains" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:integer", .value = "{\"rank\":10}" },
+        .{ .key = "doc:float", .value = "{\"rank\":10.5}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect(reader.getSection("rank", .typed_doc_values) == null);
+}
+
+test "document mapper omits non-finite numeric doc values" {
+    const alloc = std.testing.allocator;
+    const mapping = runtime_schema.FieldMapping{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+    };
+
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "nan" })) == null);
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "inf" })) == null);
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "-inf" })) == null);
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "10.5" })) != null);
+}
+
+test "document mapper emits schema geo point typed doc values" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "location",
+            .path_match = "location",
+            .mapping = .{
+                .field_type = .geopoint,
+                .doc_values = true,
+            },
+        },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const section = reader.getSection("location", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.geo_point, values.value_type);
+    const point = (try values.getGeoPoint(0)) orelse return error.TestExpectedEqual;
+    try std.testing.expectApproxEqAbs(@as(f64, 37.7749), point.lat, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f64, -122.4194), point.lon, 0.00001);
+
+    const inv_reader = (try reader.invertedIndex("location")) orelse return error.TestExpectedEqual;
+    const geohash = geo_mod.encode(.{ .lat = 37.7749, .lon = -122.4194 }, geo_mod.index_geohash_precision);
+    const lookup = inv_reader.lookup(geohash[0..geo_mod.index_geohash_precision]) orelse return error.TestExpectedEqual;
+    switch (lookup) {
+        .one_hit => |hit| try std.testing.expectEqual(@as(u32, 0), hit.doc_num),
+        .postings => |postings| {
+            var bitmap = try postings.docBitmap(alloc);
+            defer bitmap.deinit();
+            try std.testing.expectEqual(@as(usize, 1), bitmap.cardinality());
+            try std.testing.expect(bitmap.contains(0));
+        },
+    }
+    const coarse_geohash = geo_mod.encode(.{ .lat = 37.7749, .lon = -122.4194 }, geo_mod.min_index_geohash_precision);
+    try std.testing.expect(inv_reader.lookup(coarse_geohash[0..geo_mod.min_index_geohash_precision]) == null);
+
+    const mapping = runtime_schema.FieldMapping{
+        .field_type = .geopoint,
+        .doc_values = true,
+    };
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .object = std.json.ObjectMap.empty })) == null);
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, .{ .number_string = "nan" })) == null);
+
+    var invalid_lat = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"lat":91.0,"lon":10.0}
+    , .{});
+    defer invalid_lat.deinit();
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, invalid_lat.value)) == null);
+
+    var invalid_lon = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"lat":10.0,"lon":181.0}
+    , .{});
+    defer invalid_lon.deinit();
+    try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, invalid_lon.value)) == null);
+}
+
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
@@ -2985,8 +3882,238 @@ test "document mapper records observed dynamic-template field analyzers" {
     try std.testing.expectEqual(@as(usize, 2), result.observed_field_analyzers.len);
     try std.testing.expectEqualStrings("meta.body", result.observed_field_analyzers[0].field_name);
     try std.testing.expectEqualStrings("french", result.observed_field_analyzers[0].analyzer_name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.text, result.observed_field_analyzers[0].field_type);
+    try std.testing.expect(result.observed_field_analyzers[0].do_index);
+    try std.testing.expect(result.observed_field_analyzers[0].store);
+    try std.testing.expect(!result.observed_field_analyzers[0].doc_values);
+    try std.testing.expect(!result.observed_field_analyzers[0].sortable);
+    try std.testing.expect(!result.observed_field_analyzers[0].include_in_all);
     try std.testing.expectEqualStrings("meta.published", result.observed_field_analyzers[1].field_name);
     try std.testing.expectEqualStrings("keyword", result.observed_field_analyzers[1].analyzer_name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, result.observed_field_analyzers[1].field_type);
+    try std.testing.expect(result.observed_field_analyzers[1].do_index);
+    try std.testing.expect(result.observed_field_analyzers[1].store);
+    try std.testing.expect(!result.observed_field_analyzers[1].doc_values);
+    try std.testing.expect(!result.observed_field_analyzers[1].sortable);
+    try std.testing.expect(!result.observed_field_analyzers[1].include_in_all);
+}
+
+test "document mapper flushes schema index_sort segments in physical sort order" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "price",
+            .path_match = "price",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+        .{
+            .name = "content",
+            .path_match = "content",
+            .match_mapping_type = "string",
+            .mapping = .{
+                .field_type = .text,
+                .analyzer = "standard",
+            },
+        },
+    };
+    const index_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:b", .value = "{\"price\":2,\"content\":\"second\"}" },
+        .{ .key = "doc:a", .value = "{\"price\":1,\"content\":\"first\"}" },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+
+    const segment = result.segment orelse return error.TestExpectedEqual;
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("doc:a", reader.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:b", reader.storedDoc(1).?.id);
+
+    const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer segment_mod.freeIndexSortFields(alloc, fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("price", fields[0].field);
+    try std.testing.expectEqualStrings("_id", fields[1].field);
+
+    var bounds = (try reader.indexSortBoundsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer bounds.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), bounds.first.len);
+    try std.testing.expect(bounds.first[0] == .i64_val);
+    try std.testing.expectEqual(@as(i64, 1), bounds.first[0].i64_val);
+    try std.testing.expect(bounds.first[1] == .id);
+    try std.testing.expectEqualStrings("doc:a", bounds.first[1].id);
+    try std.testing.expect(bounds.last[0] == .i64_val);
+    try std.testing.expectEqual(@as(i64, 2), bounds.last[0].i64_val);
+    try std.testing.expect(bounds.last[1] == .id);
+    try std.testing.expectEqualStrings("doc:b", bounds.last[1].id);
+
+    const stats = reader.layoutStats();
+    try std.testing.expect(stats.index_sort_bytes > 0);
+    try std.testing.expect(stats.index_sort_bounds_bytes > 0);
+
+    const section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.i64_val, values.value_type);
+    try std.testing.expectEqual(@as(?i64, 1), try values.getI64(0));
+    try std.testing.expectEqual(@as(?i64, 2), try values.getI64(1));
+}
+
+test "document mapper accepts match-mapping-type dynamic template index_sort field" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "dates",
+            .path_match = "created_at",
+            .match_mapping_type = "date",
+            .mapping = .{
+                .field_type = .datetime,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const index_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:old", .value = "{\"created_at\":\"2026-01-01T00:00:00Z\"}" },
+        .{ .key = "doc:new", .value = "{\"created_at\":\"2026-01-02T00:00:00Z\"}" },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+
+    const segment = result.segment orelse return error.TestExpectedEqual;
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("doc:new", reader.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:old", reader.storedDoc(1).?.id);
+
+    const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer segment_mod.freeIndexSortFields(alloc, fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("created_at", fields[0].field);
+    try std.testing.expect(fields[0].desc);
+    try std.testing.expectEqualStrings("_id", fields[1].field);
+    try std.testing.expect(!fields[1].desc);
+
+    const section = reader.getSection("created_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.u64_val, values.value_type);
+    try std.testing.expect((try values.getU64(0)).? > (try values.getU64(1)).?);
+}
+
+test "document mapper rejects mixed native value types for index_sort field" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "price",
+            .path_match = "price",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+    };
+    const index_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    try std.testing.expectError(error.InvalidSegment, buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:a", .value = "{\"price\":1}" },
+        .{ .key = "doc:b", .value = "{\"price\":1.5}" },
+    }, text_analysis, schema));
+}
+
+test "document mapper validates schema index_sort field capabilities" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema.DynamicTemplate{
+        .{
+            .name = "price",
+            .path_match = "price",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+            },
+        },
+        .{
+            .name = "content",
+            .path_match = "content",
+            .mapping = .{
+                .field_type = .text,
+                .doc_values = false,
+                .sortable = false,
+                .analyzer = "standard",
+            },
+        },
+    };
+    const docs = [_]MapperDoc{
+        .{ .key = "doc:a", .value = "{\"price\":1,\"content\":\"first\"}" },
+    };
+
+    const missing_id_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, buildTextSegmentFromDocumentsWithMetadata(alloc, &docs, text_analysis, .{
+        .dynamic_templates = &templates,
+        .index_sort = &missing_id_sort,
+    }));
+
+    const descending_id_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = true },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, buildTextSegmentFromDocumentsWithMetadata(alloc, &docs, text_analysis, .{
+        .dynamic_templates = &templates,
+        .index_sort = &descending_id_sort,
+    }));
+
+    const non_sortable_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "content", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, buildTextSegmentFromDocumentsWithMetadata(alloc, &docs, text_analysis, .{
+        .dynamic_templates = &templates,
+        .index_sort = &non_sortable_sort,
+    }));
+
+    const duplicate_sort = [_]runtime_schema.IndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, buildTextSegmentFromDocumentsWithMetadata(alloc, &docs, text_analysis, .{
+        .dynamic_templates = &templates,
+        .index_sort = &duplicate_sort,
+    }));
 }
 
 test "document mapper emits additional-properties search_as_you_type variants" {

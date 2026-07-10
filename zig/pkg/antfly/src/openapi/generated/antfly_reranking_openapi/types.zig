@@ -3,6 +3,57 @@
 
 const std = @import("std");
 
+/// Configuration for the Antfly inference reranking provider.
+pub const AntflyRerankerConfig = struct {
+    /// The name of the reranking model (e.g., cross-encoder model name).
+    model: []const u8,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    url: ?[]const u8 = null,
+};
+
+/// Configuration for the Cohere reranking provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/rerank
+pub const CohereRerankerConfig = struct {
+    /// The name of the Cohere reranking model to use.
+    model: []const u8,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+    /// Maximum number of chunks per document for long document handling.
+    max_chunks_per_doc: ?i64 = null,
+};
+
+/// Configuration for the Ollama reranking provider.
+pub const OllamaRerankerConfig = struct {
+    /// The name of the Ollama model to use for reranking.
+    model: []const u8,
+    /// The URL of the Ollama API endpoint.
+    url: ?[]const u8 = null,
+};
+
+/// A unified configuration for a reranking provider.
+pub const RerankerConfig = struct {
+    provider: RerankerProvider,
+    /// Field name to extract from documents for reranking.
+    field: ?[]const u8 = null,
+    /// Handlebars template to render document text for reranking.
+    template: ?[]const u8 = null,
+    /// The name of the reranking model (e.g., cross-encoder model name).
+    model: ?[]const u8 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    url: ?[]const u8 = null,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+    /// Maximum number of chunks per document for long document handling.
+    max_chunks_per_doc: ?i64 = null,
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    credentials_path: ?[]const u8 = null,
+};
+
 /// The reranking provider to use.
 pub const RerankerProvider = enum {
     antfly,
@@ -35,34 +86,6 @@ pub const RerankerProvider = enum {
     }
 };
 
-/// Configuration for the Ollama reranking provider.
-pub const OllamaRerankerConfig = struct {
-    /// The name of the Ollama model to use for reranking.
-    model: []const u8,
-    /// The URL of the Ollama API endpoint.
-    url: ?[]const u8 = null,
-};
-
-/// Configuration for the Antfly inference reranking provider.
-pub const AntflyRerankerConfig = struct {
-    /// The name of the reranking model (e.g., cross-encoder model name).
-    model: []const u8,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    url: ?[]const u8 = null,
-};
-
-/// Configuration for the Cohere reranking provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/rerank
-pub const CohereRerankerConfig = struct {
-    /// The name of the Cohere reranking model to use.
-    model: []const u8,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
-};
-
 /// Configuration for the Google Vertex AI Ranking API. Uses Application Default Credentials (ADC) or explicit credentials path. **Prerequisites:** - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com` - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission) **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004 **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
 pub const VertexRerankerConfig = struct {
     /// The ranking model to use.
@@ -73,27 +96,4 @@ pub const VertexRerankerConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// Maximum number of records to return. If not specified, returns all documents with scores.
     top_n: ?i64 = null,
-};
-
-/// A unified configuration for a reranking provider.
-pub const RerankerConfig = struct {
-    provider: RerankerProvider,
-    /// Field name to extract from documents for reranking.
-    field: ?[]const u8 = null,
-    /// Handlebars template to render document text for reranking.
-    template: ?[]const u8 = null,
-    /// The name of the reranking model (e.g., cross-encoder model name).
-    model: ?[]const u8 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    url: ?[]const u8 = null,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
-    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
-    credentials_path: ?[]const u8 = null,
 };

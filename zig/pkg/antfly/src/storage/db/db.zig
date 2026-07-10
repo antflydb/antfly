@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const antfly_image = @import("antfly_image");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -24,6 +25,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
+const segment_mod = @import("../../segment.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
@@ -136,6 +138,14 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 
 fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+}
+
+fn observeSearchFailureMetric(name: ?[]const u8, query_type: db_query_metrics.QueryType, duration_ns: u64) void {
+    if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
+        db_query_metrics.observeSortRejection(name, query_type, duration_ns, diagnostic.reason, diagnostic.detail);
+        return;
+    }
+    db_query_metrics.observe(name, query_type, duration_ns);
 }
 
 fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void {
@@ -550,9 +560,11 @@ const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
+    snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
     applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    repair_sequence: u64 = 0,
     allow_graph_materialization: bool = true,
     require_graph_resolution_contract: bool = false,
     query_visibility_hook: ?QueryVisibilityHook = null,
@@ -569,6 +581,7 @@ const AsyncContext = struct {
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
+    repair_options: types.ArtifactRepairRunOptions = .{},
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -582,6 +595,14 @@ const AsyncContext = struct {
         self.target_advance_repair_last_ns.deinit(alloc);
     }
 };
+
+fn checkArtifactRepairCancelled(options: types.ArtifactRepairRunOptions) !void {
+    if (options.cancelled()) return error.Canceled;
+}
+
+fn checkAsyncRepairCancelled(ctx: *const AsyncContext) !void {
+    try checkArtifactRepairCancelled(ctx.repair_options);
+}
 
 const DocSetPlanningRuntimeStats = struct {
     resolved_set_count: AtomicU64 = AtomicU64.init(0),
@@ -1956,6 +1977,7 @@ fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WritePro
 
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
+var repair_shadow_nonce = AtomicU64.init(0);
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
@@ -2749,6 +2771,9 @@ pub const DB = struct {
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
     published_dense_searches: std.atomic.Value(u32) = .init(0),
+    index_repair_mutex: std.atomic.Mutex = .unlocked,
+    active_index_repairs: std.StringHashMapUnmanaged(void) = .{},
+    shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -2758,6 +2783,11 @@ pub const DB = struct {
         .stats = engineStats,
         .list_indexes = engineListIndexes,
         .list_enrichments = engineListEnrichments,
+    };
+
+    pub const ShadowIndexRepairHook = struct {
+        ptr: *anyopaque,
+        after_snapshot_build: *const fn (ptr: *anyopaque, db: *DB, index_name: []const u8, build_floor_sequence: u64) anyerror!void,
     };
 
     fn batchContext(self: *DB) BatchExecutionContext {
@@ -3023,6 +3053,9 @@ pub const DB = struct {
             }
             if (opts.open_mode != .status_only) {
                 db.hydrateAlgebraicObservationStatusBestEffort();
+            }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                db.core.index_manager.cleanupInactiveRepairShadowRoots();
             }
             if (opts.open_mode != .status_only) {
                 try db.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -3572,6 +3605,14 @@ pub const DB = struct {
         if (self.promotion_runtime) |runtime| runtime.stop();
     }
 
+    fn clearLiveDocSetCache(self: *DB) void {
+        lockAtomic(&self.live_doc_set_cache_mutex);
+        defer self.live_doc_set_cache_mutex.unlock();
+        if (self.live_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
+        self.live_doc_set_cache_set = null;
+        self.live_doc_set_cache_generation = null;
+    }
+
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
@@ -3581,14 +3622,12 @@ pub const DB = struct {
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
-        if (self.live_doc_set_cache_set) |*cached| {
-            cached.deinit(self.alloc);
-            self.live_doc_set_cache_set = null;
-            self.live_doc_set_cache_generation = null;
-        }
+        self.clearLiveDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
+        self.clearActiveIndexRepairsLocked();
+        self.active_index_repairs.deinit(self.alloc);
         self.closeShadowIndexManager() catch {};
         if (self.transaction_runtime) |runtime| {
             runtime.deinit();
@@ -3984,6 +4023,44 @@ pub const DB = struct {
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.core.index_manager.snapshotTextMemoryAttribution();
+    }
+
+    pub fn observedDynamicFieldCapabilitiesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+    ) ![]schema_mod.FieldCapability {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name);
+    }
+
+    pub fn tryObservedDynamicFieldCapabilitiesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        index_name: ?[]const u8,
+    ) ?[]schema_mod.FieldCapability {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name) catch null;
+    }
+
+    pub fn observedDynamicFieldCapabilitySetsAlloc(
+        self: *DB,
+        alloc: Allocator,
+    ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc);
+    }
+
+    pub fn tryObservedDynamicFieldCapabilitySetsAlloc(
+        self: *DB,
+        alloc: Allocator,
+    ) ?[]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc) catch null;
     }
 
     pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
@@ -5166,6 +5243,7 @@ pub const DB = struct {
         }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
+            self.clearLiveDocSetCache();
         }
         if (profile) |active_profile| {
             recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
@@ -5292,6 +5370,7 @@ pub const DB = struct {
         if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
             self.bulk_ingest_identity_state = state;
             self.identity_visibility_summary_cache = state.visibility_summary;
+            self.clearLiveDocSetCache();
             self.bulk_ingest_identity_all_new = true;
         }
     }
@@ -5306,6 +5385,30 @@ pub const DB = struct {
         var it = self.bulk_ingest_seen_doc_keys.keyIterator();
         while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
         self.bulk_ingest_seen_doc_keys.clearRetainingCapacity();
+    }
+
+    fn clearActiveIndexRepairsLocked(self: *DB) void {
+        var it = self.active_index_repairs.keyIterator();
+        while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
+        self.active_index_repairs.clearRetainingCapacity();
+    }
+
+    fn beginIndexRepairLease(self: *DB, index_name: []const u8) !bool {
+        lockAtomic(&self.index_repair_mutex);
+        defer self.index_repair_mutex.unlock();
+        if (self.active_index_repairs.contains(index_name)) return false;
+        const owned = try self.alloc.dupe(u8, index_name);
+        errdefer self.alloc.free(owned);
+        try self.active_index_repairs.put(self.alloc, owned, {});
+        return true;
+    }
+
+    fn endIndexRepairLease(self: *DB, index_name: []const u8) void {
+        lockAtomic(&self.index_repair_mutex);
+        defer self.index_repair_mutex.unlock();
+        if (self.active_index_repairs.fetchRemove(index_name)) |removed| {
+            self.alloc.free(@constCast(removed.key));
+        }
     }
 
     fn primaryUserNamespaceIsEmptyLocked(self: *DB) !bool {
@@ -6875,7 +6978,7 @@ pub const DB = struct {
             .dense_vector, .sparse_vector => .embedding,
             .graph => .graph,
             .full_text => .full_text,
-            .algebraic => null,
+            .algebraic => .algebraic,
         };
     }
 
@@ -6923,9 +7026,10 @@ pub const DB = struct {
                 .artifact_kind = artifact_kind,
                 .index_name = try alloc.dupe(u8, cfg.name),
                 .artifact_name = try alloc.dupe(u8, cfg.name),
-                .repairable = true,
+                .repairable = artifact_kind != .algebraic,
+                .unsupported_reason = if (artifact_kind == .algebraic) try alloc.dupe(u8, artifactRepairUnsupportedReason(.algebraic)) else "",
                 .reason = if (load_error != null) .unreadable_artifact else .missing_artifact,
-                .last_error = if (load_error) |err_name| try alloc.dupe(u8, err_name) else try alloc.dupe(u8, "index_repair_required"),
+                .last_error = if (load_error) |err_name| try alloc.dupe(u8, err_name) else try alloc.dupe(u8, if (artifact_kind == .algebraic) artifactRepairUnsupportedReason(.algebraic) else "index_repair_required"),
             });
             last_returned = cfg.name;
         }
@@ -7080,7 +7184,7 @@ pub const DB = struct {
         return switch (issue.artifact_kind) {
             .embedding => try self.embeddingArtifactNowReadable(alloc, issue),
             .asset => try self.documentAssetArtifactNowReadable(alloc, issue),
-            .chunk, .graph, .full_text => false,
+            .chunk, .graph, .full_text, .algebraic => false,
         };
     }
 
@@ -7154,7 +7258,7 @@ pub const DB = struct {
         return switch (issue.artifact_kind) {
             .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue),
             .asset => try self.reprocessDocumentArtifact(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name),
-            .chunk, .graph, .full_text => false,
+            .chunk, .graph, .full_text, .algebraic => false,
         };
     }
 
@@ -7167,7 +7271,17 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
     ) !types.ArtifactRepairResult {
-        if (req.target == .index) return try self.repairIndexIssuesWithRequest(alloc, req);
+        return try self.repairArtifactIssuesWithRequestOptions(alloc, req, .{});
+    }
+
+    pub fn repairArtifactIssuesWithRequestOptions(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairRunRequest,
+        options: types.ArtifactRepairRunOptions,
+    ) !types.ArtifactRepairResult {
+        try checkArtifactRepairCancelled(options);
+        if (req.target == .index) return try self.repairIndexIssuesWithRequest(alloc, req, options);
 
         const page = try self.listArtifactRepairIssuesPage(alloc, .{
             .artifact_kind = req.artifact_kind,
@@ -7189,6 +7303,11 @@ pub const DB = struct {
             result.next_cursor = try alloc.dupe(u8, cursor);
         }
         for (page.issues) |*issue| {
+            if (options.cancelled()) {
+                result.unresolved += 1;
+                result.debt_remaining = true;
+                return result;
+            }
             result.scanned += 1;
             issue.attempts += 1;
             issue.last_seen_ns = currentTimeNs();
@@ -7263,17 +7382,14 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
+        options: types.ArtifactRepairRunOptions,
     ) !types.ArtifactRepairResult {
+        try checkArtifactRepairCancelled(options);
         const requested_index = req.index_name orelse return error.InvalidArgument;
         if (req.cursor != null and req.cursor.?.len != 0) return error.InvalidArgument;
         const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
         var result = types.ArtifactRepairResult{ .limit = limit };
         if (limit == 0) return result;
-
-        self.beginIndexRepairBarrier();
-        defer self.endIndexRepairBarrier();
-        lockApply(self);
-        defer self.core.unlockApply();
 
         const cfg_ptr = self.core.index_manager.get(requested_index) orelse return error.NotFound;
         var cfg = try types.IndexConfig.clone(alloc, cfg_ptr.*);
@@ -7284,7 +7400,7 @@ pub const DB = struct {
                 .dense_vector, .sparse_vector => kind == .embedding,
                 .graph => kind == .graph,
                 .full_text => kind == .full_text,
-                .algebraic => false,
+                .algebraic => kind == .algebraic,
             };
             if (!matches_kind) return error.NotFound;
         }
@@ -7292,7 +7408,17 @@ pub const DB = struct {
         const repair_required = try self.indexRepairRequired(alloc, cfg.name);
         if (!repair_required and !req.force) return result;
 
+        if (!(try self.beginIndexRepairLease(cfg.name))) {
+            result.scanned += 1;
+            result.in_progress += 1;
+            result.unresolved += 1;
+            result.debt_remaining = true;
+            return result;
+        }
+        defer self.endIndexRepairLease(cfg.name);
+
         var quarantined_retry_run = false;
+        var recreated_quarantined_root_for_rebuild = false;
         result.scanned += 1;
         const had_load_failure = self.core.index_manager.loadFailure(cfg.name) != null;
         if (had_load_failure) result.indexes_degraded += 1;
@@ -7301,51 +7427,287 @@ pub const DB = struct {
             quarantined_retry_run = true;
         }
         if (self.core.index_manager.loadFailure(cfg.name) != null) {
-            result.failed += 1;
-            result.unresolved += 1;
-            result.debt_remaining = true;
-            return result;
+            switch (cfg.kind) {
+                .dense_vector, .sparse_vector, .graph, .full_text => {
+                    _ = self.core.index_manager.reopenQuarantinedIndexForArtifactRebuild(self.core.store, cfg.name) catch {
+                        result.failed += 1;
+                        result.unresolved += 1;
+                        result.debt_remaining = true;
+                        return result;
+                    };
+                    recreated_quarantined_root_for_rebuild = true;
+                },
+                .algebraic => {
+                    result.failed += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
+                    return result;
+                },
+            }
         }
-        if (had_load_failure and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexRepairRequired(alloc, cfg.name)) {
+        if (had_load_failure and !recreated_quarantined_root_for_rebuild and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexRepairRequired(alloc, cfg.name)) {
             result.repaired += 1;
             return result;
         }
 
-        const rebuilt = switch (cfg.kind) {
-            .dense_vector => blk: {
-                try self.core.index_manager.resetDenseIndexForArtifactRebuild(cfg.name);
-                const count = try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048);
-                try self.core.index_manager.syncIndexByName(cfg.name, true);
-                break :blk count;
+        if (cfg.kind == .algebraic) {
+            result.unsupported += 1;
+            result.unresolved += 1;
+            result.debt_remaining = true;
+            return result;
+        }
+        const rebuilt = self.rebuildIndexWithShadowReplacement(alloc, cfg, options) catch |err| switch (err) {
+            error.Canceled => {
+                result.unresolved += 1;
+                result.debt_remaining = true;
+                return result;
             },
-            .sparse_vector => blk: {
-                try self.core.index_manager.resetSparseIndexForArtifactRebuild(cfg.name);
-                const count = try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048);
-                try self.core.index_manager.syncIndexByName(cfg.name, true);
-                break :blk count;
+            error.ShadowIndexCatchUpIncomplete => {
+                result.failed += 1;
+                result.unresolved += 1;
+                result.debt_remaining = true;
+                return result;
             },
-            .graph => blk: {
-                try self.core.index_manager.resetGraphIndexForArtifactRebuild(cfg.name);
-                const count = try applySplitGraphArtifactsForIndexStreaming(
-                    alloc,
-                    self.core.store,
-                    self.core.index_manager,
-                    cfg.name,
-                    graph_repair_rebuild_batch_size,
-                );
-                try self.core.index_manager.syncIndexByName(cfg.name, true);
-                break :blk count;
-            },
-            .full_text => blk: {
-                const count = try self.core.index_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name);
-                break :blk count;
-            },
-            .algebraic => return result,
+            else => return err,
         };
-        result.reprocessed += rebuilt;
-        result.repaired += 1;
+        result.reprocessed += rebuilt.reprocessed;
         result.indexes_rebuilt += 1;
+        if (try self.indexRepairRequired(alloc, cfg.name)) {
+            result.unresolved += 1;
+            result.debt_remaining = true;
+        } else {
+            result.repaired += 1;
+        }
         return result;
+    }
+
+    const ShadowIndexReplacementResult = struct {
+        reprocessed: u64 = 0,
+        applied_sequence: u64 = 0,
+    };
+
+    fn rebuildIndexWithShadowReplacement(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        options: types.ArtifactRepairRunOptions,
+    ) !ShadowIndexReplacementResult {
+        try checkArtifactRepairCancelled(options);
+        const shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
+        try index_manager_mod.IndexManager.writeRepairShadowInProgressMarker(alloc, shadow_base);
+        var shadow_installed = false;
+        defer {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            if (!shadow_installed) {
+                index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+            }
+            alloc.free(shadow_base);
+        }
+        const shadow_indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{shadow_base});
+        defer alloc.free(shadow_indexes_path);
+        try ensureDirPath(shadow_indexes_path);
+
+        const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, cfg.name });
+        defer alloc.free(shadow_index_path);
+        const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
+        defer alloc.free(shadow_checkpoint_path);
+
+        var shadow_manager = try index_manager_mod.IndexManager.initWithOptions(
+            alloc,
+            shadow_base,
+            self.index_backends,
+        );
+        var shadow_manager_open = true;
+        defer if (shadow_manager_open) shadow_manager.deinit();
+        shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
+        try shadow_manager.registerReplacementIndex(self.core.store, cfg);
+
+        var shadow_ctx = AsyncContext{
+            .alloc = alloc,
+            .io = self.backend_runtime.io(),
+            .store = self.core.store,
+            .applied_sequence_checkpoint_path = shadow_checkpoint_path,
+            .index_manager = &shadow_manager,
+            .apply_mutex = self.async_context.apply_mutex,
+            .dense_bulk_session_scope = .external,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
+            .repair_options = options,
+        };
+        defer shadow_ctx.deinit(alloc);
+
+        var build_floor_sequence: u64 = 0;
+        const rebuilt: u64 = switch (cfg.kind) {
+            .dense_vector, .sparse_vector, .graph, .full_text => rebuilt_blk: {
+                try checkArtifactRepairCancelled(options);
+                var snapshot_txn = try self.core.store.beginReadTxn();
+                var snapshot_open = true;
+                defer if (snapshot_open) snapshot_txn.abort();
+                build_floor_sequence = try self.core.store.lastReplaySequenceFromTxn(&snapshot_txn, 0);
+                shadow_ctx.repair_sequence = build_floor_sequence;
+                shadow_ctx.snapshot_read_txn = &snapshot_txn;
+                defer shadow_ctx.snapshot_read_txn = null;
+                const count: u64 = switch (cfg.kind) {
+                    .dense_vector => @intCast(try rebuildDenseIndexForTargetCoverageContext(&shadow_ctx, cfg.name, 2048)),
+                    .sparse_vector => @intCast(try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(&shadow_ctx, cfg.name, 2048)),
+                    .graph => @intCast(try applySplitGraphArtifactsForIndexStreamingContext(
+                        &shadow_ctx,
+                        cfg.name,
+                        graph_repair_rebuild_batch_size,
+                    )),
+                    .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuildFromReadTxn(
+                        self.core.store,
+                        &snapshot_txn,
+                        cfg.name,
+                        options.cancel_check,
+                    ),
+                    else => unreachable,
+                };
+                snapshot_txn.abort();
+                snapshot_open = false;
+                break :rebuilt_blk count;
+            },
+            .algebraic => return error.UnsupportedOperation,
+        };
+
+        const index_ref = index_manager_mod.ManagedIndexRef{
+            .name = cfg.name,
+            .kind = cfg.kind,
+        };
+        try checkArtifactRepairCancelled(options);
+        try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
+        if (self.shadow_index_repair_hook) |hook| {
+            try hook.after_snapshot_build(hook.ptr, self, cfg.name, build_floor_sequence);
+        }
+        _ = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, self.core.nextDerivedSequence(), options);
+
+        const use_dense_search_barrier = cfg.kind == .dense_vector;
+        if (use_dense_search_barrier) self.beginIndexRepairBarrier();
+        defer if (use_dense_search_barrier) self.endIndexRepairBarrier();
+
+        try checkArtifactRepairCancelled(options);
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const final_target = self.core.nextDerivedSequence();
+        const reached_target = try self.catchUpShadowReplacementUntil(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, final_target, options);
+        if (reached_target < final_target) return error.ShadowIndexCatchUpIncomplete;
+        try checkArtifactRepairCancelled(options);
+
+        shadow_manager.deinit();
+        shadow_manager_open = false;
+        try self.core.index_manager.installBuiltReplacementIndex(self.core.store, cfg, shadow_index_path);
+        shadow_installed = true;
+        index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch |err| {
+            std.log.warn("failed to clear repair shadow in-progress marker index={s} err={s}", .{ cfg.name, @errorName(err) });
+        };
+        const prior_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
+        const final_update = apply_state.AppliedSequenceUpdate{
+            .index_name = cfg.name,
+            .sequence = final_target,
+            .status = .clean,
+            .generation = prior_checkpoint.generation +| 1,
+            .config_hash = types.indexConfigHash(cfg),
+        };
+        try saveIndexStatusSnapshots(alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{final_update});
+        try self.core.saveAppliedSequence(cfg.name, final_target);
+        try self.core.saveProjectionCheckpoint(cfg.name, .{
+            .applied_sequence = final_update.sequence,
+            .status = final_update.status,
+            .generation = final_update.generation,
+            .config_hash = final_update.config_hash,
+        });
+
+        return .{
+            .reprocessed = rebuilt,
+            .applied_sequence = final_target,
+        };
+    }
+
+    fn catchUpShadowReplacementUntil(
+        self: *DB,
+        alloc: Allocator,
+        shadow_manager: *index_manager_mod.IndexManager,
+        shadow_checkpoint_path: []const u8,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        target_sequence: u64,
+        options: types.ArtifactRepairRunOptions,
+    ) !u64 {
+        if (target_sequence == 0) return 0;
+        var batch_ctx = self.batchContext();
+        batch_ctx.index_manager = shadow_manager;
+        batch_ctx.applied_sequence_checkpoint_path = shadow_checkpoint_path;
+        batch_ctx.async_context = null;
+        batch_ctx.dense_bulk_session_scope = .external;
+
+        var applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+            alloc,
+            self.core.store,
+            shadow_checkpoint_path,
+            index_ref.name,
+        );
+        while (applied < target_sequence) {
+            try checkArtifactRepairCancelled(options);
+            var replay_ctx = ReplayApplyContextBatch{
+                .batch = &batch_ctx,
+                .dense_bulk_session_scope = .external,
+            };
+            const catch_up_stats = try derived_worker.catchUpIndexWithOptions(
+                alloc,
+                self.core.replaySource(),
+                index_ref,
+                applied,
+                &replay_ctx,
+                applyDerivedBatchToIndexReplayContext,
+                .{
+                    .resource_manager = shadow_manager.resource_manager,
+                    .window_ctx = &replay_ctx,
+                    .begin_window_fn = beginDerivedCatchUpWindowContext,
+                    .finish_window_fn = finishDerivedCatchUpWindowContext,
+                    .target_sequence = target_sequence,
+                },
+            );
+            const advanced = catch_up_stats.appliedSequenceAdvance(applied) orelse blk: {
+                if (catch_up_stats.shouldTryTargetAdvance(applied, target_sequence) and
+                    try canAdvanceDerivedReplayTargetContext(&batch_ctx, index_ref, applied, target_sequence))
+                {
+                    break :blk target_sequence;
+                }
+                break :blk applied;
+            };
+            if (advanced <= applied) return applied;
+            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
+            applied = advanced;
+        }
+        try checkArtifactRepairCancelled(options);
+        return applied;
+    }
+
+    fn saveShadowReplacementAppliedSequence(
+        self: *DB,
+        alloc: Allocator,
+        shadow_manager: *index_manager_mod.IndexManager,
+        shadow_checkpoint_path: []const u8,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        sequence: u64,
+    ) !void {
+        try shadow_manager.checkpointLsmWalForManagedIndex(index_ref);
+        const update = apply_state.AppliedSequenceUpdate{
+            .index_name = index_ref.name,
+            .sequence = sequence,
+            .config_hash = if (shadow_manager.get(index_ref.name)) |value| types.indexConfigHash(value.*) else 0,
+        };
+        const updates = [_]apply_state.AppliedSequenceUpdate{update};
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(shadow_manager, &updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
+        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+            alloc,
+            self.core.store,
+            shadow_checkpoint_path,
+            update,
+        );
     }
 
     fn indexRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
@@ -8177,6 +8539,7 @@ pub const DB = struct {
         });
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
+            self.clearLiveDocSetCache();
         }
     }
 
@@ -9556,6 +9919,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         const removed = try self.core.deleteIndex(name);
+        if (removed) try self.deleteDerivedCoverageForIndex(name);
         return removed;
     }
 
@@ -9889,6 +10253,13 @@ pub const DB = struct {
         return target_sequence;
     }
 
+    fn resolverReplayBlockedAfterRunnableDrain(self: *DB) bool {
+        const resolution_stats = self.resolutionStageStats();
+        if (resolution_stats.catch_up_required and !resolution_stats.blocked) return false;
+        const promotion_stats = self.promotionStageStats();
+        return promotion_stats.blocked;
+    }
+
     fn drainReplayStagesUntilStable(self: *DB) !void {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
@@ -9911,7 +10282,10 @@ pub const DB = struct {
                     try runtime.catchUp();
                 }
 
+                if (self.resolverReplayBlockedAfterRunnableDrain()) return;
+
                 try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+                if (self.resolverReplayBlockedAfterRunnableDrain()) return;
             }
 
             const resolution_advanced = if (self.resolution_runtime) |runtime|
@@ -10156,6 +10530,8 @@ pub const DB = struct {
         for (writes.items) |write| {
             alloc.free(write.doc_key);
             if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
+            if (write.indices.len > 0) alloc.free(write.indices);
+            if (write.values.len > 0) alloc.free(write.values);
         }
         writes.clearRetainingCapacity();
     }
@@ -10538,7 +10914,10 @@ pub const DB = struct {
         };
 
         var targets = std.ArrayListUnmanaged(DenseArtifactRebuildTarget).empty;
-        errdefer targets.deinit(alloc);
+        errdefer {
+            for (targets.items) |*target| target.deinit(alloc);
+            targets.deinit(alloc);
+        }
 
         var candidates = std.ArrayListUnmanaged(Candidate).empty;
         defer {
@@ -11041,6 +11420,7 @@ pub const DB = struct {
         try self.prepareDenseArtifactRebuildPlan(plan);
         const ResumePersistCtx = struct {
             db: *DB,
+            alloc: Allocator,
             targets: []DenseArtifactRebuildTarget,
 
             fn run(ctx: *anyopaque, last_key: []const u8) !void {
@@ -11050,19 +11430,20 @@ pub const DB = struct {
                         if (std.mem.order(u8, last_key, resume_from) != .gt) continue;
                     }
                     const entry = &persist.db.core.index_manager.dense_indexes.items[target.dense_index_idx];
-                    const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.db.alloc, entry.config.name);
-                    defer persist.db.alloc.free(rebuild_root_path);
+                    const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.alloc, entry.config.name);
+                    defer persist.alloc.free(rebuild_root_path);
                     const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
                     try rebuild_state.update(last_key);
-                    const owned_key = try persist.db.alloc.dupe(u8, last_key);
-                    errdefer persist.db.alloc.free(owned_key);
-                    if (target.resume_from) |resume_from| persist.db.alloc.free(resume_from);
+                    const owned_key = try persist.alloc.dupe(u8, last_key);
+                    errdefer persist.alloc.free(owned_key);
+                    if (target.resume_from) |resume_from| persist.alloc.free(resume_from);
                     target.resume_from = owned_key;
                 }
             }
         };
         var persist_ctx = ResumePersistCtx{
             .db = self,
+            .alloc = alloc,
             .targets = plan.targets,
         };
         const rebuilt = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
@@ -11860,6 +12241,9 @@ pub const DB = struct {
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                     }
+                    if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
+                        item.coverage_skipped_count = self.countDerivedCoverageSkipped(item.name, generation) catch item.coverage_skipped_count;
+                    }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .sparse_vector => {
@@ -11870,6 +12254,9 @@ pub const DB = struct {
                         else
                             sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
+                    }
+                    if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
+                        item.coverage_skipped_count = self.countDerivedCoverageSkipped(item.name, generation) catch item.coverage_skipped_count;
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
@@ -12036,7 +12423,7 @@ pub const DB = struct {
     }
 
     pub fn currentIdentityReadGenerationForRequest(self: *DB, requested: ?u64) !u64 {
-        const current_generation = self.core.nextDerivedSequence();
+        const current_generation = try self.currentIdentityReadGeneration();
         if (requested) |generation| {
             if (generation != current_generation) {
                 self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
@@ -12044,6 +12431,20 @@ pub const DB = struct {
             }
             return generation;
         }
+        return current_generation;
+    }
+
+    fn currentIdentityReadGeneration(self: *DB) !u64 {
+        var current_generation = self.core.nextDerivedSequence();
+        if (self.identity_visibility_summary_cache) |summary| {
+            return @max(current_generation, doc_identity.latestGenerationFromSummary(summary));
+        }
+        if (try doc_identity.latestGenerationFromSummaryFast(self.core.store)) |identity_generation| {
+            return @max(current_generation, identity_generation);
+        }
+        const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
+        current_generation = @max(current_generation, identity_stats.max_created_generation);
+        current_generation = @max(current_generation, identity_stats.max_deleted_generation);
         return current_generation;
     }
 
@@ -12157,6 +12558,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
@@ -12179,6 +12581,7 @@ pub const DB = struct {
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
@@ -12330,6 +12733,7 @@ pub const DB = struct {
                             }
                         }
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                     if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
                         item.backfill_progress = @min(
                             1.0,
@@ -12359,6 +12763,7 @@ pub const DB = struct {
                             item.backfill_progress = progress;
                         }
                     }
+                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
                     if (!item.backfill_active and item.replay_target_sequence > 0) {
                         item.backfill_progress = @min(
                             1.0,
@@ -12493,6 +12898,9 @@ pub const DB = struct {
             if (try self.loadIndexStatusSnapshot(alloc, cfg.name)) |status_snapshot| {
                 applyIndexStatusSnapshot(&item, status_snapshot);
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
+            }
+            if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
+                item.coverage_skipped_count = self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json)) catch item.coverage_skipped_count;
             }
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
@@ -12817,6 +13225,25 @@ pub const DB = struct {
         return doc_count;
     }
 
+    fn countDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
+        if (try self.loadDerivedCoverageSkippedCounter(self.core.alloc, index_name, generation)) |count| return count;
+        return try self.scanDerivedCoverageSkipped(index_name, generation);
+    }
+
+    fn loadDerivedCoverageSkippedCounter(self: *DB, alloc: Allocator, index_name: []const u8, generation: u64) !?u64 {
+        return try loadDerivedCoverageSkippedCounterFromStore(alloc, self.core.store, index_name, generation);
+    }
+
+    fn scanDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
+        return try scanDerivedCoverageSkippedFromStore(self.core.alloc, self.core.store, index_name, generation);
+    }
+
+    fn deleteDerivedCoverageForIndex(self: *DB, index_name: []const u8) !void {
+        const prefix = try internal_keys.derivedCoverageOutcomePrefixAlloc(self.core.alloc, index_name);
+        defer self.core.alloc.free(prefix);
+        try deleteKeysWithPrefixFromStore(self.core.alloc, self.core.store, prefix);
+    }
+
     fn scanPrimaryDocIdentityCoverage(self: *DB, byte_range: types.ByteRange) !DocIdentityCoverage {
         const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
         defer self.core.alloc.free(lower);
@@ -12925,6 +13352,10 @@ pub const DB = struct {
             }
             if (try isExpiredDocumentKey(self, alloc, raw_key)) continue;
 
+            if (opts.filter_query_json.len > 0) {
+                if (!(try db_query_graph.storedDocMatchesPatternFilter(alloc, raw_key, doc.value, opts.filter_query_json))) continue;
+            }
+
             const hash = std.hash.Wyhash.hash(0, doc.value);
             try hashes.append(alloc, .{
                 .id = try alloc.dupe(u8, raw_key),
@@ -13029,7 +13460,7 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
         const execution_req = directSingleVectorRequest(req) orelse req;
-        if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
+        if (searchRequestRequiresComposedSearch(execution_req)) {
             var composed = try self.searchComposed(alloc, execution_req, exec_ctx);
             errdefer composed.deinit();
             try externalizeSearchResultArtifactIds(alloc, &composed);
@@ -13085,6 +13516,21 @@ pub const DB = struct {
         return base;
     }
 
+    fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
+        if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0) return true;
+
+        var base_result_sets: u32 = 0;
+        if (req.full_text != null) base_result_sets += 1;
+        if (req.dense != null) base_result_sets += 1;
+        if (req.sparse != null) base_result_sets += 1;
+        switch (req.query) {
+            .dense_knn => base_result_sets += 1,
+            .sparse_knn => base_result_sets += 1,
+            else => {},
+        }
+        return base_result_sets > 1;
+    }
+
     fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
         if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
         if (req.full_text_queries.len != 0) return null;
@@ -13121,7 +13567,12 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
         _ = exec_ctx;
-        return try db_query_search.searchComposed(alloc, req, .{
+        const metric_name = composedQueryMetricIndexName(req);
+        const start_ns = platform_time.monotonicNs();
+        errdefer if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
+            db_query_metrics.observeSortRejection(metric_name, .search, platform_time.monotonicNs() -| start_ns, diagnostic.reason, diagnostic.detail);
+        };
+        const result = try db_query_search.searchComposed(alloc, req, .{
             .ctx = self,
             .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
             .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
@@ -13134,6 +13585,18 @@ pub const DB = struct {
             .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
         });
+        if (result.sort_profile != null) {
+            db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
+        }
+        return result;
+    }
+
+    fn composedQueryMetricIndexName(req: types.SearchRequest) ?[]const u8 {
+        if (req.index_name) |name| return name;
+        if (req.full_text_queries.len > 0) return req.full_text_queries[0].index_name;
+        if (req.dense_queries.len > 0) return req.dense_queries[0].index_name;
+        if (req.sparse_queries.len > 0) return req.sparse_queries[0].index_name;
+        return null;
     }
 
     fn resolveStructuredDocFilterForComposedCallback(
@@ -13185,21 +13648,44 @@ pub const DB = struct {
         else
             AlgebraicDocFilterRequest{ .req = req };
         defer algebraic_filter.deinit();
-        try self.proveTextQueryAccessPaths(algebraic_filter.req.index_name, text_query);
-        const metric_name = self.textQueryMetricIndexName(algebraic_filter.req);
+        var execution_req = algebraic_filter.req;
+        var resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .all_docs_visible = allDocsVisibleCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = execution_req.identity_read_generation,
+        });
+        defer if (resolved_text_filter) |*filter| filter.deinit(alloc);
+        if (resolved_text_filter) |*filter| {
+            execution_req.resolved_text_doc_filter = filter;
+            execution_req.filter_query_json = "";
+            execution_req.exclusion_query_json = "";
+        }
+        try self.proveTextQueryAccessPaths(execution_req.index_name, text_query);
+        const metric_name = self.textQueryMetricIndexName(execution_req);
         const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
-        return try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
+        errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
+        const result = try db_query_search.searchTextQuery(alloc, execution_req, text_query, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
+            .load_stored = loadStoredSearchDocumentCallback,
+            .is_expired_key = isExpiredDocumentKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .all_docs_visible = allDocsVisibleCallback,
+            .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
+        db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
+        return result;
     }
 
     fn proveTextQueryAccessPaths(self: *DB, index_name: ?[]const u8, text_query: types.TextQuery) !void {
@@ -13533,6 +14019,15 @@ pub const DB = struct {
         return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
     }
 
+    fn exactDenseSearchCallback(
+        ctx: ?*anyopaque,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        req: vectorindex_mod.SearchRequest,
+    ) anyerror!vectorindex_mod.SearchResults {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.exactScoreDenseEntryWithRequest(entry, req);
+    }
+
     fn resolveDocSetDocIdsCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -13560,13 +14055,47 @@ pub const DB = struct {
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        if (try self.allDocsVisibleAtGeneration(generation)) {
-            return try doc_set.cloneAlloc(alloc, set);
+        const duration_ns = ttlDurationNs(self);
+        var identity_visible = if (try self.allDocsVisibleAtGeneration(generation))
+            try doc_set.cloneAlloc(alloc, set)
+        else if (set.* == .all)
+            try self.broadLiveDocSetCachedAlloc(alloc, generation)
+        else
+            try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+        errdefer identity_visible.deinit(alloc);
+
+        if (duration_ns == 0 or identity_visible == .all) return identity_visible;
+        const ttl_visible = try self.ttlVisibleResolvedDocSetNoLockAlloc(alloc, &identity_visible, generation, duration_ns);
+        identity_visible.deinit(alloc);
+        return ttl_visible;
+    }
+
+    fn ttlVisibleResolvedDocSetNoLockAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+        duration_ns: u64,
+    ) !doc_set.ResolvedDocSet {
+        if (set.* == .none) return .none;
+        if (duration_ns == 0) return try doc_set.cloneAlloc(alloc, set);
+        if (set.* == .all) return .all;
+
+        const doc_ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation)) orelse
+            return .none;
+        defer freeConstDocIds(alloc, doc_ids);
+
+        const timestamps = try loadDocumentTimestampsMany(self, alloc, doc_ids);
+        defer alloc.free(timestamps);
+
+        const expiry_now = currentTimeNs();
+        var kept = std.ArrayListUnmanaged([]const u8).empty;
+        defer kept.deinit(alloc);
+        for (doc_ids, timestamps) |doc_id, ts| {
+            if (ts != 0 and ttl_mod.isExpired(ts, duration_ns, expiry_now)) continue;
+            try kept.append(alloc, doc_id);
         }
-        if (set.* == .all) {
-            return try self.broadLiveDocSetCachedAlloc(alloc, generation);
-        }
-        return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, kept.items, generation);
     }
 
     fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
@@ -13611,6 +14140,15 @@ pub const DB = struct {
     ) anyerror!bool {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.allDocsVisibleSummaryFast(generation);
+    }
+
+    fn requiresFullCandidateVisibilityFilterCallback(
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool {
+        _ = generation;
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return ttlDurationNs(self) != 0;
     }
 
     fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
@@ -13712,7 +14250,7 @@ pub const DB = struct {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.denseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_ns: u64 = 0;
@@ -13743,6 +14281,7 @@ pub const DB = struct {
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
+            .exact_dense_search = exactDenseSearchCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
         if (bench_profile) {
@@ -13752,6 +14291,7 @@ pub const DB = struct {
                 .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
             );
         }
+        db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| start_ns, result.sort_profile);
         return result;
     }
 
@@ -13789,6 +14329,7 @@ pub const DB = struct {
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
+            .exact_dense_search = exactDenseSearchCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
         return profiled catch |err| {
@@ -13820,7 +14361,7 @@ pub const DB = struct {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.sparseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_ns: u64 = 0;
@@ -13855,6 +14396,7 @@ pub const DB = struct {
                 .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
             );
         }
+        db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| start_ns, result.sort_profile);
         return result;
     }
 
@@ -14557,13 +15099,16 @@ pub const DB = struct {
         return try db_query_search.searchMatchAll(alloc, req, .{
             .ctx = self,
             .collect_candidates = collectSearchMatchAllCandidatesCallback,
+            .collect_candidates_stream = streamSearchMatchAllCandidatesCallback,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .is_expired_key = isExpiredDocumentKeyCallback,
         });
     }
 
@@ -14571,14 +15116,34 @@ pub const DB = struct {
         ctx: ?*anyopaque,
         alloc: Allocator,
         req: types.SearchRequest,
+        options: db_query_search.MatchAllCandidateCollectOptions,
     ) anyerror!db_query_search.MatchAllCandidates {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_search.collectMatchAllCandidates(alloc, req, .{
+        return try db_query_search.collectMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
             .scan_store_range = scanStoreRangeCallback,
+            .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
-        });
+        }, options);
+    }
+
+    fn streamSearchMatchAllCandidatesCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        options: db_query_search.MatchAllCandidateCollectOptions,
+        consumer_ctx: ?*anyopaque,
+        consumer: db_query_search.MatchAllCandidateConsumer,
+    ) anyerror!db_query_search.MatchAllCandidateStreamStats {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try db_query_search.streamMatchAllCandidatesWithOptions(alloc, req, .{
+            .ctx = self,
+            .scan_store_range = scanStoreRangeCallback,
+            .scan_store_range_with_context = scanStoreRangeWithContextCallback,
+            .is_expired_key = isExpiredDocumentKeyCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
+        }, options, consumer_ctx, consumer);
     }
 
     fn lookupLiveDocOrdinalCallback(
@@ -14672,6 +15237,18 @@ pub const DB = struct {
     ) anyerror![]docstore_mod.OwnedKVPair {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.scanStoreRange(alloc, lower, upper);
+    }
+
+    fn scanStoreRangeWithContextCallback(
+        ctx: ?*anyopaque,
+        lower: []const u8,
+        upper: []const u8,
+        options: docstore_mod.DocStore.ScanOptions,
+        scan_ctx: ?*anyopaque,
+        callback: docstore_mod.DocStore.ScanWithContextCallback,
+    ) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.scanStoreRangeWithContext(lower, upper, options, scan_ctx, callback);
     }
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
@@ -15570,6 +16147,11 @@ fn dupeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const 
         initialized += 1;
     }
     return out;
+}
+
+fn freeConstDocIds(alloc: Allocator, doc_ids: []const []const u8) void {
+    for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+    alloc.free(doc_ids);
 }
 
 fn docIdsForOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_set.DocOrdinal) ![]const []const u8 {
@@ -16601,7 +17183,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     ) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes, artifact_delete_keys);
             return;
         },
     };
@@ -16610,7 +17192,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         .http_error => |http_error| {
             const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer alloc.free(message);
-            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes, artifact_delete_keys);
             return;
         },
     };
@@ -16620,7 +17202,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes, artifact_delete_keys);
             return;
         },
     };
@@ -16658,12 +17240,8 @@ fn computeDocumentExtractionAssetRequestDerived(
     const new_state = try documentExtractionStateValueAlloc(alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
     defer alloc.free(new_state);
 
-    var previous_unit_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(alloc, previous_unit_keys);
-    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
-    defer freeDocumentExtractionUnitDescriptors(alloc, previous_unit_descriptors);
-    var previous_chunk_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
+    var previous_state = DocumentExtractionPreviousState{};
+    defer previous_state.deinit(alloc);
 
     if (existing_state) |state| {
         if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
@@ -16678,16 +17256,17 @@ fn computeDocumentExtractionAssetRequestDerived(
             }
         }
 
-        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
-        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
-        for (previous_unit_keys) |previous_key| {
+        previous_state = try loadDocumentExtractionPreviousState(alloc, db, request.doc_key, artifact_name, state);
+        for (previous_state.unit_keys) |previous_key| {
             if (containsDeleteKey(desired_unit_keys.items, previous_key)) continue;
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
         }
-        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
-        for (previous_chunk_keys) |previous_key| {
+        for (previous_state.chunk_keys) |previous_key| {
             if (containsDeleteKey(desired_chunk_keys.items, previous_key)) continue;
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        if (previous_state.recovered_from_store_scan) {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, state_key));
         }
     }
 
@@ -16705,7 +17284,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         defer alloc.free(unit_range_id);
         const unit_route = documentExtractionRangeRoute(previous_child_ranges, unit_range_id, "unit", artifact_name);
         const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
-            unitDescriptorFingerprintMatches(previous_unit_descriptors, unit_key, unit_descriptor.fingerprint);
+            unitDescriptorFingerprintMatches(previous_state.unit_descriptors, unit_key, unit_descriptor.fingerprint);
         if (unit_unchanged and
             try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
         {
@@ -16781,9 +17360,9 @@ fn computeDocumentExtractionAssetRequestDerived(
         desired_unit_descriptors,
         desired_chunk_keys.items,
         previous_child_ranges,
-        previous_unit_keys,
-        previous_unit_descriptors,
-        previous_chunk_keys,
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         to_generation,
         from_generation,
         to_generation,
@@ -16994,15 +17573,13 @@ fn appendDocumentExtractionDeleteKeys(
         else => return err,
     };
     defer if (existing_state) |value| alloc.free(value);
-    if (existing_state) |state| {
-        const previous_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
-        defer freeOwnedConstKeySlice(alloc, previous_keys);
-        for (previous_keys) |previous_key| {
+    if (existing_state != null) {
+        var previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
+        defer previous_state.deinit(alloc);
+        for (previous_state.unit_keys) |previous_key| {
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
         }
-        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
-        defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
-        for (previous_chunk_keys) |previous_key| {
+        for (previous_state.chunk_keys) |previous_key| {
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
         }
     }
@@ -17042,11 +17619,111 @@ const DocumentExtractionUnitDescriptor = struct {
     fingerprint: []const u8,
 };
 
+const DocumentExtractionPreviousState = struct {
+    unit_keys: []const []const u8 = &.{},
+    unit_descriptors: []DocumentExtractionUnitDescriptor = &.{},
+    chunk_keys: []const []const u8 = &.{},
+    recovered_from_store_scan: bool = false,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        freeOwnedConstKeySlice(alloc, self.unit_keys);
+        freeDocumentExtractionUnitDescriptors(alloc, self.unit_descriptors);
+        freeOwnedConstKeySlice(alloc, self.chunk_keys);
+        self.* = undefined;
+    }
+};
+
 const DocumentExtractionRangeRoute = struct {
     range_id: []const u8,
     route_status: []const u8 = "local_committed",
     owner_group_id: u64 = 0,
 };
+
+fn loadDocumentExtractionPreviousState(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    existing_state: ?[]const u8,
+) !DocumentExtractionPreviousState {
+    if (existing_state) |state| {
+        if (loadDocumentExtractionPreviousStateFromJson(alloc, state)) |parsed| {
+            return parsed;
+        } else |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        }
+    }
+    var recovered = try scanDocumentExtractionPreviousStateFromStore(alloc, db, doc_key, artifact_name);
+    recovered.recovered_from_store_scan = existing_state != null;
+    return recovered;
+}
+
+fn loadDocumentExtractionPreviousStateFromJson(alloc: Allocator, state: []const u8) !DocumentExtractionPreviousState {
+    var out = DocumentExtractionPreviousState{};
+    errdefer out.deinit(alloc);
+    out.unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+    out.unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
+    out.chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+    return out;
+}
+
+fn scanDocumentExtractionPreviousStateFromStore(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) !DocumentExtractionPreviousState {
+    var out = DocumentExtractionPreviousState{};
+    errdefer out.deinit(alloc);
+
+    var unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (unit_keys.items) |key| alloc.free(@constCast(key));
+        unit_keys.deinit(alloc);
+    }
+    const unit_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+    defer alloc.free(unit_prefix);
+    const unit_rows = try db.core.store.scanPrefix(alloc, unit_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, unit_rows);
+    for (unit_rows) |entry| {
+        if (std.mem.eql(u8, entry.key, unit_prefix)) continue;
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
+        try unit_keys.append(alloc, try alloc.dupe(u8, entry.key));
+    }
+
+    var chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (chunk_keys.items) |key| alloc.free(@constCast(key));
+        chunk_keys.deinit(alloc);
+    }
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+        const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", entry.name);
+        defer alloc.free(chunk_prefix);
+        const chunk_rows = try db.core.store.scanPrefix(alloc, chunk_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, chunk_rows);
+        for (chunk_rows) |row| {
+            if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
+            try chunk_keys.append(alloc, try alloc.dupe(u8, row.key));
+        }
+    }
+
+    out.unit_keys = try unit_keys.toOwnedSlice(alloc);
+    out.chunk_keys = try chunk_keys.toOwnedSlice(alloc);
+    out.unit_descriptors = try alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
+    for (out.unit_descriptors) |*descriptor| {
+        descriptor.* = .{ .key = "", .fingerprint = "" };
+    }
+    for (out.unit_descriptors, out.unit_keys) |*descriptor, key| {
+        descriptor.* = .{
+            .key = try alloc.dupe(u8, key),
+            .fingerprint = "",
+        };
+    }
+    return out;
+}
 
 fn documentExtractionUnitDescriptorsFromKeysAlloc(
     alloc: Allocator,
@@ -17644,10 +18321,14 @@ fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const 
         if (item != .object) return error.InvalidDocumentExtractionState;
         const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
         const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
-        if (key_value != .string or fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        if (fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        const key = try documentExtractionStateByteSliceAlloc(alloc, key_value);
+        errdefer alloc.free(@constCast(key));
+        const fingerprint = try alloc.dupe(u8, fingerprint_value.string);
+        errdefer alloc.free(fingerprint);
         out[i] = .{
-            .key = try alloc.dupe(u8, key_value.string),
-            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+            .key = key,
+            .fingerprint = fingerprint,
         };
         initialized += 1;
     }
@@ -17667,9 +18348,8 @@ fn documentExtractionStateUnitDescriptorFallbackAlloc(alloc: Allocator, object: 
         alloc.free(out);
     }
     for (keys_value.array.items, 0..) |item, i| {
-        if (item != .string) return error.InvalidDocumentExtractionState;
         out[i] = .{
-            .key = try alloc.dupe(u8, item.string),
+            .key = try documentExtractionStateByteSliceAlloc(alloc, item),
             .fingerprint = "",
         };
         initialized += 1;
@@ -17690,11 +18370,26 @@ fn documentExtractionStateKeysAlloc(alloc: Allocator, state: []const u8, field_n
         alloc.free(out);
     }
     for (keys_value.array.items, 0..) |item, i| {
-        if (item != .string) return error.InvalidDocumentExtractionState;
-        out[i] = try alloc.dupe(u8, item.string);
+        out[i] = try documentExtractionStateByteSliceAlloc(alloc, item);
         initialized += 1;
     }
     return out;
+}
+
+fn documentExtractionStateByteSliceAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+    switch (value) {
+        .string => |string| return try alloc.dupe(u8, string),
+        .array => |array| {
+            const out = try alloc.alloc(u8, array.items.len);
+            errdefer alloc.free(out);
+            for (array.items, 0..) |item, i| {
+                if (item != .integer) return error.InvalidDocumentExtractionState;
+                out[i] = std.math.cast(u8, item.integer) orelse return error.InvalidDocumentExtractionState;
+            }
+            return out;
+        },
+        else => return error.InvalidDocumentExtractionState,
+    }
 }
 
 fn documentExtractionUnitKeyStillPresent(
@@ -18431,6 +19126,7 @@ fn documentExtractionFailureManifestPayloadAlloc(
 
 fn appendDocumentExtractionFailureManifest(
     alloc: Allocator,
+    db: *DB,
     doc_key: []const u8,
     artifact_name: []const u8,
     source_url: []const u8,
@@ -18444,15 +19140,13 @@ fn appendDocumentExtractionFailureManifest(
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    if (existing_state) |state| {
-        const previous_unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
-        defer freeOwnedConstKeySlice(alloc, previous_unit_keys);
-        for (previous_unit_keys) |previous_key| {
+    if (existing_state != null) {
+        var previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
+        defer previous_state.deinit(alloc);
+        for (previous_state.unit_keys) |previous_key| {
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
         }
-        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
-        defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
-        for (previous_chunk_keys) |previous_key| {
+        for (previous_state.chunk_keys) |previous_key| {
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
         }
         try artifact_delete_keys.append(alloc, try alloc.dupe(u8, state_key));
@@ -23111,6 +23805,123 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
+fn loadDerivedCoverageSkippedCounterFromStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !?u64 {
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
+    defer alloc.free(counter_key);
+    const raw = store.get(alloc, counter_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try internal_keys.decodeDerivedCoverageSkippedCount(raw);
+}
+
+fn scanDerivedCoverageSkippedFromStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !u64 {
+    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(alloc, index_name, generation, "skipped");
+    defer alloc.free(lower);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, lower);
+    defer if (upper) |key| alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+
+    var skipped: u64 = 0;
+    const CountState = struct {
+        skipped: *u64,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = key;
+            _ = value;
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            state.skipped.* += 1;
+            return .@"continue";
+        }
+    };
+
+    var state = CountState{ .skipped = &skipped };
+    try store.scanWithContext(lower, upper_bound, .{}, &state, CountState.scanEntry);
+    return skipped;
+}
+
+fn derivedCoverageSkippedCounterValueForStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+) !u64 {
+    return (try loadDerivedCoverageSkippedCounterFromStore(alloc, store, index_name, generation)) orelse
+        try scanDerivedCoverageSkippedFromStore(alloc, store, index_name, generation);
+}
+
+fn deleteDerivedCoverageSkippedForDocKeys(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    doc_keys: []const []const u8,
+) !void {
+    if (doc_keys.len == 0) return;
+    const generation = index_manager.coverageGenerationForIndex(index_name) orelse return;
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(@constCast(key));
+        deletes.deinit(alloc);
+    }
+
+    var removed_count: u64 = 0;
+    for (doc_keys) |doc_key| {
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, "skipped");
+        errdefer alloc.free(marker_key);
+        var duplicate_delete = false;
+        for (deletes.items) |existing_delete| {
+            if (std.mem.eql(u8, existing_delete, marker_key)) {
+                duplicate_delete = true;
+                break;
+            }
+        }
+        if (duplicate_delete) {
+            alloc.free(marker_key);
+            continue;
+        }
+        const had_marker = blk: {
+            const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => return err,
+            };
+            alloc.free(existing);
+            break :blk true;
+        };
+        if (had_marker) removed_count +|= 1;
+        try deletes.append(alloc, marker_key);
+    }
+
+    if (deletes.items.len == 0) return;
+    if (removed_count == 0) {
+        try store.putBatch(&.{}, deletes.items);
+        return;
+    }
+
+    const current_count = try derivedCoverageSkippedCounterValueForStore(alloc, store, index_name, generation);
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
+    defer alloc.free(counter_key);
+    var counter_value: [8]u8 = undefined;
+    const new_count = if (current_count > removed_count) current_count - removed_count else 0;
+    const write = docstore_mod.KVPair{
+        .key = counter_key,
+        .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, new_count),
+    };
+    try store.putBatch(&.{write}, deletes.items);
+}
+
 fn artifactRepairIssueKeyForIssueAlloc(alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
     const issue_id = try artifactRepairIssueIdAlloc(alloc, issue);
     defer alloc.free(issue_id);
@@ -23159,7 +23970,7 @@ fn artifactRepairIssueIdHashOptionalU64(hasher: *std.crypto.hash.sha2.Sha256, va
 fn artifactRepairKindHasAutomatedReprocessor(kind: types.ArtifactRepairKind) bool {
     return switch (kind) {
         .embedding, .asset => true,
-        .chunk, .graph, .full_text => false,
+        .chunk, .graph, .full_text, .algebraic => false,
     };
 }
 
@@ -23169,6 +23980,7 @@ fn artifactRepairUnsupportedReason(kind: types.ArtifactRepairKind) []const u8 {
         .chunk => "chunk_reprocessor_unavailable",
         .graph => "graph_reprocessor_unavailable",
         .full_text => "full_text_reprocessor_unavailable",
+        .algebraic => "algebraic_index_rebuild_unavailable",
     };
 }
 
@@ -23696,6 +24508,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const dense_delete_start_ns = monotonicTimeNs();
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
             var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
@@ -23758,6 +24572,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
             var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
@@ -24041,6 +24857,68 @@ fn batchAdvancesManagedIndexApplyStateForReplay(
     };
 }
 
+fn managedIndexRecordApplicability(
+    index_manager: *index_manager_mod.IndexManager,
+    record: change_journal_mod.Record,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) ManagedIndexBatchApplicability {
+    switch (index_ref.kind) {
+        .full_text, .algebraic => {
+            if (record.changed_doc_keys.len > 0 or
+                record.deleted_doc_keys.len > 0 or
+                record.overwritten_doc_keys.len > 0) return .relevant;
+            return .irrelevant;
+        },
+        .dense_vector => {
+            if (record.changed_doc_keys.len > 0 or
+                record.deleted_doc_keys.len > 0 or
+                record.overwritten_doc_keys.len > 0) return .relevant;
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
+        },
+        .sparse_vector => {
+            if (record.changed_doc_keys.len > 0 or
+                record.deleted_doc_keys.len > 0 or
+                record.overwritten_doc_keys.len > 0) return .relevant;
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
+        },
+        .graph => {
+            if (record.deleted_doc_keys.len > 0) return .relevant;
+            for (record.changed_artifact_keys) |artifact_key| {
+                if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    continue;
+                }
+                if (internal_keys.isResolutionArtifactKey(artifact_key)) {
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (source.mention_edge_type.len == 0) continue;
+                    const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer {
+                        index_manager.alloc.free(parsed.doc_key);
+                        index_manager.alloc.free(parsed.artifact_name);
+                    }
+                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
+                    return .missing_dependency;
+                }
+                if (internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                    const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer {
+                        index_manager.alloc.free(parsed.doc_key);
+                        index_manager.alloc.free(parsed.index_name);
+                        index_manager.alloc.free(parsed.edge_type);
+                        index_manager.alloc.free(parsed.target_doc_key);
+                    }
+                    if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
+                }
+            }
+            return .irrelevant;
+        },
+    }
+}
+
 const OwnedBatchWrites = struct {
     alloc: Allocator,
     items: []types.BatchWrite = &.{},
@@ -24096,6 +24974,50 @@ const OwnedDenseEmbeddingWrites = struct {
         self.* = undefined;
     }
 };
+
+const OwnedEmbeddingArtifactWriteIdentity = struct {
+    doc_key: []u8,
+    parent_doc_key: ?[]u8 = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        if (self.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
+        self.* = undefined;
+    }
+};
+
+fn decodeEmbeddingArtifactWriteIdentityAlloc(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    expected_embedding_name: []const u8,
+) !?OwnedEmbeddingArtifactWriteIdentity {
+    if (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) |maybe_identity| {
+        var identity = maybe_identity orelse return null;
+        defer identity.deinit(alloc);
+        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) return null;
+
+        const doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer alloc.free(doc_key);
+        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        return .{
+            .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
+        };
+    } else |err| switch (err) {
+        error.InvalidInternalUserKey => {},
+        else => return err,
+    }
+
+    if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
+        if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) return null;
+        return .{
+            .doc_key = try alloc.dupe(u8, identity.doc_key),
+        };
+    }
+
+    return null;
+}
 
 const OwnedSparseEmbeddingWrites = struct {
     alloc: Allocator,
@@ -24642,24 +25564,17 @@ fn collectDenseEmbeddingWritesForArtifacts(
 
     const expected_embedding_name = index_manager.denseEmbeddingName(index_name) orelse index_name;
     for (artifact_keys) |artifact_key| {
-        var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
-            error.InvalidInternalUserKey => continue,
-            else => return err,
-        } orelse continue;
-        defer identity.deinit(alloc);
-        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, expected_embedding_name)) orelse continue;
+        var identity_transferred = false;
+        errdefer if (!identity_transferred) identity.deinit(alloc);
         try filtered.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = doc_key,
-            .parent_doc_key = parent_doc_key,
+            .doc_key = identity.doc_key,
+            .parent_doc_key = identity.parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
-        parent_doc_key = null;
+        identity_transferred = true;
     }
 
     return .{
@@ -24678,24 +25593,17 @@ fn appendDenseEmbeddingWritesForArtifacts(
 ) !void {
     const expected_embedding_name = index_manager.denseEmbeddingName(index_name) orelse index_name;
     for (artifact_keys) |artifact_key| {
-        var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
-            error.InvalidInternalUserKey => continue,
-            else => return err,
-        } orelse continue;
-        defer identity.deinit(alloc);
-        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, expected_embedding_name)) orelse continue;
+        var identity_transferred = false;
+        errdefer if (!identity_transferred) identity.deinit(alloc);
         try out.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = doc_key,
-            .parent_doc_key = parent_doc_key,
+            .doc_key = identity.doc_key,
+            .parent_doc_key = identity.parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
-        parent_doc_key = null;
+        identity_transferred = true;
     }
 }
 
@@ -27058,6 +27966,115 @@ fn applySplitGraphArtifactsForIndexStreaming(
     return state.mutation_count;
 }
 
+fn applySplitGraphArtifactsForIndexStreamingContext(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    batch_size: usize,
+) !usize {
+    _ = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const store_lower = try documentRangeLowerAlloc(ctx.alloc, "");
+    defer ctx.alloc.free(store_lower);
+    const effective_batch_size = @max(batch_size, 1);
+
+    const ScanState = struct {
+        ctx: *AsyncContext,
+        index_name: []const u8,
+        batch_size: usize,
+        writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
+        mutation_count: usize = 0,
+
+        fn freeWrites(state: *@This()) void {
+            for (state.writes.items) |write| {
+                state.ctx.alloc.free(@constCast(write.index_name));
+                state.ctx.alloc.free(@constCast(write.source));
+                state.ctx.alloc.free(@constCast(write.target));
+                state.ctx.alloc.free(@constCast(write.edge_type));
+                if (write.metadata_json.len > 0) state.ctx.alloc.free(@constCast(write.metadata_json));
+            }
+            state.writes.clearRetainingCapacity();
+        }
+
+        fn deinit(state: *@This()) void {
+            state.freeWrites();
+            state.writes.deinit(state.ctx.alloc);
+        }
+
+        fn flush(state: *@This()) !void {
+            try checkAsyncRepairCancelled(state.ctx);
+            if (state.writes.items.len == 0) return;
+            if (comptime builtin.is_test) {
+                _ = test_graph_repair_stream_flushes.fetchAdd(1, .monotonic);
+            }
+            try state.ctx.index_manager.applyGraphMutationsByName(state.index_name, state.writes.items, &.{});
+            state.mutation_count += state.writes.items.len;
+            state.freeWrites();
+        }
+
+        fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+            if (!internal_keys.isGraphEdgeArtifactKey(key)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
+            const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+            defer {
+                state.ctx.alloc.free(parsed.doc_key);
+                state.ctx.alloc.free(parsed.index_name);
+                state.ctx.alloc.free(parsed.edge_type);
+                state.ctx.alloc.free(parsed.target_doc_key);
+            }
+            if (!std.mem.eql(u8, parsed.index_name, state.index_name)) return .@"continue";
+
+            var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(state.ctx.alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    const artifact_name = try std.fmt.allocPrint(state.ctx.alloc, "{s}:{s}", .{ parsed.edge_type, parsed.target_doc_key });
+                    defer state.ctx.alloc.free(artifact_name);
+                    try recordArtifactRepairIssueContext(
+                        state.ctx,
+                        .graph,
+                        parsed.index_name,
+                        parsed.doc_key,
+                        "",
+                        "",
+                        "",
+                        artifact_name,
+                        key,
+                        null,
+                        state.ctx.repair_sequence,
+                        .corrupt_artifact,
+                    );
+                    return .@"continue";
+                },
+            };
+            errdefer decoded.deinit(state.ctx.alloc);
+            try state.writes.append(state.ctx.alloc, .{
+                .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
+                .source = try state.ctx.alloc.dupe(u8, parsed.doc_key),
+                .target = try state.ctx.alloc.dupe(u8, parsed.target_doc_key),
+                .edge_type = try state.ctx.alloc.dupe(u8, parsed.edge_type),
+                .weight = decoded.weight,
+                .created_at = decoded.created_at,
+                .updated_at = decoded.updated_at,
+                .metadata_json = decoded.metadata_json,
+            });
+            decoded.metadata_json = &.{};
+            decoded.deinit(state.ctx.alloc);
+            if (state.writes.items.len >= state.batch_size) try state.flush();
+            return .@"continue";
+        }
+    };
+
+    var state = ScanState{
+        .ctx = ctx,
+        .index_name = index_name,
+        .batch_size = effective_batch_size,
+    };
+    defer state.deinit();
+
+    try scanStoreForRebuildContext(ctx, store_lower, "", .{}, &state, ScanState.scanEntry);
+    try state.flush();
+    return state.mutation_count;
+}
+
 fn applySplitGraphArtifactsInRange(
     alloc: Allocator,
     lower: []const u8,
@@ -27331,6 +28348,33 @@ fn ensureDirPath(path: []const u8) !void {
     try fs_paths.createDirPathPortable(io_impl.io(), path);
 }
 
+fn createUniqueRepairShadowBase(alloc: Allocator, base_path: []const u8) ![]u8 {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, base_path);
+
+    for (0..64) |_| {
+        const candidate = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-{d}-{x}", .{
+            base_path,
+            monotonicTimeNs(),
+            repair_shadow_nonce.fetchAdd(1, .monotonic),
+        });
+        errdefer alloc.free(candidate);
+        std.Io.Dir.cwd().createDir(io, candidate, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                alloc.free(candidate);
+                continue;
+            },
+            else => return err,
+        };
+        errdefer std.Io.Dir.cwd().deleteTree(io, candidate) catch {};
+        try fs_paths.syncDirPortable(io, base_path);
+        return candidate;
+    }
+    return error.PathAlreadyExists;
+}
+
 fn resetPath(path: []const u8) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -27458,8 +28502,83 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
 }
 
+fn storeHasReplayRecordForHintAfter(
+    store: *docstore_mod.DocStore,
+    hint: change_journal_mod.TargetHint,
+    from_sequence: u64,
+) !bool {
+    const Context = struct {
+        found: bool = false,
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            _ = sequence;
+            _ = payload;
+            self.found = true;
+        }
+    };
+
+    var ctx = Context{};
+    const stats = store.forEachReplayLaneFrom(
+        @intCast(@intFromEnum(hint)),
+        from_sequence + 1,
+        1,
+        &ctx,
+        Context.handle,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return false,
+        else => return err,
+    };
+    return ctx.found or stats.matched_entries != 0;
+}
+
+fn replayRangeHasManagedIndexApplicableRecord(
+    ctx: *AsyncContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    from_sequence: u64,
+    target_sequence: u64,
+) !bool {
+    const Context = struct {
+        alloc: Allocator,
+        index_manager: *index_manager_mod.IndexManager,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        target_sequence: u64,
+        found: bool = false,
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            if (sequence > self.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+            var decoded = try change_journal_mod.decodeRecord(self.alloc, payload);
+            defer decoded.deinit();
+            switch (managedIndexRecordApplicability(self.index_manager, decoded.record, self.index_ref)) {
+                .irrelevant => {},
+                .relevant, .missing_dependency => {
+                    self.found = true;
+                    return replay_source_mod.StopReplayChunk.StopReplayChunk;
+                },
+            }
+        }
+    };
+
+    var scan_ctx = Context{
+        .alloc = ctx.alloc,
+        .index_manager = ctx.index_manager,
+        .index_ref = index_ref,
+        .target_sequence = target_sequence,
+    };
+    _ = ctx.store.forEachReplayLaneFrom(
+        @intCast(@intFromEnum(managedIndexReplayHint(index_ref.kind))),
+        from_sequence + 1,
+        0,
+        &scan_ctx,
+        Context.handle,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return try storeHasReplayRecordForHintAfter(ctx.store, managedIndexReplayHint(index_ref.kind), from_sequence),
+        replay_source_mod.StopReplayChunk.StopReplayChunk => return scan_ctx.found,
+        else => return err,
+    };
+    return scan_ctx.found;
+}
+
 fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
-    _ = from_sequence;
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     const persisted_applied = try apply_state.loadAppliedSequenceWithCheckpoint(
         ctx.alloc,
@@ -27468,6 +28587,8 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         index_ref.name,
     );
     if (persisted_applied >= target_sequence) return true;
+
+    if (try replayRangeHasManagedIndexApplicableRecord(ctx, index_ref, from_sequence, target_sequence)) return false;
     if (!ctx.index_manager.indexLoadComplete(index_ref.name)) return false;
     if (index_ref.kind != .dense_vector) return true;
 
@@ -27560,8 +28681,22 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
         .expected_name = expected_name,
         .expected_dims = expected_dims,
     };
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     return state.count;
+}
+
+fn scanStoreForRebuildContext(
+    ctx: *AsyncContext,
+    lower: []const u8,
+    upper: []const u8,
+    options: docstore_mod.DocStore.ScanOptions,
+    scan_ctx: ?*anyopaque,
+    callback: docstore_mod.DocStore.ScanWithContextCallback,
+) !void {
+    if (ctx.snapshot_read_txn) |txn| {
+        return try ctx.store.scanReadTxnWithContext(txn, lower, upper, options, scan_ctx, callback);
+    }
+    return try ctx.store.scanWithContext(lower, upper, options, scan_ctx, callback);
 }
 
 fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !u64 {
@@ -27594,7 +28729,7 @@ fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: 
         .field_name = field_name,
         .dims = dims,
     };
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     return state.count;
 }
 
@@ -27613,6 +28748,7 @@ fn flushDensePrimaryVectorRebuildChunkContext(
 ) !void {
     defer freePrimaryVectorRebuildWrites(ctx.alloc, writes);
     if (writes.items.len == 0) return;
+    try checkAsyncRepairCancelled(ctx);
     try ctx.index_manager.indexDenseBatchByNameWithOptions(
         ctx.store,
         index_name,
@@ -27658,6 +28794,7 @@ fn rebuildDenseIndexFromPrimaryVectorsContext(
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
             if (try mapper.extractDenseVectorField(state.ctx.alloc, value, state.field_name, state.dims)) |vector| {
                 state.ctx.alloc.free(vector);
             } else {
@@ -27687,7 +28824,7 @@ fn rebuildDenseIndexFromPrimaryVectorsContext(
     };
     defer state.deinit();
 
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     if (state.writes.items.len > 0) try state.flush();
 
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_name, denseCatchUpFinishOptions());
@@ -27702,6 +28839,7 @@ fn flushDenseArtifactRebuildChunkContext(
 ) !void {
     defer DB.freeDenseArtifactRebuildWrites(ctx.alloc, writes);
     if (writes.items.len == 0) return;
+    try checkAsyncRepairCancelled(ctx);
     try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(
         ctx.store,
         index_name,
@@ -27747,13 +28885,7 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
-
-            var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key) catch |err| switch (err) {
-                error.InvalidInternalUserKey => return .@"continue",
-                else => return err,
-            }) orelse return .@"continue";
-            defer identity.deinit(state.ctx.alloc);
-            if (!std.mem.eql(u8, identity.embedding_name, state.expected_name)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
 
             const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
@@ -27761,12 +28893,22 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
             };
             if (dims != state.expected_dims) return .@"continue";
 
+            var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(state.ctx.alloc, key, state.expected_name)) orelse return .@"continue";
+            var write_transferred = false;
+            errdefer if (!write_transferred) identity.deinit(state.ctx.alloc);
+
+            const owned_index_name = try state.ctx.alloc.dupe(u8, state.index_name);
+            errdefer if (!write_transferred) state.ctx.alloc.free(owned_index_name);
+            const artifact_key = try state.ctx.alloc.dupe(u8, key);
+            errdefer if (!write_transferred) state.ctx.alloc.free(artifact_key);
             try state.writes.append(state.ctx.alloc, .{
-                .index_name = try state.ctx.alloc.dupe(u8, state.index_name),
-                .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
-                .artifact_key = try state.ctx.alloc.dupe(u8, key),
+                .index_name = owned_index_name,
+                .doc_key = identity.doc_key,
+                .parent_doc_key = identity.parent_doc_key,
+                .artifact_key = artifact_key,
                 .vector = &.{},
             });
+            write_transferred = true;
             state.rebuilt += 1;
 
             if (state.writes.items.len >= state.rebuild_chunk_size) try state.flush();
@@ -27783,7 +28925,7 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
     };
     defer state.deinit();
 
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     if (state.writes.items.len > 0) try state.flush();
 
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_name, denseCatchUpFinishOptions());
@@ -27811,6 +28953,7 @@ fn flushSparseArtifactRebuildChunkContext(
 ) !void {
     defer DB.freeSparseArtifactRebuildWrites(ctx.alloc, writes);
     if (writes.items.len == 0) return;
+    try checkAsyncRepairCancelled(ctx);
     try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(
         ctx.store,
         index_name,
@@ -27849,6 +28992,7 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
+            try checkAsyncRepairCancelled(state.ctx);
 
             const identity = (try internal_keys.parseEmbeddingArtifactKeyView(key)) orelse return .@"continue";
             if (!std.mem.eql(u8, identity.artifact_name, state.expected_name)) return .@"continue";
@@ -27857,14 +29001,22 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
                 return err;
             };
-            sparse.deinit(state.ctx.alloc);
+            errdefer sparse.deinit(state.ctx.alloc);
+            const doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key);
+            errdefer state.ctx.alloc.free(doc_key);
+            const indices = sparse.indices;
+            sparse.indices = &.{};
+            errdefer state.ctx.alloc.free(indices);
+            const values = sparse.values;
+            sparse.values = &.{};
+            errdefer state.ctx.alloc.free(values);
 
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = @constCast(state.index_name),
-                .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
-                .artifact_key = try state.ctx.alloc.dupe(u8, key),
-                .indices = &.{},
-                .values = &.{},
+                .doc_key = doc_key,
+                .artifact_key = null,
+                .indices = indices,
+                .values = values,
             });
             state.rebuilt += 1;
 
@@ -27881,7 +29033,7 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
     };
     defer state.deinit();
 
-    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
     if (state.writes.items.len > 0) try state.flush();
     return state.rebuilt;
 }
@@ -28319,6 +29471,11 @@ fn waitForRawDelete(alloc: Allocator, db: *DB, key: []const u8, max_attempts: us
     return error.Timeout;
 }
 
+fn initStoppedTtlRuntimeForTest(db: *DB, cfg: ttl_runtime_mod.Config) !void {
+    try std.testing.expect(db.ttl_runtime == null);
+    try db.initOptionalTtlRuntime(cfg);
+}
+
 fn expectedChunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {
     return try internal_keys.chunkArtifactKeyAlloc(alloc, doc_key, artifact_name, chunk_id);
 }
@@ -28479,6 +29636,85 @@ const CountingDenseEmbedder = struct {
         };
     }
 };
+
+const ImageDecodingPartsEmbedder = struct {
+    calls: usize = 0,
+
+    fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+        return error.ExpectedContentParts;
+    }
+
+    fn embedDenseParts(ptr: *anyopaque, alloc: Allocator, _: []const u8, parts: []const template_mod.ContentPart, dims: u32) ![]f32 {
+        const self: *ImageDecodingPartsEmbedder = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (dims != 3) return error.InvalidVectorDimensions;
+
+        for (parts) |part| {
+            const binary = switch (part) {
+                .binary => |binary| binary,
+                else => continue,
+            };
+
+            if (std.mem.eql(u8, binary.mime_type, "image/bmp")) {
+                const decoded = antfly_image.bmp.decodeRgbaLimited(alloc, binary.data, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
+                    error.BmpDecodeFailed, error.UnsupportedBmpFormat, error.ImageTooLarge => return error.EmbedRequestFailed,
+                    else => return err,
+                };
+                defer alloc.free(decoded.rgba);
+                if (decoded.width == 0 or decoded.height == 0) return error.EmbedRequestFailed;
+                return try dupeTestVector(alloc, &.{ 1.0, 0.0, 0.0 });
+            }
+
+            if (std.mem.eql(u8, binary.mime_type, "image/webp")) {
+                const decoded = antfly_image.webp.decodeRgbaLimited(alloc, binary.data, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
+                    error.WebpDecodeFailed,
+                    error.UnsupportedWebpFormat,
+                    error.AnimatedWebpUnsupported,
+                    error.ImageTooLarge,
+                    => return error.EmbedRequestFailed,
+                    else => return err,
+                };
+                defer alloc.free(decoded.rgba);
+                return try dupeTestVector(alloc, &.{ 0.0, 1.0, 0.0 });
+            }
+
+            if (std.mem.startsWith(u8, binary.mime_type, "image/")) return error.EmbedRequestFailed;
+        }
+
+        return error.EmbedRequestFailed;
+    }
+
+    fn dupeTestVector(alloc: Allocator, values: *const [3]f32) ![]f32 {
+        const vector = try alloc.alloc(f32, 3);
+        @memcpy(vector, values);
+        return vector;
+    }
+
+    fn interface(self: *ImageDecodingPartsEmbedder) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+            .dense_embed_parts_fn = embedDenseParts,
+            .deinit_fn = null,
+        };
+    }
+};
+
+const remote_media_bmp_24_2x2 = [_]u8{
+    'B',  'M',  70,   0,    0,    0,    0,    0,    0,    0,    54,   0,    0,    0,
+    40,   0,    0,    0,    2,    0,    0,    0,    2,    0,    0,    0,    1,    0,
+    24,   0,    0,    0,    0,    0,    16,   0,    0,    0,    0,    0,    0,    0,
+    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0xff, 0x00,
+    0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00,
+};
+
+fn dataUriAlloc(alloc: Allocator, mime_type: []const u8, bytes: []const u8) ![]u8 {
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    return try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime_type, encoded });
+}
 
 const GateDenseEmbedder = struct {
     allowed_successes: std.atomic.Value(usize) = .init(1),
@@ -30667,6 +31903,35 @@ fn testRemoteTemplateHostRenderJsonToPartsErrorDirective(
     return parts;
 }
 
+fn testRemoteMediaHostRenderJsonToParts(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    template_source: []const u8,
+    json_doc: []const u8,
+    _: template_remote.RenderConfig,
+) ![]template_mod.ContentPart {
+    if (std.mem.indexOf(u8, template_source, "{{remoteMedia") == null) return error.UnsupportedPlatform;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_doc, .{});
+    defer parsed.deinit();
+
+    const url = if (std.mem.indexOf(u8, template_source, "url=this") != null) blk: {
+        if (parsed.value != .string) return error.InvalidTemplateInput;
+        break :blk parsed.value.string;
+    } else if (std.mem.indexOf(u8, template_source, "url=photo") != null) blk: {
+        if (parsed.value != .object) return error.InvalidTemplateInput;
+        const value = parsed.value.object.get("photo") orelse return error.InvalidTemplateInput;
+        if (value != .string) return error.InvalidTemplateInput;
+        break :blk value.string;
+    } else {
+        return error.UnsupportedPlatform;
+    };
+
+    const rendered = try std.fmt.allocPrint(alloc, "<<<dotprompt:media:url {s}>>>", .{url});
+    defer alloc.free(rendered);
+    return try template_mod.textToParts(alloc, rendered);
+}
+
 test "remote template host-rendered parts preserve prompt failures" {
     const alloc = std.testing.allocator;
     template_remote.setHostRenderer(.{
@@ -30684,6 +31949,108 @@ test "remote template host-rendered parts preserve prompt failures" {
             "\"https://example.com/photo.png\"",
         ),
     );
+}
+
+test "db embeddings index remoteMedia accepts bmp via shared image decode" {
+    const alloc = std.testing.allocator;
+    template_remote.setHostRenderer(.{
+        .render_json_to_parts = testRemoteMediaHostRenderJsonToParts,
+    });
+    defer template_remote.setHostRenderer(null);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var image_embedder = ImageDecodingPartsEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = image_embedder.interface() },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "visual_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"photo\",\"source_template\":\"{{remoteMedia url=photo}}\"}}",
+    });
+
+    const photo = try dataUriAlloc(alloc, "image/bmp", &remote_media_bmp_24_2x2);
+    defer alloc.free(photo);
+    const value = try std.fmt.allocPrint(alloc, "{{\"photo\":{f}}}", .{std.json.fmt(photo, .{})});
+    defer alloc.free(value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:bmp", .value = value }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), image_embedder.calls);
+
+    var result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "visual_idx",
+        .limit = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 });
+    defer result.result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+    try std.testing.expectEqualStrings("doc:bmp", result.result.hits[0].id);
+}
+
+test "db embeddings index remoteMedia accepts webp via shared image decode" {
+    const alloc = std.testing.allocator;
+    template_remote.setHostRenderer(.{
+        .render_json_to_parts = testRemoteMediaHostRenderJsonToParts,
+    });
+    defer template_remote.setHostRenderer(null);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var image_embedder = ImageDecodingPartsEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = image_embedder.interface() },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "visual_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"photo\",\"source_template\":\"{{remoteMedia url=photo}}\"}}",
+    });
+
+    const webp_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "testdata/image/webp/lossy/minimal-vp8-1x1.webp",
+        alloc,
+        .limited(64 * 1024),
+    );
+    defer alloc.free(webp_bytes);
+
+    const photo = try dataUriAlloc(alloc, "image/webp", webp_bytes);
+    defer alloc.free(photo);
+    const value = try std.fmt.allocPrint(alloc, "{{\"photo\":{f}}}", .{std.json.fmt(photo, .{})});
+    defer alloc.free(value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:webp", .value = value }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), image_embedder.calls);
+
+    var result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "visual_idx",
+        .limit = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 0.0, 1.0, 0.0 }, .k = 1 });
+    defer result.result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+    try std.testing.expectEqualStrings("doc:webp", result.result.hits[0].id);
 }
 
 test "db allocates final document ordinal with all index families present" {
@@ -31583,6 +32950,406 @@ test "db default dynamic schema vector term filters project through doc identity
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant.keyword", "tenanta"));
 }
 
+test "db exact sort resolves explicit keyword metadata filters natively" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"status":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"status\":\"active\",\"tenant\":\"tenanta\",\"score\":10}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"status\":\"active\",\"tenant\":\"tenanta\",\"score\":30}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"status\":\"draft\",\"tenant\":\"tenanta\",\"score\":40}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"status\":\"active\",\"tenant\":\"tenantb\",\"score\":50}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const text_index = db.core.index_manager.textIndex("ft_v1").?;
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "status", "active"));
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant", "tenanta"));
+    try std.testing.expectEqual(@as(u32, 0), try text_index.snapshot().termDocFreq(alloc, "status.keyword", "active"));
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tenant\":\"tenanta\"}}]}",
+        .order_by = &order,
+        .limit = 2,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:a", result.hits[1].id);
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", sort_profile.plan);
+    try std.testing.expectEqualStrings("source_free", sort_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+    try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
+
+    var keyword_range = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"range\":{\"status\":{\"gte\":\"active\",\"lt\":\"draft\"}}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer keyword_range.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), keyword_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), keyword_range.hits.len);
+    try std.testing.expectEqualStrings("doc:d", keyword_range.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", keyword_range.hits[1].id);
+    try std.testing.expectEqualStrings("doc:a", keyword_range.hits[2].id);
+    const keyword_range_profile = keyword_range.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", keyword_range_profile.plan);
+    try std.testing.expectEqualStrings("source_free", keyword_range_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 3), keyword_range_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), keyword_range_profile.stored_json_load_count);
+    try std.testing.expect(keyword_range_profile.native_doc_value_hit_count >= 3);
+}
+
+test "db exact sort resolves mapped numeric metadata filters from typed doc values" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"amount":{"type":"number","x-antfly-field":{"type":"number","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"amount\":5,\"score\":30}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"amount\":10,\"score\":20}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"amount\":15,\"score\":50}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"amount\":25,\"score\":40}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":10,\"max\":20,\"inclusive_min\":true,\"inclusive_max\":false}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", sort_profile.plan);
+    try std.testing.expectEqualStrings("source_free", sort_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+    try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
+
+    var standard_range = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"range\":{\"amount\":{\"gte\":10,\"lt\":20}}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer standard_range.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), standard_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), standard_range.hits.len);
+    try std.testing.expectEqualStrings("doc:c", standard_range.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", standard_range.hits[1].id);
+    const standard_sort_profile = standard_range.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", standard_sort_profile.plan);
+    try std.testing.expectEqual(@as(u64, 2), standard_sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), standard_sort_profile.stored_json_load_count);
+    try std.testing.expect(standard_sort_profile.native_doc_value_hit_count >= 2);
+}
+
+test "db exact sort resolves mapped date metadata filters from typed doc values" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"created_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"created_at\":\"2026-01-01T00:00:00Z\",\"score\":30}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"created_at\":\"2026-01-02T00:00:00Z\",\"score\":20}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"created_at\":\"2026-01-03T00:00:00Z\",\"score\":50}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"created_at\":\"2026-01-04T00:00:00Z\",\"score\":40}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"date_range\":{\"field\":\"created_at\",\"start\":\"2026-01-02T00:00:00Z\",\"end\":\"2026-01-04T00:00:00Z\",\"inclusive_start\":true,\"inclusive_end\":false}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", sort_profile.plan);
+    try std.testing.expectEqualStrings("source_free", sort_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+    try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
+
+    var standard_range = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"range\":{\"created_at\":{\"gte\":\"2026-01-02\",\"lt\":\"2026-01-04T00:00:00Z\"}}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer standard_range.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), standard_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), standard_range.hits.len);
+    try std.testing.expectEqualStrings("doc:c", standard_range.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", standard_range.hits[1].id);
+    const standard_sort_profile = standard_range.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", standard_sort_profile.plan);
+    try std.testing.expectEqual(@as(u64, 2), standard_sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), standard_sort_profile.stored_json_load_count);
+    try std.testing.expect(standard_sort_profile.native_doc_value_hit_count >= 2);
+}
+
+test "db exact sort resolves mapped boolean metadata filters from typed doc values" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"published":{"type":"boolean","x-antfly-field":{"type":"boolean","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"published\":false,\"score\":30}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"published\":true,\"score\":20}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"published\":true,\"score\":50}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"published\":false,\"score\":40}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", sort_profile.plan);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+    try std.testing.expect(sort_profile.native_doc_value_hit_count >= 2);
+}
+
+test "db exact sort resolves mapped geo metadata filters from typed doc values" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"location":{"type":"object","x-antfly-field":{"type":"geo_point"}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"location\":{\"lat\":37.7749,\"lon\":-122.4194},\"score\":30}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"location\":{\"lat\":37.7750,\"lon\":-122.4195},\"score\":20}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma\",\"location\":{\"lat\":40.7128,\"lon\":-74.0060},\"score\":50}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"delta\",\"location\":{\"lat\":37.8044,\"lon\":-122.2712},\"score\":40}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order = [_]types.SortField{.{ .field = "score", .desc = true }};
+    var distance = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"geo_distance\":{\"path\":\"location\",\"lat\":37.7749,\"lon\":-122.4194,\"radius_meters\":2000}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer distance.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), distance.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), distance.hits.len);
+    try std.testing.expectEqualStrings("doc:a", distance.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", distance.hits[1].id);
+    const distance_profile = distance.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", distance_profile.plan);
+    try std.testing.expectEqualStrings("source_free", distance_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), distance_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), distance_profile.stored_json_load_count);
+    try std.testing.expect(distance_profile.native_doc_value_hit_count >= 2);
+
+    var bbox = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"geo_bbox\":{\"path\":\"location\",\"min_lat\":37.70,\"min_lon\":-122.50,\"max_lat\":37.80,\"max_lon\":-122.30}}",
+        .order_by = &order,
+        .limit = 10,
+        .include_stored = false,
+        .profile = true,
+    });
+    defer bbox.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), bbox.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), bbox.hits.len);
+    try std.testing.expectEqualStrings("doc:a", bbox.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", bbox.hits[1].id);
+    const bbox_profile = bbox.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", bbox_profile.plan);
+    try std.testing.expectEqualStrings("source_free", bbox_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), bbox_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), bbox_profile.stored_json_load_count);
+    try std.testing.expect(bbox_profile.native_doc_value_hit_count >= 2);
+}
+
 test "db non chunked search paths apply broad live doc filter" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -31612,6 +33379,7 @@ test "db non chunked search paths apply broad live doc filter" {
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"alpha only\",\"embedding\":[0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
             .{ .key = "doc:b", .value = "{\"body\":\"beta only\",\"embedding\":[10,0],\"sparse\":{\"indices\":[8],\"values\":[1.0]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma only\",\"embedding\":[20,0],\"sparse\":{\"indices\":[9],\"values\":[1.0]}}" },
         },
         .sync_level = .full_index,
     });
@@ -31626,6 +33394,7 @@ test "db non chunked search paths apply broad live doc filter" {
         try txn.commit();
     }
     db.identity_visibility_summary_cache = null;
+    db.clearLiveDocSetCache();
 
     var dense_live = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -31637,6 +33406,23 @@ test "db non chunked search paths apply broad live doc filter" {
     try std.testing.expectEqual(@as(usize, 1), dense_live.result.hits.len);
     try std.testing.expectEqualStrings("doc:b", dense_live.result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 1), dense_live.profile.raw_hit_count);
+
+    var dense_live_page_two = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .offset = 1,
+        .include_stored = false,
+        .profile = true,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_live_page_two.result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), dense_live_page_two.result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, dense_live_page_two.result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), dense_live_page_two.result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", dense_live_page_two.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 2), dense_live_page_two.profile.raw_hit_count);
+    const dense_live_page_two_profile = dense_live_page_two.result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("score_top_k", dense_live_page_two_profile.plan);
+    try std.testing.expectEqualStrings("exact", dense_live_page_two_profile.exactness);
 
     var sparse_live = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -31785,6 +33571,61 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
     try std.testing.expectEqual(@as(u32, 1), sparse_result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), sparse_result.hits.len);
     try std.testing.expectEqualStrings("doc:b", sparse_result.hits[0].id);
+}
+
+test "db dense stored symbolic filter candidate window covers offset pagination" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        writes.deinit(alloc);
+    }
+    try writes.ensureTotalCapacity(alloc, 2200);
+    for (0..2200) |i| {
+        try writes.append(alloc, .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"body\":\"keep\",\"embedding\":[{d},0]}}", .{i}),
+        });
+    }
+
+    try db.batch(.{
+        .writes = writes.items,
+        .sync_level = .full_index,
+    });
+
+    const active_dense_count: u32 = @intCast(db.core.denseIndex("dv_v1").?.index.stats().active_count);
+    try std.testing.expect(active_dense_count > 1024);
+
+    var dense_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .offset = 1024,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_result.result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), dense_result.result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1025), dense_result.result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, dense_result.result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 1025), dense_result.profile.raw_hit_count);
 }
 
 test "db dense algebraic doc facts feed native dense and sparse symbolic filters" {
@@ -33452,7 +35293,10 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     defer cleanupTempDir(path);
 
     var embedder = FixedVectorEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .resolution_embedder = embedder.interface(),
+        .start_index_workers = false,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -35788,6 +37632,75 @@ test "db enrichments precomputed watermark advances across replay entries withou
     try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
 }
 
+test "db derived target advance does not skip unseen matching replay records" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "plain_relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const graph_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+        .target_hints = &.{.graph},
+    });
+    defer alloc.free(graph_payload);
+    try db.core.store.appendReplayOpaque(alloc, 1, graph_payload);
+
+    try std.testing.expect(!try canAdvanceDerivedToTargetAsync(
+        db.async_context,
+        .{ .name = "relations_graph", .kind = .graph },
+        0,
+        1,
+    ));
+    try std.testing.expect(try canAdvanceDerivedToTargetAsync(
+        db.async_context,
+        .{ .name = "plain_relations_graph", .kind = .graph },
+        0,
+        1,
+    ));
+    try std.testing.expect(try canAdvanceDerivedToTargetAsync(
+        db.async_context,
+        .{ .name = "ft_v1", .kind = .full_text },
+        0,
+        1,
+    ));
+}
+
 const TestAssetProducer = struct {
     calls: usize = 0,
     generator_calls: usize = 0,
@@ -36150,6 +38063,96 @@ test "db async document extraction accounts resource manager working set" {
     const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)];
     try std.testing.expect(stats.peak_bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+}
+
+test "db async document extraction deletes artifacts with corrupt previous extraction state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try db.addIndex(.{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:async-delete",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:async-delete", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:async-delete", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:async-delete", "document_chunks_v1", "document:000001", 0);
+    defer alloc.free(chunk_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:async-delete", "document_units_v1");
+    defer alloc.free(state_key);
+
+    const initial_unit_payload = try db.core.store.get(alloc, unit_key);
+    alloc.free(initial_unit_payload);
+    const initial_chunk_payload = try db.core.store.get(alloc, chunk_key);
+    alloc.free(initial_chunk_payload);
+    var before_delete = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "alpha" } },
+        .return_mode = .chunk,
+    });
+    defer before_delete.deinit();
+    try std.testing.expect(before_delete.total_hits > 0);
+    try db.core.store.put(state_key, "{");
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:async-delete",
+            .value = "{\"url\":\"\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, manifest_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, chunk_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+    var after_delete = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "alpha" } },
+        .return_mode = .chunk,
+    });
+    defer after_delete.deinit();
+    try std.testing.expectEqual(@as(u32, 0), after_delete.total_hits);
 }
 
 test "db document extraction routes mixed files using source metadata fields" {
@@ -38380,6 +40383,213 @@ test "db index repair rebuilds full text index from stored documents" {
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
+test "db index repair shadow swap survives reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(text_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha durable\"}" },
+                .{ .key = "doc:b", .value = "{\"body\":\"beta durable\"}" },
+            },
+            .sync_level = .full_index,
+        });
+        try db.core.saveProjectionCheckpoint("ft_v1", .{
+            .applied_sequence = 0,
+            .status = .repair_required,
+            .config_hash = types.indexConfigHash(text_cfg),
+        });
+
+        const stale_canonical_file = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/stale-before-repair", .{std.mem.span(path)});
+        defer alloc.free(stale_canonical_file);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = stale_canonical_file,
+            .data = "stale",
+        });
+
+        var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+            .target = .index,
+            .artifact_kind = .full_text,
+            .index_name = "ft_v1",
+            .limit = 1,
+        });
+        defer repair.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    }
+
+    const abandoned_shadow = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-abandoned/indexes/ft_v1", .{std.mem.span(path)});
+    defer alloc.free(abandoned_shadow);
+    try ensureDirPath(abandoned_shadow);
+    const in_progress_shadow_root = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-live-build", .{std.mem.span(path)});
+    defer alloc.free(in_progress_shadow_root);
+    const in_progress_shadow = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1", .{in_progress_shadow_root});
+    defer alloc.free(in_progress_shadow);
+    try ensureDirPath(in_progress_shadow);
+    try index_manager_mod.IndexManager.writeRepairShadowInProgressMarker(alloc, in_progress_shadow_root);
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+
+        const checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_v1");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+
+        var after = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        });
+        defer after.deinit();
+        try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+        try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned_shadow, .{}));
+        try std.Io.Dir.cwd().access(std.testing.io, in_progress_shadow, .{});
+        const stale_canonical_file = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/stale-before-repair", .{std.mem.span(path)});
+        defer alloc.free(stale_canonical_file);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_canonical_file, .{}));
+    }
+}
+
+test "db index repair shadow roots are allocated uniquely" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const first = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(first);
+    const second = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(second);
+    const third = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(third);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(!std.mem.eql(u8, first, third));
+    try std.testing.expect(!std.mem.eql(u8, second, third));
+    try std.testing.expect(std.mem.indexOf(u8, first, "/.repair-shadow-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "/.repair-shadow-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third, "/.repair-shadow-") != null);
+
+    try std.Io.Dir.cwd().access(std.testing.io, first, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, second, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, third, .{});
+}
+
+test "db index repair shadow swap preserves post snapshot mutations" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(text_cfg);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha before\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta before\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.core.saveProjectionCheckpoint("ft_v1", .{
+        .applied_sequence = 0,
+        .status = .repair_required,
+        .config_hash = types.indexConfigHash(text_cfg),
+    });
+
+    const HookContext = struct {
+        fired: bool = false,
+        observed_floor: u64 = 0,
+    };
+    const Hook = struct {
+        fn afterSnapshotBuild(ptr: *anyopaque, hook_db: *DB, index_name: []const u8, build_floor_sequence: u64) anyerror!void {
+            const ctx: *HookContext = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("ft_v1", index_name);
+            try std.testing.expect(build_floor_sequence > 0);
+            try std.testing.expect(!ctx.fired);
+            ctx.fired = true;
+            ctx.observed_floor = build_floor_sequence;
+
+            try hook_db.batch(.{
+                .writes = &.{
+                    .{ .key = "doc:b", .value = "{\"body\":\"gamma after\"}" },
+                    .{ .key = "doc:c", .value = "{\"body\":\"alpha after\"}" },
+                },
+                .deletes = &.{"doc:a"},
+                .sync_level = .write,
+            });
+        }
+    };
+    var hook_ctx = HookContext{};
+    db.shadow_index_repair_hook = .{
+        .ptr = &hook_ctx,
+        .after_snapshot_build = Hook.afterSnapshotBuild,
+    };
+    defer db.shadow_index_repair_hook = null;
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .full_text,
+        .index_name = "ft_v1",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expect(hook_ctx.fired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expect(!repair.debt_remaining);
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "ft_v1");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expect(checkpoint.applied_sequence > hook_ctx.observed_floor);
+
+    var alpha = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer alpha.deinit();
+    try std.testing.expectEqual(@as(u32, 1), alpha.total_hits);
+    try std.testing.expectEqualStrings("doc:c", alpha.hits[0].id);
+
+    var beta = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "beta" } },
+    });
+    defer beta.deinit();
+    try std.testing.expectEqual(@as(u32, 0), beta.total_hits);
+
+    var gamma = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "gamma" } },
+    });
+    defer gamma.deinit();
+    try std.testing.expectEqual(@as(u32, 1), gamma.total_hits);
+    try std.testing.expectEqualStrings("doc:b", gamma.hits[0].id);
+}
+
 test "db repair issue list reports index repair candidates" {
     const alloc = std.testing.allocator;
 
@@ -38421,6 +40631,183 @@ test "db repair issue list reports index repair candidates" {
     try std.testing.expectEqualStrings("index_repair_required", page.issues[0].last_error);
 }
 
+test "db index repair reports remaining artifact debt after rebuild" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .graph,
+        .index_name = try alloc.dupe(u8, "graph_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:missing"),
+        .artifact_name = try alloc.dupe(u8, "graph_v1"),
+        .reason = .corrupt_artifact,
+        .sequence = 1,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "graph_v1",
+        .limit = 1,
+        .force = true,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.repair_degraded);
+    try std.testing.expectEqual(@as(u64, 1), stats.repair_issue_count);
+}
+
+test "db graph index repair records corrupt artifact debt during shadow rebuild" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(artifact_key);
+    try db.core.store.put(artifact_key, "bad-graph-artifact");
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "relations_graph",
+        .limit = 1,
+        .force = true,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+
+    const issues = try db.listArtifactRepairIssues(alloc, .graph, "relations_graph", 10);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(.corrupt_artifact, issues[0].reason);
+    try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
+    try std.testing.expectEqualStrings("mentions:doc:b", issues[0].artifact_name);
+
+    const raw_artifact = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(raw_artifact);
+    try std.testing.expectEqualStrings("bad-graph-artifact", raw_artifact);
+}
+
+test "db repair issue list reports algebraic index debt as unsupported" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const cfg: types.IndexConfig = .{
+        .name = "alg_v1",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "table": "docs",
+        \\  "schema_version": 1,
+        \\  "capability_fingerprint": "test-capability"
+        \\}
+        ,
+    };
+    try db.addIndex(cfg);
+    try db.core.saveProjectionCheckpoint("alg_v1", .{
+        .applied_sequence = 0,
+        .status = .repair_required,
+        .config_hash = types.indexConfigHash(cfg),
+    });
+
+    var page = try db.listArtifactRepairIssuesPage(alloc, .{
+        .target = .index,
+        .artifact_kind = .algebraic,
+        .index_name = "alg_v1",
+        .limit = 1,
+    });
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.issues.len);
+    try std.testing.expectEqual(types.ArtifactRepairKind.algebraic, page.issues[0].artifact_kind);
+    try std.testing.expect(!page.issues[0].repairable);
+    try std.testing.expectEqualStrings("algebraic_index_rebuild_unavailable", page.issues[0].unsupported_reason);
+    try std.testing.expectEqualStrings("algebraic_index_rebuild_unavailable", page.issues[0].last_error);
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .algebraic,
+        .index_name = "alg_v1",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.unsupported);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+}
+
+test "db index repair serializes duplicate repairs for one index" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "graph_v1", .kind = .graph, .config_json = "{}" });
+    try std.testing.expect(try db.beginIndexRepairLease("graph_v1"));
+    defer db.endIndexRepairLease("graph_v1");
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "graph_v1",
+        .limit = 1,
+        .force = true,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);
+}
+
 test "db index repair recovers quarantined index load before rebuild" {
     const alloc = std.testing.allocator;
 
@@ -38458,6 +40845,77 @@ test "db index repair recovers quarantined index load before rebuild" {
         try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
         try std.testing.expect(db.core.textIndexEntry("ft_v1") != null);
     }
+}
+
+test "db index repair rebuilds full text after quarantined root recreation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const path_slice = std.mem.span(path);
+
+    const text_cfg: types.IndexConfig = .{
+        .name = "ft_recreate",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
+
+    {
+        var db = try DB.open(alloc, path_slice, .{});
+        defer db.close();
+
+        try db.addIndex(text_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha durable\"}" },
+                .{ .key = "doc:b", .value = "{\"body\":\"beta durable\"}" },
+            },
+            .sync_level = .full_index,
+        });
+        try db.core.saveProjectionCheckpoint("ft_recreate", .{
+            .applied_sequence = db.core.nextDerivedSequence(),
+            .status = .clean,
+            .generation = 2,
+            .config_hash = types.indexConfigHash(text_cfg),
+        });
+    }
+
+    const index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_recreate", .{path_slice});
+    defer alloc.free(index_path);
+    try std.testing.expect((try corruptNonEmptyFilesUnderDir(alloc, index_path)) > 0);
+
+    var reopened = try DB.open(alloc, path_slice, .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const recorded = reopened.core.index_manager.loadFailure("ft_recreate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(recorded.len > 0);
+
+    var repair = try reopened.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .full_text,
+        .index_name = "ft_recreate",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expect(!repair.debt_remaining);
+    try std.testing.expect(reopened.core.index_manager.loadFailure("ft_recreate") == null);
+
+    var after = try reopened.search(alloc, .{
+        .index_name = "ft_recreate",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+    try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
 test "db index repair streams graph artifact rebuild in batches" {
@@ -39169,6 +41627,236 @@ test "db document extraction chunks units through source artifact enrichment" {
     });
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, chunk_key));
+}
+
+fn testLargeHtmlDataUrlAlloc(alloc: Allocator, version: []const u8, unique_token: []const u8, paragraph_count: usize) ![]u8 {
+    var html = std.ArrayListUnmanaged(u8).empty;
+    defer html.deinit(alloc);
+    try html.appendSlice(alloc, "<html><body><h1>Synthetic Report ");
+    try html.appendSlice(alloc, version);
+    try html.appendSlice(alloc, "</h1>");
+    for (0..paragraph_count) |i| {
+        const paragraph = try std.fmt.allocPrint(
+            alloc,
+            "<p>{s} harbor terminal cargo fiscal quarterly report section {d} renewal authority volume meridian refrigerated shipping expansion contract.</p>\n",
+            .{ unique_token, i },
+        );
+        defer alloc.free(paragraph);
+        try html.appendSlice(alloc, paragraph);
+    }
+    try html.appendSlice(alloc, "</body></html>");
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(html.items.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, html.items);
+    return try std.fmt.allocPrint(alloc, "data:text/html;base64,{s}", .{encoded});
+}
+
+fn testSourceDocumentJsonAlloc(alloc: Allocator, url: []const u8, sha256: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"_type\":\"source_document\",\"url\":\"{s}\",\"filename\":\"doc.html\",\"mime_type\":\"text/html\",\"sha256\":\"{s}\",\"file_type\":\"document\"}}",
+        .{ url, sha256 },
+    );
+}
+
+test "db document extraction state round-trips binary chunk keys beyond one byte ids" {
+    const alloc = std.testing.allocator;
+
+    var unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (unit_keys.items) |key| alloc.free(@constCast(key));
+        unit_keys.deinit(alloc);
+    }
+    var unit_fingerprints = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (unit_fingerprints.items) |fingerprint| alloc.free(@constCast(fingerprint));
+        unit_fingerprints.deinit(alloc);
+    }
+    var chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (chunk_keys.items) |key| alloc.free(@constCast(key));
+        chunk_keys.deinit(alloc);
+    }
+
+    try unit_keys.append(alloc, try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:large", "document_units_v1", "document:000001"));
+    try unit_fingerprints.append(alloc, try alloc.dupe(u8, "unit-fingerprint"));
+    for (0..320) |i| {
+        try chunk_keys.append(alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:large", "document_chunks_v1", "document:000001", @intCast(i)));
+    }
+
+    const descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(alloc, unit_keys.items, unit_fingerprints.items);
+    defer alloc.free(descriptors);
+    const state = try documentExtractionStateValueAlloc(alloc, "source-fingerprint", unit_keys.items, descriptors, chunk_keys.items);
+    defer alloc.free(state);
+
+    const parsed_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+    defer freeOwnedConstKeySlice(alloc, parsed_chunk_keys);
+    try std.testing.expectEqual(chunk_keys.items.len, parsed_chunk_keys.len);
+    for (chunk_keys.items, parsed_chunk_keys) |expected, actual| {
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+}
+
+test "db document extraction changed version updates large chunked source document" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"etag_field\":\"sha256\",\"version_field\":\"sha256\",\"content_type_field\":\"mime_type\",\"filename_field\":\"filename\"}}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 96,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try db.addIndex(.{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    });
+
+    const url_v1 = try testLargeHtmlDataUrlAlloc(alloc, "v1", "firstversiontoken", 360);
+    defer alloc.free(url_v1);
+    const doc_v1 = try testSourceDocumentJsonAlloc(alloc, url_v1, "sha-v1");
+    defer alloc.free(doc_v1);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:large", .value = doc_v1 }},
+        .sync_level = .full_index,
+    });
+
+    const state_key = try assetStateKeyAlloc(alloc, "doc:large", "document_units_v1");
+    defer alloc.free(state_key);
+    const first_state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(first_state);
+    const first_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, first_state);
+    defer freeOwnedConstKeySlice(alloc, first_chunk_keys);
+    try std.testing.expect(first_chunk_keys.len > 300);
+
+    const url_v2 = try testLargeHtmlDataUrlAlloc(alloc, "v2", "secondversiontoken", 360);
+    defer alloc.free(url_v2);
+    const doc_v2 = try testSourceDocumentJsonAlloc(alloc, url_v2, "sha-v2");
+    defer alloc.free(doc_v2);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:large", .value = doc_v2 }},
+        .sync_level = .full_index,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:large", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":2") != null);
+
+    const second_state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(second_state);
+    const second_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, second_state);
+    defer freeOwnedConstKeySlice(alloc, second_chunk_keys);
+    try std.testing.expect(second_chunk_keys.len > 300);
+
+    var second_result = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "secondversiontoken" } },
+        .return_mode = .chunk,
+    });
+    defer second_result.deinit();
+    try std.testing.expect(second_result.total_hits > 0);
+
+    var first_result = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "firstversiontoken" } },
+        .return_mode = .chunk,
+    });
+    defer first_result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), first_result.total_hits);
+}
+
+test "db document extraction update recovers corrupt previous extraction state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"etag_field\":\"sha256\",\"version_field\":\"sha256\",\"content_type_field\":\"mime_type\",\"filename_field\":\"filename\"}}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 96,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+
+    const url_v1 = try testLargeHtmlDataUrlAlloc(alloc, "v1", "corruptoldtoken", 80);
+    defer alloc.free(url_v1);
+    const doc_v1 = try testSourceDocumentJsonAlloc(alloc, url_v1, "sha-v1");
+    defer alloc.free(doc_v1);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:corrupt", .value = doc_v1 }},
+        .sync_level = .full_index,
+    });
+
+    const state_key = try assetStateKeyAlloc(alloc, "doc:corrupt", "document_units_v1");
+    defer alloc.free(state_key);
+    try db.core.store.put(state_key, "{\"kind\":\"document_extraction_state_v1\",\"unit_keys\":[7],\"unit_descriptors\":{},\"chunk_keys\":[false]}");
+
+    const url_v2 = try testLargeHtmlDataUrlAlloc(alloc, "v2", "corruptnewtoken", 80);
+    defer alloc.free(url_v2);
+    const doc_v2 = try testSourceDocumentJsonAlloc(alloc, url_v2, "sha-v2");
+    defer alloc.free(doc_v2);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:corrupt", .value = doc_v2 }},
+        .sync_level = .full_index,
+    });
+
+    const recovered_state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(recovered_state);
+    const recovered_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, recovered_state);
+    defer freeOwnedConstKeySlice(alloc, recovered_chunk_keys);
+    try std.testing.expect(recovered_chunk_keys.len > 0);
+
+    try db.core.store.put(state_key, "{");
+
+    const url_v3 = try testLargeHtmlDataUrlAlloc(alloc, "v3", "corruptthirdtoken", 80);
+    defer alloc.free(url_v3);
+    const doc_v3 = try testSourceDocumentJsonAlloc(alloc, url_v3, "sha-v3");
+    defer alloc.free(doc_v3);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:corrupt", .value = doc_v3 }},
+        .sync_level = .full_index,
+    });
+
+    const recovered_truncated_state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(recovered_truncated_state);
+    const recovered_truncated_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, recovered_truncated_state);
+    defer freeOwnedConstKeySlice(alloc, recovered_truncated_chunk_keys);
+    try std.testing.expect(recovered_truncated_chunk_keys.len > 0);
 }
 
 test "db extractEnrichments exposes cleaned writes and special fields" {
@@ -40368,6 +43056,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
         try txn.commit();
     }
     db.identity_visibility_summary_cache = null;
+    db.clearLiveDocSetCache();
 
     var stale_sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -40632,9 +43321,12 @@ test "db write sync trailing dense no-op batches drain stale delete replay at id
     var drained = false;
     var attempts: usize = 0;
     while (attempts < slow_test_wait_attempts) : (attempts += 1) {
-        const stats = try db.stats(alloc);
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
         defer types.freeDBStats(alloc, stats);
-        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        if (stats.indexes.len != 1) {
+            sleepPollInterval();
+            continue;
+        }
         const index = stats.indexes[0];
         if (index.doc_count == 3 and
             index.replay_applied_sequence >= index.replay_target_sequence and
@@ -40668,9 +43360,12 @@ test "db write sync trailing dense no-op batches drain stale delete replay at id
     var delete_drained = false;
     attempts = 0;
     while (attempts < slow_test_wait_attempts) : (attempts += 1) {
-        const stats = try db.stats(alloc);
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
         defer types.freeDBStats(alloc, stats);
-        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        if (stats.indexes.len != 1) {
+            sleepPollInterval();
+            continue;
+        }
         const index = stats.indexes[0];
         if (index.doc_count == 2 and
             index.replay_applied_sequence >= index.replay_target_sequence and
@@ -42778,6 +45473,8 @@ test "db full-text chunk consumer returns parent and chunk modes" {
     const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
+    try std.testing.expect(chunk_result.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_result.hits[0].stored_data.?, "abcdefgh") != null);
     const chunk_ref = chunk_result.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(types.ArtifactKind.chunk, chunk_ref.kind);
     try std.testing.expectEqualStrings("doc:a", chunk_ref.document_id);
@@ -42834,13 +45531,16 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     try db.batch(.{
         .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .timestamp_ns = now_ns - 2 * ttl_duration_ns,
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
     try db.batch(.{
         .writes = &.{.{ .key = "doc:fresh", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .timestamp_ns = now_ns,
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
+
+    try db.enrichment_runtime.?.waitForApplied(2);
+    try waitForDerivedReplayTarget(&db);
 
     var chunk_result = try waitForSearchResult(alloc, &db, .{
         .index_name = "ft_chunks",
@@ -42861,6 +45561,181 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     defer parent_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", parent_result.hits[0].id);
+}
+
+test "db full-text ttl filters before pagination and count-only totals" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"alpha alpha alpha alpha alpha\"}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+        .sync_level = .full_text,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:fresh", .value = "{\"body\":\"alpha\"}" }},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_text,
+    });
+
+    var limited = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .limit = 1,
+    }, 1);
+    defer limited.deinit();
+    try std.testing.expectEqual(@as(u32, 1), limited.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), limited.hits.len);
+    try std.testing.expectEqualStrings("doc:fresh", limited.hits[0].id);
+
+    var counted = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .count_only = true,
+    });
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(u32, 1), counted.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), counted.hits.len);
+}
+
+test "db composed full-text ttl filters resolved text filters before pagination" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"alpha alpha alpha alpha alpha keep\"}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+        .sync_level = .full_text,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:fresh", .value = "{\"body\":\"alpha keep\"}" }},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_text,
+    });
+
+    var limited = try waitForSearchResult(alloc, &db, .{
+        .full_text_queries = &.{
+            .{
+                .name = "ft_body",
+                .index_name = "ft_v1",
+                .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            },
+        },
+        .primary_text_index_name = "ft_v1",
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+        .limit = 1,
+    }, 1);
+    defer limited.deinit();
+    try std.testing.expectEqual(@as(u32, 1), limited.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), limited.hits.len);
+    try std.testing.expectEqualStrings("doc:fresh", limited.hits[0].id);
+}
+
+test "db full-text ttl uses lower-bound totals for non-exhaustive visible pages" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 60 * std.time.ns_per_s,
+    });
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:high", .value = "{\"body\":\"alpha alpha alpha alpha alpha\"}" },
+            .{ .key = "doc:low", .value = "{\"body\":\"alpha\"}" },
+        },
+        .timestamp_ns = currentTimeNs(),
+        .sync_level = .full_text,
+    });
+
+    var limited = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .limit = 1,
+    }, 1);
+    defer limited.deinit();
+    try std.testing.expectEqual(@as(u32, 1), limited.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, limited.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), limited.hits.len);
+    try std.testing.expectEqualStrings("doc:high", limited.hits[0].id);
+}
+
+test "db ttl broad live filter preserves all-doc sentinel" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 60 * std.time.ns_per_s,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:old", .value = "{\"body\":\"old\"}" },
+            .{ .key = "doc:fresh", .value = "{\"body\":\"fresh\"}" },
+        },
+        .timestamp_ns = currentTimeNs(),
+        .sync_level = .write,
+    });
+
+    const all: doc_set.ResolvedDocSet = .all;
+    var filtered = try DB.liveFilterDocSetCallback(&db, alloc, &all, null);
+    defer filtered.deinit(alloc);
+    try std.testing.expect(filtered == .all);
 }
 
 test "db getArtifact loads stored chunk artifacts by public id" {
@@ -43060,6 +45935,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         try txn.commit();
     }
     db.identity_visibility_summary_cache = null;
+    db.clearLiveDocSetCache();
 
     var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -47390,6 +50266,45 @@ test "db full text count_only applies stored filters" {
     try std.testing.expectEqual(@as(usize, 0), result.hits.len);
 }
 
+test "db full text match_all applies stored filters" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"status\":\"active\",\"body\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"status\":\"draft\",\"body\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"status\":\"active\",\"body\":\"gamma\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .filter_query_json = "{\"term\":{\"status\":\"active\"}}",
+        .limit = 10,
+    }, 2);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+}
+
 test "db full_index delete waits for full text visibility" {
     const alloc = std.testing.allocator;
 
@@ -48455,6 +51370,104 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
     try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
 }
 
+test "db index repair rebuilds dense index quarantined by incomplete bulk publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    const dense_index_path_z = try alloc.dupeZ(u8, dense_index_path);
+    defer alloc.free(dense_index_path_z);
+    {
+        var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_index_path_z, .{
+            .dims = 3,
+            .storage_backend = .lsm,
+        }, .{});
+        try hbc.beginBulkIngestSession();
+        hbc.close();
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const recorded = reopened.core.index_manager.loadFailure("dense_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("IncompleteBulkPublish", recorded);
+    {
+        const status_key = try DB.indexStatusKeyAlloc(alloc, "dense_idx");
+        defer alloc.free(status_key);
+        var stale_status: [DB.index_status_encoded_len]u8 = undefined;
+        DB.encodeIndexStatusSnapshot(.{
+            .kind = .dense_vector,
+            .doc_count = 99,
+            .node_count = 99,
+            .root_node = 99,
+        }, &stale_status);
+        try reopened.core.store.put(status_key, &stale_status);
+    }
+    {
+        const stats = try reopened.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.repair_degraded);
+    }
+
+    var repair = try reopened.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "dense_idx",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 2), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expect(!repair.debt_remaining);
+    try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") == null);
+    {
+        const persisted_status = (try reopened.loadIndexStatusSnapshot(alloc, "dense_idx")).?;
+        try std.testing.expectEqual(@as(u64, 2), persisted_status.doc_count);
+    }
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 2,
+        } },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+}
+
 test "db dense artifact rebuild preserves stable vector ids distinct from ordinals" {
     const alloc = std.testing.allocator;
 
@@ -49225,6 +52238,67 @@ test "db dense artifact rebuild resumes from persisted state" {
     }
 }
 
+test "db dense artifact rebuild resume keys are owned by plan allocator" {
+    const alloc = std.testing.allocator;
+    const db_alloc = std.heap.page_allocator;
+    const doc_count: usize = 3;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(db_alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        for (0..doc_count) |i| {
+            const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
+            defer alloc.free(doc_id);
+            const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+            defer alloc.free(stored_key);
+            const stored_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc-{d}\"}}", .{i});
+            defer alloc.free(stored_value);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = stored_value },
+            }, &.{});
+
+            const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "dense_idx");
+            defer alloc.free(artifact_key);
+            try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{
+                @floatFromInt(i + 1),
+                0,
+                0,
+            });
+        }
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(db_alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    try std.testing.expectEqual(doc_count, rebuilt);
+    try std.testing.expectEqual(@as(u64, doc_count), reopened.core.index_manager.denseIndex("dense_idx").?.index.metadata.active_count);
+}
+
 test "db dense artifact rebuild progress counts source artifacts across multiple consumer indexes" {
     const alloc = std.testing.allocator;
     const doc_count: usize = 3;
@@ -49319,6 +52393,56 @@ test "db dense artifact rebuild progress counts source artifacts across multiple
     }
     try std.testing.expectEqual(@as(?u64, doc_count), dense_a_count);
     try std.testing.expectEqual(@as(?u64, doc_count), dense_b_count);
+}
+
+test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
+    const alloc = std.testing.allocator;
+    const rebuild_alloc = std.heap.page_allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(rebuild_alloc);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt);
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 }
 
 test "db chunk-backed dense artifact rebuild stays pending until all chunk artifacts are rebuilt" {
@@ -50168,7 +53292,7 @@ test "db search fuses full_text and dense named searches before graph expansion"
         .merge_config = .{
             .strategy = .rrf,
             .weights = &.{
-                .{ .name = "$full_text_results", .weight = 1.0 },
+                .{ .name = "full_text", .weight = 1.0 },
                 .{ .name = "dv_v1", .weight = 1.0 },
             },
         },
@@ -50241,7 +53365,7 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
             .strategy = .rsf,
             .window_size = 10,
             .weights = &.{
-                .{ .name = "$full_text_results", .weight = 0.4 },
+                .{ .name = "full_text", .weight = 0.4 },
                 .{ .name = "dv_v1", .weight = 1.0 },
             },
         },
@@ -50313,7 +53437,7 @@ test "db search fuses full_text and dense named searches before graph expansion 
         .merge_config = .{
             .strategy = .rrf,
             .weights = &.{
-                .{ .name = "$full_text_results", .weight = 1.0 },
+                .{ .name = "full_text", .weight = 1.0 },
                 .{ .name = "dv_v1", .weight = 1.0 },
             },
         },
@@ -51553,6 +54677,308 @@ test "db force compacts text index to searchable merge tier" {
     for (result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:3"));
     }
+}
+
+test "db text compaction preserves index sort acceleration" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"index_sort":[{"field":"price","order":"asc"},{"field":"_id","order":"asc"}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"price":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    try db.setSchemaJson(alloc, schema_json);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    for (0..12) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        defer alloc.free(key);
+        const price = 100 - i;
+        const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\",\"price\":{d}}}", .{ i, price });
+        defer alloc.free(value);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .full_index,
+        });
+    }
+
+    try db.forceCompactTextIndexes();
+
+    const text_index = db.core.index_manager.textIndex("ft_v1").?;
+    const snapshot = text_index.snapshot();
+    try std.testing.expect(snapshot.segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+    for (snapshot.segments) |segment| {
+        const fields = (try segment.reader.indexSortFieldsAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        defer segment_mod.freeIndexSortFields(alloc, fields);
+        try std.testing.expectEqual(@as(usize, 2), fields.len);
+        try std.testing.expectEqualStrings("price", fields[0].field);
+        try std.testing.expectEqualStrings("_id", fields[1].field);
+
+        var bounds = (try segment.reader.indexSortBoundsAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        defer bounds.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), bounds.first.len);
+        try std.testing.expectEqual(@as(usize, 2), bounds.last.len);
+    }
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 3,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    try std.testing.expectEqualStrings("doc:011", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", result.hits[1].id);
+    try std.testing.expectEqualStrings("doc:009", result.hits[2].id);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (result.hits) |hit| {
+            const ordinal = try doc_identity.lookupOrdinalTxn(alloc, &txn, hit.id);
+            try std.testing.expectEqual(ordinal, hit.doc_ordinal);
+        }
+    }
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", sort_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", sort_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", sort_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", sort_profile.source_load);
+    try std.testing.expect(sort_profile.index_sort_match);
+    try std.testing.expect(sort_profile.sorted_segment_executor_available);
+    try std.testing.expect(sort_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+
+    var after_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .search_after = result.hits[1].sort_values,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer after_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
+    try std.testing.expectEqualStrings("doc:009", after_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:008", after_page.hits[1].id);
+    const after_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", after_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", after_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", after_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", after_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", after_profile.index_sort_coverage);
+    try std.testing.expect(after_profile.index_sort_match);
+    try std.testing.expect(after_profile.sorted_segment_executor_available);
+    try std.testing.expect(after_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), after_profile.stored_json_load_count);
+
+    var before_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .search_before = result.hits[2].sort_values,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer before_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:011", before_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", before_page.hits[1].id);
+    const before_profile = before_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", before_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", before_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", before_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", before_profile.index_sort_coverage);
+    try std.testing.expect(before_profile.index_sort_match);
+    try std.testing.expect(before_profile.sorted_segment_executor_available);
+    try std.testing.expect(before_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.stored_json_load_count);
+
+    var text_membership_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "common" } },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer text_membership_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), text_membership_page.hits.len);
+    try std.testing.expectEqualStrings("doc:011", text_membership_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", text_membership_page.hits[1].id);
+    const text_profile = text_membership_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", text_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", text_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", text_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", text_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", text_profile.index_sort_coverage);
+    try std.testing.expect(text_profile.index_sort_match);
+    try std.testing.expect(text_profile.sorted_segment_executor_available);
+    try std.testing.expect(text_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), text_profile.stored_json_load_count);
+
+    var structured_filter_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"price\",\"min\":90}}",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer structured_filter_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), structured_filter_page.hits.len);
+    try std.testing.expectEqualStrings("doc:010", structured_filter_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:009", structured_filter_page.hits[1].id);
+    const filter_profile = structured_filter_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", filter_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", filter_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", filter_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", filter_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", filter_profile.index_sort_coverage);
+    try std.testing.expect(filter_profile.index_sort_match);
+    try std.testing.expect(filter_profile.sorted_segment_executor_available);
+    try std.testing.expect(filter_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), filter_profile.stored_json_load_count);
+}
+
+test "db index sort schema change requires a new text index generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const sortable_schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"price":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    try db.setSchemaJson(alloc, sortable_schema_json);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:b", .value = "{\"body\":\"common old\",\"price\":2}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"common old\",\"price\":4}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const index_sort_schema_json =
+        \\{"version":2,"default_type":"doc","enforce_types":false,"index_sort":[{"field":"price","order":"asc"},{"field":"_id","order":"asc"}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"price":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    try db.setSchemaJson(alloc, index_sort_schema_json);
+
+    try db.addIndex(.{
+        .name = "ft_v2",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"common new\",\"price\":1}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"common new\",\"price\":3}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var original_generation = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 4,
+    });
+    defer original_generation.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), original_generation.hits.len);
+    try std.testing.expectEqualStrings("doc:a", original_generation.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", original_generation.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", original_generation.hits[2].id);
+    try std.testing.expectEqualStrings("doc:d", original_generation.hits[3].id);
+    const original_profile = original_generation.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", original_profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", original_profile.source);
+    try std.testing.expectEqualStrings("doc_values_collector", original_profile.selection_reason);
+    try std.testing.expect(!original_profile.index_sort_match);
+    try std.testing.expect(!original_profile.sorted_segment_executor_available);
+    try std.testing.expectEqualStrings("request_mismatch", original_profile.index_sort_coverage);
+    try std.testing.expectEqual(@as(u64, 0), original_profile.stored_json_load_count);
+
+    var next_generation = try db.search(alloc, .{
+        .index_name = "ft_v2",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 4,
+    });
+    defer next_generation.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), next_generation.hits.len);
+    try std.testing.expectEqualStrings("doc:a", next_generation.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", next_generation.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", next_generation.hits[2].id);
+    try std.testing.expectEqualStrings("doc:d", next_generation.hits[3].id);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (next_generation.hits) |hit| {
+            const ordinal = try doc_identity.lookupOrdinalTxn(alloc, &txn, hit.id);
+            try std.testing.expectEqual(ordinal, hit.doc_ordinal);
+        }
+    }
+    const next_profile = next_generation.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", next_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", next_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", next_profile.selection_reason);
+    try std.testing.expectEqualStrings("covered_with_bounds", next_profile.index_sort_coverage);
+    try std.testing.expect(next_profile.index_sort_match);
+    try std.testing.expect(next_profile.sorted_segment_executor_available);
+    try std.testing.expect(next_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), next_profile.stored_json_load_count);
 }
 
 test "db text compaction preserves ordinal filters across reopen" {
@@ -54052,15 +57478,18 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -54079,7 +57508,7 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
+    try db.ttl_runtime.?.runOnce();
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
     {
@@ -54115,15 +57544,18 @@ test "db stats expose ttl cleanup activity" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -54137,15 +57569,9 @@ test "db stats expose ttl cleanup activity" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
-    var stats = try db.stats(alloc);
+    try db.ttl_runtime.?.runOnce();
+    const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    var attempts: usize = 0;
-    while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
-        sleepPollInterval();
-        types.freeDBStats(alloc, stats);
-        stats = try db.stats(alloc);
-    }
     try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.runs > 0);
     try std.testing.expect(stats.ttl_cleanup.scanned_timestamps > 0);
@@ -54160,18 +57586,21 @@ test "db ttl cleanup can run under lease ownership" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .lease_owned = true,
+        .owner_id = "ttl-owner-a",
+        .lease_ttl_ms = 250,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .lease_owned = true,
-            .owner_id = "ttl-owner-a",
-            .lease_ttl_ms = 250,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -54185,15 +57614,9 @@ test "db ttl cleanup can run under lease ownership" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
-    var stats = try db.stats(alloc);
+    try db.ttl_runtime.?.runOnce();
+    const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    var attempts: usize = 0;
-    while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
-        sleepPollInterval();
-        types.freeDBStats(alloc, stats);
-        stats = try db.stats(alloc);
-    }
 
     try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.lease_owned);
@@ -54210,19 +57633,22 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .lease_owned = true,
+        .owner_id = "ttl-owner-a",
+        .lease_ttl_ms = 250,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = primary_backend,
-        .ttl_cleanup = .{
-            .enabled = true,
-            .lease_owned = true,
-            .owner_id = "ttl-owner-a",
-            .lease_ttl_ms = 250,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -54236,15 +57662,9 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
-    var stats = try db.stats(alloc);
+    try db.ttl_runtime.?.runOnce();
+    const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    var attempts: usize = 0;
-    while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
-        sleepPollInterval();
-        types.freeDBStats(alloc, stats);
-        stats = try db.stats(alloc);
-    }
 
     try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.lease_owned);
@@ -54263,16 +57683,19 @@ test "db ttl cleanup can run with manual clock" {
         .now_realtime_ns = 10 * std.time.ns_per_s,
     };
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+        .clock = clock.clock(),
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-            .clock = clock.clock(),
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -54286,28 +57709,63 @@ test "db ttl cleanup can run with manual clock" {
         .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
     });
 
-    var deleted = false;
-    var attempts: usize = 0;
-    while (attempts < 32) : (attempts += 1) {
-        const raw = try db.get(alloc, "doc:expired_manual");
-        if (raw) |bytes| alloc.free(bytes) else {
-            deleted = true;
-            break;
-        }
-        clock.advanceMs(10);
-        yieldToBackground();
-    }
-    try std.testing.expect(deleted);
+    try db.ttl_runtime.?.runOnce();
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired_manual"));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.ttl_cleanup.runs > 0);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
+}
+
+test "db ttl cleanup background worker starts and deletes with manual clock" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var clock = platform_clock.ManualClock{
+        .now_realtime_ns = 10 * std.time.ns_per_s,
+    };
+
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 1_000,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+        .clock = clock.clock(),
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = ttl_cfg,
+    });
+    defer db.close();
+    try std.testing.expect(db.ttl_runtime != null);
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = std.time.ns_per_s,
+    });
+
+    const now_ns = clock.clock().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired_worker", .value = "{\"title\":\"gone\"}" }},
+        .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
+    });
+
+    try waitForRawDelete(alloc, &db, "doc:expired_worker", 200);
 
     var stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    attempts = 0;
-    while ((stats.ttl_cleanup.runs == 0 or stats.ttl_cleanup.deleted_docs == 0) and attempts < 32) : (attempts += 1) {
-        clock.advanceMs(10);
-        yieldToBackground();
+    var attempts: usize = 0;
+    while (stats.ttl_cleanup.deleted_docs == 0 and attempts < 200) : (attempts += 1) {
+        sleepPollInterval();
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }
+
+    try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.runs > 0);
     try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
 }
@@ -58916,6 +62374,36 @@ test "db scan returns hashes and projected documents" {
     try std.testing.expectEqual(@as(usize, 2), result.documents.len);
     try std.testing.expect(std.mem.indexOf(u8, result.documents[0].json, "\"title\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.documents[0].json, "\"body\"") == null);
+}
+
+test "db scan applies structured filter before limit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"tenant\":\"t1\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"tenant\":\"t2\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"tenant\":\"t2\"}" },
+        },
+    });
+
+    var result = try db.scan(alloc, "", "", .{
+        .include_all_fields = false,
+        .limit = 1,
+        .filter_query_json = "{\"term\":{\"tenant\":\"t2\"}}",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.hashes.len);
+    try std.testing.expectEqualStrings("doc:b", result.hashes[0].id);
+    try std.testing.expectEqual(@as(usize, 0), result.documents.len);
 }
 
 test "db updateRange constrains index backfill" {

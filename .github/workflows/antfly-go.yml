@@ -31,6 +31,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GO_VERSION: "1.26.4"
   TOKENIZERS_VERSION: "1.26.0"
   ONNXRUNTIME_VERSION: "1.24.3"

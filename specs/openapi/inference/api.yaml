@@ -935,6 +935,18 @@ components:
             - document
             - classification
             - clustering
+        error_policy:
+          type: string
+          description: |
+            Controls how dense embedding requests report per-input failures.
+            `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+            `per_item` returns successful embeddings in `data` and indexed
+            permanent/transient failures in `errors` without failing the
+            entire HTTP request.
+          default: fail_fast
+          enum:
+            - fail_fast
+            - per_item
     EmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
@@ -959,6 +971,65 @@ components:
           description: Model used for embedding generation
         usage:
           $ref: '#/components/schemas/EmbeddingUsage'
+        errors:
+          type: array
+          description: Indexed per-input failures. Only populated when request error_policy is per_item.
+          items:
+            $ref: '#/components/schemas/EmbeddingItemError'
+        summary:
+          $ref: '#/components/schemas/EmbeddingBatchSummary'
+    EmbeddingItemError:
+      type: object
+      description: Per-input embedding failure for error_policy=per_item responses
+      required:
+        - index
+        - code
+        - message
+        - stage
+        - retryable
+        - status
+      properties:
+        index:
+          type: integer
+          description: Original input index that failed
+        code:
+          type: string
+          description: Stable machine-readable failure code
+        message:
+          type: string
+          description: Human-readable failure message
+        stage:
+          type: string
+          description: Pipeline stage that classified the failure
+          enum:
+            - parse
+            - fetch
+            - image_decode
+            - audio_decode
+            - text_inference
+            - image_inference
+            - audio_inference
+            - inference
+        retryable:
+          type: boolean
+          description: Whether retrying the same item may succeed
+        status:
+          type: integer
+          description: HTTP-style status classification for this item
+    EmbeddingBatchSummary:
+      type: object
+      description: Counts for per-item embedding responses
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
     SparseVector:
       type: object
       description: A sparse vector with parallel index/value arrays, sorted by index ascending
@@ -997,76 +1068,13 @@ components:
               type: string
               description: 'MIME type: text/plain, audio/wav, image/png, etc.'
     VADOptions:
-      type: object
-      description: Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific.
-      properties:
-        min_silence_duration_ms:
-          type: integer
-          description: 'Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.'
-        min_speech_duration_ms:
-          type: integer
-          description: 'Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.'
-        speech_pad_ms:
-          type: integer
-          description: 'Padding (ms) added before and after detected speech. Default: 30.'
-        max_segment_duration_ms:
-          type: integer
-          description: 'Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.'
+      $ref: '../shared/chunking.yaml#/components/schemas/VADOptions'
     AudioChunkConfig:
-      type: object
-      description: Audio chunking configuration for inference, including VAD options.
-      properties:
-        window_duration_ms:
-          type: integer
-          description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
-        overlap_duration_ms:
-          type: integer
-          description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
-        vad:
-          $ref: '#/components/schemas/VADOptions'
+      $ref: '../shared/chunking.yaml#/components/schemas/InferenceAudioChunkConfig'
     ChunkConfig:
-      type: object
-      description: |
-        Configuration for chunking requests to Inference API.
-        Combines shared text options with inference-specific audio/VAD options.
-      properties:
-        model:
-          type: string
-          description: The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-          default: fixed
-          example: fixed
-        max_chunks:
-          type: integer
-          description: Maximum number of chunks to generate per document.
-        threshold:
-          type: number
-          format: float
-          description: Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
-        text:
-          $ref: '#/components/schemas/TextChunkOptions'
-        audio:
-          $ref: '#/components/schemas/AudioChunkConfig'
+      $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkConfig'
     ChunkRequest:
-      type: object
-      properties:
-        input:
-          description: |
-            Input content to chunk. Supports two formats:
-            - Text string: `"This is a long document..."` (backward compatible)
-            - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
-            - ContentPart: `{"type": "text", "text": "..."}`
-          oneOf:
-            - type: string
-              description: Text to chunk (backward compatible)
-            - $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
-              description: Content part (text or media)
-        text:
-          type: string
-          deprecated: true
-          description: 'DEPRECATED: Use ''input'' instead. Text to chunk.'
-          example: This is a long document that needs to be split into smaller chunks...
-        config:
-          $ref: '#/components/schemas/ChunkConfig'
+      $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkRequest'
     ChunkResponse:
       type: object
       required:

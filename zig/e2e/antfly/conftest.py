@@ -132,10 +132,13 @@ def wait_for_server(
     path: str = "/status",
     *,
     allow_unauthorized: bool = False,
+    processes: list[tuple[str, subprocess.Popen[Any]]] | None = None,
 ) -> bool:
     deadline = time.monotonic() + timeout
     consecutive_successes = 0
     while time.monotonic() < deadline:
+        if _dead_process_statuses(processes):
+            return False
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
             resp = requests.get(f"{url}{path}", timeout=request_timeout)
@@ -186,7 +189,7 @@ def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflySer
     raise last_error
 
 
-def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
+def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool = False) -> dict[str, Any] | None:
     status = index_info.get("status")
     if status is None:
         return None
@@ -202,6 +205,17 @@ def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if status.get("catch_up_active", False):
         return None
+    if require_query_fresh:
+        expected_groups = status.get("expected_groups")
+        fresh_groups = status.get("fresh_groups")
+        if isinstance(expected_groups, int) and expected_groups > 0:
+            if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+                return None
+        stale_groups = status.get("stale_groups")
+        if isinstance(stale_groups, int) and stale_groups > 0:
+            return None
+        if status.get("runtime_fresh") is False:
+            return None
     return status
 
 
@@ -264,22 +278,60 @@ def raise_request_error_with_logs(
     server_ref: AntflyServer | PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
 ) -> None:
     logs = ""
-    proc_status = None
+    proc_statuses: list[str] = []
     if server_ref is not None:
         logs = server_ref.debug_logs().strip()
-        proc = getattr(server_ref, "proc", None)
-        if proc is not None:
-            proc_status = proc.poll()
-    if not logs and proc_status is None:
+        for name, proc in _server_processes(server_ref):
+            proc_statuses.append(f"{name}: {proc.poll()}")
+    if not logs and not proc_statuses:
         raise err
     message = f"{err}\nserver logs:\n{logs}"
-    if proc_status is not None:
-        message += f"\nserver exit status: {proc_status}"
+    if proc_statuses:
+        message += f"\nserver exit status:\n" + "\n".join(proc_statuses)
     raise err.__class__(
         message,
         request=getattr(err, "request", None),
         response=getattr(err, "response", None),
     ) from err
+
+
+def raise_if_server_process_exited(server_ref: Any) -> None:
+    statuses = _dead_process_statuses(_server_processes(server_ref))
+    if not statuses:
+        return
+    logs = server_ref.debug_logs().strip() if server_ref is not None else ""
+    message = "server process exited during request retry"
+    if logs:
+        message += f"\nserver logs:\n{logs}"
+    message += "\nserver exit status:\n" + "\n".join(statuses)
+    raise RuntimeError(message)
+
+
+def _dead_process_statuses(processes: list[tuple[str, subprocess.Popen[Any]]] | None) -> list[str]:
+    statuses: list[str] = []
+    for name, proc in processes or []:
+        status = proc.poll()
+        if status is not None:
+            statuses.append(f"{name}: {status}")
+    return statuses
+
+
+def _server_processes(server_ref: Any) -> list[tuple[str, subprocess.Popen[Any]]]:
+    processes: list[tuple[str, subprocess.Popen[Any]]] = []
+    proc = getattr(server_ref, "proc", None)
+    if proc is not None:
+        processes.append(("proc", proc))
+    metadata_proc = getattr(server_ref, "metadata_proc", None)
+    if metadata_proc is not None:
+        processes.append(("metadata_proc", metadata_proc))
+    data_proc = getattr(server_ref, "data_proc", None)
+    if data_proc is not None:
+        processes.append(("data_proc", data_proc))
+    nested = getattr(server_ref, "_server", None)
+    if nested is not None and nested is not server_ref:
+        for name, nested_proc in _server_processes(nested):
+            processes.append((f"_server.{name}", nested_proc))
+    return processes
 
 
 def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
@@ -575,7 +627,11 @@ class StatefulAntflyServer:
             stderr=subprocess.STDOUT,
             cwd=self.root,
         )
-        if not wait_for_server(self.metadata_admin_url, path="/metadata/v1/status"):
+        if not wait_for_server(
+            self.metadata_admin_url,
+            path="/metadata/v1/status",
+            processes=[("metadata_proc", self.metadata_proc)],
+        ):
             self.metadata_log_file.flush()
             metadata_out = _read_log_tail(self.metadata_log_path)
             self.stop()
@@ -596,7 +652,11 @@ class StatefulAntflyServer:
             stderr=subprocess.STDOUT,
             cwd=self.root,
         )
-        if not wait_for_server(self.api_url, allow_unauthorized=self.auth_enabled):
+        if not wait_for_server(
+            self.api_url,
+            allow_unauthorized=self.auth_enabled,
+            processes=[("metadata_proc", self.metadata_proc), ("data_proc", self.data_proc)],
+        ):
             self.metadata_log_file.flush()
             self.data_log_file.flush()
             metadata_out = _read_log_tail(self.metadata_log_path)
@@ -1387,14 +1447,22 @@ def serverless_api(serverless_runtime):
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
+        def wait_index_ready(
+            self,
+            table_name: str,
+            index_name: str,
+            *,
+            timeout_s: float = 30.0,
+            interval_s: float = 0.5,
+            require_query_fresh: bool = False,
+        ) -> dict:
             deadline = time.monotonic() + timeout_s
             last_info: dict[str, Any] | None = None
             last_error: BaseException | None = None
             while True:
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
-                    ready = ready_index_status(last_info)
+                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
                     if ready is not None:
                         return ready
                 except requests.RequestException as exc:
@@ -1899,7 +1967,7 @@ def stateful_api():
             return self.get(lookup_key_path(table_name, key))
 
         def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
-            response = self._request("POST", f"/tables/{table_name}/lookup", payload)
+            response = self._request("POST", f"/tables/{table_name}/documents", payload)
             if response.status_code >= 400:
                 return self._check(response)
             if not response.content:
@@ -2224,7 +2292,7 @@ def backup_api():
             return self.get(lookup_key_path(table_name, key))
 
         def scan_keys(self, table_name: str, payload: dict) -> list[dict]:
-            response = self._request("POST", f"/tables/{table_name}/lookup", payload)
+            response = self._request("POST", f"/tables/{table_name}/documents", payload)
             if response.status_code >= 400:
                 return self._check(response)
             if not response.content:
@@ -2256,14 +2324,22 @@ def backup_api():
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
+        def wait_index_ready(
+            self,
+            table_name: str,
+            index_name: str,
+            *,
+            timeout_s: float = 30.0,
+            interval_s: float = 0.5,
+            require_query_fresh: bool = False,
+        ) -> dict:
             deadline = time.monotonic() + timeout_s
             last_info: dict[str, Any] | None = None
             last_error: BaseException | None = None
             while True:
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
-                    ready = ready_index_status(last_info)
+                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
                     if ready is not None:
                         return ready
                 except requests.RequestException as exc:

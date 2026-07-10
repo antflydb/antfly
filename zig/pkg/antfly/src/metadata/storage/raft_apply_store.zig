@@ -1078,7 +1078,9 @@ pub const RaftApplyStore = struct {
             .upsert_store => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
-                const value = try encodeStoreRecord(self.alloc, record);
+                const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
+                defer metadata_table_manager.freeStore(self.alloc, applied);
+                const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
@@ -1086,7 +1088,7 @@ pub const RaftApplyStore = struct {
                     .kind = .store,
                     .metadata_group_id = group_id,
                     .store_id = record.store_id,
-                    .node_id = record.node_id,
+                    .node_id = applied.node_id,
                 });
             },
             .register_store => |record| {
@@ -1779,6 +1781,19 @@ pub const RaftApplyStore = struct {
             applied.drain_requested = existing_record.drain_requested;
         } else {
             applied.drain_requested = false;
+        }
+        return applied;
+    }
+
+    fn normalizeStoreUpsertDrainIntentTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.StoreRecord,
+    ) !metadata.StoreRecord {
+        var applied = try metadata_table_manager.cloneStore(self.alloc, record);
+        if (try self.nodeDrainRequestedTxn(txn, group_id, record.node_id)) {
+            applied.drain_requested = true;
         }
         return applied;
     }
@@ -4133,6 +4148,50 @@ test "metadata raft apply store resolves stale store drain intent at apply time"
     try std.testing.expect(metadata_table_manager.nodeLifecycleActive(nodes[0].lifecycle));
     try std.testing.expectEqual(@as(usize, 1), stores.len);
     try std.testing.expect(!stores[0].drain_requested);
+}
+
+test "metadata raft apply store preserves node drain across store upsert" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-store-upsert-drain-apply", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const registered_store_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .register_store = .{ .store_id = 12, .node_id = 12, .role = "data", .health_class = "healthy", .live = true },
+    });
+    defer std.testing.allocator.free(registered_store_cmd);
+    const draining_node_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .request_node_shutdown = .{ .node_id = 12 } });
+    defer std.testing.allocator.free(draining_node_cmd);
+    const stale_active_store_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{ .store_id = 12, .node_id = 12, .role = "data", .health_class = "healthy", .live = true, .drain_requested = false },
+    });
+    defer std.testing.allocator.free(stale_active_store_cmd);
+
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = registered_store_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = draining_node_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = stale_active_store_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 24,
+        .commit_index = 3,
+        .entries_bytes = encoded_entries,
+    });
+
+    const nodes = try store.listNodes(std.testing.allocator, 24);
+    defer store.freeNodes(std.testing.allocator, nodes);
+    const stores = try store.listStores(std.testing.allocator, 24);
+    defer store.freeStores(std.testing.allocator, stores);
+
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expect(!metadata_table_manager.nodeLifecycleActive(nodes[0].lifecycle));
+    try std.testing.expectEqual(@as(usize, 1), stores.len);
+    try std.testing.expect(stores[0].drain_requested);
 }
 
 test "metadata raft apply store ignores stale drained first store registration after cancellation" {

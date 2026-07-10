@@ -10,6 +10,9 @@ permissions:
   packages: write # Required if publishing Docker images
   id-token: write # Required for keyless OIDC signing in container workflow
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-zig-runtime-archives:
     name: Build Zig archive (${{ matrix.artifact_name }})
@@ -268,7 +271,8 @@ jobs:
           registry-url: https://registry.npmjs.org/
 
       - name: Upgrade npm for OIDC support
-        run: npm install -g npm@latest
+        # npm 12.0.0 omitted sigstore from its published bundle: npm/cli#9722.
+        run: npm install -g npm@11
 
       - name: Publish npm packages
         run: |

@@ -22,8 +22,8 @@ pub const std_options: std.Options = .{
 };
 
 var log_err_count: usize = 0;
-var arg_buffer: [8192]u8 = undefined;
-const max_filters = 64;
+var arg_buffer: [32768]u8 = undefined;
+const max_filters = 256;
 var test_filters: [max_filters][]const u8 = undefined;
 var test_filter_count: usize = 0;
 var skip_test_filters: [max_filters][]const u8 = undefined;
@@ -70,9 +70,21 @@ pub fn main(init: std.process.Init.Minimal) void {
     var fail_count: usize = 0;
     var leak_count: usize = 0;
     var total_count: usize = 0;
+    var matched_filter_counts = [_]usize{0} ** max_filters;
 
     for (test_fns) |test_fn| {
+        recordMatchingIncludeFilters(test_fn.name, &matched_filter_counts);
         if (matchesFilter(test_fn.name)) total_count += 1;
+    }
+
+    var missing_filter_count: usize = 0;
+    for (test_filters[0..test_filter_count], 0..) |filter, filter_index| {
+        if (matched_filter_counts[filter_index] != 0) continue;
+        missing_filter_count += 1;
+        std.debug.print("test filter matched no declared tests: {s}\n", .{filter});
+    }
+    if (missing_filter_count != 0) {
+        std.process.exit(1);
     }
 
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
@@ -145,6 +157,12 @@ fn matchesFilter(name: []const u8) bool {
         if (matchesSingleFilter(name, filter)) return false;
     }
     return true;
+}
+
+fn recordMatchingIncludeFilters(name: []const u8, matched_filter_counts: *[max_filters]usize) void {
+    for (test_filters[0..test_filter_count], 0..) |filter, filter_index| {
+        if (matchesSingleFilter(name, filter)) matched_filter_counts[filter_index] += 1;
+    }
 }
 
 fn matchesSingleFilter(name: []const u8, filter: []const u8) bool {

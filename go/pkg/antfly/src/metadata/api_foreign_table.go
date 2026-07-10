@@ -136,7 +136,7 @@ func (t *TableApi) runForeignQuery(ctx context.Context, queryReq *QueryRequest, 
 		Status: http.StatusOK,
 		Hits: QueryHits{
 			Hits:  hits,
-			Total: uint64(result.Total), //nolint:gosec // G115: bounded value, cannot overflow in practice
+			Total: exactQueryHitsTotalFromInt(result.Total),
 		},
 		Took:  time.Since(startTime),
 		Table: queryReq.Table,

@@ -1519,7 +1519,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
     try std.testing.expect(query_result.profile != null);
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator, "{\"deletes\":[\"doc:a\"]}");
@@ -5982,7 +5982,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?.value);
     try expectQueryProfileSummary(std.heap.page_allocator, query_result.profile, 2, true);
 
     const graph_query_body = try test_contract_helpers.encodeGraphTraverseQueryRequest(
@@ -6137,7 +6137,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var ref_graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, ref_graph_query.body, .{});
     defer ref_graph_responses.deinit();
     const ref_query_result = ref_graph_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), ref_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), ref_query_result.hits.?.total.?.value);
     const ref_graph_result = ref_query_result.graph_results.?.map.get("walk_from_text").?;
     try std.testing.expectEqual(@as(i64, 2), ref_graph_result.total);
     try expectGraphNodeKeys(ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
@@ -6158,7 +6158,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var fused_ref_graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, fused_ref_graph_query.body, .{});
     defer fused_ref_graph_responses.deinit();
     const fused_ref_query_result = fused_ref_graph_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), fused_ref_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), fused_ref_query_result.hits.?.total.?.value);
     const fused_ref_graph_result = fused_ref_query_result.graph_results.?.map.get("walk_from_fused").?;
     try std.testing.expectEqual(@as(i64, 2), fused_ref_graph_result.total);
     try expectGraphNodeKeys(fused_ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
@@ -6462,7 +6462,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?.value);
     try expectQueryProfileSummary(std.heap.page_allocator, query_result.profile, 1, false);
 
     const graph_query_body = try test_contract_helpers.encodeGraphNeighborsQueryRequest(

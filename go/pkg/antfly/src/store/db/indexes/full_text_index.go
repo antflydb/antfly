@@ -976,43 +976,15 @@ func (bi *BleveIndexV2) Stats() IndexStats {
 	rawStats := bi.bidx.StatsMap()
 
 	// Extract the nested index stats if available
-	indexStats, ok := rawStats["index"].(map[string]any)
-	if !ok {
+	if _, ok := rawStats["index"].(map[string]any); !ok {
 		// If the structure is different, return a minimal stats map
 		return FullTextIndexStats{
 			Error: "unable to parse index statistics",
 		}.AsIndexStats()
 	}
 
-	getUnsigned := func(m map[string]any, key string) uint64 {
-		if val, ok := m[key]; ok {
-			switch v := val.(type) {
-			case uint64:
-				return v
-			case int64:
-				if v < 0 {
-					return 0
-				}
-				return uint64(v)
-			case int:
-				if v < 0 {
-					return 0
-				}
-				return uint64(v)
-			case float64:
-				if v < 0 {
-					return 0
-				}
-				return uint64(v)
-			}
-		}
-		return 0
-	}
-
-	// Extract relevant stats
-	is := FullTextIndexStats{
-		DiskUsage: getUnsigned(indexStats, "CurOnDiskBytes"),
-	}
+	// Extract relevant stats.
+	is := FullTextIndexStats{}
 	// cleanStats := map[string]any{
 	// "disk_usage": getUnsigned(indexStats, "CurOnDiskBytes"),
 	// "disk_files": getNumeric(indexStats, "CurOnDiskFiles"),
@@ -1041,11 +1013,12 @@ func (bi *BleveIndexV2) Stats() IndexStats {
 		is.Error = err.Error()
 	} else {
 		is.TotalIndexed = docCount
+		is.DocCount = docCount
 	}
 	if bi.backfilling.Load() {
 		is.Rebuilding = true
+		is.BackfillActive = true
 		is.BackfillProgress = bi.loadBackfillProgress()
-		is.BackfillItemsProcessed = bi.backfillItemsProcessed.Load()
 	}
 
 	return is.AsIndexStats()

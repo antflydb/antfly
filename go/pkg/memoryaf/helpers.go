@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	client "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 // mustMarshal marshals v to JSON or panics.
@@ -24,14 +26,25 @@ type hit struct {
 
 // queryResponse is the raw Antfly query response envelope.
 type queryResponse struct {
-	Responses []struct {
-		Hits struct {
-			Hits  []rawHit `json:"hits"`
-			Total uint64   `json:"total"`
-		} `json:"hits"`
-		Aggregations map[string]aggregationResult `json:"aggregations"`
-		Error        string                       `json:"error"`
-	} `json:"responses"`
+	Responses []queryResult `json:"responses"`
+}
+
+type queryResult struct {
+	Hits         queryHits                    `json:"hits"`
+	Aggregations map[string]aggregationResult `json:"aggregations"`
+	Error        string                       `json:"error"`
+}
+
+type queryHits struct {
+	Hits  []rawHit              `json:"hits"`
+	Total client.QueryHitsTotal `json:"total"`
+}
+
+func exactQueryHitsTotal(value uint64) client.QueryHitsTotal {
+	return client.QueryHitsTotal{
+		Relation: client.QueryHitsTotalRelationExact,
+		Value:    value,
+	}
 }
 
 type rawHit struct {
@@ -106,7 +119,7 @@ func statsFromResponse(data []byte) (*MemoryStats, error) {
 
 	r := resp.Responses[0]
 	return &MemoryStats{
-		TotalMemories:   int(r.Hits.Total),
+		TotalMemories:   int(client.QueryHitsTotalValue(r.Hits.Total)),
 		ByType:          bucketsToMap(r.Aggregations["by_type"]),
 		ByProject:       bucketsToMap(r.Aggregations["by_project"]),
 		ByTag:           bucketsToMap(r.Aggregations["by_tag"]),

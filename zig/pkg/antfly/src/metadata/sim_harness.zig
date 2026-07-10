@@ -729,7 +729,7 @@ fn expectCountProfile(
     var count_profile_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, count_profile_query.body, .{});
     defer count_profile_responses.deinit();
     const count_profile_result = count_profile_responses.value.responses.?[0];
-    try std.testing.expectEqual(expected_total_hits, count_profile_result.hits.?.total.?);
+    try std.testing.expectEqual(expected_total_hits, count_profile_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), count_profile_result.hits.?.hits.?.len);
     try std.testing.expect(count_profile_result.profile != null);
     try std.testing.expectEqual(expected_shards, count_profile_result.profile.?.object.get("shards").?.object.get("total").?.integer);
@@ -5469,7 +5469,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);
@@ -5550,11 +5550,15 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
 
     var auth_managers: [3]SimAuthManager = undefined;
     var auth_count: usize = 0;
-    errdefer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    var auth_init_complete = false;
+    errdefer if (!auth_init_complete) {
+        for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    };
     for (&auth_managers) |*auth| {
         auth.* = try SimAuthManager.init(sim_alloc);
         auth_count += 1;
     }
+    auth_init_complete = true;
     defer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
 
     const roots = [_][]const u8{ root_a, root_b, root_c };

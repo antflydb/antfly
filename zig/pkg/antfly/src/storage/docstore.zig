@@ -1092,6 +1092,16 @@ pub const DocStore = struct {
         return if (next <= 1) 0 else next - 1;
     }
 
+    pub fn lastReplaySequenceFromTxn(_: *DocStore, txn: *Txn, fallback_last: u64) !u64 {
+        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+            error.NotFound => return fallback_last,
+            else => return err,
+        };
+        if (raw.len != 8) return error.CorruptReplayMetadata;
+        const next = std.mem.readInt(u64, raw[0..8], .little);
+        return if (next <= 1) 0 else next - 1;
+    }
+
     pub fn latestReplaySequenceForHint(self: *DocStore, hint: change_journal_mod.TargetHint, fallback_last: u64) !u64 {
         return try self.latestReplaySequenceForOrdinal(replayHintOrdinal(hint), fallback_last);
     }
@@ -1502,6 +1512,52 @@ pub const DocStore = struct {
         return owned;
     }
 
+    /// Scan up to `limit` keys with the given prefix after `after_key`.
+    /// Caller owns returned slices.
+    pub fn scanPrefixPage(
+        self: *DocStore,
+        alloc: Allocator,
+        prefix: []const u8,
+        after_key: ?[]const u8,
+        limit: usize,
+    ) ![]OwnedKVPair {
+        if (limit == 0) return try alloc.dupe(OwnedKVPair, &.{});
+
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        var results = std.ArrayListUnmanaged(OwnedKVPair).empty;
+        errdefer {
+            for (results.items) |item| {
+                alloc.free(item.key);
+                alloc.free(item.value);
+            }
+            results.deinit(alloc);
+        }
+
+        const bounded_after_key = if (after_key) |key| if (std.mem.startsWith(u8, key, prefix)) key else null else null;
+        const seek_key = bounded_after_key orelse prefix;
+        var entry = (try cur.seekAtOrAfter(seek_key)) orelse return try alloc.dupe(OwnedKVPair, results.items);
+        while (true) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (bounded_after_key == null or std.mem.order(u8, entry.key, bounded_after_key.?) == .gt) {
+                try results.append(alloc, .{
+                    .key = try alloc.dupe(u8, entry.key),
+                    .value = try alloc.dupe(u8, entry.value),
+                });
+                if (results.items.len >= limit) break;
+            }
+            entry = (try cur.next()) orelse break;
+        }
+
+        const owned = try alloc.dupe(OwnedKVPair, results.items);
+        results.deinit(alloc);
+        return owned;
+    }
+
     /// Scan keys in [lower, upper). Caller owns returned slices.
     pub fn scanRange(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8) ![]OwnedKVPair {
         var txn = try self.beginReadTxn();
@@ -1566,6 +1622,7 @@ pub const DocStore = struct {
     pub const ScanOptions = struct {
         /// Return true to skip this key (callback not invoked).
         skip_fn: ?*const fn (key: []const u8) bool = null,
+        reverse: bool = false,
         /// When set, scan starts at the first key strictly greater than lower.
         lower_exclusive: bool = false,
     };
@@ -1610,37 +1667,69 @@ pub const DocStore = struct {
     ) !void {
         var txn = try self.beginReadTxn();
         defer txn.abort();
+        try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
 
+    pub fn scanReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        options: ScanOptions,
+        ctx: ?*anyopaque,
+        callback: ScanWithContextCallback,
+    ) !void {
+        _ = self;
         var cur = try txn.openCursor();
         defer cur.close();
-        cur.setUpperBound(if (upper.len > 0) upper else null);
+        if (!options.reverse) {
+            cur.setUpperBound(if (upper.len > 0) upper else null);
 
-        // Seek to first key >= lower (use .first when lower is empty)
-        const first = if (lower.len == 0)
-            (try cur.first()) orelse return
-        else
-            (try cur.seekAtOrAfter(lower)) orelse return;
+            // Seek to first key >= lower (use .first when lower is empty)
+            const first = if (lower.len == 0)
+                (try cur.first()) orelse return
+            else
+                (try cur.seekAtOrAfter(lower)) orelse return;
 
-        // Check upper bound
-        if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
+            // Check upper bound
+            if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
 
-        // Process first entry
-        if (!options.lower_exclusive or lower.len == 0 or !std.mem.eql(u8, first.key, lower)) {
-            if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
-                const action = try callback(ctx, first.key, first.value);
+            // Process first entry
+            if (!options.lower_exclusive or lower.len == 0 or !std.mem.eql(u8, first.key, lower)) {
+                if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
+                    const action = try callback(ctx, first.key, first.value);
+                    if (action == .stop) return;
+                }
+            }
+
+            // Iterate remaining
+            var entry = try cur.next();
+            while (entry) |kv| : (entry = try cur.next()) {
+                if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
+                if (options.skip_fn) |skip| {
+                    if (skip(kv.key)) continue;
+                }
+                const action = try callback(ctx, kv.key, kv.value);
                 if (action == .stop) return;
             }
+            return;
         }
 
-        // Iterate remaining
-        var entry = try cur.next();
-        while (entry) |kv| : (entry = try cur.next()) {
-            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
-            if (options.skip_fn) |skip| {
-                if (skip(kv.key)) continue;
+        var entry = if (upper.len == 0)
+            try cur.last()
+        else
+            try cur.seekAtOrBefore(upper);
+        while (entry) |kv| {
+            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) {
+                entry = try cur.prev();
+                continue;
             }
-            const action = try callback(ctx, kv.key, kv.value);
-            if (action == .stop) return;
+            if (lower.len > 0 and std.mem.order(u8, kv.key, lower) == .lt) break;
+            if (options.skip_fn == null or !options.skip_fn.?(kv.key)) {
+                const action = try callback(ctx, kv.key, kv.value);
+                if (action == .stop) return;
+            }
+            entry = try cur.prev();
         }
     }
 
@@ -2224,6 +2313,38 @@ test "docstore streaming scan visits all keys" {
     try store.scan("b", "d", .{}, &Context.cb);
     try std.testing.expectEqual(@as(usize, 2), Context.count);
     try std.testing.expectEqual(@as(u8, 'c'), Context.last_key[0]);
+}
+
+test "docstore streaming scan supports reverse bounded ranges" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+
+    var store = try DocStore.open(std.testing.allocator, path, .{});
+    defer store.close();
+
+    try store.put("a", "1");
+    try store.put("b", "2");
+    try store.put("c", "3");
+    try store.put("d", "4");
+
+    const Context = struct {
+        var keys: [3]u8 = undefined;
+        var count: usize = 0;
+
+        fn cb(key: []const u8, _: []const u8) anyerror!DocStore.ScanAction {
+            keys[count] = key[0];
+            count += 1;
+            return .@"continue";
+        }
+    };
+    Context.count = 0;
+
+    try store.scan("a", "d", .{ .reverse = true }, &Context.cb);
+    try std.testing.expectEqual(@as(usize, 3), Context.count);
+    try std.testing.expectEqual(@as(u8, 'c'), Context.keys[0]);
+    try std.testing.expectEqual(@as(u8, 'b'), Context.keys[1]);
+    try std.testing.expectEqual(@as(u8, 'a'), Context.keys[2]);
 }
 
 test "docstore streaming scan skip_fn" {

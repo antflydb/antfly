@@ -919,6 +919,17 @@ pub const DBCore = struct {
         return try self.store.scanRange(alloc, lower, upper);
     }
 
+    pub fn scanStoreRangeWithContext(
+        self: *DBCore,
+        lower: []const u8,
+        upper: []const u8,
+        options: docstore_mod.DocStore.ScanOptions,
+        ctx: ?*anyopaque,
+        callback: docstore_mod.DocStore.ScanWithContextCallback,
+    ) !void {
+        return try self.store.scanWithContext(lower, upper, options, ctx, callback);
+    }
+
     pub fn findMedianStoreKey(
         self: *DBCore,
         alloc: Allocator,

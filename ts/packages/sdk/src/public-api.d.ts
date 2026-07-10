@@ -940,7 +940,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/lookup": {
+    "/db/v1/tables/{tableName}/documents": {
         parameters: {
             query?: never;
             header?: never;
@@ -953,10 +953,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Scan keys in a table within a key range
+         * Scan documents in a table within a key range
          * @description Scans keys in a table within an optional key range and returns them as
          *     newline-delimited JSON (NDJSON). Each line contains a JSON object with
-         *     the key and optionally projected document fields. This is useful for
+         *     the `_id` document identifier and optionally projected document fields. This is useful for
          *     iterating through all keys in a table or a subset of keys within a range.
          */
         post: operations["scanKeys"];
@@ -1054,7 +1054,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * List artifact repair issues
+         * List table repair issues
          * @description Lists durable repair debt for a table. This operator-facing endpoint
          *     returns exact document keys, artifact keys, index names, and repair
          *     errors, and therefore requires table admin permission when authentication
@@ -1062,7 +1062,7 @@ export interface paths {
          *     supports `target=artifact` for durable artifact queue entries and
          *     `target=index` for index repair candidates.
          */
-        post: operations["listArtifactRepairIssues"];
+        post: operations["listTableRepairIssues"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1083,17 +1083,119 @@ export interface paths {
         put?: never;
         /**
          * Run a bounded table repair pass
-         * @description Attempts to repair queued table issues. `target=artifact` reprocesses
+         * @description Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
          *     supported artifact kinds and replays derived state; it is bounded by
          *     `limit` and returns an opaque continuation cursor when another artifact
-         *     repair page is available. `target=index` repairs one named index after
-         *     resetting its derived index storage; healthy indexes are skipped unless
-         *     `force=true` is supplied, and any positive `limit` permits that single
-         *     named index repair. The response reports unresolved debt separately, and
-         *     the endpoint requires table admin permission when authentication is
-         *     enabled.
+         *     repair page is available. `target=index` repairs one named index by
+         *     building a shadow replacement, catching it up to the current derived
+         *     replay sequence, and atomically swapping it into service; healthy
+         *     indexes are skipped unless `force=true` is supplied, and any positive
+         *     `limit` permits that single named index repair. The response reports
+         *     unresolved debt separately, and the endpoint requires table admin
+         *     permission when authentication is enabled.
          */
         post: operations["runTableRepair"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable table repair job
+         * @description Creates a durable table repair job for large or long-running repair work.
+         *     The job stores progress and accumulated counters across bounded advance
+         *     calls. Use this endpoint instead of synchronous `runTableRepair` when
+         *     repairing large indexes or when clients need retryable progress.
+         */
+        post: operations["startTableRepairJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a table repair job */
+        get: operations["getTableRepairJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a table repair job
+         * @description Runs at most one bounded repair pass for the job. Concurrent advances use the job lease and return the current running state.
+         */
+        post: operations["advanceTableRepairJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a table repair job
+         * @description Cancels a queued table repair job. If a repair pass is already running,
+         *     the response returns the current running state; cancellation is applied
+         *     only at pass boundaries so the API never reports a committed in-flight
+         *     pass as cancelled.
+         */
+        post: operations["cancelTableRepairJob"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1260,7 +1362,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cancel a derived document artifact reprocess job */
+        /**
+         * Cancel a derived document artifact reprocess job
+         * @description Cancels a queued document artifact reprocess job. If a reprocess pass is
+         *     already running, the response returns the current running state;
+         *     cancellation is applied only at pass boundaries so the API never reports
+         *     a committed in-flight pass as cancelled.
+         */
         post: operations["cancelDocumentArtifactReprocessJob"];
         delete?: never;
         options?: never;
@@ -2376,6 +2484,66 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        ExactSortError: {
+            /**
+             * @description Stable error class.
+             * @example unsupported_exact_sort
+             */
+            error: string;
+            /**
+             * @description Human-readable error summary.
+             * @example exact sort is unsupported for this query
+             */
+            message: string;
+            /**
+             * @description Stable machine-readable rejection reason. Known exact-sort
+             *     reasons include `unmapped_field`, `non_sortable_field`,
+             *     `unsupported_sort_field`, `mixed_field_type`,
+             *     `field_not_sort_ready`, `filter_not_queryable`,
+             *     `invalid_cursor_arity`, `invalid_cursor_type`,
+             *     `invalid_sort_tuple`, `approximate_candidate_source`,
+             *     `candidate_budget_exceeded`, `missing_null_policy`,
+             *     `non_score_bearing_source`, `invalid_score_value`,
+             *     `count_only_ordered_page`, `stored_json_sort_disabled`,
+             *     `unsupported_exact_sort`, and `distributed_merge_unsupported`.
+             * @example field_not_sort_ready
+             */
+            reason: string;
+            /**
+             * @description Stable exact-sort rejection reason; uses the same stable reason taxonomy as `reason`.
+             * @example field_not_sort_ready
+             */
+            sort_rejection_reason: string;
+            /**
+             * @description Stable budget rejection reason when the rejection was
+             *     budget-driven. Known values include
+             *     `text_exact_late_visibility_totals`,
+             *     `text_field_sort_candidate_window`,
+             *     `match_all_candidate_collect_limit`,
+             *     `match_all_exact_candidate_window`,
+             *     `sorted_segment_scan_window`, and
+             *     `distributed_merge_shard_window`.
+             * @example text_field_sort_candidate_window
+             */
+            budget_rejection_reason?: string;
+            /**
+             * @description Stable user-facing exact-sort rejection detail. Internal storage
+             *     and planner details are reserved for logs, traces, and explicit
+             *     debug surfaces.
+             * @example field_not_sort_ready
+             */
+            sort_rejection_detail: string;
+            /**
+             * @description Sort field associated with the rejection when safe to expose.
+             * @example created_at
+             */
+            sort_rejection_field: string;
+            /**
+             * Format: int32
+             * @example 422
+             */
+            status: number;
+        };
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -2737,7 +2905,7 @@ export interface components {
          * @description Kind of stored artifact tracked by the repair queue.
          * @enum {string}
          */
-        ArtifactRepairKind: "embedding" | "asset" | "chunk" | "graph" | "full_text";
+        ArtifactRepairKind: "embedding" | "asset" | "chunk" | "graph" | "full_text" | "algebraic";
         /**
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}
@@ -2748,8 +2916,8 @@ export interface components {
          * @enum {string}
          */
         RepairTarget: "artifact" | "index";
-        /** @description Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers. */
-        ArtifactRepairIssue: {
+        /** @description Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status. */
+        TableRepairIssue: {
             artifact_kind: components["schemas"]["ArtifactRepairKind"];
             /** @description Index whose replay or derived state observed the artifact problem. */
             index_name: string;
@@ -2799,7 +2967,7 @@ export interface components {
             last_error?: string;
         };
         /** @description Bounded page of table repair issues. */
-        ArtifactRepairIssueList: {
+        TableRepairIssueList: {
             /** @description Table whose repair queue was listed. */
             table: string;
             target: components["schemas"]["RepairTarget"];
@@ -2822,7 +2990,7 @@ export interface components {
             has_more: boolean;
             /** @description Opaque cursor for the next page when has_more is true. */
             next_cursor?: string | null;
-            issues: components["schemas"]["ArtifactRepairIssue"][];
+            issues: components["schemas"]["TableRepairIssue"][];
         };
         /** @description Bounded request to list table repair issues. */
         RepairIssueListRequest: {
@@ -2863,8 +3031,8 @@ export interface components {
              */
             limit?: number;
         };
-        /** @description Result of one bounded artifact repair pass. */
-        ArtifactRepairRunResult: {
+        /** @description Result of one bounded table repair pass. */
+        TableRepairRunResult: {
             /**
              * Format: uint64
              * @description Number of repair records attempted by this pass.
@@ -2897,7 +3065,7 @@ export interface components {
             failed: number;
             /**
              * Format: uint64
-             * @description Number of repair records skipped because no reprocessor exists for the artifact kind.
+             * @description Number of repair records skipped because no automated repair exists for the selected target.
              */
             unsupported: number;
             /**
@@ -2905,6 +3073,11 @@ export interface components {
              * @description Number of attempted repair records that remained queued after this pass.
              */
             unresolved: number;
+            /**
+             * Format: uint64
+             * @description Number of selected repair records or indexes skipped because another repair pass already owns them.
+             */
+            in_progress: number;
             /**
              * Format: uint64
              * @description Number of indexes rebuilt by this pass when target is index.
@@ -2922,13 +3095,13 @@ export interface components {
             limit: number;
             /** @description Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor. */
             next_cursor?: string | null;
-            /** @description Whether another artifact scan page is available via next_cursor. */
+            /** @description Whether another repair scan page is available via next_cursor. */
             has_more: boolean;
             /** @description Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records. */
             debt_remaining: boolean;
         };
         /** @description Response for a bounded table repair pass. */
-        ArtifactRepairRunResponse: {
+        TableRepairRunResponse: {
             /** @description Table whose repair queue was processed. */
             table: string;
             target: components["schemas"]["RepairTarget"];
@@ -2937,7 +3110,91 @@ export interface components {
              * @description Effective repair limit.
              */
             limit: number;
-            result: components["schemas"]["ArtifactRepairRunResult"];
+            result: components["schemas"]["TableRepairRunResult"];
+        };
+        /** @description Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair. */
+        TableRepairJobStartRequest: {
+            /** @default artifact */
+            target?: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Restrict repair attempts to one index name. */
+            index?: string;
+            /** @description Opaque cursor returned by a prior repair response. */
+            cursor?: string;
+            /**
+             * @description Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+             * @default false
+             */
+            force?: boolean;
+            /**
+             * Format: uint32
+             * @description Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+             * @default 100
+             */
+            limit?: number;
+            /**
+             * @description When true, the server immediately attempts the first bounded repair pass before returning the job.
+             * @default true
+             */
+            advance?: boolean;
+        };
+        /** @description Durable table repair job state. */
+        TableRepairJob: {
+            /**
+             * Format: uint64
+             * @description Server-assigned durable repair job identifier.
+             */
+            job_id: number;
+            /**
+             * Format: uint64
+             * @description Monotonic execution attempt token for the current running pass.
+             */
+            attempt_id: number;
+            /** @description Table being repaired. */
+            table_name: string;
+            /**
+             * @description Lifecycle phase of the repair job.
+             * @enum {string}
+             */
+            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            /**
+             * @description User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+             * @enum {string}
+             */
+            repair_status: "in_progress" | "complete" | "debt_remaining" | "stopped";
+            target: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Index name when the job is restricted to one index. */
+            index?: string;
+            /** @description Opaque continuation cursor for the next bounded repair pass. */
+            cursor?: string | null;
+            /**
+             * Format: uint32
+             * @description Effective per-pass repair limit.
+             */
+            limit: number;
+            /** @description Whether the job forces a named index rebuild. */
+            force: boolean;
+            result: components["schemas"]["TableRepairRunResult"];
+            /** @description Last stable job-level error code. */
+            last_error?: string | null;
+            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled. */
+            cancel_requested: boolean;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job was created.
+             */
+            created_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job state was last updated.
+             */
+            last_updated_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job is eligible for cleanup.
+             */
+            expires_at_millis: number;
         };
         DocumentArtifactReprocessResponse: {
             /**
@@ -3059,6 +3316,11 @@ export interface components {
              * @description Server-assigned durable repair job identifier.
              */
             job_id: number;
+            /**
+             * Format: uint64
+             * @description Monotonic execution attempt token for the current running pass.
+             */
+            attempt_id: number;
             /** @description Table containing the source documents being repaired. */
             table_name: string;
             /** @description Name of the derived artifact being repaired. */
@@ -3100,19 +3362,21 @@ export interface components {
             shard_cursors: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
             /** @description Last terminal or transient job error, when available. */
             last_error?: string | null;
+            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled. */
+            cancel_requested: boolean;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp when the job was created.
+             * @description Unix epoch milliseconds when the job was created.
              */
             created_at_millis: number;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp when the job was last updated.
+             * @description Unix epoch milliseconds when the job was last updated.
              */
             last_updated_at_millis: number;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp after which the retained job status may be removed.
+             * @description Unix epoch milliseconds after which the retained job status may be removed.
              */
             expires_at_millis: number;
         };
@@ -3341,6 +3605,57 @@ export interface components {
              */
             replication_sources?: components["schemas"]["ReplicationSource"][];
         };
+        /** @description Public field capability derived from Antfly schema mappings and observed dynamic field metadata. */
+        FieldCapability: {
+            /** @description Mapping or dynamic-template name, when applicable. */
+            name?: string;
+            /** @description Concrete query field path when known. Pattern-only dynamic templates may omit this. */
+            field?: string;
+            /** @description Dynamic-template path_match pattern, when applicable. */
+            path_pattern?: string;
+            /** @description Dynamic-template match pattern, when applicable. */
+            field_pattern?: string;
+            /** @description Dynamic-template match_mapping_type, when applicable. */
+            match_mapping_type?: string;
+            /** @description Physical emitted field name for schema-derived text fields, when different from the logical path. */
+            emitted_name?: string;
+            /** @description Document schema that produced this capability, when applicable. */
+            document_schema?: string;
+            type: components["schemas"]["AntflyType"];
+            /**
+             * @description Query modes supported by this concrete field variant. These modes are derived from
+             *     Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
+             *     `search_as_you_type`; they are not separate schema toggles.
+             */
+            query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete")[];
+            /**
+             * @description Whether this concrete field is declared sortable in the effective
+             *     capability model. Public exact order_by accepts it only when
+             *     sort_lifecycle_state is queryable or accelerated.
+             */
+            sortable: boolean;
+            /** @description Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic. */
+            provenance: string;
+            /** @description Current missing/null handling policy for this field. */
+            missing_null_policy: string;
+            /**
+             * @description Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+             * @enum {string}
+             */
+            sort_lifecycle_state: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
+            /** @description Analyzer name for text/searchable fields, when applicable. */
+            analyzer?: string;
+            /**
+             * Format: int64
+             * @description Zero-based position in the table index_sort tuple when this field participates.
+             */
+            index_sort_position?: number;
+            /**
+             * @description Sort direction in the table index_sort tuple when this field participates.
+             * @enum {string}
+             */
+            index_sort_order?: "asc" | "desc";
+        };
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
         Table: {
@@ -3361,6 +3676,13 @@ export interface components {
             migration?: components["schemas"]["TableMigration"];
             /** @description PostgreSQL CDC replication sources configured for this table. */
             replication_sources?: components["schemas"]["ReplicationSource"][];
+            /**
+             * @description Effective runtime field capabilities for this table. Clients can use this to discover
+             *     concrete field variants and their supported query modes, such as full_text, exact,
+             *     range, geo, and autocomplete. Public exact field sort is supported only for `_id`
+             *     or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+             */
+            field_capabilities?: components["schemas"]["FieldCapability"][];
         };
         /** @description Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema. */
         TableMigration: {
@@ -5257,6 +5579,10 @@ export interface components {
              *     - Status filtering: `"status:published"`
              *     - Date ranges: `"created_at:>2023-01-01"`
              *     - Category filtering: `"+category:technology +language:en"`
+             *     - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}`
+             *
+             *     For structured `geo_bbox`, `min_lon > max_lon` intentionally
+             *     represents a bounding box that crosses the antimeridian.
              * @example {
              *       "query": "+category:technology +year:>2020",
              *       "boost": 1
@@ -5351,14 +5677,33 @@ export interface components {
              */
             limit?: number;
             /**
-             * @description Number of results to skip for pagination. Only available for full_text_search queries.
-             *     Not supported for semantic_search due to vector index limitations.
+             * @description Number of results to skip for pagination. Supported for text-backed,
+             *     match_all, and filter-only requests. Not supported for semantic_search
+             *     due to vector index limitations.
              * @example 0
              */
             offset?: number;
             /**
+             * @description Optional query execution deadline in milliseconds. The server applies this as a
+             *     cooperative deadline across query planning, search execution, aggregation reruns,
+             *     sorting, and response post-processing. If the deadline expires before the query
+             *     completes, the HTTP API returns 504.
+             * @example 5000
+             */
+            timeout_ms?: number;
+            /**
              * @description Sort order for results. Array of sort fields with direction.
-             *     Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+             *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
+             *     Supported for exact text-backed, match_all, and filter-only requests
+             *     when each non-`_id` field is a mapped exact scalar field with sortable
+             *     native doc-value coverage. Sortable mapping types are keyword,
+             *     numeric/number/integer, boolean/bool, datetime/date/timestamp, and
+             *     link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+             *     blob, html, object, and array fields are not directly sortable; sort
+             *     on an exact scalar mapping such as `title.keyword` instead. Requests
+             *     that cannot be executed through an exact native sort path return 422
+             *     rather than falling back to stored JSON sorting. Semantic searches
+             *     are always sorted by similarity score. Not supported when `count` is true.
              * @example [
              *       {
              *         "field": "created_at",
@@ -5373,16 +5718,32 @@ export interface components {
             order_by?: components["schemas"]["SortField"][];
             /**
              * @description Cursor for forward pagination. Pass the `_sort` values from the last hit
-             *     of the previous page. Mutually exclusive with `offset`.
-             *     Requires `order_by` to be set. Only supported for full_text_search queries.
+             *     of the previous page exactly, including the appended `_id` tie-breaker.
+             *     Values preserve their JSON types; for example numbers remain numbers,
+             *     booleans remain booleans, and strings remain strings. Cursor values
+             *     must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+             *     numbers are rejected.
+             *     Mutually exclusive with `offset`.
+             *     When `order_by` is omitted, Antfly uses `_id` ascending as the effective
+             *     order and the cursor tuple must contain exactly one `_id` string.
+             *     Supported for exact text-backed, match_all, and filter-only requests;
+             *     not supported for semantic_search or count-only requests.
              */
-            search_after?: string[];
+            search_after?: unknown[];
             /**
              * @description Cursor for backward pagination. Pass the `_sort` values from the first hit
-             *     of the current page. Mutually exclusive with `offset`.
-             *     Requires `order_by` to be set. Only supported for full_text_search queries.
+             *     of the current page exactly, including the appended `_id` tie-breaker.
+             *     Values preserve their JSON types; for example numbers remain numbers,
+             *     booleans remain booleans, and strings remain strings. Cursor values
+             *     must be replayable JSON scalars; nulls, arrays, objects, and non-finite
+             *     numbers are rejected.
+             *     Mutually exclusive with `offset`.
+             *     When `order_by` is omitted, Antfly uses `_id` ascending as the effective
+             *     order and the cursor tuple must contain exactly one `_id` string.
+             *     Supported for exact text-backed, match_all, and filter-only requests;
+             *     not supported for semantic_search or count-only requests.
              */
-            search_before?: string[];
+            search_before?: unknown[];
             /**
              * Format: float
              * @description Maximum distance threshold for semantic similarity search. Results with distance
@@ -5408,7 +5769,9 @@ export interface components {
             merge_config?: components["schemas"]["MergeConfig"];
             /**
              * @description If true, returns only the total count of matching documents without retrieving the actual documents.
-             *     Useful for pagination and displaying result counts.
+             *     Useful for pagination and displaying result counts. Count-only requests
+             *     do not return an ordered result page, so `order_by`, `search_after`,
+             *     and `search_before` are not supported when this is true.
              * @example false
              */
             count?: boolean;
@@ -5726,6 +6089,183 @@ export interface components {
             reranker?: components["schemas"]["RerankerProfile"];
             /** @description Result merge statistics (present for hybrid search). */
             merge?: components["schemas"]["MergeProfile"];
+            /** @description Sort execution statistics (present when the query used ordered page options and profiling was enabled). */
+            sort?: components["schemas"]["SortProfile"];
+        };
+        /**
+         * @description Sort execution profile. These fields are the stable public diagnostic
+         *     surface. Low-level implementation counters such as doc-value load
+         *     timings, stored-source loads, collector/window internals, cost-model
+         *     inputs, native-filter modes, and index-sort availability flags are kept
+         *     out of normal SDK-facing query responses and may appear only in
+         *     internal debug logs or explicit debug surfaces.
+         */
+        SortProfile: {
+            /**
+             * @description Stable physical sort plan name. Known values include `none`,
+             *     `id_only`, `id_seek`, `sorted_segment_seek`,
+             *     `native_doc_values_top_n`, `score_top_k`,
+             *     `distributed_k_way_merge`, `stored_json_debug`, and
+             *     `unsupported_exact_sort`. Public exact sort requests must not
+             *     silently move from native plans to `stored_json_debug`; missing
+             *     native coverage is reported through the rejection fields instead.
+             */
+            plan?: string;
+            /** @description Requested order fields, including the implicit _id tie-breaker when applicable. */
+            order_by?: components["schemas"]["SortField"][];
+            /** @description Cursor mode for this request. */
+            cursor?: string;
+            /**
+             * @description Exactness class for the selected plan. Known values include
+             *     `none`, `exact`, `bounded_exact`, `approximate`, and
+             *     `unsupported`.
+             */
+            exactness?: string;
+            /**
+             * @description Sort execution primitive used by the selected plan. Known values
+             *     include `none`, `candidate_collector`, `primary_key_scan`,
+             *     `sorted_segment_scan`, `score_top_k`, `doc_values_collector`,
+             *     `distributed_merge`, `stored_json_debug`, and `unsupported`.
+             */
+            source?: string;
+            /**
+             * @description Exact candidate source consumed by the selected sort primitive.
+             * @enum {string}
+             */
+            candidate_source?: "none" | "existing_hits" | "match_all" | "primary_key" | "native_filter" | "sorted_segment_membership" | "text_postings" | "distributed_shards" | "vector_top_k" | "composed";
+            /**
+             * @description Cursor support level for the selected plan. Known values include
+             *     `none`, `comparator`, `segment_seek`, `distributed_seek`, and
+             *     `unsupported`.
+             */
+            cursor_support?: string;
+            /**
+             * @description Stored source load strategy. Known values include `none`,
+             *     `source_free`, `projected_source_after_page`,
+             *     `stored_source_required`, and `unsupported`.
+             */
+            source_load?: string;
+            /**
+             * @description Distributed sort behavior. Known values include `none`,
+             *     `shard_local_only`, `coordinator_merge`, and `unsupported`.
+             */
+            distributed_behavior?: string;
+            /**
+             * @description Stable reason the planner selected this sort plan. Known values
+             *     include `none`, `unsupported_exact_sort`,
+             *     `distributed_k_way_merge`, `stored_json_debug`,
+             *     `id_candidate_order`, `id_primary_key_seek`, `score_top_k`,
+             *     `index_sort_sorted_segment_seek`, `sorted_segment_seek`,
+             *     `doc_values_collector`, `index_sort_unavailable_doc_values_collector`,
+             *     `caller_selected_doc_values_collector`, and
+             *     `selective_filter_doc_values_collector`.
+             */
+            selection_reason?: string;
+            /** @description Whether exact execution required native typed sort values. */
+            require_native?: boolean;
+            /**
+             * @description Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
+             * @enum {string}
+             */
+            sort_lifecycle_state?: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
+            /**
+             * @description Physical index_sort coverage status for the requested order. Known
+             *     values include `request_mismatch`, `no_live_segments`,
+             *     `missing_segment_index_sort`, `covered_without_bounds`, and
+             *     `covered_with_bounds`.
+             */
+            index_sort_coverage?: string;
+            /**
+             * Format: int64
+             * @description Candidate documents considered by sort execution.
+             */
+            candidate_count?: number;
+            /**
+             * Format: int64
+             * @description Candidates rejected by cursor comparison.
+             */
+            cursor_rejected_count?: number;
+            /**
+             * Format: int64
+             * @description Hits selected for the returned page.
+             */
+            selected_count?: number;
+            /**
+             * Format: int64
+             * @description Total sort execution time in microseconds.
+             */
+            total_us?: number;
+            /**
+             * Format: int64
+             * @description Shards participating in distributed sort execution.
+             */
+            distributed_shard_count?: number;
+            /**
+             * @description Stable budget rejection reason. Known values include
+             *     `text_exact_late_visibility_totals`,
+             *     `text_field_sort_candidate_window`,
+             *     `match_all_candidate_collect_limit`,
+             *     `match_all_exact_candidate_window`,
+             *     `sorted_segment_scan_window`, and
+             *     `distributed_merge_shard_window`.
+             */
+            budget_rejection_reason?: string;
+            /**
+             * @description Stable public exact-sort rejection reason. Known values include
+             *     `unmapped_field`, `non_sortable_field`,
+             *     `unsupported_sort_field`, `mixed_field_type`,
+             *     `field_not_sort_ready`, `filter_not_queryable`,
+             *     `invalid_cursor_arity`, `invalid_cursor_type`,
+             *     `invalid_sort_tuple`, `approximate_candidate_source`,
+             *     `candidate_budget_exceeded`, `missing_null_policy`,
+             *     `non_score_bearing_source`, `invalid_score_value`,
+             *     `count_only_ordered_page`, `stored_json_sort_disabled`,
+             *     `unsupported_exact_sort`, and
+             *     `distributed_merge_unsupported`.
+             */
+            sort_rejection_reason?: string;
+            /**
+             * @description Stable rejection detail. Known exact-sort details include
+             *     `unmapped_sort_field`, `unmapped_field`,
+             *     `non_sortable_sort_field`, `non_scalar_field`,
+             *     `non_sortable_field`, `mixed_field_type`,
+             *     `missing_doc_values_section`, `malformed_doc_values_section`,
+             *     `doc_values_kind_mismatch`, `sparse_live_doc_values`,
+             *     `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`,
+             *     `unsupported_doc_values_type`, `missing_doc_values_coverage`,
+             *     `missing_doc_values_capability`, `schema_declared`,
+             *     `observed_declared`, `not_declared`, `missing_doc_values`,
+             *     `non_sortable`, `declared`, `text_search_only`, `mixed`,
+             *     `missing_native_filter_coverage`, `invalid_cursor_arity`,
+             *     `invalid_cursor_type`, `invalid_sort_tuple`,
+             *     `sort_tuple_arity`, `invalid_doc_value_type`,
+             *     `missing_runtime_mapping`, `incomplete_sort_tuple`,
+             *     `mixed_sort_value_domain`, `unsorted_shard_window`,
+             *     `unsorted_component_window`,
+             *     `non_numeric_score`, `missing_score`, `non_finite_score`,
+             *     `score_sort_tuple_mismatch`, `non_score_bearing_source`,
+             *     `id_tiebreaker_mismatch`, `approximate_candidate_source`,
+             *     `count_only_ordered_page`, `native_sort_loader_unavailable`,
+             *     `sorted_segment_executor_unavailable`,
+             *     `primary_key_stream_unavailable`,
+             *     `native_candidate_stream_unavailable`,
+             *     `candidate_stream_unavailable`, `incompatible_sort_plan`,
+             *     `sorted_segment_bounds_unavailable`,
+             *     `filter_query_json_unresolved`,
+             *     `exclusion_query_json_unresolved`,
+             *     `text_index_entry_unavailable`,
+             *     `doc_ordinal_projection_unavailable`,
+             *     `component_sort_profile_missing`,
+             *     `unsupported_composed_sort_source`,
+             *     `stored_json_sort_disabled`, `distributed_merge_unsupported`,
+             *     `distributed_merge_plan_required`,
+             *     `distributed_shard_window_incomplete`,
+             *     `distributed_shard_cursor_window_invalid`, and
+             *     `distributed_merge_shard_window`.
+             */
+            sort_rejection_detail?: string;
+            /** @description Sort field associated with the rejection when safe to expose. */
+            sort_rejection_field?: string;
         };
         /** @description Shard-level execution statistics. */
         ShardsProfile: {
@@ -5892,23 +6432,35 @@ export interface components {
             };
             /**
              * @description Sort key values for this hit. Pass as search_after or search_before
-             *     to paginate to the next/previous page. Only present when order_by is specified.
+             *     to paginate to the next/previous page. Values preserve their JSON
+             *     types. Present for ordered result pages, including cursor-only
+             *     requests whose effective order is `_id` ascending.
              */
-            _sort?: string[];
+            _sort?: unknown[];
         };
         /** @description A list of query hits. */
         QueryHits: {
-            /**
-             * Format: uint64
-             * @description Total number of hits available.
-             */
-            total?: number;
+            /** @description Total number of hits available and whether it is exact. */
+            total?: components["schemas"]["QueryHitsTotal"];
             hits?: components["schemas"]["QueryHit"][];
             /**
              * Format: float
              * @description Maximum score of the results.
              */
             max_score?: number;
+        };
+        /** @description Total hit count metadata. */
+        QueryHitsTotal: {
+            /**
+             * Format: uint64
+             * @description Hit count value.
+             */
+            value: number;
+            /**
+             * @description Whether value is exact or a lower bound.
+             * @enum {string}
+             */
+            relation: "exact" | "gte";
         };
         /** @description Responses from multiple query operations. */
         QueryResponses: {
@@ -7789,10 +8341,25 @@ export interface components {
              */
             include_in_all?: boolean;
             /**
-             * @description Whether to enable doc values for sorting/faceting
+             * @description Whether this exact scalar field can be used in order_by. Supported
+             *     sortable mapping types are keyword, numeric/number/integer,
+             *     boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+             *     search_as_you_type, geo, embedding, blob, html, object, and array
+             *     fields are not directly sortable; use an exact scalar subfield such
+             *     as title.keyword for sorted string pagination. When true, Antfly
+             *     derives the internal typed doc-value structures required for exact
+             *     sorting; users should not configure doc_values directly.
              * @default false
              */
-            doc_values?: boolean;
+            sortable?: boolean;
+            /**
+             * @description Missing/null sort policy for this mapped field. The current production
+             *     policy rejects missing or null native sort values so sorted cursors
+             *     remain replayable JSON scalar tuples.
+             * @default missing_rejected
+             * @enum {string}
+             */
+            missing_null_policy?: "missing_rejected";
         };
         /**
          * @description A rule for mapping dynamically detected fields. Templates are checked in order
@@ -8008,12 +8575,30 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat. */
         GeoBoundingBoxQuery: {
-            /** @description [lon, lat] */
-            top_left: number[];
-            /** @description [lon, lat] */
-            bottom_right: number[];
-            field?: string;
+            /** @description Field or path containing geo_point values. */
+            field: string;
+            /**
+             * Format: double
+             * @description Southern latitude bound.
+             */
+            min_lat: number;
+            /**
+             * Format: double
+             * @description Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+             */
+            min_lon: number;
+            /**
+             * Format: double
+             * @description Northern latitude bound. Must be greater than or equal to min_lat.
+             */
+            max_lat: number;
+            /**
+             * Format: double
+             * @description Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
+             */
+            max_lon: number;
             boost?: components["schemas"]["Boost"];
         };
         GeoDistanceQuery: {
@@ -8071,6 +8656,8 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            /** @description Whether the index is actively rebuilding, replaying, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Progress of ongoing rebuild as fraction [0.0, 1.0]
@@ -8081,6 +8668,48 @@ export interface components {
              * @description Number of documents indexed during current rebuild
              */
             backfill_items_processed?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
+            /**
+             * Format: uint64
+             * @description Number of documents visible to the index.
+             */
+            doc_count?: number;
+            /**
+             * Format: uint64
+             * @description Number of indexed terms when available.
+             */
+            term_count?: number;
+            /**
+             * Format: uint64
+             * @description Highest replay sequence applied to the index runtime.
+             */
+            replay_applied_sequence?: number;
+            /**
+             * Format: uint64
+             * @description Replay sequence the index runtime must reach to be current.
+             */
+            replay_target_sequence?: number;
+            /** @description Whether replay must catch up before the index is fully current. */
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** @description Full-text merge runtime diagnostics. */
+            text_merge?: {
+                [key: string]: unknown;
+            };
+            /** @description Asynchronous indexer runtime diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             /** @description Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required. */
             projection_checkpoint_status?: string;
             /**
@@ -8108,6 +8737,35 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
@@ -8145,6 +8803,8 @@ export interface components {
              * @description Number of documents pending enrichment in the WAL
              */
             wal_backlog?: number;
+            /** @description Whether the index is actively rebuilding, replaying, enriching, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Backfill progress as a ratio from 0.0 to 1.0
@@ -8155,6 +8815,63 @@ export interface components {
              * @description Total items processed during backfill
              */
             backfill_items_processed?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
+            /**
+             * Format: uint64
+             * @description Number of documents visible to the index.
+             */
+            doc_count?: number;
+            /**
+             * Format: uint64
+             * @description Documents currently visible to queries.
+             */
+            query_visible_doc_count?: number;
+            /** Format: uint64 */
+            published_doc_count?: number;
+            /** Format: uint64 */
+            published_node_count?: number;
+            /** Format: uint64 */
+            root_node?: number;
+            /** Format: uint64 */
+            published_root_node?: number;
+            /** Format: uint64 */
+            dense_replay_applied_sequence?: number;
+            /** Format: uint64 */
+            dense_replay_target_sequence?: number;
+            /** @description Whether dense/vector artifacts still need publication before queries see the latest data. */
+            dense_publish_pending?: boolean;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** @description Embedding enrichment worker runtime diagnostics. */
+            enrichment_runtime?: {
+                /** Format: uint64 */
+                pending_sequence_count?: number;
+            } & {
+                [key: string]: unknown;
+            };
+            hbc_cache?: {
+                [key: string]: unknown;
+            };
+            hbc_posting?: {
+                [key: string]: unknown;
+            };
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             /** @description Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required. */
             projection_checkpoint_status?: string;
             /**
@@ -8182,6 +8899,37 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {
@@ -8203,6 +8951,8 @@ export interface components {
             };
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
+            /** @description Whether the index is actively rebuilding, materializing, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Rebuild progress as a ratio from 0.0 to 1.0
@@ -8213,6 +8963,49 @@ export interface components {
              * @description Number of edges indexed during current rebuild
              */
             backfill_items_processed?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
+            /**
+             * Format: uint64
+             * @description Number of documents covered by the graph index.
+             */
+            doc_count?: number;
+            /**
+             * Format: uint64
+             * @description Number of graph edges currently indexed.
+             */
+            edge_count?: number;
+            /**
+             * Format: uint64
+             * @description Number of graph nodes currently indexed.
+             */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** @description Graph source artifact materialization status. */
+            source_artifact?: {
+                [key: string]: unknown;
+            };
+            /** @description Resolver replay diagnostics for graph materialization. */
+            resolver_replay?: {
+                [key: string]: unknown;
+            };
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             /** @description Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required. */
             projection_checkpoint_status?: string;
             /**
@@ -8240,6 +9033,33 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
             /** @description Algebraic graph execution health for bounded semiring traversal. */
             algebraic_graph?: {
                 traversal?: {
@@ -8277,6 +9097,8 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the sidecar is currently rebuilding */
             rebuilding?: boolean;
+            /** @description Whether the sidecar is actively rebuilding, replaying, or catching up. */
+            backfill_active?: boolean;
             /**
              * Format: double
              * @description Backfill progress as a ratio from 0.0 to 1.0
@@ -8287,6 +9109,33 @@ export interface components {
              * @description Number of documents processed during current backfill
              */
             backfill_items_processed?: number;
+            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            backfill_state?: string;
+            /**
+             * Format: uint64
+             * @description Number of documents visible to the sidecar.
+             */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             healthy?: boolean;
             /** Format: uint64 */
             parse_error_count?: number;
@@ -8361,6 +9210,43 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Source artifact stream used to materialize graph edges. */
+            source_artifact?: {
+                [key: string]: unknown;
+            };
+            /** @description Graph resolver replay diagnostics. */
+            resolver_replay?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
@@ -9701,6 +10587,16 @@ export interface components {
              * @enum {string}
              */
             input_type?: "search_query" | "search_document" | "query" | "document" | "classification" | "clustering";
+            /**
+             * @description Controls how dense embedding requests report per-input failures.
+             *     `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+             *     `per_item` returns successful embeddings in `data` and indexed
+             *     permanent/transient failures in `errors` without failing the
+             *     entire HTTP request.
+             * @default fail_fast
+             * @enum {string}
+             */
+            error_policy?: "fail_fast" | "per_item";
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
         InferenceEmbedResponse: {
@@ -9714,6 +10610,33 @@ export interface components {
             /** @description Model used for embedding generation */
             model: string;
             usage: components["schemas"]["InferenceEmbeddingUsage"];
+            /** @description Indexed per-input failures. Only populated when request error_policy is per_item. */
+            errors?: components["schemas"]["InferenceEmbeddingItemError"][];
+            summary?: components["schemas"]["InferenceEmbeddingBatchSummary"];
+        };
+        /** @description Per-input embedding failure for error_policy=per_item responses */
+        InferenceEmbeddingItemError: {
+            /** @description Original input index that failed */
+            index: number;
+            /** @description Stable machine-readable failure code */
+            code: string;
+            /** @description Human-readable failure message */
+            message: string;
+            /**
+             * @description Pipeline stage that classified the failure
+             * @enum {string}
+             */
+            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "inference";
+            /** @description Whether retrying the same item may succeed */
+            retryable: boolean;
+            /** @description HTTP-style status classification for this item */
+            status: number;
+        };
+        /** @description Counts for per-item embedding responses */
+        InferenceEmbeddingBatchSummary: {
+            total: number;
+            succeeded: number;
+            failed: number;
         };
         /** @description A sparse vector with parallel index/value arrays, sorted by index ascending */
         InferenceSparseVector: {
@@ -9729,60 +10652,14 @@ export interface components {
             /** @description MIME type: text/plain, audio/wav, image/png, etc. */
             mime_type: string;
         };
-        /** @description Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific. */
-        InferenceVADOptions: {
-            /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
-            min_silence_duration_ms?: number;
-            /** @description Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250. */
-            min_speech_duration_ms?: number;
-            /** @description Padding (ms) added before and after detected speech. Default: 30. */
-            speech_pad_ms?: number;
-            /** @description Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000. */
-            max_segment_duration_ms?: number;
-        };
-        /** @description Audio chunking configuration for inference, including VAD options. */
-        InferenceAudioChunkConfig: {
-            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
-            window_duration_ms?: number;
-            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
-            overlap_duration_ms?: number;
-            vad?: components["schemas"]["InferenceVADOptions"];
-        };
-        /**
-         * @description Configuration for chunking requests to Inference API.
-         *     Combines shared text options with inference-specific audio/VAD options.
-         */
-        InferenceChunkConfig: {
-            /**
-             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-             * @default fixed
-             * @example fixed
-             */
-            model?: string;
-            /** @description Maximum number of chunks to generate per document. */
-            max_chunks?: number;
-            /**
-             * Format: float
-             * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
-             */
-            threshold?: number;
-            text?: components["schemas"]["InferenceTextChunkOptions"];
-            audio?: components["schemas"]["InferenceAudioChunkConfig"];
-        };
         InferenceChunkRequest: {
             /**
              * @description Input content to chunk. Supports two formats:
-             *     - Text string: `"This is a long document..."` (backward compatible)
+             *     - Text string: `"This is a long document..."`
              *     - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
              *     - ContentPart: `{"type": "text", "text": "..."}`
              */
-            input?: string | components["schemas"]["ContentPart"];
-            /**
-             * @deprecated
-             * @description DEPRECATED: Use 'input' instead. Text to chunk.
-             * @example This is a long document that needs to be split into smaller chunks...
-             */
-            text?: string;
+            input: string | components["schemas"]["InferenceChunkContentPart"];
             config?: components["schemas"]["InferenceChunkConfig"];
         };
         /**
@@ -10680,15 +11557,6 @@ export interface components {
              */
             wasm?: boolean;
         };
-        /** @description Options specific to text chunking. */
-        InferenceTextChunkOptions: {
-            /** @description Target number of tokens per chunk. */
-            target_tokens?: number;
-            /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
-            overlap_tokens?: number;
-            /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
-            separator?: string;
-        };
         /** @description Text content with character offsets. */
         InferenceTextContent: {
             /** @description The chunk text content */
@@ -11119,6 +11987,48 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Content part supported by chunking requests. */
+        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"];
+        /** @description Options for Voice Activity Detection (VAD) based audio segmentation. */
+        VADOptions: {
+            /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
+            min_silence_duration_ms?: number;
+            /** @description Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250. */
+            min_speech_duration_ms?: number;
+            /** @description Padding (ms) added before and after detected speech. Default: 30. */
+            speech_pad_ms?: number;
+            /** @description Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000. */
+            max_segment_duration_ms?: number;
+        };
+        /** @description Audio chunking configuration for inference, including VAD options. */
+        InferenceAudioChunkConfig: {
+            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
+            window_duration_ms?: number;
+            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
+            overlap_duration_ms?: number;
+            vad?: components["schemas"]["VADOptions"];
+        };
+        /**
+         * @description Configuration for chunking requests to Antfly inference.
+         *     Combines shared text options with inference-specific audio/VAD options.
+         */
+        InferenceChunkConfig: {
+            /**
+             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
+            /** @description Maximum number of chunks to generate per document. */
+            max_chunks?: number;
+            /**
+             * Format: float
+             * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+             */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["InferenceAudioChunkConfig"];
+        };
     };
     responses: {
         /** @description Bad request */
@@ -11182,6 +12092,15 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Exact sort cannot be executed through a supported native plan */
+        UnsupportedExactSort: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ExactSortError"];
             };
         };
         /** @description Internal server error */
@@ -11952,6 +12871,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            422: components["responses"]["UnsupportedExactSort"];
             /** @description Internal server error */
             500: {
                 headers: {
@@ -12235,6 +13155,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            422: components["responses"]["UnsupportedExactSort"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -12540,7 +13461,7 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
-    listArtifactRepairIssues: {
+    listTableRepairIssues: {
         parameters: {
             query?: never;
             header?: never;
@@ -12556,13 +13477,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Artifact repair issue page */
+            /** @description Table repair issue page */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ArtifactRepairIssueList"];
+                    "application/json": components["schemas"]["TableRepairIssueList"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -12587,18 +13508,161 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Bounded table repair pass was accepted */
-            202: {
+            /** @description Bounded table repair pass completed */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ArtifactRepairRunResponse"];
+                    "application/json": components["schemas"]["TableRepairRunResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    startTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["TableRepairJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Job completed during the initial advance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job accepted or advanced but not terminal. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job reached a terminal phase. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job remains queued or running. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    cancelTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job cancelled or already terminal. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -12821,8 +13885,17 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Reprocess job was cancelled or already terminal */
+            /** @description Reprocess job cancelled or already terminal. */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };

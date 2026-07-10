@@ -1,0 +1,25 @@
+openapi: 3.0.3
+info:
+  title: Antfly Sort Types
+  version: "1.0.0"
+  description: Shared sort tuple definitions used by Antfly query and index contracts.
+paths: {}
+components:
+  schemas:
+    SortDirection:
+      type: boolean
+      description: "Sort direction for a single field. true = descending, false = ascending."
+    SortField:
+      type: object
+      description: "A single sort field with direction."
+      additionalProperties: false
+      required:
+        - field
+      properties:
+        field:
+          type: string
+          description: "The field name to sort by."
+        desc:
+          type: boolean
+          default: false
+          description: "Sort direction. true = descending, false = ascending."

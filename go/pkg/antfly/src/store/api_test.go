@@ -765,7 +765,7 @@ func TestHandleSearch_PreservesCompositeSortCursorAndTokens(t *testing.T) {
 		BlevePagingOpts: indexes.FullTextPagingOptions{
 			OrderBy: []indexes.SortField{{Field: "tags"}},
 			Limit:   2,
-			SearchAfter: []string{
+			SearchAfter: []any{
 				"bravo",
 			},
 		},
@@ -786,7 +786,7 @@ func TestHandleSearch_PreservesCompositeSortCursorAndTokens(t *testing.T) {
 	mockShard.On("Search", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		var forwarded indexes.RemoteIndexSearchRequest
 		require.NoError(t, json.Unmarshal(args.Get(1).([]byte), &forwarded))
-		require.Equal(t, []string{"bravo"}, forwarded.BlevePagingOpts.SearchAfter)
+		require.Equal(t, []any{"bravo"}, forwarded.BlevePagingOpts.SearchAfter)
 		require.Equal(t, "tags", forwarded.BlevePagingOpts.OrderBy[0].Field)
 	}).Return(respBytes, nil)
 
@@ -818,7 +818,7 @@ func TestHandleSearch_PreservesSyntheticCompositeSortSentinel(t *testing.T) {
 		BlevePagingOpts: indexes.FullTextPagingOptions{
 			OrderBy: []indexes.SortField{{Field: "mixed_scalar"}},
 			Limit:   2,
-			SearchAfter: []string{
+			SearchAfter: []any{
 				bleveCompositeSortSentinel,
 			},
 		},
@@ -840,7 +840,7 @@ func TestHandleSearch_PreservesSyntheticCompositeSortSentinel(t *testing.T) {
 	mockShard.On("Search", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		var forwarded indexes.RemoteIndexSearchRequest
 		require.NoError(t, json.Unmarshal(args.Get(1).([]byte), &forwarded))
-		require.Equal(t, []string{bleveCompositeSortSentinel}, forwarded.BlevePagingOpts.SearchAfter)
+		require.Equal(t, []any{bleveCompositeSortSentinel}, forwarded.BlevePagingOpts.SearchAfter)
 	}).Return(respBytes, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/search", bytes.NewReader(jsonBody))

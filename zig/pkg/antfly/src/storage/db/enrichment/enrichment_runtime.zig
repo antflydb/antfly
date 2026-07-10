@@ -102,6 +102,12 @@ const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
 const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 
+const CoverageMarkerDelete = struct {
+    key: []u8,
+    had_marker: bool,
+    counter_key: ?[]u8 = null,
+};
+
 const GeneratedReplayWindow = struct {
     alloc: Allocator,
     documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
@@ -110,6 +116,7 @@ const GeneratedReplayWindow = struct {
     changed_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
     dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
+    coverage_marker_deletes: std.ArrayListUnmanaged(CoverageMarkerDelete) = .empty,
 
     fn isEmpty(self: *const @This()) bool {
         return self.documents.items.len == 0 and
@@ -170,6 +177,9 @@ const GeneratedReplayWindow = struct {
             self.alloc.free(@constCast(embedding.values));
         }
         self.sparse_embeddings.deinit(self.alloc);
+
+        clearQueuedCoverageMarkerDeletes(self.alloc, &self.coverage_marker_deletes);
+        self.coverage_marker_deletes.deinit(self.alloc);
     }
 };
 
@@ -427,6 +437,7 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .error_count = runtime.error_count,
         .retryable_error_count = runtime.retryable_error_count,
         .fatal_error_count = runtime.fatal_error_count,
+        .skipped_source_count = runtime.skipped_source_count,
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
@@ -442,6 +453,7 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.error_count = persisted_status.error_count;
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
+    runtime.skipped_source_count = persisted_status.skipped_source_count;
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
     runtime.worker_failed = persisted_status.worker_failed;
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
@@ -454,6 +466,7 @@ test "enrichment runtime restore preserves retry target across restart" {
         error_count: u64 = 0,
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
+        skipped_source_count: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -481,6 +494,7 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         error_count: u64 = 0,
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
+        skipped_source_count: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -934,6 +948,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
+    skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
     embed_batches_started: u64 = 0,
     embed_batches_completed: u64 = 0,
@@ -1115,6 +1130,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
             .skip_by_hash_count = self.skip_by_hash_count,
+            .skipped_source_count = self.skipped_source_count,
             .codec_decode_failures = self.codec_decode_failures,
             .embed_batches_started = self.embed_batches_started,
             .embed_batches_completed = self.embed_batches_completed,
@@ -1165,6 +1181,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
+    skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
     embed_batches_started: u64 = 0,
     embed_batches_completed: u64 = 0,
@@ -1406,6 +1423,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
             .skip_by_hash_count = self.skip_by_hash_count,
+            .skipped_source_count = self.skipped_source_count,
             .codec_decode_failures = self.codec_decode_failures,
             .embed_batches_started = self.embed_batches_started,
             .embed_batches_completed = self.embed_batches_completed,
@@ -1745,7 +1763,7 @@ fn processAsset(
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
-            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+            try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
@@ -1759,7 +1777,7 @@ fn processAsset(
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
-            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+            try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
@@ -2033,26 +2051,20 @@ fn processDocumentExtractionAsset(
         deletes.deinit(runtime.alloc);
     }
 
-    var previous_unit_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
-    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
-    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
-    var previous_chunk_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+    var previous_state = RuntimeDocumentExtractionPreviousState{};
+    defer previous_state.deinit(runtime.alloc);
     if (existing_state) |state| {
-        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
-        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+        previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, request.doc_key, artifact_name, state);
     }
 
     if (existing_state != null) {
-        for (previous_unit_keys) |previous_key| {
+        for (previous_state.unit_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
         }
-        for (previous_chunk_keys) |previous_key| {
+        for (previous_state.chunk_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
@@ -2080,9 +2092,9 @@ fn processDocumentExtractionAsset(
         desired_unit_descriptors,
         desired_chunk_keys.items,
         previous_child_ranges,
-        previous_unit_keys,
-        previous_unit_descriptors,
-        previous_chunk_keys,
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         &.{},
         from_generation,
         from_generation,
@@ -2158,9 +2170,9 @@ fn processDocumentExtractionAsset(
         desired_unit_descriptors,
         desired_chunk_keys.items,
         previous_child_ranges,
-        previous_unit_keys,
-        previous_unit_descriptors,
-        previous_chunk_keys,
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         &.{},
         to_generation,
         from_generation,
@@ -2227,16 +2239,10 @@ fn writeDocumentExtractionFailureManifest(
     from_generation: u64,
     window: *GeneratedReplayWindow,
 ) !void {
-    var previous_unit_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
-    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
-    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
-    var previous_chunk_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+    var previous_state = RuntimeDocumentExtractionPreviousState{};
+    defer previous_state.deinit(runtime.alloc);
     if (existing_state) |state| {
-        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
-        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+        previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, doc_key, artifact_name, state);
     }
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
@@ -2258,9 +2264,9 @@ fn writeDocumentExtractionFailureManifest(
         &.{},
         &.{},
         previous_child_ranges,
-        previous_unit_keys,
-        previous_unit_descriptors,
-        previous_chunk_keys,
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         previous_child_ranges,
         to_generation,
         from_generation,
@@ -2291,12 +2297,12 @@ fn writeDocumentExtractionFailureManifest(
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
 
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
-    for (previous_unit_keys) |previous_key| {
+    for (previous_state.unit_keys) |previous_key| {
         try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
         try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
     }
-    for (previous_chunk_keys) |previous_key| {
+    for (previous_state.chunk_keys) |previous_key| {
         try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
         try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
@@ -2308,6 +2314,8 @@ fn writeDocumentExtractionFailureManifest(
 
 fn deleteDocumentExtractionForRuntime(
     runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
     manifest_key: []const u8,
     state_key: []const u8,
     window: *GeneratedReplayWindow,
@@ -2321,6 +2329,7 @@ fn deleteDocumentExtractionForRuntime(
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, manifest_key));
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+    try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, manifest_key);
 
     const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
@@ -2328,17 +2337,17 @@ fn deleteDocumentExtractionForRuntime(
     };
     defer if (existing_state) |value| runtime.alloc.free(value);
     if (existing_state) |state| {
-        const previous_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
-        for (previous_keys) |previous_key| {
+        var previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, doc_key, artifact_name, state);
+        defer previous_state.deinit(runtime.alloc);
+        for (previous_state.unit_keys) |previous_key| {
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, previous_key);
         }
-        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
-        defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
-        for (previous_chunk_keys) |previous_key| {
+        for (previous_state.chunk_keys) |previous_key| {
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, previous_key);
         }
     }
 
@@ -3768,8 +3777,8 @@ fn appendCachedChunkDenseEmbeddingToWindow(
     chunk_key: []const u8,
     artifact_key: []const u8,
     consumer_indexes: []const []const u8,
-) !void {
-    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return;
+) !bool {
+    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     const index_name = try runtime.alloc.dupe(u8, request.index_name);
     var index_name_owned = true;
     errdefer if (index_name_owned) runtime.alloc.free(index_name);
@@ -3802,6 +3811,7 @@ fn appendCachedChunkDenseEmbeddingToWindow(
         if (expanded_cached.len > 0) runtime.alloc.free(expanded_cached);
     }
     try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded_cached);
+    return true;
 }
 
 fn freeChunkedDenseWindowItems(
@@ -3883,6 +3893,7 @@ fn flushChunkedDenseItems(
             .source_hash = item.source_hash,
             .vector = vector,
         });
+        try queueDerivedCoverageProduced(runtime, window, item.request.doc_key, consumer_indexes);
         const artifact_key = try embeddingArtifactKey(runtime, item.chunk_key, item.artifact_name);
         var artifact_key_owned = true;
         errdefer if (artifact_key_owned) runtime.alloc.free(artifact_key);
@@ -3928,8 +3939,14 @@ fn processCachedChunkDenseItems(
     cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
     max_window_items: usize,
 ) !void {
+    var queued_produced = false;
     for (cached_items.items) |item| {
-        try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, item.chunk_key, item.embedding_key, consumer_indexes);
+        if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, item.chunk_key, item.embedding_key, consumer_indexes)) {
+            if (!queued_produced) {
+                try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                queued_produced = true;
+            }
+        }
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
     freeCachedChunkDenseWindowItems(runtime.alloc, cached_items.items);
@@ -4106,6 +4123,7 @@ fn processMaterializedChunkDenseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
+    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -4126,6 +4144,7 @@ fn flushMaterializedSparseChunkSources(
         if (chunk_embeddings.len > 0) runtime.alloc.free(chunk_embeddings);
     }
     if (chunk_embeddings.len == 0) return;
+    try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
 
     var expanded = try expandSparseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
     defer {
@@ -4137,13 +4156,20 @@ fn flushMaterializedSparseChunkSources(
 
 fn processCachedChunkSparseItems(
     runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
     consumer_indexes: []const []const u8,
     window: *GeneratedReplayWindow,
     cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
     max_window_items: usize,
 ) !void {
+    var queued_produced = false;
     for (cached_items.items) |item| {
-        try appendCachedSparseEmbeddingToWindow(runtime, window, item.chunk_key, item.embedding_key, consumer_indexes);
+        if (try appendCachedSparseEmbeddingToWindow(runtime, window, item.chunk_key, item.embedding_key, consumer_indexes)) {
+            if (!queued_produced) {
+                try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                queued_produced = true;
+            }
+        }
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
     freeCachedChunkDenseWindowItems(runtime.alloc, cached_items.items);
@@ -4288,7 +4314,7 @@ fn processMaterializedChunkSparseRequest(
         };
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
-        try processCachedChunkSparseItems(runtime, consumer_indexes, window, &cached_items, max_window_items);
+        try processCachedChunkSparseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items);
         try flushMaterializedSparseChunkSources(runtime, request, sparse_embedder, consumer_indexes, &sources, window);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
         batch_source_bytes = 0;
@@ -4308,6 +4334,7 @@ fn processMaterializedChunkSparseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
+    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -4326,14 +4353,19 @@ fn collectPlainDenseBatchItem(
     };
     defer runtime.alloc.free(raw);
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return null;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return null;
+    };
     errdefer runtime.alloc.free(@constCast(source_text));
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
-        try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
+        if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
+            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        }
         runtime.alloc.free(@constCast(source_text));
         runtime.alloc.free(artifact_key);
         return null;
@@ -4389,6 +4421,7 @@ fn flushPlainDenseItems(
             .source_hash = item.source_hash,
             .vector = vector,
         });
+        try queueDerivedCoverageProduced(runtime, window, item.request.doc_key, consumer_indexes);
 
         var embeddings = try singleDenseEmbeddingForConsumers(runtime, item.request.doc_key, item.artifact_key, vector, consumer_indexes);
         defer {
@@ -4521,13 +4554,19 @@ fn processChunkedDenseWindow(
             errdefer stale_deletes.deinit(runtime.alloc);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+            if (source_set.sources.len == 0) {
+                try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+                continue;
+            }
 
             for (source_set.sources) |source| {
                 const source_hash = enrichment_artifact_codec.hashSource(source.text);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
-                    try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes);
+                    if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes)) {
+                        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                    }
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     continue;
                 }
@@ -4626,6 +4665,8 @@ fn flushGeneratedReplayWindow(
     defer derived_types.deinitDerivedBatch(runtime.alloc, &batch);
     defer freeKeyList(runtime.alloc, artifact_delete_keys);
     const sequence = try appendGeneratedBatchWithRetry(runtime, batch, artifact_delete_keys);
+    try deleteCoverageMarkersAfterReplayAppend(runtime, window.coverage_marker_deletes.items);
+    clearQueuedCoverageMarkerDeletes(runtime.alloc, &window.coverage_marker_deletes);
     try rememberPublishedGeneratedBatch(runtime, batch);
     runtime.notify_fn(runtime.notify_ctx, sequence);
 }
@@ -4721,10 +4762,11 @@ fn appendCachedDenseEmbeddingToWindow(
     doc_key: []const u8,
     artifact_key: []const u8,
     consumer_indexes: []const []const u8,
-) !void {
-    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return;
+) !bool {
+    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     var embeddings = try singleDenseEmbeddingForConsumers(runtime, doc_key, artifact_key, &.{}, consumer_indexes);
     try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
+    return true;
 }
 
 fn appendCachedSparseEmbeddingToWindow(
@@ -4733,10 +4775,11 @@ fn appendCachedSparseEmbeddingToWindow(
     doc_key: []const u8,
     artifact_key: []const u8,
     consumer_indexes: []const []const u8,
-) !void {
-    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return;
+) !bool {
+    if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, doc_key, artifact_key, &.{}, &.{}, consumer_indexes);
     try appendOwnedSparseEmbeddingsToWindow(runtime, window, &embeddings);
+    return true;
 }
 
 fn mergeOwnedDeletedKeysIntoWindow(
@@ -4940,6 +4983,11 @@ fn processDenseEmbedding(
 
         var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
         errdefer stale_deletes.deinit(runtime.alloc);
+        if (source_set.sources.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+            return;
+        }
 
         const chunk_embeddings = try buildChunkDenseEmbeddingsFromSources(runtime, request, dense_embedder, source_set.sources);
         defer {
@@ -4948,6 +4996,7 @@ fn processDenseEmbedding(
         }
 
         if (chunk_embeddings.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
@@ -4956,6 +5005,7 @@ fn processDenseEmbedding(
             if (embedding.vector.len > 0) try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, embedding.doc_key);
         }
         try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, embedding_artifact_name, chunk_embeddings);
+        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
         var expanded = try expandDenseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
             for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
@@ -4991,6 +5041,7 @@ fn processDenseEmbedding(
                 .source_hash = null,
                 .vector = vector,
             });
+            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
             const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
             defer runtime.alloc.free(artifact_key);
 
@@ -5002,16 +5053,23 @@ fn processDenseEmbedding(
             try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
             return;
         }
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return;
     }
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return;
+    };
     defer runtime.alloc.free(source_text);
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
-        try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
+        if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
+            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        }
         return;
     }
 
@@ -5027,6 +5085,7 @@ fn processDenseEmbedding(
         .source_hash = source_hash,
         .vector = vector,
     });
+    try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
 
     var embeddings = try singleDenseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, vector, consumer_indexes);
     defer {
@@ -5062,6 +5121,11 @@ fn processSparseEmbedding(
 
         var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
         errdefer stale_deletes.deinit(runtime.alloc);
+        if (source_set.sources.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+            return;
+        }
 
         const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, source_set.sources);
         defer {
@@ -5070,10 +5134,12 @@ fn processSparseEmbedding(
         }
 
         if (chunk_embeddings.len == 0) {
+            try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
 
+        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
         var expanded = try expandSparseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
             for (expanded) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
@@ -5092,20 +5158,26 @@ fn processSparseEmbedding(
     };
     defer runtime.alloc.free(raw);
 
-    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse return;
+    const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
+        try markDerivedCoverageSkipped(runtime, request.doc_key, consumer_indexes);
+        return;
+    };
     defer runtime.alloc.free(source_text);
     const source_hash = enrichment_artifact_codec.hashSource(source_text);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
-        try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes);
+        if (try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
+            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        }
         return;
     }
 
     var sparse = try embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text);
     defer sparse.deinit(runtime.alloc);
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
+    try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
 
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
     defer {
@@ -5612,6 +5684,102 @@ const DocumentExtractionRangeRoute = struct {
     owner_group_id: u64 = 0,
 };
 
+const RuntimeDocumentExtractionPreviousState = struct {
+    unit_keys: []const []const u8 = &.{},
+    unit_descriptors: []DocumentExtractionUnitDescriptor = &.{},
+    chunk_keys: []const []const u8 = &.{},
+    recovered_from_store_scan: bool = false,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        freeOwnedConstKeySlice(alloc, self.unit_keys);
+        freeDocumentExtractionUnitDescriptors(alloc, self.unit_descriptors);
+        freeOwnedConstKeySlice(alloc, self.chunk_keys);
+        self.* = undefined;
+    }
+};
+
+fn loadRuntimeDocumentExtractionPreviousState(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    state: []const u8,
+) !RuntimeDocumentExtractionPreviousState {
+    if (loadRuntimeDocumentExtractionPreviousStateFromJson(runtime.alloc, state)) |parsed| {
+        return parsed;
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {},
+    }
+    var recovered = try scanRuntimeDocumentExtractionPreviousStateFromStore(runtime, doc_key, artifact_name);
+    recovered.recovered_from_store_scan = true;
+    return recovered;
+}
+
+fn loadRuntimeDocumentExtractionPreviousStateFromJson(alloc: Allocator, state: []const u8) !RuntimeDocumentExtractionPreviousState {
+    var out = RuntimeDocumentExtractionPreviousState{};
+    errdefer out.deinit(alloc);
+    out.unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+    out.unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
+    out.chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+    return out;
+}
+
+fn scanRuntimeDocumentExtractionPreviousStateFromStore(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) !RuntimeDocumentExtractionPreviousState {
+    var out = RuntimeDocumentExtractionPreviousState{};
+    errdefer out.deinit(runtime.alloc);
+
+    var unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (unit_keys.items) |key| runtime.alloc.free(@constCast(key));
+        unit_keys.deinit(runtime.alloc);
+    }
+    const unit_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", artifact_name);
+    defer runtime.alloc.free(unit_prefix);
+    const unit_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, unit_prefix);
+    defer backend_scan.freeResults(runtime.alloc, unit_rows);
+    for (unit_rows) |entry| {
+        if (std.mem.eql(u8, entry.key, unit_prefix)) continue;
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
+        try unit_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
+    }
+
+    var chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (chunk_keys.items) |key| runtime.alloc.free(@constCast(key));
+        chunk_keys.deinit(runtime.alloc);
+    }
+    for (runtime.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+        const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "chunk", entry.name);
+        defer runtime.alloc.free(chunk_prefix);
+        const chunk_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, chunk_prefix);
+        defer backend_scan.freeResults(runtime.alloc, chunk_rows);
+        for (chunk_rows) |row| {
+            if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
+            try chunk_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, row.key));
+        }
+    }
+
+    out.unit_keys = try unit_keys.toOwnedSlice(runtime.alloc);
+    out.chunk_keys = try chunk_keys.toOwnedSlice(runtime.alloc);
+    out.unit_descriptors = try runtime.alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
+    for (out.unit_descriptors) |*descriptor| {
+        descriptor.* = .{ .key = "", .fingerprint = "" };
+    }
+    for (out.unit_descriptors, out.unit_keys) |*descriptor, key| {
+        descriptor.* = .{
+            .key = try runtime.alloc.dupe(u8, key),
+            .fingerprint = "",
+        };
+    }
+    return out;
+}
+
 fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(unit.unit_id);
@@ -5761,10 +5929,14 @@ fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const 
         if (item != .object) return error.InvalidDocumentExtractionState;
         const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
         const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
-        if (key_value != .string or fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        if (fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        const key = try documentExtractionStateByteSliceAlloc(alloc, key_value);
+        errdefer alloc.free(@constCast(key));
+        const fingerprint = try alloc.dupe(u8, fingerprint_value.string);
+        errdefer alloc.free(fingerprint);
         out[i] = .{
-            .key = try alloc.dupe(u8, key_value.string),
-            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+            .key = key,
+            .fingerprint = fingerprint,
         };
         initialized += 1;
     }
@@ -5784,9 +5956,8 @@ fn documentExtractionStateUnitDescriptorFallbackAlloc(alloc: Allocator, object: 
         alloc.free(out);
     }
     for (keys_value.array.items, 0..) |item, i| {
-        if (item != .string) return error.InvalidDocumentExtractionState;
         out[i] = .{
-            .key = try alloc.dupe(u8, item.string),
+            .key = try documentExtractionStateByteSliceAlloc(alloc, item),
             .fingerprint = "",
         };
         initialized += 1;
@@ -5807,11 +5978,26 @@ fn documentExtractionStateKeysAlloc(alloc: Allocator, state: []const u8, field_n
         alloc.free(out);
     }
     for (keys_value.array.items, 0..) |item, i| {
-        if (item != .string) return error.InvalidDocumentExtractionState;
-        out[i] = try alloc.dupe(u8, item.string);
+        out[i] = try documentExtractionStateByteSliceAlloc(alloc, item);
         initialized += 1;
     }
     return out;
+}
+
+fn documentExtractionStateByteSliceAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+    switch (value) {
+        .string => |string| return try alloc.dupe(u8, string),
+        .array => |array| {
+            const out = try alloc.alloc(u8, array.items.len);
+            errdefer alloc.free(out);
+            for (array.items, 0..) |item, i| {
+                if (item != .integer) return error.InvalidDocumentExtractionState;
+                out[i] = std.math.cast(u8, item.integer) orelse return error.InvalidDocumentExtractionState;
+            }
+            return out;
+        },
+        else => return error.InvalidDocumentExtractionState,
+    }
 }
 
 fn documentExtractionUnitKeyStillPresent(
@@ -7164,6 +7350,163 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
     }
 }
 
+fn markDerivedCoverageSkippedForIndex(runtime: *EnrichmentRuntime, index_name: []const u8, doc_key: []const u8) !void {
+    const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
+    const key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key, "skipped");
+    defer runtime.alloc.free(key);
+    const already_marked = blk: {
+        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
+            error.NotFound => break :blk false,
+            std.mem.Allocator.Error.OutOfMemory => return err,
+            else => break :blk false,
+        };
+        runtime.alloc.free(existing);
+        break :blk true;
+    };
+    if (already_marked) {
+        try storePutWithRetry(runtime, key, "skipped");
+        return;
+    }
+
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(runtime.alloc, index_name, generation);
+    defer runtime.alloc.free(counter_key);
+    const current_count = try derivedCoverageSkippedCounterValue(runtime, counter_key, index_name, generation);
+    var counter_value: [8]u8 = undefined;
+    const writes = [_]KVPair{
+        .{ .key = key, .value = "skipped" },
+        .{ .key = counter_key, .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, current_count +| 1) },
+    };
+    try storePutBatchWithRetry(runtime, &writes, &.{});
+    runtime.skipped_source_count += 1;
+}
+
+fn queuedCoverageMarkerDelete(window: *GeneratedReplayWindow, key: []const u8) ?usize {
+    for (window.coverage_marker_deletes.items, 0..) |item, i| {
+        if (std.mem.eql(u8, item.key, key)) return i;
+    }
+    return null;
+}
+
+fn clearQueuedCoverageMarkerDeletes(alloc: Allocator, marker_deletes: *std.ArrayListUnmanaged(CoverageMarkerDelete)) void {
+    for (marker_deletes.items) |item| {
+        alloc.free(item.key);
+        if (item.counter_key) |key| alloc.free(key);
+    }
+    marker_deletes.clearRetainingCapacity();
+}
+
+fn loadDerivedCoverageSkippedCounter(runtime: *EnrichmentRuntime, counter_key: []const u8) !?u64 {
+    const raw = storeGetAlloc(runtime, counter_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer runtime.alloc.free(raw);
+    return try internal_keys.decodeDerivedCoverageSkippedCount(raw);
+}
+
+fn scanDerivedCoverageSkipped(runtime: *EnrichmentRuntime, index_name: []const u8, generation: u64) !u64 {
+    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(runtime.alloc, index_name, generation, "skipped");
+    defer runtime.alloc.free(lower);
+    const upper = try internal_keys.nextPrefixAlloc(runtime.alloc, lower);
+    defer if (upper) |key| runtime.alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+
+    var skipped: u64 = 0;
+    const CountState = struct {
+        skipped: *u64,
+
+        fn scan(ctx_ptr: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+            _ = key;
+            _ = value;
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
+            ctx.skipped.* += 1;
+            return .@"continue";
+        }
+    };
+    var state = CountState{ .skipped = &skipped };
+    try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &state, CountState.scan);
+    return skipped;
+}
+
+fn derivedCoverageSkippedCounterValue(runtime: *EnrichmentRuntime, counter_key: []const u8, index_name: []const u8, generation: u64) !u64 {
+    return (try loadDerivedCoverageSkippedCounter(runtime, counter_key)) orelse
+        try scanDerivedCoverageSkipped(runtime, index_name, generation);
+}
+
+fn queueDerivedCoverageProducedForIndex(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, index_name: []const u8, doc_key: []const u8) !void {
+    const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
+    const key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key, "skipped");
+    errdefer runtime.alloc.free(key);
+    if (queuedCoverageMarkerDelete(window, key) != null) {
+        runtime.alloc.free(key);
+        return;
+    }
+    const had_marker = blk: {
+        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
+            error.NotFound => break :blk false,
+            std.mem.Allocator.Error.OutOfMemory => return err,
+            else => break :blk false,
+        };
+        runtime.alloc.free(existing);
+        break :blk true;
+    };
+    const counter_key = if (had_marker)
+        try internal_keys.derivedCoverageSkippedCountKeyAlloc(runtime.alloc, index_name, generation)
+    else
+        null;
+    errdefer if (counter_key) |owned| runtime.alloc.free(owned);
+    try window.coverage_marker_deletes.append(runtime.alloc, .{ .key = key, .had_marker = had_marker, .counter_key = counter_key });
+}
+
+fn markDerivedCoverageSkipped(runtime: *EnrichmentRuntime, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
+    for (consumer_indexes) |index_name| try markDerivedCoverageSkippedForIndex(runtime, index_name, doc_key);
+}
+
+fn queueDerivedCoverageProduced(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
+    for (consumer_indexes) |index_name| try queueDerivedCoverageProducedForIndex(runtime, window, index_name, doc_key);
+}
+
+fn deleteCoverageMarkersAfterReplayAppend(runtime: *EnrichmentRuntime, marker_deletes: []const CoverageMarkerDelete) !void {
+    if (marker_deletes.len == 0) return;
+    const keys = try runtime.alloc.alloc([]const u8, marker_deletes.len);
+    defer runtime.alloc.free(keys);
+    for (marker_deletes, 0..) |item, i| keys[i] = item.key;
+
+    const CounterState = struct {
+        key: []const u8,
+        count: u64,
+        value: [8]u8 = undefined,
+    };
+    var counter_states = std.ArrayListUnmanaged(CounterState).empty;
+    defer counter_states.deinit(runtime.alloc);
+    for (marker_deletes) |item| {
+        if (!item.had_marker) continue;
+        const counter_key = item.counter_key orelse continue;
+        const state_index = blk: {
+            for (counter_states.items, 0..) |state, i| {
+                if (std.mem.eql(u8, state.key, counter_key)) break :blk i;
+            }
+            const current_count = (try loadDerivedCoverageSkippedCounter(runtime, counter_key)) orelse continue;
+            try counter_states.append(runtime.alloc, .{ .key = counter_key, .count = current_count });
+            break :blk counter_states.items.len - 1;
+        };
+        if (counter_states.items[state_index].count > 0) counter_states.items[state_index].count -= 1;
+    }
+
+    const counter_writes = try runtime.alloc.alloc(KVPair, counter_states.items.len);
+    defer runtime.alloc.free(counter_writes);
+    for (counter_states.items, 0..) |*state, i| {
+        counter_writes[i] = .{
+            .key = state.key,
+            .value = internal_keys.encodeDerivedCoverageSkippedCount(&state.value, state.count),
+        };
+    }
+    try storePutBatchWithRetry(runtime, counter_writes, keys);
+    for (marker_deletes) |item| {
+        if (item.had_marker and runtime.skipped_source_count > 0) runtime.skipped_source_count -= 1;
+    }
+}
+
 test "enrichment applied checkpoint stays degraded until runtime status clears" {
     const alloc = std.testing.allocator;
 
@@ -7539,6 +7882,24 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "enrichment runtime document extraction state parses byte-array keys" {
+    const alloc = std.testing.allocator;
+    const state = "{\"kind\":\"document_extraction_state_v1\",\"fingerprint\":\"source\",\"unit_keys\":[[65,0,255]],\"unit_descriptors\":[{\"key\":[65,0,255],\"fingerprint\":\"fp\"}],\"chunk_keys\":[[66,1,254]]}";
+
+    var parsed = try loadRuntimeDocumentExtractionPreviousStateFromJson(alloc, state);
+    defer parsed.deinit(alloc);
+
+    const expected_unit_key = [_]u8{ 65, 0, 255 };
+    const expected_chunk_key = [_]u8{ 66, 1, 254 };
+    try std.testing.expectEqual(@as(usize, 1), parsed.unit_keys.len);
+    try std.testing.expectEqualSlices(u8, &expected_unit_key, parsed.unit_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.unit_descriptors.len);
+    try std.testing.expectEqualSlices(u8, &expected_unit_key, parsed.unit_descriptors[0].key);
+    try std.testing.expectEqualStrings("fp", parsed.unit_descriptors[0].fingerprint);
+    try std.testing.expectEqual(@as(usize, 1), parsed.chunk_keys.len);
+    try std.testing.expectEqualSlices(u8, &expected_chunk_key, parsed.chunk_keys[0]);
+}
 
 test "enrichment runtime document extraction manifest uses v2 range and merge shape" {
     const alloc = std.testing.allocator;

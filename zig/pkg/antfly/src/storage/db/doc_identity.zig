@@ -481,6 +481,17 @@ pub fn allVisibleFromSummary(summary: VisibilitySummary, generation: ?u64) bool 
     return true;
 }
 
+pub fn latestGenerationFromSummary(summary: VisibilitySummary) u64 {
+    return @max(summary.max_created_generation, summary.max_deleted_generation);
+}
+
+pub fn latestGenerationFromSummaryFast(store: *docstore_mod.DocStore) !?u64 {
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const summary = (try readVisibilitySummaryTxn(&txn)) orelse return null;
+    return latestGenerationFromSummary(summary);
+}
+
 pub fn visibilitySummaryFromWrites(writes: []const docstore_mod.KVPair) !?VisibilitySummary {
     var idx = writes.len;
     while (idx > 0) {

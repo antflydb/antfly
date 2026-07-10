@@ -285,7 +285,7 @@ fn chooseNextCandidate(
     var best_order_index: usize = std.math.maxInt(usize);
     for (ordered, 0..) |node_id, order_index| {
         if (containsNode(selected, node_id)) continue;
-        if (!candidateRoleMatches(candidate_domains, node_id, placement_role)) continue;
+        if (!candidateSelectable(candidate_domains, node_id, placement_role)) continue;
         const domain_score = domainScore(selected, node_id, candidate_domains);
         const pair_score = pairScore(selected, node_id, pair_by_nodes);
         if (best_node == null or
@@ -343,9 +343,19 @@ fn countEligibleCandidates(
 ) usize {
     var count: usize = 0;
     for (candidate_node_ids) |node_id| {
-        if (candidateRoleMatches(candidate_domains, node_id, placement_role)) count += 1;
+        if (candidateSelectable(candidate_domains, node_id, placement_role)) count += 1;
     }
     return count;
+}
+
+fn candidateSelectable(candidate_domains: []const CandidateDomain, node_id: u64, placement_role: []const u8) bool {
+    if (placement_role.len == 0 and candidate_domains.len == 0) return true;
+    for (candidate_domains) |candidate| {
+        if (candidate.node_id != node_id) continue;
+        if (candidate.status_tag == .excluded) return false;
+        return table_manager.placementRoleCompatible(placement_role, candidate.role);
+    }
+    return table_manager.placementRoleCompatible(placement_role, "data");
 }
 
 fn candidateRoleMatches(candidate_domains: []const CandidateDomain, node_id: u64, placement_role: []const u8) bool {
@@ -527,7 +537,7 @@ fn candidateLoadPressure(candidate_domains: []const CandidateDomain, node_id: u6
 
 fn candidateRetentionAllowed(candidate_domains: []const CandidateDomain, node_id: u64) bool {
     for (candidate_domains) |candidate| {
-        if (candidate.node_id == node_id) return candidate.retain_current;
+        if (candidate.node_id == node_id) return candidate.status_tag != .excluded and candidate.retain_current;
     }
     return true;
 }
@@ -789,6 +799,38 @@ test "placement planner rebalances away from overloaded current peers" {
     try std.testing.expect(!has_one);
     try std.testing.expect(has_two);
     try std.testing.expect(has_three);
+}
+
+test "placement planner excludes draining stores from replacement selection" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 141, .name = "docs", .desired_replica_count = 1 });
+    try manager.upsertRange(.{
+        .group_id = 14101,
+        .table_id = 141,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 14101, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 1, .peer_node_ids = &.{1}, .serving_state = .serving },
+    };
+    const candidate_domains = [_]CandidateDomain{
+        .{ .node_id = 1, .store_id = 1, .role = "data", .failure_domain = "rack-a", .priority = 255, .status_tag = .excluded, .retain_current = false },
+        .{ .node_id = 2, .store_id = 2, .role = "data", .failure_domain = "rack-b" },
+        .{ .node_id = 3, .store_id = 3, .role = "data", .failure_domain = "rack-c" },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithCurrentAndDomains(&manager, &.{ 1, 2, 3 }, &current, &candidate_domains);
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expect(intents[0].record.local_node_id == 2 or intents[0].record.local_node_id == 3);
+    try std.testing.expectEqual(@as(u64, 1), intents[0].relocation_source_node_id);
+    try std.testing.expectEqual(@as(u64, 1), intents[0].relocation_source_store_id);
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, intents[0].serving_state);
 }
 
 test "placement planner tags replacement with the dropped current peer as source" {

@@ -25,7 +25,7 @@ function mockMultiquery(hits: QueryHit[] = []) {
       {
         status: 200,
         took: 10,
-        hits: { hits, total: hits.length },
+        hits: { hits, total: { value: hits.length, relation: "exact" } },
       },
     ],
   });

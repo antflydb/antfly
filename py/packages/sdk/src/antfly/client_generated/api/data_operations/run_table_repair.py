@@ -6,9 +6,9 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.artifact_repair_run_response import ArtifactRepairRunResponse
 from ...models.error import Error
 from ...models.repair_run_request import RepairRunRequest
+from ...models.table_repair_run_response import TableRepairRunResponse
 from ...types import UNSET, Response, Unset
 
 
@@ -37,11 +37,11 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ArtifactRepairRunResponse | Error | None:
-    if response.status_code == 202:
-        response_202 = ArtifactRepairRunResponse.from_dict(response.json())
+) -> Error | TableRepairRunResponse | None:
+    if response.status_code == 200:
+        response_200 = TableRepairRunResponse.from_dict(response.json())
 
-        return response_202
+        return response_200
 
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
@@ -71,7 +71,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ArtifactRepairRunResponse | Error]:
+) -> Response[Error | TableRepairRunResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -85,18 +85,19 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> Response[ArtifactRepairRunResponse | Error]:
+) -> Response[Error | TableRepairRunResponse]:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
-    repair page is available. `target=index` repairs one named index after
-    resetting its derived index storage; healthy indexes are skipped unless
-    `force=true` is supplied, and any positive `limit` permits that single
-    named index repair. The response reports unresolved debt separately, and
-    the endpoint requires table admin permission when authentication is
-    enabled.
+    repair page is available. `target=index` repairs one named index by
+    building a shadow replacement, catching it up to the current derived
+    replay sequence, and atomically swapping it into service; healthy
+    indexes are skipped unless `force=true` is supplied, and any positive
+    `limit` permits that single named index repair. The response reports
+    unresolved debt separately, and the endpoint requires table admin
+    permission when authentication is enabled.
 
     Args:
         table_name (str):
@@ -107,7 +108,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairRunResponse | Error]
+        Response[Error | TableRepairRunResponse]
     """
 
     kwargs = _get_kwargs(
@@ -127,18 +128,19 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> ArtifactRepairRunResponse | Error | None:
+) -> Error | TableRepairRunResponse | None:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
-    repair page is available. `target=index` repairs one named index after
-    resetting its derived index storage; healthy indexes are skipped unless
-    `force=true` is supplied, and any positive `limit` permits that single
-    named index repair. The response reports unresolved debt separately, and
-    the endpoint requires table admin permission when authentication is
-    enabled.
+    repair page is available. `target=index` repairs one named index by
+    building a shadow replacement, catching it up to the current derived
+    replay sequence, and atomically swapping it into service; healthy
+    indexes are skipped unless `force=true` is supplied, and any positive
+    `limit` permits that single named index repair. The response reports
+    unresolved debt separately, and the endpoint requires table admin
+    permission when authentication is enabled.
 
     Args:
         table_name (str):
@@ -149,7 +151,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairRunResponse | Error
+        Error | TableRepairRunResponse
     """
 
     return sync_detailed(
@@ -164,18 +166,19 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> Response[ArtifactRepairRunResponse | Error]:
+) -> Response[Error | TableRepairRunResponse]:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
-    repair page is available. `target=index` repairs one named index after
-    resetting its derived index storage; healthy indexes are skipped unless
-    `force=true` is supplied, and any positive `limit` permits that single
-    named index repair. The response reports unresolved debt separately, and
-    the endpoint requires table admin permission when authentication is
-    enabled.
+    repair page is available. `target=index` repairs one named index by
+    building a shadow replacement, catching it up to the current derived
+    replay sequence, and atomically swapping it into service; healthy
+    indexes are skipped unless `force=true` is supplied, and any positive
+    `limit` permits that single named index repair. The response reports
+    unresolved debt separately, and the endpoint requires table admin
+    permission when authentication is enabled.
 
     Args:
         table_name (str):
@@ -186,7 +189,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairRunResponse | Error]
+        Response[Error | TableRepairRunResponse]
     """
 
     kwargs = _get_kwargs(
@@ -204,18 +207,19 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: RepairRunRequest | Unset = UNSET,
-) -> ArtifactRepairRunResponse | Error | None:
+) -> Error | TableRepairRunResponse | None:
     """Run a bounded table repair pass
 
-     Attempts to repair queued table issues. `target=artifact` reprocesses
+     Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
     supported artifact kinds and replays derived state; it is bounded by
     `limit` and returns an opaque continuation cursor when another artifact
-    repair page is available. `target=index` repairs one named index after
-    resetting its derived index storage; healthy indexes are skipped unless
-    `force=true` is supplied, and any positive `limit` permits that single
-    named index repair. The response reports unresolved debt separately, and
-    the endpoint requires table admin permission when authentication is
-    enabled.
+    repair page is available. `target=index` repairs one named index by
+    building a shadow replacement, catching it up to the current derived
+    replay sequence, and atomically swapping it into service; healthy
+    indexes are skipped unless `force=true` is supplied, and any positive
+    `limit` permits that single named index repair. The response reports
+    unresolved debt separately, and the endpoint requires table admin
+    permission when authentication is enabled.
 
     Args:
         table_name (str):
@@ -226,7 +230,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairRunResponse | Error
+        Error | TableRepairRunResponse
     """
 
     return (

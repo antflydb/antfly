@@ -113,6 +113,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/antfly/metadata.yaml",
     "../specs/openapi/antfly/query.yaml",
     "../specs/openapi/antfly/reranking.yaml",
+    "../specs/openapi/antfly/sort.yaml",
     "../specs/openapi/antfly/websearch.yaml",
     "../specs/openapi/auth/api.yaml",
     "../specs/openapi/extensions/api.yaml",
@@ -156,6 +157,12 @@ const DelegatedInferenceBuildSteps = struct {
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
     for (dependencies) |dependency| {
         step.dependOn(dependency);
+    }
+}
+
+fn addRuntimeTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) void {
+    for (filters) |filter| {
+        run.addArgs(&.{ "--test-filter", filter });
     }
 }
 
@@ -409,6 +416,7 @@ const AntflyRootImports = struct {
     client_openapi: *std.Build.Module,
     schema_openapi: *std.Build.Module,
     indexes_openapi: *std.Build.Module,
+    sort_openapi: *std.Build.Module,
     generating_api_openapi: *std.Build.Module,
     eval_openapi: *std.Build.Module,
     query_openapi: *std.Build.Module,
@@ -474,6 +482,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_client_openapi", .field = "client_openapi" },
         .{ .name = "antfly_schema_openapi", .field = "schema_openapi" },
         .{ .name = "antfly_indexes_openapi", .field = "indexes_openapi" },
+        .{ .name = "antfly_sort_openapi", .field = "sort_openapi" },
         .{ .name = "antfly_generating_api_openapi", .field = "generating_api_openapi" },
         .{ .name = "antfly_eval_openapi", .field = "eval_openapi" },
         .{ .name = "antfly_query_openapi", .field = "query_openapi" },
@@ -781,6 +790,7 @@ fn addPublicOpenApiModule(
         &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -809,6 +819,7 @@ fn addPublicClientOpenApiModule(
         &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -949,6 +960,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -958,6 +970,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, addPrefixedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -965,7 +978,9 @@ fn addOpenApiRegenStep(
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/schema.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/sort.yaml"), "antfly_sort_openapi", antfly_generated_root ++ "/antfly_sort_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
+            .{ "sort.yaml", "antfly_sort_openapi" },
             .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "chunking.yaml", "antfly_chunking_openapi" },
@@ -983,6 +998,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
             .{ "indexes.yaml", "antfly_indexes_openapi" },
+            .{ "sort.yaml", "antfly_sort_openapi" },
             .{ "schema.yaml", "antfly_schema_openapi" },
             .{ "generating.yaml", "antfly_generating_api_openapi" },
             .{ "eval.yaml", "antfly_eval_openapi" },
@@ -1004,7 +1020,9 @@ fn addOpenApiRegenStep(
             .{ "../shared/logging.yaml", "antfly_logging_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{
+            .{ "generating.yaml", "antfly_generating_openapi" },
+        }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/chunking.yaml"), "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi", "types", &.{
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
         }),
@@ -1032,6 +1050,7 @@ fn addOpenApiRegenStep(
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server", &.{
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
@@ -1156,6 +1175,7 @@ pub fn build(b: *std.Build) void {
     const client_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", httpx_mod);
     const schema_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi");
     const indexes_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi");
+    const sort_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_sort_openapi", antfly_generated_root ++ "/antfly_sort_openapi");
     const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi");
     const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi");
     const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi");
@@ -1181,12 +1201,14 @@ pub fn build(b: *std.Build) void {
     indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1194,6 +1216,7 @@ pub fn build(b: *std.Build) void {
     public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    client_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1201,12 +1224,14 @@ pub fn build(b: *std.Build) void {
     client_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
+    chunking_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -1558,6 +1583,7 @@ pub fn build(b: *std.Build) void {
     const inference_build_options_mod = inference_graph.build_options_mod;
     const inference_api_mod = inference_graph.inference_api_mod;
     inference_api_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    inference_api_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     inference_api_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     const inference_hf_tokenizer_mod = inference_graph.inference_hf_tokenizer_mod;
     const inference_fixed_tokenizer_data_mod = inference_graph.inference_fixed_tokenizer_data_mod;
@@ -1601,6 +1627,7 @@ pub fn build(b: *std.Build) void {
         .client_openapi = client_openapi_mod,
         .schema_openapi = schema_openapi_mod,
         .indexes_openapi = indexes_openapi_mod,
+        .sort_openapi = sort_openapi_mod,
         .generating_api_openapi = generating_api_openapi_mod,
         .eval_openapi = eval_openapi_mod,
         .query_openapi = query_openapi_mod,
@@ -1675,6 +1702,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const introducer_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/introducer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, introducer_test_mod, true, true);
+
     const data_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
         .target = target,
@@ -1714,6 +1748,7 @@ pub fn build(b: *std.Build) void {
         public_openapi_mod,
         query_openapi_mod,
         indexes_openapi_mod,
+        sort_openapi_mod,
         metadata_openapi_mod,
         reranking_mod,
         objectstore_mod,
@@ -1798,6 +1833,7 @@ pub fn build(b: *std.Build) void {
         public_openapi_mod,
         query_openapi_mod,
         indexes_openapi_mod,
+        sort_openapi_mod,
         metadata_openapi_mod,
         reranking_mod,
         wasm_objectstore_mod,
@@ -2357,7 +2393,21 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "artifact reprocess job store starts and updates a job",
             "artifact reprocess job store recovers durable jobs and reseeds ids",
+            "artifact reprocess job store persists monotonic next id across stale durable writes",
             "artifact reprocess job cleanup removes recovered durable expired jobs",
+            "artifact reprocess job store applies running cancellation at pass boundary",
+            "artifact reprocess job store records cancel requested across stale queued token",
+            "repair job store starts and records a pass",
+            "repair job store applies running cancellation at pass boundary",
+            "repair job store records cancel requested across stale queued token",
+            "repair job store does not expire future live running heartbeat",
+            "table repair job store persists monotonic next id across stale durable writes",
+            "table repair job cleanup pages durable expired jobs",
+            "api http client maps remote repair cancel unavailable",
+            "api http client encodes table name for repair cancel callback",
+            "public api routes compile",
+            "internal group artifact repair rejects callback token without cancel executor",
+            "table repair job records bounded pass and continuation",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -2570,6 +2620,22 @@ pub fn build(b: *std.Build) void {
     run_lib_image_corpus_verify_gif_quiet.addArg("verify-gif");
     const run_lib_image_corpus_verify_gif_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_gif_quiet);
 
+    const run_lib_image_corpus_verify_bmp = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_bmp.addArg("verify-bmp");
+    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_bmp.step);
+
+    const run_lib_image_corpus_verify_bmp_quiet = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_bmp_quiet.addArg("verify-bmp");
+    const run_lib_image_corpus_verify_bmp_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_bmp_quiet);
+
+    const run_lib_image_corpus_verify_webp = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_webp.addArg("verify-webp");
+    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_webp.step);
+
+    const run_lib_image_corpus_verify_webp_quiet = b.addRunArtifact(lib_image_corpus);
+    run_lib_image_corpus_verify_webp_quiet.addArg("verify-webp");
+    const run_lib_image_corpus_verify_webp_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_webp_quiet);
+
     const image_jpeg_seed_corpora_e2e = b.addExecutable(.{
         .name = "image-jpeg-seed-corpora-e2e",
         .root_module = b.createModule(.{
@@ -2660,6 +2726,8 @@ pub fn build(b: *std.Build) void {
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_png.step);
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_png_spng.step);
     lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_gif.step);
+    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_bmp.step);
+    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_webp.step);
 
     const run_lib_image_conformance_tests_after_fetch_quiet = b.addRunArtifact(lib_image_conformance_tests);
     run_lib_image_conformance_tests_after_fetch_quiet.step.dependOn(fetch_lib_image_conformance_fixtures_quiet_step);
@@ -2689,7 +2757,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"provider registry"},
+        .filters = &.{ "provider registry", "std http listener" },
     });
     const run_lib_common_tests = b.addRunArtifact(lib_common_tests);
     const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
@@ -2795,31 +2863,160 @@ pub fn build(b: *std.Build) void {
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
         "public index contract exposes runtime status metadata",
+        "public openapi documents stable exact sort diagnostics",
+        "api query contract serializes sort profile diagnostics",
+        "api query contract maps public exact sort rejection diagnostics",
+        "api query contract preflight rejects cursor pagination over approximate vector source",
+        "api query contract preflight rejects search_before pagination over approximate vector source",
         "artifact enrichment request permits asset full text routing",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned group storage wires remote content to writer caches",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "backend runtime durable lane runs inline jobs",
+        "backend runtime durable lane leaves inline failed jobs owned by caller",
+        "backend runtime threaded durable lane rejects jobs after owner close",
         "provisioned table write cache retires stale db when index metadata changes",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
         "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+        "partial coverage embeddings readiness counts skipped source units",
+        "partial coverage embeddings readiness does not mask pending enrichment",
+        "api http public sort capability gate validates mapped sortable fields",
+        "api http public sort capability gate fails closed for uncovered observed dynamic fields",
+        "metadata.table generated field capabilities include schema dynamic templates",
+        "metadata.table status exposes stable field capabilities",
+        "metadata.table status promotes schema capability when runtime coverage is complete",
+        "metadata.table status promotes schema geo capability when runtime coverage is complete",
+        "metadata.table status does not promote mismatched index sort runtime capability",
+        "metadata.table status does not advertise changed index sort direction before rebuild",
+        "metadata.table status merges observed capabilities conservatively",
+        "metadata.table debug encoder emits runtime schemas and index bindings",
+        "api query builder preflight describes missing physical sort coverage with public sortable wording",
+        "api query builder prompt exposes native sort capabilities",
+        "distributed query shard request preserves sorted cursor contract",
+        "distributed sorted hit merge uses typed sort tuple ordering and cursors",
+        "distributed shard validation rejects mixed scalar sort domains",
+        "distributed merge rejects provably incomplete exact shard windows",
+        "distributed merge rejects oversized shard windows",
+        "distributed merge uses runtime schema for typed date cursors",
+        "segment index sort metadata roundtrip",
+        "segment merge drops index sort metadata until physical sort is preserved",
+        "segment sorted merge rejects mixed index sort doc value domains",
+        "segment sorted merge preserves index sort and remaps doc addressed sections",
+        "dynamic template selector and mapping-option resolution",
+        "parse document field mapping contract",
+        "runtime schema derives internal doc values from sortable scalar mappings",
+        "schema rejects sortable non-scalar dynamic mappings",
+        "runtime schema derives and validates index sort metadata",
+        "runtime schema lowers document field mappings to exact declared fields",
+        "schema rejects sortable non-scalar document field mappings",
+        "runtime schema field capability helpers classify mapped sortability",
+        "document mapper accepts match-mapping-type dynamic template index_sort field",
+        "document mapper emits mapped keyword subfield postings and typed doc values",
+        "document mapper emits schema-derived mapped keyword subfield coverage",
+        "document mapper omits multi-valued mapped keyword subfield typed doc values",
+        "document mapper flushes schema index_sort segments in physical sort order",
+        "document mapper validates schema index_sort field capabilities",
+        "document mapper emits schema geo point typed doc values",
+        "typed doc values bytes round-trip",
+        "cover bounding box enforces budget with hashed deduplication",
+        "cover bounding box rejects invalid bounds",
+        "geo distance filter",
+        "geo bbox filter refines indexed geohash candidates",
+        "geo filter candidate precision adapts to selective boxes",
+        "geo bbox coarse candidates expand max precision geohash terms",
+        "geo bbox dense coarse candidates fall back to exact doc values",
+        "geo bbox filter supports antimeridian wrapped longitude ranges",
+        "geo distance filter uses indexed candidates across antimeridian",
+        "document mapper preserves unsigned numeric doc values beyond i64 as u64",
+        "schema-derived keyword subfield backs native sort execution",
+        "sort value comparison defines canonical scalar order",
+        "sort execution plan dimension names are stable for profiles",
+        "sort cursor contract classifies arity separately from type",
+        "json sort values reject non-replayable numeric values at API boundaries",
+        "stored json debug sort honors runtime missing null policy",
+        "stored json debug sort normalizes runtime datetime values",
+        "score sort source detection rejects non-scoring text queries",
+        "vector score order helper is limited to internal score tuple decoration",
+        "score sort rejects hits without finite scores",
+        "native sort zero limit avoids generic collector decoration",
+        "text doc values sort zero limit avoids budget and decoration",
+        "match_all candidate sort rejects direct score sort execution",
+        "match_all native candidate sort zero limit avoids decoration",
+        "match_all native ordinal doc values zero limit avoids budget and decoration",
+        "match_all native stream sort zero limit counts without decoration",
+        "match_all id seek zero limit exposes internal sort profile when sampled",
+        "match_all id seek zero limit respects cursor bounds exactly",
+        "match_all native candidate sort applies cursor before admission",
+        "match_all unordered source loads selected hits through projected batch",
+        "vector score top k sort profile uses common sort vocabulary",
+        "native sort planner classifies mapping and cursor rejection reasons",
+        "text score query exposes score top k sort profile",
+        "native text sort planner requires live segment index sort coverage for sorted executor",
+        "native text sort planner ignores fully deleted legacy segments for index sort coverage",
+        "text field sort uses sorted segment membership path when index sort matches",
+        "text projected source load rejects expired deadline before stored load",
+        "native numeric sort rejects non-finite doc values",
+        "sort uses native text doc values without stored json fallback",
+        "required native sort does not fall back to stored json on doc value miss",
+        "native doc values plan enforces native values even with non-requiring loader",
+        "native doc values plan rejects runtime value kind mismatch",
+        "required native sort fails on absent physical doc value section",
+        "required native sort fails on sparse doc value entry miss",
+        "pattern typed structured filters accept explicit path alias",
+        "pattern typed structured filters reject ambiguous field and path aliases",
+        "pattern typed structured filters reject malformed and unbounded ranges",
+        "pattern geo structured filters reject invalid coordinates",
+        "dense and sparse search reject unsupported exact sort page options",
+        "dense projected source load rejects expired deadline before load",
+        "match_all sorted segment seek merges sorted segments and applies cursors",
+        "match_all sorted segment seek honors deleted old sort values after upsert",
+        "match_all sorted segment seek uses cursor seek within each segment",
+        "match_all sorted segment seek enforces scan budget",
+        "match_all sorted segment seek checks deadline while scanning",
+        "match_all sorted segment seek zero limit returns profile without scanning",
+        "match_all projected source load rejects expired deadline before batch load",
+        "match_all rejects sorted pages with unresolved stored pattern filters",
+        "match_all rejects cursor pages with unresolved stored pattern filters",
+        "match_all rejects field sort without native doc values",
+        "match_all rejects score sort without score-bearing source",
+        "composed search rejects exact field sort across embedding sources",
+        "composed text exact sort preserves native component profile",
+        "composed exact sort validates component sort tuples",
+        "composed text exact sort surfaces missing component profile",
+        "declared runtime sortable field capability reports covered queryable state",
+        "declared runtime geo field capability reports covered filterable state",
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
     };
+    const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_unit_default_filters),
+        .filters = lib_unit_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    addRuntimeTestFilters(run_lib_unit_tests, lib_unit_filters);
     for (root_test_skip_filters) |filter| {
         run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+
+    const introducer_tests = b.addTest(.{
+        .root_module = introducer_test_mod,
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_introducer_tests = b.addRunArtifact(introducer_tests);
+    const introducer_test_step = b.step("introducer-test", "Run segment introducer unit tests");
+    introducer_test_step.dependOn(&run_introducer_tests.step);
 
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
@@ -3015,6 +3212,8 @@ pub fn build(b: *std.Build) void {
         run_lib_image_corpus_verify_png_quiet_step,
         run_lib_image_corpus_verify_png_spng_quiet_step,
         run_lib_image_corpus_verify_gif_quiet_step,
+        run_lib_image_corpus_verify_bmp_quiet_step,
+        run_lib_image_corpus_verify_webp_quiet_step,
         run_image_jpeg_seed_corpora_e2e_after_fetch_quiet_step,
     });
 
@@ -3222,30 +3421,109 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_merge_cutover_reopen_step = b.step("lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test");
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
+    const lib_db_query_default_filters = [_][]const u8{
+        "storage.db.db.test.db full-text",
+        "storage.db.db.test.db dense ",
+        "storage.db.db.test.db sparse ",
+        "storage.db.db.test.db graph ",
+        "storage.db.db.test.db search ",
+        "storage.db.db.test.db document _edges",
+        "storage.db.db.test.db document _embeddings",
+        "sort execution plan dimension names are stable for profiles",
+        "sort cursor contract classifies arity separately from type",
+        "json sort values reject non-replayable numeric values at API boundaries",
+        "stored json debug sort honors runtime missing null policy",
+        "stored json debug sort normalizes runtime datetime values",
+        "score sort source detection rejects non-scoring text queries",
+        "vector score order helper is limited to internal score tuple decoration",
+        "score sort rejects hits without finite scores",
+        "match_all rejects score sort without score-bearing source",
+        "match_all candidate sort rejects direct score sort execution",
+        "distributed sorted hit merge uses typed sort tuple ordering and cursors",
+        "distributed merge rejects provably incomplete exact shard windows",
+        "distributed merge uses runtime schema for typed date cursors",
+        "vector score top k sort profile uses common sort vocabulary",
+        "native sort planner classifies mapping and cursor rejection reasons",
+        "text score query exposes score top k sort profile",
+        "native text sort planner requires live segment index sort coverage for sorted executor",
+        "native text sort planner ignores fully deleted legacy segments for index sort coverage",
+        "match_all sorted segment seek merges sorted segments and applies cursors",
+        "match_all sorted segment seek uses cursor seek within each segment",
+        "match_all sorted segment seek enforces scan budget",
+        "match_all sorted segment seek checks deadline while scanning",
+        "match_all sorted segment seek zero limit returns profile without scanning",
+        "match_all sorted segment seek rejects cursor when segment bounds are unavailable",
+        "match_all projected source load rejects expired deadline before batch load",
+        "dense projected source load rejects expired deadline before load",
+        "match_all unordered source loads selected hits through projected batch",
+        "text field sort uses sorted segment membership path when index sort matches",
+        "text projected source load rejects expired deadline before stored load",
+        "native numeric sort rejects non-finite doc values",
+        "native sort zero limit avoids generic collector decoration",
+        "text doc values sort zero limit avoids budget and decoration",
+        "match_all native candidate sort zero limit avoids decoration",
+        "match_all native ordinal doc values zero limit avoids budget and decoration",
+        "match_all native stream sort zero limit counts without decoration",
+        "match_all id seek zero limit exposes internal sort profile when sampled",
+        "match_all id seek zero limit respects cursor bounds exactly",
+        "match_all native candidate sort applies cursor before admission",
+        "document mapper emits schema keyword typed doc values",
+        "document mapper omits multi-valued schema keyword typed doc values",
+        "document mapper omits multi-valued schema numeric typed doc values",
+        "document mapper preserves integer numeric doc values as i64",
+        "document mapper preserves unsigned numeric doc values beyond i64 as u64",
+        "document mapper omits mixed numeric typed doc value domains",
+        "document mapper omits non-finite numeric doc values",
+        "document mapper flushes schema index_sort segments in physical sort order",
+        "document mapper rejects mixed native value types for index_sort field",
+        "document mapper validates schema index_sort field capabilities",
+        "merge preserves common sorted segment index_sort metadata",
+        "sort planner rejects non-finite numeric index sort bounds",
+        "schema keyword doc values back native sort planner",
+        "schema link doc values back native sort planner",
+        "schema numeric u64 doc values back native sort planner without rounding",
+        "schema numeric i64 doc values back native sort planner",
+        "schema boolean doc values back native sort planner",
+        "db exact sort resolves mapped geo metadata filters from typed doc values",
+    };
     const lib_db_query_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db full-text",
-            "storage.db.db.test.db dense ",
-            "storage.db.db.test.db sparse ",
-            "storage.db.db.test.db graph ",
-            "storage.db.db.test.db search ",
-            "storage.db.db.test.db document _edges",
-            "storage.db.db.test.db document _embeddings",
+        .filters = &lib_db_query_default_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
+    addRuntimeTestFilters(run_lib_db_query_tests, &lib_db_query_default_filters);
     const lib_db_query_step = b.step("lib-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
+
+    const lib_db_text_query_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "text late visibility",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_db_text_query_tests = b.addRunArtifact(lib_db_text_query_tests);
+    const lib_db_text_query_step = b.step("lib-db-text-query-test", "Run focused full-text query guardrail tests");
+    lib_db_text_query_step.dependOn(&run_lib_db_text_query_tests.step);
 
     const lib_db_result_shape_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
             "dedupeSearchHitsById uses ordinals when hit page is complete",
+            "applyStoredSearchPatternFilters reports lower-bound total for filtered page window",
             "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals",
             "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters",
             "applyStoredSearchPatternFilters fails closed without resolved ordinal projection",
             "applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported",
+            "postprocessTextSearchResult preserves exact upstream total when page is unchanged",
+            "postprocessTextSearchResult forwards batch stored loader to pattern filters",
             "native dense constraints fail closed without ordinal vector mapping",
             "buildPatternDocumentHits preserves resolved binding ordinals",
             "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents",
@@ -3559,6 +3837,7 @@ pub fn build(b: *std.Build) void {
         "api http server returns retryable not leader through public cluster adapter mutation",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
+        "api http server retries stale metadata table-exists restore race",
         "public API request body limit matches Go linear merge contract",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e recreates managed embeddings index after corrupt artifact",
@@ -3607,6 +3886,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
             "document artifact routes declare read and admin permissions",
+            "api http server marks table repair job failed when background submit is closing",
             "api http server serves mcp and a2a protocol surfaces",
             "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
             "api http server requires auth for ARD tenant catalog when auth is enabled",
@@ -3632,6 +3912,7 @@ pub fn build(b: *std.Build) void {
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
             "artifact operations apply source document row filter visibility",
+            "scan line key uses reserved _id document identity",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3658,7 +3939,42 @@ pub fn build(b: *std.Build) void {
             "distributed graph rejects unstamped result refs before cross-range fanout",
             "distributed graph edge reader carries identity generation",
             "query merge preserves common identity read generation",
+            "query merge applies distributed typed sort ordering and cursor paging",
+            "match_all index sort uses doc values collector for selective native filters",
+            "text index sort uses doc values collector for selective term filters",
+            "query merge applies runtime schema to distributed date cursors",
+            "query merge rejects sorted shards without complete sort tuples",
+            "query merge rejects sorted shards whose id tiebreaker mismatches hit id",
+            "query merge rejects sorted shards with mixed sort value domains",
+            "query merge rejects score ordered hits without finite scores",
+            "query merge orders non score bearing hits by id without requiring scores",
+            "query parser records approximate source diagnostic for semantic exact sort",
+            "query parser rejects semantic cursor-only pagination as approximate source",
+            "query parser rejects semantic search_before pagination as approximate source",
+            "query parser rejects semantic score sort as approximate source",
             "query encoder does not expose internal doc ordinals",
+            "query builder preflight validates score sort source",
+            "query builder preflight validates cursor values against mapped sort field types",
+            "query builder preflight reports sort tuple shape diagnostics directly",
+            "api query contract serializes sort profile diagnostics",
+            "api query contract maps public exact sort rejection diagnostics",
+            "api query contract serializes ordered hit sort tuple",
+            "api query contract rejects ordered hits without complete sort tuple",
+            "api query contract rejects ordered hits with non replayable sort tuple",
+            "api query contract defaults cursor pagination without sort to id order",
+            "api query contract preflight rejects cursor pagination without sort when cursor is not id arity",
+            "create table parser rejects schemas that cannot derive runtime mappings",
+            "metadata.schema update rejects schemas that cannot derive runtime mappings",
+            "api query contract preflight rejects cursor pagination over approximate vector source",
+            "api query contract preflight rejects search_before pagination over approximate vector source",
+            "api query contract preflight rejects score sort over approximate vector source",
+            "api query contract preflight rejects score sort without score-bearing source",
+            "api query contract appends stable id sort tiebreaker for cursors",
+            "api query contract rejects cursor width that omits stable id tiebreaker",
+            "api query contract records cursor arity diagnostic without sort",
+            "api query contract rejects non replayable search_after cursor values",
+            "api query contract rejects non replayable search_before cursor values",
+            "api query contract rejects ambiguous explicit id sort tiebreaker",
             "graph edge local read rejects stale identity generation",
             "catalog doc identity readiness checks table range health",
             "catalog resolved filter validation accepts preserved split identity domains",
@@ -3771,7 +4087,33 @@ pub fn build(b: *std.Build) void {
             "text native constraints fall back for mixed ordinal sidecar coverage",
             "text native constraints fail closed when resolved ordinals cannot be projected",
             "text native constraints treat resolved all-doc exclusion as empty candidates",
+            "sort cursor contract classifies arity separately from type",
             "segment doc ordinal sidecar roundtrip and merge preserve live order",
+            "segment index sort metadata roundtrip",
+            "segment merge drops index sort metadata until physical sort is preserved",
+            "segment sorted merge preserves index sort and remaps doc addressed sections",
+            "segment sorted merge rejects non-finite f64 index sort values",
+            "match_all sorted segment seek merges sorted segments and applies cursors",
+            "match_all sorted segment seek uses cursor seek within each segment",
+            "match_all sorted segment seek enforces scan budget",
+            "match_all sorted segment seek checks deadline while scanning",
+            "match_all sorted segment seek zero limit returns profile without scanning",
+            "match_all sorted segment seek rejects cursor when segment bounds are unavailable",
+            "match_all projected source load rejects expired deadline before batch load",
+            "dense projected source load rejects expired deadline before load",
+            "match_all unordered source loads selected hits through projected batch",
+            "text projected source load rejects expired deadline before stored load",
+            "native sort zero limit avoids generic collector decoration",
+            "text doc values sort zero limit avoids budget and decoration",
+            "match_all native candidate sort zero limit avoids decoration",
+            "match_all native ordinal doc values zero limit avoids budget and decoration",
+            "match_all native stream sort zero limit counts without decoration",
+            "match_all id seek zero limit exposes internal sort profile when sampled",
+            "match_all id seek zero limit respects cursor bounds exactly",
+            "match_all native candidate sort applies cursor before admission",
+            "document mapper flushes schema index_sort segments in physical sort order",
+            "document mapper validates schema index_sort field capabilities",
+            "merge preserves common sorted segment index_sort metadata",
             "db text compaction preserves ordinal filters across reopen",
             "structured filter doc set cache returns owned clones",
             "structured filter doc set cache separates shared namespace generation keys",
@@ -3870,6 +4212,11 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up uses provided indexes json without catalog fetch",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up finishes restore repair before terminal index load degradation",
+            "table runtime snapshot cache clones stored status",
+            "provisioned runtime status overlays live writer replay target without republishing stats",
+            "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
+            "provisioned runtime status live replay overlay clears ambiguous replay-only backfill",
+            "provisioned runtime status live replay overlay preserves non-replay backfill",
             "managed source status-only open drains stale pending close before retry",
             "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
@@ -3882,8 +4229,10 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "aggregation completeness requires exact total relation",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "parseRemoteSearchResult preserves fused index scores",
+            "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
             "catalog backed router skips non-serving relocation placements",
         },
@@ -3900,6 +4249,9 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",
+            "public table query handler maps unsupported exact sort",
+            "public table query handler exposes stable count-only sort rejection reason",
+            "public table query handler surfaces exact sort rejection diagnostics",
             "public table query view handler maps doc identity unavailable errors",
             "public table backup handler accepts portable format",
             "public table query view handler maps HA read gate errors",
@@ -4407,6 +4759,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
+    unit_test_step.dependOn(&run_introducer_tests.step);
+    unit_test_step.dependOn(&run_lib_db_text_query_tests.step);
     unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
@@ -4775,6 +5129,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
+    if (b.args) |args| run_db_unit_tests.addArgs(args);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
@@ -6348,7 +6703,6 @@ pub fn build(b: *std.Build) void {
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
     const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
     public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
-
     const raft_apply_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),
         .target = target,

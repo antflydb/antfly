@@ -16,7 +16,7 @@
 //!
 //! Matches Go antfly's lib/schema/ types:
 //!   - AntflyType: text, keyword, numeric, embedding, link, boolean, datetime, geopoint, etc.
-//!   - FieldMapping: type + index/store/doc_values/analyzer settings
+//!   - FieldMapping: type + index/store/doc_values/sortable/analyzer settings
 //!   - DynamicTemplate: glob-based pattern matching for field names
 //!   - TableSchema: version, TTL config, default type, dynamic templates
 
@@ -69,11 +69,28 @@ pub const AntflyType = enum(u8) {
     search_as_you_type = 11,
 };
 
+pub const MissingNullPolicy = enum(u8) {
+    missing_rejected = 0,
+};
+
+pub fn missingNullPolicyName(policy: MissingNullPolicy) []const u8 {
+    return switch (policy) {
+        .missing_rejected => "missing_rejected",
+    };
+}
+
+pub fn parseMissingNullPolicy(value: []const u8) ?MissingNullPolicy {
+    if (std.mem.eql(u8, value, "missing_rejected")) return .missing_rejected;
+    return null;
+}
+
 pub const FieldMapping = struct {
     field_type: AntflyType = .text,
     do_index: bool = true,
     store: bool = true,
     doc_values: bool = false,
+    sortable: bool = false,
+    missing_null_policy: MissingNullPolicy = .missing_rejected,
     include_in_all: bool = false,
     analyzer: []const u8 = "standard",
 };
@@ -116,6 +133,11 @@ pub const FullTextDocument = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
 };
 
+pub const IndexSortField = struct {
+    field: []const u8,
+    desc: bool = false,
+};
+
 pub const TableSchema = struct {
     version: u32 = 0,
     default_type: []const u8 = "_default",
@@ -124,6 +146,7 @@ pub const TableSchema = struct {
     enforce_types: bool = false,
     dynamic_templates: []const DynamicTemplate = &.{},
     full_text_documents: []const FullTextDocument = &.{},
+    index_sort: []const IndexSortField = &.{},
 };
 
 // ============================================================================
@@ -144,7 +167,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 8); // format version
+    try appendU32(&buf, alloc, 11); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -164,6 +187,8 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, if (tmpl.mapping.do_index) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.store) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.doc_values) 1 else 0);
+        try buf.append(alloc, if (tmpl.mapping.sortable) 1 else 0);
+        try buf.append(alloc, @intFromEnum(tmpl.mapping.missing_null_policy));
         try buf.append(alloc, if (tmpl.mapping.include_in_all) 1 else 0);
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
     }
@@ -196,6 +221,12 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         for (doc.infer_type_dynamic_paths) |path| try appendStr(&buf, alloc, path);
     }
 
+    try appendU32(&buf, alloc, @intCast(schema.index_sort.len));
+    for (schema.index_sort) |field| {
+        try appendStr(&buf, alloc, field.field);
+        try buf.append(alloc, if (field.desc) 1 else 0);
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -209,7 +240,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 11) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -272,6 +303,19 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         pos += 1;
         const doc_values = data[pos] == 1;
         pos += 1;
+        const sortable = if (fmt_version >= 9) blk: {
+            const value = data[pos] == 1;
+            pos += 1;
+            break :blk value;
+        } else defaultSortableForMapping(field_type, doc_values);
+        const missing_null_policy: MissingNullPolicy = if (fmt_version >= 11) blk: {
+            const value: MissingNullPolicy = switch (data[pos]) {
+                0 => .missing_rejected,
+                else => return error.InvalidSchema,
+            };
+            pos += 1;
+            break :blk value;
+        } else .missing_rejected;
         const include_in_all = data[pos] == 1;
         pos += 1;
         const analyzer = try alloc.dupe(u8, readStr(data, &pos));
@@ -288,6 +332,8 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .do_index = do_index,
                 .store = store_val,
                 .doc_values = doc_values,
+                .sortable = sortable,
+                .missing_null_policy = missing_null_policy,
                 .include_in_all = include_in_all,
                 .analyzer = analyzer,
             },
@@ -455,6 +501,25 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk docs;
     } else &.{};
 
+    const index_sort: []IndexSortField = if (fmt_version >= 10) blk: {
+        const field_count = readU32(data, &pos);
+        const fields = try alloc.alloc(IndexSortField, field_count);
+        var fields_initialized: usize = 0;
+        errdefer {
+            for (fields[0..fields_initialized]) |field| alloc.free(field.field);
+            alloc.free(fields);
+        }
+        for (fields) |*field| {
+            field.* = .{
+                .field = try alloc.dupe(u8, readStr(data, &pos)),
+                .desc = data[pos] == 1,
+            };
+            pos += 1;
+            fields_initialized += 1;
+        }
+        break :blk fields;
+    } else &.{};
+
     return .{
         .version = version,
         .default_type = default_type,
@@ -463,6 +528,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .enforce_types = enforce_types,
         .dynamic_templates = templates,
         .full_text_documents = full_text_documents,
+        .index_sort = index_sort,
     };
 }
 
@@ -505,6 +571,8 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
     if (s.full_text_documents.len > 0) alloc.free(s.full_text_documents);
+    for (s.index_sort) |field| alloc.free(field.field);
+    if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
 
 /// Save a schema to DocStore.
@@ -650,6 +718,17 @@ pub fn resolveFieldType(schema: TableSchema, field_name: []const u8) ?FieldMappi
     return resolveFieldTypeForValue(schema, field_name, null);
 }
 
+/// Resolve a declared mapping for a concrete field path without requiring a
+/// sample value for `match_mapping_type`. Use this only for schema/config
+/// validation paths that still require physical coverage before queryability.
+pub fn resolveDeclaredFieldType(schema: TableSchema, path: []const u8) ?FieldMapping {
+    const field_name = fieldNameFromPath(path);
+    for (schema.dynamic_templates) |tmpl| {
+        if (dynamicTemplateMatchesDeclaredPath(tmpl, path, field_name)) return tmpl.mapping;
+    }
+    return null;
+}
+
 /// Resolve the field type for a field/path using dynamic templates and an
 /// optional runtime value for `match_mapping_type` matching.
 pub fn resolveFieldTypeForValue(schema: TableSchema, path: []const u8, value: ?std.json.Value) ?FieldMapping {
@@ -658,6 +737,381 @@ pub fn resolveFieldTypeForValue(schema: TableSchema, path: []const u8, value: ?s
         if (dynamicTemplateMatches(tmpl, path, field_name, value)) return tmpl.mapping;
     }
     return null;
+}
+
+pub fn defaultSortableForMapping(field_type: AntflyType, doc_values: bool) bool {
+    if (!doc_values) return false;
+    return fieldTypeIsSortableScalar(field_type);
+}
+
+pub fn fieldTypeIsSortableScalar(field_type: AntflyType) bool {
+    return switch (field_type) {
+        .keyword, .numeric, .boolean, .datetime, .link => true,
+        else => false,
+    };
+}
+
+pub fn mappingIsFilterable(mapping: FieldMapping) bool {
+    return switch (mapping.field_type) {
+        .geopoint => mapping.doc_values,
+        else => fieldTypeIsSortableScalar(mapping.field_type) and (mapping.do_index or mapping.doc_values),
+    };
+}
+
+pub fn mappingIsAggregatable(mapping: FieldMapping) bool {
+    return fieldTypeIsSortableScalar(mapping.field_type) and mapping.doc_values;
+}
+
+pub fn mappingHasNativeDocValues(mapping: FieldMapping) bool {
+    if (!mapping.doc_values) return false;
+    return switch (mapping.field_type) {
+        .keyword, .numeric, .boolean, .datetime, .link, .geopoint => true,
+        else => false,
+    };
+}
+
+pub fn mappingIsSortable(mapping: FieldMapping) bool {
+    return fieldTypeIsSortableScalar(mapping.field_type) and mapping.doc_values and mapping.sortable;
+}
+
+pub fn mappingQueryabilityStateName(mapping: FieldMapping) []const u8 {
+    if (mappingIsSortable(mapping)) return "declared";
+    if (mapping.field_type == .geopoint) {
+        if (mapping.doc_values) return "declared";
+        return "missing_doc_values";
+    }
+    if (!fieldTypeIsSortableScalar(mapping.field_type)) return "non_scalar";
+    if (!mapping.doc_values) return "missing_doc_values";
+    if (!mapping.sortable) return "non_sortable";
+    return "unsupported";
+}
+
+pub fn conservativeDocValueCoverage(left: []const u8, right: []const u8) []const u8 {
+    return if (docValueCoverageRank(left) <= docValueCoverageRank(right)) left else right;
+}
+
+fn docValueCoverageRank(value: []const u8) u8 {
+    if (std.mem.eql(u8, value, "identity_metadata")) return 5;
+    if (std.mem.eql(u8, value, "covered")) return 4;
+    if (std.mem.eql(u8, value, "schema_declared")) return 3;
+    if (std.mem.eql(u8, value, "observed_declared")) return 2;
+    if (std.mem.eql(u8, value, "not_declared")) return 1;
+    return 0;
+}
+
+pub fn conservativeQueryabilityState(left: []const u8, right: []const u8) []const u8 {
+    return if (queryabilityStateRank(left) <= queryabilityStateRank(right)) left else right;
+}
+
+fn queryabilityStateRank(value: []const u8) u8 {
+    if (std.mem.eql(u8, value, "queryable")) return 6;
+    if (std.mem.eql(u8, value, "declared")) return 5;
+    if (std.mem.eql(u8, value, "text_search_only")) return 4;
+    if (std.mem.eql(u8, value, "missing_doc_values")) return 3;
+    if (std.mem.eql(u8, value, "non_sortable")) return 2;
+    if (std.mem.eql(u8, value, "non_scalar")) return 1;
+    return 0;
+}
+
+pub fn sortLifecycleStateName(capability: FieldCapability) []const u8 {
+    if (!capability.sortable) return "unsupported";
+    if (std.mem.eql(u8, capability.queryability_state, "queryable")) {
+        return if (capability.index_sort != null) "accelerated" else "queryable";
+    }
+    if (std.mem.eql(u8, capability.doc_value_coverage, "covered") or
+        std.mem.eql(u8, capability.doc_value_coverage, "identity_metadata"))
+    {
+        return "covered";
+    }
+    if (capability.doc_values and std.mem.eql(u8, capability.doc_value_coverage, "observed_declared")) return "indexed";
+    return "declared";
+}
+
+pub fn refreshSortLifecycleState(capability: *FieldCapability) void {
+    capability.sort_lifecycle_state = sortLifecycleStateName(capability.*);
+}
+
+pub fn conservativeSortLifecycleState(left: []const u8, right: []const u8) []const u8 {
+    return if (sortLifecycleStateRank(left) <= sortLifecycleStateRank(right)) left else right;
+}
+
+fn sortLifecycleStateRank(value: []const u8) u8 {
+    if (std.mem.eql(u8, value, "accelerated")) return 5;
+    if (std.mem.eql(u8, value, "queryable")) return 4;
+    if (std.mem.eql(u8, value, "covered")) return 3;
+    if (std.mem.eql(u8, value, "indexed")) return 2;
+    if (std.mem.eql(u8, value, "declared")) return 1;
+    return 0;
+}
+
+pub const IndexSortMembership = struct {
+    position: usize,
+    desc: bool,
+};
+
+pub const FieldCapability = struct {
+    name: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    path_pattern: ?[]const u8 = null,
+    field_pattern: ?[]const u8 = null,
+    match_mapping_type: ?[]const u8 = null,
+    emitted_name: ?[]const u8 = null,
+    document_schema: ?[]const u8 = null,
+    field_type: AntflyType,
+    searchable: bool,
+    filterable: bool,
+    aggregatable: bool,
+    doc_values: bool,
+    sortable: bool,
+    doc_value_coverage: []const u8,
+    provenance: []const u8,
+    missing_null_policy: []const u8,
+    queryability_state: []const u8,
+    sort_lifecycle_state: []const u8,
+    analyzer: ?[]const u8 = null,
+    index_sort: ?IndexSortMembership = null,
+};
+
+pub fn indexSortMembership(schema: TableSchema, field: []const u8) ?IndexSortMembership {
+    for (schema.index_sort, 0..) |sort_field, idx| {
+        if (std.mem.eql(u8, sort_field.field, field)) {
+            return .{ .position = idx, .desc = sort_field.desc };
+        }
+    }
+    return null;
+}
+
+pub fn reservedIdFieldCapability(schema: TableSchema) FieldCapability {
+    const index_sort = indexSortMembership(schema, "_id");
+    return .{
+        .field = "_id",
+        .field_type = .keyword,
+        .searchable = true,
+        .filterable = true,
+        .aggregatable = false,
+        .doc_values = false,
+        .sortable = true,
+        .doc_value_coverage = "identity_metadata",
+        .provenance = "reserved",
+        .missing_null_policy = "not_null",
+        .queryability_state = "queryable",
+        .sort_lifecycle_state = lifecycleStateFromParts(true, false, "identity_metadata", "queryable", index_sort),
+        .index_sort = index_sort,
+    };
+}
+
+pub fn dynamicTemplateFieldCapability(schema: TableSchema, tmpl: DynamicTemplate) FieldCapability {
+    const mapping = tmpl.mapping;
+    const exact_path = exactDynamicTemplatePath(tmpl);
+    const index_sort = if (exact_path) |field| indexSortMembership(schema, field) else null;
+    const sortable = mappingIsSortable(mapping);
+    const queryability_state = mappingQueryabilityStateName(mapping);
+    const doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
+    return .{
+        .name = tmpl.name,
+        .field = exact_path,
+        .path_pattern = tmpl.path_match,
+        .field_pattern = tmpl.match_pattern,
+        .match_mapping_type = tmpl.match_mapping_type,
+        .field_type = mapping.field_type,
+        .searchable = mapping.do_index,
+        .filterable = mappingIsFilterable(mapping),
+        .aggregatable = mappingIsAggregatable(mapping),
+        .doc_values = mapping.doc_values,
+        .sortable = sortable,
+        .doc_value_coverage = doc_value_coverage,
+        .provenance = "dynamic_template",
+        .missing_null_policy = missingNullPolicyName(mapping.missing_null_policy),
+        .queryability_state = queryability_state,
+        .sort_lifecycle_state = lifecycleStateFromParts(sortable, mapping.doc_values, doc_value_coverage, queryability_state, index_sort),
+        .analyzer = mapping.analyzer,
+        .index_sort = index_sort,
+    };
+}
+
+pub fn fullTextFieldCapability(schema: TableSchema, document_name: []const u8, field: FullTextField) FieldCapability {
+    const exact_keyword = std.mem.eql(u8, field.analyzer, "keyword");
+    const capability_field = if (exact_keyword) field.emitted_name else field.path;
+    return .{
+        .field = capability_field,
+        .emitted_name = field.emitted_name,
+        .document_schema = document_name,
+        .field_type = if (exact_keyword) .keyword else .text,
+        .searchable = true,
+        .filterable = exact_keyword,
+        .aggregatable = false,
+        .doc_values = false,
+        .sortable = false,
+        .doc_value_coverage = "not_declared",
+        .provenance = "document_schema",
+        .missing_null_policy = "not_applicable",
+        .queryability_state = if (exact_keyword) "missing_doc_values" else "text_search_only",
+        .sort_lifecycle_state = "unsupported",
+        .analyzer = field.analyzer,
+        .index_sort = indexSortMembership(schema, capability_field),
+    };
+}
+
+pub fn observedDynamicFieldCapability(schema: ?TableSchema, field: []const u8, mapping: FieldMapping) FieldCapability {
+    const index_sort = if (schema) |runtime_schema| indexSortMembership(runtime_schema, field) else null;
+    const sortable = mappingIsSortable(mapping);
+    const queryability_state = mappingQueryabilityStateName(mapping);
+    const doc_value_coverage = if (mapping.doc_values) "observed_declared" else "not_declared";
+    return .{
+        .field = field,
+        .field_type = mapping.field_type,
+        .searchable = mapping.do_index,
+        .filterable = mappingIsFilterable(mapping),
+        .aggregatable = mappingIsAggregatable(mapping),
+        .doc_values = mapping.doc_values,
+        .sortable = sortable,
+        .doc_value_coverage = doc_value_coverage,
+        .provenance = "observed_dynamic",
+        .missing_null_policy = missingNullPolicyName(mapping.missing_null_policy),
+        .queryability_state = queryability_state,
+        .sort_lifecycle_state = lifecycleStateFromParts(sortable, mapping.doc_values, doc_value_coverage, queryability_state, index_sort),
+        .analyzer = mapping.analyzer,
+        .index_sort = index_sort,
+    };
+}
+
+fn lifecycleStateFromParts(
+    sortable: bool,
+    doc_values: bool,
+    doc_value_coverage: []const u8,
+    queryability_state: []const u8,
+    index_sort: ?IndexSortMembership,
+) []const u8 {
+    if (!sortable) return "unsupported";
+    if (std.mem.eql(u8, queryability_state, "queryable")) {
+        return if (index_sort != null) "accelerated" else "queryable";
+    }
+    if (std.mem.eql(u8, doc_value_coverage, "covered") or
+        std.mem.eql(u8, doc_value_coverage, "identity_metadata"))
+    {
+        return "covered";
+    }
+    if (doc_values and std.mem.eql(u8, doc_value_coverage, "observed_declared")) return "indexed";
+    return "declared";
+}
+
+pub fn fieldCapabilitiesAlloc(alloc: Allocator, schema: TableSchema) ![]FieldCapability {
+    var count: usize = 1 + schema.dynamic_templates.len;
+    for (schema.full_text_documents) |doc| {
+        for (doc.fields) |field| {
+            if (std.mem.eql(u8, field.path, "_id")) continue;
+            if (resolveFieldType(schema, field.path) != null) continue;
+            count += 1;
+        }
+    }
+
+    const capabilities = try alloc.alloc(FieldCapability, count);
+    errdefer alloc.free(capabilities);
+
+    var index: usize = 0;
+    capabilities[index] = reservedIdFieldCapability(schema);
+    index += 1;
+
+    for (schema.dynamic_templates) |tmpl| {
+        capabilities[index] = dynamicTemplateFieldCapability(schema, tmpl);
+        index += 1;
+    }
+
+    for (schema.full_text_documents) |doc| {
+        for (doc.fields) |field| {
+            if (std.mem.eql(u8, field.path, "_id")) continue;
+            if (resolveFieldType(schema, field.path) != null) continue;
+            capabilities[index] = fullTextFieldCapability(schema, doc.name, field);
+            index += 1;
+        }
+    }
+
+    std.debug.assert(index == capabilities.len);
+    return capabilities;
+}
+
+pub fn freeFieldCapabilities(alloc: Allocator, capabilities: []FieldCapability) void {
+    if (capabilities.len > 0) alloc.free(capabilities);
+}
+
+pub fn cloneFieldCapabilityAlloc(alloc: Allocator, capability: FieldCapability) !FieldCapability {
+    var cloned = capability;
+    cloned.name = if (capability.name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.name) |value| alloc.free(value);
+    cloned.field = if (capability.field) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.field) |value| alloc.free(value);
+    cloned.path_pattern = if (capability.path_pattern) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.path_pattern) |value| alloc.free(value);
+    cloned.field_pattern = if (capability.field_pattern) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.field_pattern) |value| alloc.free(value);
+    cloned.match_mapping_type = if (capability.match_mapping_type) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.match_mapping_type) |value| alloc.free(value);
+    cloned.emitted_name = if (capability.emitted_name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.emitted_name) |value| alloc.free(value);
+    cloned.document_schema = if (capability.document_schema) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.document_schema) |value| alloc.free(value);
+    cloned.doc_value_coverage = try alloc.dupe(u8, capability.doc_value_coverage);
+    errdefer alloc.free(cloned.doc_value_coverage);
+    cloned.provenance = try alloc.dupe(u8, capability.provenance);
+    errdefer alloc.free(cloned.provenance);
+    cloned.missing_null_policy = try alloc.dupe(u8, capability.missing_null_policy);
+    errdefer alloc.free(cloned.missing_null_policy);
+    cloned.queryability_state = try alloc.dupe(u8, capability.queryability_state);
+    errdefer alloc.free(cloned.queryability_state);
+    cloned.sort_lifecycle_state = try alloc.dupe(u8, capability.sort_lifecycle_state);
+    errdefer alloc.free(cloned.sort_lifecycle_state);
+    cloned.analyzer = if (capability.analyzer) |value| try alloc.dupe(u8, value) else null;
+    return cloned;
+}
+
+pub fn cloneFieldCapabilitiesAlloc(alloc: Allocator, capabilities: []const FieldCapability) ![]FieldCapability {
+    const cloned = try alloc.alloc(FieldCapability, capabilities.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |item| freeOwnedFieldCapability(alloc, item);
+        alloc.free(cloned);
+    }
+
+    for (capabilities, 0..) |capability, i| {
+        cloned[i] = try cloneFieldCapabilityAlloc(alloc, capability);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeOwnedFieldCapability(alloc: Allocator, capability: FieldCapability) void {
+    if (capability.name) |value| alloc.free(value);
+    if (capability.field) |value| alloc.free(value);
+    if (capability.path_pattern) |value| alloc.free(value);
+    if (capability.field_pattern) |value| alloc.free(value);
+    if (capability.match_mapping_type) |value| alloc.free(value);
+    if (capability.emitted_name) |value| alloc.free(value);
+    if (capability.document_schema) |value| alloc.free(value);
+    alloc.free(capability.doc_value_coverage);
+    alloc.free(capability.provenance);
+    alloc.free(capability.missing_null_policy);
+    alloc.free(capability.queryability_state);
+    alloc.free(capability.sort_lifecycle_state);
+    if (capability.analyzer) |value| alloc.free(value);
+}
+
+pub fn freeOwnedFieldCapabilities(alloc: Allocator, capabilities: []FieldCapability) void {
+    for (capabilities) |capability| freeOwnedFieldCapability(alloc, capability);
+    if (capabilities.len > 0) alloc.free(capabilities);
+}
+
+pub fn exactDynamicTemplatePath(tmpl: DynamicTemplate) ?[]const u8 {
+    const path_match = tmpl.path_match orelse return null;
+    if (std.mem.indexOfAny(u8, path_match, "*?") != null) return null;
+    if (tmpl.path_unmatch != null) return null;
+    if (tmpl.match_pattern) |pattern| {
+        if (std.mem.indexOfAny(u8, pattern, "*?") != null) return null;
+        if (!std.mem.eql(u8, pattern, fieldNameFromPath(path_match))) return null;
+    }
+    if (tmpl.unmatch_pattern) |pattern| {
+        if (std.mem.eql(u8, pattern, fieldNameFromPath(path_match))) return null;
+    }
+    return path_match;
 }
 
 fn dynamicTemplateMatches(
@@ -685,6 +1139,26 @@ fn dynamicTemplateMatches(
     return true;
 }
 
+fn dynamicTemplateMatchesDeclaredPath(
+    tmpl: DynamicTemplate,
+    path: []const u8,
+    field_name: []const u8,
+) bool {
+    if (tmpl.match_pattern) |pattern| {
+        if (!globMatch(pattern, field_name)) return false;
+    }
+    if (tmpl.unmatch_pattern) |pattern| {
+        if (globMatch(pattern, field_name)) return false;
+    }
+    if (tmpl.path_match) |pattern| {
+        if (!globMatch(pattern, path)) return false;
+    }
+    if (tmpl.path_unmatch) |pattern| {
+        if (globMatch(pattern, path)) return false;
+    }
+    return true;
+}
+
 fn inferDynamicTemplateMatchType(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => |text| if (parseRfc3339ToNs(text) != null or isValidDate(text)) "date" else "string",
@@ -695,7 +1169,7 @@ fn inferDynamicTemplateMatchType(value: std.json.Value) ?[]const u8 {
     };
 }
 
-fn fieldNameFromPath(path: []const u8) []const u8 {
+pub fn fieldNameFromPath(path: []const u8) []const u8 {
     const last_dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
     return path[last_dot + 1 ..];
 }
@@ -738,6 +1212,29 @@ pub fn validateFields(schema: TableSchema, field_names: []const []const u8) !voi
     }
 }
 
+pub fn parseDateTimeToNs(text: []const u8) ?u64 {
+    if (parseRfc3339ToNs(text)) |ns| return ns;
+    return parseDateToNs(text);
+}
+
+pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
+    const seconds = ns / std.time.ns_per_s;
+    const nanos = ns % std.time.ns_per_s;
+    const days: i64 = @intCast(seconds / 86_400);
+    const seconds_of_day = seconds % 86_400;
+    const civil = civilFromDays(days);
+    if (civil.year < 0 or civil.year > 9999) return error.InvalidDateTime;
+    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}Z", .{
+        @as(u64, @intCast(civil.year)),
+        civil.month,
+        civil.day,
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60,
+        seconds_of_day % 60,
+        nanos,
+    });
+}
+
 fn parseRfc3339ToNs(text: []const u8) ?u64 {
     if (text.len < 20) return null;
     if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
@@ -771,12 +1268,42 @@ fn parseRfc3339ToNs(text: []const u8) ?u64 {
     return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
 }
 
+fn parseDateToNs(value: []const u8) ?u64 {
+    if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
+    const year = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, value[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, value[8..10], 10) catch return null;
+    const days = daysFromCivil(year, month, day);
+    if (days < 0) return null;
+    return @as(u64, @intCast(days * 86_400)) * std.time.ns_per_s;
+}
+
 fn isValidDate(value: []const u8) bool {
-    if (value.len != 10 or value[4] != '-' or value[7] != '-') return false;
-    const year = std.fmt.parseInt(i64, value[0..4], 10) catch return false;
-    const month = std.fmt.parseInt(i64, value[5..7], 10) catch return false;
-    const day = std.fmt.parseInt(i64, value[8..10], 10) catch return false;
-    return daysFromCivil(year, month, day) >= 0;
+    return parseDateToNs(value) != null;
+}
+
+const CivilDate = struct {
+    year: i64,
+    month: u8,
+    day: u8,
+};
+
+fn civilFromDays(days_since_epoch: i64) CivilDate {
+    const z = days_since_epoch + 719_468;
+    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    var year = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const day = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const month = mp + if (mp < 10) @as(i64, 3) else @as(i64, -9);
+    year += if (month <= 2) @as(i64, 1) else @as(i64, 0);
+    return .{
+        .year = year,
+        .month = @intCast(month),
+        .day = @intCast(day),
+    };
 }
 
 fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
@@ -865,6 +1392,8 @@ test "schema serialize/deserialize round-trip" {
                     .do_index = false,
                     .store = false,
                     .doc_values = true,
+                    .sortable = true,
+                    .missing_null_policy = .missing_rejected,
                     .include_in_all = false,
                     .analyzer = "keyword",
                 },
@@ -925,6 +1454,10 @@ test "schema serialize/deserialize round-trip" {
                 .infer_type_dynamic_paths = &.{"typed"},
             },
         },
+        .index_sort = &.{
+            .{ .field = "created_at", .desc = true },
+            .{ .field = "_id" },
+        },
     };
 
     const data = try serializeSchema(alloc, schema);
@@ -945,6 +1478,8 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqual(AntflyType.datetime, loaded.dynamic_templates[0].mapping.field_type);
     try std.testing.expect(!loaded.dynamic_templates[0].mapping.do_index);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.doc_values);
+    try std.testing.expect(loaded.dynamic_templates[0].mapping.sortable);
+    try std.testing.expectEqual(MissingNullPolicy.missing_rejected, loaded.dynamic_templates[0].mapping.missing_null_policy);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents.len);
     try std.testing.expectEqualStrings("my_type", loaded.full_text_documents[0].name);
     try std.testing.expectEqual(@as(usize, 4), loaded.full_text_documents[0].fields.len);
@@ -967,6 +1502,11 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].open_dynamic_paths[1]);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].infer_type_dynamic_paths.len);
     try std.testing.expectEqualStrings("typed", loaded.full_text_documents[0].infer_type_dynamic_paths[0]);
+    try std.testing.expectEqual(@as(usize, 2), loaded.index_sort.len);
+    try std.testing.expectEqualStrings("created_at", loaded.index_sort[0].field);
+    try std.testing.expect(loaded.index_sort[0].desc);
+    try std.testing.expectEqualStrings("_id", loaded.index_sort[1].field);
+    try std.testing.expect(!loaded.index_sort[1].desc);
 }
 
 test "schema save/load via DocStore" {
@@ -1138,17 +1678,244 @@ test "glob matching" {
     try std.testing.expect(!globMatch("*.embedding.*", "field.text.vector"));
 }
 
+test "runtime schema field capability helpers classify mapped sortability" {
+    const keyword = FieldMapping{
+        .field_type = .keyword,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+    const text = FieldMapping{
+        .field_type = .text,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "standard",
+    };
+    const missing_doc_values = FieldMapping{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = false,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+    const non_sortable = FieldMapping{
+        .field_type = .datetime,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = false,
+        .analyzer = "keyword",
+    };
+    const geo = FieldMapping{
+        .field_type = .geopoint,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = false,
+        .analyzer = "standard",
+    };
+    const geo_missing_doc_values = FieldMapping{
+        .field_type = .geopoint,
+        .do_index = true,
+        .doc_values = false,
+        .sortable = false,
+        .analyzer = "standard",
+    };
+
+    try std.testing.expect(fieldTypeIsSortableScalar(.keyword));
+    try std.testing.expect(fieldTypeIsSortableScalar(.datetime));
+    try std.testing.expect(!fieldTypeIsSortableScalar(.text));
+    try std.testing.expect(!fieldTypeIsSortableScalar(.geopoint));
+    try std.testing.expect(mappingIsFilterable(keyword));
+    try std.testing.expect(mappingIsFilterable(geo));
+    try std.testing.expect(!mappingIsFilterable(geo_missing_doc_values));
+    try std.testing.expect(mappingIsAggregatable(keyword));
+    try std.testing.expect(mappingIsSortable(keyword));
+    try std.testing.expect(!mappingIsSortable(text));
+    try std.testing.expect(!mappingIsSortable(geo));
+    try std.testing.expect(!mappingIsAggregatable(text));
+    try std.testing.expect(mappingHasNativeDocValues(keyword));
+    try std.testing.expect(mappingHasNativeDocValues(geo));
+    try std.testing.expect(!mappingHasNativeDocValues(geo_missing_doc_values));
+    try std.testing.expectEqualStrings("declared", mappingQueryabilityStateName(keyword));
+    try std.testing.expectEqualStrings("declared", mappingQueryabilityStateName(geo));
+    try std.testing.expectEqualStrings("non_scalar", mappingQueryabilityStateName(text));
+    try std.testing.expectEqualStrings("missing_doc_values", mappingQueryabilityStateName(missing_doc_values));
+    try std.testing.expectEqualStrings("missing_doc_values", mappingQueryabilityStateName(geo_missing_doc_values));
+    try std.testing.expectEqualStrings("non_sortable", mappingQueryabilityStateName(non_sortable));
+}
+
+test "runtime schema exact dynamic template path is conservative" {
+    const exact = DynamicTemplate{
+        .name = "created",
+        .path_match = "meta.created_at",
+        .match_pattern = "created_at",
+        .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true },
+    };
+    const wildcard = DynamicTemplate{
+        .name = "dates",
+        .path_match = "meta.*_at",
+        .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true },
+    };
+    const excluded = DynamicTemplate{
+        .name = "excluded",
+        .path_match = "meta.created_at",
+        .path_unmatch = "meta.private.*",
+        .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true },
+    };
+    const mismatched_field = DynamicTemplate{
+        .name = "mismatch",
+        .path_match = "meta.created_at",
+        .match_pattern = "updated_at",
+        .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true },
+    };
+
+    try std.testing.expectEqualStrings("meta.created_at", exactDynamicTemplatePath(exact).?);
+    try std.testing.expect(exactDynamicTemplatePath(wildcard) == null);
+    try std.testing.expect(exactDynamicTemplatePath(excluded) == null);
+    try std.testing.expect(exactDynamicTemplatePath(mismatched_field) == null);
+}
+
+test "runtime schema field capability model carries provenance and index sort membership" {
+    const index_sort = [_]IndexSortField{
+        .{ .field = "meta.created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const tmpl = DynamicTemplate{
+        .name = "created",
+        .path_match = "meta.created_at",
+        .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true, .analyzer = "keyword" },
+    };
+    const text_field = FullTextField{
+        .path = "title",
+        .emitted_name = "title",
+        .analyzer = "english",
+    };
+    const templates = [_]DynamicTemplate{tmpl};
+    const schema = TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    const id_capability = reservedIdFieldCapability(schema);
+    try std.testing.expectEqualStrings("_id", id_capability.field.?);
+    try std.testing.expectEqual(AntflyType.keyword, id_capability.field_type);
+    try std.testing.expect(id_capability.sortable);
+    try std.testing.expectEqualStrings("identity_metadata", id_capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("accelerated", id_capability.sort_lifecycle_state);
+    try std.testing.expectEqual(@as(usize, 1), id_capability.index_sort.?.position);
+    try std.testing.expect(!id_capability.index_sort.?.desc);
+
+    const dynamic_capability = dynamicTemplateFieldCapability(schema, tmpl);
+    try std.testing.expectEqualStrings("created", dynamic_capability.name.?);
+    try std.testing.expectEqualStrings("meta.created_at", dynamic_capability.field.?);
+    try std.testing.expectEqual(AntflyType.datetime, dynamic_capability.field_type);
+    try std.testing.expect(dynamic_capability.filterable);
+    try std.testing.expect(dynamic_capability.aggregatable);
+    try std.testing.expect(dynamic_capability.sortable);
+    try std.testing.expectEqualStrings("dynamic_template", dynamic_capability.provenance);
+    try std.testing.expectEqualStrings("declared", dynamic_capability.queryability_state);
+    try std.testing.expectEqualStrings("declared", dynamic_capability.sort_lifecycle_state);
+    try std.testing.expectEqual(@as(usize, 0), dynamic_capability.index_sort.?.position);
+    try std.testing.expect(dynamic_capability.index_sort.?.desc);
+
+    const text_capability = fullTextFieldCapability(schema, "doc", text_field);
+    try std.testing.expectEqualStrings("title", text_capability.field.?);
+    try std.testing.expectEqualStrings("doc", text_capability.document_schema.?);
+    try std.testing.expectEqual(AntflyType.text, text_capability.field_type);
+    try std.testing.expect(text_capability.searchable);
+    try std.testing.expect(!text_capability.sortable);
+    try std.testing.expectEqualStrings("document_schema", text_capability.provenance);
+    try std.testing.expectEqualStrings("text_search_only", text_capability.queryability_state);
+    try std.testing.expectEqualStrings("unsupported", text_capability.sort_lifecycle_state);
+    try std.testing.expect(text_capability.index_sort == null);
+
+    const observed_capability = observedDynamicFieldCapability(schema, "meta.created_at", tmpl.mapping);
+    try std.testing.expectEqualStrings("meta.created_at", observed_capability.field.?);
+    try std.testing.expectEqual(AntflyType.datetime, observed_capability.field_type);
+    try std.testing.expect(observed_capability.filterable);
+    try std.testing.expect(observed_capability.aggregatable);
+    try std.testing.expect(observed_capability.sortable);
+    try std.testing.expectEqualStrings("observed_declared", observed_capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("observed_dynamic", observed_capability.provenance);
+    try std.testing.expectEqualStrings("declared", observed_capability.queryability_state);
+    try std.testing.expectEqualStrings("indexed", observed_capability.sort_lifecycle_state);
+    try std.testing.expectEqual(@as(usize, 0), observed_capability.index_sort.?.position);
+    try std.testing.expect(observed_capability.index_sort.?.desc);
+}
+
+test "runtime schema field capability matrix enumerates shared capabilities" {
+    const alloc = std.testing.allocator;
+    const templates = [_]DynamicTemplate{.{
+        .name = "created",
+        .path_match = "created_at",
+        .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true, .analyzer = "keyword" },
+    }};
+    const fields = [_]FullTextField{
+        .{ .path = "created_at", .emitted_name = "created_at", .analyzer = "keyword" },
+        .{ .path = "title", .emitted_name = "title", .analyzer = "english" },
+        .{ .path = "title", .emitted_name = "title.keyword", .analyzer = "keyword" },
+        .{ .path = "_id", .emitted_name = "_id", .analyzer = "keyword" },
+    };
+    const docs = [_]FullTextDocument{.{
+        .name = "doc",
+        .fields = &fields,
+    }};
+    const index_sort = [_]IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema = TableSchema{
+        .dynamic_templates = &templates,
+        .full_text_documents = &docs,
+        .index_sort = &index_sort,
+    };
+
+    const capabilities = try fieldCapabilitiesAlloc(alloc, schema);
+    defer freeFieldCapabilities(alloc, capabilities);
+
+    try std.testing.expectEqual(@as(usize, 4), capabilities.len);
+    try std.testing.expectEqualStrings("_id", capabilities[0].field.?);
+    try std.testing.expectEqualStrings("reserved", capabilities[0].provenance);
+    try std.testing.expectEqualStrings("accelerated", capabilities[0].sort_lifecycle_state);
+    try std.testing.expectEqual(@as(usize, 1), capabilities[0].index_sort.?.position);
+
+    try std.testing.expectEqualStrings("created", capabilities[1].name.?);
+    try std.testing.expectEqualStrings("created_at", capabilities[1].field.?);
+    try std.testing.expectEqualStrings("dynamic_template", capabilities[1].provenance);
+    try std.testing.expect(capabilities[1].sortable);
+    try std.testing.expectEqualStrings("declared", capabilities[1].sort_lifecycle_state);
+    try std.testing.expectEqual(@as(usize, 0), capabilities[1].index_sort.?.position);
+
+    try std.testing.expectEqualStrings("title", capabilities[2].field.?);
+    try std.testing.expectEqualStrings("document_schema", capabilities[2].provenance);
+    try std.testing.expectEqual(AntflyType.text, capabilities[2].field_type);
+    try std.testing.expectEqualStrings("text_search_only", capabilities[2].queryability_state);
+    try std.testing.expectEqualStrings("unsupported", capabilities[2].sort_lifecycle_state);
+    try std.testing.expect(capabilities[2].index_sort == null);
+
+    try std.testing.expectEqualStrings("title.keyword", capabilities[3].field.?);
+    try std.testing.expectEqualStrings("title.keyword", capabilities[3].emitted_name.?);
+    try std.testing.expectEqualStrings("document_schema", capabilities[3].provenance);
+    try std.testing.expectEqual(AntflyType.keyword, capabilities[3].field_type);
+    try std.testing.expect(capabilities[3].filterable);
+    try std.testing.expect(!capabilities[3].doc_values);
+    try std.testing.expect(!capabilities[3].sortable);
+    try std.testing.expectEqualStrings("missing_doc_values", capabilities[3].queryability_state);
+    try std.testing.expectEqualStrings("unsupported", capabilities[3].sort_lifecycle_state);
+}
+
 test "dynamic template field resolution" {
     const templates = [_]DynamicTemplate{
         .{
             .name = "embeddings",
             .match_pattern = "*_embedding",
-            .mapping = .{ .field_type = .embedding, .doc_values = true },
+            .mapping = .{ .field_type = .embedding, .doc_values = true, .sortable = false },
         },
         .{
             .name = "keywords",
             .match_pattern = "*_id",
-            .mapping = .{ .field_type = .keyword },
+            .mapping = .{ .field_type = .keyword, .doc_values = true, .sortable = true },
         },
     };
 
@@ -1165,6 +1932,7 @@ test "dynamic template field resolution" {
     const kw = resolveFieldType(schema, "user_id");
     try std.testing.expect(kw != null);
     try std.testing.expectEqual(AntflyType.keyword, kw.?.field_type);
+    try std.testing.expect(kw.?.sortable);
 
     const unknown = resolveFieldType(schema, "random_field");
     try std.testing.expect(unknown == null);
@@ -1191,6 +1959,7 @@ test "dynamic template selector and mapping-option resolution" {
                 .do_index = false,
                 .store = false,
                 .doc_values = true,
+                .sortable = true,
                 .include_in_all = false,
                 .analyzer = "keyword",
             },
@@ -1214,14 +1983,35 @@ test "dynamic template selector and mapping-option resolution" {
     try std.testing.expectEqual(AntflyType.datetime, created.?.field_type);
     try std.testing.expect(!created.?.do_index);
     try std.testing.expect(created.?.doc_values);
+    try std.testing.expect(created.?.sortable);
     try std.testing.expectEqualStrings("keyword", created.?.analyzer);
 
     try std.testing.expect(resolveFieldTypeForValue(schema, "meta.skip_created_at", .{ .string = "2026-01-03T00:00:00Z" }) == null);
     try std.testing.expect(resolveFieldTypeForValue(schema, "meta.private.created_at", .{ .string = "2026-01-03T00:00:00Z" }) == null);
     try std.testing.expect(resolveFieldTypeForValue(schema, "meta.created_at", .{ .string = "not-a-date" }) == null);
+    try std.testing.expect(resolveFieldType(schema, "meta.created_at") == null);
+
+    const declared_created = resolveDeclaredFieldType(schema, "meta.created_at");
+    try std.testing.expect(declared_created != null);
+    try std.testing.expectEqual(AntflyType.datetime, declared_created.?.field_type);
+    try std.testing.expect(declared_created.?.doc_values);
+    try std.testing.expect(declared_created.?.sortable);
+    try std.testing.expect(resolveDeclaredFieldType(schema, "meta.skip_created_at") == null);
+    try std.testing.expect(resolveDeclaredFieldType(schema, "meta.private.created_at") == null);
 
     const tag = resolveFieldTypeForValue(schema, "meta.tags.primary", .{ .string = "alpha" });
     try std.testing.expect(tag != null);
     try std.testing.expectEqual(AntflyType.keyword, tag.?.field_type);
     try std.testing.expect(tag.?.include_in_all);
+}
+
+test "parseDateTimeToNs accepts rfc3339 and date-only values" {
+    try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs("1970-01-01T00:00:00.000000015Z"));
+    try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1970-01-01"));
+    try std.testing.expect(parseDateTimeToNs("not-a-date") == null);
+
+    const formatted = try formatDateTimeNsAlloc(std.testing.allocator, 15);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000015Z", formatted);
+    try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs(formatted));
 }

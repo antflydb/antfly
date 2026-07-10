@@ -3,7 +3,18 @@
 
 from typing import cast
 from antfly import AntflyClient
+from antfly.client_generated.models.query_hits_total import QueryHitsTotal
+from antfly.client_generated.models.query_hits_total_relation import QueryHitsTotalRelation
 from antfly.client_generated.types import Unset
+
+
+def format_hits_total(total: QueryHitsTotal | Unset) -> str:
+    """Format the generated query total model for readable examples."""
+    if isinstance(total, Unset):
+        return "unknown"
+
+    prefix = ">= " if total.relation == QueryHitsTotalRelation.GTE else ""
+    return f"{prefix}{total.value}"
 
 
 def main():
@@ -167,7 +178,7 @@ def print_results(results):
     if not isinstance(results.responses, Unset):
         result = results.responses[0]
         if result.hits and result.hits.hits:
-            print(f"  Found {result.hits.total} results:")
+            print(f"  Found {format_hits_total(result.hits.total)} results:")
             for i, hit in enumerate(result.hits.hits, 1):
                 if not isinstance(hit.field_source, Unset):
                     source = cast(dict, hit.field_source)

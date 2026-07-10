@@ -18,7 +18,10 @@
 //! layout plus the first native page stores used by the Lite backend.
 
 const std = @import("std");
+const antfly_platform = @import("antfly_platform");
+const platform_sync = antfly_platform.sync;
 const fs_paths = @import("../../common/fs_paths.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -163,6 +166,7 @@ pub const LockMode = enum {
 pub const OpenOptions = struct {
     read_only: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const PathWriterLock = struct {
@@ -176,9 +180,15 @@ pub const PathWriterLock = struct {
     }
 };
 
+const LockFile = struct {
+    file: std.Io.File,
+    locks_supported: bool = true,
+};
+
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const Header = struct {
@@ -235,6 +245,265 @@ pub const OwnedCatalogKey = struct {
     key: []u8,
 };
 
+/// Decoded chain-navigation metadata for a page, cached so reachability
+/// walks can traverse chains without re-reading and re-decoding page
+/// payloads. Mirrors exactly the fields the walks consume.
+const PageLinkInfo = struct {
+    kind: PageKind,
+    /// catalog/document: previous page in the chain; value: next page.
+    link_page: u64 = 0,
+    external_value_root_page: u64 = 0,
+    external_value_len: usize = 0,
+    /// value pages only.
+    chunk_len: usize = 0,
+    /// catalog pages only; owned by the cache.
+    key: []u8 = &.{},
+};
+
+/// A copy of one page's link info handed out by the cache. `key` (catalog
+/// pages) is owned by the caller.
+const PageLinkCopy = struct {
+    kind: PageKind,
+    link_page: u64,
+    external_value_root_page: u64,
+    external_value_len: usize,
+    chunk_len: usize,
+    key: ?[]u8,
+};
+
+/// In-memory cache of encoded pages, keyed by page id.
+///
+/// Safe when OS file locks are available because page contents are stable for
+/// the lifetime of an open handle: all in-process page writes flow through
+/// `writePage` (which updates the cache) or `replaceOpenFileWithImage` (which
+/// clears it), sidecar writer locks serialize writers, and read-only
+/// data-file shared locks block the exclusive data-rewrite lock needed for
+/// free-page reuse and vacuum. If the filesystem reports
+/// `FileLocksUnsupported`, the owning `NativeFile` disables this cache for
+/// that handle and reads page bytes from disk instead.
+const PageCache = struct {
+    const default_limit_bytes: usize = 64 * 1024 * 1024;
+    const default_link_limit_bytes: usize = 16 * 1024 * 1024;
+    const link_entry_overhead: usize = 64;
+
+    mutex: std.atomic.Mutex = .unlocked,
+    pages: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    links: std.AutoHashMapUnmanaged(u64, PageLinkInfo) = .empty,
+    total_bytes: usize = 0,
+    link_bytes: usize = 0,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    resource_page_accounted_bytes: u64 = 0,
+    resource_link_accounted_bytes: u64 = 0,
+    /// Page-bytes cap. Eviction is wholesale: overflow clears the page bytes
+    /// and starts over, which keeps the bookkeeping trivially correct and is
+    /// cheap to rebuild at Lite's target file sizes. Link entries are
+    /// budgeted separately — they are ~50x smaller per page, and reachability
+    /// walks depend on them staying resident even when the page-bytes working
+    /// set exceeds its cap.
+    limit_bytes: usize = default_limit_bytes,
+    link_limit_bytes: usize = default_link_limit_bytes,
+
+    fn getCopy(self: *PageCache, allocator: Allocator, page_id: u64) !?[]u8 {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const cached = self.pages.get(page_id) orelse return null;
+        return try allocator.dupe(u8, cached);
+    }
+
+    fn attachResourceManager(self: *PageCache, manager: *resource_manager_mod.ResourceManager) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.resource_manager = manager;
+        self.refreshPageResourceUsageLocked();
+        self.refreshLinkResourceUsageLocked();
+    }
+
+    fn put(self: *PageCache, allocator: Allocator, page_id: u64, page: []const u8) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.clearPagesForHardPressureLocked(allocator)) return;
+        if (self.pages.getEntry(page_id)) |entry| {
+            self.total_bytes -= entry.value_ptr.len;
+            allocator.free(entry.value_ptr.*);
+            entry.value_ptr.* = allocator.dupe(u8, page) catch {
+                std.debug.assert(self.pages.remove(page_id));
+                self.refreshPageResourceUsageLocked();
+                return;
+            };
+            self.total_bytes += page.len;
+            self.refreshPageResourceUsageLocked();
+            _ = self.clearPagesForHardPressureLocked(allocator);
+            return;
+        }
+        if (self.total_bytes + page.len > self.limit_bytes) {
+            self.clearPagesLocked(allocator);
+            self.refreshPageResourceUsageLocked();
+        }
+        const owned = allocator.dupe(u8, page) catch return;
+        self.pages.put(allocator, page_id, owned) catch {
+            allocator.free(owned);
+            return;
+        };
+        self.total_bytes += page.len;
+        self.refreshPageResourceUsageLocked();
+        _ = self.clearPagesForHardPressureLocked(allocator);
+    }
+
+    fn getLinksCopy(self: *PageCache, allocator: Allocator, page_id: u64) !?PageLinkCopy {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const cached = self.links.get(page_id) orelse return null;
+        return .{
+            .kind = cached.kind,
+            .link_page = cached.link_page,
+            .external_value_root_page = cached.external_value_root_page,
+            .external_value_len = cached.external_value_len,
+            .chunk_len = cached.chunk_len,
+            .key = if (cached.key.len > 0) try allocator.dupe(u8, cached.key) else null,
+        };
+    }
+
+    fn putLinks(self: *PageCache, allocator: Allocator, page_id: u64, info: PageLinkInfo) void {
+        const owned_key = if (info.key.len > 0) allocator.dupe(u8, info.key) catch return else @as([]u8, &.{});
+        var owned = info;
+        owned.key = owned_key;
+
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.clearLinksForHardPressureLocked(allocator)) {
+            if (owned.key.len > 0) allocator.free(owned.key);
+            return;
+        }
+        if (self.links.getEntry(page_id)) |entry| {
+            self.link_bytes -= entry.value_ptr.key.len + link_entry_overhead;
+            if (entry.value_ptr.key.len > 0) allocator.free(entry.value_ptr.key);
+            entry.value_ptr.* = owned;
+            self.link_bytes += owned.key.len + link_entry_overhead;
+            self.refreshLinkResourceUsageLocked();
+            _ = self.clearLinksForHardPressureLocked(allocator);
+            return;
+        }
+        if (self.link_bytes + owned.key.len + link_entry_overhead > self.link_limit_bytes) {
+            // At capacity, prefer keeping the resident entries: chain walks
+            // revisit the same old pages every commit, so evicting them to
+            // admit one new entry would thrash the whole walk.
+            if (owned.key.len > 0) allocator.free(owned.key);
+            return;
+        }
+        self.links.put(allocator, page_id, owned) catch {
+            if (owned.key.len > 0) allocator.free(owned.key);
+            return;
+        };
+        self.link_bytes += owned.key.len + link_entry_overhead;
+        self.refreshLinkResourceUsageLocked();
+        _ = self.clearLinksForHardPressureLocked(allocator);
+    }
+
+    fn remove(self: *PageCache, allocator: Allocator, page_id: u64) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.removeLocked(allocator, page_id);
+    }
+
+    fn removeLinks(self: *PageCache, allocator: Allocator, page_id: u64) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.links.fetchRemove(page_id)) |entry| {
+            self.link_bytes -= entry.value.key.len + link_entry_overhead;
+            if (entry.value.key.len > 0) allocator.free(entry.value.key);
+            self.refreshLinkResourceUsageLocked();
+        }
+    }
+
+    fn removeLocked(self: *PageCache, allocator: Allocator, page_id: u64) void {
+        var removed_page = false;
+        var removed_links = false;
+        if (self.pages.fetchRemove(page_id)) |entry| {
+            self.total_bytes -= entry.value.len;
+            allocator.free(entry.value);
+            removed_page = true;
+        }
+        if (self.links.fetchRemove(page_id)) |entry| {
+            self.link_bytes -= entry.value.key.len + link_entry_overhead;
+            if (entry.value.key.len > 0) allocator.free(entry.value.key);
+            removed_links = true;
+        }
+        if (removed_page) self.refreshPageResourceUsageLocked();
+        if (removed_links) self.refreshLinkResourceUsageLocked();
+    }
+
+    fn clear(self: *PageCache, allocator: Allocator) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.clearLocked(allocator);
+    }
+
+    fn clearLocked(self: *PageCache, allocator: Allocator) void {
+        self.clearPagesLocked(allocator);
+        self.clearLinksLocked(allocator);
+        self.refreshPageResourceUsageLocked();
+        self.refreshLinkResourceUsageLocked();
+    }
+
+    fn clearPagesLocked(self: *PageCache, allocator: Allocator) void {
+        var it = self.pages.valueIterator();
+        while (it.next()) |page| allocator.free(page.*);
+        self.pages.clearRetainingCapacity();
+        self.total_bytes = 0;
+    }
+
+    fn clearLinksLocked(self: *PageCache, allocator: Allocator) void {
+        var link_it = self.links.valueIterator();
+        while (link_it.next()) |info| {
+            if (info.key.len > 0) allocator.free(info.key);
+        }
+        self.links.clearRetainingCapacity();
+        self.link_bytes = 0;
+    }
+
+    fn deinit(self: *PageCache, allocator: Allocator) void {
+        self.clearLocked(allocator);
+        self.releaseResourceUsageLocked();
+        self.pages.deinit(allocator);
+        self.links.deinit(allocator);
+    }
+
+    fn refreshPageResourceUsageLocked(self: *PageCache) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lite_native_page_cache, &self.resource_page_accounted_bytes, @intCast(self.total_bytes));
+    }
+
+    fn refreshLinkResourceUsageLocked(self: *PageCache) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lite_native_link_cache, &self.resource_link_accounted_bytes, @intCast(self.link_bytes));
+    }
+
+    fn releaseResourceUsageLocked(self: *PageCache) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lite_native_page_cache, &self.resource_page_accounted_bytes, 0);
+        manager.observeUsage(.lite_native_link_cache, &self.resource_link_accounted_bytes, 0);
+        self.resource_manager = null;
+    }
+
+    fn clearPagesForHardPressureLocked(self: *PageCache, allocator: Allocator) bool {
+        const manager = self.resource_manager orelse return false;
+        const stats = manager.sliceStats(.lite_native_page_cache);
+        if (stats.pressure != .hard or stats.hard_action != .shrink_cache) return false;
+        self.clearPagesLocked(allocator);
+        self.refreshPageResourceUsageLocked();
+        return true;
+    }
+
+    fn clearLinksForHardPressureLocked(self: *PageCache, allocator: Allocator) bool {
+        const manager = self.resource_manager orelse return false;
+        const stats = manager.sliceStats(.lite_native_link_cache);
+        if (stats.pressure != .hard or stats.hard_action != .shrink_cache) return false;
+        self.clearLinksLocked(allocator);
+        self.refreshLinkResourceUsageLocked();
+        return true;
+    }
+};
+
 pub const NativeFile = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,
@@ -244,6 +513,12 @@ pub const NativeFile = struct {
     header: Header,
     read_only: bool = false,
     no_sync: bool = false,
+    page_cache_enabled: std.atomic.Value(bool) = .init(true),
+    page_cache: PageCache = .{},
+    /// While non-zero, page reads bypass the page cache and hit disk.
+    /// Integrity checks hold this so they verify on-disk state rather than
+    /// cached copies.
+    page_cache_bypass: std.atomic.Value(u32) = .init(0),
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -258,13 +533,18 @@ pub const NativeFile = struct {
         errdefer allocator.free(owned_path);
 
         var writer_lock_file: ?std.Io.File = null;
+        var page_cache_enabled = true;
         if (!opts.read_only) {
-            writer_lock_file = try acquireWriterLock(allocator, io, path);
+            const writer_lock = try acquireWriterLock(allocator, io, path);
+            writer_lock_file = writer_lock.file;
+            page_cache_enabled = writer_lock.locks_supported;
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
-        const file = try openDataFile(io, path, if (opts.read_only) .reader else .writer);
+        const opened_file = try openDataFile(io, path, if (opts.read_only) .reader else .writer);
+        const file = opened_file.file;
         errdefer file.close(io);
+        page_cache_enabled = page_cache_enabled and opened_file.locks_supported;
 
         var header_bytes: [header_size]u8 = undefined;
         try readHeaderExactAt(file, io, &header_bytes);
@@ -272,7 +552,7 @@ pub const NativeFile = struct {
         const file_size = (try file.stat(io)).size;
         header.active_checkpoint = try selectCompleteCheckpointForFile(header, file_size);
 
-        return .{
+        var result = NativeFile{
             .allocator = allocator,
             .io_impl = io_impl,
             .path = owned_path,
@@ -281,22 +561,31 @@ pub const NativeFile = struct {
             .header = header,
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
+            .page_cache_enabled = .init(page_cache_enabled),
         };
+        if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
+        return result;
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, false, false);
+        return try createWithMode(allocator, path, false, false, null);
     }
 
     pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, true, false);
+        return try createWithMode(allocator, path, true, false, null);
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync);
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager);
     }
 
-    fn createWithMode(allocator: Allocator, path: []const u8, exclusive: bool, no_sync: bool) !NativeFile {
+    fn createWithMode(
+        allocator: Allocator,
+        path: []const u8,
+        exclusive: bool,
+        no_sync: bool,
+        resource_manager: ?*resource_manager_mod.ResourceManager,
+    ) !NativeFile {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         errdefer io_impl.deinit();
         const io = io_impl.io();
@@ -304,7 +593,8 @@ pub const NativeFile = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
 
-        var writer_lock_file = try acquireWriterLock(allocator, io, path);
+        const writer_lock = try acquireWriterLock(allocator, io, path);
+        var writer_lock_file = writer_lock.file;
         errdefer writer_lock_file.close(io);
 
         var encoded: [header_size]u8 = undefined;
@@ -319,7 +609,7 @@ pub const NativeFile = struct {
         try file.writePositionalAll(io, &encoded, 0);
         if (!no_sync) try file.sync(io);
 
-        return .{
+        var result = NativeFile{
             .allocator = allocator,
             .io_impl = io_impl,
             .path = owned_path,
@@ -328,10 +618,14 @@ pub const NativeFile = struct {
             .header = .{},
             .read_only = false,
             .no_sync = no_sync,
+            .page_cache_enabled = .init(writer_lock.locks_supported),
         };
+        if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
+        return result;
     }
 
     pub fn close(self: *NativeFile) void {
+        self.page_cache.deinit(self.allocator);
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(self.io_impl.io());
         }
@@ -341,11 +635,20 @@ pub const NativeFile = struct {
         self.* = undefined;
     }
 
+    fn disablePageCacheForUnsupportedLocks(self: *NativeFile) void {
+        self.page_cache_enabled.store(false, .monotonic);
+        self.page_cache.clear(self.allocator);
+    }
+
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
         return self.header.checkpoints[self.header.active_checkpoint];
     }
 
     pub fn check(self: *NativeFile) !CheckReport {
+        // Integrity checking must observe on-disk state, not cached pages.
+        _ = self.page_cache_bypass.fetchAdd(1, .monotonic);
+        defer _ = self.page_cache_bypass.fetchSub(1, .monotonic);
+
         const checkpoint = self.activeCheckpoint();
         const expected_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
         const file_size = (try self.file.stat(self.io_impl.io())).size;
@@ -424,11 +727,22 @@ pub const NativeFile = struct {
     fn readPageAllocForCheckpoint(self: *NativeFile, allocator: Allocator, page_id: u64, checkpoint: CheckpointSlot) ![]u8 {
         if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
 
+        const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
+        if (use_cache) {
+            if (try self.page_cache.getCopy(allocator, page_id)) |cached| return cached;
+        }
+
         const page_size: usize = @intCast(self.header.page_size);
         const page = try allocator.alloc(u8, page_size);
         errdefer allocator.free(page);
 
         try readExactAt(self.file, self.io_impl.io(), page, page_id * @as(u64, self.header.page_size));
+        // Free-map pages are rewritten every commit and read once, so caching
+        // them buys nothing; skipping them also keeps free-map validation
+        // reading disk truth before any pages are handed out for reuse.
+        if (use_cache and page.len > 4 and page[4] != @intFromEnum(PageKind.free_map)) {
+            self.page_cache.put(self.allocator, page_id, page);
+        }
         return page;
     }
 
@@ -954,32 +1268,6 @@ pub const NativeFile = struct {
     }
 
     pub fn snapshotDocumentsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedDocument {
-        var map = std.StringHashMapUnmanaged(?[]u8).empty;
-        defer {
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                if (entry.value_ptr.*) |value| allocator.free(value);
-            }
-            map.deinit(allocator);
-        }
-
-        var page_id = self.activeCheckpoint().document_root_page;
-        while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
-            defer allocator.free(payload);
-            const entry = try decodeDocumentEntry(payload);
-
-            if (!map.contains(entry.key)) {
-                const owned_key = try allocator.dupe(u8, entry.key);
-                errdefer allocator.free(owned_key);
-                const owned_value = if (entry.is_delete) null else try self.documentEntryValueAlloc(allocator, entry);
-                errdefer if (owned_value) |value| allocator.free(value);
-                try map.put(allocator, owned_key, owned_value);
-            }
-            page_id = entry.previous_page;
-        }
-
         var docs = std.ArrayListUnmanaged(OwnedDocument).empty;
         errdefer {
             for (docs.items) |doc| {
@@ -988,14 +1276,41 @@ pub const NativeFile = struct {
             }
             docs.deinit(allocator);
         }
-        var it = map.iterator();
-        while (it.next()) |entry| {
-            const value = entry.value_ptr.* orelse continue;
-            const key = try allocator.dupe(u8, entry.key_ptr.*);
-            errdefer allocator.free(key);
-            const value_copy = try allocator.dupe(u8, value);
-            errdefer allocator.free(value_copy);
-            try docs.append(allocator, .{ .key = key, .value = value_copy });
+
+        // Keys already resolved while walking newest-to-oldest. Live keys are
+        // owned by `docs`, tombstone keys by `tombstone_keys`; the set itself
+        // borrows both, so entries are reserved before ownership transfers.
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(allocator);
+        var tombstone_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (tombstone_keys.items) |key| allocator.free(key);
+            tombstone_keys.deinit(allocator);
+        }
+
+        var page_id = self.activeCheckpoint().document_root_page;
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
+            defer allocator.free(payload);
+            const entry = try decodeDocumentEntry(payload);
+
+            if (!seen.contains(entry.key)) {
+                try seen.ensureUnusedCapacity(allocator, 1);
+                if (entry.is_delete) {
+                    try tombstone_keys.ensureUnusedCapacity(allocator, 1);
+                    const owned_key = try allocator.dupe(u8, entry.key);
+                    tombstone_keys.appendAssumeCapacity(owned_key);
+                    seen.putAssumeCapacity(owned_key, {});
+                } else {
+                    try docs.ensureUnusedCapacity(allocator, 1);
+                    const owned_key = try allocator.dupe(u8, entry.key);
+                    errdefer allocator.free(owned_key);
+                    const owned_value = try self.documentEntryValueAlloc(allocator, entry);
+                    docs.appendAssumeCapacity(.{ .key = owned_key, .value = owned_value });
+                    seen.putAssumeCapacity(owned_key, {});
+                }
+            }
+            page_id = entry.previous_page;
         }
 
         std.mem.sort(OwnedDocument, docs.items, {}, struct {
@@ -1018,8 +1333,9 @@ pub const NativeFile = struct {
     pub fn vacuum(self: *NativeFile) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
 
-        var data_lock_file = try acquireDataRewriteLock(self.io_impl.io(), self.path);
-        defer data_lock_file.close(self.io_impl.io());
+        var data_lock = try acquireDataRewriteLock(self.io_impl.io(), self.path);
+        defer data_lock.file.close(self.io_impl.io());
+        if (!data_lock.locks_supported) self.disablePageCacheForUnsupportedLocks();
 
         const before_size = (try self.file.stat(self.io_impl.io())).size;
         const previous = self.activeCheckpoint();
@@ -1299,8 +1615,40 @@ pub const NativeFile = struct {
 
         var count: u64 = 0;
         var page_id = root_page_id;
+        const use_link_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         while (page_id != 0) {
             try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
+
+            if (use_link_cache) blk: {
+                const links = (try self.page_cache.getLinksCopy(self.allocator, page_id)) orelse break :blk;
+                defer if (links.key) |key| self.allocator.free(key);
+                if (links.kind != kind) return error.UnexpectedNativePageKind;
+                switch (kind) {
+                    .catalog => {
+                        const entry_key = links.key orelse &[_]u8{};
+                        const seen = seen_catalog_keys.contains(entry_key);
+                        if (!seen) {
+                            const owned_key = try self.allocator.dupe(u8, entry_key);
+                            errdefer self.allocator.free(owned_key);
+                            try seen_catalog_keys.put(self.allocator, owned_key, {});
+                        }
+                        if (!seen and links.external_value_root_page != 0) {
+                            try self.validateReachableValuePages(links.external_value_root_page, links.external_value_len, checkpoint, reachable_pages);
+                        }
+                    },
+                    .document => {
+                        if (links.external_value_root_page != 0) {
+                            try self.validateReachableValuePages(links.external_value_root_page, links.external_value_len, checkpoint, reachable_pages);
+                        }
+                    },
+                    .data, .value, .free_map => return error.UnexpectedNativePageKind,
+                }
+                page_id = links.link_page;
+                count += 1;
+                if (count > checkpoint.page_count) return error.InvalidNativePageChain;
+                continue;
+            }
+
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, kind, checkpoint);
             defer self.allocator.free(payload);
             page_id = switch (kind) {
@@ -1315,6 +1663,7 @@ pub const NativeFile = struct {
                     if (!seen and entry.external_value_root_page != 0) {
                         try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, checkpoint, reachable_pages);
                     }
+                    if (use_link_cache) self.cachePageLinks(page_id, .catalog, payload);
                     break :blk entry.previous_page;
                 },
                 .document => blk: {
@@ -1322,6 +1671,7 @@ pub const NativeFile = struct {
                     if (entry.external_value_root_page != 0) {
                         try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, checkpoint, reachable_pages);
                     }
+                    if (use_link_cache) self.cachePageLinks(page_id, .document, payload);
                     break :blk entry.previous_page;
                 },
                 .data, .value, .free_map => return error.UnexpectedNativePageKind,
@@ -1493,7 +1843,7 @@ pub const NativeFile = struct {
         try self.validateFreePagesSafeForCheckpointSlots(free_pages);
         var data_lock_file: ?std.Io.File = null;
         if (free_pages.len > 0) {
-            data_lock_file = acquireDataRewriteLock(self.io_impl.io(), self.path) catch |err| switch (err) {
+            const data_lock = acquireDataRewriteLock(self.io_impl.io(), self.path) catch |err| switch (err) {
                 error.WouldBlock => blk: {
                     self.allocator.free(free_pages);
                     free_pages = try self.allocator.alloc(u64, 0);
@@ -1501,6 +1851,10 @@ pub const NativeFile = struct {
                 },
                 else => return err,
             };
+            if (data_lock) |lock| {
+                if (!lock.locks_supported) self.disablePageCacheForUnsupportedLocks();
+                data_lock_file = lock.file;
+            }
         }
         return .{
             .file = self,
@@ -1675,19 +2029,38 @@ pub const NativeFile = struct {
         var remaining = value_len;
         var page_id = root_page_id;
         var pages_seen: u64 = 0;
+        const use_link_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         while (page_id != 0) {
             pages_seen += 1;
             if (pages_seen > checkpoint.page_count) return error.InvalidNativeValueChain;
 
             try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
-            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .value, checkpoint);
-            defer self.allocator.free(payload);
 
-            const page = try decodeValuePage(payload);
-            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
-            if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
-            remaining -= page.chunk.len;
-            page_id = page.next_page;
+            var chunk_len: usize = 0;
+            var next_page: u64 = 0;
+            var resolved = false;
+            if (use_link_cache) {
+                if (try self.page_cache.getLinksCopy(self.allocator, page_id)) |links| {
+                    defer if (links.key) |key| self.allocator.free(key);
+                    if (links.kind != .value) return error.UnexpectedNativePageKind;
+                    chunk_len = links.chunk_len;
+                    next_page = links.link_page;
+                    resolved = true;
+                }
+            }
+            if (!resolved) {
+                const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .value, checkpoint);
+                defer self.allocator.free(payload);
+                const page = try decodeValuePage(payload);
+                chunk_len = page.chunk.len;
+                next_page = page.next_page;
+                if (use_link_cache) self.cachePageLinks(page_id, .value, payload);
+            }
+
+            if (chunk_len == 0) return error.InvalidNativeValueChain;
+            if (chunk_len > remaining) return error.InvalidNativeValueChain;
+            remaining -= chunk_len;
+            page_id = next_page;
             if (remaining == 0 and page_id != 0) return error.InvalidNativeValueChain;
         }
 
@@ -1781,6 +2154,63 @@ pub const NativeFile = struct {
             try self.file.setLength(self.io_impl.io(), page_end);
         }
         try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
+        if (kind == .free_map) {
+            // A reused page id may still be cached under its previous life;
+            // free-map pages themselves are not cached (see read path).
+            self.page_cache.remove(self.allocator, page_id);
+        } else if (self.page_cache_enabled.load(.monotonic)) {
+            self.page_cache.put(self.allocator, page_id, page);
+            self.cachePageLinks(page_id, kind, contents);
+        }
+    }
+
+    /// Best-effort: decode and cache the chain-navigation metadata for a page
+    /// just written, so reachability walks can traverse it without re-reading
+    /// the payload. On any decode surprise the stale entry is dropped and the
+    /// walks fall back to the payload path.
+    fn cachePageLinks(self: *NativeFile, page_id: u64, kind: PageKind, payload: []const u8) void {
+        if (!self.page_cache_enabled.load(.monotonic)) return;
+        switch (kind) {
+            .document => {
+                const entry = decodeDocumentEntry(payload) catch {
+                    self.page_cache.remove(self.allocator, page_id);
+                    return;
+                };
+                self.page_cache.putLinks(self.allocator, page_id, .{
+                    .kind = .document,
+                    .link_page = entry.previous_page,
+                    .external_value_root_page = entry.external_value_root_page,
+                    .external_value_len = entry.external_value_len,
+                });
+            },
+            .catalog => {
+                const entry = decodeCatalogEntry(payload) catch {
+                    self.page_cache.remove(self.allocator, page_id);
+                    return;
+                };
+                self.page_cache.putLinks(self.allocator, page_id, .{
+                    .kind = .catalog,
+                    .link_page = entry.previous_page,
+                    .external_value_root_page = entry.external_value_root_page,
+                    .external_value_len = entry.external_value_len,
+                    .key = @constCast(entry.key),
+                });
+            },
+            .value => {
+                const page = decodeValuePage(payload) catch {
+                    self.page_cache.remove(self.allocator, page_id);
+                    return;
+                };
+                self.page_cache.putLinks(self.allocator, page_id, .{
+                    .kind = .value,
+                    .link_page = page.next_page,
+                    .chunk_len = page.chunk.len,
+                });
+            },
+            // A reused page id may carry stale link info from a previous life.
+            .data => self.page_cache.removeLinks(self.allocator, page_id),
+            .free_map => unreachable,
+        }
     }
 
     fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
@@ -1818,12 +2248,15 @@ pub const NativeFile = struct {
 
         try renameFilePath(io, tmp_path, self.path);
         errdefer {
-            self.file = openDataFile(io, self.path, .writer) catch self.file;
+            if (openDataFile(io, self.path, .writer)) |reopened| {
+                self.file = reopened.file;
+            } else |_| {}
         }
 
+        self.page_cache.clear(self.allocator);
         const replacement = try openDataFile(io, self.path, .writer);
         self.file.close(io);
-        self.file = replacement;
+        self.file = replacement.file;
     }
 };
 
@@ -1905,7 +2338,7 @@ fn setCatalogRootPage(slot: *CheckpointSlot, root: CatalogRoot, page_id: u64) vo
 }
 
 pub fn create(io: std.Io, path: []const u8) !void {
-    var writer_lock_file = try acquireWriterLock(std.heap.page_allocator, io, path);
+    var writer_lock_file = (try acquireWriterLock(std.heap.page_allocator, io, path)).file;
     defer writer_lock_file.close(io);
 
     var encoded: [header_size]u8 = undefined;
@@ -1922,7 +2355,7 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     errdefer io_impl.deinit();
 
-    const file = try acquireWriterLock(allocator, io_impl.io(), path);
+    const file = (try acquireWriterLock(allocator, io_impl.io(), path)).file;
     errdefer file.close(io_impl.io());
 
     return .{
@@ -1931,17 +2364,23 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     };
 }
 
-fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File {
-    return std.Io.Dir.cwd().openFile(io, path, .{
+fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !LockFile {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = if (lock_mode == .reader) .read_only else .read_write,
         .lock = if (lock_mode == .reader) .shared else .none,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
-            .mode = if (lock_mode == .reader) .read_only else .read_write,
-        }),
+        error.FileLocksUnsupported => {
+            return .{
+                .file = try std.Io.Dir.cwd().openFile(io, path, .{
+                    .mode = if (lock_mode == .reader) .read_only else .read_write,
+                }),
+                .locks_supported = false,
+            };
+        },
         else => return err,
     };
+    return .{ .file = file };
 }
 
 const CreateDataFileOptions = struct {
@@ -1957,21 +2396,27 @@ fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !st
     });
 }
 
-fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !std.Io.File {
+fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFile {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
-    return std.Io.Dir.cwd().createFile(io, lock_path, .{
+    const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => try std.Io.Dir.cwd().createFile(io, lock_path, .{
-            .read = true,
-            .truncate = false,
-        }),
+        error.FileLocksUnsupported => {
+            return .{
+                .file = try std.Io.Dir.cwd().createFile(io, lock_path, .{
+                    .read = true,
+                    .truncate = false,
+                }),
+                .locks_supported = false,
+            };
+        },
         else => return err,
     };
+    return .{ .file = file };
 }
 
 fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -2020,17 +2465,23 @@ fn appendLockSuffix(allocator: Allocator, path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}.lock", .{path});
 }
 
-fn acquireDataRewriteLock(io: std.Io, path: []const u8) !std.Io.File {
-    return std.Io.Dir.cwd().openFile(io, path, .{
+fn acquireDataRewriteLock(io: std.Io, path: []const u8) !LockFile {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = .read_write,
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
-            .mode = .read_write,
-        }),
+        error.FileLocksUnsupported => {
+            return .{
+                .file = try std.Io.Dir.cwd().openFile(io, path, .{
+                    .mode = .read_write,
+                }),
+                .locks_supported = false,
+            };
+        },
         else => return err,
     };
+    return .{ .file = file };
 }
 
 fn pathExists(io: std.Io, path: []const u8) bool {
@@ -2066,7 +2517,7 @@ fn deleteFilePath(io: std.Io, path: []const u8) !void {
 }
 
 pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
-    var file = try openDataFile(io, path, .reader);
+    var file = (try openDataFile(io, path, .reader)).file;
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
@@ -2079,7 +2530,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var file = try openDataFile(io, path, .reader);
+    var file = (try openDataFile(io, path, .reader)).file;
     defer file.close(io);
 
     const file_size = (try file.stat(io)).size;
@@ -4230,4 +4681,173 @@ test "lite native checkFile reports checkpoint prefix overflow as invalid metada
     try std.testing.expectEqualStrings("invalid_checkpoint", report.issue.?);
     try std.testing.expectEqual(@as(u64, 0), report.record_count);
     try std.testing.expectEqual(@as(u64, 0), report.compact_size);
+}
+
+test "lite native page cache tracks put remove and wholesale eviction" {
+    const allocator = std.testing.allocator;
+
+    var cache = PageCache{ .limit_bytes = 32 };
+    defer cache.deinit(allocator);
+
+    cache.put(allocator, 1, "0123456789ab");
+    cache.put(allocator, 2, "0123456789ab");
+    try std.testing.expectEqual(@as(usize, 24), cache.total_bytes);
+
+    const hit = (try cache.getCopy(allocator, 1)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(hit);
+    try std.testing.expectEqualStrings("0123456789ab", hit);
+    try std.testing.expectEqual(@as(?[]u8, null), try cache.getCopy(allocator, 3));
+
+    cache.put(allocator, 1, "ba9876543210");
+    try std.testing.expectEqual(@as(usize, 24), cache.total_bytes);
+    const replaced = (try cache.getCopy(allocator, 1)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(replaced);
+    try std.testing.expectEqualStrings("ba9876543210", replaced);
+
+    cache.remove(allocator, 2);
+    try std.testing.expectEqual(@as(usize, 12), cache.total_bytes);
+    try std.testing.expectEqual(@as(?[]u8, null), try cache.getCopy(allocator, 2));
+
+    // Overflow clears everything and keeps only the incoming page.
+    cache.put(allocator, 4, "0123456789ab");
+    cache.put(allocator, 5, "0123456789abcdefghijklmnopqrstuv");
+    try std.testing.expectEqual(@as(usize, 32), cache.total_bytes);
+    try std.testing.expectEqual(@as(?[]u8, null), try cache.getCopy(allocator, 1));
+    try std.testing.expectEqual(@as(?[]u8, null), try cache.getCopy(allocator, 4));
+    const survivor = (try cache.getCopy(allocator, 5)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(survivor);
+    try std.testing.expectEqual(@as(usize, 32), survivor.len);
+}
+
+test "lite native page and link caches report usage to resource manager" {
+    const allocator = std.testing.allocator;
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var cache = PageCache{ .limit_bytes = 128, .link_limit_bytes = 256 };
+    defer cache.deinit(allocator);
+    cache.attachResourceManager(&manager);
+
+    cache.put(allocator, 1, "0123456789ab");
+    var page_stats = manager.sliceStats(.lite_native_page_cache);
+    try std.testing.expectEqual(@as(u64, 12), page_stats.used_bytes);
+
+    cache.putLinks(allocator, 1, .{
+        .kind = .document,
+        .link_page = 0,
+        .external_value_root_page = 7,
+        .external_value_len = 128,
+    });
+    var link_stats = manager.sliceStats(.lite_native_link_cache);
+    try std.testing.expect(link_stats.used_bytes > 0);
+
+    cache.remove(allocator, 1);
+    page_stats = manager.sliceStats(.lite_native_page_cache);
+    link_stats = manager.sliceStats(.lite_native_link_cache);
+    try std.testing.expectEqual(@as(u64, 0), page_stats.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), link_stats.used_bytes);
+}
+
+test "lite native disables page and link caches when lock support is unavailable" {
+    const allocator = std.testing.allocator;
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var file = NativeFile{
+        .allocator = allocator,
+        .io_impl = undefined,
+        .path = &.{},
+        .file = undefined,
+        .header = .{},
+    };
+    defer file.page_cache.deinit(allocator);
+    file.page_cache.attachResourceManager(&manager);
+
+    file.page_cache.put(allocator, 1, "0123456789ab");
+    file.page_cache.putLinks(allocator, 1, .{
+        .kind = .document,
+        .link_page = 0,
+        .external_value_root_page = 7,
+        .external_value_len = 128,
+    });
+    try std.testing.expect(manager.sliceStats(.lite_native_page_cache).used_bytes > 0);
+    try std.testing.expect(manager.sliceStats(.lite_native_link_cache).used_bytes > 0);
+
+    file.disablePageCacheForUnsupportedLocks();
+    try std.testing.expect(!file.page_cache_enabled.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.link_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_link_cache).used_bytes);
+}
+
+test "lite native page and link caches shrink under hard resource pressure" {
+    const allocator = std.testing.allocator;
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_page_cache)] = .{
+        .soft_limit_bytes = 4,
+        .hard_limit_bytes = 8,
+    };
+    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_link_cache)] = .{
+        .soft_limit_bytes = 4,
+        .hard_limit_bytes = 8,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var cache = PageCache{ .limit_bytes = 128, .link_limit_bytes = 256 };
+    defer cache.deinit(allocator);
+    cache.attachResourceManager(&manager);
+
+    cache.put(allocator, 1, "0123456789ab");
+    const page_stats = manager.sliceStats(.lite_native_page_cache);
+    try std.testing.expectEqual(@as(usize, 0), cache.total_bytes);
+    try std.testing.expectEqual(@as(u64, 0), page_stats.used_bytes);
+    try std.testing.expect(page_stats.hard_limit_rejections > 0);
+
+    cache.putLinks(allocator, 2, .{ .kind = .value, .link_page = 0, .chunk_len = 1 });
+    const link_stats = manager.sliceStats(.lite_native_link_cache);
+    try std.testing.expectEqual(@as(usize, 0), cache.link_bytes);
+    try std.testing.expectEqual(@as(u64, 0), link_stats.used_bytes);
+    try std.testing.expect(link_stats.hard_limit_rejections > 0);
+}
+
+test "lite native page cache serves updated documents after page reuse and vacuum" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-page-cache-reuse.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    // Enough update churn to force free-page reuse across many commits while
+    // reads run through the cache.
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        var value_buf: [32]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "round-{d}", .{round});
+        try file.putDocument("doc:cache", value);
+
+        const read = (try file.getDocumentAlloc(allocator, "doc:cache")) orelse return error.TestUnexpectedResult;
+        defer allocator.free(read);
+        try std.testing.expectEqualStrings(value, read);
+
+        const docs = try file.snapshotDocumentsAlloc(allocator);
+        defer NativeFile.freeSnapshotDocuments(allocator, docs);
+        try std.testing.expectEqual(@as(usize, 1), docs.len);
+        try std.testing.expectEqualStrings(value, docs[0].value);
+    }
+
+    const report_before = try file.check();
+    try std.testing.expect(report_before.valid);
+
+    _ = try file.vacuum();
+
+    const read = (try file.getDocumentAlloc(allocator, "doc:cache")) orelse return error.TestUnexpectedResult;
+    defer allocator.free(read);
+    try std.testing.expectEqualStrings("round-19", read);
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
 }

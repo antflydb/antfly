@@ -1,0 +1,267 @@
+---
+title: Document Engine
+description: How Antfly stores, indexes, queries, filters, sorts, paginates, and traverses documents
+---
+
+<Questions>
+- How do Antfly queries combine full-text, vector, filters, sort, and graph search?
+- How do mappings control searchable, filterable, and sortable fields?
+- When should I use search_after instead of offset?
+- How does index_sort accelerate sorted pagination?
+- Why does an exact sorted query return 422?
+</Questions>
+
+## Overview
+
+Antfly's document engine is one query system over several physical indexes. A
+table stores JSON documents, schema mappings describe how fields become queryable
+structures, and the planner chooses the exact or approximate execution path that
+matches the request.
+
+The important pieces are:
+
+- **Documents** are the source payload returned to clients.
+- **Mappings** declare field types such as `text`, `keyword`, `number`,
+  `date`, `boolean`, `embedding`, and `geo_point`.
+- **Full-text indexes** execute BM25 and phrase-style searches over analyzed
+  text fields.
+- **Vector indexes** execute semantic nearest-neighbor search over embeddings.
+- **Typed field values** power exact structured filters, aggregations, and field
+  sort without parsing stored JSON on the hot path.
+- **Graph indexes** materialize relationships and run traversal or pattern
+  queries over document ids.
+- **The query planner** composes those structures, applies filters and
+  exclusions, sorts or ranks the eligible set, and returns one page.
+
+Stored JSON remains the document payload. It is not the production search or
+sort index.
+
+## Schema And Field Capabilities
+
+Antfly can accept schemaless documents, but production query behavior is best
+when fields that participate in filters, sort, and graph traversals have schema
+mappings. Mappings give the planner a stable type model and let Antfly build the
+right physical sections during indexing.
+
+Use `text` for analyzed search and an exact scalar mapping for exact filters and
+sort. A common pattern is to expose both a searchable text field and a keyword
+subfield:
+
+```json
+{
+  "version": 1,
+  "default_type": "doc",
+  "document_schemas": {
+    "doc": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "title": {
+            "type": "string",
+            "x-antfly-field": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "sortable": true
+                }
+              }
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "x-antfly-field": {
+              "type": "date",
+              "sortable": true
+            }
+          },
+          "price": {
+            "type": "number",
+            "x-antfly-field": {
+              "type": "number",
+              "sortable": true
+            }
+          },
+          "published": {
+            "type": "boolean",
+            "x-antfly-field": {
+              "type": "boolean",
+              "sortable": true
+            }
+          },
+          "body": {
+            "type": "string",
+            "x-antfly-field": {
+              "type": "text"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+`sortable` is the user-facing declaration. Antfly derives the internal typed
+field-value structures needed for exact sort and filters. Do not configure
+`doc_values` directly.
+
+Field capabilities report what the planner can safely do with a concrete field:
+
+- `query_modes` describes modes such as `full_text`, `exact`, `range`, `geo`,
+  and `autocomplete`.
+- `sortable` says the field is declared sortable.
+- `sort_lifecycle_state` says whether the field is accepted for exact public
+  sort. Public sort requires `queryable` or `accelerated`.
+- `index_sort_position` and `index_sort_order` identify fields participating in
+  the table's physical index sort.
+
+## Query Pipeline
+
+A query request can combine several inputs:
+
+- `query` or `full_text_search` supplies the scoring text query.
+- `semantic_search` supplies the vector query.
+- `filter_query` is an AND condition over the main query.
+- `exclusion_query` removes matching documents.
+- `graph_searches` run graph traversals or patterns alongside document search.
+- `order_by`, `search_after`, and `search_before` control exact ordered pages.
+- `reranker` and `pruner` can post-process the selected search results.
+- `fields` controls the response projection.
+
+The planner normalizes the request into one execution shape. Full-text and
+semantic search can both produce candidates, filters and exclusions narrow the
+eligible set, graph searches can add relationship results, and sort or score
+ordering decides which page is returned.
+
+```json
+{
+  "table": "articles",
+  "full_text_search": {
+    "query": "body:database"
+  },
+  "filter_query": {
+    "query": "+published:true +created_at:>2026-01-01"
+  },
+  "order_by": [
+    {"field": "created_at", "desc": true}
+  ],
+  "fields": ["title", "created_at"],
+  "limit": 20,
+  "profile": true
+}
+```
+
+## Full-Text And Vector Search
+
+Full-text search uses analyzed text fields and returns BM25-style relevance.
+Use it when exact terms, phrases, field scoping, and lexical constraints matter.
+
+Vector search ranks by semantic similarity. Use it when natural-language meaning
+matters more than exact wording. Hybrid search runs both and fuses the ranked
+sets, commonly with Reciprocal Rank Fusion.
+
+When a request includes `semantic_search`, the primary result order is semantic
+score or hybrid relevance. Exact field sorting is intentionally separate because
+approximate vector top-k is not the same as "all matching documents sorted by
+field." If a request would need approximate overfetch and rerank to pretend to
+be exact field sort, Antfly should reject it instead of returning a misleading
+page.
+
+## Filters And Exclusions
+
+Filters are query clauses that must match in addition to the main query.
+Exclusions remove documents after candidate selection. For scalar fields with
+native mappings, Antfly can evaluate term, range, boolean, and date filters from
+native field structures instead of parsing stored JSON.
+
+This matters for sort because exact sorted pages need an exact eligible set. A
+broad filter with an `index_sort`-compatible order can be served by scanning
+sorted segments. A selective filter often works better as candidate-first
+doc-values top-N. Unsupported filter and sort combinations should fail closed
+with a stable 422 reason rather than falling back to an unbounded stored-source
+scan.
+
+## Sort And Cursor Pagination
+
+Use `order_by` for exact sorted pages over `_id` or mapped scalar fields whose
+capability is `queryable` or `accelerated`. Antfly appends `_id` ascending as a
+deterministic tie-breaker when it is omitted.
+
+The response includes `_sort` values for each hit. Pass those values back
+unchanged as `search_after` for the next page or `search_before` for the
+previous page:
+
+```json
+{
+  "table": "articles",
+  "filter_query": {
+    "query": "published:true"
+  },
+  "order_by": [
+    {"field": "created_at", "desc": true}
+  ],
+  "search_after": ["2026-07-01T00:00:00Z", "doc:article:1842"],
+  "limit": 20
+}
+```
+
+Cursor values preserve JSON scalar types. Strings remain strings, numbers remain
+numbers, and booleans remain booleans. Nulls, arrays, objects, and non-finite
+numbers are rejected because they cannot form replayable typed cursor tuples.
+
+Use cursor pagination for large or changing result sets. Offset pagination is
+useful for shallow UI pages, but it requires the engine to count past skipped
+results and is less stable when documents change between requests.
+
+## Physical Index Sort
+
+`index_sort` is an optional acceleration path for one dominant order. It stores
+new segments in that physical tuple order and preserves the order during merges.
+When a broad query asks for the same order, the planner can use sorted segment
+seek instead of collecting all candidates and sorting them.
+
+There is only one physical order per index generation. Arbitrary `order_by`
+fields still use typed field values and top-N collection. Changing `index_sort`
+is a layout change; existing generations need backfill, compaction, or reindex
+before the accelerated path can be considered fully covered.
+
+## Graph Search
+
+Graph indexes materialize relationships between document ids. Graph queries can
+run traversals, pathfinding, or pattern-style queries, and node filters use the
+same query primitives as document filters.
+
+Graph search composes with document retrieval in two directions:
+
+- A document query can choose start or target nodes, then a graph traversal
+  expands through relationships.
+- A graph traversal can produce related document ids, then the response can
+  fetch documents or merge graph results with search results.
+
+This keeps relationship search in the same document engine instead of requiring
+a separate graph database for common retrieval workflows.
+
+## Rejections And Diagnostics
+
+Exact public query behavior should fail closed. A sorted request can return 422
+when the engine cannot execute the requested order exactly through a native
+path. Common reasons include:
+
+- unmapped sort field
+- analyzed text field used directly for sort
+- non-scalar, geo, embedding, blob, object, or array sort field
+- field not yet `queryable` or `accelerated`
+- missing typed field coverage in older segments
+- invalid `search_after` or `search_before` tuple
+- semantic/vector candidate source used for exact field sort
+- count-only query combined with ordered pagination
+
+Set `profile: true` while diagnosing. The stable public sort profile reports
+the selected plan, source, candidate source, selection reason, exactness,
+candidate counts, source-load behavior, and rejection reasons. Lower-level
+executor counters belong in logs, traces, benchmarks, or explicit debug
+surfaces rather than normal SDK responses.
+

@@ -135,11 +135,14 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
-  unit:
+  zig-base:
+    name: zig-base
     needs: changes
-    if: (github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true') || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
+    if: (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && (needs.changes.outputs.zig_tests == 'true' || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true')
     runs-on: arc-antfly-heavy
-    timeout-minutes: 45
+    # Keep the outer job timeout above the in-step hard watchdog so true hangs
+    # produce the watchdog stack dump instead of an opaque GitHub cancellation.
+    timeout-minutes: 120
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -327,38 +330,6 @@ jobs:
           wait "$watchdog_pid" 2>/dev/null || true
           exit "$status"
 
-  tla-verify:
-    needs: changes
-    if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-    runs-on: ${{ needs.changes.outputs.trace_validate == 'true' && 'arc-antfly-heavy' || 'arc-antfly-standard' }}
-    timeout-minutes: 30
-    env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
-      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: ${{ needs.changes.outputs.trace_validate == 'true' }}
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
-
-      - name: Set up Zig
-        if: needs.changes.outputs.trace_validate == 'true'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
-
-      - name: Restore ARC Zig cache dirs
-        if: needs.changes.outputs.trace_validate == 'true'
-        run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
-
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
         uses: actions/setup-java@v5
@@ -366,55 +337,26 @@ jobs:
           distribution: "temurin"
           java-version: "21"
 
-      - name: Run TLC on all specs
-        if: needs.changes.outputs.model_check == 'true'
-        working-directory: zig
-        run: make tla-check
-
-      - name: Download TLA+ tools
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-tools
-
-      - name: Run raft tests and extract traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
+      - name: Run TLA verification
+        if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
         env:
-          ANTFLY_TRACE_FILE: /tmp/raft-trace.ndjson
-        run: |
-          zig build -Dwith_tla=true raft-test
-          test -s /tmp/raft-trace.ndjson
-          echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
+          ANTFLY_TLA_MODEL_CHECK: ${{ needs.changes.outputs.model_check }}
+          ANTFLY_TLA_TRACE_VALIDATE: ${{ needs.changes.outputs.trace_validate }}
+        run: scripts/ci/zig-tla-verify.sh
 
-      - name: Validate raft traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
-
-      - name: Run transaction tests and extract traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        env:
-          ANTFLY_TRACE_FILE: /tmp/txn-trace.ndjson
-        run: |
-          zig build -Dwith_tla=true lib-db-txn-test
-          test -s /tmp/txn-trace.ndjson
-          echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
-
-      - name: Validate transaction traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson
-
-  full-default:
+  zig-full:
+    name: zig-full
+    needs: changes
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
@@ -439,11 +381,14 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
+      - name: Check generated sources
+        run: make zig-generated-check
+
       # The in-process cluster simulations size their thread pools from the
       # visible CPU count, which on ARC reflects the node rather than the pod
       # quota. The resulting burst can starve the runner agent long enough for
       # GitHub to declare the runner lost (~10 min of missed heartbeats), which
-      # is how most full-default failures present. Bound the test steps to a
+      # is how most full-suite failures present. Bound the test steps to a
       # fixed CPU set so pools and zig build parallelism stay within budget.
       - name: Compute CPU bound for heavy test steps
         id: cpus
@@ -454,6 +399,18 @@ jobs:
 
       - name: Run full Zig unit tests
         run: taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test
+
+      - name: Set up Java for TLA+
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Run TLA verification
+        env:
+          ANTFLY_TLA_MODEL_CHECK: "true"
+          ANTFLY_TLA_TRACE_VALIDATE: "true"
+        run: scripts/ci/zig-tla-verify.sh
 
       - name: Run Zig simulation tests
         working-directory: zig
@@ -495,6 +452,7 @@ jobs:
         run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test
 
   e2e-base:
+    name: e2e-base
     needs: changes
     if: github.event_name != 'schedule' && needs.changes.outputs.e2e == 'true'
     runs-on: arc-antfly-heavy
@@ -543,6 +501,7 @@ jobs:
         run: scripts/ci/zig-e2e-base-linux.sh
 
   e2e-full:
+    name: e2e-full
     needs: changes
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy

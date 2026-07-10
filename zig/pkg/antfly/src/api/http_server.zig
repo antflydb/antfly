@@ -40,6 +40,8 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const db_query_search = @import("../storage/db/query/search_exec.zig");
+const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
@@ -56,6 +58,7 @@ const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+const repair_jobs = @import("repair_jobs.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
@@ -105,12 +108,22 @@ const ParsedGlobalQueryTable = struct {
 };
 
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
-    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+    var parsed = parsePublicGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
     return .{
         .parsed = parsed,
         .table_name = parsed.value.table orelse "",
     };
+}
+
+fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+    try query_contract.validatePublicQuerySortTupleContract(alloc, body);
+    return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
+}
+
+fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+    try query_contract.validatePublicQuerySortTupleContract(alloc, body);
+    return metadata_openapi.server.parseQueryTableBody(alloc, body);
 }
 
 fn isNdjsonContentType(content_type: ?[]const u8) bool {
@@ -281,6 +294,8 @@ pub const ApiHttpServerConfig = struct {
     join_job_retention_ms: ?u64 = null,
     artifact_reprocess_job_store_path: ?[]const u8 = null,
     artifact_reprocess_job_retention_ms: ?u64 = null,
+    repair_job_store_path: ?[]const u8 = null,
+    repair_job_retention_ms: ?u64 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -1051,6 +1066,8 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    repair_job_owner_id: u64 = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -1094,6 +1111,11 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .repair_job_store = repair_jobs.Store.init(alloc, .{
+                .repair_job_store_path = cfg.repair_job_store_path,
+                .repair_job_retention_ms = cfg.repair_job_retention_ms,
+            }),
+            .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
@@ -1165,6 +1187,18 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
+        if (cfg.repair_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.repair_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.repair_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(repair_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try repair_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.repair_job_store.attachOpenedStore(opened);
+        }
         return server;
     }
 
@@ -1187,6 +1221,9 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        if (self.cfg.backend_runtime) |runtime| {
+            if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
+        }
         self.mcp_sessions.deinit(self.alloc);
         self.a2a_tasks.deinit(self.alloc);
         self.txn_sessions.deinit(self.alloc);
@@ -1196,6 +1233,7 @@ pub const ApiHttpServer = struct {
         }
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
+        self.repair_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
             self.alloc.destroy(registry);
@@ -1283,7 +1321,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json);
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null);
     }
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror![]u8 {
@@ -1324,6 +1362,12 @@ pub const ApiHttpServer = struct {
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
+        self.repair_job_store.cleanupExpiredJobs();
+        if (self.cfg.backend_runtime) |runtime| {
+            _ = runtime.durable_jobs.poll(32) catch |err| {
+                std.log.warn("failed to reap table repair background jobs err={s}", .{@errorName(err)});
+            };
+        }
     }
 
     fn localTableRuntimeStatuses(
@@ -1756,6 +1800,22 @@ pub const ApiHttpServer = struct {
         return tables_api.lsmStorageStatusFromStats(stats);
     }
 
+    fn bestEffortObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        const source = self.table_reads orelse return &.{};
+        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name)) orelse &.{};
+    }
+
+    fn freeObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        sets: []table_reads.ObservedDynamicFieldCapabilitySet,
+    ) void {
+        for (sets) |*set| set.deinit(self.alloc);
+        if (sets.len > 0) self.alloc.free(sets);
+    }
+
     pub fn bestEffortSingleTableStorageStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -1939,7 +1999,8 @@ pub const ApiHttpServer = struct {
     pub fn handleInternalRoute(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const uri_parts = splitTarget(req.uri);
         if (!std.mem.startsWith(u8, uri_parts.path, routes.Routes.internal_groups_prefix) and
-            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null)
+            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null and
+            routes.Routes.matchInternalTableRepairCancelState(uri_parts.path) == null)
         {
             return null;
         }
@@ -3548,6 +3609,8 @@ pub const ApiHttpServer = struct {
                 .shard_ops = self.cfg.shard_ops,
                 .shard_db_adapter = self.cfg.shard_db_adapter,
                 .writes = self.table_writes,
+                .repair_job_store = &self.repair_job_store,
+                .repair_cancel_executor = self.cfg.session_executor,
                 .batch_validator = .{
                     .ptr = self,
                     .validate = validateInternalGroupBatchWrites,
@@ -3946,7 +4009,13 @@ pub const ApiHttpServer = struct {
                     ) catch return try textResponse(self.alloc, 500, "index lookup failed")) orelse return try textResponse(self.alloc, 404, "not found");
                     var value = parseOwnedJsonValueAlloc(arena, body) catch return try textResponse(self.alloc, 500, "index lookup failed");
                     if (value != .object) return try textResponse(self.alloc, 500, "index lookup failed");
-                    try value.object.put(arena, try arena.dupe(u8, "debug"), try tables_api.buildTableIndexRuntimeSchemaDebugValue(arena, table, index_name));
+                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+                    try value.object.put(
+                        arena,
+                        try arena.dupe(u8, "debug"),
+                        try tables_api.buildTableIndexRuntimeSchemaDebugValueWithObserved(arena, table, index_name, observed_dynamic_capability_sets),
+                    );
                     return try jsonResponse(self.alloc, value);
                 }
                 return try self.handlePublicTableGetIndex(table_name, index_name);
@@ -3986,6 +4055,22 @@ pub const ApiHttpServer = struct {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
                 defer self.alloc.free(table_name);
                 return try self.handlePublicRunTableRepair(table_name, req.body);
+            }
+            if (routes.Routes.matchTableRepairJobs(uri_parts.path)) |job_route| {
+                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair job requests use json body");
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicStartTableRepairJob(table_name, req.body);
+            }
+            if (routes.Routes.matchTableRepairJobAdvance(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicAdvanceTableRepairJob(table_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableRepairJobCancel(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicCancelTableRepairJob(table_name, job_route.job_id);
             }
             if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
@@ -4028,6 +4113,9 @@ pub const ApiHttpServer = struct {
                 defer self.alloc.free(table_name);
                 var create_req = table_contract.parseCreateTableRequest(self.alloc, req.body) catch |err| {
                     std.log.err("create table parse failed: {} body_len={d}", .{ err, req.body.len });
+                    if (err == error.InvalidCreateTableSchemaRequest) {
+                        return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(req.body));
+                    }
                     return try textResponse(self.alloc, 400, "invalid create table request");
                 };
                 defer create_req.deinit(self.alloc);
@@ -4058,6 +4146,7 @@ pub const ApiHttpServer = struct {
                 const metadata_create_start_ns = platform_time.monotonicNs();
                 while (true) {
                     self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
+                        error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
                         error.UnexpectedHttpStatus => {
@@ -4153,21 +4242,22 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_schema.table_name);
                 defer self.alloc.free(table_name);
+                const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(req.body);
                 const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid schema update request");
+                    return try textResponse(self.alloc, 400, invalid_schema_message);
                 };
                 defer self.alloc.free(schema_json);
 
                 const table_before = try self.loadOwnedTableRecord(table_name);
                 if (table_before == null) {
                     self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                        error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                        error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                             _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                                 else => return write_err,
                             } orelse return try textResponse(self.alloc, 404, "not found");
                         },
@@ -4182,13 +4272,13 @@ pub const ApiHttpServer = struct {
 
                 var local_schema_applied = false;
                 self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                    error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                    error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
                         _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                             else => return write_err,
                         };
                         local_schema_applied = true;
@@ -4204,7 +4294,7 @@ pub const ApiHttpServer = struct {
                 if (self.table_writes) |table_writes_source| {
                     if (!local_schema_applied) {
                         _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                             else => return write_err,
                         };
                     }
@@ -4273,6 +4363,11 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .GET) {
+            if (routes.Routes.matchTableRepairJob(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRepairJob(table_name, job_route.job_id);
+            }
             if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
@@ -4312,6 +4407,11 @@ pub const ApiHttpServer = struct {
                 var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
                 const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &storage_status_buf);
                 if (runtimeSchemaDebugRequested(uri_parts.query)) {
+                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+                    if (storage_statuses != null) {
+                        storage_status_buf[0].observed_dynamic_field_capability_sets = observed_dynamic_capability_sets;
+                    }
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena_impl.deinit();
                     const response =
@@ -4491,6 +4591,31 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, table, query_req);
+    }
+
+    fn validatePublicQuerySortCapabilities(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query_req: db_mod.types.SearchRequest,
+    ) !void {
+        if (!publicSearchRequestHasSortPageControls(query_req)) return;
+
+        var snapshot = (try self.source.adminSnapshot()) orelse return;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        const schema_json = if (table.read_schema_json.len > 0)
+            table.read_schema_json
+        else
+            tables_api.effectiveSchemaJson(table.schema_json);
+
+        var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, schema_json);
+        defer parsed_schema.deinit(self.alloc);
+        const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
+        defer storage_schema.freeSchema(self.alloc, runtime_schema);
+
+        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+        try validatePublicQuerySortCapabilitiesAgainstRuntime(query_req, runtime_schema, observed_dynamic_capability_sets);
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
@@ -4726,12 +4851,18 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        const schema_fields = try self.loadQueryBuilderSchemaFieldsFromJson(table.schema_json);
+        const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else table.schema_json;
+        const schema_fields = try self.loadQueryBuilderSchemaFieldsFromJson(schema_json);
         errdefer freeOwnedStrings(self.alloc, schema_fields);
+        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+        const field_capabilities = try self.loadQueryBuilderFieldCapabilitiesFromJson(schema_json, observed_dynamic_capability_sets);
+        errdefer freeQueryBuilderFieldCapabilities(self.alloc, field_capabilities);
         const index_context = try self.loadQueryBuilderIndexContextFromJson(table.indexes_json);
         errdefer freeQueryBuilderIndexContext(self.alloc, index_context);
         return .{
             .schema_fields = schema_fields,
+            .field_capabilities = field_capabilities,
             .full_text_index_metadata = index_context.full_text_index_metadata,
             .embedding_index_metadata = index_context.embedding_index_metadata,
             .graph_index_metadata = index_context.graph_index_metadata,
@@ -4765,6 +4896,56 @@ pub const ApiHttpServer = struct {
         }
 
         return try fields.toOwnedSlice(self.alloc);
+    }
+
+    fn loadQueryBuilderFieldCapabilitiesFromJson(
+        self: *ApiHttpServer,
+        schema_json: []const u8,
+        observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    ) ![]const query_builder_agent.QueryBuilderFieldCapability {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+
+        var out = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFieldCapability).empty;
+        errdefer {
+            freeQueryBuilderFieldCapabilitiesItems(self.alloc, out.items);
+            out.deinit(self.alloc);
+        }
+        if (schema_json.len > 0) {
+            const parsed_schema = try tables_api.parseValidatedTableSchema(arena, schema_json);
+            const runtime_schema = try schema_mod.deriveRuntimeTableSchema(arena, parsed_schema);
+            const capabilities = try storage_schema.fieldCapabilitiesAlloc(arena, runtime_schema);
+            for (capabilities) |capability| {
+                const field = capability.field orelse continue;
+                try appendQueryBuilderFieldCapability(self.alloc, &out, .{
+                    .field = field,
+                    .field_type = capability.field_type,
+                    .query_modes = queryBuilderQueryModesForFieldCapability(capability),
+                    .sortable = capability.sortable,
+                    .sort_lifecycle_state = capability.sort_lifecycle_state,
+                    .provenance = capability.provenance,
+                    .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
+                    .index_sort_order = if (capability.index_sort) |membership| if (membership.desc) "desc" else "asc" else null,
+                });
+            }
+        }
+        for (observed_dynamic_capability_sets) |set| {
+            for (set.field_capabilities) |capability| {
+                const field = capability.field orelse continue;
+                try appendQueryBuilderFieldCapability(self.alloc, &out, .{
+                    .field = field,
+                    .field_type = capability.field_type,
+                    .query_modes = queryBuilderQueryModesForFieldCapability(capability),
+                    .sortable = capability.sortable,
+                    .sort_lifecycle_state = capability.sort_lifecycle_state,
+                    .provenance = capability.provenance,
+                    .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
+                    .index_sort_order = if (capability.index_sort) |membership| if (membership.desc) "desc" else "asc" else null,
+                });
+            }
+        }
+        return try out.toOwnedSlice(self.alloc);
     }
 
     fn loadQueryBuilderIndexContextFromJson(self: *ApiHttpServer, indexes_json: []const u8) !QueryBuilderIndexContext {
@@ -5432,6 +5613,29 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn restoreMetadataTableWithRetry(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        backup_id: []const u8,
+    ) !bool {
+        var attempt: usize = 0;
+        while (attempt < 3) : (attempt += 1) {
+            return self.source.restoreTable(alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+                error.TableAlreadyExists => {
+                    if (self.tableExists(table_name) catch true) return err;
+                    if (attempt + 1 >= 3) return err;
+                    self.waitForTableVisibility(table_name, .absent) catch {};
+                    sleepNs(500 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+        return false;
+    }
+
     fn restoreOwnedTableWithRetry(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -5721,10 +5925,13 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return error.NotFound;
         return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.Timeout => return error.ReadUnavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5740,7 +5947,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) ![]u8 {
-        return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null);
+        return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null, null);
     }
 
     fn executePublicTableQueryDispatchWithReadinessRetry(
@@ -5755,7 +5962,9 @@ pub const ApiHttpServer = struct {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
+        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
         while (true) {
+            if (retryDeadlineExpired(request_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
             return self.executePublicTableQueryDispatchWithIdentity(
                 alloc,
                 source,
@@ -5763,12 +5972,21 @@ pub const ApiHttpServer = struct {
                 body,
                 row_filter_json,
                 authenticated_identity,
+                request_deadline_ns,
             ) catch |err| switch (err) {
                 error.DocIdentityNamespaceMismatch => {
-                    if (retry_timeout_ns > 0 and platform_time.monotonicNs() -| start_ns < retry_timeout_ns) {
-                        sleepNs(retry_poll_ns);
-                        continue;
-                    }
+                    const now_ns = platform_time.monotonicNs();
+                    if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
+                    if (retry_timeout_ns == 0) return err;
+                    const sleep_ns = boundedRetrySleepNs(request_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    if (sleep_ns == 0) return error.Timeout;
+                    sleepNs(sleep_ns);
+                    continue;
+                },
+                error.Timeout => {
+                    return error.Timeout;
+                },
+                error.InvalidQueryRequest => {
                     return err;
                 },
                 else => return err,
@@ -5784,6 +6002,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        request_deadline_ns: ?u64,
     ) ![]u8 {
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
             var result = self.executePlainPublicTableQuery(
@@ -5792,13 +6011,18 @@ pub const ApiHttpServer = struct {
                 table_name,
                 body,
                 row_filter_json,
+                request_deadline_ns,
             ) catch |err| switch (err) {
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+                error.InvalidQueryRequest => return error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+                error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound => return error.TableNotFound,
                 error.ModelNotFound => return error.ModelNotFound,
+                error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
+                error.Timeout => return error.Timeout,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -5808,12 +6032,15 @@ pub const ApiHttpServer = struct {
             return try alloc.dupe(u8, result.json);
         }
 
-        var contract_req = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+        var contract_req = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_req.deinit();
 
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -5847,13 +6074,18 @@ pub const ApiHttpServer = struct {
             table_name,
             body,
             row_filter_json,
+            request_deadline_ns,
         ) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.ModelNotFound => return error.ModelNotFound,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
+            error.Timeout => return error.Timeout,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5903,7 +6135,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) anyerror!?[]u8 {
-        var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+        var parsed_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = &parsed_request.value;
         if (row_filter_json) |value| {
@@ -6054,7 +6286,7 @@ pub const ApiHttpServer = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
     ) anyerror![]u8 {
-        var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+        var contract_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_request.deinit();
         const requested_left_fields = contract_request.value.fields orelse &.{};
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
@@ -6063,7 +6295,7 @@ pub const ApiHttpServer = struct {
         const primary_body = rewrite.body;
         defer alloc.free(primary_body);
 
-        var primary_request = try metadata_openapi.server.parseQueryTableBody(alloc, primary_body);
+        var primary_request = try parsePublicTableQueryBody(alloc, primary_body);
         defer primary_request.deinit();
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);
@@ -6192,6 +6424,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        request_deadline_ns: ?u64,
     ) !query_api.QueryResponse {
         var semantic_resolver = SemanticStatusResolver{
             .source = self.source,
@@ -6205,9 +6438,18 @@ pub const ApiHttpServer = struct {
             return error.InvalidQueryRequest;
         };
         defer query_req.deinit(alloc);
+        if (request_deadline_ns) |deadline| {
+            query_req.req.execution_deadline_ns = deadline;
+            if (retryDeadlineExpired(deadline, platform_time.monotonicNs())) return error.Timeout;
+        }
         self.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
+            else => return err,
+        };
+        self.validatePublicQuerySortCapabilities(table_name, query_req.req) catch |err| switch (err) {
+            error.TableNotFound => return error.TableNotFound,
+            error.InvalidSchemaUpdateRequest => return error.InvalidQueryRequest,
             else => return err,
         };
         if (row_filter_json) |value| {
@@ -6228,6 +6470,7 @@ pub const ApiHttpServer = struct {
         const start_ns = platform_time.monotonicNs();
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
+            if (retryDeadlineExpired(req.execution_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
@@ -6236,10 +6479,14 @@ pub const ApiHttpServer = struct {
                 // than an open completes.
                 error.EndOfStream, error.FileNotFound, error.TableReadChurn => {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
-                    if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
-                    sleepNs(retry_poll_ns);
+                    const now_ns = platform_time.monotonicNs();
+                    if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
+                    const sleep_ns = boundedRetrySleepNs(req.execution_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    if (sleep_ns == 0) return error.Timeout;
+                    sleepNs(sleep_ns);
                     continue;
                 },
+                error.Timeout => return error.Timeout,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
                     return err;
@@ -6282,6 +6529,7 @@ pub const ApiHttpServer = struct {
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
+        try self.validatePublicQuerySortCapabilities(table_name, owned.req);
         return owned;
     }
 
@@ -6329,7 +6577,7 @@ pub const ApiHttpServer = struct {
         if (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)) return error.TableAlreadyExists;
 
         if (!self.cfg.swarm_mode) {
-            if (self.source.restoreTable(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
                 error.InvalidBackupRequest => {
@@ -6910,7 +7158,7 @@ pub const ApiHttpServer = struct {
             // For overwrite, skip the metadata restore path and use the owned-table
             // restore which creates the table and copies data synchronously.
             if (!is_overwrite and !self.cfg.swarm_mode) {
-                const restored_via_metadata = self.source.restoreTable(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
+                const restored_via_metadata = self.restoreMetadataTableWithRetry(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     error.UnsupportedOperation => false,
                     else => {
@@ -7012,6 +7260,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        db_mod.resetLastSortRejectionDiagnostic();
         const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -7020,7 +7269,11 @@ pub const ApiHttpServer = struct {
             row_filter_json,
             authenticated_identity,
         ) catch |err| switch (err) {
-            error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
+            error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
+            error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
+            error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
+            error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
@@ -7072,6 +7325,7 @@ pub const ApiHttpServer = struct {
             defer if (row_filter_json) |value| self.alloc.free(value);
 
             const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+            db_mod.resetLastSortRejectionDiagnostic();
             const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,
@@ -7080,7 +7334,11 @@ pub const ApiHttpServer = struct {
                 row_filter_json,
                 authenticated_identity,
             ) catch |err| switch (err) {
-                error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
+                error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
+                error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
+                error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
+                error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
@@ -7361,7 +7619,312 @@ pub const ApiHttpServer = struct {
             .result = result,
         }, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(response_body);
-        return try jsonBodyResponseWithStatus(self.alloc, 202, response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+        var parsed = std.json.parseFromSlice(repair_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 400, "invalid repair job request");
+        };
+        defer parsed.deinit();
+        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try textResponse(self.alloc, 400, "invalid repair target");
+        if (parsed.value.limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+
+        const encoded = try self.repair_job_store.startJob(self.alloc, table_name, .{
+            .target = parsed.value.target,
+            .kind = parsed.value.kind,
+            .index = parsed.value.index,
+            .cursor = parsed.value.cursor,
+            .limit = @min(parsed.value.limit, 1000),
+            .force = parsed.value.force,
+            .advance = parsed.value.advance,
+        });
+        defer self.alloc.free(encoded);
+        if (parsed.value.advance) {
+            var parsed_state = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+                return try textResponse(self.alloc, 500, "repair job failed");
+            };
+            defer parsed_state.deinit();
+            return try self.advanceTableRepairJobState(table_name, parsed_state.value);
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+    }
+
+    pub fn handlePublicTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "repair job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+    }
+
+    pub fn handlePublicAdvanceTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "repair job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        return try self.advanceTableRepairJobState(table_name, parsed.value);
+    }
+
+    pub fn handlePublicCancelTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "repair job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        const cancelled = try self.repair_job_store.requestCancel(self.alloc, parsed.value);
+        defer self.alloc.free(cancelled);
+        var parsed_cancelled = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid repair job state");
+        };
+        defer parsed_cancelled.deinit();
+        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
+    }
+
+    fn advanceTableRepairJobState(self: *ApiHttpServer, table_name: []const u8, state: repair_jobs.JobState) !http_common.HttpResponse {
+        if (repair_jobs.isTerminalPhase(state.phase)) {
+            const encoded = try repair_jobs.encodeState(self.alloc, state);
+            defer self.alloc.free(encoded);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+
+        const begin = try self.repair_job_store.beginAdvance(self.alloc, state);
+        defer self.alloc.free(begin.encoded);
+        var parsed_running = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid repair job state");
+        };
+        defer parsed_running.deinit();
+        const running_state = parsed_running.value;
+        if (!begin.started) {
+            return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+        }
+
+        const updated = if (try self.submitTableRepairJobPass(table_name, begin.encoded, running_state.job_id)) |submitted|
+            submitted
+        else
+            try self.runTableRepairJobPass(table_name, running_state);
+        defer self.alloc.free(updated);
+        var parsed_updated = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, updated, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid repair job state");
+        };
+        defer parsed_updated.deinit();
+        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_updated.value.phase)) 200 else 202, updated);
+    }
+
+    const TableRepairJobPassWork = struct {
+        server: *ApiHttpServer,
+        table_name: []u8,
+        running_encoded: []u8,
+
+        fn run(ptr: *anyopaque) !void {
+            const work: *TableRepairJobPassWork = @ptrCast(@alignCast(ptr));
+            var parsed = try std.json.parseFromSlice(repair_jobs.JobState, work.server.alloc, work.running_encoded, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const heartbeat = work.server.submitTableRepairJobHeartbeat(parsed.value.job_id, parsed.value.attempt_id) catch null;
+            defer if (heartbeat) |hb| hb.stop.store(true, .release);
+            const updated = try work.server.runTableRepairJobPass(work.table_name, parsed.value);
+            work.server.alloc.free(updated);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const work: *TableRepairJobPassWork = @ptrCast(@alignCast(ptr));
+            work.server.alloc.free(work.running_encoded);
+            work.server.alloc.free(work.table_name);
+            work.server.alloc.destroy(work);
+        }
+    };
+
+    const TableRepairJobHeartbeatWork = struct {
+        server: *ApiHttpServer,
+        job_id: u64,
+        attempt_id: u64,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        const interval_ns: u64 = 30 * std.time.ns_per_s;
+        const poll_ns: u64 = 100 * std.time.ns_per_ms;
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
+            const runtime = self.server.cfg.backend_runtime orelse return;
+            const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return;
+            var elapsed_ns: u64 = 0;
+            while (!self.stop.load(.acquire)) {
+                io_impl.io().sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
+                if (self.stop.load(.acquire)) break;
+                elapsed_ns +|= poll_ns;
+                if (elapsed_ns < interval_ns) continue;
+                elapsed_ns = 0;
+                self.server.repair_job_store.heartbeatRunning(self.server.alloc, self.job_id, self.attempt_id) catch |err| {
+                    std.log.warn("failed to heartbeat table repair job job_id={d} attempt_id={d} err={s}", .{
+                        self.job_id,
+                        self.attempt_id,
+                        @errorName(err),
+                    });
+                };
+            }
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
+            self.server.alloc.destroy(self);
+        }
+    };
+
+    const TableRepairCancelProbe = struct {
+        server: *ApiHttpServer,
+        job_id: u64,
+        attempt_id: u64,
+        cached_requested: std.atomic.Value(bool) = .init(false),
+        last_check_ns: std.atomic.Value(u64) = .init(0),
+
+        const check_interval_ns: u64 = 100 * std.time.ns_per_ms;
+
+        fn check(ptr: *anyopaque) bool {
+            const self: *TableRepairCancelProbe = @ptrCast(@alignCast(ptr));
+            if (self.cached_requested.load(.acquire)) return true;
+            const now_ns = platform_time.monotonicNs();
+            const last_ns = self.last_check_ns.load(.acquire);
+            if (last_ns != 0 and now_ns -| last_ns < check_interval_ns) return false;
+            self.last_check_ns.store(now_ns, .release);
+
+            const encoded = self.server.repair_job_store.loadJobAlloc(self.server.alloc, self.job_id) catch return false;
+            defer if (encoded) |buf| self.server.alloc.free(buf);
+            const body = encoded orelse {
+                self.cached_requested.store(true, .release);
+                return true;
+            };
+            var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.server.alloc, body, .{ .ignore_unknown_fields = true }) catch return false;
+            defer parsed.deinit();
+            const state = parsed.value;
+            const requested = state.cancel_requested or
+                repair_jobs.isTerminalPhase(state.phase) or
+                state.attempt_id != self.attempt_id;
+            if (requested) self.cached_requested.store(true, .release);
+            return requested;
+        }
+    };
+
+    fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        if (runtime.threaded_jobs == null) return null;
+        if (runtime.apiIoImpl() == null and runtime.io_impl == null) return null;
+        if (self.repair_job_owner_id == 0) return null;
+
+        const heartbeat = try self.alloc.create(TableRepairJobHeartbeatWork);
+        heartbeat.* = .{
+            .server = self,
+            .job_id = job_id,
+            .attempt_id = attempt_id,
+        };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.repair_job_owner_id,
+            .class = .maintenance,
+            .ptr = heartbeat,
+            .run = TableRepairJobHeartbeatWork.run,
+            .deinit = TableRepairJobHeartbeatWork.deinit,
+        }) catch |err| {
+            self.alloc.destroy(heartbeat);
+            return err;
+        };
+        return heartbeat;
+    }
+
+    fn submitTableRepairJobPass(self: *ApiHttpServer, table_name: []const u8, running_encoded: []const u8, job_id: u64) !?[]u8 {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        if (runtime.threaded_jobs == null) return null;
+        if (self.repair_job_owner_id == 0) return null;
+
+        var work_consumed = false;
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer if (!work_consumed) self.alloc.free(owned_table_name);
+        const owned_running_encoded = try self.alloc.dupe(u8, running_encoded);
+        errdefer if (!work_consumed) self.alloc.free(owned_running_encoded);
+        const work = try self.alloc.create(TableRepairJobPassWork);
+        errdefer if (!work_consumed) self.alloc.destroy(work);
+        work.* = .{
+            .server = self,
+            .table_name = owned_table_name,
+            .running_encoded = owned_running_encoded,
+        };
+
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.repair_job_owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = TableRepairJobPassWork.run,
+            .deinit = TableRepairJobPassWork.deinit,
+        }) catch |err| {
+            TableRepairJobPassWork.deinit(work);
+            work_consumed = true;
+            var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const failed = try self.repair_job_store.markPhase(self.alloc, parsed.value, .failed, @errorName(err));
+            defer self.alloc.free(failed);
+            std.log.err("failed to submit table repair job table={s} job_id={d} err={}", .{ table_name, job_id, err });
+            return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, failed);
+        };
+        work_consumed = true;
+
+        return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, running_encoded);
+    }
+
+    fn runTableRepairJobPass(self: *ApiHttpServer, table_name: []const u8, running_state: repair_jobs.JobState) ![]u8 {
+        const source = self.table_writes orelse {
+            return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+        };
+        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, running_state.target) orelse {
+            return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "invalid repair target");
+        };
+        var cancel_probe = TableRepairCancelProbe{
+            .server = self,
+            .job_id = running_state.job_id,
+            .attempt_id = running_state.attempt_id,
+        };
+        var result = (source.repairArtifactIssuesControlled(self.alloc, table_name, .{
+            .target = target,
+            .artifact_kind = running_state.kind,
+            .index_name = running_state.index,
+            .limit = running_state.limit,
+            .cursor = running_state.cursor,
+            .force = running_state.force,
+            .repair_job_id = running_state.job_id,
+            .repair_attempt_id = running_state.attempt_id,
+        }, .{
+            .cancel_check = .{
+                .ptr = &cancel_probe,
+                .is_requested = TableRepairCancelProbe.check,
+            },
+        }) catch |err| switch (err) {
+            error.Canceled => {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .cancelled, "cancel_requested");
+            },
+            error.InvalidArgument => {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+            },
+            error.NotFound => {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+            },
+            else => {
+                std.log.err("public table repair job failed table={s} job_id={d} err={}", .{ table_name, running_state.job_id, err });
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+            },
+        }) orelse {
+            return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+        };
+        defer result.deinit(self.alloc);
+        return try self.repair_job_store.recordPass(self.alloc, running_state, result);
     }
 
     pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -7433,9 +7996,13 @@ pub const ApiHttpServer = struct {
         if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
             return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
         }
-        const cancelled = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        const cancelled = try self.artifact_reprocess_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, cancelled);
+        var parsed_cancelled = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid artifact reprocess job state");
+        };
+        defer parsed_cancelled.deinit();
+        return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
     fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
@@ -7606,6 +8173,30 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
+fn retryDeadlineExpired(deadline_ns: ?u64, now_ns: u64) bool {
+    const deadline = deadline_ns orelse return false;
+    return now_ns >= deadline;
+}
+
+fn boundedRetrySleepNs(
+    deadline_ns: ?u64,
+    now_ns: u64,
+    retry_start_ns: u64,
+    retry_timeout_ns: u64,
+    retry_poll_ns: u64,
+) ?u64 {
+    if (retry_timeout_ns == 0) return null;
+    const retry_elapsed_ns = now_ns -| retry_start_ns;
+    if (retry_elapsed_ns >= retry_timeout_ns) return null;
+
+    var sleep_ns = @min(retry_poll_ns, retry_timeout_ns - retry_elapsed_ns);
+    if (deadline_ns) |deadline| {
+        if (now_ns >= deadline) return 0;
+        sleep_ns = @min(sleep_ns, deadline - now_ns);
+    }
+    return sleep_ns;
+}
+
 fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataService) StatusSource {
     const V = struct {
         fn status(ptr: *anyopaque) anyerror!metadata_api.MetadataStatus {
@@ -7681,12 +8272,403 @@ fn freeQueryBuilderIndexContext(alloc: std.mem.Allocator, context: QueryBuilderI
 
 pub fn freeQueryBuilderTableContext(alloc: std.mem.Allocator, context: query_builder_agent.QueryBuilderTableContext) void {
     freeOwnedStrings(alloc, context.schema_fields);
+    freeQueryBuilderFieldCapabilities(alloc, context.field_capabilities);
     freeOwnedStrings(alloc, context.full_text_indexes);
     freeOwnedStrings(alloc, context.semantic_indexes);
     freeOwnedStrings(alloc, context.graph_indexes);
     freeQueryBuilderFullTextIndexMetadata(alloc, context.full_text_index_metadata);
     freeQueryBuilderEmbeddingIndexMetadata(alloc, context.embedding_index_metadata);
     freeQueryBuilderGraphIndexMetadata(alloc, context.graph_index_metadata);
+}
+
+fn validatePublicQuerySortCapabilitiesAgainstRuntime(
+    query_req: db_mod.types.SearchRequest,
+    runtime_schema: storage_schema.TableSchema,
+    observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+) !void {
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    if (query_req.order_by.len == 0 and cursor.len == 0) return;
+    try validatePublicCountOnlySortPageContract(query_req);
+    try validatePublicSortCursorContract(query_req);
+    try validatePublicScoreSortSource(query_req);
+    try validatePublicApproximateSortSource(query_req);
+    if (query_req.order_by.len == 0) return;
+    for (query_req.order_by, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        if (std.mem.eql(u8, field.field, "_score")) continue;
+
+        if (storage_schema.resolveDeclaredFieldType(runtime_schema, field.field)) |mapping| {
+            try validatePublicMappedSortField(field.field, mapping);
+            if (try validatePublicSortCapabilityEvidence(
+                observed_dynamic_capability_sets,
+                query_req.primary_text_index_name orelse query_req.index_name,
+                field.field,
+                mapping.field_type,
+            ) == null) {
+                try validatePublicMappedSortCoverage(field.field, mapping);
+            }
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
+            continue;
+        }
+
+        if (try validatePublicSortCapabilityEvidence(
+            observed_dynamic_capability_sets,
+            query_req.primary_text_index_name orelse query_req.index_name,
+            field.field,
+            null,
+        )) |field_type| {
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
+            continue;
+        }
+
+        recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
+        return error.UnsupportedExactSort;
+    }
+}
+
+fn publicSearchRequestHasSortPageControls(query_req: db_mod.types.SearchRequest) bool {
+    return query_req.order_by.len > 0 or
+        query_req.search_after.len > 0 or
+        query_req.search_before.len > 0;
+}
+
+fn validatePublicCountOnlySortPageContract(query_req: db_mod.types.SearchRequest) !void {
+    if (!query_req.count_only) return;
+    if (!publicSearchRequestHasSortPageControls(query_req)) return;
+    recordPublicSortCapabilityRejection("*", "unsupported_exact_sort", "count_only_ordered_page");
+    return error.UnsupportedExactSort;
+}
+
+fn validatePublicSortCursorContract(query_req: db_mod.types.SearchRequest) !void {
+    try validatePublicSortIdTiebreaker(query_req.order_by);
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    const field_count = publicEffectiveSortFieldCount(query_req);
+    if (query_req.search_after.len > 0 and query_req.search_before.len > 0) {
+        recordPublicSortCapabilityRejection("*", "invalid_cursor_arity", "invalid_cursor_arity");
+        return error.InvalidQueryRequest;
+    }
+    if (cursor.len > 0 and query_req.offset != 0) {
+        recordPublicSortCapabilityRejection("*", "invalid_cursor_arity", "invalid_cursor_arity");
+        return error.InvalidQueryRequest;
+    }
+    if (cursor.len > 0 and cursor.len != field_count) {
+        recordPublicSortCapabilityRejection("*", "invalid_cursor_arity", "invalid_cursor_arity");
+        return error.InvalidQueryRequest;
+    }
+    for (0..@min(field_count, cursor.len)) |i| {
+        const field = publicEffectiveSortFieldAt(query_req, i);
+        if (!publicSortCursorValueIsReplayable(cursor[i])) {
+            recordPublicSortCapabilityRejection(field.field, "invalid_cursor_type", "invalid_cursor_type");
+            return error.InvalidQueryRequest;
+        }
+        if (std.mem.eql(u8, field.field, "_id") and cursor[i] != .string) {
+            recordPublicSortCapabilityRejection(field.field, "invalid_cursor_type", "invalid_cursor_type");
+            return error.InvalidQueryRequest;
+        }
+        if (std.mem.eql(u8, field.field, "_score") and !publicSortCursorValueIsNumeric(cursor[i])) {
+            recordPublicSortCapabilityRejection(field.field, "invalid_cursor_type", "invalid_cursor_type");
+            return error.InvalidQueryRequest;
+        }
+    }
+}
+
+fn validatePublicSortIdTiebreaker(order_by: []const db_mod.types.SortField) !void {
+    for (order_by, 0..) |field, i| {
+        for (order_by[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) {
+                recordPublicSortCapabilityRejection(field.field, "invalid_cursor_arity", "invalid_cursor_arity");
+                return error.InvalidQueryRequest;
+            }
+        }
+        if (!std.mem.eql(u8, field.field, "_id")) continue;
+        if (i + 1 != order_by.len or field.desc) {
+            recordPublicSortCapabilityRejection("_id", "invalid_cursor_arity", "invalid_cursor_arity");
+            return error.InvalidQueryRequest;
+        }
+    }
+}
+
+fn publicSortRequestNeedsDefaultIdOrder(query_req: db_mod.types.SearchRequest) bool {
+    return query_req.order_by.len == 0 and (query_req.search_after.len > 0 or query_req.search_before.len > 0);
+}
+
+fn publicSortFieldsNeedImplicitIdTiebreaker(order_by: []const db_mod.types.SortField) bool {
+    if (order_by.len == 0) return false;
+    return !std.mem.eql(u8, order_by[order_by.len - 1].field, "_id");
+}
+
+fn publicEffectiveSortFieldCount(query_req: db_mod.types.SearchRequest) usize {
+    if (publicSortRequestNeedsDefaultIdOrder(query_req)) return 1;
+    return query_req.order_by.len + @as(usize, if (publicSortFieldsNeedImplicitIdTiebreaker(query_req.order_by)) 1 else 0);
+}
+
+fn publicEffectiveSortFieldAt(query_req: db_mod.types.SearchRequest, index: usize) db_mod.types.SortField {
+    if (publicSortRequestNeedsDefaultIdOrder(query_req)) return .{ .field = "_id", .desc = false };
+    if (index < query_req.order_by.len) return query_req.order_by[index];
+    return .{ .field = "_id", .desc = false };
+}
+
+fn validatePublicScoreSortSource(query_req: db_mod.types.SearchRequest) !void {
+    var has_score_sort = false;
+    for (query_req.order_by) |field| {
+        if (std.mem.eql(u8, field.field, "_score")) {
+            has_score_sort = true;
+            break;
+        }
+    }
+    if (!has_score_sort) return;
+    if (db_query_search.searchRequestHasScoreBearingSource(query_req)) return;
+    recordPublicSortCapabilityRejection("_score", "non_score_bearing_source", "non_score_bearing_source");
+    return error.UnsupportedQueryRequest;
+}
+
+fn validatePublicApproximateSortSource(query_req: db_mod.types.SearchRequest) !void {
+    if (!db_query_search.searchRequestHasScoreBearingVectorSource(query_req)) return;
+    for (query_req.order_by) |field| {
+        recordPublicSortCapabilityRejection(field.field, "approximate_candidate_source", "approximate_candidate_source");
+        return error.UnsupportedQueryRequest;
+    }
+    recordPublicSortCapabilityRejection("*", "approximate_candidate_source", "approximate_candidate_source");
+    return error.UnsupportedQueryRequest;
+}
+
+fn validatePublicMappedSortField(field: []const u8, mapping: storage_schema.FieldMapping) !void {
+    if (!storage_schema.fieldTypeIsSortableScalar(mapping.field_type)) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_scalar_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!mapping.sortable) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_sortable_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!mapping.doc_values) {
+        recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", "missing_doc_values_capability");
+        return error.UnsupportedExactSort;
+    }
+}
+
+fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, expected_type: ?storage_schema.AntflyType) !storage_schema.AntflyType {
+    const field = capability.field orelse "*";
+    if (expected_type) |field_type| {
+        if (capability.field_type != field_type) {
+            recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "mixed_field_type");
+            return error.UnsupportedExactSort;
+        }
+    }
+    if (!storage_schema.fieldTypeIsSortableScalar(capability.field_type)) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_scalar_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!capability.sortable) {
+        recordPublicSortCapabilityRejection(field, "non_sortable_sort_field", "non_sortable_field");
+        return error.UnsupportedExactSort;
+    }
+    if (!capability.doc_values) {
+        recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", "missing_doc_values_capability");
+        return error.UnsupportedExactSort;
+    }
+    if (!std.mem.eql(u8, capability.doc_value_coverage, "covered") or
+        !std.mem.eql(u8, capability.queryability_state, "queryable"))
+    {
+        const detail = if (!std.mem.eql(u8, capability.doc_value_coverage, "covered"))
+            capability.doc_value_coverage
+        else
+            capability.queryability_state;
+        recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", detail);
+        return error.UnsupportedExactSort;
+    }
+    return capability.field_type;
+}
+
+fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.FieldMapping) !void {
+    const coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
+    const queryability = storage_schema.mappingQueryabilityStateName(mapping);
+    const detail = if (!std.mem.eql(u8, coverage, "covered")) coverage else queryability;
+    recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", detail);
+    return error.UnsupportedExactSort;
+}
+
+fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, value: std.json.Value) !void {
+    const valid = switch (field_type) {
+        .keyword, .link => value == .string,
+        .numeric => publicSortCursorValueIsNumeric(value),
+        .datetime => publicSortCursorValueIsDateLike(value),
+        .boolean => value == .bool,
+        else => false,
+    };
+    if (!valid) {
+        recordPublicSortCapabilityRejection(field, "invalid_cursor_type", "invalid_cursor_type");
+        return error.InvalidQueryRequest;
+    }
+}
+
+fn publicSortCursorValueIsReplayable(value: std.json.Value) bool {
+    return switch (value) {
+        .bool, .integer, .string => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |text| publicJsonNumberStringIsFinite(text),
+        .null, .array, .object => false,
+    };
+}
+
+fn publicSortCursorValueIsNumeric(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |text| publicJsonNumberStringIsFinite(text),
+        else => false,
+    };
+}
+
+fn publicSortCursorValueIsDateLike(value: std.json.Value) bool {
+    return switch (value) {
+        .string => |text| storage_schema.parseDateTimeToNs(text) != null,
+        .integer => |number| number >= 0,
+        .number_string => |text| blk: {
+            _ = std.fmt.parseUnsigned(u64, text, 10) catch break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn publicJsonNumberStringIsFinite(text: []const u8) bool {
+    if (std.fmt.parseInt(i64, text, 10)) |_| return true else |_| {}
+    if (std.fmt.parseInt(u64, text, 10)) |_| return true else |_| {}
+    const value = std.fmt.parseFloat(f64, text) catch return false;
+    return std.math.isFinite(value);
+}
+
+fn validatePublicSortCapabilityEvidence(
+    observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    preferred_index_name: ?[]const u8,
+    field: []const u8,
+    expected_type: ?storage_schema.AntflyType,
+) !?storage_schema.AntflyType {
+    var matched_preferred = false;
+    var preferred_type: ?storage_schema.AntflyType = null;
+    for (observed_dynamic_capability_sets) |set| {
+        const preferred = if (preferred_index_name) |name| std.mem.eql(u8, set.index_name, name) else true;
+        if (!preferred) continue;
+        for (set.field_capabilities) |capability| {
+            const capability_field = capability.field orelse continue;
+            if (!std.mem.eql(u8, capability_field, field)) continue;
+            const effective_expected = expected_type orelse preferred_type;
+            preferred_type = try validatePublicObservedSortField(capability, effective_expected);
+            matched_preferred = true;
+        }
+    }
+    if (matched_preferred) return preferred_type;
+    if (preferred_index_name != null) return null;
+
+    var matched_fallback = false;
+    var fallback_type: ?storage_schema.AntflyType = null;
+    for (observed_dynamic_capability_sets) |set| {
+        for (set.field_capabilities) |capability| {
+            const capability_field = capability.field orelse continue;
+            if (!std.mem.eql(u8, capability_field, field)) continue;
+            const effective_expected = expected_type orelse fallback_type;
+            fallback_type = try validatePublicObservedSortField(capability, effective_expected);
+            matched_fallback = true;
+        }
+    }
+    return if (matched_fallback) fallback_type else null;
+}
+
+fn recordPublicSortCapabilityRejection(field: []const u8, reason: []const u8, detail: []const u8) void {
+    db_mod.recordSortRejectionDiagnostic(field, reason, detail);
+}
+
+fn freeQueryBuilderFieldCapabilities(
+    alloc: std.mem.Allocator,
+    capabilities: []const query_builder_agent.QueryBuilderFieldCapability,
+) void {
+    freeQueryBuilderFieldCapabilitiesItems(alloc, capabilities);
+    if (capabilities.len > 0) alloc.free(@constCast(capabilities));
+}
+
+fn freeQueryBuilderFieldCapabilitiesItems(
+    alloc: std.mem.Allocator,
+    capabilities: []const query_builder_agent.QueryBuilderFieldCapability,
+) void {
+    for (capabilities) |capability| freeQueryBuilderFieldCapability(alloc, capability);
+}
+
+fn freeQueryBuilderFieldCapability(
+    alloc: std.mem.Allocator,
+    capability: query_builder_agent.QueryBuilderFieldCapability,
+) void {
+    alloc.free(@constCast(capability.field));
+    freeOwnedStrings(alloc, capability.query_modes);
+    alloc.free(@constCast(capability.sort_lifecycle_state));
+    alloc.free(@constCast(capability.provenance));
+    if (capability.index_sort_order) |value| alloc.free(@constCast(value));
+}
+
+fn queryBuilderQueryModesForFieldCapability(capability: storage_schema.FieldCapability) []const []const u8 {
+    return switch (capability.field_type) {
+        .text, .html => if (capability.searchable) &.{"full_text"} else &.{},
+        .search_as_you_type => if (capability.searchable) &.{ "full_text", "autocomplete" } else &.{"autocomplete"},
+        .keyword, .link => if (capability.filterable) &.{"exact"} else &.{},
+        .numeric, .datetime => if (capability.filterable) &.{ "exact", "range" } else &.{},
+        .boolean => if (capability.filterable) &.{"exact"} else &.{},
+        .geopoint, .geoshape => if (capability.filterable) &.{"geo"} else &.{},
+        .embedding, .blob => &.{},
+    };
+}
+
+fn dupeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn appendQueryBuilderFieldCapability(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFieldCapability),
+    capability: query_builder_agent.QueryBuilderFieldCapability,
+) !void {
+    const owned_field = try alloc.dupe(u8, capability.field);
+    var field_owned = true;
+    errdefer if (field_owned) alloc.free(owned_field);
+    const owned_query_modes = try dupeOwnedStringSlice(alloc, capability.query_modes);
+    var query_modes_owned = true;
+    errdefer if (query_modes_owned) freeOwnedStrings(alloc, owned_query_modes);
+    const owned_lifecycle = try alloc.dupe(u8, capability.sort_lifecycle_state);
+    var lifecycle_owned = true;
+    errdefer if (lifecycle_owned) alloc.free(owned_lifecycle);
+    const owned_provenance = try alloc.dupe(u8, capability.provenance);
+    var provenance_owned = true;
+    errdefer if (provenance_owned) alloc.free(owned_provenance);
+    const owned_index_sort_order = if (capability.index_sort_order) |value| try alloc.dupe(u8, value) else null;
+    var index_sort_order_owned = owned_index_sort_order != null;
+    errdefer if (index_sort_order_owned) alloc.free(owned_index_sort_order.?);
+    const item = query_builder_agent.QueryBuilderFieldCapability{
+        .field = owned_field,
+        .field_type = capability.field_type,
+        .query_modes = owned_query_modes,
+        .sortable = capability.sortable,
+        .sort_lifecycle_state = owned_lifecycle,
+        .provenance = owned_provenance,
+        .index_sort_position = capability.index_sort_position,
+        .index_sort_order = owned_index_sort_order,
+    };
+    field_owned = false;
+    query_modes_owned = false;
+    lifecycle_owned = false;
+    provenance_owned = false;
+    index_sort_order_owned = false;
+    errdefer freeQueryBuilderFieldCapability(alloc, item);
+    try out.append(alloc, item);
 }
 
 fn freeQueryBuilderFullTextIndexMetadata(
@@ -8455,6 +9437,22 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
+    if (routes.Routes.matchTableRepairJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJob(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJobAdvance(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJobCancel(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
     if (routes.Routes.matchTableArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -8565,6 +9563,34 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/repair/jobs/42")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs/42/advance")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs/42/cancel")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/artifacts/document_units_v1/reprocess")).?;
         defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
@@ -8617,6 +9643,51 @@ test "required permissions decode table path resources" {
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     try std.testing.expectError(error.InvalidArgument, requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%ZZ/artifacts"));
+}
+
+test "api http server marks table repair job failed when background submit is closing" {
+    if (@import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+
+    const DummyStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+    }, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = DummyStatus.status },
+    }, null, null);
+    defer server.deinit();
+
+    const started = try server.repair_job_store.startJob(alloc, "docs", .{
+        .target = "artifact",
+        .limit = 1,
+    });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(repair_jobs.JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+
+    const begin = try server.repair_job_store.beginAdvance(alloc, parsed_started.value);
+    defer alloc.free(begin.encoded);
+    try std.testing.expect(begin.started);
+    var parsed_running = try std.json.parseFromSlice(repair_jobs.JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_running.deinit();
+
+    runtime.ptr().durable_jobs.closeOwner(server.repair_job_owner_id);
+    const updated = (try server.submitTableRepairJobPass("docs", begin.encoded, parsed_running.value.job_id)).?;
+    defer alloc.free(updated);
+
+    var parsed_updated = try std.json.parseFromSlice(repair_jobs.JobState, alloc, updated, .{ .ignore_unknown_fields = true });
+    defer parsed_updated.deinit();
+    try std.testing.expectEqualStrings("failed", parsed_updated.value.phase);
+    try std.testing.expectEqualStrings("BackgroundOwnerClosing", parsed_updated.value.last_error.?);
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -8767,6 +9838,69 @@ fn jsonResponseWithStatus(alloc: std.mem.Allocator, status: u16, value: anytype)
 
 fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
     return try jsonResponseWithStatus(alloc, 200, value);
+}
+
+fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
+        .reason = "candidate_budget_exceeded",
+        .detail = "candidate_budget_exceeded",
+    };
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try jsonResponseWithStatus(alloc, 422, .{
+        .status = 422,
+        .@"error" = "query_candidate_budget_exceeded",
+        .message = "query candidate budget exceeded",
+        .reason = public_rejection.reason,
+        .budget_rejection_reason = diagnostic.detail,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    });
+}
+
+fn unsupportedPublicQueryResponse(alloc: std.mem.Allocator, body: []const u8) !http_common.HttpResponse {
+    if (queryBodyHasSortPageControls(alloc, body)) {
+        return try unsupportedExactSortResponse(alloc);
+    }
+    return try textResponse(alloc, 422, "unsupported query request");
+}
+
+fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    if (db_mod.peekLastSortRejectionDiagnostic() != null) {
+        return try unsupportedExactSortResponse(alloc);
+    }
+    return try textResponse(alloc, 400, "invalid query request");
+}
+
+fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ InvalidQueryRequest, UnsupportedExactSort } {
+    if (queryBodyHasSortPageControls(alloc, body)) return error.UnsupportedExactSort;
+    return error.InvalidQueryRequest;
+}
+
+fn unsupportedExactSortResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try jsonResponseWithStatus(alloc, 422, .{
+        .status = 422,
+        .@"error" = "unsupported_exact_sort",
+        .message = "exact sort is unsupported for this query",
+        .reason = public_rejection.reason,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    });
+}
+
+fn queryBodyHasSortPageControls(alloc: std.mem.Allocator, body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    return object.get("order_by") != null or
+        object.get("search_after") != null or
+        object.get("search_before") != null;
 }
 
 fn writeMaybeAbsoluteUrl(writer: *std.Io.Writer, base_url: ?[]const u8, url: []const u8) !void {
@@ -9781,13 +10915,23 @@ fn injectRowFilterIntoOpenApiQueryRequest(
 
 pub fn scanLineKey(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
     const ScanLineKey = struct {
-        key: []const u8,
+        _id: []const u8,
     };
     var parsed = try std.json.parseFromSlice(ScanLineKey, alloc, line, .{
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    return try alloc.dupe(u8, parsed.value.key);
+    return try alloc.dupe(u8, parsed.value._id);
+}
+
+test "scan line key uses reserved _id document identity" {
+    const alloc = std.testing.allocator;
+
+    const key = try scanLineKey(alloc, "{\"_id\":\"doc:server\",\"title\":\"alpha\"}");
+    defer alloc.free(key);
+    try std.testing.expectEqualStrings("doc:server", key);
+
+    try std.testing.expectError(error.MissingField, scanLineKey(alloc, "{\"key\":\"doc:legacy\"}"));
 }
 
 const TestQueryHitInput = struct {
@@ -10145,6 +11289,759 @@ test "api http server serves status" {
     const request_stats = server.requestStats();
     try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
+}
+
+test "api http query budget rejection response exposes stable sort reason" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "full_text_index_v0",
+        "candidate_budget_exceeded",
+        "text_field_sort_candidate_window",
+    );
+    var resp = try queryCandidateBudgetExceededResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        budget_rejection_reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("query_candidate_budget_exceeded", parsed.value.@"error");
+    try std.testing.expectEqualStrings("query candidate budget exceeded", parsed.value.message);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.reason);
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.budget_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+}
+
+test "api http unsupported sorted query response exposes stable sort reason" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", parsed.value.sort_rejection_field);
+}
+
+test "api http unsupported sorted query response surfaces exact sort diagnostics" {
+    const alloc = std.testing.allocator;
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "created_at",
+        "missing_doc_values_coverage",
+        "missing_doc_values_section",
+    );
+    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
+}
+
+test "api http unsupported count ordered page response exposes stable sort reason" {
+    const alloc = std.testing.allocator;
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "*",
+        "unsupported_exact_sort",
+        "count_only_ordered_page",
+    );
+    var resp = try unsupportedPublicQueryResponse(alloc,
+        \\{"count":true,"order_by":[{"field":"created_at"}]}
+    );
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("*", parsed.value.sort_rejection_field);
+}
+
+test "api http invalid query with sort diagnostic returns exact sort response" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "_score",
+        "invalid_sort_tuple",
+        "non_numeric_score",
+    );
+    var resp = try invalidPublicQueryRequestResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
+}
+
+test "api http unsupported unsorted query response remains generic" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    var resp = try unsupportedPublicQueryResponse(alloc, "{\"join\":{}}");
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
+    try std.testing.expectEqualStrings("unsupported query request", resp.body);
+}
+
+test "api http retry sleep is bounded by request deadline" {
+    const now_ns: u64 = 1_000;
+    try std.testing.expectEqual(
+        @as(?u64, 10),
+        boundedRetrySleepNs(now_ns + 10, now_ns, now_ns - 100, std.time.ns_per_s, 25 * std.time.ns_per_ms),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        boundedRetrySleepNs(now_ns, now_ns, now_ns - 100, std.time.ns_per_s, 25 * std.time.ns_per_ms),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        boundedRetrySleepNs(null, now_ns, now_ns - 100, 50, 25 * std.time.ns_per_ms),
+    );
+}
+
+test "api http transient read retry honors expired request deadline before source query" {
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            return error.FileNotFound;
+        }
+    };
+
+    var reads = FakeReads{};
+    try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        .{ .execution_deadline_ns = 0 },
+        .read_index,
+    ));
+    try std.testing.expectEqual(@as(u32, 0), reads.attempts);
+}
+
+test "api http plain public query preserves outer absolute request deadline" {
+    const alloc = std.testing.allocator;
+    const outer_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        expected_deadline_ns: u64,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(self.expected_deadline_ns, req.execution_deadline_ns.?);
+            return .{ .json = try inner_alloc.dupe(u8, "{\"hits\":[],\"total\":0}") };
+        }
+    };
+
+    var reads = FakeReads{ .expected_deadline_ns = outer_deadline_ns };
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    const body =
+        \\{"query":{"match_all":{}},"timeout_ms":999999}
+    ;
+    var response = try server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        body,
+        null,
+        outer_deadline_ns,
+    );
+    defer response.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
+}
+
+test "api http public table dispatch preserves unsupported sorted query as exact sort" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(error.UnsupportedExactSort, unsupportedPublicTableQueryDispatchError(
+        alloc,
+        "{\"order_by\":[{\"field\":\"created_at\"}]}",
+    ));
+    try std.testing.expectEqual(error.UnsupportedExactSort, unsupportedPublicTableQueryDispatchError(
+        alloc,
+        "{\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+    ));
+    try std.testing.expectEqual(error.InvalidQueryRequest, unsupportedPublicTableQueryDispatchError(
+        alloc,
+        "{\"join\":{}}",
+    ));
+}
+
+test "api http public sort capability gate validates mapped sortable fields" {
+    const templates = [_]storage_schema.DynamicTemplate{
+        .{
+            .name = "created_at",
+            .path_match = "created_at",
+            .mapping = .{
+                .field_type = .datetime,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+        .{
+            .name = "body",
+            .path_match = "body",
+            .mapping = .{
+                .field_type = .text,
+                .doc_values = false,
+                .sortable = false,
+                .analyzer = "standard",
+            },
+        },
+        .{
+            .name = "location",
+            .path_match = "location",
+            .mapping = .{
+                .field_type = .geopoint,
+                .do_index = true,
+                .doc_values = true,
+                .sortable = false,
+                .analyzer = "standard",
+            },
+        },
+    };
+    const runtime_schema = storage_schema.TableSchema{ .dynamic_templates = &templates };
+    var covered_created = storage_schema.observedDynamicFieldCapability(null, "created_at", .{
+        .field_type = .datetime,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    covered_created.doc_value_coverage = "covered";
+    covered_created.queryability_state = "queryable";
+    storage_schema.refreshSortLifecycleState(&covered_created);
+    const covered_created_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered_created})[0..]),
+    };
+    const covered_created_other_index_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v1"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered_created})[0..]),
+    };
+
+    const created_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set});
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .count_only = true,
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_other_index_set}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("schema_declared", diagnostic.detail);
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+    }, runtime_schema, &.{covered_created_other_index_set});
+    const created_effective_order = [_]db_mod.types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const valid_date_cursor = [_]std.json.Value{ .{ .string = "2026-01-01T00:00:00Z" }, .{ .string = "doc:1" } };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &valid_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set});
+    const valid_date_ns_cursor = [_]std.json.Value{ .{ .number_string = "1767225600000000000" }, .{ .string = "doc:1" } };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &valid_date_ns_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set});
+
+    const short_date_cursor = [_]std.json.Value{.{ .string = "2026-01-01T00:00:00Z" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_order,
+        .search_after = &short_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:1" }};
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .search_after = &id_cursor,
+    }, runtime_schema, &.{});
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .count_only = true,
+        .search_after = &id_cursor,
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
+
+    const bad_id_cursor = [_]std.json.Value{.{ .integer = 7 }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .search_after = &bad_id_cursor,
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+    const invalid_date_cursor = [_]std.json.Value{ .{ .string = "not-a-date" }, .{ .string = "doc:1" } };
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &invalid_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+    const rounded_date_cursor = [_]std.json.Value{ .{ .float = 1767225600000000000.0 }, .{ .string = "doc:1" } };
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &created_effective_order,
+        .search_after = &rounded_date_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_created_set}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &created_order }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("schema_declared", diagnostic.detail);
+
+    const match_mapping_templates = [_]storage_schema.DynamicTemplate{.{
+        .name = "dates",
+        .path_match = "meta.*_at",
+        .match_mapping_type = "date",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    }};
+    const match_mapping_schema = storage_schema.TableSchema{ .dynamic_templates = &match_mapping_templates };
+    const dynamic_created_order = [_]db_mod.types.SortField{.{ .field = "meta.created_at", .desc = true }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &dynamic_created_order,
+    }, match_mapping_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("meta.created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("schema_declared", diagnostic.detail);
+
+    const body_order = [_]db_mod.types.SortField{.{ .field = "body" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &body_order }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("body", diagnostic.field);
+    try std.testing.expectEqualStrings("non_sortable_sort_field", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_scalar_field", diagnostic.detail);
+
+    const location_order = [_]db_mod.types.SortField{.{ .field = "location" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{ .order_by = &location_order }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("location", diagnostic.field);
+    try std.testing.expectEqualStrings("non_sortable_sort_field", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_scalar_field", diagnostic.detail);
+}
+
+test "api http public sort capability gate validates score-bearing source" {
+    const runtime_schema = storage_schema.TableSchema{};
+    const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &score_order,
+        .full_text = .{ .match_all = {} },
+    }, runtime_schema, &.{}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &score_order,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }, runtime_schema, &.{});
+
+    const vector = [_]f32{ 0.1, 0.2 };
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:1" }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .search_after = &id_cursor,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &score_order,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+
+    const id_order = [_]db_mod.types.SortField{.{ .field = "_id", .desc = false }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &id_order,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, runtime_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+
+    const templates = [_]storage_schema.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const mapped_schema = storage_schema.TableSchema{ .dynamic_templates = &templates };
+    const combined_order = [_]db_mod.types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "created_at", .desc = true },
+    };
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &combined_order,
+        .full_text = .{ .match_all = {} },
+    }, mapped_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &combined_order,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }, mapped_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+
+    const field_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &field_order,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }, mapped_schema, &.{}));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+}
+
+test "api http public sort capability gate fails closed for uncovered observed dynamic fields" {
+    const runtime_schema = storage_schema.TableSchema{};
+    var covered = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    storage_schema.refreshSortLifecycleState(&covered);
+    const covered_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered})[0..]),
+    };
+    const price_order = [_]db_mod.types.SortField{.{ .field = "price" }};
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{covered_set});
+
+    const declared = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    const declared_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{declared})[0..]),
+    };
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{declared_set}));
+    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("price", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("observed_declared", diagnostic.detail);
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{ covered_set, declared_set }));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("price", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("observed_declared", diagnostic.detail);
+
+    const declared_other_index = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    const declared_other_index_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v1"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{declared_other_index})[0..]),
+    };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{ covered_set, declared_other_index_set });
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+    }, runtime_schema, &.{ covered_set, declared_other_index_set }));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("price", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("observed_declared", diagnostic.detail);
 }
 
 test "api http server serves extension catalog reads" {
@@ -14390,7 +16287,7 @@ test "api http server serves fielded full-text search through mcp tools" {
 
 test "api http server serves table scan as ndjson" {
     const ScanRow = struct {
-        key: []const u8,
+        _id: []const u8,
         title: []const u8,
     };
     const alloc = std.testing.allocator;
@@ -14432,7 +16329,7 @@ test "api http server serves table scan as ndjson" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
     var resp = try server.handle(.{
         .method = .POST,
-        .uri = "/tables/docs/lookup",
+        .uri = "/tables/docs/documents",
         .content_type = "application/json",
         .body = "{\"from\":\"doc:a\",\"to\":\"doc:b\",\"inclusive_from\":true,\"fields\":[\"title\"]}",
     });
@@ -14442,7 +16339,7 @@ test "api http server serves table scan as ndjson" {
     const newline = std.mem.indexOfScalar(u8, resp.body, '\n') orelse resp.body.len;
     var parsed = try std.json.parseFromSlice(ScanRow, std.testing.allocator, resp.body[0..newline], .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed.value.key);
+    try std.testing.expectEqualStrings("doc:a", parsed.value._id);
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
@@ -15131,7 +17028,7 @@ test "api http server query builder loads structured table index metadata" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}",
+                    .schema_json = "{\"default_type\":\"doc\",\"dynamic_templates\":[{\"name\":\"created\",\"path_match\":\"created_at\",\"mapping\":{\"type\":\"datetime\",\"sortable\":true}}],\"index_sort\":[{\"field\":\"created_at\",\"order\":\"desc\"},{\"field\":\"_id\",\"order\":\"asc\"}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"created_at\":{\"type\":\"string\",\"format\":\"date-time\"}}}}}}",
                     .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"fields\":[\"title\",\"body\"]},\"semantic_idx\":{\"type\":\"dense_vector\",\"dimension\":384,\"embedder\":{\"model\":\"e5-small\"}},\"sparse_idx\":{\"type\":\"sparse_vector\",\"model\":\"splade\"},\"doc_graph\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"references\",\"topology\":\"graph\"},{\"name\":\"parent\",\"topology\":\"tree\"}]}}",
                     .placement_role = "data",
                 }})[0..]),
@@ -15154,6 +17051,21 @@ test "api http server query builder loads structured table index metadata" {
     try std.testing.expectEqualStrings("search_idx", context.full_text_index_metadata[0].name);
     try std.testing.expectEqualStrings("title", context.full_text_index_metadata[0].fields[0]);
     try std.testing.expectEqualStrings("body", context.full_text_index_metadata[0].fields[1]);
+
+    var created_capability: ?query_builder_agent.QueryBuilderFieldCapability = null;
+    var id_capability: ?query_builder_agent.QueryBuilderFieldCapability = null;
+    for (context.field_capabilities) |capability| {
+        if (std.mem.eql(u8, capability.field, "created_at")) created_capability = capability;
+        if (std.mem.eql(u8, capability.field, "_id")) id_capability = capability;
+    }
+    const created = created_capability orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, created.field_type.?);
+    try std.testing.expect(created.sortable);
+    try std.testing.expectEqual(@as(?usize, 0), created.index_sort_position);
+    try std.testing.expectEqualStrings("desc", created.index_sort_order.?);
+    const id = id_capability orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?usize, 1), id.index_sort_position);
+    try std.testing.expectEqualStrings("asc", id.index_sort_order.?);
 
     try std.testing.expectEqual(@as(usize, 2), context.embedding_index_metadata.len);
     try std.testing.expectEqualStrings("semantic_idx", context.embedding_index_metadata[0].name);
@@ -19319,6 +21231,7 @@ test "api http server serves table create and drop" {
         fn createTable(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
+            if (self.created) return error.TableAlreadyExists;
             try std.testing.expectEqual(@as(?u32, 1), req.num_shards);
             try std.testing.expectEqualStrings("docs table", req.description.?);
             try std.testing.expect(req.schema_json == null);
@@ -19391,6 +21304,17 @@ test "api http server serves table create and drop" {
     defer parsed_create.deinit();
     try std.testing.expectEqualStrings("docs", parsed_create.value.name);
     try std.testing.expectEqualStrings("docs table", parsed_create.value.description.?);
+
+    var duplicate_create_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = create_body,
+    });
+    defer duplicate_create_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), duplicate_create_resp.status);
+    try std.testing.expectEqualStrings("text/plain", duplicate_create_resp.content_type.?);
+    try std.testing.expectEqualStrings("table already exists", duplicate_create_resp.body);
 
     var drop_resp = try server.handle(.{
         .method = .DELETE,
@@ -22271,6 +24195,53 @@ test "api http server prefers metadata-owned restore over inline write-source re
     defer parsed_restore.deinit();
     const restore_status = parsed_restore.value.object.get("restore") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("triggered", restore_status.string);
+    try std.testing.expect(restore_source.restored);
+}
+
+test "api http server retries stale metadata table-exists restore race" {
+    const alloc = std.testing.allocator;
+
+    const RestoreSource = struct {
+        attempts: usize = 0,
+        restored: bool = false,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("snap1", backup_id);
+            try std.testing.expectEqualStrings("file:///tmp/out", location_uri);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.TableAlreadyExists;
+            self.restored = true;
+        }
+    };
+
+    var restore_source = RestoreSource{};
+    var server = ApiHttpServer.init(alloc, .{}, restore_source.iface(), null, null);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/restore",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\"}",
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), restore_source.attempts);
     try std.testing.expect(restore_source.restored);
 }
 
@@ -25655,7 +27626,7 @@ test "api http server executes direct foreign table query through registry" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
     const response = parsed.value.responses.?[0];
-    try std.testing.expectEqual(@as(?i64, 2), response.hits.?.total);
+    try std.testing.expectEqual(@as(i64, 2), response.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 2), response.hits.?.hits.?.len);
     try std.testing.expectEqualStrings("cust:a", response.hits.?.hits.?[0]._id);
     try std.testing.expectEqualStrings("Alice", testQueryHitSourcePathValue(response.hits.?.hits.?[0], "name").?.string);

@@ -10,3 +10,5 @@ output-options:
   skip-prune: true
   prefer-skip-optional-pointer: true
   prefer-skip-optional-pointer-with-omitzero: true
+import-mapping:
+  generating.yaml: github.com/antflydb/antfly/go/pkg/generating

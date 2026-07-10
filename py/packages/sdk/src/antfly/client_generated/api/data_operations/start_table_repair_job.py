@@ -6,22 +6,22 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.artifact_repair_issue_list import ArtifactRepairIssueList
 from ...models.error import Error
-from ...models.repair_issue_list_request import RepairIssueListRequest
+from ...models.table_repair_job import TableRepairJob
+from ...models.table_repair_job_start_request import TableRepairJobStartRequest
 from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     table_name: str,
     *,
-    body: RepairIssueListRequest | Unset = UNSET,
+    body: TableRepairJobStartRequest | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/db/v1/tables/{table_name}/repair/issues".format(
+        "url": "/db/v1/tables/{table_name}/repair/jobs".format(
             table_name=quote(str(table_name), safe=""),
         ),
     }
@@ -35,13 +35,16 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(
-    *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ArtifactRepairIssueList | Error | None:
+def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | TableRepairJob | None:
     if response.status_code == 200:
-        response_200 = ArtifactRepairIssueList.from_dict(response.json())
+        response_200 = TableRepairJob.from_dict(response.json())
 
         return response_200
+
+    if response.status_code == 202:
+        response_202 = TableRepairJob.from_dict(response.json())
+
+        return response_202
 
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
@@ -71,7 +74,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ArtifactRepairIssueList | Error]:
+) -> Response[Error | TableRepairJob]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -84,27 +87,26 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RepairIssueListRequest | Unset = UNSET,
-) -> Response[ArtifactRepairIssueList | Error]:
-    """List artifact repair issues
+    body: TableRepairJobStartRequest | Unset = UNSET,
+) -> Response[Error | TableRepairJob]:
+    """Start a durable table repair job
 
-     Lists durable repair debt for a table. This operator-facing endpoint
-    returns exact document keys, artifact keys, index names, and repair
-    errors, and therefore requires table admin permission when authentication
-    is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact` for durable artifact queue entries and
-    `target=index` for index repair candidates.
+     Creates a durable table repair job for large or long-running repair work.
+    The job stores progress and accumulated counters across bounded advance
+    calls. Use this endpoint instead of synchronous `runTableRepair` when
+    repairing large indexes or when clients need retryable progress.
 
     Args:
         table_name (str):
-        body (RepairIssueListRequest | Unset): Bounded request to list table repair issues.
+        body (TableRepairJobStartRequest | Unset): Starts a durable table repair job. The job
+            advances in bounded passes using the same repair request shape as runTableRepair.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairIssueList | Error]
+        Response[Error | TableRepairJob]
     """
 
     kwargs = _get_kwargs(
@@ -123,27 +125,26 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RepairIssueListRequest | Unset = UNSET,
-) -> ArtifactRepairIssueList | Error | None:
-    """List artifact repair issues
+    body: TableRepairJobStartRequest | Unset = UNSET,
+) -> Error | TableRepairJob | None:
+    """Start a durable table repair job
 
-     Lists durable repair debt for a table. This operator-facing endpoint
-    returns exact document keys, artifact keys, index names, and repair
-    errors, and therefore requires table admin permission when authentication
-    is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact` for durable artifact queue entries and
-    `target=index` for index repair candidates.
+     Creates a durable table repair job for large or long-running repair work.
+    The job stores progress and accumulated counters across bounded advance
+    calls. Use this endpoint instead of synchronous `runTableRepair` when
+    repairing large indexes or when clients need retryable progress.
 
     Args:
         table_name (str):
-        body (RepairIssueListRequest | Unset): Bounded request to list table repair issues.
+        body (TableRepairJobStartRequest | Unset): Starts a durable table repair job. The job
+            advances in bounded passes using the same repair request shape as runTableRepair.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairIssueList | Error
+        Error | TableRepairJob
     """
 
     return sync_detailed(
@@ -157,27 +158,26 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RepairIssueListRequest | Unset = UNSET,
-) -> Response[ArtifactRepairIssueList | Error]:
-    """List artifact repair issues
+    body: TableRepairJobStartRequest | Unset = UNSET,
+) -> Response[Error | TableRepairJob]:
+    """Start a durable table repair job
 
-     Lists durable repair debt for a table. This operator-facing endpoint
-    returns exact document keys, artifact keys, index names, and repair
-    errors, and therefore requires table admin permission when authentication
-    is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact` for durable artifact queue entries and
-    `target=index` for index repair candidates.
+     Creates a durable table repair job for large or long-running repair work.
+    The job stores progress and accumulated counters across bounded advance
+    calls. Use this endpoint instead of synchronous `runTableRepair` when
+    repairing large indexes or when clients need retryable progress.
 
     Args:
         table_name (str):
-        body (RepairIssueListRequest | Unset): Bounded request to list table repair issues.
+        body (TableRepairJobStartRequest | Unset): Starts a durable table repair job. The job
+            advances in bounded passes using the same repair request shape as runTableRepair.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ArtifactRepairIssueList | Error]
+        Response[Error | TableRepairJob]
     """
 
     kwargs = _get_kwargs(
@@ -194,27 +194,26 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RepairIssueListRequest | Unset = UNSET,
-) -> ArtifactRepairIssueList | Error | None:
-    """List artifact repair issues
+    body: TableRepairJobStartRequest | Unset = UNSET,
+) -> Error | TableRepairJob | None:
+    """Start a durable table repair job
 
-     Lists durable repair debt for a table. This operator-facing endpoint
-    returns exact document keys, artifact keys, index names, and repair
-    errors, and therefore requires table admin permission when authentication
-    is enabled. Request filters are supplied in the JSON body. This release
-    supports `target=artifact` for durable artifact queue entries and
-    `target=index` for index repair candidates.
+     Creates a durable table repair job for large or long-running repair work.
+    The job stores progress and accumulated counters across bounded advance
+    calls. Use this endpoint instead of synchronous `runTableRepair` when
+    repairing large indexes or when clients need retryable progress.
 
     Args:
         table_name (str):
-        body (RepairIssueListRequest | Unset): Bounded request to list table repair issues.
+        body (TableRepairJobStartRequest | Unset): Starts a durable table repair job. The job
+            advances in bounded passes using the same repair request shape as runTableRepair.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ArtifactRepairIssueList | Error
+        Error | TableRepairJob
     """
 
     return (

@@ -8,10 +8,30 @@ from httpx import Timeout
 
 from antfly import AntflyClient, AntflyException  # noqa: E402
 from antfly.client import normalize_base_url  # noqa: E402
+from antfly.client_generated.models.sort_profile import SortProfile  # noqa: E402
+from antfly.client_generated.types import Unset  # noqa: E402
 
 
 class TestAntflyClient:
     """Test cases for AntflyClient."""
+
+    def test_sort_profile_uses_closed_public_diagnostic_shape(self) -> None:
+        """SortProfile keeps stable fields typed and drops internal counters."""
+        profile = SortProfile.from_dict(
+            {
+                "plan": "native_doc_values_top_n",
+                "candidate_count": 7,
+                "native_doc_value_load_us": 13,
+                "collector_heap_peak": 5,
+            }
+        )
+
+        assert profile.plan == "native_doc_values_top_n"
+        assert profile.candidate_count == 7
+        encoded = profile.to_dict()
+
+        assert "native_doc_value_load_us" not in encoded
+        assert "collector_heap_peak" not in encoded
 
     @patch("antfly.client.Client")
     def test_client_initialization(self, mock_client: MagicMock) -> None:
@@ -116,6 +136,69 @@ class TestAntflyClient:
             client.create_table(name="test_table")
 
         assert "table already exists" in str(exc_info.value)
+
+    @patch("antfly.client.Client")
+    def test_query_preserves_sorted_cursor_contract(self, mock_client_class: MagicMock) -> None:
+        """High-level query forwards order_by/search_after/profile and returns generated response model."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "responses": [
+                {
+                    "took": 3,
+                    "status": 200,
+                    "hits": {
+                        "hits": [
+                            {
+                                "_id": "doc:2",
+                                "_score": 1.0,
+                                "_sort": ["2026-01-01T00:00:00Z", "doc:2"],
+                                "_source": {"created_at": "2026-01-01T00:00:00Z"},
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+
+        mock_httpx = MagicMock()
+        mock_httpx.request.return_value = mock_response
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        result = client.query(
+            table="docs",
+            query={"match_all": {}},
+            order_by=[{"field": "created_at", "desc": True}],
+            search_after=["2025-12-31T00:00:00Z", "doc:1"],
+            limit=10,
+            profile=False,
+        )
+
+        mock_httpx.request.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/query",
+            json={
+                "query": {"match_all": {}},
+                "limit": 10,
+                "order_by": [{"field": "created_at", "desc": True}],
+                "search_after": ["2025-12-31T00:00:00Z", "doc:1"],
+                "profile": False,
+            },
+        )
+        assert not isinstance(result.responses, Unset)
+        query_result = result.responses[0]
+        assert not isinstance(query_result.hits, Unset)
+        assert not isinstance(query_result.hits.hits, Unset)
+        hit = query_result.hits.hits[0]
+        assert hit.field_id == "doc:2"
+        assert hit.field_sort == ["2026-01-01T00:00:00Z", "doc:2"]
+
+    def test_query_rejects_ambiguous_aggregation_aliases(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="either aggregations or facets"):
+            client.query(table="docs", aggregations={"a": {}}, facets={"b": {}})
 
     @patch("antfly.client.Client")
     @patch("antfly.client.lookup_key")

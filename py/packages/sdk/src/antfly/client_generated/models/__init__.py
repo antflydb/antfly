@@ -18,8 +18,13 @@ from .algebraic_aggregation_join import AlgebraicAggregationJoin
 from .algebraic_aggregation_join_kind import AlgebraicAggregationJoinKind
 from .algebraic_index_config import AlgebraicIndexConfig
 from .algebraic_index_stats import AlgebraicIndexStats
+from .algebraic_index_stats_async_indexing import AlgebraicIndexStatsAsyncIndexing
 from .algebraic_index_stats_index_type import AlgebraicIndexStatsIndexType
 from .algebraic_index_stats_planner_last_decision import AlgebraicIndexStatsPlannerLastDecision
+from .algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
+from .algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
+from .algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
+from .algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
@@ -34,12 +39,8 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
-from .artifact_repair_issue import ArtifactRepairIssue
-from .artifact_repair_issue_list import ArtifactRepairIssueList
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
-from .artifact_repair_run_response import ArtifactRepairRunResponse
-from .artifact_repair_run_result import ArtifactRepairRunResult
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
@@ -154,7 +155,13 @@ from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
+from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
+from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
+from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
+from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
+from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
+from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
 from .error import Error
@@ -172,6 +179,7 @@ from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
+from .exact_sort_error import ExactSortError
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
 from .extension_object_decl import ExtensionObjectDecl
@@ -205,6 +213,10 @@ from .extraction_token import ExtractionToken
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
+from .field_capability import FieldCapability
+from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
+from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
+from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -214,7 +226,11 @@ from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_index_config import FullTextIndexConfig
 from .full_text_index_stats import FullTextIndexStats
+from .full_text_index_stats_async_indexing import FullTextIndexStatsAsyncIndexing
 from .full_text_index_stats_index_type import FullTextIndexStatsIndexType
+from .full_text_index_stats_promotion import FullTextIndexStatsPromotion
+from .full_text_index_stats_resolution import FullTextIndexStatsResolution
+from .full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
 from .fuzziness_type_1 import FuzzinessType1
 from .fuzzy_query import FuzzyQuery
 from .generation_step_config import GenerationStepConfig
@@ -234,8 +250,13 @@ from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
+from .graph_index_stats_async_indexing import GraphIndexStatsAsyncIndexing
 from .graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
 from .graph_index_stats_index_type import GraphIndexStatsIndexType
+from .graph_index_stats_promotion import GraphIndexStatsPromotion
+from .graph_index_stats_resolution import GraphIndexStatsResolution
+from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
+from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -274,10 +295,14 @@ from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
+from .inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
 from .inference_embed_request_input_type import InferenceEmbedRequestInputType
 from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
+from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_item_error import InferenceEmbeddingItemError
+from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
 from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
@@ -358,7 +383,6 @@ from .inference_rewrite_response_object import InferenceRewriteResponseObject
 from .inference_role import InferenceRole
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
-from .inference_text_chunk_options import InferenceTextChunkOptions
 from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
@@ -376,7 +400,6 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
-from .inference_vad_options import InferenceVADOptions
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -468,6 +491,8 @@ from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
+from .query_hits_total import QueryHitsTotal
+from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
 from .query_responses import QueryResponses
 from .query_result import QueryResult
@@ -515,6 +540,9 @@ from .shard_config import ShardConfig
 from .shards_profile import ShardsProfile
 from .significance_algorithm import SignificanceAlgorithm
 from .sort_field import SortField
+from .sort_profile import SortProfile
+from .sort_profile_candidate_source import SortProfileCandidateSource
+from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .sse_error import SSEError
 from .sse_event import SSEEvent
 from .sse_step_completed import SSEStepCompleted
@@ -531,6 +559,14 @@ from .table_backup_status import TableBackupStatus
 from .table_backup_status_status import TableBackupStatusStatus
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
+from .table_repair_issue import TableRepairIssue
+from .table_repair_issue_list import TableRepairIssueList
+from .table_repair_job import TableRepairJob
+from .table_repair_job_phase import TableRepairJobPhase
+from .table_repair_job_repair_status import TableRepairJobRepairStatus
+from .table_repair_job_start_request import TableRepairJobStartRequest
+from .table_repair_run_response import TableRepairRunResponse
+from .table_repair_run_result import TableRepairRunResult
 from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
@@ -540,6 +576,7 @@ from .table_statistics_field_stats import TableStatisticsFieldStats
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
+from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from .term_query import TermQuery
 from .term_range_query import TermRangeQuery
 from .text_chunk_options import TextChunkOptions
@@ -585,6 +622,7 @@ from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
+from .vad_options import VADOptions
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_reranker_config import VertexRerankerConfig
@@ -615,8 +653,13 @@ __all__ = (
     "AlgebraicAggregationJoinKind",
     "AlgebraicIndexConfig",
     "AlgebraicIndexStats",
+    "AlgebraicIndexStatsAsyncIndexing",
     "AlgebraicIndexStatsIndexType",
     "AlgebraicIndexStatsPlannerLastDecision",
+    "AlgebraicIndexStatsPromotion",
+    "AlgebraicIndexStatsResolution",
+    "AlgebraicIndexStatsResolverReplay",
+    "AlgebraicIndexStatsSourceArtifact",
     "Analyses",
     "AnalysesResult",
     "AnswerAgentResult",
@@ -631,12 +674,8 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
-    "ArtifactRepairIssue",
-    "ArtifactRepairIssueList",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
-    "ArtifactRepairRunResponse",
-    "ArtifactRepairRunResult",
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
@@ -747,7 +786,13 @@ __all__ = (
     "EmbedderProvider",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
+    "EmbeddingsIndexStatsAsyncIndexing",
+    "EmbeddingsIndexStatsEnrichmentRuntime",
+    "EmbeddingsIndexStatsHbcCache",
+    "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
+    "EmbeddingsIndexStatsPromotion",
+    "EmbeddingsIndexStatsResolution",
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
@@ -765,6 +810,7 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExactSortError",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExtensionError",
@@ -800,6 +846,10 @@ __all__ = (
     "FailedOperation",
     "FailedOperationOperation",
     "FetchConfig",
+    "FieldCapability",
+    "FieldCapabilityIndexSortOrder",
+    "FieldCapabilityQueryModesItem",
+    "FieldCapabilitySortLifecycleState",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
@@ -809,7 +859,11 @@ __all__ = (
     "ForeignSourceType",
     "FullTextIndexConfig",
     "FullTextIndexStats",
+    "FullTextIndexStatsAsyncIndexing",
     "FullTextIndexStatsIndexType",
+    "FullTextIndexStatsPromotion",
+    "FullTextIndexStatsResolution",
+    "FullTextIndexStatsTextMerge",
     "FuzzinessType1",
     "FuzzyQuery",
     "GenerationStepConfig",
@@ -829,8 +883,13 @@ __all__ = (
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
+    "GraphIndexStatsAsyncIndexing",
     "GraphIndexStatsEdgeTypes",
     "GraphIndexStatsIndexType",
+    "GraphIndexStatsPromotion",
+    "GraphIndexStatsResolution",
+    "GraphIndexStatsResolverReplay",
+    "GraphIndexStatsSourceArtifact",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",
@@ -867,11 +926,15 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingItemError",
+    "InferenceEmbeddingItemErrorStage",
     "InferenceEmbeddingObject",
     "InferenceEmbeddingObjectObject",
     "InferenceEmbeddingUsage",
     "InferenceEmbedRequest",
     "InferenceEmbedRequestEncodingFormat",
+    "InferenceEmbedRequestErrorPolicy",
     "InferenceEmbedRequestInputType",
     "InferenceEmbedRequestTaskType",
     "InferenceEmbedResponse",
@@ -954,7 +1017,6 @@ __all__ = (
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
-    "InferenceTextChunkOptions",
     "InferenceTextContent",
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
@@ -972,7 +1034,6 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
-    "InferenceVADOptions",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -1063,6 +1124,8 @@ __all__ = (
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
+    "QueryHitsTotal",
+    "QueryHitsTotalRelation",
     "QueryProfile",
     "QueryResponses",
     "QueryResult",
@@ -1110,6 +1173,9 @@ __all__ = (
     "ShardsProfile",
     "SignificanceAlgorithm",
     "SortField",
+    "SortProfile",
+    "SortProfileCandidateSource",
+    "SortProfileSortLifecycleState",
     "SSEError",
     "SSEEvent",
     "SSEStepCompleted",
@@ -1126,6 +1192,14 @@ __all__ = (
     "TableBackupStatusStatus",
     "TableMigration",
     "TableMigrationState",
+    "TableRepairIssue",
+    "TableRepairIssueList",
+    "TableRepairJob",
+    "TableRepairJobPhase",
+    "TableRepairJobRepairStatus",
+    "TableRepairJobStartRequest",
+    "TableRepairRunResponse",
+    "TableRepairRunResult",
     "TableRestoreStatus",
     "TableRestoreStatusStatus",
     "TableSchema",
@@ -1135,6 +1209,7 @@ __all__ = (
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",
+    "TemplateFieldMappingMissingNullPolicy",
     "TermQuery",
     "TermRangeQuery",
     "TextChunkOptions",
@@ -1180,6 +1255,7 @@ __all__ = (
     "UpdatePasswordRequest",
     "User",
     "UserMetadataType0",
+    "VADOptions",
     "VertexEmbedderConfig",
     "VertexGeneratorConfig",
     "VertexRerankerConfig",

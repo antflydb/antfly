@@ -8,12 +8,12 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="InferenceVADOptions")
+T = TypeVar("T", bound="VADOptions")
 
 
 @_attrs_define
-class InferenceVADOptions:
-    """Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific.
+class VADOptions:
+    """Options for Voice Activity Detection (VAD) based audio segmentation.
 
     Attributes:
         min_silence_duration_ms (int | Unset): Minimum silence duration (ms) to split speech segments. Gaps shorter than
@@ -65,15 +65,15 @@ class InferenceVADOptions:
 
         max_segment_duration_ms = d.pop("max_segment_duration_ms", UNSET)
 
-        inference_vad_options = cls(
+        vad_options = cls(
             min_silence_duration_ms=min_silence_duration_ms,
             min_speech_duration_ms=min_speech_duration_ms,
             speech_pad_ms=speech_pad_ms,
             max_segment_duration_ms=max_segment_duration_ms,
         )
 
-        inference_vad_options.additional_properties = d
-        return inference_vad_options
+        vad_options.additional_properties = d
+        return vad_options
 
     @property
     def additional_keys(self) -> list[str]:

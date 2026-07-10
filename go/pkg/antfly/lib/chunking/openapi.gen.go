@@ -16,7 +16,8 @@ import (
 	"path"
 	"strings"
 
-	externalRef0 "github.com/antflydb/antfly/go/pkg/libaf/chunking"
+	externalRef0 "github.com/antflydb/antfly/go/pkg/generating"
+	externalRef1 "github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/oapi-codegen/runtime"
 )
@@ -33,7 +34,7 @@ type AntflyChunkerConfig struct {
 	ApiUrl string `json:"api_url,omitempty,omitzero"`
 
 	// Audio Options specific to audio chunking.
-	Audio externalRef0.AudioChunkOptions `json:"audio,omitempty,omitzero"`
+	Audio externalRef1.AudioChunkOptions `json:"audio,omitempty,omitzero"`
 
 	// MaxChunks Maximum number of chunks to generate per document.
 	MaxChunks int `json:"max_chunks,omitempty,omitzero"`
@@ -42,17 +43,17 @@ type AntflyChunkerConfig struct {
 	Model string `json:"model"`
 
 	// Text Options specific to text chunking.
-	Text externalRef0.TextChunkOptions `json:"text,omitempty,omitzero"`
+	Text externalRef1.TextChunkOptions `json:"text,omitempty,omitzero"`
 
 	// Threshold Confidence threshold for model-based chunking (0.0-1.0).
 	Threshold float32 `json:"threshold,omitempty,omitzero"`
 }
 
 // Chunk A chunk of content. Text chunks have mime_type text/plain.
-type Chunk = externalRef0.Chunk
+type Chunk = externalRef1.Chunk
 
 // ChunkOptions Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
-type ChunkOptions = externalRef0.ChunkOptions
+type ChunkOptions = externalRef1.ChunkOptions
 
 // ChunkerConfig defines model for ChunkerConfig.
 type ChunkerConfig struct {
@@ -370,7 +371,13 @@ func PathToRawSpec(pathToFile string) map[string]func() ([]byte, error) {
 		res[pathToFile] = rawSpec
 	}
 
-	for rawPath, rawFunc := range externalRef0.PathToRawSpec(path.Join(path.Dir(pathToFile), "../shared/chunking.yaml")) {
+	for rawPath, rawFunc := range externalRef1.PathToRawSpec(path.Join(path.Dir(pathToFile), "../shared/chunking.yaml")) {
+		if _, ok := res[rawPath]; ok {
+			// it is not possible to compare functions in golang, so always overwrite the old value
+		}
+		res[rawPath] = rawFunc
+	}
+	for rawPath, rawFunc := range externalRef0.PathToRawSpec(path.Join(path.Dir(pathToFile), "../shared/generating.yaml")) {
 		if _, ok := res[rawPath]; ok {
 			// it is not possible to compare functions in golang, so always overwrite the old value
 		}
