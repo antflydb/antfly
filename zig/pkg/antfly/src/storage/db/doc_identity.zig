@@ -744,6 +744,57 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     return try doc_set.fromOrdinalsAlloc(alloc, primary_scan.ordinals.items);
 }
 
+pub const default_max_nonvisible_doc_set_entries: usize = 65536;
+
+/// Complement of the broad visible-doc derivation: ordinals for docs that a
+/// query must not return — every deleted doc (query results must resolve to
+/// currently stored docs, matching the include path that drives off primary
+/// rows), plus docs created after the read generation. A single tombstone in
+/// a large table would otherwise force every query through a full-table
+/// include filter; representing the same constraint as a small exclude set
+/// keeps that cost proportional to the number of invisible docs. Returns null
+/// when the set would exceed `max_entries` so callers can fall back to the
+/// include-set representation. An ordinal without a state row is simply not
+/// excluded, which matches the include path's "no filtering" fallback for
+/// incomplete identity coverage.
+pub fn nonVisibleDocSetFromStoreAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    generation: ?u64,
+    max_entries: usize,
+) !?doc_set.ResolvedDocSet {
+    const Scan = struct {
+        alloc: Allocator,
+        generation: ?u64,
+        max_entries: usize,
+        ordinals: std.ArrayListUnmanaged(DocOrdinal) = .empty,
+        overflow: bool = false,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const ordinal = internal_keys.parseIdentityOrdinalKey(key, internal_keys.identity_ordinal_state_kind) orelse return .@"continue";
+            const ordinal_state = decodeOrdinalState(value) catch return .@"continue";
+            const returnable = ordinal_state.isLive() and
+                (if (state.generation) |at| ordinal_state.isVisibleAt(at) else true);
+            if (returnable) return .@"continue";
+            if (state.ordinals.items.len >= state.max_entries) {
+                state.overflow = true;
+                return .stop;
+            }
+            try state.ordinals.append(state.alloc, ordinal);
+            return .@"continue";
+        }
+    };
+
+    const lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind };
+    const upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind + 1 };
+    var scan = Scan{ .alloc = alloc, .generation = generation, .max_entries = max_entries };
+    defer scan.ordinals.deinit(alloc);
+    try store.scanWithContext(lower[0..], upper[0..], .{}, &scan, Scan.scanEntry);
+    if (scan.overflow) return null;
+    return try doc_set.fromOrdinalsAlloc(alloc, scan.ordinals.items);
+}
+
 const DocOrdinalRow = struct {
     doc_id: []u8,
     ordinal: DocOrdinal,
@@ -2367,6 +2418,76 @@ test "live primary doc set requires complete live primary coverage" {
     defer visible_before_tombstone.deinit(alloc);
     try std.testing.expect(visible_before_tombstone.containsOrdinal(1));
     try std.testing.expect(visible_before_tombstone.containsOrdinal(2));
+}
+
+test "non-visible doc set complements visibility per generation" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var initial_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &initial_writes);
+    try appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        10,
+        &initial_writes,
+        &.{ "doc:a", "doc:b" },
+        &.{},
+    );
+    try store.putBatchWithReplay(null, initial_writes.items, &.{}, null);
+
+    // Everything live: the complement is empty.
+    var none_excluded = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 10, 16)) orelse return error.TestUnexpectedResult;
+    defer none_excluded.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 0), none_excluded.estimatedCardinality());
+
+    var tombstone_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &tombstone_writes);
+    try appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        12,
+        &tombstone_writes,
+        &.{},
+        &.{"doc:b"},
+    );
+    try store.putBatchWithReplay(null, tombstone_writes.items, &.{}, null);
+
+    // At generation 12 the tombstoned ordinal is the whole complement.
+    var excluded_at_12 = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 12, 16)) orelse return error.TestUnexpectedResult;
+    defer excluded_at_12.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), excluded_at_12.estimatedCardinality());
+    try std.testing.expect(!excluded_at_12.containsOrdinal(1));
+    try std.testing.expect(excluded_at_12.containsOrdinal(2));
+
+    // Deleted docs are excluded even at a read generation before the delete:
+    // query results must resolve to currently stored docs, matching the
+    // include-set path that drives off primary rows.
+    var excluded_at_11 = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 11, 16)) orelse return error.TestUnexpectedResult;
+    defer excluded_at_11.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), excluded_at_11.estimatedCardinality());
+    try std.testing.expect(excluded_at_11.containsOrdinal(2));
+
+    // Live semantics (no generation) also exclude the tombstone.
+    var excluded_live = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, null, 16)) orelse return error.TestUnexpectedResult;
+    defer excluded_live.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), excluded_live.estimatedCardinality());
+
+    // A zero budget overflows and asks the caller to fall back.
+    try std.testing.expectEqual(
+        @as(?doc_set.ResolvedDocSet, null),
+        try nonVisibleDocSetFromStoreAlloc(alloc, &store, 12, 0),
+    );
 }
 
 fn appendPrimaryDocWrite(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), doc_id: []const u8) !void {

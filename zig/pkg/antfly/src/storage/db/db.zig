@@ -2767,6 +2767,10 @@ pub const DB = struct {
     live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
     live_doc_set_cache_generation: ?u64 = null,
     live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    nonvisible_doc_set_cache_generation: ?u64 = null,
+    nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set_cache_overflow: bool = false,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
@@ -3613,6 +3617,15 @@ pub const DB = struct {
         self.live_doc_set_cache_generation = null;
     }
 
+    fn clearNonVisibleDocSetCache(self: *DB) void {
+        lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+        defer self.nonvisible_doc_set_cache_mutex.unlock();
+        if (self.nonvisible_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
+        self.nonvisible_doc_set_cache_set = null;
+        self.nonvisible_doc_set_cache_generation = null;
+        self.nonvisible_doc_set_cache_overflow = false;
+    }
+
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
@@ -3623,6 +3636,7 @@ pub const DB = struct {
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
         self.clearLiveDocSetCache();
+        self.clearNonVisibleDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
@@ -5244,6 +5258,7 @@ pub const DB = struct {
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
             self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
         }
         if (profile) |active_profile| {
             recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
@@ -5371,6 +5386,7 @@ pub const DB = struct {
             self.bulk_ingest_identity_state = state;
             self.identity_visibility_summary_cache = state.visibility_summary;
             self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
             self.bulk_ingest_identity_all_new = true;
         }
     }
@@ -8540,6 +8556,7 @@ pub const DB = struct {
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
             self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
         }
     }
 
@@ -13611,6 +13628,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
         });
@@ -13628,6 +13646,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
@@ -13682,6 +13701,7 @@ pub const DB = struct {
             .live_filter_doc_set = liveFilterDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
             .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
         db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
@@ -14126,6 +14146,65 @@ pub const DB = struct {
         return computed;
     }
 
+    fn nonVisibleDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.nonVisibleDocSetCachedAlloc(alloc, generation);
+    }
+
+    fn nonVisibleDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !?doc_set.ResolvedDocSet {
+        const gen = generation orelse {
+            return try doc_identity.nonVisibleDocSetFromStoreAlloc(
+                alloc,
+                self.core.store,
+                generation,
+                doc_identity.default_max_nonvisible_doc_set_entries,
+            );
+        };
+        {
+            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+            defer self.nonvisible_doc_set_cache_mutex.unlock();
+            if (self.nonvisible_doc_set_cache_generation == gen) {
+                if (self.nonvisible_doc_set_cache_overflow) return null;
+                if (self.nonvisible_doc_set_cache_set) |*cached| {
+                    return try doc_set.cloneAlloc(alloc, cached);
+                }
+            }
+        }
+        var computed = (try doc_identity.nonVisibleDocSetFromStoreAlloc(
+            alloc,
+            self.core.store,
+            generation,
+            doc_identity.default_max_nonvisible_doc_set_entries,
+        )) orelse {
+            // Overflow (more non-visible docs than the budget) is also worth
+            // remembering, so each query does not rescan before falling back
+            // to the include-set path.
+            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+            defer self.nonvisible_doc_set_cache_mutex.unlock();
+            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.nonvisible_doc_set_cache_set = null;
+            self.nonvisible_doc_set_cache_generation = gen;
+            self.nonvisible_doc_set_cache_overflow = true;
+            return null;
+        };
+        errdefer computed.deinit(alloc);
+        if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
+            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+            defer self.nonvisible_doc_set_cache_mutex.unlock();
+            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.nonvisible_doc_set_cache_set = cloned;
+            self.nonvisible_doc_set_cache_generation = gen;
+            self.nonvisible_doc_set_cache_overflow = false;
+        } else |_| {
+            // Caching is best-effort; the computed set is still returned.
+        }
+        return computed;
+    }
+
     fn allDocsVisibleCallback(
         ctx: ?*anyopaque,
         generation: ?u64,
@@ -14278,6 +14357,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -14326,6 +14406,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -14382,6 +14463,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
@@ -14597,6 +14679,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
         })) orelse return null;
@@ -15104,6 +15187,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .load_stored = loadStoredSearchDocumentCallback,

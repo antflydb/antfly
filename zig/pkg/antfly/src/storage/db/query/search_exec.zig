@@ -170,6 +170,11 @@ pub const SearchTextQueryExecutor = struct {
         ctx: ?*anyopaque,
         generation: ?u64,
     ) anyerror!bool = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -381,6 +386,11 @@ pub const DenseSearchExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -521,6 +531,11 @@ pub const SparseSearchExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     lookup_doc_nums_for_ordinals: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -638,6 +653,11 @@ pub const MatchAllExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1752,6 +1772,16 @@ pub const StructuredFilterResolverExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    // Complement of the broad live set: the (usually tiny) set of ordinals not
+    // visible at the read generation. When available, the broad live-doc
+    // constraint is expressed as this exclude set instead of materializing an
+    // include set proportional to the table size. Null result = unavailable or
+    // too large; callers fall back to live_filter_doc_set.
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     all_docs_visible: ?*const fn (
         ctx: ?*anyopaque,
         generation: ?u64,
@@ -2414,6 +2444,44 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
     out: *NativeDocIdConstraints,
     executor: StructuredFilterResolverExecutor,
 ) !void {
+    // Prefer the complement representation: excluding the handful of
+    // non-visible ordinals is equivalent to including every visible one, but
+    // its cost scales with the tombstone count instead of the table size.
+    //
+    // Only valid when ordinals are used directly. When the include set is
+    // projected to index doc nums (text snapshots, sparse indexes), the
+    // positive filter also implicitly drops stale index rows for re-indexed
+    // docs — their old doc nums map to no live ordinal — and an exclusion of
+    // non-visible ordinals cannot express that.
+    const exclusion_representable = executor.text_snapshot_for_doc_num_projection == null and
+        executor.lookup_doc_nums_for_ordinals == null and
+        !executor.require_doc_num_projection_mapper;
+    if (executor.nonvisible_doc_set != null and exclusion_representable) {
+        const nonvisible = executor.nonvisible_doc_set.?;
+        if (try nonvisible(executor.ctx, alloc, executor.identity_read_generation)) |set| {
+            var owned_set = set;
+            if (owned_set == .none) {
+                owned_set.deinit(alloc);
+                return;
+            }
+            var owned_filter = doc_set.ResolvedDocFilter{
+                .include = .all,
+                .exclude = owned_set,
+            };
+            defer owned_filter.deinit(alloc);
+
+            // The exclude set already encodes visibility; live-filtering it
+            // would strip the very ordinals it exists to exclude.
+            var already_filtered_executor = executor;
+            already_filtered_executor.live_filter_doc_set = null;
+
+            const resolved_stored_filters_before = out.resolved_stored_filters;
+            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, already_filtered_executor);
+            out.resolved_stored_filters = resolved_stored_filters_before;
+            return;
+        }
+    }
+
     const live_filter = executor.live_filter_doc_set orelse return;
     const all: doc_set.ResolvedDocSet = .all;
     var live = try live_filter(executor.ctx, alloc, &all, executor.identity_read_generation);
@@ -9970,6 +10038,7 @@ fn deriveNativeDenseConstraintsAlloc(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = apply_broad_live_docs,
     });
@@ -10727,6 +10796,7 @@ pub fn searchTextQuery(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
         .apply_live_all_docs = can_apply_live_all_docs,
@@ -12671,6 +12741,7 @@ pub fn searchSparse(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .lookup_doc_nums_for_ordinals = executor.lookup_doc_nums_for_ordinals,
         .doc_num_index_name = req.index_name orelse entry.config.name,
         .require_doc_num_projection_mapper = true,
@@ -14443,6 +14514,7 @@ pub fn searchMatchAll(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = true,
     });
@@ -25670,6 +25742,85 @@ test "native sparse constraints can apply broad live doc filter" {
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
     try std.testing.expect(!containsDocNum(constraints.filter_doc_nums, 1));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
+}
+
+fn testNonVisibleDocSetCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    _: ?u64,
+) anyerror!?doc_set.ResolvedDocSet {
+    return try doc_set.fromOrdinalsAlloc(alloc, &.{1});
+}
+
+fn testNonVisibleDocSetEmptyCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: ?u64,
+) anyerror!?doc_set.ResolvedDocSet {
+    return .none;
+}
+
+fn testNonVisibleDocSetUnavailableCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: ?u64,
+) anyerror!?doc_set.ResolvedDocSet {
+    return null;
+}
+
+test "broad live doc filter prefers small non-visible exclude set" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveAllDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer constraints.deinit(alloc);
+
+    // The tombstone becomes a one-entry exclusion; no include set of every
+    // live ordinal is materialized.
+    try std.testing.expect(!constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.exclude_doc_nums, 1));
+}
+
+test "broad live doc filter with empty non-visible set applies no constraint" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveAllDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetEmptyCallback,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(!constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
+}
+
+test "broad live doc filter falls back to include set when complement unavailable" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveAllDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetUnavailableCallback,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
 }
