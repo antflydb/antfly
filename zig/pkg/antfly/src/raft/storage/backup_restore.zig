@@ -88,7 +88,8 @@ pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
         options,
     )) orelse return;
     defer prepared.deinit();
-    _ = try publishPreparedRestore(alloc, path, &prepared);
+    const outcome = try publishPreparedRestore(alloc, path, &prepared);
+    if (outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
 }
 
 /// Builds and validates a replacement generation without mutating the live
@@ -103,6 +104,7 @@ pub fn prepareRestoreSnapshotToPathWithExclusiveTransition(
     options: RestoreOptions,
 ) !?db_mod.generation_lifecycle.StagedGeneration {
     try transition.validate(path);
+    try transition.reconcilePublished();
     return try prepareRestoreSnapshotIfNeeded(transition, alloc, path, group_id, restore, options);
 }
 

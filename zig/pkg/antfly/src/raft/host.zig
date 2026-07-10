@@ -129,6 +129,7 @@ pub const BootstrapStatusKind = enum {
 
 pub const BootstrapStatusPhase = enum {
     preparing,
+    durability_pending,
     succeeded,
     failed,
 };
@@ -167,6 +168,7 @@ pub const HostMetrics = struct {
     backup_bootstrap_attempts: usize = 0,
     backup_bootstrap_failures: usize = 0,
     backup_bootstrap_successes: usize = 0,
+    backup_bootstrap_durability_pending: usize = 0,
     async_send_enqueued: u64 = 0,
     async_send_failed: u64 = 0,
     async_send_retried: u64 = 0,
@@ -414,7 +416,7 @@ pub const Host = struct {
     pub fn status(self: *Host, group_id: u64) HostedReplicaStatus {
         if (self.bootstrap_statuses.get(group_id)) |bootstrap_status| {
             return switch (bootstrap_status.phase) {
-                .preparing => .starting,
+                .preparing, .durability_pending => .starting,
                 .failed => .failed,
                 .succeeded => if (self.runtime_host.group(group_id) == null) .absent else if (self.runtime_host.isGroupQuiesced(group_id)) .quiesced else .active,
             };
@@ -693,6 +695,11 @@ pub const Host = struct {
         err: anyerror,
         restore: ?catalog.BackupRestoreBootstrapRecord,
     ) void {
+        if (err == error.GenerationDurabilityUncertain) {
+            self.metrics.backup_bootstrap_durability_pending += 1;
+            self.updateBootstrapStatus(group_id, kind, .durability_pending, @errorName(err), restore, false);
+            return;
+        }
         self.metrics.backup_bootstrap_failures += 1;
         self.updateBootstrapStatus(group_id, kind, .failed, @errorName(err), restore, false);
     }
@@ -1561,6 +1568,29 @@ test "host records backup restore bootstrap failure when no handler is available
     try std.testing.expectEqual(@as(usize, 1), host_metrics.backup_bootstrap_attempts);
     try std.testing.expectEqual(@as(usize, 0), host_metrics.backup_bootstrap_successes);
     try std.testing.expectEqual(@as(usize, 1), host_metrics.backup_bootstrap_failures);
+}
+
+test "host records committed bootstrap durability as pending instead of failed" {
+    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{});
+    defer host.deinit();
+    const restore: catalog.BackupRestoreBootstrapRecord = .{
+        .backup_id = "snap-pending",
+        .location = "file:///tmp/backups",
+        .snapshot_path = "snap-pending/groups/94",
+    };
+
+    host.noteBootstrapPreparing(94, .backup_db_snapshot_restore, restore);
+    host.noteBootstrapFailure(94, .backup_db_snapshot_restore, error.GenerationDurabilityUncertain, restore);
+
+    try std.testing.expectEqual(.starting, host.status(94));
+    const status_value = host.bootstrapStatus(94) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(.durability_pending, status_value.phase);
+    try std.testing.expectEqualStrings("GenerationDurabilityUncertain", status_value.last_error orelse return error.TestExpectedEqual);
+    const metrics = host.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), metrics.backup_bootstrap_attempts);
+    try std.testing.expectEqual(@as(usize, 1), metrics.backup_bootstrap_durability_pending);
+    try std.testing.expectEqual(@as(usize, 0), metrics.backup_bootstrap_failures);
+    try std.testing.expectEqual(@as(usize, 0), metrics.backup_bootstrap_successes);
 }
 
 test "host records backup restore bootstrap failure details" {

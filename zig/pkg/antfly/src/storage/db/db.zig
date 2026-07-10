@@ -2886,6 +2886,7 @@ pub const DB = struct {
 
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return blk: {
+            try generation_lifecycle.ensurePublishedGenerationDurable(alloc, path);
             const open_started_ns = monotonicTimeNs();
             var profile = OpenProfile{};
             const runtime_alloc = backgroundRuntimeAllocator(alloc);

@@ -105,6 +105,7 @@ pub const TableApi = struct {
         UnsupportedBackupMigrationState,
         UnsupportedMultiRangeTable,
         UnsupportedBackupFormat,
+        RestoreDurabilityPending,
         InvalidBackupRequest,
         InternalFailure,
     };
@@ -746,6 +747,7 @@ pub fn handleTableRestore(
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support active schema migration") },
         error.UnsupportedMultiRangeTable => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support multi-range tables") },
         error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support this backup layout") },
+        error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc) },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
@@ -2451,6 +2453,50 @@ test "public table restore handler maps unsupported multi-range error" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("restore does not support multi-range tables", resp.body);
+}
+
+test "public table restore handler reports committed durability pending" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = executeTableRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableRestore(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: *backups_api.BackupLocation,
+        ) TableApi.ExecuteRestoreError!void {
+            return error.RestoreDurabilityPending;
+        }
+    };
+
+    var resp = try handleTableRestore(
+        std.testing.allocator,
+        "docs",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
+        Backend.iface(),
+        null,
+    );
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expectEqualStrings("{\"restore\":\"committed\",\"durability\":\"pending\"}", resp.body);
 }
 
 test "public document artifact manifest handlers map HA read gate errors" {

@@ -97,6 +97,11 @@ pub const TableRestorePlan = struct {
     manifest: *const TableBackupManifest,
 };
 
+pub fn validateRestorableManifestLayout(manifest: *const TableBackupManifest) !void {
+    if (manifest.shards.len == 0) return error.UnsupportedBackupFormat;
+    if (manifest.shards.len != 1) return error.UnsupportedMultiRangeTable;
+}
+
 pub const BackupLocation = union(enum) {
     file: []u8,
     remote: RemoteBackupStore,
@@ -872,6 +877,10 @@ pub fn encodeBackupSuccess(alloc: std.mem.Allocator) ![]u8 {
 
 pub fn encodeRestoreTriggered(alloc: std.mem.Allocator) ![]u8 {
     return try alloc.dupe(u8, "{\"restore\":\"triggered\"}");
+}
+
+pub fn encodeRestoreDurabilityPending(alloc: std.mem.Allocator) ![]u8 {
+    return try alloc.dupe(u8, "{\"restore\":\"committed\",\"durability\":\"pending\"}");
 }
 
 pub fn clusterTableBackupId(alloc: std.mem.Allocator, cluster_backup_id: []const u8, table_name: []const u8) ![]u8 {

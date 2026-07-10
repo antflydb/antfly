@@ -3712,15 +3712,26 @@ paths:
               $ref: '#/components/schemas/RestoreRequest'
       responses:
         '202':
-          description: Restore process triggered successfully
+          description: Restore committed or triggered successfully
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - restore
                 properties:
                   restore:
                     type: string
+                    enum:
+                      - triggered
+                      - committed
                     example: triggered
+                  durability:
+                    type: string
+                    enum:
+                      - pending
+                    description: Present when publication committed but filesystem durability confirmation
+                      is pending
         '400':
           $ref: '#/components/responses/BadRequest'
         '500':
@@ -10444,6 +10455,7 @@ components:
           type: string
           enum:
             - triggered
+            - durability_pending
             - skipped
             - failed
           description: Restore status for this table

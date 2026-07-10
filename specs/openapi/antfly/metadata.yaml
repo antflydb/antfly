@@ -4649,7 +4649,7 @@ components:
           example: "users"
         status:
           type: string
-          enum: [triggered, skipped, failed]
+          enum: [triggered, durability_pending, skipped, failed]
           description: Restore status for this table
           example: "triggered"
         error:
@@ -8671,16 +8671,22 @@ paths:
             schema:
               $ref: "#/components/schemas/RestoreRequest"
       responses:
-        "202": # Corrected to 202 as per handler
-          description: Restore process triggered successfully
+        "202":
+          description: Restore committed or triggered successfully
           content:
             application/json:
               schema:
                 type: object
+                required: [restore]
                 properties:
                   restore:
                     type: string
+                    enum: [triggered, committed]
                     example: triggered
+                  durability:
+                    type: string
+                    enum: [pending]
+                    description: Present when publication committed but filesystem durability confirmation is pending
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":

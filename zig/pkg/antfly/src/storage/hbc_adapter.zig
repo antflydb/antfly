@@ -655,7 +655,7 @@ pub const Cache = struct {
         const registration = self.namespace_paths.getPtr(namespace) orelse return;
         if (!std.mem.eql(u8, registration.path, stable_path) or registration.active_owners == 0) return;
         registration.active_owners -= 1;
-        self.removeNamespacePathIfUnusedLocked(namespace);
+        self.removeNamespaceStateIfUnusedLocked(namespace);
     }
 
     pub fn invalidatePath(self: *Cache, path: []const u8) void {
@@ -989,7 +989,7 @@ pub const Cache = struct {
         removeHbcKindBytes(&self.global_stats, kind, bytes);
         if (self.namespace_stats.getPtr(namespace)) |stats| {
             removeHbcKindBytes(stats, kind, bytes);
-            if (stats.total_bytes == 0) self.removeNamespacePathIfUnusedLocked(namespace);
+            if (stats.total_bytes == 0) self.removeNamespaceStateIfUnusedLocked(namespace);
         }
     }
 
@@ -1298,11 +1298,14 @@ pub const Cache = struct {
         return stats.total_bytes != 0;
     }
 
-    fn removeNamespacePathIfUnusedLocked(self: *Cache, namespace: u64) void {
-        const registration = self.namespace_paths.get(namespace) orelse return;
-        if (registration.active_owners != 0 or self.namespaceHasEntriesLocked(namespace)) return;
-        const removed = self.namespace_paths.fetchRemove(namespace) orelse return;
-        self.alloc.free(removed.value.path);
+    fn removeNamespaceStateIfUnusedLocked(self: *Cache, namespace: u64) void {
+        if (self.namespaceHasEntriesLocked(namespace)) return;
+        if (self.namespace_paths.get(namespace)) |registration| {
+            if (registration.active_owners != 0) return;
+            const removed = self.namespace_paths.fetchRemove(namespace) orelse return;
+            self.alloc.free(removed.value.path);
+        }
+        _ = self.namespace_stats.remove(namespace);
     }
 
     fn pruneUnusedNamespacePathsLocked(self: *Cache) void {
@@ -1316,7 +1319,7 @@ pub const Cache = struct {
                 }
             }
             const namespace = victim orelse return;
-            self.removeNamespacePathIfUnusedLocked(namespace);
+            self.removeNamespaceStateIfUnusedLocked(namespace);
         }
     }
 };
@@ -6673,6 +6676,24 @@ test "hbc shared cache releases unused namespace path registrations" {
     second.close();
     second_open = false;
     try std.testing.expect(!cache.namespace_paths.contains(namespace));
+    try std.testing.expect(!cache.namespace_stats.contains(namespace));
+}
+
+test "hbc shared cache bounds namespace state across path churn" {
+    const alloc = std.testing.allocator;
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+
+    var path_buf: [128]u8 = undefined;
+    for (0..512) |i| {
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-hbc-namespace-churn/{d}", .{i});
+        const namespace = hbcCacheNamespace(path);
+        try std.testing.expect(cache.registerNamespacePath(namespace, path));
+        cache.unregisterNamespacePath(namespace, path);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), cache.namespace_paths.count());
+    try std.testing.expectEqual(@as(usize, 0), cache.namespace_stats.count());
 }
 
 test "hbc cache reports byte usage to resource manager" {

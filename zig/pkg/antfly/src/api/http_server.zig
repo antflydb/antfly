@@ -5459,6 +5459,7 @@ pub const ApiHttpServer = struct {
 
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
         if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
+        try backups_api.validateRestorableManifestLayout(&manifest);
         if (try self.tableExists(table_name)) return error.TableAlreadyExists;
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
@@ -5471,6 +5472,7 @@ pub const ApiHttpServer = struct {
         defer create_req.deinit(self.alloc);
 
         var created_metadata = false;
+        var storage_committed = false;
         self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
             error.UnsupportedOperation => {},
             else => return err,
@@ -5480,7 +5482,7 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         if (try self.tableExists(table_name)) created_metadata = true;
-        errdefer if (created_metadata) self.source.dropTable(self.alloc, table_name) catch {};
+        errdefer if (created_metadata and !storage_committed) self.source.dropTable(self.alloc, table_name) catch {};
 
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
@@ -5516,6 +5518,10 @@ pub const ApiHttpServer = struct {
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
                     error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
+                    error.GenerationDurabilityUncertain => {
+                        storage_committed = true;
+                        return error.RestoreDurabilityPending;
+                    },
                     else => {
                         std.log.err("restoreOwnedTable restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
                         return err;
@@ -5534,6 +5540,7 @@ pub const ApiHttpServer = struct {
         var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
         defer manifest.deinit(self.alloc);
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+        try backups_api.validateRestorableManifestLayout(&manifest);
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const local_backup_root = switch (backup_location.*) {
@@ -6589,6 +6596,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
+            error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => error.RestoreDurabilityPending,
             error.InvalidBackupRequest => error.InvalidBackupRequest,
             else => error.InternalFailure,
         };
@@ -7210,6 +7218,7 @@ pub const ApiHttpServer = struct {
                         });
                         statuses[i].@"error" = switch (err) {
                             error.UnsupportedBackupFormat => "restore does not support this backup layout",
+                            error.UnsupportedMultiRangeTable => "restore does not support multi-range tables",
                             error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
                             error.TableAlreadyExists => "table already exists",
                             error.TableNotFound => "not found",
@@ -7235,12 +7244,17 @@ pub const ApiHttpServer = struct {
                 statuses[i].@"error" = switch (err) {
                     error.UnsupportedOperation => "method not allowed",
                     error.UnsupportedBackupFormat => "restore does not support this backup layout",
+                    error.UnsupportedMultiRangeTable => "restore does not support multi-range tables",
                     error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
+                    error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => null,
                     error.TableAlreadyExists => "table already exists",
                     error.TableNotFound => "not found",
                     error.InvalidBackupRequest => "invalid restore request",
                     else => "restore failed",
                 };
+                if (err == error.RestoreDurabilityPending or err == error.GenerationDurabilityUncertain) {
+                    statuses[i].status = "durability_pending";
+                }
                 continue;
             };
             statuses[i].status = "triggered";
@@ -8141,15 +8155,7 @@ pub const ApiHttpServer = struct {
         var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            202 => blk: {
-                const RestoreTriggered = struct {
-                    restore: []const u8,
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(RestoreTriggered, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 202, parsed);
-            },
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -23575,7 +23581,7 @@ test "api http server backs up and restores a table through public routes" {
     try std.testing.expectEqualStrings("alpha", stored.title);
 }
 
-test "api http server table restore is triggered when read path is still empty" {
+test "api http server durability-pending restore preserves committed metadata" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -23608,10 +23614,25 @@ test "api http server table restore is triggered when read path is still empty" 
         .replication_sources_json = "[]",
     }, shards);
     defer manifest.deinit(alloc);
-    try backups_api.writeManifest(alloc, backup_root_abs, &manifest);
+    const multi_shards = [_]backups_api.ShardSnapshot{
+        .{ .group_id = 1, .start_key = "", .end_key = "m", .snapshot_path = "snap1/groups/1" },
+        .{ .group_id = 2, .start_key = "m", .snapshot_path = "snap1/groups/2" },
+    };
+    var multi_manifest = try backups_api.createManifest(alloc, "snap1", &.{
+        .table_id = 1,
+        .name = "docs",
+        .description = "docs table",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+    }, &multi_shards);
+    defer multi_manifest.deinit(alloc);
+    try backups_api.writeManifest(alloc, backup_root_abs, &multi_manifest);
 
     const FakeSource = struct {
         created: bool = false,
+        dropped: bool = false,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -23621,6 +23642,7 @@ test "api http server table restore is triggered when read path is still empty" 
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
+                    .drop_table = dropTable,
                 },
             };
         }
@@ -23668,6 +23690,13 @@ test "api http server table restore is triggered when read path is still empty" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             self.created = true;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.created = false;
+            self.dropped = true;
         }
     };
 
@@ -23719,6 +23748,7 @@ test "api http server table restore is triggered when read path is still empty" 
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("snap1", plan.manifest.backup_id);
             self.restored = true;
+            return error.GenerationDurabilityUncertain;
         }
     };
 
@@ -23729,6 +23759,21 @@ test "api http server table restore is triggered when read path is still empty" 
 
     const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\"}}", .{location_uri});
     defer alloc.free(restore_body);
+    {
+        var unsupported_resp = try server.handle(.{
+            .method = .POST,
+            .uri = "/tables/docs/restore",
+            .content_type = "application/json",
+            .body = restore_body,
+        });
+        defer unsupported_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), unsupported_resp.status);
+        try std.testing.expect(!source.created);
+        try std.testing.expect(!source.dropped);
+        try std.testing.expect(!write_source.restored);
+    }
+
+    try backups_api.writeManifest(alloc, backup_root_abs, &manifest);
     var restore_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/restore",
@@ -23739,7 +23784,10 @@ test "api http server table restore is triggered when read path is still empty" 
 
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     try std.testing.expect(write_source.restored);
-    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"triggered\"") != null);
+    try std.testing.expect(source.created);
+    try std.testing.expect(!source.dropped);
+    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"pending\"") != null);
 }
 
 test "api http server cluster overwrite restore tolerates already absent metadata drop" {

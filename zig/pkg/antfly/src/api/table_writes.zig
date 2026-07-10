@@ -3859,7 +3859,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        if (plan.manifest.shards.len != 1) return error.UnsupportedBackupFormat;
+        try backups_api.validateRestorableManifestLayout(plan.manifest);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
         defer alloc.free(snapshot_root);
@@ -9068,8 +9068,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.restoreTable(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
-        if (plan.manifest.shards.len != 1) return error.UnsupportedMultiRangeTable;
+        try backups_api.validateRestorableManifestLayout(plan.manifest);
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
         defer alloc.free(local_location);
@@ -9079,6 +9078,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer transition.deinit();
         var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer restore_io_impl.deinit();
+        var publication_outcome: db_mod.generation_lifecycle.PublicationOutcome = .durable;
 
         for (plan.manifest.shards) |shard| {
             const group_id = shard.group_id;
@@ -9130,6 +9130,7 @@ pub const ProvisionedTableWriteSource = struct {
             try self.repairRestoredTableRuntimeStateBlocking(alloc, repair_path, group_id, table_name);
             if (prepared_generation) |*generation| {
                 const outcome = try backup_restore.publishPreparedRestore(alloc, path, generation);
+                publication_outcome = outcome;
                 if (outcome == .durability_uncertain) {
                     std.log.err("restore generation published with uncertain durability table={s} group_id={d} path={s}", .{ table_name, group_id, path });
                 }
@@ -9142,6 +9143,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
+        if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
     }
 
     fn commitTransaction(
@@ -16607,6 +16609,17 @@ test "provisioned table write source backs up and restores a local table" {
         .timestamp_ns = 2,
     });
 
+    db_mod.generation_lifecycle.failNextPublishedParentSyncForTest();
+    try std.testing.expectError(error.GenerationDurabilityUncertain, source.source().restoreTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .manifest = &manifest,
+    }));
+
+    db_mod.generation_lifecycle.failNextReconciliationSyncForTest();
+    try std.testing.expectError(error.GenerationDurabilityUncertain, db_mod.DB.open(alloc, db_path, .{}));
+
+    // Retry reconciles the committed marker and retained prior generation
+    // before reporting the restore complete.
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,

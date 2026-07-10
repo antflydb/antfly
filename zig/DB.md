@@ -68,12 +68,21 @@ never force-restored by raw path.
 Publication errors are pre-commit errors. After a directory rename or exchange
 makes the new generation visible, publication returns either `durable` or
 `durability_uncertain` and the caller must finish cache invalidation and reopen
-admission in both cases. A post-commit sync failure must never enter the
-pre-commit abort or metadata-drop path. Replacing an existing direct-path
-generation requires an atomic directory exchange; platforms or filesystems
-without that primitive reject publication before changing the live namespace.
-If the exchange is visible but its parent-directory sync fails, the previous
-generation remains under the staging name for explicit recovery.
+admission bookkeeping in both cases. A post-commit sync failure must never enter
+the pre-commit abort or metadata-drop path. It is reported as committed with
+durability pending, while raft bootstrap remains inactive. Every staged
+candidate contains a publication marker that moves into the live root at
+commit. DB open reconciles that marker by syncing the parent namespace, pruning
+retained or abandoned sibling generations, and clearing the marker before the
+root is admitted. Reconciliation is cached per process generation and a new
+exclusive transition invalidates that cache entry, keeping normal opens at an
+O(1) hash lookup after the first check.
+
+Replacing an existing direct-path generation requires an atomic directory
+exchange; platforms or filesystems without that primitive reject publication
+before changing the live namespace. If the exchange is visible but its
+parent-directory sync fails, the previous generation remains under the staging
+name until reconciliation confirms the new namespace is durable.
 
 The current root layout is path-relative and may lazily open run files after a
 transaction starts. Consequently, serving transitions stop admission and drain
@@ -84,8 +93,9 @@ versioned root and atomically publish a separate current-generation pointer;
 only then may generation N readers overlap preparation and publication of N+1.
 The direct-path layout also cannot make multiple shard directory swaps
 crash-atomic. Until table generations are published through one durable table
-generation pointer, table backup and restore reject multi-range tables before
-staging or publishing any shard.
+generation pointer, table backup and restore reject multi-range manifests
+immediately after decoding, before metadata creation, remote shard transfer,
+staging, or publication.
 
 LSM manifests are relocatable generation metadata. On open, run paths are
 reconstructed from the current root and run identity instead of trusting an
@@ -105,7 +115,9 @@ scoped and owned by the generation transition.
 Shared HBC namespace-to-path registrations are reference counted by open index
 owners. A registration remains after the last owner closes only while retained
 cache entries still use it; clear, path invalidation, and subsequent index opens
-prune unowned registrations once those entries are gone.
+prune unowned registrations once those entries are gone. Per-namespace cache
+statistics are retired at the same boundary; only bounded live namespace state
+and cumulative global counters remain.
 
 The DB layer therefore separates three concepts:
 
