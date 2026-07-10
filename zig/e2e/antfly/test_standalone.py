@@ -12,7 +12,7 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""Live swarm integration tests using antfly swarm with embedded inference."""
+"""Live standalone integration tests using antfly standalone with embedded inference."""
 
 from __future__ import annotations
 
@@ -34,17 +34,17 @@ from conftest import antfly_public_api_url, inference_public_api_url
 from helpers import wait_until
 
 
-pytestmark = pytest.mark.swarm_integration
+pytestmark = pytest.mark.standalone_integration
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
 DEFAULT_INFERENCE_MODELS_DIR = Path("~/.antfly/inference/models").expanduser()
 DEFAULT_INFERENCE_MODEL_NAME = "ggml-org/gemma-4-e2b-it-gguf"
-DEFAULT_INFERENCE_SWARM_HOST_BUDGET_MB = 0
-DEFAULT_INFERENCE_SWARM_BACKEND_BUDGET_MB = 12288
-DEFAULT_INFERENCE_SWARM_COMBINED_BUDGET_MB = 16384
-DEFAULT_INFERENCE_SWARM_KV_BUDGET_MB = 0
-DEFAULT_INFERENCE_SWARM_SCRATCH_BUDGET_MB = 0
+DEFAULT_INFERENCE_STANDALONE_HOST_BUDGET_MB = 0
+DEFAULT_INFERENCE_STANDALONE_BACKEND_BUDGET_MB = 12288
+DEFAULT_INFERENCE_STANDALONE_COMBINED_BUDGET_MB = 16384
+DEFAULT_INFERENCE_STANDALONE_KV_BUDGET_MB = 0
+DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB = 0
 
 
 def _integration_enabled(env_name: str) -> bool:
@@ -140,7 +140,7 @@ def _model_exists(models_dir: Path, model_name: str) -> bool:
     return any(path.exists() for path in _candidate_model_dirs(models_dir, model_name))
 
 
-class EmbeddedInferenceSwarmServer:
+class EmbeddedInferenceStandaloneServer:
     def __init__(
         self,
         binary: str,
@@ -161,7 +161,7 @@ class EmbeddedInferenceSwarmServer:
         self.url = antfly_public_api_url(self.public_url)
         self.health_url = f"http://{host}:{self.health_port}"
         self.inference_api_url = inference_public_api_url(self.public_url)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-swarm-e2e-")
+        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-standalone-e2e-")
         self.root = Path(self.tempdir.name)
         self.log_path = self.root / "server.log"
         self.log_file = self.log_path.open("w")
@@ -171,7 +171,7 @@ class EmbeddedInferenceSwarmServer:
     def _start(self) -> None:
         command = [
             self.binary,
-            "swarm",
+            "standalone",
             "--host",
             self.host,
             "--port",
@@ -207,7 +207,7 @@ class EmbeddedInferenceSwarmServer:
         if not _wait_for_server(self.url):
             self.stop()
             logs = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Swarm API server failed to start at {self.url}\n{logs}")
+            raise RuntimeError(f"Standalone API server failed to start at {self.url}\n{logs}")
         if not _wait_for_server(self.inference_api_url, timeout_s=120.0, path="/models"):
             self.stop()
             logs = _read_log_tail(self.log_path)
@@ -245,21 +245,21 @@ def _warm_inference_generator(api_url: str, model_name: str) -> None:
 
 
 @pytest.fixture(scope="session")
-def embedded_swarm_runtime():
-    if not _integration_enabled("ANTFLY_INFERENCE_SWARM_TESTS"):
-        pytest.skip("Set ANTFLY_INFERENCE_SWARM_TESTS=1 to run live inference swarm tests")
+def embedded_standalone_runtime():
+    if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_TESTS"):
+        pytest.skip("Set ANTFLY_INFERENCE_STANDALONE_TESTS=1 to run live inference standalone tests")
 
     binary = _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Antfly binary not found: {binary}")
 
     models_dir = Path(
-        os.environ.get("ANTFLY_INFERENCE_SWARM_MODELS_DIR", str(DEFAULT_INFERENCE_MODELS_DIR))
+        os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODELS_DIR", str(DEFAULT_INFERENCE_MODELS_DIR))
     ).expanduser().resolve()
     if not models_dir.exists():
         pytest.skip(f"Antfly inference models directory not found: {models_dir}")
 
-    model_name = os.environ.get("ANTFLY_INFERENCE_SWARM_MODEL_NAME", DEFAULT_INFERENCE_MODEL_NAME)
+    model_name = os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODEL_NAME", DEFAULT_INFERENCE_MODEL_NAME)
     if not _model_exists(models_dir, model_name):
         pytest.skip(
             "Antfly inference generator model not found under "
@@ -267,20 +267,20 @@ def embedded_swarm_runtime():
         )
 
     inference_budget_mb = {
-        "host": _env_int("ANTFLY_INFERENCE_SWARM_HOST_BUDGET_MB", DEFAULT_INFERENCE_SWARM_HOST_BUDGET_MB),
+        "host": _env_int("ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_HOST_BUDGET_MB),
         "backend": _env_int(
-            "ANTFLY_INFERENCE_SWARM_BACKEND_BUDGET_MB", DEFAULT_INFERENCE_SWARM_BACKEND_BUDGET_MB
+            "ANTFLY_INFERENCE_STANDALONE_BACKEND_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_BACKEND_BUDGET_MB
         ),
         "combined": _env_int(
-            "ANTFLY_INFERENCE_SWARM_COMBINED_BUDGET_MB", DEFAULT_INFERENCE_SWARM_COMBINED_BUDGET_MB
+            "ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_COMBINED_BUDGET_MB
         ),
-        "kv": _env_int("ANTFLY_INFERENCE_SWARM_KV_BUDGET_MB", DEFAULT_INFERENCE_SWARM_KV_BUDGET_MB),
+        "kv": _env_int("ANTFLY_INFERENCE_STANDALONE_KV_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_KV_BUDGET_MB),
         "scratch": _env_int(
-            "ANTFLY_INFERENCE_SWARM_SCRATCH_BUDGET_MB", DEFAULT_INFERENCE_SWARM_SCRATCH_BUDGET_MB
+            "ANTFLY_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB
         ),
     }
 
-    server = EmbeddedInferenceSwarmServer(
+    server = EmbeddedInferenceStandaloneServer(
         binary,
         models_dir,
         model_name,
@@ -301,12 +301,12 @@ def embedded_swarm_runtime():
 
 
 @pytest.fixture(scope="function")
-def embedded_swarm_api(embedded_swarm_runtime):
+def embedded_standalone_api(embedded_standalone_runtime):
     session = requests.Session()
     session.headers["Content-Type"] = "application/json"
     session.headers["Connection"] = "close"
-    base_url = embedded_swarm_runtime["base_url"]
-    log_fn = embedded_swarm_runtime["logs"]
+    base_url = embedded_standalone_runtime["base_url"]
+    log_fn = embedded_standalone_runtime["logs"]
 
     class Api:
         def __init__(self, session: requests.Session, base_url: str):
@@ -374,10 +374,10 @@ def embedded_swarm_api(embedded_swarm_runtime):
 
 
 @pytest.fixture(scope="function")
-def embedded_swarm_cli(embedded_swarm_runtime):
+def embedded_standalone_cli(embedded_standalone_runtime):
     binary = _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     env = os.environ.copy()
-    env["ANTFLY_URL"] = embedded_swarm_runtime["public_url"]
+    env["ANTFLY_URL"] = embedded_standalone_runtime["public_url"]
 
     def run_cli(*args: str, check: bool = True, timeout_s: float = 180.0) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -393,7 +393,7 @@ def embedded_swarm_cli(embedded_swarm_runtime):
                 f"CLI failed (exit {result.returncode}): {' '.join([binary, *args])}\n"
                 f"stdout: {result.stdout}\n"
                 f"stderr: {result.stderr}\n"
-                f"server logs:\n{embedded_swarm_runtime['logs']()}"
+                f"server logs:\n{embedded_standalone_runtime['logs']()}"
             )
         return result
 
@@ -416,9 +416,9 @@ def _parse_cli_json(stdout: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def test_swarm_health_endpoints(embedded_swarm_runtime):
-    health_url = embedded_swarm_runtime["health_url"]
-    logs = embedded_swarm_runtime["logs"]
+def test_standalone_health_endpoints(embedded_standalone_runtime):
+    health_url = embedded_standalone_runtime["health_url"]
+    logs = embedded_standalone_runtime["logs"]
 
     # The dedicated health server may take a brief moment after the public
     # API comes up. Retry /healthz briefly before asserting.
@@ -430,7 +430,7 @@ def test_swarm_health_endpoints(embedded_swarm_runtime):
         return r.status_code == 200
 
     if not wait_until(lambda: True if healthz_ok() else None, timeout_s=15.0, interval_s=0.25):
-        raise AssertionError(f"swarm health server did not come up at {health_url}\nlogs:\n{logs()}")
+        raise AssertionError(f"standalone health server did not come up at {health_url}\nlogs:\n{logs()}")
 
     healthz = requests.get(f"{health_url}/healthz", timeout=5)
     assert healthz.status_code == 200
@@ -446,7 +446,7 @@ def test_swarm_health_endpoints(embedded_swarm_runtime):
     assert metrics.status_code == 200
     assert metrics.headers["Content-Type"].startswith("text/plain")
     body = metrics.text
-    # Core raft host metrics written by SwarmHealthSource.
+    # Core raft host metrics written by StandaloneHealthSource.
     assert "antfly_raft_hosted_groups" in body
     assert "antfly_raft_reconcile_rounds_total" in body
     # Managed service metrics.
@@ -460,12 +460,12 @@ def test_swarm_health_endpoints(embedded_swarm_runtime):
     assert unknown.status_code == 404
 
 
-def test_swarm_retrieval_generation_with_live_inference(embedded_swarm_api, embedded_swarm_runtime):
-    table_name = f"swarm_generation_{time.time_ns()}"
-    created = embedded_swarm_api.create_table(table_name, num_shards=1)
+def test_standalone_retrieval_generation_with_live_inference(embedded_standalone_api, embedded_standalone_runtime):
+    table_name = f"standalone_generation_{time.time_ns()}"
+    created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    batch = embedded_swarm_api.batch_write(
+    batch = embedded_standalone_api.batch_write(
         table_name,
         inserts={
             "doc:a": {
@@ -486,7 +486,7 @@ def test_swarm_retrieval_generation_with_live_inference(embedded_swarm_api, embe
         "stream": False,
         "generator": {
             "provider": "antfly",
-            "model": embedded_swarm_runtime["model"],
+            "model": embedded_standalone_runtime["model"],
             "max_tokens": 32,
             "temperature": 0,
         },
@@ -509,7 +509,7 @@ def test_swarm_retrieval_generation_with_live_inference(embedded_swarm_api, embe
             response
             if (
                 (response := _post_json_with_timeout(
-                    embedded_swarm_api,
+                    embedded_standalone_api,
                     "/agents/retrieval",
                     payload,
                     timeout_s=180,
@@ -525,18 +525,18 @@ def test_swarm_retrieval_generation_with_live_inference(embedded_swarm_api, embe
     assert result["status"] == "completed"
     assert result["strategy_used"] == "bm25"
     assert _hit_ids(result) == ["doc:a"]
-    assert result["model"] == embedded_swarm_runtime["model"]
+    assert result["model"] == embedded_standalone_runtime["model"]
     assert isinstance(result["generation"], str)
     assert result["generation"].strip()
     assert result["steps"][-1]["name"] == "generation"
 
 
-def test_swarm_retrieval_streaming_with_live_inference(embedded_swarm_api, embedded_swarm_runtime):
-    table_name = f"swarm_streaming_{time.time_ns()}"
-    created = embedded_swarm_api.create_table(table_name, num_shards=1)
+def test_standalone_retrieval_streaming_with_live_inference(embedded_standalone_api, embedded_standalone_runtime):
+    table_name = f"standalone_streaming_{time.time_ns()}"
+    created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    batch = embedded_swarm_api.batch_write(
+    batch = embedded_standalone_api.batch_write(
         table_name,
         inserts={
             "doc:a": {
@@ -552,14 +552,14 @@ def test_swarm_retrieval_streaming_with_live_inference(embedded_swarm_api, embed
     )
     assert batch["inserted"] == 2
 
-    response = embedded_swarm_api.s.post(
-        f"{embedded_swarm_api.url}/agents/retrieval",
+    response = embedded_standalone_api.s.post(
+        f"{embedded_standalone_api.url}/agents/retrieval",
         json={
             "query": "Explain the retrieval system",
             "stream": True,
             "generator": {
                 "provider": "antfly",
-                "model": embedded_swarm_runtime["model"],
+                "model": embedded_standalone_runtime["model"],
                 "max_tokens": 64,
                 "temperature": 0,
             },
@@ -579,7 +579,7 @@ def test_swarm_retrieval_streaming_with_live_inference(embedded_swarm_api, embed
         timeout=180,
     )
     if response.status_code >= 400:
-        logs = embedded_swarm_runtime["logs"]()
+        logs = embedded_standalone_runtime["logs"]()
         raise requests.HTTPError(
             f"{response.status_code} {response.reason} body={response.text}\nserver logs:\n{logs}",
             response=response,
@@ -597,12 +597,12 @@ def test_swarm_retrieval_streaming_with_live_inference(embedded_swarm_api, embed
     assert any(isinstance(chunk, str) and chunk.strip() for chunk in generation_chunks)
 
 
-def test_swarm_cli_retrieval_non_streaming_with_live_inference(embedded_swarm_api, embedded_swarm_cli, embedded_swarm_runtime):
-    table_name = f"swarm_cli_generation_{time.time_ns()}"
-    created = embedded_swarm_api.create_table(table_name, num_shards=1)
+def test_standalone_cli_retrieval_non_streaming_with_live_inference(embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime):
+    table_name = f"standalone_cli_generation_{time.time_ns()}"
+    created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    batch = embedded_swarm_api.batch_write(
+    batch = embedded_standalone_api.batch_write(
         table_name,
         inserts={
             "doc:a": {
@@ -621,7 +621,7 @@ def test_swarm_cli_retrieval_non_streaming_with_live_inference(embedded_swarm_ap
     generator_json = json.dumps(
         {
             "provider": "antfly",
-            "model": embedded_swarm_runtime["model"],
+            "model": embedded_standalone_runtime["model"],
             "max_tokens": 96,
             "temperature": 0,
         }
@@ -631,7 +631,7 @@ def test_swarm_cli_retrieval_non_streaming_with_live_inference(embedded_swarm_ap
         lambda: (
             parsed
             if (
-                (completed := embedded_swarm_cli(
+                (completed := embedded_standalone_cli(
                     "agents",
                     "retrieval",
                     "--table",
@@ -663,7 +663,7 @@ def test_swarm_cli_retrieval_non_streaming_with_live_inference(embedded_swarm_ap
     assert result is not None
     assert result["status"] == "completed"
     assert result["strategy_used"] == "bm25"
-    assert result["model"] == embedded_swarm_runtime["model"]
+    assert result["model"] == embedded_standalone_runtime["model"]
     assert _hit_ids(result) == ["doc:a"]
     assert isinstance(result["generation"], str)
     assert result["generation"].strip()
@@ -675,12 +675,12 @@ def test_swarm_cli_retrieval_non_streaming_with_live_inference(embedded_swarm_ap
     assert result["followup_questions"]
 
 
-def test_swarm_cli_retrieval_streaming_with_live_inference(embedded_swarm_api, embedded_swarm_cli, embedded_swarm_runtime):
-    table_name = f"swarm_cli_streaming_{time.time_ns()}"
-    created = embedded_swarm_api.create_table(table_name, num_shards=1)
+def test_standalone_cli_retrieval_streaming_with_live_inference(embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime):
+    table_name = f"standalone_cli_streaming_{time.time_ns()}"
+    created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    batch = embedded_swarm_api.batch_write(
+    batch = embedded_standalone_api.batch_write(
         table_name,
         inserts={
             "doc:a": {
@@ -699,13 +699,13 @@ def test_swarm_cli_retrieval_streaming_with_live_inference(embedded_swarm_api, e
     generator_json = json.dumps(
         {
             "provider": "antfly",
-            "model": embedded_swarm_runtime["model"],
+            "model": embedded_standalone_runtime["model"],
             "max_tokens": 96,
             "temperature": 0,
         }
     )
 
-    result = embedded_swarm_cli(
+    result = embedded_standalone_cli(
         "agents",
         "retrieval",
         "--table",

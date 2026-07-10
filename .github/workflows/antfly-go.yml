@@ -42,7 +42,7 @@ jobs:
   unit:
     # Runs on heavy because the standard runner's 10Gi ephemeral cap was
     # being exhausted by go build + module cache + workspace + Pebble dbs
-    # written during "Test swarm startup", leading to silent SIGTERM.
+    # written during "Test standalone startup", leading to silent SIGTERM.
     # Heavy provides /mnt/cache (50Gi PVC) for GOCACHE/GOMODCACHE. Inference
     # omni also runs here so regular Go CI and omni consume one heavy runner
     # slot instead of two.
@@ -124,12 +124,12 @@ jobs:
       - name: Build Antfly
         run: cd go/pkg/antfly && GOWORK=off go build -v -o ../../../antfly ./cmd
 
-      - name: Test swarm startup
+      - name: Test standalone startup
         run: |
-          ./antfly swarm &
-          SWARM_PID=$!
+          ./antfly standalone &
+          STANDALONE_PID=$!
 
-          echo "Waiting for swarm to start (PID: $SWARM_PID)..."
+          echo "Waiting for standalone to start (PID: $STANDALONE_PID)..."
 
           HEALTHZ_OK=false
           for i in {1..30}; do
@@ -143,7 +143,7 @@ jobs:
 
           if [ "$HEALTHZ_OK" != "true" ]; then
             echo "ERROR: healthz endpoint did not respond within 30 seconds"
-            kill $SWARM_PID 2>/dev/null || true
+            kill $STANDALONE_PID 2>/dev/null || true
             exit 1
           fi
 
@@ -159,13 +159,13 @@ jobs:
 
           if [ "$READYZ_OK" != "true" ]; then
             echo "ERROR: readyz endpoint did not respond within 30 seconds"
-            kill $SWARM_PID 2>/dev/null || true
+            kill $STANDALONE_PID 2>/dev/null || true
             exit 1
           fi
 
-          echo "Swarm startup test passed!"
-          kill $SWARM_PID 2>/dev/null || true
-          wait $SWARM_PID 2>/dev/null || true
+          echo "Standalone startup test passed!"
+          kill $STANDALONE_PID 2>/dev/null || true
+          wait $STANDALONE_PID 2>/dev/null || true
 
       - name: Test
         run: |

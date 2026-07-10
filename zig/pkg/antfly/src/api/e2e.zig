@@ -2148,15 +2148,15 @@ test "public api split e2e backs up drops and restores a table" {
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 }
 
-test "public api swarm-like e2e backs up drops and restores a table" {
+test "public api standalone-like e2e backs up drops and restores a table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-swarm-like-backup-restore-root", .{tmp.sub_path});
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
-    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-swarm-like-backup-restore-catalog.txt", .{tmp.sub_path});
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
-    const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-swarm-like-backup-restore-out", .{tmp.sub_path});
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -2256,7 +2256,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
 
     const backup_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"backup_id\":\"swarm-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
+        "{{\"backup_id\":\"standalone-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
         .{backup_root},
     );
     defer std.testing.allocator.free(backup_body);
@@ -2275,7 +2275,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
 
     const restore_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"backup_id\":\"swarm-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
+        "{{\"backup_id\":\"standalone-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
         .{backup_root},
     );
     defer std.testing.allocator.free(restore_body);

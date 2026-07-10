@@ -193,7 +193,7 @@ func (c *TestCluster) startMetadataNode(ctx context.Context, logger *zap.Logger,
 
 	// Create config
 	config := &common.Config{
-		SwarmMode:             false, // Not swarm mode - multi-node cluster
+		DeploymentMode:        common.ConfigDeploymentModeDistributed,
 		DisableShardAlloc:     cfg.DisableShardAlloc,
 		ReplicationFactor:     uint64(cfg.ReplicationFactor), //nolint:gosec // G115: bounded value, cannot overflow in practice
 		DefaultShardsPerTable: uint64(cfg.NumShards),         //nolint:gosec // G115: bounded value, cannot overflow in practice

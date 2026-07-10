@@ -140,7 +140,7 @@ func GetGlobalKeystore() *Keystore {
 }
 
 // SetGlobalKeystore sets the global keystore instance and updates the resolver.
-// Used when auto-creating a keystore at runtime (e.g., swarm mode dashboard).
+// Used when auto-creating a keystore at runtime (e.g., standalone mode dashboard).
 func SetGlobalKeystore(ks *Keystore) {
 	globalKeystore = ks
 	globalResolver = NewResolver(ks)

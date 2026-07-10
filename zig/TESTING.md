@@ -159,7 +159,7 @@ base tier locally with the release binaries:
 zig build -Doptimize=ReleaseFast install -Dedition=full
 
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q \
-  -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
+  -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow" \
   e2e/antfly
 
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest -q \
@@ -319,7 +319,7 @@ E2E marker policy:
 - `postgres_integration`: requires local PostgreSQL.
 - `objectstore_integration`: requires S3 or GCS credentials and buckets.
 - `real_model` or `model_integration`: requires local or downloadable model weights.
-- `swarm_integration`: requires a local Antfly swarm plus live inference model support.
+- `standalone_integration`: requires a local Antfly standalone plus live inference model support.
 - `browser_integration`: requires a browser or WebGPU runtime.
 - `slow`: too long-running for required E2E base CI.
 

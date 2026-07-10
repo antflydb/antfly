@@ -5345,7 +5345,7 @@ pub const Node = struct {
     }
 
     /// Register inference API routes on an external server with a compile-time prefix.
-    /// Used by swarm mode to register on the unified httpx.Server.
+    /// Used by standalone mode to register on the unified httpx.Server.
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };

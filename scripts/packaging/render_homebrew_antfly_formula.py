@@ -79,7 +79,7 @@ class Antfly < Formula
   end
 
   service do
-    run [opt_bin/"antfly", "swarm", "--data-dir", var/"lib/antfly"]
+    run [opt_bin/"antfly", "standalone", "--data-dir", var/"lib/antfly"]
     keep_alive true
     working_dir var/"lib/antfly"
     log_path var/"log/antfly.log"

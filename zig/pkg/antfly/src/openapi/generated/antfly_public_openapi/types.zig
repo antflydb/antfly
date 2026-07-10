@@ -820,9 +820,10 @@ pub const ClusterStatus = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?StorageRuntimeStatus = null,
 };
 
 pub const ClusterTopology = struct {
@@ -831,9 +832,10 @@ pub const ClusterTopology = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
 };
 
@@ -2808,6 +2810,21 @@ pub const SortProfile = struct {
     sort_rejection_detail: ?[]const u8 = null,
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: ?[]const u8 = null,
+};
+
+pub const StorageMaintenanceCapabilities = struct {
+    check: bool,
+    compact: bool,
+    vacuum: bool,
+    online: bool,
+    asynchronous: bool,
+};
+
+pub const StorageRuntimeStatus = struct {
+    engine: []const u8,
+    format: ?[]const u8 = null,
+    fsync: ?bool = null,
+    maintenance: StorageMaintenanceCapabilities,
 };
 
 pub const StorageStatus = struct {

@@ -342,7 +342,8 @@ pub const AntflyApiHandler = struct {
         var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
-        public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        public_status.deployment_mode = self.api_server.cfg.deployment_mode;
+        public_status.storage = self.api_server.currentStorageRuntimeStatus();
         if (self.api_server.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -361,7 +362,8 @@ pub const AntflyApiHandler = struct {
         var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
-        public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        public_status.deployment_mode = self.api_server.cfg.deployment_mode;
+        public_status.storage = self.api_server.currentStorageRuntimeStatus();
         if (self.api_server.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -3298,7 +3300,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     var source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &secret_store,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);

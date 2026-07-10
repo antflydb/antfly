@@ -30,7 +30,7 @@ import requests
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
-    _swarm_stateful_command,
+    _standalone_stateful_command,
     _read_log_tail,
     antfly_public_api_url,
     find_free_port,
@@ -104,7 +104,7 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 
 
 class AuthApi:
-    def __init__(self, base_url: str, server_ref: "SwarmAuthServer | SplitAuthServer"):
+    def __init__(self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"):
         self.url = base_url.rstrip("/")
         self.auth_url = self._auth_url_from_db_url(self.url)
         self.s = requests.Session()
@@ -218,7 +218,7 @@ class AuthApi:
         return [json.loads(line) for line in response.text.splitlines() if line.strip()]
 
 
-class SwarmAuthServer:
+class StandaloneAuthServer:
     def __init__(self, binary: str, host: str, port: int):
         self.url = f"http://{host}:{port}"
         self.api_url = antfly_public_api_url(self.url)
@@ -227,7 +227,7 @@ class SwarmAuthServer:
         self.root = root
         self.log_path = root / "server.log"
         self.log_file = self.log_path.open("w")
-        command = _swarm_stateful_command(binary, host=host, port=port, root=root)
+        command = _standalone_stateful_command(binary, host=host, port=port, root=root)
         command.extend(["--auth", "true"])
         self.proc = subprocess.Popen(
             command,
@@ -238,12 +238,12 @@ class SwarmAuthServer:
         if not wait_for_server(self.api_url, allow_unauthorized=True):
             self.stop()
             out = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Auth swarm failed to start at {self.api_url}\n{out}")
+            raise RuntimeError(f"Auth standalone failed to start at {self.api_url}\n{out}")
         self.metadata_admin_url = self._poll_metadata_admin_url()
         if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
             out = self.debug_logs()
             self.stop()
-            raise RuntimeError(f"Auth swarm failed to initialize admin auth at {self.api_url}\n{out}")
+            raise RuntimeError(f"Auth standalone failed to initialize admin auth at {self.api_url}\n{out}")
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -253,7 +253,7 @@ class SwarmAuthServer:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             logs = _read_log_tail(self.log_path)
-            matches = re.findall(r"(?:swarm )?metadata admin api listening on (http://[^\s]+)", logs)
+            matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
             if matches:
                 return matches[-1].rstrip("/")
             time.sleep(0.1)
@@ -298,7 +298,7 @@ def auth_api():
         pytest.skip("auth parity requires the unified antfly CLI")
 
     port = find_free_port()
-    server = SwarmAuthServer(binary, "127.0.0.1", port)
+    server = StandaloneAuthServer(binary, "127.0.0.1", port)
     try:
         yield AuthApi(server.api_url, server)
     finally:
@@ -321,7 +321,7 @@ def stateful_auth_api():
         server.stop()
 
 
-def test_swarm_auth_defaults_to_local_admin_user(auth_api: AuthApi):
+def test_standalone_auth_defaults_to_local_admin_user(auth_api: AuthApi):
     response = auth_api.s.get(f"{auth_api.url}/status", timeout=30)
     assert response.status_code == 401
 
@@ -334,7 +334,7 @@ def test_swarm_auth_defaults_to_local_admin_user(auth_api: AuthApi):
     )
 
 
-def test_swarm_auth_user_and_api_key_flow(auth_api: AuthApi):
+def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
     auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
 
     created = auth_api.post(
@@ -373,7 +373,7 @@ def test_swarm_auth_user_and_api_key_flow(auth_api: AuthApi):
     )
 
 
-def test_swarm_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
+def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     auth_api.create_table("docs")
     auth_api.batch_write(
@@ -488,7 +488,7 @@ def test_swarm_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     assert remaining[0]["key_id"] == read_only_key["key_id"]
 
 
-def test_swarm_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
+def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
     auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     auth_api.create_table("docs")
     auth_api.batch_write(

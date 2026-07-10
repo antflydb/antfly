@@ -104,11 +104,11 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 	}
 	v.SetDefault("disable_shard_alloc", true)
 	if v.GetInt("replication_factor") == 0 {
-		// If the default wasn't set by swarm mode set it here
+		// If the default wasn't set by standalone mode set it here
 		v.SetDefault("replication_factor", 3)
 	}
 	if v.GetInt("default_shards_per_table") == 0 {
-		// If the default wasn't set by swarm mode set it here
+		// If the default wasn't set by standalone mode set it here
 		v.SetDefault("default_shards_per_table", 3)
 	}
 	v.SetDefault("health_enabled", true)
@@ -132,6 +132,7 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 		return nil, fmt.Errorf("failed to parse config: %v", err)
 	}
 	config.Version = Version
+	config.NormalizeDeploymentMode()
 
 	// Get log level from config or viper (env var / flag)
 	logLevel := string(config.Log.Level)

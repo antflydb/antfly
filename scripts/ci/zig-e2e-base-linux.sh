@@ -64,7 +64,7 @@ if [[ "$#" -gt 0 ]]; then
   run_inference="${RUN_INFERENCE_E2E:-0}"
 else
   antfly_args=(
-    -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow"
+    -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow"
     e2e/antfly
   )
   run_inference="${RUN_INFERENCE_E2E:-1}"

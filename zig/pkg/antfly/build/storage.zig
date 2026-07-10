@@ -46,7 +46,7 @@ pub fn makeRootBuildOptions(
     storage_sim_soak: bool,
     with_tla: bool,
     link_libc: bool,
-    swarm_runtime_focused_test: bool,
+    standalone_runtime_focused_test: bool,
     lite_local_inference_runtime: bool,
     antfly_version: []const u8,
 ) *std.Build.Step.Options {
@@ -56,7 +56,7 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "storage_sim_soak", storage_sim_soak);
     options.addOption(bool, "with_tla", with_tla);
     options.addOption(bool, "link_libc", link_libc);
-    options.addOption(bool, "swarm_runtime_focused_test", swarm_runtime_focused_test);
+    options.addOption(bool, "standalone_runtime_focused_test", standalone_runtime_focused_test);
     options.addOption(bool, "lite_local_inference_runtime", lite_local_inference_runtime);
     options.addOption(bool, "bench_minimal_deps", false);
     options.addOption([]const u8, "antfly_version", antfly_version);

@@ -2181,7 +2181,7 @@ func (s *StoreDB) loadPersistentSnapshot(ctx context.Context) error {
 	} else if err != nil {
 		return fmt.Errorf("loading snapshot: %w", err)
 	}
-	// In swarm mode, snapID will be empty (no Raft snapshots)
+	// In standalone mode, snapID will be empty (no Raft snapshots)
 	if snapID == "" {
 		return nil
 	}

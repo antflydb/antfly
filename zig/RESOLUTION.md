@@ -623,7 +623,7 @@ Open/index/enrichment validation should reject:
         `DataServer` also injects a leadership-backed `PromotionOwner` so raft
         followers do not emit duplicate entity-table proposals from apply replay;
         non-owners wait without advancing their promotion checkpoint. Verified
-        end-to-end on a live multi-Raft swarm by
+        end-to-end on a live multi-Raft standalone by
         `e2e/antfly/test_resolution.py` (document -> extraction -> resolution ->
         cross-shard entity upsert) plus db-test/lib-resolution-source-test.
    - [x] Resolvers declarable via table config: a `resolvers` section in the

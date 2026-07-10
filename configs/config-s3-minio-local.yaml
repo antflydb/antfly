@@ -9,6 +9,7 @@ metadata:
 
 # Storage configuration
 storage:
+  engine: local
   local:
     base_dir: "antflydb"
   keyvalue: "s3"

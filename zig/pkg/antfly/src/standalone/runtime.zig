@@ -61,6 +61,9 @@ const CliConfig = struct {
     inference_scratch_budget_mb: usize = 0,
     inference_preload_models: std.ArrayListUnmanaged(inference.server.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
+    storage_engine: ?antfly.common.config.StorageEngine = null,
+    storage_path: ?[]const u8 = null,
+    storage_fsync: ?bool = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
@@ -125,18 +128,18 @@ const ResolvedPaths = struct {
     }
 };
 
-const SwarmHealthSource = struct {
+const StandaloneHealthSource = struct {
     data_server: *antfly.data.runtime.DataServer,
     unified_api_ready: *const std.atomic.Value(bool),
 
-    fn readiness(self: *SwarmHealthSource) antfly.common.health_server.ReadinessChecker {
+    fn readiness(self: *StandaloneHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
             .ptr = self,
             .vtable = &.{ .check = checkReady },
         };
     }
 
-    fn metricsWriter(self: *SwarmHealthSource) antfly.common.health_server.MetricsWriter {
+    fn metricsWriter(self: *StandaloneHealthSource) antfly.common.health_server.MetricsWriter {
         return .{
             .ptr = self,
             .vtable = &.{ .write_metrics = writeMetrics },
@@ -144,25 +147,25 @@ const SwarmHealthSource = struct {
     }
 
     fn checkReady(ptr: *anyopaque) bool {
-        const self: *SwarmHealthSource = @ptrCast(@alignCast(ptr));
-        return swarmReadyFromState(
+        const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
+        return standaloneReadyFromState(
             self.data_server.http_server != null,
             self.unified_api_ready.load(.acquire),
         );
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
-        const self: *SwarmHealthSource = @ptrCast(@alignCast(ptr));
+        const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
         var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
         try data_health.metricsWriter().writeMetrics(writer);
     }
 };
 
-fn swarmReadyFromState(api_server_initialized: bool, unified_api_ready: bool) bool {
+fn standaloneReadyFromState(api_server_initialized: bool, unified_api_ready: bool) bool {
     return api_server_initialized and unified_api_ready;
 }
 
-const LocalSwarmMetadata = struct {
+const LocalStandaloneMetadata = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     manager: antfly.metadata.TableManager,
@@ -172,6 +175,7 @@ const LocalSwarmMetadata = struct {
     api_url: []const u8,
     replica_root_dir: []const u8,
     catalog_path: []const u8,
+    catalog_store: ?*antfly.storage_backend_erased.Store,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
@@ -194,14 +198,15 @@ const LocalSwarmMetadata = struct {
         replica_root_dir: []const u8,
         catalog_path: []const u8,
         backend_runtime: *antfly.db.background_runtime.BackendRuntime,
-    ) !LocalSwarmMetadata {
+        catalog_store: ?*antfly.storage_backend_erased.Store,
+    ) !LocalStandaloneMetadata {
         const owned_api_url = try alloc.dupe(u8, api_url);
         errdefer alloc.free(owned_api_url);
         const owned_replica_root_dir = try alloc.dupe(u8, replica_root_dir);
         errdefer alloc.free(owned_replica_root_dir);
         const owned_catalog_path = try alloc.dupe(u8, catalog_path);
         errdefer alloc.free(owned_catalog_path);
-        var self = LocalSwarmMetadata{
+        var self = LocalStandaloneMetadata{
             .alloc = alloc,
             .manager = antfly.metadata.TableManager.init(alloc),
             .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
@@ -210,6 +215,7 @@ const LocalSwarmMetadata = struct {
             .api_url = owned_api_url,
             .replica_root_dir = owned_replica_root_dir,
             .catalog_path = owned_catalog_path,
+            .catalog_store = catalog_store,
             .backend_runtime = backend_runtime,
         };
         errdefer self.deinit();
@@ -217,7 +223,7 @@ const LocalSwarmMetadata = struct {
         return self;
     }
 
-    fn deinit(self: *LocalSwarmMetadata) void {
+    fn deinit(self: *LocalStandaloneMetadata) void {
         self.extension_catalog.deinit();
         self.manager.deinit();
         self.alloc.free(self.catalog_path);
@@ -226,7 +232,7 @@ const LocalSwarmMetadata = struct {
         self.* = undefined;
     }
 
-    fn catalogSource(self: *LocalSwarmMetadata) antfly.public_api.table_catalog.CatalogSource {
+    fn catalogSource(self: *LocalStandaloneMetadata) antfly.public_api.table_catalog.CatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -236,7 +242,7 @@ const LocalSwarmMetadata = struct {
         };
     }
 
-    fn statusSource(self: *LocalSwarmMetadata) antfly.public_api.http_server.StatusSource {
+    fn statusSource(self: *LocalStandaloneMetadata) antfly.public_api.http_server.StatusSource {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -267,7 +273,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn status(ptr: *anyopaque) !antfly.metadata_api.MetadataStatus {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         return .{
@@ -291,7 +297,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn catalogAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -365,7 +371,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn catalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.AdminSnapshot) void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         self.manager.freeTables(self.alloc, snapshot.tables);
         self.manager.freeRanges(self.alloc, snapshot.ranges);
         for (snapshot.stores) |store| antfly.metadata.table_manager.freeStore(self.alloc, store);
@@ -381,7 +387,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         const table = antfly.public_api.tables.deriveTableRecord(table_name, req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
         defer {
@@ -399,7 +405,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var location = try antfly.public_api.backups.openBackupLocation(alloc, location_uri);
         defer location.deinit(alloc);
         var manifest = antfly.public_api.backups.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
@@ -423,7 +429,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
@@ -433,7 +439,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
@@ -445,7 +451,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
@@ -458,7 +464,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
@@ -472,7 +478,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
@@ -486,7 +492,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn deleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
@@ -503,7 +509,7 @@ const LocalSwarmMetadata = struct {
     fn waitTableLifecycle(_: *anyopaque, _: []const u8, _: antfly.public_api.http_server.TableVisibility) !void {}
 
     fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableVisibilityTimeout;
@@ -516,7 +522,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn runRound(ptr: *anyopaque) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         self.finalizeReadySchemaMigrations() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
@@ -524,7 +530,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.InstallExtensionRequest) !antfly.extensions.InstalledExtension {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const installed_at_ms: i64 = @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
@@ -545,7 +551,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.UpdateExtensionRequest) !antfly.extensions.InstalledExtension {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var persisted_req = req;
@@ -565,7 +571,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn dropExtension(ptr: *anyopaque, _: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.DropExtensionRequest) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var persisted_req = req;
@@ -581,7 +587,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.extensions.InstalledExtension {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         try self.extension_catalog.enableInstalled(extension_name);
@@ -591,7 +597,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.extensions.InstalledExtension {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         try self.extension_catalog.disableInstalled(extension_name);
@@ -601,7 +607,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.ConfigureExtensionRequest) !antfly.extensions.InstalledExtension {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         try self.extension_catalog.configureInstalled(extension_name, req);
@@ -617,7 +623,7 @@ const LocalSwarmMetadata = struct {
         members: []const antfly.extensions.ExtensionMember,
         dependencies: []const antfly.extensions.ExtensionDependency,
     ) !void {
-        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -628,7 +634,7 @@ const LocalSwarmMetadata = struct {
         try self.persistLocked();
     }
 
-    fn cloneExtensionCatalogLocked(self: *LocalSwarmMetadata) !antfly.extensions.ExtensionCatalog {
+    fn cloneExtensionCatalogLocked(self: *LocalStandaloneMetadata) !antfly.extensions.ExtensionCatalog {
         var catalog = antfly.extensions.ExtensionCatalog.init(self.alloc);
         errdefer catalog.deinit();
         try catalog.loadProjectedRows(
@@ -640,7 +646,7 @@ const LocalSwarmMetadata = struct {
         return catalog;
     }
 
-    fn syncExtensionPackageStore(self: *LocalSwarmMetadata, io: std.Io, root_path: []const u8) !usize {
+    fn syncExtensionPackageStore(self: *LocalStandaloneMetadata, io: std.Io, root_path: []const u8) !usize {
         const entries = try antfly.extensions.scanPackageStoreAlloc(self.alloc, io, root_path);
         defer antfly.extensions.freePackageStoreEntries(self.alloc, entries);
 
@@ -654,7 +660,7 @@ const LocalSwarmMetadata = struct {
         return entries.len;
     }
 
-    fn finalizeReadySchemaMigrations(self: *LocalSwarmMetadata) !void {
+    fn finalizeReadySchemaMigrations(self: *LocalStandaloneMetadata) !void {
         const now_ms = monotonicMs();
         const snapshot = blk: {
             lockAtomic(&self.mutex);
@@ -731,7 +737,7 @@ const LocalSwarmMetadata = struct {
         }
     }
 
-    fn findTableByNameLocked(self: *LocalSwarmMetadata, table_name: []const u8) ?*const antfly.metadata.TableRecord {
+    fn findTableByNameLocked(self: *LocalStandaloneMetadata, table_name: []const u8) ?*const antfly.metadata.TableRecord {
         var it = self.manager.tables.valueIterator();
         while (it.next()) |table| {
             if (std.mem.eql(u8, table.name, table_name)) return table;
@@ -739,8 +745,16 @@ const LocalSwarmMetadata = struct {
         return null;
     }
 
-    fn loadPersistedCatalog(self: *LocalSwarmMetadata) !void {
-        const raw = readFileAlloc(self.alloc, self.catalog_path, 64 * 1024 * 1024) catch |err| switch (err) {
+    fn loadPersistedCatalog(self: *LocalStandaloneMetadata) !void {
+        const raw = if (self.catalog_store) |store| blk: {
+            var txn = try store.beginRead();
+            defer txn.abort();
+            const value = txn.get("catalog") catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            break :blk try self.alloc.dupe(u8, value);
+        } else readFileAlloc(self.alloc, self.catalog_path, 64 * 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -762,7 +776,7 @@ const LocalSwarmMetadata = struct {
         self.epoch = @max(parsed.value.epoch, 1);
     }
 
-    fn persistLocked(self: *LocalSwarmMetadata) !void {
+    fn persistLocked(self: *LocalStandaloneMetadata) !void {
         const tables = try self.manager.listTables(self.alloc);
         defer self.manager.freeTables(self.alloc, tables);
         const ranges = try self.manager.listRanges(self.alloc);
@@ -787,7 +801,15 @@ const LocalSwarmMetadata = struct {
         }, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(encoded);
 
-        try writeFileAtomically(self.alloc, self.catalog_path, encoded);
+        if (self.catalog_store) |store| {
+            var txn = try store.beginWrite();
+            errdefer txn.abort();
+            try txn.put("catalog", encoded);
+            try txn.commit();
+            try store.sync(true);
+        } else {
+            try writeFileAtomically(self.alloc, self.catalog_path, encoded);
+        }
     }
 };
 
@@ -840,7 +862,7 @@ pub fn run(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
 
-    const argv0 = args.next() orelse "antfly_swarm";
+    const argv0 = args.next() orelse "antfly_standalone";
     return try runFromIterator(init, argv0, &args);
 }
 
@@ -876,9 +898,17 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    const storage_engine = cli.storage_engine orelse if (loaded_config) |*cfg| cfg.storage.engine else .local;
+    if (storage_engine == .object) return error.UnsupportedStandaloneStorageEngine;
+    const lite_path = if (storage_engine == .lite)
+        (cli.storage_path orelse if (loaded_config) |*cfg| cfg.storage.lite_path else null) orelse return error.MissingLiteStoragePath
+    else
+        null;
+    const lite_fsync = cli.storage_fsync orelse if (loaded_config) |*cfg| cfg.storage.lite_fsync else true;
+
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
-    try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, data_dir);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
@@ -894,8 +924,21 @@ pub fn runFromIterator(
 
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
+    var lite_backend: ?antfly.lite.backend.Handle = if (lite_path) |path|
+        try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{ .no_sync = !lite_fsync })
+    else
+        null;
+    defer if (lite_backend) |*backend| backend.deinit();
+    if (lite_backend) |*backend| {
+        node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
+    }
+    var storage_maintenance = antfly.storage_maintenance.Coordinator.init(
+        alloc,
+        if (lite_backend) |*backend| backend.maintenanceSource() else antfly.storage_maintenance.localSource,
+    );
+    defer storage_maintenance.deinit();
 
-    // Swarm always owns a local Antfly node. Antfly-managed embeddings use it
+    // Standalone always owns a local Antfly node. Antfly-managed embeddings use it
     // directly, and the public Antfly routes are registered on the unified
     // server for compatibility with external clients.
     var resolved_warm_models = try resolveInferenceWarmModels(alloc, cli, if (loaded_config) |*cfg| cfg else null);
@@ -965,7 +1008,7 @@ pub fn runFromIterator(
     );
     defer alloc.free(public_api_url);
 
-    var local_metadata = try LocalSwarmMetadata.init(
+    var local_metadata = try LocalStandaloneMetadata.init(
         alloc,
         local_node_id,
         1,
@@ -973,11 +1016,12 @@ pub fn runFromIterator(
         resolved.replica_root_dir,
         resolved.local_metadata_catalog_path,
         node_backend_runtime.ptr(),
+        if (lite_backend) |*backend| try backend.runtimeStoreForNamespace("system/metadata") else null,
     );
     defer local_metadata.deinit();
     const synced_extension_packages = try local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
     if (synced_extension_packages > 0) {
-        std.log.info("swarm synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
+        std.log.info("standalone synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
     }
 
     try validateHARole(cli);
@@ -1017,7 +1061,8 @@ pub fn runFromIterator(
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
             .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
-            .swarm_mode = true,
+            .deployment_mode = .standalone,
+            .storage_maintenance = &storage_maintenance,
             .secret_store = &secret_store,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
@@ -1049,14 +1094,14 @@ pub fn runFromIterator(
     // Initialize API server (wires caches + sources) without binding a listener.
     data_server.initApiServer();
     data_server.registerNodeIfConfigured() catch |err| {
-        std.log.err("swarm startup failed step=register_node err={}", .{err});
+        std.log.err("standalone startup failed step=register_node err={}", .{err});
         return err;
     };
     data_server.requestProvisionedStartupCatchUpNow() catch |err| {
-        std.log.warn("swarm startup provisioned startup catch-up skipped err={}", .{err});
+        std.log.warn("standalone startup provisioned startup catch-up skipped err={}", .{err});
     };
     data_server.requestProvisionedCacheWarmup() catch |err| {
-        std.log.warn("swarm startup provisioned cache warmup skipped err={}", .{err});
+        std.log.warn("standalone startup provisioned cache warmup skipped err={}", .{err});
     };
 
     const api_server = &data_server.http_server.?;
@@ -1080,15 +1125,15 @@ pub fn runFromIterator(
         api_server,
         &unified_api_ready,
     }) catch |err| {
-        std.log.err("swarm startup failed step=spawn_unified_http err={}", .{err});
+        std.log.err("standalone startup failed step=spawn_unified_http err={}", .{err});
         return err;
     };
     _ = thread; // detach happens on process exit
 
     // Print bound address. The thread will print it after bind().
-    std.debug.print("swarm local metadata enabled (raft disabled)\n", .{});
+    std.debug.print("standalone local metadata enabled (raft disabled)\n", .{});
 
-    var swarm_health = SwarmHealthSource{
+    var standalone_health = StandaloneHealthSource{
         .data_server = &data_server,
         .unified_api_ready = &unified_api_ready,
     };
@@ -1099,13 +1144,13 @@ pub fn runFromIterator(
         null;
     const health_server = antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
         alloc,
-        "swarm",
+        "standalone",
         public_listener.bind_host,
         health_port,
-        swarm_health.readiness(),
-        swarm_health.metricsWriter(),
+        standalone_health.readiness(),
+        standalone_health.metricsWriter(),
     ) catch |err| {
-        std.log.err("swarm startup failed step=health_server err={}", .{err});
+        std.log.err("standalone startup failed step=health_server err={}", .{err});
         return err;
     };
     defer if (health_server) |hs| hs.deinit();
@@ -1117,7 +1162,7 @@ pub fn runFromIterator(
     };
     while (true) {
         try data_server.runRound();
-        try LocalSwarmMetadata.runRound(&local_metadata);
+        try LocalStandaloneMetadata.runRound(&local_metadata);
         const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
         switch (err) {
             .SUCCESS => {},
@@ -1125,6 +1170,34 @@ pub fn runFromIterator(
             else => return std.posix.unexpectedErrno(err),
         }
     }
+}
+
+pub fn runLite(
+    init: std.process.Init,
+    path: []const u8,
+    host: []const u8,
+    port: u16,
+    fsync: bool,
+) !void {
+    const path_z = try init.gpa.dupeZ(u8, path);
+    defer init.gpa.free(path_z);
+    const host_z = try init.gpa.dupeZ(u8, host);
+    defer init.gpa.free(host_z);
+    var port_buf: [16]u8 = undefined;
+    const port_z = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
+    const argv = [_][*:0]const u8{
+        "--storage-engine",
+        "lite",
+        "--storage-path",
+        path_z.ptr,
+        "--host",
+        host_z.ptr,
+        "--port",
+        port_z.ptr,
+        if (fsync) "--fsync=true" else "--fsync=false",
+    };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try runFromIterator(init, "antfly standalone", &args);
 }
 
 fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
@@ -1556,6 +1629,7 @@ fn serveUnifiedInner(
     // Internal group routes are still served by the legacy ApiHttpServer
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
+    try registerStorageMaintenanceRoutes(&server);
     try registerHAAdminRoutes(&server);
     try registerHAInternalRoutes(&server);
     try registerMcpRoutes(&server);
@@ -1567,7 +1641,7 @@ fn serveUnifiedInner(
     unified_api_ready.store(true, .release);
 
     if (server.boundAddress()) |addr| {
-        std.debug.print("swarm public api listening on http://{}\n", .{addr});
+        std.debug.print("standalone public api listening on http://{}\n", .{addr});
     }
 
     try server.listen();
@@ -1637,6 +1711,13 @@ fn registerHAAdminRoutes(server: anytype) !void {
         try server.put(path, haAdminBridgeHandler);
         try server.delete(path, haAdminBridgeHandler);
     }
+}
+
+fn registerStorageMaintenanceRoutes(server: anytype) !void {
+    try server.post(antfly.admin.routes.maintenance_check, haAdminBridgeHandler);
+    try server.post(antfly.admin.routes.maintenance_compact, haAdminBridgeHandler);
+    try server.post(antfly.admin.routes.maintenance_vacuum, haAdminBridgeHandler);
+    try server.get(antfly.admin.routes.maintenance_jobs_prefix ++ "*", haAdminBridgeHandler);
 }
 
 fn registerHAInternalRoutes(server: anytype) !void {
@@ -1789,6 +1870,8 @@ fn hasUnsafeStaticPath(path: []const u8) bool {
 fn isAntfarmReservedPath(path: []const u8) bool {
     const reserved = [_][]const u8{
         "/api",
+        "/db",
+        "/ai",
         "/ml",
         "/antfly",
         "/metadata",
@@ -1804,7 +1887,19 @@ fn isAntfarmReservedPath(path: []const u8) bool {
         if (std.mem.eql(u8, path, prefix)) return true;
         if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix) and path[prefix.len] == '/') return true;
     }
-    return false;
+    return isVersionedApiPath(path);
+}
+
+fn isVersionedApiPath(path: []const u8) bool {
+    if (path.len < 5 or path[0] != '/') return false;
+    const first_separator = std.mem.indexOfScalarPos(u8, path, 1, '/') orelse return false;
+    if (first_separator == 1 or first_separator + 2 >= path.len or path[first_separator + 1] != 'v') return false;
+
+    var cursor = first_separator + 2;
+    const digits_start = cursor;
+    while (cursor < path.len and std.ascii.isDigit(path[cursor])) : (cursor += 1) {}
+    if (cursor == digits_start) return false;
+    return cursor == path.len or path[cursor] == '/';
 }
 
 fn haAdminBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1825,9 +1920,14 @@ fn haAdminBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     };
 
     const body_data = (try ctx.body()) orelse "";
+    const idempotency_headers: []const http_common.RequestHeader = if (ctx.header("idempotency-key")) |value|
+        &.{.{ .name = "Idempotency-Key", .value = value }}
+    else
+        &.{};
     const legacy_req = http_common.HttpRequest{
         .method = method,
         .uri = ctx.request.uri.raw,
+        .headers = idempotency_headers,
         .authorization = ctx.header("authorization"),
         .content_type = ctx.header("content-type"),
         .body = body_data,
@@ -1925,7 +2025,7 @@ fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) !
 }
 
 fn writeFileAtomically(alloc: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-swarm-metadata-{d}", .{ path, platform_time.monotonicNs() });
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-standalone-metadata-{d}", .{ path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -2198,6 +2298,30 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.data_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--storage-engine")) {
+            cfg.storage_engine = parseStorageEngine(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--storage-engine=")) {
+            cfg.storage_engine = parseStorageEngine(arg["--storage-engine=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--storage-path")) {
+            cfg.storage_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--storage-path=")) {
+            cfg.storage_path = arg["--storage-path=".len..];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--fsync")) {
+            cfg.storage_fsync = parseBoolFlag(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--fsync=")) {
+            cfg.storage_fsync = parseBoolFlag(arg["--fsync=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--replica-root-dir")) {
             cfg.replica_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
@@ -2317,6 +2441,13 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         return error.InvalidArguments;
     }
     return cfg;
+}
+
+fn parseStorageEngine(value: []const u8) ?antfly.common.config.StorageEngine {
+    if (std.mem.eql(u8, value, "local")) return .local;
+    if (std.mem.eql(u8, value, "lite")) return .lite;
+    if (std.mem.eql(u8, value, "object")) return .object;
+    return null;
 }
 
 fn resolveLocalBaseDir(
@@ -2893,7 +3024,7 @@ fn mbToBytes(value: usize) usize {
 
 fn printUsage() void {
     std.debug.print(
-        \\Usage: antfly swarm [options]
+        \\Usage: antfly standalone [options]
         \\
         \\Options:
         \\  --config <path>                       JSON common config file
@@ -2916,6 +3047,9 @@ fn printUsage() void {
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
+        \\  --storage-engine lite                 Use the single-file Lite engine
+        \\  --storage-path <path.aflite>          Lite database path (required with Lite)
+        \\  --fsync <true|false>                  Lite commit durability (default: true)
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
         \\  --snapshot-root-dir <path>            Snapshot root directory
@@ -3041,12 +3175,12 @@ const RecordingServer = struct {
     }
 };
 
-test "swarm runtime module compiles" {
+test "standalone runtime module compiles" {
     _ = run;
     _ = runFromIterator;
 }
 
-test "swarm runtime local generator accepts media url data uris" {
+test "standalone runtime local generator accepts media url data uris" {
     const alloc = std.testing.allocator;
     const messages = [_]antfly.inference.ChatMessage{.{
         .role = .user,
@@ -3071,13 +3205,13 @@ test "swarm runtime local generator accepts media url data uris" {
     try std.testing.expectEqual(@as(usize, 0), message.content_parts.?[1].image);
 }
 
-test "swarm runtime leaves auth disabled unless config or cli enables it" {
+test "standalone runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{}, null));
     try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
-test "swarm bridge shared adapter preserves protocol headers and absent body" {
+test "standalone bridge shared adapter preserves protocol headers and absent body" {
     const alloc = std.testing.allocator;
 
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
@@ -3094,7 +3228,7 @@ test "swarm bridge shared adapter preserves protocol headers and absent body" {
     try std.testing.expectEqualStrings("", req.body);
 }
 
-test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
+test "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
     var data_server = antfly.data.runtime.DataServer{
         .alloc = std.testing.allocator,
         .provisioned_storage = undefined,
@@ -3127,7 +3261,7 @@ test "swarm runtime local replica reconcile permit stays blocked while startup d
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
 }
 
-test "swarm runtime registers internal group routes explicitly" {
+test "standalone runtime registers internal group routes explicitly" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
@@ -3163,7 +3297,7 @@ test "swarm runtime registers internal group routes explicitly" {
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_status_suffix));
 }
 
-test "swarm runtime registers HA admin bridge routes before antfarm catch-all" {
+test "standalone runtime registers HA admin bridge routes before antfarm catch-all" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
@@ -3183,7 +3317,7 @@ test "swarm runtime registers HA admin bridge routes before antfarm catch-all" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
-test "swarm runtime registers HA internal replication bridge routes before antfarm catch-all" {
+test "standalone runtime registers HA internal replication bridge routes before antfarm catch-all" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
@@ -3203,7 +3337,7 @@ test "swarm runtime registers HA internal replication bridge routes before antfa
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
-test "swarm runtime registers mcp routes before antfarm catch-all" {
+test "standalone runtime registers mcp routes before antfarm catch-all" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
@@ -3220,7 +3354,7 @@ test "swarm runtime registers mcp routes before antfarm catch-all" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
-test "swarm runtime registers extension routes before antfarm catch-all" {
+test "standalone runtime registers extension routes before antfarm catch-all" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
@@ -3238,7 +3372,7 @@ test "swarm runtime registers extension routes before antfarm catch-all" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
-test "swarm runtime registers antfarm static routes" {
+test "standalone runtime registers antfarm static routes" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
@@ -3250,12 +3384,15 @@ test "swarm runtime registers antfarm static routes" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
-test "swarm runtime antfarm path guards keep api routes reserved" {
+test "standalone runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/db/v1/tables"));
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
     try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
     try std.testing.expect(isAntfarmReservedPath("/admin/v1/ha/primary/status"));
     try std.testing.expect(isAntfarmReservedPath("/extensions/v1/packages"));
+    try std.testing.expect(isAntfarmReservedPath("/unknown/v1/status"));
+    try std.testing.expect(isAntfarmReservedPath("/unknown/v12/status"));
+    try std.testing.expect(!isAntfarmReservedPath("/models/version/status"));
     try std.testing.expect(!isAntfarmReservedPath("/models"));
     try std.testing.expect(hasUnsafeStaticPath("../index.html"));
     try std.testing.expect(hasUnsafeStaticPath("%2e%2e/index.html"));
@@ -3556,7 +3693,7 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
 }
 
-test "swarm HA standby replication flags require upstream and slot" {
+test "standalone HA standby replication flags require upstream and slot" {
     try std.testing.expectError(error.HAStandbySlotMissing, haStandbyReplicationConfigFromCli(.{
         .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
     }));
@@ -3613,7 +3750,7 @@ test "swarm HA standby replication flags require upstream and slot" {
     try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
 }
 
-test "swarm HA string classifier distinguishes missing padded and valid values" {
+test "standalone HA string classifier distinguishes missing padded and valid values" {
     try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(null));
     try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(""));
     try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(" \t\r\n"));
@@ -3627,7 +3764,7 @@ test "swarm HA string classifier distinguishes missing padded and valid values" 
     try std.testing.expectEqualStrings("standby-a", try requireHAString("standby-a", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
 }
 
-test "swarm HA primary identity defaults shard and table to whole instance" {
+test "standalone HA primary identity defaults shard and table to whole instance" {
     const identity = try haPrimaryIdentity(.{
         .ha_cluster_id = 100,
         .ha_timeline_id = 3,
@@ -3640,7 +3777,7 @@ test "swarm HA primary identity defaults shard and table to whole instance" {
     try std.testing.expectEqual(@as(u64, 4), identity.epoch);
 }
 
-test "swarm HA standby identity defaults shard and table to whole instance" {
+test "standalone HA standby identity defaults shard and table to whole instance" {
     const identity = try haStandbyIdentity(.{
         .ha_cluster_id = 100,
         .ha_timeline_id = 3,
@@ -3653,7 +3790,7 @@ test "swarm HA standby identity defaults shard and table to whole instance" {
     try std.testing.expectEqual(@as(u64, 4), identity.epoch);
 }
 
-test "swarm HA runtime rejects ambiguous role flags" {
+test "standalone HA runtime rejects ambiguous role flags" {
     try std.testing.expectError(error.HAMultipleRolesConfigured, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
         .ha_standby_log = "/tmp/standby.log",
@@ -3946,7 +4083,7 @@ test "swarm HA runtime rejects ambiguous role flags" {
     }));
 }
 
-test "swarm HA runtime requires HA paths under resolved data root" {
+test "standalone HA runtime requires HA paths under resolved data root" {
     const root = "/tmp/antfly-data-root";
     const primary_cfg = CliConfig{
         .ha_primary_log = root ++ "/ha/primary.log",
@@ -4040,7 +4177,7 @@ test "swarm HA runtime requires HA paths under resolved data root" {
     }, root));
 }
 
-test "swarm HA runtime validates bearer token env name before lookup" {
+test "standalone HA runtime validates bearer token env name before lookup" {
     const alloc = std.testing.allocator;
     const c = struct {
         extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -4076,13 +4213,13 @@ test "swarm HA runtime validates bearer token env name before lookup" {
     }));
 }
 
-test "swarm runtime defaults public listener to antfarm port" {
+test "standalone runtime defaults public listener to antfarm port" {
     const listener = resolvePublicListener(.{});
     try std.testing.expectEqualStrings("127.0.0.1", listener.bind_host);
     try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
 }
 
-test "swarm public HTTP server uses public API request body limit" {
+test "standalone public HTTP server uses public API request body limit" {
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
 }
@@ -4112,20 +4249,20 @@ test "antfly config uses cli override before common config" {
     try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveInferenceBudgetOverrides(cli).backend_limit_bytes);
 }
 
-test "swarm public api caps keep alive request reuse" {
+test "standalone public api caps keep alive request reuse" {
     try std.testing.expect(public_api_max_requests_per_connection > 0);
     try std.testing.expect(public_api_max_requests_per_connection < 1000);
 }
 
-test "swarm public api body limit matches common http listener" {
+test "standalone public api body limit matches common http listener" {
     try std.testing.expectEqual(antfly.common.http.default_max_request_bytes, public_api_max_body_size);
 }
 
-test "swarm readiness follows api initialization and unified listener" {
-    try std.testing.expect(!swarmReadyFromState(false, false));
-    try std.testing.expect(!swarmReadyFromState(false, true));
-    try std.testing.expect(!swarmReadyFromState(true, false));
-    try std.testing.expect(swarmReadyFromState(true, true));
+test "standalone readiness follows api initialization and unified listener" {
+    try std.testing.expect(!standaloneReadyFromState(false, false));
+    try std.testing.expect(!standaloneReadyFromState(false, true));
+    try std.testing.expect(!standaloneReadyFromState(true, false));
+    try std.testing.expect(standaloneReadyFromState(true, true));
 }
 
 test "parse cli accepts inference budget overrides" {
@@ -4187,7 +4324,7 @@ test "inference config falls back to common config" {
     try std.testing.expectEqualStrings("q4_k", warm_models.items[0].quantization.?);
 }
 
-test "swarm runtime resolves paths from common storage base dir" {
+test "standalone runtime resolves paths from common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
@@ -4228,14 +4365,14 @@ test "swarm runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
 }
 
-test "swarm runtime resolves explicit extension package store path" {
+test "standalone runtime resolves explicit extension package store path" {
     const alloc = std.testing.allocator;
     const resolved = try resolvePaths(alloc, .{ .extension_package_store_dir = "/opt/antfly/extensions" }, null);
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", resolved.extension_package_store_dir);
 }
 
-test "swarm runtime resolves extension package store env before local default" {
+test "standalone runtime resolves extension package store env before local default" {
     const alloc = std.testing.allocator;
 
     const env_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, null, "/tmp/antflydb", "/antfly-extension-env");
@@ -4247,7 +4384,7 @@ test "swarm runtime resolves extension package store env before local default" {
     try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
 }
 
-test "swarm runtime resolves explicit secret store path" {
+test "standalone runtime resolves explicit secret store path" {
     const alloc = std.testing.allocator;
     var cli = CliConfig{};
     defer cli.deinit(alloc);
@@ -4257,7 +4394,7 @@ test "swarm runtime resolves explicit secret store path" {
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", resolved.secret_store_path);
 }
 
-test "swarm runtime data dir overrides common storage base dir" {
+test "standalone runtime data dir overrides common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),

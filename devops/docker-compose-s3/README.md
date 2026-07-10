@@ -37,7 +37,7 @@ This will:
 Check the Antfly logs to confirm S3 is configured:
 
 ```bash
-docker logs antfly-swarm-s3 | grep "S3 storage"
+docker logs antfly-standalone-s3 | grep "S3 storage"
 ```
 
 You should see:
@@ -266,7 +266,7 @@ Trade-offs:
 
 View Antfly logs:
 ```bash
-docker logs -f antfly-swarm-s3
+docker logs -f antfly-standalone-s3
 ```
 
 Look for:
@@ -325,10 +325,10 @@ docker logs minio  # Check MinIO logs
 **Check**:
 ```bash
 # Verify S3 is enabled
-docker exec antfly-swarm-s3 cat /config.yaml | grep -A 5 "s3:"
+docker exec antfly-standalone-s3 cat /config.yaml | grep -A 5 "s3:"
 
 # Check if Antfly became leader
-docker logs antfly-swarm-s3 | grep "leader"
+docker logs antfly-standalone-s3 | grep "leader"
 ```
 
 ### High S3 Request Costs
@@ -434,7 +434,7 @@ This removes:
 ## Support
 
 For issues or questions:
-- Check Antfly logs: `docker logs antfly-swarm-s3`
+- Check Antfly logs: `docker logs antfly-standalone-s3`
 - Check MinIO logs: `docker logs minio`
 - Review documentation in `docs/`
 - Open an issue on GitHub

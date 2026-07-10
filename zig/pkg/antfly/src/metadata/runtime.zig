@@ -158,7 +158,7 @@ const ResolvedPaths = struct {
 /// Backs the metadata server's health/metrics endpoints. Exposes local raft
 /// host metrics and managed-service metrics as Prometheus text, and reports
 /// readiness from a cached, constant-time probe flag. Shared by the standalone
-/// metadata runtime and the swarm runtime so both expose the same metric set.
+/// metadata runtime and the standalone runtime so both expose the same metric set.
 pub const HealthSource = struct {
     server: *Server,
 

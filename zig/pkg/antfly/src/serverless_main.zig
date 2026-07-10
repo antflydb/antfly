@@ -51,14 +51,14 @@ pub fn run(
     init: std.process.Init,
     forced_role: ?serverless.RuntimeRole,
     forced_listener: ?bool,
-    forced_swarm_mode: ?bool,
+    forced_combined_mode: ?bool,
 ) !void {
     const alloc = init.gpa;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
 
     const argv0 = args.next() orelse "antfly_serverless";
-    return try runFromIterator(init, argv0, &args, forced_role, forced_listener, forced_swarm_mode);
+    return try runFromIterator(init, argv0, &args, forced_role, forced_listener, forced_combined_mode);
 }
 
 pub fn runFromIterator(
@@ -67,7 +67,7 @@ pub fn runFromIterator(
     args: *std.process.Args.Iterator,
     forced_role: ?serverless.RuntimeRole,
     forced_listener: ?bool,
-    forced_swarm_mode: ?bool,
+    forced_combined_mode: ?bool,
 ) !void {
     const alloc = init.gpa;
     const cli = try parseCli(args);
@@ -98,7 +98,7 @@ pub fn runFromIterator(
         .chunk_embedding_dimensions = cli.chunk_embedding_dimensions orelse parseEnvIntOrDefault(init.environ_map, u32, "ANTFLY_SERVERLESS_CHUNK_EMBEDDING_DIMS", 8),
         .tick_interval_ms = cli.tick_ms orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_TICK_INTERVAL_MS", 25),
         .role = forced_role orelse try parseRuntimeRole(cli.role orelse init.environ_map.get("ANTFLY_SERVERLESS_ROLE") orelse "combined"),
-        .swarm_mode = forced_swarm_mode orelse false,
+        .combined_mode = forced_combined_mode orelse false,
         .publish_enabled = cli.publish_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PUBLISH_ENABLED", true),
         .compaction_enabled = cli.compaction_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_COMPACTION_ENABLED", true),
         .prune_enabled = cli.prune_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
@@ -482,9 +482,9 @@ fn sleepMs(io: std.Io, ms: u64) void {
 }
 
 fn printRuntimeStatusSummary(status: *const serverless.ServerlessRuntimeStatus) void {
-    std.debug.print("serverless bootstrap role={s} swarm_mode={any} validated={any} tick_ms={d}\n", .{
+    std.debug.print("serverless bootstrap role={s} combined_mode={any} validated={any} tick_ms={d}\n", .{
         @tagName(status.role),
-        status.swarm_mode,
+        status.combined_mode,
         status.validated,
         status.tick_interval_ms,
     });

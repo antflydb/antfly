@@ -49,21 +49,21 @@ func TestE2E_SecretsAPI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Start swarm — no Antfly inference needed, secrets are metadata-only.
-	t.Log("Starting Antfly swarm (no Antfly inference)...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	defer swarm.Cleanup()
+	// Start standalone — no Antfly inference needed, secrets are metadata-only.
+	t.Log("Starting Antfly standalone (no Antfly inference)...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	defer standalone.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/db/v1"
+	baseURL := standalone.MetadataAPIURL + "/db/v1"
 
 	// ---- 1. GET /secrets — initially empty (or env-var-only) ----
 	t.Log("Step 1: List secrets (expect empty)")
 	list := listSecrets(t, ctx, baseURL)
 	t.Logf("  Got %d secrets", len(list.Secrets))
-	// No keystore secrets should exist in a fresh swarm.
+	// No keystore secrets should exist in a fresh standalone.
 	for _, s := range list.Secrets {
 		assert.NotEqual(t, "configured_keystore", s.Status,
-			"fresh swarm should not have keystore secrets")
+			"fresh standalone should not have keystore secrets")
 	}
 
 	// ---- 2. PUT /secrets/test.api_key — store a secret ----

@@ -33,9 +33,9 @@ Supported intent includes:
 
 - metadata node count and resources
 - data node count and resources
-- swarm-mode resources
+- standalone-mode resources
 - inference pool attachment through Inference
-- metadata, data, and swarm storage sizes
+- metadata, data, and standalone storage sizes
 - data-node autoscaling bounds
 - cloud-specific placement and service settings
 - backup and restore integration through the backup/restore CRDs
@@ -101,7 +101,7 @@ Antfly storage changes are grow-only.
 
 Users may increase:
 
-- `spec.storage.swarmStorage`
+- `spec.storage.standaloneStorage`
 - `spec.storage.metadataStorage`
 - `spec.storage.dataStorage`
 
@@ -124,9 +124,9 @@ possible.
 
 CPU and memory changes are expressed through the `AntflyCluster` spec.
 
-Swarm mode uses:
+Standalone mode uses:
 
-- `spec.swarm.resources`
+- `spec.standalone.resources`
 
 Clustered mode uses:
 
@@ -228,7 +228,7 @@ Useful public condition types include:
 - `Scaling`
 - `MetadataReady`
 - `DataReady`
-- `SwarmReady`
+- `StandaloneReady`
 
 Common public reason values include:
 

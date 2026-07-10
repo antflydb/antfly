@@ -146,6 +146,14 @@ pub const Store = struct {
         return try backend_erased.storeFrom(allocator, RuntimeStore{ .store = self });
     }
 
+    /// Returns a DB runtime store isolated under a caller-owned key prefix.
+    /// The prefix must remain alive for the erased store's lifetime and end in
+    /// a zero byte so range scans have an unambiguous namespace boundary.
+    pub fn runtimeStoreWithPrefix(self: *Store, allocator: Allocator, prefix: []const u8) !backend_erased.Store {
+        if (prefix.len == 0 or prefix[prefix.len - 1] != 0) return error.InvalidArgument;
+        return try backend_erased.storeFrom(allocator, RuntimeStore{ .store = self, .prefix = prefix });
+    }
+
     pub fn vacuum(self: *Store) !native.VacuumReport {
         try self.reserveWriterSlot();
         defer self.releaseWriterSlot();
@@ -390,41 +398,70 @@ pub const Store = struct {
 
 const RuntimeStore = struct {
     store: *Store,
+    prefix: []const u8 = "",
 
     pub fn capabilities(self: *RuntimeStore) backend_types.Capabilities {
         return Store.capabilities(self.store);
     }
 
     pub fn beginRead(self: *RuntimeStore) !Txn {
-        return try self.store.beginRead();
+        return try Txn.openReadWithPrefix(self.store, self.prefix);
     }
 
     pub fn beginWrite(self: *RuntimeStore) !Txn {
-        return try self.store.beginWriteYielding();
+        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
     }
 
     pub fn beginBatch(self: *RuntimeStore) !Txn {
-        return try self.store.beginBatchYielding();
+        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
     }
 
     pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
-        return try self.store.beginBatchWithOptionsYielding(options);
+        _ = options;
+        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
     }
 
     pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
-        return self.store.lastReplaySequence(fallback_last);
+        const next = self.nextReplaySequence(fallback_last + 1);
+        return if (next <= 1) 0 else next - 1;
     }
 
     pub fn nextReplaySequence(self: *RuntimeStore, fallback_next: u64) u64 {
-        return self.store.nextReplaySequence(fallback_next);
+        var read = self.beginRead() catch return fallback_next;
+        defer read.abort();
+        const raw = read.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        if (raw.len != 8) return fallback_next;
+        return std.mem.readInt(u64, raw[0..8], .little);
     }
 
     pub fn appendReplayOpaque(self: *RuntimeStore, alloc: Allocator, sequence: u64, payload: []const u8) !void {
-        return try self.store.appendReplayOpaqueYielding(alloc, sequence, payload);
+        _ = alloc;
+        var txn = try self.beginWrite();
+        errdefer txn.abort();
+        try txn.setReplayOpaque(sequence, payload);
+        try txn.commit();
     }
 
     pub fn iterateReplayFrom(self: *RuntimeStore, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
-        return try self.store.iterateReplayFrom(alloc, from_sequence);
+        var entries = std.ArrayListUnmanaged(backend_types.ReplayEntry).empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(alloc);
+            entries.deinit(alloc);
+        }
+        const Context = struct {
+            allocator: Allocator,
+            entries: *std.ArrayListUnmanaged(backend_types.ReplayEntry),
+            fn handle(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                try ctx.entries.append(ctx.allocator, .{
+                    .sequence = sequence,
+                    .payload = try ctx.allocator.dupe(u8, payload),
+                });
+            }
+        };
+        var ctx = Context{ .allocator = alloc, .entries = &entries };
+        _ = try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Context.handle);
+        return try entries.toOwnedSlice(alloc);
     }
 
     pub fn forEachReplayLaneFrom(
@@ -435,11 +472,50 @@ const RuntimeStore = struct {
         callback_ctx: *anyopaque,
         callback: backend_erased.Store.ReplayCallback,
     ) !backend_types.ReplayLaneIterationStats {
-        return try self.store.forEachReplayLaneFrom(kind_ordinal, from_sequence, max_entries, callback_ctx, callback);
+        var read = try self.beginRead();
+        defer read.abort();
+        _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return error.ReplayIndexUnavailable;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(kind_ordinal, from_sequence);
+        const upper = internal_keys.replayRangeUpper(kind_ordinal);
+        cursor.setUpperBound(upper[0..]);
+        var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+        var entry = cursor.seekAtOrAfter(lower[0..]) catch return stats;
+        while (true) {
+            if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
+            const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind_ordinal) orelse break;
+            try callback(callback_ctx, sequence, entry.value);
+            stats.scanned_entries += 1;
+            stats.matched_entries += 1;
+            stats.last_sequence = sequence;
+            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
+            entry = cursor.next() catch break;
+        }
+        return stats;
     }
 
     pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
-        return try self.store.truncateReplayUpToYielding(alloc, up_to_sequence);
+        if (up_to_sequence == 0) return;
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+        {
+            var read = try self.beginRead();
+            defer read.abort();
+            _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return;
+            try collectReplayDeletes(alloc, &read, internal_keys.replay_all_kind, up_to_sequence, &deletes);
+            for (replay_hints) |hint| {
+                try collectReplayDeletes(alloc, &read, replayHintOrdinal(hint), up_to_sequence, &deletes);
+            }
+        }
+        if (deletes.items.len == 0) return;
+        var write = try self.beginWrite();
+        errdefer write.abort();
+        for (deletes.items) |key| try write.delete(key);
+        try write.commit();
     }
 };
 
@@ -598,8 +674,13 @@ pub const Txn = struct {
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
     read_only: bool = true,
     writer_reserved: bool = false,
+    prefix: []const u8 = "",
 
     pub fn openRead(store: *Store) !Txn {
+        return try openReadWithPrefix(store, "");
+    }
+
+    pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         lockStore(store);
         defer store.mutex.unlock();
         const snapshot = try acquireSnapshotLocked(store);
@@ -608,10 +689,15 @@ pub const Txn = struct {
             .snapshot = snapshot,
             .docs = snapshot.docs,
             .read_only = true,
+            .prefix = prefix,
         };
     }
 
     pub fn openWrite(store: *Store) !Txn {
+        return try openWriteWithPrefix(store, "");
+    }
+
+    pub fn openWriteWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try store.reserveWriterSlot();
         errdefer store.releaseWriterSlot();
 
@@ -626,10 +712,15 @@ pub const Txn = struct {
             .docs = snapshot.docs,
             .read_only = false,
             .writer_reserved = true,
+            .prefix = prefix,
         };
     }
 
     pub fn openWriteYielding(store: *Store) !Txn {
+        return try openWriteYieldingWithPrefix(store, "");
+    }
+
+    pub fn openWriteYieldingWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try store.reserveWriterSlotYielding();
         errdefer store.releaseWriterSlot();
 
@@ -644,6 +735,7 @@ pub const Txn = struct {
             .docs = snapshot.docs,
             .read_only = false,
             .writer_reserved = true,
+            .prefix = prefix,
         };
     }
 
@@ -692,23 +784,28 @@ pub const Txn = struct {
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
+        const lookup_key = try self.prefixedKey(key);
+        defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
         if (self.pending.items.len > 0) {
             var i = self.pending.items.len;
             while (i > 0) {
                 i -= 1;
                 const pending = self.pending.items[i];
-                if (!std.mem.eql(u8, pending.key, key)) continue;
+                if (!std.mem.eql(u8, pending.key, lookup_key)) continue;
                 return pending.value orelse error.NotFound;
             }
         }
-        const idx = lowerBoundDocs(self.docs, key);
-        if (idx >= self.docs.len or !std.mem.eql(u8, self.docs[idx].key, key)) return error.NotFound;
+        const idx = lowerBoundDocs(self.docs, lookup_key);
+        if (idx >= self.docs.len or !std.mem.eql(u8, self.docs[idx].key, lookup_key)) return error.NotFound;
         return self.docs[idx].value;
     }
 
     pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
-        const owned_key = try self.allocator.dupe(u8, key);
+        const owned_key = if (self.prefix.len == 0)
+            try self.allocator.dupe(u8, key)
+        else
+            try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
@@ -717,7 +814,10 @@ pub const Txn = struct {
 
     pub fn delete(self: *Txn, key: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
-        const owned_key = try self.allocator.dupe(u8, key);
+        const owned_key = if (self.prefix.len == 0)
+            try self.allocator.dupe(u8, key)
+        else
+            try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         try self.pending.append(self.allocator, .{ .key = owned_key });
     }
@@ -745,6 +845,11 @@ pub const Txn = struct {
         store.releaseWriterSlot();
         self.writer_reserved = false;
     }
+
+    fn prefixedKey(self: *Txn, key: []const u8) ![]const u8 {
+        if (self.prefix.len == 0) return key;
+        return try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
+    }
 };
 
 pub const Cursor = struct {
@@ -755,14 +860,23 @@ pub const Cursor = struct {
     pub fn close(_: *Cursor) void {}
 
     pub fn first(self: *Cursor) !backend_adapter.Entry {
-        if (self.txn.docs.len == 0) return error.NotFound;
-        self.current = 0;
-        return self.entryAt(0);
+        const idx = if (self.txn.prefix.len == 0) 0 else lowerBoundDocs(self.txn.docs, self.txn.prefix);
+        if (idx >= self.txn.docs.len) return error.NotFound;
+        self.current = idx;
+        return self.entryAt(idx);
     }
 
     pub fn last(self: *Cursor) !backend_adapter.Entry {
         if (self.txn.docs.len == 0) return error.NotFound;
-        const idx = self.txn.docs.len - 1;
+        const idx = if (self.txn.prefix.len == 0)
+            self.txn.docs.len - 1
+        else blk: {
+            const upper = try self.namespaceUpperBound();
+            defer self.txn.allocator.free(upper);
+            const end = lowerBoundDocs(self.txn.docs, upper);
+            if (end == 0) return error.NotFound;
+            break :blk end - 1;
+        };
         self.current = idx;
         return self.entryAt(idx);
     }
@@ -784,15 +898,19 @@ pub const Cursor = struct {
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        const idx = lowerBoundDocs(self.txn.docs, key);
+        const lookup_key = try self.txn.prefixedKey(key);
+        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
+        const idx = lowerBoundDocs(self.txn.docs, lookup_key);
         if (idx >= self.txn.docs.len) return error.NotFound;
         self.current = idx;
         return self.entryAt(idx);
     }
 
     pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        const idx = lowerBoundDocs(self.txn.docs, key);
-        if (idx < self.txn.docs.len and std.mem.eql(u8, self.txn.docs[idx].key, key)) {
+        const lookup_key = try self.txn.prefixedKey(key);
+        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
+        const idx = lowerBoundDocs(self.txn.docs, lookup_key);
+        if (idx < self.txn.docs.len and std.mem.eql(u8, self.txn.docs[idx].key, lookup_key)) {
             self.current = idx;
             return self.entryAt(idx);
         }
@@ -807,10 +925,19 @@ pub const Cursor = struct {
 
     fn entryAt(self: *Cursor, idx: usize) !backend_adapter.Entry {
         const doc = self.txn.docs[idx];
+        if (!std.mem.startsWith(u8, doc.key, self.txn.prefix)) return error.NotFound;
+        const key = doc.key[self.txn.prefix.len..];
         if (self.upper_bound) |upper| {
-            if (std.mem.order(u8, doc.key, upper) != .lt) return error.NotFound;
+            if (std.mem.order(u8, key, upper) != .lt) return error.NotFound;
         }
-        return .{ .key = doc.key, .value = doc.value };
+        return .{ .key = key, .value = doc.value };
+    }
+
+    fn namespaceUpperBound(self: *Cursor) ![]u8 {
+        const upper = try self.txn.allocator.dupe(u8, self.txn.prefix);
+        std.debug.assert(upper.len > 0 and upper[upper.len - 1] == 0);
+        upper[upper.len - 1] = 1;
+        return upper;
     }
 };
 
@@ -1021,6 +1148,50 @@ test "lite native docstore runtime persists atomic batch" {
     try std.testing.expectEqualStrings("first", try read.get("doc:a"));
     try std.testing.expectEqualStrings("newer second", try read.get("doc:b"));
     try std.testing.expectError(error.NotFound, read.get("doc:c"));
+}
+
+test "lite native docstore prefixed runtimes isolate keys cursors and replay" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-prefixed.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    const prefix_a = [_]u8{ 't', 'a', 0 };
+    const prefix_b = [_]u8{ 't', 'b', 0 };
+    var runtime_a = try store.runtimeStoreWithPrefix(allocator, &prefix_a);
+    defer runtime_a.deinit();
+    var runtime_b = try store.runtimeStoreWithPrefix(allocator, &prefix_b);
+    defer runtime_b.deinit();
+
+    var write_a = try runtime_a.beginBatch();
+    try write_a.put("doc:same", "a");
+    try write_a.put("doc:only-a", "a-only");
+    try write_a.commit();
+    var write_b = try runtime_b.beginBatch();
+    try write_b.put("doc:same", "b");
+    try write_b.commit();
+
+    var read_a = try runtime_a.beginRead();
+    defer read_a.abort();
+    try std.testing.expectEqualStrings("a", try read_a.get("doc:same"));
+    var cursor_a = try read_a.openCursor();
+    defer cursor_a.close();
+    try std.testing.expectEqualStrings("doc:only-a", (try cursor_a.first()).?.key);
+    try std.testing.expectEqualStrings("doc:same", (try cursor_a.next()).?.key);
+    try std.testing.expect((try cursor_a.next()) == null);
+
+    var read_b = try runtime_b.beginRead();
+    defer read_b.abort();
+    try std.testing.expectEqualStrings("b", try read_b.get("doc:same"));
+    try std.testing.expectError(error.NotFound, read_b.get("doc:only-a"));
+
+    try runtime_a.appendReplayOpaque(allocator, 7, "a-replay");
+    try runtime_b.appendReplayOpaque(allocator, 2, "b-replay");
+    try std.testing.expectEqual(@as(u64, 8), runtime_a.nextReplaySequence(0));
+    try std.testing.expectEqual(@as(u64, 3), runtime_b.nextReplaySequence(0));
 }
 
 test "lite native docstore runtime scans ordered snapshot" {

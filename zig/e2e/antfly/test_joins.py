@@ -217,7 +217,7 @@ def test_distributed_right_join_returns_unmatched_right_rows(stateful_api):
     assert zoe_source[joined_tier] == "gold"
 
 
-def test_distributed_join_still_works_after_swarm_restart(stateful_api):
+def test_distributed_join_still_works_after_standalone_restart(stateful_api):
     docs_table, customers_table = _seed_join_tables(stateful_api, "distributed_join_restart")
 
     before_restart = wait_until(

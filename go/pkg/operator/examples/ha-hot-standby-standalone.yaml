@@ -28,9 +28,9 @@ metadata:
 spec:
   image: ghcr.io/antflydb/antfly:latest
   imagePullPolicy: IfNotPresent
-  mode: Swarm
+  mode: Standalone
 
-  swarm:
+  standalone:
     replicas: 1
     nodeID: 1
     metadataAPI:
@@ -57,7 +57,7 @@ spec:
 
   storage:
     storageClass: ""
-    swarmStorage: "20Gi"
+    standaloneStorage: "20Gi"
 
   highAvailability:
     mode: HotStandby
@@ -91,7 +91,7 @@ spec:
       adminURL: http://antfly-standby-public-api.default.svc.cluster.local:80
       routeSelector:
         app.kubernetes.io/name: antfly-database
-        app.kubernetes.io/component: swarm
+        app.kubernetes.io/component: standalone
         app.kubernetes.io/instance: antfly-standby
     syncPolicy:
       mode: RemoteApply
@@ -129,9 +129,9 @@ metadata:
 spec:
   image: ghcr.io/antflydb/antfly:latest
   imagePullPolicy: IfNotPresent
-  mode: Swarm
+  mode: Standalone
 
-  swarm:
+  standalone:
     replicas: 1
     nodeID: 2
     metadataAPI:
@@ -158,7 +158,7 @@ spec:
 
   storage:
     storageClass: ""
-    swarmStorage: "20Gi"
+    standaloneStorage: "20Gi"
 
   highAvailability:
     mode: HotStandby

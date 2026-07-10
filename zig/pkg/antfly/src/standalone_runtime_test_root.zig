@@ -12,19 +12,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const std = @import("std");
-const antfly = @import("antfly-zig");
-const serverless_main = @import("../serverless_main.zig");
+pub const runtime = @import("standalone/runtime.zig");
+pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
-pub fn run(init: std.process.Init) !void {
-    return try serverless_main.run(init, antfly.serverless.RuntimeRole.combined, true, true);
-}
-
-pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator) !void {
-    return try serverless_main.runFromIterator(init, argv0, args, antfly.serverless.RuntimeRole.combined, true, true);
-}
-
-test "serverless swarm cmd compiles" {
-    _ = run;
-    _ = runFromIterator;
+test {
+    _ = runtime;
+    _ = storage_backend_erased;
+    _ = lsm_backend;
 }

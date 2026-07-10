@@ -915,11 +915,11 @@ const ModelsPage: React.FC = () => {
     const checkDownloads = async () => {
       try {
         if (isProductEnabled("antfly")) {
-          // Full antfarm build: check swarm_mode from antfly status
+          // Full antfarm build: check the deployment topology from Antfly status.
           const response = await fetch(`${apiUrl}/status`);
           if (response.ok) {
             const data = await response.json();
-            setAllowDownloads(data.swarm_mode === true);
+            setAllowDownloads(data.deployment_mode === "standalone");
           }
         } else {
           // Inference-only build: check allow_downloads from the model listing metadata.

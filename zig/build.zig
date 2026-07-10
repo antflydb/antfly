@@ -1146,7 +1146,7 @@ pub fn build(b: *std.Build) void {
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, antfly_version);
-    const swarm_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, antfly_version);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, antfly_version);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -3819,6 +3819,7 @@ pub fn build(b: *std.Build) void {
         "api http server surfaces structured torn-state conflicts when txn record is corrupted",
         "api http server serves transaction session cleanup route",
         "api http server serves table metadata list and detail",
+        "api http server exposes storage status and asynchronous maintenance jobs",
         "api http server serves runtime schema debug on table and index detail",
         "api http server serves table index metadata routes",
         "api index status prefers best-effort write runtime status",
@@ -4378,15 +4379,15 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
     lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
 
-    const lib_api_swarm_backup_restore_tests = b.addTest(.{
+    const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "public api swarm-like e2e backs up drops and restores a table",
+            "public api standalone-like e2e backs up drops and restores a table",
         },
     });
-    const run_lib_api_swarm_backup_restore_tests = b.addRunArtifact(lib_api_swarm_backup_restore_tests);
-    const lib_api_swarm_backup_restore_test_step = b.step("lib-api-swarm-backup-restore-test", "Run the focused swarm-like backup/restore e2e test");
-    lib_api_swarm_backup_restore_test_step.dependOn(&run_lib_api_swarm_backup_restore_tests.step);
+    const run_lib_api_standalone_backup_restore_tests = b.addRunArtifact(lib_api_standalone_backup_restore_tests);
+    const lib_api_standalone_backup_restore_test_step = b.step("lib-api-standalone-backup-restore-test", "Run the focused standalone-like backup/restore e2e test");
+    lib_api_standalone_backup_restore_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
 
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
@@ -4681,29 +4682,30 @@ pub fn build(b: *std.Build) void {
     conformance_test_step.dependOn(run_lib_audio_xiph_conformance_after_fetch_quiet_step);
     conformance_test_step.dependOn(run_lib_audio_misc_conformance_after_fetch_quiet_step);
 
-    const swarm_runtime_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/swarm_runtime_test_root.zig"),
+    const standalone_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    var swarm_runtime_imports = antfly_imports;
-    swarm_runtime_imports.build_options = swarm_runtime_build_options;
-    swarm_runtime_imports.configure(b, swarm_runtime_test_mod, true, true);
-    const usermgr_storage_swarm_runtime_test_mod = b.createModule(.{
+    var standalone_runtime_imports = antfly_imports;
+    standalone_runtime_imports.build_options = standalone_runtime_build_options;
+    standalone_runtime_imports.configure(b, standalone_runtime_test_mod, true, true);
+    const usermgr_storage_standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
         .optimize = optimize,
     });
-    usermgr_storage_swarm_runtime_test_mod.addImport("antfly_root", swarm_runtime_test_mod);
-    usermgr_storage_swarm_runtime_test_mod.addImport("antfly_platform", platform_mod);
-    swarm_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_swarm_runtime_test_mod);
-    const lib_swarm_runtime_tests = b.addTest(.{
-        .root_module = swarm_runtime_test_mod,
+    usermgr_storage_standalone_runtime_test_mod.addImport("antfly_root", standalone_runtime_test_mod);
+    usermgr_storage_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
+    const lib_standalone_runtime_tests = b.addTest(.{
+        .root_module = standalone_runtime_test_mod,
         .filters = &.{
-            "swarm runtime module compiles",
-            "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
-            "swarm runtime registers internal group routes explicitly",
-            "swarm runtime registers mcp routes before antfarm catch-all",
+            "standalone runtime module compiles",
+            "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved",
+            "standalone runtime registers internal group routes explicitly",
+            "standalone runtime registers mcp routes before antfarm catch-all",
+            "standalone runtime antfarm path guards keep api routes reserved",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -4711,26 +4713,26 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
             "parse cli accepts HA standby runtime flags",
-            "swarm HA standby replication flags require upstream and slot",
-            "swarm HA string classifier distinguishes missing padded and valid values",
-            "swarm HA runtime rejects ambiguous role flags",
+            "standalone HA standby replication flags require upstream and slot",
+            "standalone HA string classifier distinguishes missing padded and valid values",
+            "standalone HA runtime rejects ambiguous role flags",
             "antfly config uses cli override before common config",
-            "swarm public api caps keep alive request reuse",
-            "swarm public api body limit matches common http listener",
-            "swarm public HTTP server uses public API request body limit",
+            "standalone public api caps keep alive request reuse",
+            "standalone public api body limit matches common http listener",
+            "standalone public HTTP server uses public API request body limit",
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
-            "swarm runtime resolves paths from common storage base dir",
-            "swarm runtime resolves extension package store env before local default",
+            "standalone runtime resolves paths from common storage base dir",
+            "standalone runtime resolves extension package store env before local default",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
-    const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
-    lib_swarm_runtime_test_step.dependOn(&run_lib_swarm_runtime_tests.step);
+    const lib_standalone_runtime_test_step = b.step("lib-standalone-runtime-test", "Run focused standalone runtime tests");
+    const run_lib_standalone_runtime_tests = b.addRunArtifact(lib_standalone_runtime_tests);
+    lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
 
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
@@ -4778,7 +4780,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
-    unit_test_step.dependOn(lib_swarm_runtime_test_step);
+    unit_test_step.dependOn(lib_standalone_runtime_test_step);
     unit_test_step.dependOn(ha_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
@@ -6215,7 +6217,7 @@ pub fn build(b: *std.Build) void {
     replay_bench_build_options.addOption(bool, "storage_sim_soak", false);
     replay_bench_build_options.addOption(bool, "with_tla", with_tla);
     replay_bench_build_options.addOption(bool, "link_libc", true);
-    replay_bench_build_options.addOption(bool, "swarm_runtime_focused_test", false);
+    replay_bench_build_options.addOption(bool, "standalone_runtime_focused_test", false);
     replay_bench_build_options.addOption(bool, "bench_minimal_deps", true);
 
     const replay_bench_mod = b.createModule(.{

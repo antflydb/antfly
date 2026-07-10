@@ -17,6 +17,8 @@ const common_secrets = @import("../common/secrets.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const table_manager = @import("../metadata/table_manager.zig");
+const common_config = @import("../common/config.zig");
+const metadata_openapi = @import("antfly_metadata_openapi");
 
 pub const ClusterHealth = enum {
     healthy,
@@ -28,8 +30,9 @@ pub const ClusterStatus = struct {
     health: ClusterHealth,
     message: ?[]u8 = null,
     auth_enabled: bool = false,
-    swarm_mode: bool = false,
+    deployment_mode: common_config.DeploymentMode = .distributed,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?metadata_openapi.StorageRuntimeStatus = null,
 
     pub fn deinit(self: *ClusterStatus, alloc: std.mem.Allocator) void {
         if (self.message) |message| alloc.free(message);
@@ -41,8 +44,9 @@ pub const ClusterTopology = struct {
     health: ClusterHealth,
     message: ?[]u8 = null,
     auth_enabled: bool = false,
-    swarm_mode: bool = false,
+    deployment_mode: common_config.DeploymentMode = .distributed,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?metadata_openapi.StorageRuntimeStatus = null,
     data: ClusterDataStatus = .{},
 
     pub fn deinit(self: *ClusterTopology, alloc: std.mem.Allocator) void {
@@ -195,8 +199,9 @@ pub fn topologyFromStatus(alloc: std.mem.Allocator, status: ClusterStatus) !Clus
         .health = status.health,
         .message = if (status.message) |message| try alloc.dupe(u8, message) else null,
         .auth_enabled = status.auth_enabled,
-        .swarm_mode = status.swarm_mode,
+        .deployment_mode = status.deployment_mode,
         .secret_store = status.secret_store,
+        .storage = status.storage,
         .data = .{},
     };
 }

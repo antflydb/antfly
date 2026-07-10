@@ -78,7 +78,7 @@ export function SecretsPage() {
   const [secrets, setSecrets] = useState<SecretEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
-  const [swarmMode, setSwarmMode] = useState(false);
+  const [standaloneMode, setStandaloneMode] = useState(false);
 
   // Add secret dialog state
   const [addDialogOpen, setAddDialogOpen] = useState(false);
@@ -107,14 +107,14 @@ export function SecretsPage() {
     return headers;
   }, []);
 
-  // Check swarm mode from status endpoint
+  // Check standalone mode from status endpoint
   useEffect(() => {
     const checkMode = async () => {
       try {
         const response = await fetch(`${apiUrl}/status`, { headers: authHeaders });
         if (response.ok) {
           const data = await response.json();
-          setSwarmMode(data.swarm_mode === true);
+          setStandaloneMode(data.deployment_mode === "standalone");
         }
       } catch {
         // ignore
@@ -248,7 +248,7 @@ export function SecretsPage() {
         ),
       },
     ];
-    if (swarmMode) {
+    if (standaloneMode) {
       cols.push({
         id: "actions",
         header: "",
@@ -269,7 +269,7 @@ export function SecretsPage() {
       });
     }
     return cols;
-  }, [swarmMode, handleDeleteSecret]);
+  }, [standaloneMode, handleDeleteSecret]);
 
   const isHttpNonLocal =
     typeof window !== "undefined" &&
@@ -286,7 +286,7 @@ export function SecretsPage() {
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
-          {swarmMode && (
+          {standaloneMode && (
             <Dialog open={addDialogOpen} onOpenChange={setAddDialogOpen}>
               <DialogTrigger asChild>
                 <Button>
@@ -383,11 +383,11 @@ export function SecretsPage() {
         </DashboardPageActions>
       </DashboardPageHeader>
 
-      {!swarmMode && (
+      {!standaloneMode && (
         <Alert>
           <AlertTriangle className="size-4" />
           <p className="text-sm">
-            Secret management via the dashboard is only available in single-node (swarm) mode. In
+            Secret management via the dashboard is only available in single-node (standalone) mode. In
             multi-node deployments, configure secrets using environment variables, Kubernetes
             secrets, or the <code>antfly keystore add</code> CLI on each node.
           </p>
@@ -427,7 +427,7 @@ export function SecretsPage() {
         </CardContent>
       </Card>
 
-      {swarmMode && (
+      {standaloneMode && (
         <Card>
           <CardHeader>
             <CardTitle className="text-sm font-medium">Quick Add</CardTitle>

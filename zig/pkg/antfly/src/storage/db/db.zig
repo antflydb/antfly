@@ -2881,8 +2881,14 @@ pub const DB = struct {
         .run_until_idle = maintenanceDriverRunUntilIdle,
     };
 
-    pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
+    pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
+            var opts = requested_opts;
+            if (opts.backend_runtime) |runtime| {
+                if (runtime.db_open_configurator) |configurator| {
+                    try configurator.configure(path, &opts);
+                }
+            }
             const open_started_ns = monotonicTimeNs();
             var profile = OpenProfile{};
             const runtime_alloc = backgroundRuntimeAllocator(alloc);

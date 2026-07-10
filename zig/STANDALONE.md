@@ -1,4 +1,4 @@
-# Swarm Runtime, Providers, and Shard DB Access
+# Standalone Runtime, Providers, and Shard DB Access
 
 This file records the node-level design decisions for metadata, data, local
 providers, shard DB access, and DB runtime ownership.
@@ -7,7 +7,7 @@ providers, shard DB access, and DB runtime ownership.
 
 - A node should own one `BackendRuntime` and share it across metadata, data,
   and all DB/store opens on that node.
-- A swarm node always owns embedded Antfly inference. It exposes Antfly inference as both the
+- A standalone node always owns embedded Antfly inference. It exposes Antfly inference as both the
   direct local inference provider for Antfly enrichment/query code and as the
   public `/ai/v1` compatibility API on the unified server. Local managed
   embeddings must not loop back through the node's public HTTP `/ai/v1` server
@@ -47,7 +47,7 @@ Antfly inference:
   APIs directly, reuse loaded model sessions, and never consume public HTTP
   accept/handler capacity.
 
-The direct provider is the production shape for `antfly swarm`. Loopback HTTP is
+The direct provider is the production shape for `antfly standalone`. Loopback HTTP is
 only for external clients using the Antfly inference-compatible API; it has the wrong
 failure mode for background enrichment because a long local embedding request
 can occupy the public API path, making status and other public requests look
@@ -61,7 +61,7 @@ user traffic for the same listener.
 This applies to Antfly inference chunking as well as embeddings. Today the enrichment
 chunker routes `.antfly` configs through `chunking.antfly.chunkText(...)`,
 which posts to `{api_url}/chunk`. That is correct for remote Antfly inference, but local
-embedded swarm should resolve the same config to an in-process chunker instead.
+embedded standalone should resolve the same config to an in-process chunker instead.
 The existing `.antfly` / `.mock` fixed chunkers are already local and do not
 need this migration.
 
@@ -155,14 +155,14 @@ Current classification:
       local adapter/fallback probes only for bootstrap or missing runtime
       status.
 - [x] Add direct local Antfly inference dense/sparse embedder, reranker, and chunker
-      implementations and route embedded swarm `provider=antfly` /
+      implementations and route embedded standalone `provider=antfly` /
       `provider=antfly` configs to them.
-- [x] Always expose the Antfly inference-compatible public `/ai/v1` API from swarm while
+- [x] Always expose the Antfly inference-compatible public `/ai/v1` API from standalone while
       keeping Antfly-managed local enrichment/query paths on the direct provider
       instead of loopback HTTP.
 - [x] Add direct local Antfly inference generator implementations for Antfly managed
       query/retrieval paths that need those providers in-process.
-- [ ] Add a swarm regression where enrichment is embedding a slow local batch
+- [ ] Add a standalone regression where enrichment is embedding a slow local batch
       while public index status remains reachable and reports active local
       inference progress.
 - [x] Make metadata/public HTTP simulations choose an explicit shared runtime

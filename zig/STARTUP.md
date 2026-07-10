@@ -224,7 +224,7 @@ Constraints:
   - instrumentation
   - parallel index open
   - cache warming
-- do not make swarm readiness depend on assumptions that are not already
+- do not make standalone readiness depend on assumptions that are not already
   represented in current health wiring
 
 ### Open Path Instrumentation
@@ -280,7 +280,7 @@ Status: in progress.
 
 Current progress:
 
-- swarm startup requests provisioned-cache warmup immediately after store
+- standalone startup requests provisioned-cache warmup immediately after store
   registration
 - warmup opens writer caches before read/query caches for local table groups
 - `bench/storage/provisioned_warmup_bench.zig` compares cold vs warmed first
@@ -328,13 +328,13 @@ warmup.
 Follow-through order:
 
 1. re-measure after warmup and parallel index load
-2. add a swarm-specific background replay mode for provisioned writer-cache
+2. add a standalone-specific background replay mode for provisioned writer-cache
    opens first
 3. keep default `DB.open()` behavior blocking until readiness semantics are
    proven
 4. use per-index replay debt/runtime status to build a data-server readiness
    view
-5. do not attach replay-debt readiness directly to metadata-only swarm health
+5. do not attach replay-debt readiness directly to metadata-only standalone health
    without an explicit composite readiness design
 6. move post-replay text merge off the critical path if replay still leaves
    expensive text merge work on startup

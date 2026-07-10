@@ -148,7 +148,7 @@ type Shard struct {
 	confChangeC chan<- *raft.ConfChangeProposal
 	// TODO (ajr) Handle these errors
 	errorC <-chan error
-	// cancelLeaderFactory cancels the LeaderFactory goroutine in swarm mode
+	// cancelLeaderFactory cancels the LeaderFactory goroutine in standalone mode
 	// In raft mode, this is nil since raft manages the lifecycle
 	cancelLeaderFactory context.CancelFunc
 	leaderFactoryDone   <-chan struct{}
@@ -227,7 +227,7 @@ func (s *Shard) Close() error {
 			close(s.confChangeC)
 		}
 
-		// In swarm mode, cancel the LeaderFactory context to stop background goroutines
+		// In standalone mode, cancel the LeaderFactory context to stop background goroutines
 		if s.cancelLeaderFactory != nil {
 			s.cancelLeaderFactory()
 		}
@@ -321,9 +321,9 @@ func (s *Shard) ProposeConfChange(ctx context.Context, cc raftpb.ConfChange) err
 	if s.IsInitializing() {
 		return ErrShardNotReady
 	}
-	// In swarm mode without Raft, configuration changes are not supported
+	// In standalone mode without Raft, configuration changes are not supported
 	if s.confChangeC == nil {
-		return fmt.Errorf("configuration changes not supported in swarm mode")
+		return fmt.Errorf("configuration changes not supported in standalone mode")
 	}
 	proposeDoneC := make(chan error, 1)
 	proposal := &raft.ConfChangeProposal{
@@ -342,9 +342,9 @@ func (s *Shard) ApplyConfChange(ctx context.Context, cc raftpb.ConfChange) error
 	if s.IsInitializing() {
 		return ErrShardNotReady
 	}
-	// In swarm mode without Raft, configuration changes are not supported
+	// In standalone mode without Raft, configuration changes are not supported
 	if s.confChangeC == nil {
-		return fmt.Errorf("configuration changes not supported in swarm mode")
+		return fmt.Errorf("configuration changes not supported in standalone mode")
 	}
 
 	// Generate a callback ID to track when this conf change is applied

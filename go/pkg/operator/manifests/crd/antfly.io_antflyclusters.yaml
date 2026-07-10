@@ -3339,7 +3339,7 @@ spec:
                 default: Clustered
                 enum:
                 - Clustered
-                - Swarm
+                - Standalone
                 type: string
               productTier:
                 properties:
@@ -3355,7 +3355,7 @@ spec:
                     type: string
                   revision:
                     type: string
-                  swarmTier:
+                  standaloneTier:
                     type: string
                 type: object
               publicAPI:
@@ -3405,47 +3405,7 @@ spec:
                     default: false
                     type: boolean
                 type: object
-              storage:
-                properties:
-                  dataStorage:
-                    type: string
-                  metadataStorage:
-                    type: string
-                  pvcRetentionPolicy:
-                    properties:
-                      whenDeleted:
-                        default: Retain
-                        enum:
-                        - Retain
-                        - Delete
-                        type: string
-                      whenScaled:
-                        default: Retain
-                        enum:
-                        - Retain
-                        - Delete
-                        type: string
-                    type: object
-                  storageAutoGrow:
-                    properties:
-                      enabled:
-                        type: boolean
-                      growIncrement:
-                        type: string
-                      growThresholdPercent:
-                        format: int32
-                        type: integer
-                      maxDataStorage:
-                        type: string
-                      maxSwarmStorage:
-                        type: string
-                    type: object
-                  storageClass:
-                    type: string
-                  swarmStorage:
-                    type: string
-                type: object
-              swarm:
+              standalone:
                 properties:
                   affinity:
                     properties:
@@ -4073,6 +4033,46 @@ spec:
                     type: array
                 required:
                 - resources
+                type: object
+              storage:
+                properties:
+                  dataStorage:
+                    type: string
+                  metadataStorage:
+                    type: string
+                  pvcRetentionPolicy:
+                    properties:
+                      whenDeleted:
+                        default: Retain
+                        enum:
+                        - Retain
+                        - Delete
+                        type: string
+                      whenScaled:
+                        default: Retain
+                        enum:
+                        - Retain
+                        - Delete
+                        type: string
+                    type: object
+                  standaloneStorage:
+                    type: string
+                  storageAutoGrow:
+                    properties:
+                      enabled:
+                        type: boolean
+                      growIncrement:
+                        type: string
+                      growThresholdPercent:
+                        format: int32
+                        type: integer
+                      maxDataStorage:
+                        type: string
+                      maxStandaloneStorage:
+                        type: string
+                    type: object
+                  storageClass:
+                    type: string
                 type: object
             required:
             - config
@@ -4731,11 +4731,11 @@ spec:
                     type: integer
                   revision:
                     type: string
-                  swarmResources:
+                  standaloneResources:
                     type: string
-                  swarmStorage:
+                  standaloneStorage:
                     type: string
-                  swarmTier:
+                  standaloneTier:
                     type: string
                 type: object
               readyReplicas:
@@ -4756,6 +4756,32 @@ spec:
                   totalPods:
                     format: int32
                     type: integer
+                type: object
+              standaloneNodesReady:
+                format: int32
+                type: integer
+              standaloneStatus:
+                properties:
+                  inferenceReady:
+                    type: boolean
+                  lastTransitionTime:
+                    format: date-time
+                    type: string
+                  metadataReady:
+                    type: boolean
+                  nodeID:
+                    format: int32
+                    type: integer
+                  observedConfigHash:
+                    type: string
+                  podIP:
+                    type: string
+                  podName:
+                    type: string
+                  ready:
+                    type: boolean
+                  storeReady:
+                    type: boolean
                 type: object
               storageAutoGrowStatus:
                 properties:
@@ -4783,32 +4809,6 @@ spec:
                   usedBytes:
                     format: int64
                     type: integer
-                type: object
-              swarmNodesReady:
-                format: int32
-                type: integer
-              swarmStatus:
-                properties:
-                  inferenceReady:
-                    type: boolean
-                  lastTransitionTime:
-                    format: date-time
-                    type: string
-                  metadataReady:
-                    type: boolean
-                  nodeID:
-                    format: int32
-                    type: integer
-                  observedConfigHash:
-                    type: string
-                  podIP:
-                    type: string
-                  podName:
-                    type: string
-                  ready:
-                    type: boolean
-                  storeReady:
-                    type: boolean
                 type: object
             type: object
         required:

@@ -107,14 +107,14 @@ export interface paths {
         get?: never;
         /**
          * Store a secret
-         * @description Store a secret in the keystore. Only available in swarm (single-node) mode.
+         * @description Store a secret in the keystore. Only available in standalone (single-node) mode.
          *     Returns 503 in multi-node mode.
          */
         put: operations["putSecret"];
         post?: never;
         /**
          * Delete a secret
-         * @description Remove a secret from the keystore. Only available in swarm (single-node) mode.
+         * @description Remove a secret from the keystore. Only available in standalone (single-node) mode.
          *     Returns 503 in multi-node mode.
          */
         delete: operations["deleteSecret"];
@@ -2593,9 +2593,13 @@ export interface components {
             message?: string;
             /** @description Indicates whether authentication is enabled for the cluster */
             auth_enabled?: boolean;
-            /** @description Indicates whether the cluster is running in single-node swarm mode */
-            swarm_mode?: boolean;
+            /**
+             * @description Runtime deployment topology
+             * @enum {string}
+             */
+            deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            storage?: components["schemas"]["StorageRuntimeStatus"];
         } & {
             [key: string]: unknown;
         };
@@ -2605,12 +2609,30 @@ export interface components {
             message?: string;
             /** @description Indicates whether authentication is enabled for the cluster */
             auth_enabled?: boolean;
-            /** @description Indicates whether the cluster is running in single-node swarm mode */
-            swarm_mode?: boolean;
+            /**
+             * @description Runtime deployment topology
+             * @enum {string}
+             */
+            deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            storage?: components["schemas"]["StorageRuntimeStatus"];
             data: components["schemas"]["ClusterDataStatus"];
         } & {
             [key: string]: unknown;
+        };
+        StorageMaintenanceCapabilities: {
+            check: boolean;
+            compact: boolean;
+            vacuum: boolean;
+            online: boolean;
+            asynchronous: boolean;
+        };
+        StorageRuntimeStatus: {
+            /** @enum {string} */
+            engine: "lite" | "local" | "object";
+            format?: string;
+            fsync?: boolean;
+            maintenance: components["schemas"]["StorageMaintenanceCapabilities"];
         };
         /** @description Typed Zig status view for table data topology and range placement. */
         ClusterDataStatus: {
@@ -11602,7 +11624,7 @@ export interface components {
             };
             /**
              * @description Whether the dashboard should show model download commands.
-             *     Defaults to true for standalone/swarm mode. Set to false in managed
+             *     Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
              *     deployments (e.g., Kubernetes operator) where models are managed externally.
              * @default true
              */

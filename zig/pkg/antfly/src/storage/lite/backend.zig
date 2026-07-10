@@ -19,6 +19,8 @@ const db_mod = @import("../db/db.zig");
 const db_core = @import("../db/core.zig");
 const db_types = @import("../db/types.zig");
 const backend_erased = @import("../backend_erased.zig");
+const background_runtime = @import("../background_runtime.zig");
+const maintenance = @import("../maintenance.zig");
 const bridge = @import("bridge.zig");
 const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
@@ -89,6 +91,7 @@ pub const StorageStatus = struct {
     active_checkpoint: ?u8 = null,
     checkpoint_sequence: ?u64 = null,
     page_count: ?u64 = null,
+    fsync: ?bool = null,
 };
 
 pub fn Status(comptime Stats: type) type {
@@ -121,12 +124,30 @@ pub fn copyStableSnapshotFile(allocator: Allocator, source_path: []const u8, des
 }
 
 pub const Handle = struct {
+    const NamespaceRuntime = struct {
+        name: []u8,
+        key_prefix: []u8,
+        index_base_path: []u8,
+        runtime_store: *backend_erased.Store,
+
+        fn deinit(self: *NamespaceRuntime, allocator: Allocator) void {
+            self.runtime_store.deinit();
+            allocator.destroy(self.runtime_store);
+            allocator.free(self.index_base_path);
+            allocator.free(self.key_prefix);
+            allocator.free(self.name);
+            self.* = undefined;
+        }
+    };
+
     allocator: Allocator,
     engine: EngineKind,
     bridge_storage: ?*bridge.ContainerStorage = null,
     native_docstore: ?*docstore.Store = null,
     native_index_storage: ?*index_storage.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
+    namespace_mutex: std.atomic.Mutex = .unlocked,
+    namespace_runtimes: std.ArrayListUnmanaged(NamespaceRuntime) = .empty,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
@@ -153,6 +174,23 @@ pub const Handle = struct {
         return try createNativeSingleFile(allocator, path, opts);
     }
 
+    /// Opens an existing file or atomically creates it. Exclusive creation and
+    /// the retry close the check/create race when two processes start together;
+    /// the file's writer lock remains the final single-writer authority.
+    pub fn openOrCreate(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
+        return open(allocator, path, opts) catch |err| switch (err) {
+            error.FileNotFound => createWithOptions(allocator, path, .{
+                .exclusive = true,
+                .no_sync = opts.no_sync,
+                .resource_manager = opts.resource_manager,
+            }) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => try open(allocator, path, opts),
+                else => return create_err,
+            },
+            else => return err,
+        };
+    }
+
     pub fn deinit(self: *Handle) void {
         switch (self.engine) {
             .bridge_lsm_container => {
@@ -163,6 +201,8 @@ pub const Handle = struct {
                 }
             },
             .native_single_file => {
+                for (self.namespace_runtimes.items) |*runtime| runtime.deinit(self.allocator);
+                self.namespace_runtimes.deinit(self.allocator);
                 if (self.native_index_storage) |storage| {
                     self.allocator.destroy(storage);
                     self.native_index_storage = null;
@@ -224,6 +264,95 @@ pub const Handle = struct {
         }
     }
 
+    /// Configures a DB instance to use an isolated logical namespace inside
+    /// this Lite file. Runtime stores and index paths are cached per namespace,
+    /// so repeated reader/writer opens allocate nothing after the first open.
+    pub fn configureDbOpenOptionsForNamespace(self: *Handle, opts: *db_mod.OpenOptions, namespace: []const u8) !void {
+        if (self.engine != .native_single_file or namespace.len == 0 or std.mem.indexOfScalar(u8, namespace, 0) != null) {
+            return error.InvalidArgument;
+        }
+        platform_sync.lockYielding(&self.namespace_mutex);
+        defer self.namespace_mutex.unlock();
+
+        var selected: ?*NamespaceRuntime = null;
+        for (self.namespace_runtimes.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, namespace)) {
+                selected = entry;
+                break;
+            }
+        }
+        if (selected == null) {
+            const name = try self.allocator.dupe(u8, namespace);
+            errdefer self.allocator.free(name);
+            const key_prefix = try std.mem.concat(self.allocator, u8, &.{ "\x02db/", namespace, "\x00" });
+            errdefer self.allocator.free(key_prefix);
+            var namespace_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(namespace, &namespace_digest, .{});
+            const namespace_hex = std.fmt.bytesToHex(namespace_digest, .lower);
+            const index_base_path = try std.fmt.allocPrint(self.allocator, "{s}/tables/{s}", .{ native_index_base_path, namespace_hex });
+            errdefer self.allocator.free(index_base_path);
+            const runtime_store = try self.allocator.create(backend_erased.Store);
+            errdefer self.allocator.destroy(runtime_store);
+            runtime_store.* = try self.native_docstore.?.runtimeStoreWithPrefix(self.allocator, key_prefix);
+            errdefer runtime_store.deinit();
+            try self.namespace_runtimes.append(self.allocator, .{
+                .name = name,
+                .key_prefix = key_prefix,
+                .index_base_path = index_base_path,
+                .runtime_store = runtime_store,
+            });
+            selected = &self.namespace_runtimes.items[self.namespace_runtimes.items.len - 1];
+        }
+
+        const runtime = selected.?;
+        if (opts.resource_manager == null) opts.resource_manager = self.native_docstore.?.resource_manager;
+        opts.primary_backend = .{ .mem = .{} };
+        opts.primary_runtime_store = runtime.runtime_store;
+        const storage = self.native_index_storage.?.storage();
+        opts.index_backends.text_main_backend = .lsm;
+        opts.index_backends.dense_storage_backend = .lsm;
+        opts.index_backends.sparse_backend = .lsm;
+        opts.index_backends.graph_reverse_backend = .lsm;
+        opts.index_backends.text_lsm_storage = storage;
+        opts.index_backends.dense_lsm_storage = storage;
+        opts.index_backends.sparse_lsm_storage = storage;
+        opts.index_backends.graph_lsm_storage = storage;
+        opts.index_backends.text_main_lsm_options.storage = storage;
+        opts.index_backends.text_wal_lsm_options.storage = storage;
+        opts.index_backends.dense_lsm_options.storage = storage;
+        opts.index_backends.sparse_lsm_options.storage = storage;
+        opts.index_backends.graph_reverse_lsm_options.storage = storage;
+        opts.index_base_path = runtime.index_base_path;
+        opts.index_open_parallelism = 1;
+        opts.external_derived_checkpoints = false;
+    }
+
+    /// Installs this file as the storage provider for DBs opened by a composed
+    /// server runtime. The logical DB path is a stable namespace within the
+    /// file; repeated opens reuse the cached runtime and index storage objects.
+    pub fn dbOpenConfigurator(self: *Handle) background_runtime.DbOpenConfigurator {
+        return .{ .ptr = self, .configure_fn = configureDbOpenOpaque };
+    }
+
+    fn configureDbOpenOpaque(ptr: *anyopaque, path: []const u8, raw_options: *anyopaque) anyerror!void {
+        const self: *Handle = @ptrCast(@alignCast(ptr));
+        const opts: *db_mod.OpenOptions = @ptrCast(@alignCast(raw_options));
+        try self.configureDbOpenOptionsForNamespace(opts, path);
+    }
+
+    /// Returns a cached raw store for small system records such as the
+    /// standalone metadata catalog. The pointer remains valid until deinit.
+    pub fn runtimeStoreForNamespace(self: *Handle, namespace: []const u8) !*backend_erased.Store {
+        var opts: db_mod.OpenOptions = .{};
+        try self.configureDbOpenOptionsForNamespace(&opts, namespace);
+        platform_sync.lockYielding(&self.namespace_mutex);
+        defer self.namespace_mutex.unlock();
+        for (self.namespace_runtimes.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, namespace)) return entry.runtime_store;
+        }
+        unreachable;
+    }
+
     pub fn storageStatus(self: *Handle) StorageStatus {
         return switch (self.engine) {
             .native_single_file => blk: {
@@ -240,6 +369,7 @@ pub const Handle = struct {
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
                     .page_count = checkpoint.page_count,
+                    .fsync = !file.no_sync,
                 };
             },
             .bridge_lsm_container => .{
@@ -268,7 +398,65 @@ pub const Handle = struct {
     pub fn check(self: *Handle) !CheckReport {
         return switch (self.engine) {
             .bridge_lsm_container => toCheckReport(try self.bridge_storage.?.check()),
-            .native_single_file => try self.native_docstore.?.file.check(),
+            .native_single_file => blk: {
+                const store = self.native_docstore.?;
+                platform_sync.lockYielding(&store.mutex);
+                defer store.mutex.unlock();
+                break :blk try store.file.check();
+            },
+        };
+    }
+
+    pub fn maintenanceSource(self: *Handle) maintenance.Source {
+        return .{ .ptr = self, .vtable = &.{ .status = maintenanceStatus, .run = runMaintenance } };
+    }
+
+    fn maintenanceStatus(ptr: *anyopaque) maintenance.Status {
+        const self: *Handle = @ptrCast(@alignCast(ptr));
+        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
+        defer if (self.native_docstore) |store| store.mutex.unlock();
+        const status = self.storageStatus();
+        return .{
+            .engine = "lite",
+            .format = status.format,
+            .fsync = status.fsync,
+            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = true },
+        };
+    }
+
+    fn runMaintenance(ptr: *anyopaque, operation: maintenance.Operation) anyerror!maintenance.Result {
+        const self: *Handle = @ptrCast(@alignCast(ptr));
+        return switch (operation) {
+            .check => blk: {
+                const report = try self.check();
+                break :blk .{
+                    .valid = report.valid,
+                    .issue = report.issue,
+                    .file_size = report.file_size,
+                    .valid_prefix_size = report.valid_prefix_size,
+                    .reclaimable_bytes = report.reclaimable_bytes,
+                    .live_file_count = report.live_file_count,
+                    .live_bytes = report.live_bytes,
+                };
+            },
+            .compact => blk: {
+                platform_sync.lockYielding(&self.namespace_mutex);
+                defer self.namespace_mutex.unlock();
+                for (self.namespace_runtimes.items) |*runtime| try runtime.runtime_store.sync(true);
+                const report = try self.vacuum();
+                break :blk vacuumMaintenanceResult(report);
+            },
+            .vacuum => vacuumMaintenanceResult(try self.vacuum()),
+        };
+    }
+
+    fn vacuumMaintenanceResult(report: VacuumReport) maintenance.Result {
+        return .{
+            .before_size = report.before_size,
+            .after_size = report.after_size,
+            .reclaimed_bytes = report.reclaimed_bytes,
+            .live_file_count = report.live_file_count,
+            .live_bytes = report.live_bytes,
         };
     }
 
@@ -988,6 +1176,35 @@ test "lite backend native engine can back db primary documents" {
         defer allocator.free(value);
         try std.testing.expectEqualStrings("{\"name\":\"native\"}", value);
     }
+}
+
+test "lite backend namespaced db options isolate tables in one file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-namespaced-db.aflite");
+    defer allocator.free(path);
+
+    var handle = try Handle.create(allocator, path, true);
+    defer handle.deinit();
+    var opts_a = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+    var opts_b = opts_a;
+    try handle.configureDbOpenOptionsForNamespace(&opts_a, "table/a");
+    try handle.configureDbOpenOptionsForNamespace(&opts_b, "table/b");
+    var db_a = try db_mod.DB.open(allocator, "table/a", opts_a);
+    defer db_a.close();
+    var db_b = try db_mod.DB.open(allocator, "table/b", opts_b);
+    defer db_b.close();
+
+    try db_a.batch(.{ .writes = &.{.{ .key = "doc:same", .value = "{\"table\":\"a\"}" }}, .sync_level = .write });
+    try db_b.batch(.{ .writes = &.{.{ .key = "doc:same", .value = "{\"table\":\"b\"}" }}, .sync_level = .write });
+    const value_a = (try db_a.get(allocator, "doc:same")).?;
+    defer allocator.free(value_a);
+    const value_b = (try db_b.get(allocator, "doc:same")).?;
+    defer allocator.free(value_b);
+    try std.testing.expectEqualStrings("{\"table\":\"a\"}", value_a);
+    try std.testing.expectEqualStrings("{\"table\":\"b\"}", value_b);
+    try std.testing.expect(!std.mem.eql(u8, opts_a.index_base_path.?, opts_b.index_base_path.?));
 }
 
 test "lite backend native open requires an existing file" {

@@ -944,7 +944,7 @@ Verify batch operation touching multiple shards commits atomically via 2PC.
 
 Steps:
 1. Skip if `testing.Short()` or `RUN_TXN_TESTS != "true"`
-2. Start swarm, create table with `NumShards: 4` (no indexes needed)
+2. Start standalone, create table with `NumShards: 4` (no indexes needed)
 3. Wait for shards to elect leaders
 4. Insert initial documents across 4 shards using `client.Batch()`
 5. Perform multi-key update via `client.Batch()` that modifies all 4 keys
@@ -955,7 +955,7 @@ Steps:
 Verify that when context is cancelled mid-transaction, no data is committed.
 
 Steps:
-1. Start swarm, create table with 4 shards
+1. Start standalone, create table with 4 shards
 2. Insert initial documents across shards
 3. Store original values via `client.LookupKey()`
 4. Create a short-timeout context (1ms)
@@ -967,7 +967,7 @@ Steps:
 Verify the recovery loop properly resolves committed transactions.
 
 Steps:
-1. Start swarm, create table with 4 shards
+1. Start standalone, create table with 4 shards
 2. Perform successful multi-shard transaction
 3. Verify data is correct
 4. Wait for recovery loop interval (~35 seconds) OR verify intents are cleaned up
@@ -978,7 +978,7 @@ Steps:
 Classic "bank transfer" scenario -- atomic update of multiple keys.
 
 Steps:
-1. Start swarm, create table with 2+ shards
+1. Start standalone, create table with 2+ shards
 2. Insert accounts on different shards: `"0_alice": {"balance": 1000}`, `"8_bob": {"balance": 0}`
 3. Perform atomic "transfer" via batch: `"0_alice": {"balance": 500}`, `"8_bob": {"balance": 500}`
 4. Verify both updates applied atomically
@@ -1001,9 +1001,9 @@ type DistributedCluster struct {
 func startDistributedCluster(t *testing.T, ctx context.Context) *DistributedCluster
 ```
 
-### Key Differences from Single-Node Swarm
+### Key Differences from Single-Node Standalone
 
-| Aspect | Single-Node Swarm | Multi-Node Cluster |
+| Aspect | Single-Node Standalone | Multi-Node Cluster |
 |--------|-------------------|-------------------|
 | Metadata nodes | 1 (in-process) | 1 (separate goroutine) |
 | Store nodes | 1 (in-process) | 2 (separate goroutines) |
@@ -1026,7 +1026,7 @@ RUN_TXN_TESTS=true go test -v ./e2e -run TestE2E_DistributedTransaction_MultiSha
 
 | File | Purpose |
 |------|---------|
-| `e2e/docsaf_test.go` | Pattern for swarm startup and test structure |
+| `e2e/docsaf_test.go` | Pattern for standalone startup and test structure |
 | `e2e/test_helpers.go` | `GetFreePort()`, `CreateTestConfig()`, `WaitForHTTP()` |
 | `src/metadata/runner.go` | `RunAsMetadataServer()` -- starts metadata node |
 | `src/store/runner.go` | `RunAsStore()` -- starts store node with auto-registration |

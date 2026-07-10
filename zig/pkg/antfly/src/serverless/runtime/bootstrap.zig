@@ -50,7 +50,7 @@ pub const BootstrapConfig = struct {
     chunk_embedding_dimensions: u32 = 8,
     tick_interval_ms: u64 = 25,
     role: api_mod.RuntimeRole = .combined,
-    swarm_mode: bool = false,
+    combined_mode: bool = false,
     publish_enabled: bool = true,
     compaction_enabled: bool = true,
     prune_enabled: bool = true,
@@ -283,7 +283,7 @@ pub fn runtimeStatusAlloc(alloc: Allocator, cfg: BootstrapConfig) !RuntimeStatus
 
     return .{
         .role = cfg.role,
-        .swarm_mode = cfg.swarm_mode,
+        .combined_mode = cfg.combined_mode,
         .tick_interval_ms = cfg.tick_interval_ms,
         .validated = true,
         .publish_enabled = cfg.publish_enabled,
@@ -371,11 +371,11 @@ test "runtime bootstrap assembles serverless stack from uri config" {
         .query_cache_dir = null,
         .tick_interval_ms = 1,
         .role = .combined,
-        .swarm_mode = true,
+        .combined_mode = true,
     });
     defer stack.deinit();
 
-    try std.testing.expect(stack.status.swarm_mode);
+    try std.testing.expect(stack.status.combined_mode);
 
     try std.testing.expect(try stack.catalog.ensureTable("docs", 100));
 
@@ -478,7 +478,7 @@ test "runtime bootstrap wires foreign registry into public join handler" {
         .query_cache_dir = null,
         .tick_interval_ms = 1,
         .role = .combined,
-        .swarm_mode = true,
+        .combined_mode = true,
         .foreign_registry = &foreign_registry,
     });
     defer stack.deinit();

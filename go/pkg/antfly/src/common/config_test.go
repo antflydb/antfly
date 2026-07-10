@@ -251,7 +251,7 @@ default_shards_per_table: 4
 			},
 		},
 		{
-			name: "config with swarm mode and flags",
+			name: "config with standalone mode and flags",
 			yaml: `
 version: "0.0.1"
 health_port: 4200
@@ -265,12 +265,12 @@ replication_factor: 1
 max_shard_size_bytes: 1073741824
 max_shards_per_table: 100
 default_shards_per_table: 4
-swarm_mode: true
+deployment_mode: standalone
 enable_auth: true
 disable_shard_alloc: true
 `,
 			validate: func(t *testing.T, cfg *Config) {
-				assert.True(t, cfg.SwarmMode)
+				assert.Equal(t, ConfigDeploymentModeStandalone, cfg.DeploymentMode)
 				assert.True(t, cfg.EnableAuth)
 				assert.True(t, cfg.DisableShardAlloc)
 			},
@@ -577,6 +577,51 @@ func TestValidateStorage(t *testing.T) {
 				},
 			},
 			wantErr: false,
+		},
+		{
+			name: "valid standalone Lite storage",
+			config: &Config{
+				DeploymentMode: ConfigDeploymentModeStandalone,
+				Storage: StorageConfig{
+					Engine: StorageEngineLite,
+					Lite:   LiteStorageConfig{Path: "data.antfly.aflite"},
+				},
+				ReplicationFactor:     1,
+				DefaultShardsPerTable: 1,
+			},
+			wantErr: false,
+		},
+		{
+			name: "Lite rejected for distributed topology",
+			config: &Config{
+				DeploymentMode: ConfigDeploymentModeDistributed,
+				Storage:        StorageConfig{Engine: StorageEngineLite, Lite: LiteStorageConfig{Path: "data.aflite"}},
+			},
+			wantErr: true,
+			errMsg:  "requires deployment_mode standalone or embedded",
+		},
+		{
+			name: "Lite rejects mixed local member",
+			config: &Config{
+				DeploymentMode: ConfigDeploymentModeStandalone,
+				Storage: StorageConfig{
+					Engine: StorageEngineLite,
+					Lite:   LiteStorageConfig{Path: "data.aflite"},
+					Local:  LocalStorageConfig{BaseDir: "antflydb"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "mutually exclusive",
+		},
+		{
+			name: "Lite rejects external metadata orchestration",
+			config: &Config{
+				DeploymentMode: ConfigDeploymentModeStandalone,
+				Storage:        StorageConfig{Engine: StorageEngineLite, Lite: LiteStorageConfig{Path: "data.aflite"}},
+				Metadata:       MetadataInfo{OrchestrationUrls: map[string]string{"1": "http://127.0.0.1:7001"}},
+			},
+			wantErr: true,
+			errMsg:  "cannot use external metadata",
 		},
 		{
 			name: "empty base directory",
@@ -936,6 +981,20 @@ func TestConfigValidate(t *testing.T) {
 				MaxShardSizeBytes:     1073741824,
 				DefaultShardsPerTable: 4,
 				MaxShardsPerTable:     100,
+			},
+			wantErr: false,
+		},
+		{
+			name: "fully valid standalone Lite config needs no external metadata",
+			config: &Config{
+				DeploymentMode:        ConfigDeploymentModeStandalone,
+				Storage:               StorageConfig{Engine: StorageEngineLite, Lite: LiteStorageConfig{Path: "data.aflite"}},
+				ReplicationFactor:     1,
+				MaxShardSizeBytes:     1073741824,
+				DefaultShardsPerTable: 1,
+				MinShardsPerTable:     1,
+				MaxShardsPerTable:     1,
+				DisableShardAlloc:     true,
 			},
 			wantErr: false,
 		},

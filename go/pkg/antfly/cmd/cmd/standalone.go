@@ -30,6 +30,7 @@ import (
 	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	"github.com/antflydb/antfly/go/pkg/libaf/healthserver"
@@ -40,46 +41,46 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var swarmCmd = &cobra.Command{
-	Use:   "swarm",
-	Short: "Run as a swarm node (metadata + raft)",
-	Long:  `Start the AntFly database in swarm mode, running both metadata and raft services.`,
-	RunE:  runSwarm,
+var standaloneCmd = &cobra.Command{
+	Use:   "standalone",
+	Short: "Run as a standalone node (metadata + raft)",
+	Long:  `Start the AntFly database in standalone mode, running both metadata and raft services.`,
+	RunE:  runStandalone,
 }
 
 func init() {
-	rootCmd.AddCommand(swarmCmd)
+	rootCmd.AddCommand(standaloneCmd)
 
-	swarmCmd.Flags().Uint64("id", 1, "node ID")
-	swarmCmd.Flags().String("metadata-raft", "http://0.0.0.0:9017", "metadata raft server URL")
-	swarmCmd.Flags().String("metadata-api", "http://0.0.0.0:8080", "metadata api server URL")
-	swarmCmd.Flags().
+	standaloneCmd.Flags().Uint64("id", 1, "node ID")
+	standaloneCmd.Flags().String("metadata-raft", "http://0.0.0.0:9017", "metadata raft server URL")
+	standaloneCmd.Flags().String("metadata-api", "http://0.0.0.0:8080", "metadata api server URL")
+	standaloneCmd.Flags().
 		String("metadata-cluster", `{ "1": "http://0.0.0.0:9017" }`, "metadata cluster peer URLs (json object)")
-	swarmCmd.Flags().String("store-raft", "http://0.0.0.0:9021", "store raft server URL")
-	swarmCmd.Flags().String("store-api", "http://0.0.0.0:12380", "store api server URL")
-	swarmCmd.Flags().Bool("inference", true, "also run the inference runtime")
-	swarmCmd.Flags().String("inference-api-url", "", "Inference API URL (http://host:port)")
-	swarmCmd.Flags().Bool("health", true, "enable health/metrics server")
-	swarmCmd.Flags().Int("health-port", 4200, "health/metrics server port")
+	standaloneCmd.Flags().String("store-raft", "http://0.0.0.0:9021", "store raft server URL")
+	standaloneCmd.Flags().String("store-api", "http://0.0.0.0:12380", "store api server URL")
+	standaloneCmd.Flags().Bool("inference", true, "also run the inference runtime")
+	standaloneCmd.Flags().String("inference-api-url", "", "Inference API URL (http://host:port)")
+	standaloneCmd.Flags().Bool("health", true, "enable health/metrics server")
+	standaloneCmd.Flags().Int("health-port", 4200, "health/metrics server port")
 
-	mustBindPFlag("swarm.id", swarmCmd.Flags().Lookup("id"))
-	mustBindPFlag("swarm.metadata-raft", swarmCmd.Flags().Lookup("metadata-raft"))
-	mustBindPFlag("swarm.metadata-api", swarmCmd.Flags().Lookup("metadata-api"))
-	mustBindPFlag("swarm.metadata-cluster", swarmCmd.Flags().Lookup("metadata-cluster"))
-	mustBindPFlag("swarm.store-raft", swarmCmd.Flags().Lookup("store-raft"))
-	mustBindPFlag("swarm.store-api", swarmCmd.Flags().Lookup("store-api"))
-	mustBindPFlag("swarm.inference", swarmCmd.Flags().Lookup("inference"))
-	mustBindPFlag("inference.api_url", swarmCmd.Flags().Lookup("inference-api-url"))
-	mustBindPFlag("health_enabled", swarmCmd.Flags().Lookup("health"))
-	mustBindPFlag("health_port", swarmCmd.Flags().Lookup("health-port"))
+	mustBindPFlag("standalone.id", standaloneCmd.Flags().Lookup("id"))
+	mustBindPFlag("standalone.metadata-raft", standaloneCmd.Flags().Lookup("metadata-raft"))
+	mustBindPFlag("standalone.metadata-api", standaloneCmd.Flags().Lookup("metadata-api"))
+	mustBindPFlag("standalone.metadata-cluster", standaloneCmd.Flags().Lookup("metadata-cluster"))
+	mustBindPFlag("standalone.store-raft", standaloneCmd.Flags().Lookup("store-raft"))
+	mustBindPFlag("standalone.store-api", standaloneCmd.Flags().Lookup("store-api"))
+	mustBindPFlag("standalone.inference", standaloneCmd.Flags().Lookup("inference"))
+	mustBindPFlag("inference.api_url", standaloneCmd.Flags().Lookup("inference-api-url"))
+	mustBindPFlag("health_enabled", standaloneCmd.Flags().Lookup("health"))
+	mustBindPFlag("health_port", standaloneCmd.Flags().Lookup("health-port"))
 }
 
-func runSwarm(cmd *cobra.Command, args []string) error {
+func runStandalone(cmd *cobra.Command, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	id := viper.GetUint64("swarm.id")
-	enableInference := viper.GetBool("swarm.inference")
+	id := viper.GetUint64("standalone.id")
+	enableInference := viper.GetBool("standalone.inference")
 	// When inference is enabled, decide whether to run it in-process (mounted on
 	// Antfly's metadata listener under /ai/v1/) or as a separate HTTP server.
 	// In-process is the default. If the user explicitly provides
@@ -90,7 +91,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	viper.SetDefault("replication_factor", 1)
 	viper.SetDefault("default_shards_per_table", 1)
 	defaultOrchestrationURLs := map[string]string{
-		types.ID(id).String(): viper.GetString("swarm.metadata-api"),
+		types.ID(id).String(): viper.GetString("standalone.metadata-api"),
 	}
 	viper.SetDefault("metadata.orchestration_urls", defaultOrchestrationURLs)
 
@@ -107,9 +108,9 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	defer func() { _ = logger.Sync() }()
 
 	config.DisableShardAlloc = true
-	config.SwarmMode = true
+	config.DeploymentMode = common.ConfigDeploymentModeStandalone
 
-	peers, err := parsePeers(viper.GetString("swarm.metadata-cluster"))
+	peers, err := parsePeers(viper.GetString("standalone.metadata-cluster"))
 	if err != nil {
 		logger.Fatal("Failed to parse metadata cluster peers", zap.Error(err))
 	}
@@ -137,7 +138,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 			<-inferenceReadyC
 		}
 		ready.Store(true)
-		logger.Info("Swarm mode: all servers are ready")
+		logger.Info("Standalone mode: all servers are ready")
 	}()
 	if config.HealthEnabled {
 		healthserver.Start(logger, config.HealthPort, ready.Load)
@@ -145,14 +146,14 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 
 	metaConf := &store.StoreInfo{
 		ID:      tid,
-		RaftURL: viper.GetString("swarm.metadata-raft"),
-		ApiURL:  viper.GetString("swarm.metadata-api"),
+		RaftURL: viper.GetString("standalone.metadata-raft"),
+		ApiURL:  viper.GetString("standalone.metadata-api"),
 	}
 
 	storeConf := &store.StoreInfo{
 		ID:      tid,
-		ApiURL:  viper.GetString("swarm.store-api"),
-		RaftURL: viper.GetString("swarm.store-raft"),
+		ApiURL:  viper.GetString("standalone.store-api"),
+		RaftURL: viper.GetString("standalone.store-raft"),
 	}
 
 	localProvider := metadata.NewDeferredLocalExecutionProvider()
@@ -243,7 +244,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	}()
 	<-metadataReadyC
 	storeRuntime.StartRaft()
-	logger.Info("Local shard bypass enabled for swarm mode")
+	logger.Info("Local shard bypass enabled for standalone mode")
 
 	eg, egCtx := errgroup.WithContext(ctx)
 
@@ -284,10 +285,10 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 
 	if err := eg.Wait(); err != nil {
 		if errors.Is(err, context.Canceled) {
-			logger.Info("Swarm shut down")
+			logger.Info("Standalone shut down")
 			return nil
 		}
-		return fmt.Errorf("swarm failure: %w", err)
+		return fmt.Errorf("standalone failure: %w", err)
 	}
 	return nil
 }

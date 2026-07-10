@@ -17,7 +17,7 @@
 Usage:
     ANTFLY_SERVERLESS_URL=http://127.0.0.1:8080 uv run --project e2e/antfly pytest e2e/antfly
 
-    # Start a local swarm binary automatically:
+    # Start a local standalone binary automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest e2e/antfly
 
     # Run stateful tests against an existing server:
@@ -174,14 +174,14 @@ def wait_for_listener(url: str, timeout: float = 5.0) -> bool:
     return False
 
 
-def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflyServer | SwarmAntflyServer:
+def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflyServer | StandaloneAntflyServer:
     if Path(binary).name != "antfly":
         return PublicAntflyServer(binary, "127.0.0.1", port)
 
     last_error: RuntimeError | None = None
     for _ in range(3):
         try:
-            return SwarmAntflyServer(binary, "127.0.0.1", port)
+            return StandaloneAntflyServer(binary, "127.0.0.1", port)
         except RuntimeError as exc:
             last_error = exc
             time.sleep(0.5)
@@ -275,7 +275,7 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
 
 def raise_request_error_with_logs(
     err: requests.RequestException,
-    server_ref: AntflyServer | PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
+    server_ref: AntflyServer | PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
 ) -> None:
     logs = ""
     proc_statuses: list[str] = []
@@ -370,7 +370,7 @@ class AntflyServer:
                 "ANTFLY_SERVERLESS_QUERY_CACHE_DIR": str(root / "cache"),
             }
         )
-        command = _serverless_swarm_command(binary, host=host, port=port, root=root)
+        command = _serverless_combined_command(binary, host=host, port=port, root=root)
         self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, env=env, cwd=REPO_ROOT)
         if not wait_for_server(self.url):
             self.stop()
@@ -442,13 +442,13 @@ class PublicAntflyServer:
             self.tempdir.cleanup()
 
 
-def _serverless_swarm_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
+def _serverless_combined_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
     basename = Path(binary).name
     if basename == "antfly":
         return [
             binary,
             "serverless",
-            "swarm",
+            "combined",
             "--host",
             host,
             "--port",
@@ -493,10 +493,10 @@ def _legacy_stateful_command(binary: str, *, host: str, port: int, root: Path) -
     ]
 
 
-def _swarm_stateful_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
+def _standalone_stateful_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
     return [
         binary,
-        "swarm",
+        "standalone",
         "--config",
         str(_write_remote_content_e2e_config(root)),
         "--host",
@@ -715,14 +715,14 @@ class StatefulAntflyServer:
             self.tempdir.cleanup()
 
 
-class SwarmAntflyServer:
+class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
         self.host = host
         self.port = port
         self.url = f"http://{host}:{port}"
         self.api_url = antfly_public_api_url(self.url, binary=binary)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-swarm-e2e-")
+        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-standalone-e2e-")
         self.root = Path(self.tempdir.name)
         self.replica_root = self.root / "replicas"
         self.log_path = self.root / "server.log"
@@ -733,12 +733,12 @@ class SwarmAntflyServer:
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
-        command = _swarm_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
+        command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
         self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=self.root)
         if not wait_for_server(self.api_url):
             self.stop()
             out = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Swarm API server failed to start at {self.api_url}\n{out}")
+            raise RuntimeError(f"Standalone API server failed to start at {self.api_url}\n{out}")
         self.metadata_admin_url = self._poll_metadata_admin_url()
 
     def _poll_metadata_admin_url(self) -> str:
@@ -746,7 +746,7 @@ class SwarmAntflyServer:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             logs = _read_log_tail(self.log_path)
-            matches = re.findall(r"(?:swarm )?metadata admin api listening on (http://[^\s]+)", logs)
+            matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
             if matches:
                 return matches[-1].rstrip("/")
             time.sleep(0.1)
@@ -1634,7 +1634,7 @@ def real_clipclap_backup_api(request, clipclap_model_available):
 @pytest.fixture(scope="function")
 def stateful_api():
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
-    server: PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None = None
+    server: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
     if not base_url:
         binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -1660,7 +1660,7 @@ def stateful_api():
             self,
             session: requests.Session,
             base_url: str,
-            server_ref: PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
+            server_ref: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
         ):
             self.s = session
             self.url = base_url.rstrip("/")
@@ -2133,7 +2133,7 @@ def backup_api():
 
     port = find_free_port()
     if Path(binary).name == "antfly":
-        server = SwarmAntflyServer(binary, "127.0.0.1", port)
+        server = StandaloneAntflyServer(binary, "127.0.0.1", port)
     else:
         server = PublicAntflyServer(binary, "127.0.0.1", port)
 
@@ -2152,7 +2152,7 @@ def backup_api():
             self,
             session: requests.Session,
             base_url: str,
-            server_ref: PublicAntflyServer | SwarmAntflyServer | StatefulAntflyServer | None,
+            server_ref: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
         ):
             self.s = session
             self.url = base_url.rstrip("/")

@@ -4,6 +4,7 @@ metadata:
     c: "http://127.0.0.1:12278"
     d: "http://127.0.0.1:12279"
 storage:
+  engine: local
   local:
     base_dir: "antflydb"
   keyvalue: "local"

@@ -14,10 +14,79 @@ servers:
 security:
   - BearerAuth: []
 tags:
+  - name: maintenance
+    x-displayName: Storage Maintenance
+    description: Engine-neutral asynchronous storage inspection and reclamation.
   - name: ha
     x-displayName: High Availability
     description: Hot-standby HA status and replication-slot management.
 paths:
+  /maintenance/check:
+    post:
+      tags: [maintenance]
+      operationId: startStorageCheck
+      summary: Start an online storage integrity check
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "202":
+          description: Maintenance job accepted or an idempotent existing job returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageMaintenanceJob" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnsupportedOperation" }
+  /maintenance/compact:
+    post:
+      tags: [maintenance]
+      operationId: startStorageCompact
+      summary: Start coordinated storage compaction
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "202":
+          description: Maintenance job accepted or an idempotent existing job returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageMaintenanceJob" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnsupportedOperation" }
+  /maintenance/vacuum:
+    post:
+      tags: [maintenance]
+      operationId: startStorageVacuum
+      summary: Start physical storage reclamation
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "202":
+          description: Maintenance job accepted or an idempotent existing job returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageMaintenanceJob" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnsupportedOperation" }
+  /maintenance/jobs/{job_id}:
+    get:
+      tags: [maintenance]
+      operationId: getStorageMaintenanceJob
+      summary: Get a storage maintenance job
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: integer, format: uint64, minimum: 1 }
+      responses:
+        "200":
+          description: Current maintenance job state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageMaintenanceJob" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /ha/primary/status:
     get:
       tags: [ha]
@@ -598,6 +667,15 @@ components:
         started with `--ha-admin-token-env`, typed `/admin/v1/ha` routes require
         `Authorization: Bearer <token>`.
   parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Stable caller key used to return the original job on safe retries.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
     SlotName:
       name: slot_name
       in: path
@@ -625,12 +703,51 @@ components:
           schema:
             type: string
     NotFound:
-      description: HA resource was not found.
+      description: Admin resource was not found.
+      content:
+        text/plain:
+          schema:
+            type: string
+    UnsupportedOperation:
+      description: The configured storage engine does not support this operation.
       content:
         text/plain:
           schema:
             type: string
   schemas:
+    StorageMaintenanceOperation:
+      type: string
+      enum: [check, compact, vacuum]
+    StorageMaintenanceState:
+      type: string
+      enum: [queued, running, succeeded, failed]
+    StorageMaintenanceResult:
+      type: object
+      additionalProperties: false
+      properties:
+        valid: { type: boolean }
+        issue: { type: string }
+        file_size: { type: integer, format: uint64, minimum: 0 }
+        valid_prefix_size: { type: integer, format: uint64, minimum: 0 }
+        reclaimable_bytes: { type: integer, format: uint64, minimum: 0 }
+        before_size: { type: integer, format: uint64, minimum: 0 }
+        after_size: { type: integer, format: uint64, minimum: 0 }
+        reclaimed_bytes: { type: integer, format: uint64, minimum: 0 }
+        live_file_count: { type: integer, format: uint64, minimum: 0 }
+        live_bytes: { type: integer, format: uint64, minimum: 0 }
+    StorageMaintenanceJob:
+      type: object
+      additionalProperties: false
+      required: [job_id, operation, state, created_at_ms]
+      properties:
+        job_id: { type: integer, format: uint64, minimum: 1 }
+        operation: { $ref: "#/components/schemas/StorageMaintenanceOperation" }
+        state: { $ref: "#/components/schemas/StorageMaintenanceState" }
+        created_at_ms: { type: integer, format: int64 }
+        started_at_ms: { type: integer, format: int64 }
+        completed_at_ms: { type: integer, format: int64 }
+        result: { $ref: "#/components/schemas/StorageMaintenanceResult" }
+        error: { type: string }
     HAIdentifier:
       type: string
       description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.

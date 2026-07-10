@@ -12,12 +12,18 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const runtime = @import("swarm/runtime.zig");
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+const std = @import("std");
+const antfly = @import("antfly-zig");
 
-test {
-    _ = runtime;
-    _ = storage_backend_erased;
-    _ = lsm_backend;
+pub fn run(init: std.process.Init) !void {
+    return try antfly.standalone.runtime.run(init);
+}
+
+pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator) !void {
+    return try antfly.standalone.runtime.runFromIterator(init, argv0, args);
+}
+
+test "standalone cmd compiles" {
+    _ = run;
+    _ = runFromIterator;
 }

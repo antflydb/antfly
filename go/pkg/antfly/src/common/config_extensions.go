@@ -87,9 +87,13 @@ func (c *Config) ValidateWithOptions(opts ValidationOptions) error {
 	if c == nil {
 		return errors.New("config cannot be nil")
 	}
+	if err := c.validateDeploymentMode(); err != nil {
+		return fmt.Errorf("deployment_mode validation failed: %w", err)
+	}
 
 	// Validate metadata configuration
-	if opts.RequireMetadata || len(c.Metadata.OrchestrationUrls) > 0 {
+	requiresExternalMetadata := opts.RequireMetadata && c.EffectiveDeploymentMode() == ConfigDeploymentModeDistributed
+	if requiresExternalMetadata || len(c.Metadata.OrchestrationUrls) > 0 {
 		if err := c.validateMetadata(); err != nil {
 			return fmt.Errorf("metadata config validation failed: %w", err)
 		}
@@ -117,12 +121,20 @@ func (c *Config) ValidateWithOptions(opts ValidationOptions) error {
 	if err := c.validateReplicationFactor(); err != nil {
 		return fmt.Errorf("replication_factor validation failed: %w", err)
 	}
-
 	if c.DefaultShardsPerTable == 0 {
 		return errors.New("default_shards_per_table must be greater than 0")
 	}
 
 	return nil
+}
+
+func (c *Config) validateDeploymentMode() error {
+	switch c.EffectiveDeploymentMode() {
+	case ConfigDeploymentModeEmbedded, ConfigDeploymentModeDistributed, ConfigDeploymentModeStandalone, ConfigDeploymentModeServerless:
+		return nil
+	default:
+		return fmt.Errorf("unsupported mode %q", c.DeploymentMode)
+	}
 }
 
 // validateMetadata validates the metadata configuration
@@ -192,6 +204,57 @@ func (c *Config) validateTLS() error {
 
 // validateStorage validates the storage configuration
 func (c *Config) validateStorage() error {
+	engine := c.Storage.Engine
+	if engine == "" {
+		engine = StorageEngineLocal
+	}
+	hasLite := strings.TrimSpace(c.Storage.Lite.Path) != ""
+	hasLocal := strings.TrimSpace(c.Storage.Local.BaseDir) != ""
+	hasObject := strings.TrimSpace(string(c.Storage.Object.Provider)) != "" || strings.TrimSpace(c.Storage.Object.Bucket) != ""
+
+	switch engine {
+	case StorageEngineLite:
+		if c.EffectiveDeploymentMode() != ConfigDeploymentModeStandalone && c.EffectiveDeploymentMode() != ConfigDeploymentModeEmbedded {
+			return fmt.Errorf("storage.engine=lite requires deployment_mode standalone or embedded")
+		}
+		if !hasLite {
+			return errors.New("storage.lite.path is required when storage.engine=lite")
+		}
+		if !strings.HasSuffix(c.Storage.Lite.Path, ".aflite") {
+			return errors.New("storage.lite.path must end in .aflite")
+		}
+		if hasLocal || hasObject || c.Storage.S3.Bucket != "" || c.Storage.Data != "" || c.Storage.Metadata != "" {
+			return errors.New("storage.lite, storage.local, storage.object, and legacy backend settings are mutually exclusive")
+		}
+		if c.ReplicationFactor > 1 || c.DefaultShardsPerTable > 1 {
+			return errors.New("Lite storage supports one writer and one shard; replication and horizontal sharding are not supported")
+		}
+		if len(c.Metadata.OrchestrationUrls) > 0 {
+			return errors.New("Lite storage cannot use external metadata or Raft orchestration URLs")
+		}
+		return nil
+	case StorageEngineObject:
+		if c.EffectiveDeploymentMode() != ConfigDeploymentModeServerless {
+			return errors.New("storage.engine=object requires deployment_mode serverless")
+		}
+		if hasLite || hasLocal || !hasObject || c.Storage.S3.Bucket != "" || c.Storage.Data != "" || c.Storage.Metadata != "" {
+			return errors.New("storage.object is required and must be the only storage member when storage.engine=object")
+		}
+		if c.Storage.Object.Provider != ObjectStorageConfigProviderS3 {
+			return fmt.Errorf("unsupported object storage provider %q", c.Storage.Object.Provider)
+		}
+		if bucketLen := len(strings.TrimSpace(c.Storage.Object.Bucket)); bucketLen < 3 || bucketLen > 63 {
+			return fmt.Errorf("object storage bucket name must be between 3 and 63 characters, got %d", bucketLen)
+		}
+		return nil
+	case StorageEngineLocal:
+		if hasLite || hasObject {
+			return errors.New("storage.local must be the only tagged storage member when storage.engine=local")
+		}
+	default:
+		return fmt.Errorf("unsupported storage.engine %q", c.Storage.Engine)
+	}
+
 	// Validate local storage base directory
 	if strings.TrimSpace(c.Storage.Local.BaseDir) == "" {
 		return errors.New("storage.local.base_dir is required")

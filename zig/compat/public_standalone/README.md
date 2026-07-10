@@ -1,4 +1,4 @@
-# Public Swarm Search Compat
+# Public Standalone Search Compat
 
 This compat target compares the Go and Zig servers through the same public HTTP
 contract instead of comparing isolated HBC internals.
@@ -22,9 +22,9 @@ documents and runs:
 ```sh
 zig build install -Dedition=full
 zig build public-query-guardrail -- \
-  --mode swarm \
+  --mode standalone \
   --server-kind zig \
-  --swarm-binary ./zig-out/bin/antfly \
+  --standalone-binary ./zig-out/bin/antfly \
   --docs 50000 \
   --dims 384 \
   --queries 8 \
@@ -46,13 +46,13 @@ Build the sibling Go binary first:
   go build -o /tmp/antfly-go ./go/pkg/antfly/cmd)
 ```
 
-Then run the same harness against Go swarm:
+Then run the same harness against Go standalone:
 
 ```sh
 zig build public-query-guardrail -- \
-  --mode swarm \
+  --mode standalone \
   --server-kind go \
-  --swarm-binary /tmp/antfly-go \
+  --standalone-binary /tmp/antfly-go \
   --docs 50000 \
   --dims 384 \
   --queries 8 \

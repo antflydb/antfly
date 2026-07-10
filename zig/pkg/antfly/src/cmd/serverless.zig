@@ -16,7 +16,7 @@ const std = @import("std");
 const api = @import("serverless_api.zig");
 const query = @import("serverless_query.zig");
 const maintenance = @import("serverless_maintenance.zig");
-const swarm = @import("serverless_swarm.zig");
+const combined = @import("serverless_combined.zig");
 
 pub fn run(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -49,7 +49,7 @@ fn dispatch(init: std.process.Init, argv0: []const u8, subcommand: []const u8, a
     if (std.mem.eql(u8, subcommand, "api")) return try api.runFromIterator(init, nested_argv0, args);
     if (std.mem.eql(u8, subcommand, "query")) return try query.runFromIterator(init, nested_argv0, args);
     if (std.mem.eql(u8, subcommand, "maintenance")) return try maintenance.runFromIterator(init, nested_argv0, args);
-    if (std.mem.eql(u8, subcommand, "swarm")) return try swarm.runFromIterator(init, nested_argv0, args);
+    if (std.mem.eql(u8, subcommand, "combined")) return try combined.runFromIterator(init, nested_argv0, args);
 
     std.debug.print("unknown serverless subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -64,7 +64,7 @@ fn printUsage(argv0: []const u8) void {
         \\  api
         \\  query
         \\  maintenance
-        \\  swarm
+        \\  combined
         \\
     , .{argv0});
 }

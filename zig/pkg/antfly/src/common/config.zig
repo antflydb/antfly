@@ -28,10 +28,27 @@ const synthesizing = @import("antfly_synthesizing");
 const platform = @import("antfly_platform");
 
 const default_max_shard_size_bytes: u64 = 64 * 1024 * 1024;
+
+pub const StorageEngine = common_openapi.StorageEngine;
 const default_max_shards_per_table: u32 = 20;
 const default_config_shards_per_table: u32 = 3;
-const default_swarm_shards_per_table: u32 = 1;
+const default_standalone_shards_per_table: u32 = 1;
 pub const default_health_port: u16 = 4200;
+
+pub const DeploymentMode = enum {
+    embedded,
+    distributed,
+    standalone,
+    serverless,
+
+    pub fn isStandalone(self: DeploymentMode) bool {
+        return self == .standalone;
+    }
+
+    pub fn supportsLite(self: DeploymentMode) bool {
+        return self == .standalone or self == .embedded;
+    }
+};
 
 pub const Config = struct {
     registry: provider_registry.Registry,
@@ -39,7 +56,7 @@ pub const Config = struct {
     readers: readers.Registry,
     text_to_speech: synthesizing.Registry,
     auth_enabled: bool = false,
-    swarm_mode: bool = false,
+    deployment_mode: DeploymentMode = .distributed,
     health_enabled: bool = true,
     health_port: ?u16 = null,
     log: ?logging_openapi.Config = null,
@@ -82,14 +99,24 @@ pub const Config = struct {
     };
 
     pub const StorageConfig = struct {
+        engine: common_openapi.StorageEngine = .local,
+        lite_path: ?[]u8 = null,
+        lite_fsync: bool = true,
         local_base_dir: ?[]u8 = null,
+        object_provider: ?[]u8 = null,
+        object_bucket: ?[]u8 = null,
+        object_prefix: ?[]u8 = null,
         data_backend: ?common_openapi.StorageBackend = null,
         metadata_backend: ?common_openapi.StorageBackend = null,
         s3_bucket: ?[]u8 = null,
         s3_prefix: ?[]u8 = null,
 
         fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
+            if (self.lite_path) |value| alloc.free(value);
             if (self.local_base_dir) |value| alloc.free(value);
+            if (self.object_provider) |value| alloc.free(value);
+            if (self.object_bucket) |value| alloc.free(value);
+            if (self.object_prefix) |value| alloc.free(value);
             if (self.s3_bucket) |value| alloc.free(value);
             if (self.s3_prefix) |value| alloc.free(value);
             self.* = undefined;
@@ -361,6 +388,9 @@ pub const Config = struct {
         });
         defer validated.deinit();
 
+        const deployment_mode = try deploymentModeFromObject(root);
+        try validateStorageFromOpenApi(deployment_mode, root, validated.value.storage);
+
         var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
         var transcribers = if (root.get("transcribers")) |transcribers_value|
@@ -379,14 +409,13 @@ pub const Config = struct {
             synthesizing.Registry.init(alloc);
         errdefer text_to_speech.deinit();
 
-        const swarm_mode = try optionalBoolField(root, "swarm_mode") orelse false;
         return .{
             .registry = registry,
             .transcribers = transcribers,
             .readers = reader_registry,
             .text_to_speech = text_to_speech,
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
-            .swarm_mode = swarm_mode,
+            .deployment_mode = deployment_mode,
             .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
             .health_port = if (validated.value.health_port) |value|
                 std.math.cast(u16, value) orelse return error.InvalidConfig
@@ -419,7 +448,7 @@ pub const Config = struct {
                 null,
             .connections = try parseConnectionsConfig(alloc, root.get("connections")),
             .shard_allocation = .{
-                .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (swarm_mode) default_swarm_shards_per_table else default_config_shards_per_table,
+                .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (deployment_mode.supportsLite()) default_standalone_shards_per_table else default_config_shards_per_table,
                 .max_shard_size_bytes = try optionalU64Field(root, "max_shard_size_bytes") orelse default_max_shard_size_bytes,
                 .min_shard_size_bytes = try optionalU64Field(root, "min_shard_size_bytes") orelse 0,
                 .min_shards_per_table = try optionalU32Field(root, "min_shards_per_table") orelse 1,
@@ -441,8 +470,24 @@ pub const Config = struct {
         errdefer parsed.deinit(alloc);
 
         const value = storage orelse return parsed;
+        parsed.engine = value.engine;
         parsed.data_backend = value.data;
         parsed.metadata_backend = value.metadata;
+
+        switch (parsed.engine) {
+            .lite => {
+                const lite = value.lite.?;
+                parsed.lite_path = try alloc.dupe(u8, lite.path);
+                parsed.lite_fsync = lite.fsync orelse true;
+            },
+            .local => {},
+            .object => {
+                const object = value.object.?;
+                parsed.object_provider = try alloc.dupe(u8, object.provider);
+                parsed.object_bucket = try alloc.dupe(u8, object.bucket);
+                if (object.prefix) |prefix| parsed.object_prefix = try alloc.dupe(u8, prefix);
+            },
+        }
 
         if (value.local) |local| {
             if (local.base_dir) |base_dir| parsed.local_base_dir = try alloc.dupe(u8, base_dir);
@@ -453,6 +498,53 @@ pub const Config = struct {
         }
 
         return parsed;
+    }
+
+    fn validateStorageFromOpenApi(
+        deployment_mode: DeploymentMode,
+        root: std.json.ObjectMap,
+        storage: ?common_openapi.StorageConfig,
+    ) !void {
+        const value = storage orelse return;
+        const engine = value.engine;
+        const has_lite = value.lite != null;
+        const has_local = value.local != null;
+        const has_object = value.object != null;
+        const selected_count: u8 = @intFromBool(has_lite) + @intFromBool(has_local) + @intFromBool(has_object);
+        if (selected_count > 1) return error.InvalidConfig;
+
+        switch (engine) {
+            .lite => {
+                if (!deployment_mode.supportsLite()) return error.InvalidConfig;
+                const lite = value.lite orelse return error.InvalidConfig;
+                if (!std.mem.endsWith(u8, lite.path, ".aflite")) return error.InvalidConfig;
+                if (has_local or has_object or value.s3 != null or value.data != null or value.metadata != null) return error.InvalidConfig;
+                if ((try optionalU32Field(root, "replication_factor") orelse 1) != 1) return error.InvalidConfig;
+                if ((try optionalU32Field(root, "default_shards_per_table") orelse 1) != 1) return error.InvalidConfig;
+                if (try optionalBoolField(root, "disable_shard_alloc")) |disabled| {
+                    if (!disabled) return error.InvalidConfig;
+                }
+                if (root.get("metadata")) |metadata| {
+                    if (metadata != .object) return error.InvalidConfig;
+                    inline for (.{ "orchestration_urls", "raft_urls" }) |field_name| {
+                        if (metadata.object.get(field_name)) |urls| {
+                            if (urls != .object or urls.object.count() != 0) return error.InvalidConfig;
+                        }
+                    }
+                }
+            },
+            .local => {
+                if (has_lite or has_object) return error.InvalidConfig;
+                if (!has_local) return error.InvalidConfig;
+            },
+            .object => {
+                if (deployment_mode != .serverless) return error.InvalidConfig;
+                const object = value.object orelse return error.InvalidConfig;
+                if (has_lite or has_local or value.s3 != null or value.data != null or value.metadata != null) return error.InvalidConfig;
+                if (!std.mem.eql(u8, object.provider, "s3")) return error.InvalidConfig;
+                if (object.bucket.len < 3 or object.bucket.len > 63) return error.InvalidConfig;
+            },
+        }
     }
 
     pub fn deinit(self: *Config) void {
@@ -616,6 +708,17 @@ fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
     };
 }
 
+fn deploymentModeFromObject(root: std.json.ObjectMap) !DeploymentMode {
+    if (root.get("deployment_mode")) |value| {
+        if (value != .string) return error.InvalidConfig;
+        inline for (std.meta.fields(DeploymentMode)) |field| {
+            if (std.mem.eql(u8, value.string, field.name)) return @enumFromInt(field.value);
+        }
+        return error.InvalidConfig;
+    }
+    return .distributed;
+}
+
 fn optionalU32Field(root: std.json.ObjectMap, field_name: []const u8) !?u32 {
     const value = root.get(field_name) orelse return null;
     return switch (value) {
@@ -630,6 +733,68 @@ fn optionalU64Field(root: std.json.ObjectMap, field_name: []const u8) !?u64 {
         .integer => std.math.cast(u64, value.integer) orelse error.InvalidConfig,
         else => error.InvalidConfig,
     };
+}
+
+test "common config keeps Lite as a storage engine independent of standalone topology" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "standalone",
+        \\  "storage": {
+        \\    "engine": "lite",
+        \\    "lite": { "path": "data.antfly.aflite", "fsync": true }
+        \\  },
+        \\  "replication_factor": 1,
+        \\  "default_shards_per_table": 1
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(DeploymentMode.standalone, cfg.deployment_mode);
+    try std.testing.expectEqual(common_openapi.StorageEngine.lite, cfg.storage.engine);
+    try std.testing.expectEqualStrings("data.antfly.aflite", cfg.storage.lite_path.?);
+    try std.testing.expect(cfg.storage.lite_fsync);
+}
+
+test "common config rejects Lite storage for distributed topology" {
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "distributed",
+        \\  "storage": {
+        \\    "engine": "lite",
+        \\    "lite": { "path": "data.aflite" }
+        \\  }
+        \\}
+    ));
+}
+
+test "common config gives embedded Lite a single shard default" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "embedded",
+        \\  "storage": {
+        \\    "engine": "lite",
+        \\    "lite": { "path": "embedded.aflite" }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 1), cfg.shard_allocation.default_shards_per_table);
+}
+
+test "common config rejects distributed controls with Lite storage" {
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "standalone",
+        \\  "storage": { "engine": "lite", "lite": { "path": "data.aflite" } },
+        \\  "disable_shard_alloc": false
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "standalone",
+        \\  "storage": { "engine": "lite", "lite": { "path": "data.aflite" } },
+        \\  "metadata": { "orchestration_urls": { "1": "http://127.0.0.1:7001" } }
+        \\}
+    ));
 }
 
 fn optionalObjectStringFieldDup(
@@ -1134,6 +1299,7 @@ test "common config parses provider maps" {
         \\  },
         \\  "enable_auth": true,
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "replication_factor": 1,
@@ -1199,6 +1365,7 @@ test "common config extracts antfly settings" {
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "replication_factor": 1,
@@ -1284,6 +1451,7 @@ test "common config defaults shard scalar fields" {
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  }
         \\}
@@ -1307,6 +1475,7 @@ test "common config treats go orchestration urls as metadata api discovery urls"
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "replication_factor": 1,
@@ -1340,8 +1509,9 @@ test "common config preserves remote content logging and storage fields" {
         \\    "style": "json"
         \\  },
         \\  "health_port": 4200,
-        \\  "swarm_mode": true,
+        \\  "deployment_mode": "standalone",
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" },
         \\    "data": "s3",
         \\    "metadata": "local",
@@ -1382,7 +1552,7 @@ test "common config preserves remote content logging and storage fields" {
     var cfg = try Config.parseFromSlice(alloc, raw);
     defer cfg.deinit();
 
-    try std.testing.expectEqual(true, cfg.swarm_mode);
+    try std.testing.expectEqual(DeploymentMode.standalone, cfg.deployment_mode);
     try std.testing.expect(cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, 4200), cfg.health_port);
     try std.testing.expectEqual(logging_openapi.Level.debug, cfg.log.?.level.?);
@@ -1519,6 +1689,7 @@ test "common config preserves tls and cors fields" {
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "tls": {
@@ -1562,6 +1733,7 @@ test "common config preserves named audio provider maps and defaults" {
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "replication_factor": 1,
@@ -1624,6 +1796,7 @@ test "common config resolves secret references through the provided store" {
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "replication_factor": 1,
@@ -1650,6 +1823,7 @@ test "common config inherits antfly content security from remote content" {
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "remote_content": {
@@ -1685,6 +1859,7 @@ test "common config prefers antfly content security over inherited remote conten
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "remote_content": {
@@ -1724,6 +1899,7 @@ test "common config treats empty antfly content security as inheritable" {
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "remote_content": {
@@ -1775,6 +1951,7 @@ test "common config preserves live secret references inside remote content crede
         \\    }
         \\  },
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "remote_content": {
@@ -1827,19 +2004,19 @@ test "common config resolves local role base dir from config" {
     };
     defer cfg.deinit();
 
-    const base = try resolveLocalRoleBaseDir(alloc, &cfg, "swarm");
+    const base = try resolveLocalRoleBaseDir(alloc, &cfg, "standalone");
     defer alloc.free(base);
-    try std.testing.expectEqualStrings("/tmp/antflydb/swarm", base);
+    try std.testing.expectEqualStrings("/tmp/antflydb/standalone", base);
 }
 
 test "common config resolves stable local role base dir by default" {
     const alloc = std.testing.allocator;
     const default_base = try defaultLocalBaseDir(alloc);
     defer alloc.free(default_base);
-    const expected = try std.fs.path.join(alloc, &.{ default_base, "swarm" });
+    const expected = try std.fs.path.join(alloc, &.{ default_base, "standalone" });
     defer alloc.free(expected);
 
-    const base = try resolveLocalRoleBaseDir(alloc, null, "swarm");
+    const base = try resolveLocalRoleBaseDir(alloc, null, "standalone");
     defer alloc.free(base);
     try std.testing.expectEqualStrings(expected, base);
 }
@@ -1875,6 +2052,7 @@ test "common config accepts partial metadata and storage objects" {
         \\{
         \\  "metadata": {},
         \\  "storage": {
+        \\    "engine": "local",
         \\    "local": {},
         \\    "data": "local"
         \\  }
@@ -1888,15 +2066,15 @@ test "common config accepts partial metadata and storage objects" {
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
 }
 
-test "common config applies swarm shard defaults when swarm mode is set" {
+test "common config applies standalone shard defaults when standalone mode is set" {
     const alloc = std.testing.allocator;
     var cfg = try Config.parseFromSlice(alloc,
-        \\{"swarm_mode": true}
+        \\{"deployment_mode": "standalone"}
     );
     defer cfg.deinit();
 
-    try std.testing.expect(cfg.swarm_mode);
-    try std.testing.expectEqual(@as(u32, default_swarm_shards_per_table), cfg.shard_allocation.default_shards_per_table);
+    try std.testing.expectEqual(DeploymentMode.standalone, cfg.deployment_mode);
+    try std.testing.expectEqual(@as(u32, default_standalone_shards_per_table), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);

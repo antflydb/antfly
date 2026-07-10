@@ -3997,7 +3997,7 @@ pub const MetadataHttpService = struct {
         var cdc_group_router = api_table_router.CatalogBackedGroupRouter.init(
             catalog,
             // CDC is metadata-owned but data-applied; force the routed API path even
-            // when metadata and data live in the same swarm process.
+            // when metadata and data live in the same standalone process.
             0,
         );
         var hosted_write_source = api_table_writes.HostedProvisionedTableWriteSource.init(

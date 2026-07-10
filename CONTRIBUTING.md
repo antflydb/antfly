@@ -3,7 +3,7 @@
 ## Repository Layout
 
 ```
-go/pkg/antfly/cmd/          CLI entry point (cobra subcommands: swarm, store, metadata, query, load, etc.)
+go/pkg/antfly/cmd/          CLI entry point (cobra subcommands: standalone, store, metadata, query, load, etc.)
 go/pkg/antfly/src/
   metadata/          Metadata server (API, Raft, schema management, retrieval agents)
   store/             Storage nodes (shards, indexes, queries, transactions)
@@ -86,13 +86,13 @@ Run `make help` for the full list. Key targets:
 
 ## Running Locally
 
-### Swarm Mode (Single Process)
+### Standalone Mode (Single Process)
 
 Runs metadata, storage, and Antfly inference together:
 
 ```bash
 cd go/pkg/antfly
-go run ./cmd swarm
+go run ./cmd standalone
 ```
 
 Dashboard at `http://localhost:8080`. Antfly inference auto-discovers models from `~/.antfly/inference/models/`.

@@ -270,8 +270,9 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
-    swarm_mode: bool = false,
+    deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -1138,6 +1139,11 @@ pub const ApiHttpServer = struct {
     pub fn configuredInferenceAPIURL(self: *const ApiHttpServer) ?[]const u8 {
         const node_config = self.cfg.node_config orelse return null;
         return node_config.inference.api_url;
+    }
+
+    pub fn currentStorageRuntimeStatus(self: *const ApiHttpServer) ?metadata_openapi.StorageRuntimeStatus {
+        const maintenance = self.cfg.storage_maintenance orelse return null;
+        return storageRuntimeStatus(maintenance.status());
     }
 
     pub fn initWithConfig(
@@ -2059,13 +2065,17 @@ pub const ApiHttpServer = struct {
             }
         }
 
+        if (try self.dispatchStorageMaintenanceRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
             const metadata_status = try self.source.status();
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
             defer public_status.deinit(self.alloc);
             public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.swarm_mode = self.cfg.swarm_mode;
+            public_status.deployment_mode = self.cfg.deployment_mode;
+            if (self.cfg.storage_maintenance) |maintenance| {
+                public_status.storage = storageRuntimeStatus(maintenance.status());
+            }
             if (self.cfg.secret_store) |secret_store| {
                 _ = secret_store.refreshIfChanged() catch |err| {
                     std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -2079,7 +2089,10 @@ pub const ApiHttpServer = struct {
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
             defer public_status.deinit(self.alloc);
             public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.swarm_mode = self.cfg.swarm_mode;
+            public_status.deployment_mode = self.cfg.deployment_mode;
+            if (self.cfg.storage_maintenance) |maintenance| {
+                public_status.storage = storageRuntimeStatus(maintenance.status());
+            }
             if (self.cfg.secret_store) |secret_store| {
                 _ = secret_store.refreshIfChanged() catch |err| {
                     std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -2161,6 +2174,42 @@ pub const ApiHttpServer = struct {
             return try ha_exec.execute(self.alloc, req);
         }
         return null;
+    }
+
+    fn dispatchStorageMaintenanceRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
+        if (!isStorageMaintenancePath(uri_parts.path)) return null;
+        const coordinator = self.cfg.storage_maintenance orelse return try textResponse(self.alloc, 422, "storage maintenance unsupported");
+        if (std.mem.startsWith(u8, uri_parts.path, admin_routes.maintenance_jobs_prefix)) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            const raw_id = uri_parts.path[admin_routes.maintenance_jobs_prefix.len..];
+            if (raw_id.len == 0 or std.mem.indexOfScalar(u8, raw_id, '/') != null) return try textResponse(self.alloc, 404, "not found");
+            const job_id = std.fmt.parseUnsigned(u64, raw_id, 10) catch return try textResponse(self.alloc, 404, "not found");
+            const snapshot = coordinator.get(job_id) orelse return try textResponse(self.alloc, 404, "not found");
+            return try storageMaintenanceJobResponse(self.alloc, 200, snapshot);
+        }
+        if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
+        const operation: @import("../storage/maintenance.zig").Operation = if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_check))
+            .check
+        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_compact))
+            .compact
+        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_vacuum))
+            .vacuum
+        else
+            return try textResponse(self.alloc, 404, "not found");
+        const capabilities = coordinator.status().maintenance;
+        const supported = switch (operation) {
+            .check => capabilities.check,
+            .compact => capabilities.compact,
+            .vacuum => capabilities.vacuum,
+        };
+        if (!supported) return try textResponse(self.alloc, 422, "storage maintenance operation unsupported");
+        const snapshot = coordinator.start(operation, req.header("Idempotency-Key")) catch |err| switch (err) {
+            error.MaintenanceBusy => return try textResponse(self.alloc, 409, "storage maintenance already running"),
+            error.IdempotencyConflict => return try textResponse(self.alloc, 409, "idempotency key reused for another operation"),
+            error.InvalidIdempotencyKey => return try textResponse(self.alloc, 400, "invalid idempotency key"),
+            else => return err,
+        };
+        return try storageMaintenanceJobResponse(self.alloc, 202, snapshot);
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
@@ -6576,7 +6625,7 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         if (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)) return error.TableAlreadyExists;
 
-        if (!self.cfg.swarm_mode) {
+        if (!self.cfg.deployment_mode.isStandalone()) {
             if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
@@ -7157,7 +7206,7 @@ pub const ApiHttpServer = struct {
 
             // For overwrite, skip the metadata restore path and use the owned-table
             // restore which creates the table and copies data synchronously.
-            if (!is_overwrite and !self.cfg.swarm_mode) {
+            if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     error.UnsupportedOperation => false,
@@ -9345,6 +9394,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 
 pub fn requiresAdminPermission(path: []const u8) bool {
     if (isHaAdminPath(path)) return true;
+    if (isStorageMaintenancePath(path)) return true;
     if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
@@ -9356,6 +9406,42 @@ pub fn requiresAdminPermission(path: []const u8) bool {
 
 fn isHaAdminPath(path: []const u8) bool {
     return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+}
+
+fn isStorageMaintenancePath(path: []const u8) bool {
+    return std.mem.eql(u8, path, admin_routes.maintenance) or std.mem.startsWith(u8, path, admin_routes.maintenance ++ "/");
+}
+
+fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) metadata_openapi.StorageRuntimeStatus {
+    return .{
+        .engine = status.engine,
+        .format = status.format,
+        .fsync = status.fsync,
+        .maintenance = .{
+            .check = status.maintenance.check,
+            .compact = status.maintenance.compact,
+            .vacuum = status.maintenance.vacuum,
+            .online = status.maintenance.online,
+            .asynchronous = status.maintenance.asynchronous,
+        },
+    };
+}
+
+fn storageMaintenanceJobResponse(
+    alloc: std.mem.Allocator,
+    status_code: u16,
+    snapshot: @import("../storage/maintenance.zig").Coordinator.Snapshot,
+) !http_common.HttpResponse {
+    return try jsonResponseWithStatus(alloc, status_code, .{
+        .job_id = snapshot.job_id,
+        .operation = snapshot.operation,
+        .state = snapshot.state,
+        .created_at_ms = snapshot.created_at_ms,
+        .started_at_ms = snapshot.started_at_ms,
+        .completed_at_ms = snapshot.completed_at_ms,
+        .result = snapshot.result,
+        .@"error" = snapshot.error_name,
+    });
 }
 
 fn isHaInternalPath(path: []const u8) bool {
@@ -12254,6 +12340,62 @@ test "api http server validates writes against extension data shape members" {
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
 }
 
+test "api http server exposes storage status and asynchronous maintenance jobs" {
+    const maintenance_mod = @import("../storage/maintenance.zig");
+    const FakeStatus = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const FakeMaintenance = struct {
+        fn source(self: *@This()) maintenance_mod.Source {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
+        }
+        fn status(_: *anyopaque) maintenance_mod.Status {
+            return .{ .engine = "lite", .format = "aflite", .fsync = true, .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = true } };
+        }
+        fn run(_: *anyopaque, operation: maintenance_mod.Operation) anyerror!maintenance_mod.Result {
+            return switch (operation) {
+                .check => .{ .valid = true, .file_size = 4096 },
+                .compact, .vacuum => .{ .before_size = 8192, .after_size = 4096, .reclaimed_bytes = 4096 },
+            };
+        }
+    };
+
+    var status_source = FakeStatus{};
+    var maintenance_source = FakeMaintenance{};
+    var coordinator = maintenance_mod.Coordinator.init(std.testing.allocator, maintenance_source.source());
+    defer coordinator.deinit();
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .storage_maintenance = &coordinator }, status_source.iface(), null, null);
+    defer server.deinit();
+
+    var status_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
+    defer status_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), status_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"engine\":\"lite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"vacuum\":true") != null);
+
+    const headers = [_]http_common.RequestHeader{.{ .name = "Idempotency-Key", .value = "check-1" }};
+    var start_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
+    defer start_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), start_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, start_resp.body, "\"operation\":\"check\"") != null);
+
+    var replay_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
+    defer replay_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), replay_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, replay_resp.body, "\"job_id\":1") != null);
+
+    while (coordinator.get(1).?.state != .succeeded) std.Thread.yield() catch {};
+    var get_resp = try server.handle(.{ .method = .GET, .uri = admin_routes.maintenance_jobs_prefix ++ "1" });
+    defer get_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), get_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "\"valid\":true") != null);
+}
+
 test "api http server dispatches extension lifecycle mutations" {
     const FakeSource = struct {
         install_called: bool = false,
@@ -14711,7 +14853,7 @@ test "api http server serves secrets crud when backed by a local store" {
     defer store.deinit();
 
     var server = ApiHttpServer.init(alloc, .{
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &store,
     }, source.iface(), null, null);
 
@@ -14819,7 +14961,7 @@ test "api http server status includes secret store reload health" {
     defer store.deinit();
 
     var server = ApiHttpServer.init(alloc, .{
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &store,
     }, source.iface(), null, null);
 
@@ -14930,7 +15072,7 @@ test "api http server forbids non-admin secret access when auth is enabled" {
 
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &store,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);

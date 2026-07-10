@@ -184,7 +184,7 @@
         "tags": [
           "cluster_management"
         ],
-        "description": "Store a secret in the keystore. Only available in swarm (single-node) mode.\nReturns 503 in multi-node mode.\n",
+        "description": "Store a secret in the keystore. Only available in standalone (single-node) mode.\nReturns 503 in multi-node mode.\n",
         "operationId": "putSecret",
         "requestBody": {
           "required": true,
@@ -237,7 +237,7 @@
         "tags": [
           "cluster_management"
         ],
-        "description": "Remove a secret from the keystore. Only available in swarm (single-node) mode.\nReturns 503 in multi-node mode.\n",
+        "description": "Remove a secret from the keystore. Only available in standalone (single-node) mode.\nReturns 503 in multi-node mode.\n",
         "operationId": "deleteSecret",
         "responses": {
           "204": {
@@ -1508,10 +1508,10 @@
             "description": "Indicates whether authentication is enabled for the cluster",
             "x-omitzero": false
           },
-          "swarm_mode": {
-            "type": "boolean",
-            "description": "Indicates whether the cluster is running in single-node swarm mode",
-            "x-omitzero": false
+          "deployment_mode": {
+            "type": "string",
+            "enum": ["distributed", "standalone", "serverless", "lite"],
+            "description": "Runtime deployment topology"
           }
         }
       },
@@ -8676,7 +8676,7 @@
         }
       },
       "AntflyChunkerConfig": {
-        "description": "Configuration for the local Antfly chunking provider.\n\nThis provider runs chunking directly within the storage node process,\nwithout requiring an external Antfly inference service. It uses simple fixed-size\ntokenizer-based chunking with no caching overhead.\n\n**Use this when:**\n- Running single-node deployments (swarm mode)\n- You don't need embedding/chunk caching across nodes\n- You want minimal setup complexity\n\n**Use Antfly inference instead when:**\n- Running multi-node clusters where caching reduces costs\n- You need ONNX-accelerated chunking models\n- You want persistent chunk/embedding caches\n",
+        "description": "Configuration for the local Antfly chunking provider.\n\nThis provider runs chunking directly within the storage node process,\nwithout requiring an external Antfly inference service. It uses simple fixed-size\ntokenizer-based chunking with no caching overhead.\n\n**Use this when:**\n- Running single-node deployments (standalone mode)\n- You don't need embedding/chunk caching across nodes\n- You want minimal setup complexity\n\n**Use Antfly inference instead when:**\n- Running multi-node clusters where caching reduces costs\n- You need ONNX-accelerated chunking models\n- You want persistent chunk/embedding caches\n",
         "allOf": [
           {
             "$ref": "#/components/schemas/ChunkOptions"

@@ -143,7 +143,7 @@ func CreateTestConfig(t *testing.T, baseDir string, id types.ID) *common.Config 
 	t.Helper()
 
 	config := &common.Config{
-		SwarmMode:             true,
+		DeploymentMode:        common.ConfigDeploymentModeStandalone,
 		DisableShardAlloc:     true,
 		ReplicationFactor:     1,
 		DefaultShardsPerTable: 1,
@@ -667,7 +667,7 @@ func cdcCleanupPG(t *testing.T, tableName, slotName, pubName string) {
 	_, _ = conn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", pubName))
 }
 
-// waitForKeyAvailable polls until a key is available (reusable for swarm tests).
+// waitForKeyAvailable polls until a key is available (reusable for standalone tests).
 func waitForKeyAvailable(t *testing.T, ctx context.Context, client *antfly.AntflyClient, table, key string, timeout time.Duration) error {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

@@ -12,18 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const std = @import("std");
-const antfly = @import("antfly-zig");
+pub const runtime = @import("runtime.zig");
 
-pub fn run(init: std.process.Init) !void {
-    return try antfly.swarm.runtime.run(init);
-}
-
-pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator) !void {
-    return try antfly.swarm.runtime.runFromIterator(init, argv0, args);
-}
-
-test "swarm cmd compiles" {
-    _ = run;
-    _ = runFromIterator;
+test "standalone module compiles" {
+    _ = runtime;
 }

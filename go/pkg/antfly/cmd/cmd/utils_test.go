@@ -355,7 +355,7 @@ func TestParseConfigCommandSpecificMetadataValidation(t *testing.T) {
 		require.Equal(t, defaultInferenceAPIURL, config.Inference.ApiUrl)
 	})
 
-	t.Run("swarm_does_not_require_user_metadata", func(t *testing.T) {
+	t.Run("standalone_does_not_require_user_metadata", func(t *testing.T) {
 		v := viper.New()
 		v.SetConfigType("yaml")
 		require.NoError(t, v.ReadConfig(strings.NewReader(`{}`)))

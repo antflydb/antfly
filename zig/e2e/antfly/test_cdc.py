@@ -181,7 +181,7 @@ def _metadata_admin_base_url(stateful_api) -> str:
     if env_url:
         return env_url.rstrip("/")
     logs = _server_logs(stateful_api)
-    matches = re.findall(r"(?:swarm )?metadata admin api listening on (http://[^\s]+)", logs)
+    matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
     if matches:
         return matches[-1].rstrip("/")
     return ""

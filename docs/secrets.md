@@ -64,13 +64,13 @@ indexes:
 
 ```bash
 # With password-protected keystore
-ANTFLY_KEYSTORE_PASSWORD="your-password" antfly swarm --config config.yaml
+ANTFLY_KEYSTORE_PASSWORD="your-password" antfly standalone --config config.yaml
 
 # With passwordless keystore
-antfly swarm --config config.yaml
+antfly standalone --config config.yaml
 
 # Custom keystore path
-antfly swarm --config config.yaml --keystore-path /path/to/keystore
+antfly standalone --config config.yaml --keystore-path /path/to/keystore
 ```
 
 ## CLI Commands
@@ -425,7 +425,7 @@ antfly keystore create
 echo "sk-..." | antfly keystore add openai.api_key --stdin
 
 # Run
-ANTFLY_KEYSTORE_PASSWORD="..." antfly swarm --config config.yaml
+ANTFLY_KEYSTORE_PASSWORD="..." antfly standalone --config config.yaml
 ```
 
 ### S3 Storage with AWS Credentials
@@ -450,7 +450,7 @@ antfly keystore add aws.access_key_id
 antfly keystore add aws.secret_access_key
 
 # Run
-ANTFLY_KEYSTORE_PASSWORD="..." antfly swarm --config config.yaml
+ANTFLY_KEYSTORE_PASSWORD="..." antfly standalone --config config.yaml
 ```
 
 ### Multi-Provider AI with Multiple Keys
@@ -477,5 +477,5 @@ echo "$OPENAI_API_KEY" | antfly keystore add openai.api_key --stdin
 echo "$ANTHROPIC_API_KEY" | antfly keystore add anthropic.api_key --stdin
 
 # Run
-ANTFLY_KEYSTORE_PASSWORD="..." antfly swarm --config config.yaml
+ANTFLY_KEYSTORE_PASSWORD="..." antfly standalone --config config.yaml
 ```

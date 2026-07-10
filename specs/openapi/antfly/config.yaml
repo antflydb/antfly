@@ -140,10 +140,15 @@ components:
           default: 3
           example: 4
           x-go-type: uint64
-        swarm_mode:
-          type: boolean
-          description: "Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node."
-          default: false
+        deployment_mode:
+          type: string
+          description: "Runtime deployment topology. Standalone runs metadata, data, APIs, and inference in one process."
+          enum:
+            - embedded
+            - distributed
+            - standalone
+            - serverless
+          default: distributed
         embedders:
           type: object
           additionalProperties:
@@ -655,9 +660,99 @@ components:
       default: "local"
       example: "local"
 
+    StorageEngine:
+      type: string
+      description: "Durable storage representation, independent of deployment topology."
+      enum:
+        - lite
+        - local
+        - object
+      default: local
+
+    LiteStorageConfig:
+      type: object
+      required:
+        - path
+      properties:
+        path:
+          type: string
+          minLength: 8
+          pattern: "\\.aflite$"
+          description: "Path to the single writable Antfly Lite database file."
+          example: "./data.antfly.aflite"
+        fsync:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+          description: "Synchronize committed Lite state before acknowledging it."
+
+    ObjectStorageConfig:
+      type: object
+      required:
+        - provider
+        - bucket
+      properties:
+        provider:
+          type: string
+          enum:
+            - s3
+        bucket:
+          type: string
+          minLength: 3
+          maxLength: 63
+        prefix:
+          type: string
+
     StorageConfig:
       type: object
+      description: >-
+        Tagged storage-engine configuration. Engine is required and exactly the
+        matching engine member must be present.
+      required: [engine]
+      oneOf:
+        - title: Lite storage configuration
+          required: [engine, lite]
+          properties:
+            engine:
+              type: string
+              enum: [lite]
+          not:
+            anyOf:
+              - required: [local]
+              - required: [object]
+              - required: [data]
+              - required: [metadata]
+              - required: [s3]
+        - title: Local storage configuration
+          required: [engine, local]
+          properties:
+            engine:
+              type: string
+              enum: [local]
+          not:
+            anyOf:
+              - required: [lite]
+              - required: [object]
+        - title: Object storage configuration
+          required: [engine, object]
+          properties:
+            engine:
+              type: string
+              enum: [object]
+          not:
+            anyOf:
+              - required: [lite]
+              - required: [local]
+              - required: [data]
+              - required: [metadata]
+              - required: [s3]
       properties:
+        engine:
+          $ref: "#/components/schemas/StorageEngine"
+        lite:
+          $ref: "#/components/schemas/LiteStorageConfig"
+        object:
+          $ref: "#/components/schemas/ObjectStorageConfig"
         local:
           $ref: "#/components/schemas/LocalStorageConfig"
         data:

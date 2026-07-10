@@ -678,7 +678,7 @@ Current binary/image split:
 - serverless API command: `antfly serverless api`
 - serverless query command: `antfly serverless query`
 - serverless maintenance command: `antfly serverless maintenance`
-- serverless all-in-one command: `antfly serverless swarm`
+- serverless all-in-one command: `antfly serverless combined`
 - runtime image Dockerfile: `Dockerfile.serverless`
 - published image: `ghcr.io/antflydb/antfly:zig`
 

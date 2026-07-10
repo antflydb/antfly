@@ -1526,12 +1526,14 @@ components:
           type: boolean
           description: Indicates whether authentication is enabled for the cluster
           x-omitzero: false
-        swarm_mode:
-          type: boolean
-          description: Indicates whether the cluster is running in single-node swarm mode
-          x-omitzero: false
+        deployment_mode:
+          type: string
+          enum: [embedded, distributed, standalone, serverless]
+          description: Runtime deployment topology
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
+        storage:
+          $ref: "#/components/schemas/StorageRuntimeStatus"
     ClusterTopology:
       type: object
       required:
@@ -1548,14 +1550,40 @@ components:
           type: boolean
           description: Indicates whether authentication is enabled for the cluster
           x-omitzero: false
-        swarm_mode:
-          type: boolean
-          description: Indicates whether the cluster is running in single-node swarm mode
-          x-omitzero: false
+        deployment_mode:
+          type: string
+          enum: [embedded, distributed, standalone, serverless]
+          description: Runtime deployment topology
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
+        storage:
+          $ref: "#/components/schemas/StorageRuntimeStatus"
         data:
           $ref: "#/components/schemas/ClusterDataStatus"
+    StorageMaintenanceCapabilities:
+      type: object
+      required: [check, compact, vacuum, online, asynchronous]
+      additionalProperties: false
+      properties:
+        check: { type: boolean }
+        compact: { type: boolean }
+        vacuum: { type: boolean }
+        online: { type: boolean }
+        asynchronous: { type: boolean }
+    StorageRuntimeStatus:
+      type: object
+      required: [engine, maintenance]
+      additionalProperties: false
+      properties:
+        engine:
+          type: string
+          enum: [lite, local, object]
+        format:
+          type: string
+        fsync:
+          type: boolean
+        maintenance:
+          $ref: "#/components/schemas/StorageMaintenanceCapabilities"
     ClusterDataStatus:
       type: object
       description: Typed Zig status view for table data topology and range placement.
@@ -7469,7 +7497,7 @@ paths:
       tags:
         - cluster_management
       description: |
-        Store a secret in the keystore. Only available in swarm (single-node) mode.
+        Store a secret in the keystore. Only available in standalone (single-node) mode.
         Returns 503 in multi-node mode.
       operationId: putSecret
       requestBody:
@@ -7504,7 +7532,7 @@ paths:
       tags:
         - cluster_management
       description: |
-        Remove a secret from the keystore. Only available in swarm (single-node) mode.
+        Remove a secret from the keystore. Only available in standalone (single-node) mode.
         Returns 503 in multi-node mode.
       operationId: deleteSecret
       responses:

@@ -174,7 +174,7 @@ func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 	return fmt.Sprintf(" \\\n  --secret-store-path %s", shellQuoteArg(secretStorePath(store)))
 }
 
-func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
+func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
 		return ""
 	}
@@ -235,7 +235,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		if ha.Retention != nil && ha.Retention.MaxRetainedAgeNS > 0 {
 			appendHAUint("--ha-retention-max-retained-age-ns", ha.Retention.MaxRetainedAgeNS)
 		}
-		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
+		appendStandaloneHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
 		logPath := defaultHAStandbyLogPath
@@ -277,7 +277,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	return args.String()
 }
 
-func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncPolicy) {
+func appendStandaloneHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncPolicy) {
 	if policy == nil || policy.Mode == "" || policy.Mode == antflyv1.HADurabilityModeAsync {
 		return
 	}
@@ -294,9 +294,9 @@ func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncP
 		args.WriteString(strconv.FormatInt(int64(value), 10))
 	}
 
-	appendArg("--ha-sync-mode", swarmHASyncMode(policy.Mode))
+	appendArg("--ha-sync-mode", standaloneHASyncMode(policy.Mode))
 	if policy.Selection != "" {
-		appendArg("--ha-sync-selection", swarmHAStandbySelection(policy.Selection))
+		appendArg("--ha-sync-selection", standaloneHAStandbySelection(policy.Selection))
 	}
 	if policy.Required > 0 {
 		appendUint("--ha-sync-required", policy.Required)
@@ -307,7 +307,7 @@ func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncP
 		}
 	}
 	if policy.FailurePolicy != "" {
-		appendArg("--ha-sync-failure", swarmHAFailurePolicy(policy.FailurePolicy))
+		appendArg("--ha-sync-failure", standaloneHAFailurePolicy(policy.FailurePolicy))
 	}
 }
 
@@ -315,7 +315,7 @@ func shellQuoteArg(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
-func swarmHASyncMode(mode antflyv1.HADurabilityMode) string {
+func standaloneHASyncMode(mode antflyv1.HADurabilityMode) string {
 	switch mode {
 	case antflyv1.HADurabilityModeRemoteApply:
 		return "remote-apply"
@@ -326,7 +326,7 @@ func swarmHASyncMode(mode antflyv1.HADurabilityMode) string {
 	}
 }
 
-func swarmHAStandbySelection(selection antflyv1.HAStandbySelection) string {
+func standaloneHAStandbySelection(selection antflyv1.HAStandbySelection) string {
 	switch selection {
 	case antflyv1.HAStandbySelectionFirst:
 		return "first"
@@ -337,7 +337,7 @@ func swarmHAStandbySelection(selection antflyv1.HAStandbySelection) string {
 	}
 }
 
-func swarmHAFailurePolicy(policy antflyv1.HAFailurePolicy) string {
+func standaloneHAFailurePolicy(policy antflyv1.HAFailurePolicy) string {
 	switch policy {
 	case antflyv1.HAFailurePolicyFailClosed:
 		return "fail-closed"
@@ -442,11 +442,11 @@ func haPrimaryRouteManaged(cluster *antflyv1.AntflyCluster) bool {
 		cluster.Spec.HighAvailability.Mode != antflyv1.HAModeDisabled
 }
 
-func haPublicAPISelector(cluster *antflyv1.AntflyCluster, swarmMode bool, target string) (map[string]string, bool) {
+func haPublicAPISelector(cluster *antflyv1.AntflyCluster, standaloneMode bool, target string) (map[string]string, bool) {
 	if target == "" || target == "primary" {
 		component := "metadata"
-		if swarmMode {
-			component = "swarm"
+		if standaloneMode {
+			component = "standalone"
 		}
 		return serviceSelectorLabels(cluster.Name, component), true
 	}
@@ -521,18 +521,67 @@ func buildPVCRetentionPolicy(policy *antflyv1.PVCRetentionPolicy) *appsv1.Statef
 
 // cleanupStorageResources handles ordered deletion of StatefulSets, pods, and PVCs
 // on cluster deletion. Returns a non-nil Result if the caller should requeue.
-// Deletion order: StatefulSets → wait for pods → PVCs → remove finalizer.
-// This avoids a deadlock where PVCs have kubernetes.io/pvc-protection finalizer
-// blocking deletion while pods still reference them.
+// Deletion order: record PVC deletion intent → delete StatefulSets → wait for
+// pods → sweep remaining PVCs → remove finalizer. Kubernetes PVC protection
+// keeps claims alive until their last pod exits without losing cleanup intent
+// when a historical StatefulSet disappears between reconciles.
 func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, cluster *antflyv1.AntflyCluster) (*ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// Step 1: Delete all known StatefulSets
-	for _, suffix := range []string{"-metadata", "-data", "-swarm"} {
+	// Step 1: Delete all owned or instance-labeled StatefulSets. This also covers
+	// workloads whose historical component/name is no longer recognized.
+	var namespaceStatefulSets appsv1.StatefulSetList
+	if err := r.List(ctx, &namespaceStatefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list StatefulSets for PVC cleanup: %w", err)
+	}
+	discoveredClaimPrefixes := make([]string, 0)
+	for i := range namespaceStatefulSets.Items {
+		sts := &namespaceStatefulSets.Items[i]
+		if sts.Labels["app.kubernetes.io/instance"] != cluster.Name && !metav1.IsControlledBy(sts, cluster) {
+			continue
+		}
+		for claimIndex := range sts.Spec.VolumeClaimTemplates {
+			discoveredClaimPrefixes = append(discoveredClaimPrefixes,
+				sts.Spec.VolumeClaimTemplates[claimIndex].Name+"-"+sts.Name+"-")
+		}
+		log.Info("Deleting StatefulSet for PVC cleanup", "statefulset", sts.Name)
+		if err := r.Delete(ctx, sts); err != nil && !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to delete StatefulSet %s: %w", sts.Name, err)
+		}
+	}
+
+	// Delete claims discovered from every owned StatefulSet before returning to
+	// wait for pods. PVC protection keeps in-use claims until those pods exit,
+	// while recording the deletion intent now means an unlabeled claim cannot be
+	// orphaned after its historical StatefulSet has disappeared.
+	if len(discoveredClaimPrefixes) > 0 {
+		var discoveredPVCs corev1.PersistentVolumeClaimList
+		if err := r.List(ctx, &discoveredPVCs, client.InNamespace(cluster.Namespace)); err != nil {
+			return nil, fmt.Errorf("failed to discover PVCs from owned StatefulSets: %w", err)
+		}
+		for i := range discoveredPVCs.Items {
+			pvc := &discoveredPVCs.Items[i]
+			if !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) {
+				continue
+			}
+			log.Info("Deleting discovered PVC", "pvc", pvc.Name)
+			if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
+				return nil, fmt.Errorf("failed to delete discovered PVC %s: %w", pvc.Name, err)
+			}
+		}
+	}
+
+	// Also check canonical names for workloads created before stable labels were
+	// applied. These lookups are idempotent with the labeled deletion above.
+	for _, suffix := range []string{"-metadata", "-data", "-standalone"} {
 		sts := &appsv1.StatefulSet{}
 		stsName := cluster.Name + suffix
 		err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 		if err == nil {
+			if sts.Labels["app.kubernetes.io/instance"] != cluster.Name && !metav1.IsControlledBy(sts, cluster) {
+				log.Info("Skipping canonical-name StatefulSet not owned by cluster", "statefulset", stsName)
+				continue
+			}
 			log.Info("Deleting StatefulSet for PVC cleanup", "statefulset", stsName)
 			if err := r.Delete(ctx, sts); err != nil && !errors.IsNotFound(err) {
 				return nil, fmt.Errorf("failed to delete StatefulSet %s: %w", stsName, err)
@@ -544,16 +593,14 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 
 	// Step 2: Check if pods still exist — requeue if they do
 	var podList corev1.PodList
-	for _, component := range []string{"metadata", "data", "swarm"} {
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace),
-			client.MatchingLabels(serviceSelectorLabels(cluster.Name, component))); err != nil {
-			return nil, fmt.Errorf("failed to list %s pods: %w", component, err)
-		}
-		if len(podList.Items) > 0 {
-			log.Info("Waiting for pods to terminate", "component", component, "remaining", len(podList.Items))
-			result := ctrl.Result{RequeueAfter: 5 * time.Second}
-			return &result, nil
-		}
+	if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{"app.kubernetes.io/instance": cluster.Name}); err != nil {
+		return nil, fmt.Errorf("failed to list pods for PVC cleanup: %w", err)
+	}
+	if len(podList.Items) > 0 {
+		log.Info("Waiting for pods to terminate", "remaining", len(podList.Items))
+		result := ctrl.Result{RequeueAfter: 5 * time.Second}
+		return &result, nil
 	}
 
 	// Step 3: Delete PVCs belonging to this cluster.
@@ -563,7 +610,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	prefixes := []string{
 		"metadata-storage-" + cluster.Name + "-metadata-",
 		"data-storage-" + cluster.Name + "-data-",
-		"swarm-storage-" + cluster.Name + "-swarm-",
+		"standalone-storage-" + cluster.Name + "-standalone-",
 	}
 
 	var pvcList corev1.PersistentVolumeClaimList
@@ -572,6 +619,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		return nil, fmt.Errorf("failed to list PVCs: %w", err)
 	}
 
+	labeledPVCs := len(pvcList.Items) > 0
 	// If no labeled PVCs found, fall back to namespace-wide list with prefix matching
 	// (backward compatibility for clusters created before labels were added to VolumeClaimTemplates)
 	if len(pvcList.Items) == 0 {
@@ -582,7 +630,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if hasAnyPrefix(pvc.Name, prefixes) {
+		if labeledPVCs || hasAnyPrefix(pvc.Name, prefixes) {
 			// In the fallback path (namespace-wide listing), skip PVCs that are
 			// labeled for a different cluster to avoid cross-cluster deletion.
 			if inst, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && inst != cluster.Name {
@@ -740,23 +788,24 @@ const (
 type topologyMode string
 
 const (
-	topologyModeClustered topologyMode = "clustered"
-	topologyModeSwarm     topologyMode = "swarm"
+	topologyModeClustered  topologyMode = "clustered"
+	topologyModeStandalone topologyMode = "standalone"
+	topologyModeInvalid    topologyMode = "invalid"
 )
 
 func effectiveTopologyMode(cluster *antflyv1.AntflyCluster) topologyMode {
 	switch cluster.Spec.Mode {
-	case antflyv1.ClusterModeSwarm:
-		return topologyModeSwarm
+	case antflyv1.ClusterModeStandalone:
+		return topologyModeStandalone
 	case antflyv1.ClusterModeClustered, "":
 		return topologyModeClustered
 	default:
-		return topologyModeClustered
+		return topologyModeInvalid
 	}
 }
 
-func isSwarmMode(cluster *antflyv1.AntflyCluster) bool {
-	return effectiveTopologyMode(cluster) == topologyModeSwarm
+func isStandaloneMode(cluster *antflyv1.AntflyCluster) bool {
+	return effectiveTopologyMode(cluster) == topologyModeStandalone
 }
 
 func shouldCancelDataScaleDown(status *antflyv1.DataScaleDownStatus, currentReplicas, desiredReplicas int32) bool {
@@ -798,25 +847,42 @@ func shouldFinalizeDataScaleDown(status *antflyv1.DataScaleDownStatus, currentRe
 }
 
 func (r *AntflyClusterReconciler) ensureTopologyResourcesMatchMode(ctx context.Context, cluster *antflyv1.AntflyCluster, mode topologyMode) error {
-	if mode == topologyModeSwarm {
-		for _, name := range []string{cluster.Name + "-metadata", cluster.Name + "-data"} {
-			sts := &appsv1.StatefulSet{}
-			if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, sts); err == nil {
-				return fmt.Errorf("swarm mode cannot reconcile while clustered StatefulSet %q exists; recreate the cluster instead", name)
-			} else if !errors.IsNotFound(err) {
-				return fmt.Errorf("failed to check existing clustered StatefulSet %q: %w", name, err)
-			}
+	if mode == topologyModeInvalid {
+		return fmt.Errorf("unsupported spec.mode %q; reconciliation is blocked until the resource uses Clustered or Standalone", cluster.Spec.Mode)
+	}
+
+	expected := map[string]struct{}{}
+	if mode == topologyModeStandalone {
+		expected[cluster.Name+"-standalone"] = struct{}{}
+	} else {
+		expected[cluster.Name+"-metadata"] = struct{}{}
+		expected[cluster.Name+"-data"] = struct{}{}
+	}
+
+	// Discover by the stable instance label instead of guessing historical names.
+	// Any operator-owned workload outside the selected topology requires an
+	// explicit data migration; silently adopting or redirecting Services could
+	// expose an empty database.
+	var statefulSets appsv1.StatefulSetList
+	if err := r.List(ctx, &statefulSets, client.InNamespace(cluster.Namespace)); err != nil {
+		return fmt.Errorf("failed to discover existing StatefulSets for topology safety check: %w", err)
+	}
+	for i := range statefulSets.Items {
+		sts := &statefulSets.Items[i]
+		_, hasExpectedName := expected[sts.Name]
+		controlled := metav1.IsControlledBy(sts, cluster)
+		instanceLabeled := sts.Labels["app.kubernetes.io/instance"] == cluster.Name
+		if hasExpectedName && !controlled {
+			return fmt.Errorf("cannot reconcile %s topology because canonical StatefulSet %q is not controlled by AntflyCluster UID %s; rename or remove the conflicting workload explicitly", mode, sts.Name, cluster.UID)
 		}
-		return nil
+		if !instanceLabeled && !controlled {
+			continue
+		}
+		if hasExpectedName {
+			continue
+		}
+		return fmt.Errorf("cannot reconcile %s topology while existing Antfly StatefulSet %q is not part of that topology; migrate or remove the old workload explicitly", mode, sts.Name)
 	}
-
-	sts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-swarm", Namespace: cluster.Namespace}, sts); err == nil {
-		return fmt.Errorf("clustered mode cannot reconcile while swarm StatefulSet %q exists; recreate the cluster instead", cluster.Name+"-swarm")
-	} else if !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to check existing swarm StatefulSet %q: %w", cluster.Name+"-swarm", err)
-	}
-
 	return nil
 }
 
@@ -859,45 +925,45 @@ func applyDefaultZoneTopologySpread(statefulSet *appsv1.StatefulSet, podTemplate
 
 // applyDefaults sets default port values if not specified
 func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster) {
-	swarmMode := isSwarmMode(cluster)
+	standaloneMode := isStandaloneMode(cluster)
 
 	if cluster.Spec.Mode == "" {
 		cluster.Spec.Mode = antflyv1.ClusterModeClustered
 	}
 
-	if swarmMode && cluster.Spec.Swarm != nil {
-		if cluster.Spec.Swarm.Replicas == 0 {
-			cluster.Spec.Swarm.Replicas = 1
+	if standaloneMode && cluster.Spec.Standalone != nil {
+		if cluster.Spec.Standalone.Replicas == 0 {
+			cluster.Spec.Standalone.Replicas = 1
 		}
-		if cluster.Spec.Swarm.NodeID == 0 {
-			cluster.Spec.Swarm.NodeID = 1
+		if cluster.Spec.Standalone.NodeID == 0 {
+			cluster.Spec.Standalone.NodeID = 1
 		}
-		if cluster.Spec.Swarm.MetadataAPI.Port == 0 {
-			cluster.Spec.Swarm.MetadataAPI.Port = 8080
+		if cluster.Spec.Standalone.MetadataAPI.Port == 0 {
+			cluster.Spec.Standalone.MetadataAPI.Port = 8080
 		}
-		if cluster.Spec.Swarm.MetadataRaft.Port == 0 {
-			cluster.Spec.Swarm.MetadataRaft.Port = 9017
+		if cluster.Spec.Standalone.MetadataRaft.Port == 0 {
+			cluster.Spec.Standalone.MetadataRaft.Port = 9017
 		}
-		if cluster.Spec.Swarm.StoreAPI.Port == 0 {
-			cluster.Spec.Swarm.StoreAPI.Port = 12380
+		if cluster.Spec.Standalone.StoreAPI.Port == 0 {
+			cluster.Spec.Standalone.StoreAPI.Port = 12380
 		}
-		if cluster.Spec.Swarm.StoreRaft.Port == 0 {
-			cluster.Spec.Swarm.StoreRaft.Port = 9021
+		if cluster.Spec.Standalone.StoreRaft.Port == 0 {
+			cluster.Spec.Standalone.StoreRaft.Port = 9021
 		}
-		if cluster.Spec.Swarm.Health.Port == 0 {
-			cluster.Spec.Swarm.Health.Port = 4200
+		if cluster.Spec.Standalone.Health.Port == 0 {
+			cluster.Spec.Standalone.Health.Port = 4200
 		}
-		if cluster.Spec.Swarm.Inference == nil {
-			cluster.Spec.Swarm.Inference = &antflyv1.SwarmInferenceSpec{
+		if cluster.Spec.Standalone.Inference == nil {
+			cluster.Spec.Standalone.Inference = &antflyv1.StandaloneInferenceSpec{
 				Enabled: true,
 				APIURL:  "http://0.0.0.0:11433",
 			}
-		} else if cluster.Spec.Swarm.Inference.APIURL == "" {
-			cluster.Spec.Swarm.Inference.APIURL = "http://0.0.0.0:11433"
+		} else if cluster.Spec.Standalone.Inference.APIURL == "" {
+			cluster.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 		}
 	}
 
-	if !swarmMode {
+	if !standaloneMode {
 		// Default ports for metadata nodes
 		if cluster.Spec.MetadataNodes.MetadataAPI.Port == 0 {
 			cluster.Spec.MetadataNodes.MetadataAPI.Port = 12377
@@ -1318,7 +1384,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// this avoids an error from our caller `reconcileHandler` because of a version missmatch.
 	workingCluster := antflyCluster.DeepCopy()
 	topologyMode := effectiveTopologyMode(workingCluster)
-	swarmMode := topologyMode == topologyModeSwarm
+	standaloneMode := topologyMode == topologyModeStandalone
 	if err := r.ensureTopologyResourcesMatchMode(ctx, &antflyCluster, topologyMode); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1371,10 +1437,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	if swarmMode {
-		// Swarm mode is a single topology and does not support clustered autoscaling.
+	if standaloneMode {
+		// Standalone mode is a single topology and does not support clustered autoscaling.
 		if workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
-			log.Info("Ignoring data node autoscaling because swarm mode is enabled")
+			log.Info("Ignoring data node autoscaling because standalone mode is enabled")
 		}
 
 		if err := r.reconcileConfigMap(ctx, workingCluster); err != nil {
@@ -1383,8 +1449,8 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileServices(ctx, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		workingCluster.Spec.Storage.SwarmStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "swarm", "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster), maxSwarmAutoGrowSize(workingCluster))
-		if err := r.reconcileSwarmStatefulSet(ctx, efCache, workingCluster); err != nil {
+		workingCluster.Spec.Storage.StandaloneStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "standalone", "standalone-storage", workingCluster.Name+"-standalone", chooseStandaloneStorageSize(workingCluster), maxStandaloneAutoGrowSize(workingCluster))
+		if err := r.reconcileStandaloneStatefulSet(ctx, efCache, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
 		if repaired, err := r.repairBlockedStatefulSetRollouts(ctx, workingCluster); err != nil {
@@ -1394,10 +1460,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 
 		r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
-			r.reconcilePVCExpansion(ctx, workingCluster, "swarm", "swarm-storage", workingCluster.Name+"-swarm", chooseSwarmStorageSize(workingCluster)),
+			r.reconcilePVCExpansion(ctx, workingCluster, "standalone", "standalone-storage", workingCluster.Name+"-standalone", chooseStandaloneStorageSize(workingCluster)),
 		})
 
-		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-swarm-pdb", "swarm"); err != nil {
+		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-standalone-pdb", "standalone"); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -1999,8 +2065,8 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 
 // generateCompleteConfig creates a complete Antfly configuration by merging user config with generated metadata network config
 func (r *AntflyClusterReconciler) generateCompleteConfig(cluster *antflyv1.AntflyCluster) (string, error) {
-	if effectiveTopologyMode(cluster) == topologyModeSwarm {
-		return r.generateSwarmConfig(cluster)
+	if effectiveTopologyMode(cluster) == topologyModeStandalone {
+		return r.generateStandaloneConfig(cluster)
 	}
 
 	return r.generateClusteredConfig(cluster)
@@ -2012,7 +2078,6 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 	if err := json.Unmarshal([]byte(cluster.Spec.Config), &userConfig); err != nil {
 		return "", fmt.Errorf("failed to parse user config: %w", err)
 	}
-
 	// Generate metadata orchestration URLs
 	metadataReplicas := int32(3)
 	if cluster.Spec.MetadataNodes.Replicas > 0 {
@@ -2091,15 +2156,15 @@ func ensureInferenceAPIURL(config map[string]any, apiURL string) {
 	config["inference"] = inferenceConfig
 }
 
-func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCluster) (string, error) {
-	swarm := cluster.Spec.Swarm
-	if swarm == nil {
-		return "", fmt.Errorf("spec.swarm is required when spec.mode=Swarm")
+func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.AntflyCluster) (string, error) {
+	standalone := cluster.Spec.Standalone
+	if standalone == nil {
+		return "", fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 	}
-	inferenceEnabled := swarm.Inference == nil || swarm.Inference.Enabled
+	inferenceEnabled := standalone.Inference == nil || standalone.Inference.Enabled
 	inferenceAPIURL := "http://0.0.0.0:11433"
-	if swarm.Inference != nil && swarm.Inference.APIURL != "" {
-		inferenceAPIURL = swarm.Inference.APIURL
+	if standalone.Inference != nil && standalone.Inference.APIURL != "" {
+		inferenceAPIURL = standalone.Inference.APIURL
 	}
 
 	// Parse user-provided configuration
@@ -2107,9 +2172,12 @@ func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCl
 	if err := json.Unmarshal([]byte(cluster.Spec.Config), &userConfig); err != nil {
 		return "", fmt.Errorf("failed to parse user config: %w", err)
 	}
+	if err := antflyv1.ValidateOperatorManagedStandaloneStorageConfig(cluster.Spec.Config); err != nil {
+		return "", err
+	}
 
 	orchestrationURLs := map[string]string{
-		strconv.FormatInt(int64(swarm.NodeID), 16): fmt.Sprintf("http://%s-swarm.%s.svc.cluster.local:%d", cluster.Name, cluster.Namespace, swarm.MetadataAPI.Port),
+		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s-standalone.%s.svc.cluster.local:%d", cluster.Name, cluster.Namespace, standalone.MetadataAPI.Port),
 	}
 
 	completeConfig := map[string]any{
@@ -2126,7 +2194,7 @@ func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCl
 		"enable_auth":              false,
 		"disable_shard_alloc":      true,
 		"default_shards_per_table": uint64(1),
-		"swarm_mode":               true,
+		"deployment_mode":          "standalone",
 	}
 
 	maps.Copy(completeConfig, userConfig)
@@ -2137,7 +2205,7 @@ func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCl
 	completeConfig["replication_factor"] = uint64(1)
 	completeConfig["default_shards_per_table"] = uint64(1)
 	completeConfig["disable_shard_alloc"] = true
-	completeConfig["swarm_mode"] = true
+	completeConfig["deployment_mode"] = "standalone"
 
 	if inferenceEnabled {
 		inferenceConfig := map[string]any{}
@@ -2175,13 +2243,13 @@ func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster
 	serviceDefs := []*corev1.Service{}
 
 	// Only add public API service if enabled
-	publicAPIService := r.createPublicAPIService(cluster, mode == topologyModeSwarm)
+	publicAPIService := r.createPublicAPIService(cluster, mode == topologyModeStandalone)
 	if publicAPIService != nil {
 		serviceDefs = append(serviceDefs, publicAPIService)
 	}
 
-	if mode == topologyModeSwarm {
-		serviceDefs = append(serviceDefs, r.createSwarmService(cluster))
+	if mode == topologyModeStandalone {
+		serviceDefs = append(serviceDefs, r.createStandaloneService(cluster))
 	} else {
 		serviceDefs = append(serviceDefs,
 			r.createMetadataService(cluster),
@@ -2261,7 +2329,7 @@ func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster
 	return nil
 }
 
-func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.AntflyCluster, swarmMode bool) *corev1.Service {
+func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.AntflyCluster, standaloneMode bool) *corev1.Service {
 	// Return nil if public API service is disabled
 	if cluster.Spec.PublicAPI != nil && cluster.Spec.PublicAPI.Enabled != nil && !*cluster.Spec.PublicAPI.Enabled {
 		return nil
@@ -2280,9 +2348,9 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 
 	targetPort := cluster.Spec.MetadataNodes.MetadataAPI.Port
 	component := "metadata"
-	if swarmMode && cluster.Spec.Swarm != nil {
-		targetPort = cluster.Spec.Swarm.MetadataAPI.Port
-		component = "swarm"
+	if standaloneMode && cluster.Spec.Standalone != nil {
+		targetPort = cluster.Spec.Standalone.MetadataAPI.Port
+		component = "standalone"
 	}
 
 	servicePort := corev1.ServicePort{
@@ -2303,12 +2371,12 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 	if haPrimaryRouteManaged(cluster) {
 		target := haCurrentPrimaryRouteTarget(cluster)
 		routeSelectorApplied := false
-		if routeSelector, ok := haPublicAPISelector(cluster, swarmMode, target); ok {
+		if routeSelector, ok := haPublicAPISelector(cluster, standaloneMode, target); ok {
 			selector = routeSelector
 			routeSelectorApplied = true
 		}
 		annotations = haPrimaryRouteServiceAnnotations(cluster, target, routeSelectorApplied)
-	} else if routeSelector, ok := haPublicAPISelector(cluster, swarmMode, "primary"); ok {
+	} else if routeSelector, ok := haPublicAPISelector(cluster, standaloneMode, "primary"); ok {
 		selector = routeSelector
 	}
 
@@ -2378,46 +2446,46 @@ func (r *AntflyClusterReconciler) createDataService(cluster *antflyv1.AntflyClus
 	}
 }
 
-func (r *AntflyClusterReconciler) createSwarmService(cluster *antflyv1.AntflyCluster) *corev1.Service {
-	swarm := cluster.Spec.Swarm
-	if swarm == nil {
-		swarm = &antflyv1.SwarmSpec{}
+func (r *AntflyClusterReconciler) createStandaloneService(cluster *antflyv1.AntflyCluster) *corev1.Service {
+	standalone := cluster.Spec.Standalone
+	if standalone == nil {
+		standalone = &antflyv1.StandaloneSpec{}
 	}
 
-	healthPort := swarm.Health.Port
+	healthPort := standalone.Health.Port
 	if healthPort == 0 {
 		healthPort = 4200
 	}
 
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-swarm",
+			Name:      cluster.Name + "-standalone",
 			Namespace: cluster.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP:                "None",
 			PublishNotReadyAddresses: true,
-			Selector:                 serviceSelectorLabels(cluster.Name, "swarm"),
+			Selector:                 serviceSelectorLabels(cluster.Name, "standalone"),
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "metadata-api",
-					Port:       swarm.MetadataAPI.Port,
-					TargetPort: intstr.FromInt(int(swarm.MetadataAPI.Port)),
+					Port:       standalone.MetadataAPI.Port,
+					TargetPort: intstr.FromInt(int(standalone.MetadataAPI.Port)),
 				},
 				{
 					Name:       "metadata-raft",
-					Port:       swarm.MetadataRaft.Port,
-					TargetPort: intstr.FromInt(int(swarm.MetadataRaft.Port)),
+					Port:       standalone.MetadataRaft.Port,
+					TargetPort: intstr.FromInt(int(standalone.MetadataRaft.Port)),
 				},
 				{
 					Name:       "store-api",
-					Port:       swarm.StoreAPI.Port,
-					TargetPort: intstr.FromInt(int(swarm.StoreAPI.Port)),
+					Port:       standalone.StoreAPI.Port,
+					TargetPort: intstr.FromInt(int(standalone.StoreAPI.Port)),
 				},
 				{
 					Name:       "store-raft",
-					Port:       swarm.StoreRaft.Port,
-					TargetPort: intstr.FromInt(int(swarm.StoreRaft.Port)),
+					Port:       standalone.StoreRaft.Port,
+					TargetPort: intstr.FromInt(int(standalone.StoreRaft.Port)),
 				},
 				{
 					Name:       "health",
@@ -2429,41 +2497,41 @@ func (r *AntflyClusterReconciler) createSwarmService(cluster *antflyv1.AntflyClu
 	}
 }
 
-func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
-	swarm := cluster.Spec.Swarm
-	if swarm == nil {
-		return fmt.Errorf("spec.swarm is required when spec.mode=Swarm")
+func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
+	standalone := cluster.Spec.Standalone
+	if standalone == nil {
+		return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 	}
-	replicas := swarm.Replicas
+	replicas := standalone.Replicas
 	if replicas == 0 {
 		replicas = 1
 	}
-	storageSize := chooseSwarmStorageSize(cluster)
+	storageSize := chooseStandaloneStorageSize(cluster)
 
 	var storageClassName *string
 	if cluster.Spec.Storage.StorageClass != "" {
 		storageClassName = &cluster.Spec.Storage.StorageClass
 	}
 
-	envFromSources := append([]corev1.EnvFromSource{}, swarm.EnvFrom...)
+	envFromSources := append([]corev1.EnvFromSource{}, standalone.EnvFrom...)
 
 	statefulSet := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-swarm",
+			Name:      cluster.Name + "-standalone",
 			Namespace: cluster.Namespace,
 		},
 		Spec: appsv1.StatefulSetSpec{
-			ServiceName:         cluster.Name + "-swarm",
+			ServiceName:         cluster.Name + "-standalone",
 			Replicas:            &replicas,
 			PodManagementPolicy: appsv1.ParallelPodManagement,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: serviceSelectorLabels(cluster.Name, "swarm"),
+				MatchLabels: serviceSelectorLabels(cluster.Name, "standalone"),
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:   "swarm-storage",
-						Labels: serviceSelectorLabels(cluster.Name, "swarm"),
+						Name:   "standalone-storage",
+						Labels: serviceSelectorLabels(cluster.Name, "standalone"),
 					},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -2490,14 +2558,14 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      podLabels(cluster, "swarm"),
+				Labels:      podLabels(cluster, "standalone"),
 				Annotations: r.buildPodAnnotations(ctx, cache, cluster, envFromSources),
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: cluster.Spec.ServiceAccountName,
 				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
-					r.buildStorageInitContainer("swarm-storage"),
+					r.buildStorageInitContainer("standalone-storage"),
 				},
 				Containers: []corev1.Container{
 					{
@@ -2509,33 +2577,33 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
-								ContainerPort: swarm.MetadataAPI.Port,
+								ContainerPort: standalone.MetadataAPI.Port,
 								Protocol:      corev1.ProtocolTCP,
 							},
 							{
 								Name:          "metadata-raft",
-								ContainerPort: swarm.MetadataRaft.Port,
+								ContainerPort: standalone.MetadataRaft.Port,
 								Protocol:      corev1.ProtocolTCP,
 							},
 							{
 								Name:          "store-api",
-								ContainerPort: swarm.StoreAPI.Port,
+								ContainerPort: standalone.StoreAPI.Port,
 								Protocol:      corev1.ProtocolTCP,
 							},
 							{
 								Name:          "store-raft",
-								ContainerPort: swarm.StoreRaft.Port,
+								ContainerPort: standalone.StoreRaft.Port,
 								Protocol:      corev1.ProtocolTCP,
 							},
 							{
 								Name:          "health",
-								ContainerPort: swarm.Health.Port,
+								ContainerPort: standalone.Health.Port,
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
 						VolumeMounts: append([]corev1.VolumeMount{
 							{
-								Name:      "swarm-storage",
+								Name:      "standalone-storage",
 								MountPath: "/antflydb",
 							},
 							{
@@ -2546,25 +2614,25 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
-exec /antfly swarm --id %d --config /config/config.json \
+exec /antfly standalone --id %d --config /config/config.json \
   --host 0.0.0.0 \
   --port %d \
   --health-port %d%s%s
 							`,
-								swarm.NodeID,
-								swarm.MetadataAPI.Port,
-								swarm.Health.Port,
+								standalone.NodeID,
+								standalone.MetadataAPI.Port,
+								standalone.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
-								swarmHAArgs(cluster.Spec.HighAvailability),
+								standaloneHAArgs(cluster.Spec.HighAvailability),
 							),
 						},
-						Resources:    r.buildResourceRequirements(swarm.Resources),
-						StartupProbe: buildHTTPStartupProbe(swarm.Health.Port, swarm.StartupProbe),
+						Resources:    r.buildResourceRequirements(standalone.Resources),
+						StartupProbe: buildHTTPStartupProbe(standalone.Health.Port, standalone.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
 									Path: "/healthz",
-									Port: intstr.FromInt(int(swarm.Health.Port)),
+									Port: intstr.FromInt(int(standalone.Health.Port)),
 								},
 							},
 							PeriodSeconds:    15,
@@ -2574,7 +2642,7 @@ exec /antfly swarm --id %d --config /config/config.json \
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
 									Path: "/readyz",
-									Port: intstr.FromInt(int(swarm.Health.Port)),
+									Port: intstr.FromInt(int(standalone.Health.Port)),
 								},
 							},
 							PeriodSeconds:    5,
@@ -2598,17 +2666,17 @@ exec /antfly swarm --id %d --config /config/config.json \
 		}
 
 		applySchedulingConstraints(&statefulSet.Spec.Template,
-			swarm.Tolerations,
-			swarm.NodeSelector,
-			swarm.Affinity,
-			swarm.TopologySpreadConstraints)
+			standalone.Tolerations,
+			standalone.NodeSelector,
+			standalone.Affinity,
+			standalone.TopologySpreadConstraints)
 
 		r.applyGKEPodSpec(&statefulSet.Spec.Template, cluster, false)
 		r.applyEKSPodSpec(&statefulSet.Spec.Template, cluster, false)
 
 		isGKEAutopilot := cluster.Spec.GKE != nil && cluster.Spec.GKE.Autopilot
-		applyDefaultZoneTopologySpread(statefulSet, &statefulSet.Spec.Template, "swarm", cluster.Name,
-			swarm.TopologySpreadConstraints, isGKEAutopilot)
+		applyDefaultZoneTopologySpread(statefulSet, &statefulSet.Spec.Template, "standalone", cluster.Name,
+			standalone.TopologySpreadConstraints, isGKEAutopilot)
 
 		return nil
 	})
@@ -3103,9 +3171,9 @@ func buildHTTPStartupProbe(port int32, cfg *antflyv1.ProbeConfig) *corev1.Probe 
 	}
 }
 
-func chooseSwarmStorageSize(cluster *antflyv1.AntflyCluster) string {
-	if cluster.Spec.Storage.SwarmStorage != "" {
-		return cluster.Spec.Storage.SwarmStorage
+func chooseStandaloneStorageSize(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Storage.StandaloneStorage != "" {
+		return cluster.Spec.Storage.StandaloneStorage
 	}
 	return "1Gi"
 }
@@ -3124,12 +3192,12 @@ func maxDataAutoGrowSize(cluster *antflyv1.AntflyCluster) string {
 	return cluster.Spec.Storage.StorageAutoGrow.MaxDataStorage
 }
 
-func maxSwarmAutoGrowSize(cluster *antflyv1.AntflyCluster) string {
+func maxStandaloneAutoGrowSize(cluster *antflyv1.AntflyCluster) string {
 	if cluster.Spec.Storage.StorageAutoGrow == nil {
 		return ""
 	}
-	if cluster.Spec.Storage.StorageAutoGrow.MaxSwarmStorage != "" {
-		return cluster.Spec.Storage.StorageAutoGrow.MaxSwarmStorage
+	if cluster.Spec.Storage.StorageAutoGrow.MaxStandaloneStorage != "" {
+		return cluster.Spec.Storage.StorageAutoGrow.MaxStandaloneStorage
 	}
 	return cluster.Spec.Storage.StorageAutoGrow.MaxDataStorage
 }
@@ -3341,84 +3409,84 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	originalConditions := append([]metav1.Condition(nil), cluster.Status.Conditions...)
 	mode := effectiveTopologyMode(cluster)
 
-	if mode == topologyModeSwarm {
-		swarm := cluster.Spec.Swarm
-		if swarm == nil {
-			return fmt.Errorf("spec.swarm is required when spec.mode=Swarm")
+	if mode == topologyModeStandalone {
+		standalone := cluster.Spec.Standalone
+		if standalone == nil {
+			return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 		}
 
-		swarmSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-swarm", Namespace: cluster.Namespace}, swarmSts); err != nil && !errors.IsNotFound(err) {
+		standaloneSts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
 			return err
 		}
 
-		readyReplicas := swarmSts.Status.ReadyReplicas
-		cluster.Status.Mode = antflyv1.ClusterModeSwarm
+		readyReplicas := standaloneSts.Status.ReadyReplicas
+		cluster.Status.Mode = antflyv1.ClusterModeStandalone
 		cluster.Status.ReadyReplicas = readyReplicas
-		cluster.Status.SwarmNodesReady = readyReplicas
+		cluster.Status.StandaloneNodesReady = readyReplicas
 		cluster.Status.MetadataNodesReady = 0
 		cluster.Status.DataNodesReady = 0
-		if readyReplicas >= swarm.Replicas && swarm.Replicas > 0 {
+		if readyReplicas >= standalone.Replicas && standalone.Replicas > 0 {
 			cluster.Status.Phase = "Running"
 		} else {
 			cluster.Status.Phase = "Pending"
 		}
 
-		if cluster.Status.SwarmStatus == nil {
-			cluster.Status.SwarmStatus = &antflyv1.SwarmStatus{}
+		if cluster.Status.StandaloneStatus == nil {
+			cluster.Status.StandaloneStatus = &antflyv1.StandaloneStatus{}
 		}
-		oldStatus := *cluster.Status.SwarmStatus
-		inferenceEnabled := swarm.Inference == nil || swarm.Inference.Enabled
-		cluster.Status.SwarmStatus.Ready = readyReplicas >= swarm.Replicas && swarm.Replicas > 0
-		cluster.Status.SwarmStatus.MetadataReady = cluster.Status.SwarmStatus.Ready
-		cluster.Status.SwarmStatus.StoreReady = cluster.Status.SwarmStatus.Ready
-		cluster.Status.SwarmStatus.InferenceReady = !inferenceEnabled || cluster.Status.SwarmStatus.Ready
-		cluster.Status.SwarmStatus.NodeID = swarm.NodeID
+		oldStatus := *cluster.Status.StandaloneStatus
+		inferenceEnabled := standalone.Inference == nil || standalone.Inference.Enabled
+		cluster.Status.StandaloneStatus.Ready = readyReplicas >= standalone.Replicas && standalone.Replicas > 0
+		cluster.Status.StandaloneStatus.MetadataReady = cluster.Status.StandaloneStatus.Ready
+		cluster.Status.StandaloneStatus.StoreReady = cluster.Status.StandaloneStatus.Ready
+		cluster.Status.StandaloneStatus.InferenceReady = !inferenceEnabled || cluster.Status.StandaloneStatus.Ready
+		cluster.Status.StandaloneStatus.NodeID = standalone.NodeID
 
-		if completeConfig, err := r.generateSwarmConfig(cluster); err == nil {
+		if completeConfig, err := r.generateStandaloneConfig(cluster); err == nil {
 			sum := sha256.Sum256([]byte(completeConfig))
-			cluster.Status.SwarmStatus.ObservedConfigHash = fmt.Sprintf("%x", sum)[:16]
+			cluster.Status.StandaloneStatus.ObservedConfigHash = fmt.Sprintf("%x", sum)[:16]
 		}
 
 		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "swarm"))); err != nil {
+		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "standalone"))); err != nil {
 			return err
 		}
 		for _, pod := range podList.Items {
 			if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
-				cluster.Status.SwarmStatus.PodName = pod.Name
-				cluster.Status.SwarmStatus.PodIP = pod.Status.PodIP
+				cluster.Status.StandaloneStatus.PodName = pod.Name
+				cluster.Status.StandaloneStatus.PodIP = pod.Status.PodIP
 				break
 			}
 		}
-		swarmFindings := poddiagnostics.DiagnosePods(podList.Items)
-		if len(swarmFindings) > 0 {
+		standaloneFindings := poddiagnostics.DiagnosePods(podList.Items)
+		if len(standaloneFindings) > 0 {
 			cluster.Status.Phase = "Degraded"
-			cluster.Status.SwarmStatus.Ready = false
-			cluster.Status.SwarmStatus.MetadataReady = false
-			cluster.Status.SwarmStatus.StoreReady = false
-			cluster.Status.SwarmStatus.InferenceReady = !inferenceEnabled
+			cluster.Status.StandaloneStatus.Ready = false
+			cluster.Status.StandaloneStatus.MetadataReady = false
+			cluster.Status.StandaloneStatus.StoreReady = false
+			cluster.Status.StandaloneStatus.InferenceReady = !inferenceEnabled
 		}
 
 		if oldStatus.LastTransitionTime == nil ||
-			cluster.Status.SwarmStatus.Ready != oldStatus.Ready ||
-			cluster.Status.SwarmStatus.MetadataReady != oldStatus.MetadataReady ||
-			cluster.Status.SwarmStatus.StoreReady != oldStatus.StoreReady ||
-			cluster.Status.SwarmStatus.InferenceReady != oldStatus.InferenceReady ||
-			cluster.Status.SwarmStatus.PodName != oldStatus.PodName ||
-			cluster.Status.SwarmStatus.PodIP != oldStatus.PodIP ||
-			cluster.Status.SwarmStatus.NodeID != oldStatus.NodeID ||
-			cluster.Status.SwarmStatus.ObservedConfigHash != oldStatus.ObservedConfigHash {
+			cluster.Status.StandaloneStatus.Ready != oldStatus.Ready ||
+			cluster.Status.StandaloneStatus.MetadataReady != oldStatus.MetadataReady ||
+			cluster.Status.StandaloneStatus.StoreReady != oldStatus.StoreReady ||
+			cluster.Status.StandaloneStatus.InferenceReady != oldStatus.InferenceReady ||
+			cluster.Status.StandaloneStatus.PodName != oldStatus.PodName ||
+			cluster.Status.StandaloneStatus.PodIP != oldStatus.PodIP ||
+			cluster.Status.StandaloneStatus.NodeID != oldStatus.NodeID ||
+			cluster.Status.StandaloneStatus.ObservedConfigHash != oldStatus.ObservedConfigHash {
 			now := metav1.Now()
-			cluster.Status.SwarmStatus.LastTransitionTime = &now
+			cluster.Status.StandaloneStatus.LastTransitionTime = &now
 		}
 
-		r.updateRolloutCondition(cluster, swarmSts)
-		r.setComponentCondition(cluster, antflyv1.TypeSwarmReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm")
-		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm metadata")
-		r.setComponentCondition(cluster, antflyv1.TypeDataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm store")
+		r.updateRolloutCondition(cluster, standaloneSts)
+		r.setComponentCondition(cluster, antflyv1.TypeStandaloneReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone")
+		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone metadata")
+		r.setComponentCondition(cluster, antflyv1.TypeDataReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone store")
 		if inferenceEnabled {
-			r.setComponentCondition(cluster, antflyv1.TypeInferenceReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm inference")
+			r.setComponentCondition(cluster, antflyv1.TypeInferenceReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone inference")
 		} else {
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type:               antflyv1.TypeInferenceReady,
@@ -3428,7 +3496,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 				Message:            "Inference is disabled",
 			})
 		}
-		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
+		r.setAvailableCondition(cluster, standaloneFindings, readyReplicas >= standalone.Replicas && standalone.Replicas > 0)
 		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
 		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
@@ -3482,8 +3550,8 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	cluster.Status.DataNodesReady = dataSts.Status.ReadyReplicas
 	cluster.Status.Mode = antflyv1.ClusterModeClustered
 	cluster.Status.ReadyReplicas = metadataSts.Status.ReadyReplicas + dataSts.Status.ReadyReplicas
-	cluster.Status.SwarmNodesReady = 0
-	cluster.Status.SwarmStatus = nil
+	cluster.Status.StandaloneNodesReady = 0
+	cluster.Status.StandaloneStatus = nil
 
 	// Update autoscaling status if enabled
 	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
@@ -6920,7 +6988,7 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 		}
 		return err
 	}
-	selector, selectorOK := haPublicAPISelector(cluster, effectiveTopologyMode(cluster) == topologyModeSwarm, action.RouteTo)
+	selector, selectorOK := haPublicAPISelector(cluster, effectiveTopologyMode(cluster) == topologyModeStandalone, action.RouteTo)
 	if !selectorOK {
 		cluster.Status.HAStatus.PrimaryRoute.DesiredTarget = action.RouteTo
 		cluster.Status.HAStatus.PrimaryRoute.Stale = true
@@ -7859,15 +7927,15 @@ func statefulSetRolloutAppearsBlocked(sts *appsv1.StatefulSet, replicas int32) b
 }
 
 func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollouts(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
-	if effectiveTopologyMode(cluster) == topologyModeSwarm {
-		swarmSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-swarm", Namespace: cluster.Namespace}, swarmSts); err != nil {
+	if effectiveTopologyMode(cluster) == topologyModeStandalone {
+		standaloneSts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}, standaloneSts); err != nil {
 			if !errors.IsNotFound(err) {
 				return false, err
 			}
 			return false, nil
 		}
-		return r.repairBlockedStatefulSetRollout(ctx, cluster, swarmSts, "swarm")
+		return r.repairBlockedStatefulSetRollout(ctx, cluster, standaloneSts, "standalone")
 	}
 
 	metadataSts := &appsv1.StatefulSet{}
@@ -8067,7 +8135,7 @@ func (r *AntflyClusterReconciler) recordClusterRuntimeFailureEvents(cluster *ant
 		}
 		if condition.Type != antflyv1.TypeMetadataReady &&
 			condition.Type != antflyv1.TypeDataReady &&
-			condition.Type != antflyv1.TypeSwarmReady &&
+			condition.Type != antflyv1.TypeStandaloneReady &&
 			condition.Type != antflyv1.TypeInferenceReady &&
 			condition.Type != antflyv1.TypeAvailable {
 			continue
@@ -8092,7 +8160,7 @@ func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.Antf
 		Revision:           tier.Revision,
 		ManagedBy:          tier.ManagedBy,
 		Mode:               effectiveTopologyModeForAPI(cluster),
-		SwarmTier:          tier.SwarmTier,
+		StandaloneTier:     tier.StandaloneTier,
 		MetadataTier:       tier.MetadataTier,
 		DataTier:           tier.DataTier,
 		InferenceTier:      tier.InferenceTier,
@@ -8100,11 +8168,11 @@ func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.Antf
 		ObservedGeneration: cluster.Generation,
 	}
 
-	if isSwarmMode(cluster) {
-		if cluster.Spec.Swarm != nil {
-			status.SwarmResources = resourceSpecSummary(cluster.Spec.Swarm.Resources)
+	if isStandaloneMode(cluster) {
+		if cluster.Spec.Standalone != nil {
+			status.StandaloneResources = resourceSpecSummary(cluster.Spec.Standalone.Resources)
 		}
-		status.SwarmStorage = chooseSwarmStorageSize(cluster)
+		status.StandaloneStorage = chooseStandaloneStorageSize(cluster)
 	} else {
 		status.MetadataReplicas = cluster.Spec.MetadataNodes.Replicas
 		if status.MetadataReplicas == 0 {
@@ -8140,8 +8208,8 @@ func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.Antf
 }
 
 func effectiveTopologyModeForAPI(cluster *antflyv1.AntflyCluster) antflyv1.ClusterMode {
-	if isSwarmMode(cluster) {
-		return antflyv1.ClusterModeSwarm
+	if isStandaloneMode(cluster) {
+		return antflyv1.ClusterModeStandalone
 	}
 	return antflyv1.ClusterModeClustered
 }
@@ -8866,8 +8934,8 @@ func (r *AntflyClusterReconciler) checkPVCTopologyHealth(ctx context.Context, cl
 
 	mode := effectiveTopologyMode(cluster)
 	components := []string{"metadata", "data"}
-	if mode == topologyModeSwarm {
-		components = []string{"swarm"}
+	if mode == topologyModeStandalone {
+		components = []string{"standalone"}
 	}
 
 	// Check pods for topology issues
@@ -8960,7 +9028,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *AntflyClusterReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {
 	clusterName := obj.GetLabels()["app.kubernetes.io/instance"]
 	component := obj.GetLabels()["app.kubernetes.io/component"]
-	if clusterName == "" || (component != "metadata" && component != "data" && component != "swarm") {
+	if clusterName == "" || (component != "metadata" && component != "data" && component != "standalone") {
 		return nil
 	}
 	cluster := &antflyv1.AntflyCluster{}

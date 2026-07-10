@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -58,48 +59,48 @@ func (r *AntflyCluster) Default() {
 
 	defaultStorageAutoGrow(&r.Spec.Storage)
 
-	if r.Spec.Mode != ClusterModeSwarm || r.Spec.Swarm == nil {
+	if r.Spec.Mode != ClusterModeStandalone || r.Spec.Standalone == nil {
 		return
 	}
 
-	if r.Spec.Swarm.Replicas == 0 {
-		r.Spec.Swarm.Replicas = 1
+	if r.Spec.Standalone.Replicas == 0 {
+		r.Spec.Standalone.Replicas = 1
 	}
 
-	if r.Spec.Swarm.NodeID == 0 {
-		r.Spec.Swarm.NodeID = 1
+	if r.Spec.Standalone.NodeID == 0 {
+		r.Spec.Standalone.NodeID = 1
 	}
 
-	if r.Spec.Swarm.MetadataAPI.Port == 0 {
-		r.Spec.Swarm.MetadataAPI.Port = 8080
+	if r.Spec.Standalone.MetadataAPI.Port == 0 {
+		r.Spec.Standalone.MetadataAPI.Port = 8080
 	}
 
-	if r.Spec.Swarm.MetadataRaft.Port == 0 {
-		r.Spec.Swarm.MetadataRaft.Port = 9017
+	if r.Spec.Standalone.MetadataRaft.Port == 0 {
+		r.Spec.Standalone.MetadataRaft.Port = 9017
 	}
 
-	if r.Spec.Swarm.StoreAPI.Port == 0 {
-		r.Spec.Swarm.StoreAPI.Port = 12380
+	if r.Spec.Standalone.StoreAPI.Port == 0 {
+		r.Spec.Standalone.StoreAPI.Port = 12380
 	}
 
-	if r.Spec.Swarm.StoreRaft.Port == 0 {
-		r.Spec.Swarm.StoreRaft.Port = 9021
+	if r.Spec.Standalone.StoreRaft.Port == 0 {
+		r.Spec.Standalone.StoreRaft.Port = 9021
 	}
 
-	if r.Spec.Swarm.Health.Port == 0 {
-		r.Spec.Swarm.Health.Port = 4200
+	if r.Spec.Standalone.Health.Port == 0 {
+		r.Spec.Standalone.Health.Port = 4200
 	}
 
-	if r.Spec.Swarm.Inference == nil {
-		r.Spec.Swarm.Inference = &SwarmInferenceSpec{
+	if r.Spec.Standalone.Inference == nil {
+		r.Spec.Standalone.Inference = &StandaloneInferenceSpec{
 			Enabled: true,
 			APIURL:  "http://0.0.0.0:11433",
 		}
 		return
 	}
 
-	if r.Spec.Swarm.Inference.APIURL == "" {
-		r.Spec.Swarm.Inference.APIURL = "http://0.0.0.0:11433"
+	if r.Spec.Standalone.Inference.APIURL == "" {
+		r.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 	}
 }
 
@@ -331,8 +332,8 @@ Solution: Either:
 	// Validate Accelerator compute class requires GPU
 	if gke.AutopilotComputeClass == "Accelerator" {
 		hasGPU := false
-		if r.isSwarmMode() {
-			hasGPU = hasGPUInResourceSpec(r.Spec.Swarm.Resources)
+		if r.isStandaloneMode() {
+			hasGPU = hasGPUInResourceSpec(r.Spec.Standalone.Resources)
 		} else {
 			// Check if metadata nodes have GPU
 			if hasGPUInResourceSpec(r.Spec.MetadataNodes.Resources) {
@@ -490,14 +491,14 @@ func (r *AntflyCluster) validateNoConflictingSettings() error {
 		return nil
 	}
 
-	if r.isSwarmMode() {
-		if len(r.Spec.Swarm.NodeSelector) > 0 {
-			return fmt.Errorf(`spec.swarm.nodeSelector conflicts with spec.gke.autopilot=true
+	if r.isStandaloneMode() {
+		if len(r.Spec.Standalone.NodeSelector) > 0 {
+			return fmt.Errorf(`spec.standalone.nodeSelector conflicts with spec.gke.autopilot=true
 
 Problem: GKE Autopilot manages node scheduling via compute classes, not node selectors.
 Any custom nodeSelector values will be overridden.
 
-Solution: Remove spec.swarm.nodeSelector when using GKE Autopilot.
+Solution: Remove spec.standalone.nodeSelector when using GKE Autopilot.
 Use spec.gke.autopilotComputeClass to control scheduling instead`)
 		}
 		return nil
@@ -566,12 +567,12 @@ Use spec.gke.autopilotComputeClass to control scheduling instead`)
 // Metadata nodes run Raft consensus and require an odd number of replicas >= 1
 // for quorum. Data nodes just need non-negative counts.
 func (r *AntflyCluster) validateNodeCounts() error {
-	if r.isSwarmMode() {
-		if r.Spec.Swarm.Replicas < 1 {
-			return fmt.Errorf("spec.swarm.replicas must be >= 1, got %d", r.Spec.Swarm.Replicas)
+	if r.isStandaloneMode() {
+		if r.Spec.Standalone.Replicas < 1 {
+			return fmt.Errorf("spec.standalone.replicas must be >= 1, got %d", r.Spec.Standalone.Replicas)
 		}
-		if r.Spec.Swarm.NodeID < 1 {
-			return fmt.Errorf("spec.swarm.nodeID must be >= 1, got %d", r.Spec.Swarm.NodeID)
+		if r.Spec.Standalone.NodeID < 1 {
+			return fmt.Errorf("spec.standalone.nodeID must be >= 1, got %d", r.Spec.Standalone.NodeID)
 		}
 		return nil
 	}
@@ -768,18 +769,18 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 				old.Spec.Storage.DataStorage, r.Spec.Storage.DataStorage))
 		}
 	}
-	if old.Spec.Storage.SwarmStorage != "" && r.Spec.Storage.SwarmStorage != "" {
-		oldQ, errOld := resource.ParseQuantity(old.Spec.Storage.SwarmStorage)
-		newQ, errNew := resource.ParseQuantity(r.Spec.Storage.SwarmStorage)
+	if old.Spec.Storage.StandaloneStorage != "" && r.Spec.Storage.StandaloneStorage != "" {
+		oldQ, errOld := resource.ParseQuantity(old.Spec.Storage.StandaloneStorage)
+		newQ, errNew := resource.ParseQuantity(r.Spec.Storage.StandaloneStorage)
 		if errNew != nil {
 			errors = append(errors, fmt.Sprintf(
-				"spec.storage.swarmStorage: %q is not a valid storage quantity", r.Spec.Storage.SwarmStorage))
+				"spec.storage.standaloneStorage: %q is not a valid storage quantity", r.Spec.Storage.StandaloneStorage))
 		} else if errOld == nil && newQ.Cmp(oldQ) < 0 {
 			errors = append(errors, fmt.Sprintf(
-				`field 'spec.storage.swarmStorage' cannot be decreased (current: %s, attempted: %s)
+				`field 'spec.storage.standaloneStorage' cannot be decreased (current: %s, attempted: %s)
 
 Problem: PVC storage size cannot be reduced. Kubernetes only supports volume expansion, not shrinking.`,
-				old.Spec.Storage.SwarmStorage, r.Spec.Storage.SwarmStorage))
+				old.Spec.Storage.StandaloneStorage, r.Spec.Storage.StandaloneStorage))
 		}
 	}
 
@@ -854,9 +855,9 @@ Current configuration:
 func (r *AntflyCluster) validateEnvFrom() error {
 	var errors []string
 
-	if r.isSwarmMode() {
-		for i, source := range r.Spec.Swarm.EnvFrom {
-			if err := validateEnvFromSource(source, fmt.Sprintf("spec.swarm.envFrom[%d]", i)); err != nil {
+	if r.isStandaloneMode() {
+		for i, source := range r.Spec.Standalone.EnvFrom {
+			if err := validateEnvFromSource(source, fmt.Sprintf("spec.standalone.envFrom[%d]", i)); err != nil {
 				errors = append(errors, err.Error())
 			}
 		}
@@ -926,7 +927,7 @@ func (r *AntflyCluster) validatePVCRetentionPolicy() error {
 
 	policy := r.Spec.Storage.PVCRetentionPolicy
 
-	if r.isSwarmMode() {
+	if r.isStandaloneMode() {
 		return nil
 	}
 
@@ -955,7 +956,7 @@ Solution: Set spec.storage.pvcRetentionPolicy.whenScaled=Retain before suspendin
 }
 
 func (r *AntflyCluster) validateAutoScalingConfig() error {
-	if r.isSwarmMode() || r.Spec.DataNodes.AutoScaling == nil {
+	if r.isStandaloneMode() || r.Spec.DataNodes.AutoScaling == nil {
 		return nil
 	}
 
@@ -1028,15 +1029,15 @@ func (r *AntflyCluster) validateStorageAutoGrowConfig() error {
 		errors = append(errors, "spec.storage.storageAutoGrow.growIncrement must be greater than zero")
 	}
 
-	if r.isSwarmMode() {
-		maxSize := autoGrow.MaxSwarmStorage
+	if r.isStandaloneMode() {
+		maxSize := autoGrow.MaxStandaloneStorage
 		if maxSize == "" {
 			maxSize = autoGrow.MaxDataStorage
 		}
 		if maxSize == "" {
-			errors = append(errors, "spec.storage.storageAutoGrow.maxSwarmStorage or maxDataStorage is required when storage auto-grow is enabled in swarm mode")
+			errors = append(errors, "spec.storage.storageAutoGrow.maxStandaloneStorage or maxDataStorage is required when storage auto-grow is enabled in standalone mode")
 		} else if _, err := resource.ParseQuantity(maxSize); err != nil {
-			errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxSwarmStorage: %q is not a valid resource quantity", maxSize))
+			errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxStandaloneStorage: %q is not a valid resource quantity", maxSize))
 		}
 	} else if autoGrow.MaxDataStorage == "" {
 		errors = append(errors, "spec.storage.storageAutoGrow.maxDataStorage is required when storage auto-grow is enabled in clustered mode")
@@ -1072,20 +1073,20 @@ func (r *AntflyCluster) validateProductTierMapping() error {
 	validateTierToken("spec.productTier.name", tier.Name, true)
 	validateTierToken("spec.productTier.revision", tier.Revision, false)
 	validateTierToken("spec.productTier.managedBy", tier.ManagedBy, false)
-	validateTierToken("spec.productTier.swarmTier", tier.SwarmTier, false)
+	validateTierToken("spec.productTier.standaloneTier", tier.StandaloneTier, false)
 	validateTierToken("spec.productTier.metadataTier", tier.MetadataTier, false)
 	validateTierToken("spec.productTier.dataTier", tier.DataTier, false)
 	validateTierToken("spec.productTier.inferenceTier", tier.InferenceTier, false)
 
-	if r.isSwarmMode() {
-		if r.Spec.Swarm == nil {
-			errors = append(errors, "spec.swarm is required for a swarm product tier")
+	if r.isStandaloneMode() {
+		if r.Spec.Standalone == nil {
+			errors = append(errors, "spec.standalone is required for a standalone product tier")
 		} else {
-			if !resourceSpecHasCPUAndMemory(r.Spec.Swarm.Resources) {
-				errors = append(errors, "spec.swarm.resources must include cpu and memory requests or limits for a swarm product tier")
+			if !resourceSpecHasCPUAndMemory(r.Spec.Standalone.Resources) {
+				errors = append(errors, "spec.standalone.resources must include cpu and memory requests or limits for a standalone product tier")
 			}
-			if r.Spec.Storage.SwarmStorage == "" {
-				errors = append(errors, "spec.storage.swarmStorage is required for a swarm product tier")
+			if r.Spec.Storage.StandaloneStorage == "" {
+				errors = append(errors, "spec.storage.standaloneStorage is required for a standalone product tier")
 			}
 		}
 	} else {
@@ -1226,8 +1227,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 	}
 
-	if ha.Runtime != nil && r.effectiveMode() != ClusterModeSwarm {
-		errors = append(errors, "spec.highAvailability.runtime is only supported when spec.mode=Swarm")
+	if ha.Runtime != nil && r.effectiveMode() != ClusterModeStandalone {
+		errors = append(errors, "spec.highAvailability.runtime is only supported when spec.mode=Standalone")
 	}
 	errors = append(errors, validateHARuntime(ha)...)
 	errors = append(errors, r.validateHARuntimeAdminTokenSource(ha)...)
@@ -1516,10 +1517,10 @@ func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySp
 	if ha.Runtime.AdminTokenSecretRef != nil {
 		return nil
 	}
-	if r.effectiveMode() == ClusterModeSwarm && r.Spec.Swarm != nil && len(r.Spec.Swarm.EnvFrom) > 0 {
+	if r.effectiveMode() == ClusterModeStandalone && r.Spec.Standalone != nil && len(r.Spec.Standalone.EnvFrom) > 0 {
 		return nil
 	}
-	return []string{"spec.highAvailability.runtime.adminTokenEnvVar requires spec.highAvailability.runtime.adminTokenSecretRef or spec.swarm.envFrom"}
+	return []string{"spec.highAvailability.runtime.adminTokenEnvVar requires spec.highAvailability.runtime.adminTokenSecretRef or spec.standalone.envFrom"}
 }
 
 func validateHARouteSelector(selector map[string]string, fieldPath string) []string {
@@ -1652,8 +1653,8 @@ func (r *AntflyCluster) validateResourceQuantities() error {
 
 	validateQuantity("spec.metadataNodes.resources.limits.gpu", r.Spec.MetadataNodes.Resources.Limits.GPU)
 	validateQuantity("spec.dataNodes.resources.limits.gpu", r.Spec.DataNodes.Resources.Limits.GPU)
-	if r.Spec.Swarm != nil {
-		validateQuantity("spec.swarm.resources.limits.gpu", r.Spec.Swarm.Resources.Limits.GPU)
+	if r.Spec.Standalone != nil {
+		validateQuantity("spec.standalone.resources.limits.gpu", r.Spec.Standalone.Resources.Limits.GPU)
 	}
 
 	if len(errors) > 0 {
@@ -1664,26 +1665,26 @@ func (r *AntflyCluster) validateResourceQuantities() error {
 
 func (r *AntflyCluster) validateModeConfig() error {
 	if r.Spec.Mode == "" {
-		if r.Spec.Swarm != nil {
-			return fmt.Errorf("spec.swarm may only be set when spec.mode=Swarm")
+		if r.Spec.Standalone != nil {
+			return fmt.Errorf("spec.standalone may only be set when spec.mode=Standalone")
 		}
 		return nil
 	}
 
 	switch r.Spec.Mode {
 	case ClusterModeClustered:
-		if r.Spec.Swarm != nil {
-			return fmt.Errorf("spec.swarm may only be set when spec.mode=Swarm")
+		if r.Spec.Standalone != nil {
+			return fmt.Errorf("spec.standalone may only be set when spec.mode=Standalone")
 		}
-	case ClusterModeSwarm:
-		if r.Spec.Swarm == nil {
-			return fmt.Errorf("spec.swarm is required when spec.mode=Swarm")
+	case ClusterModeStandalone:
+		if r.Spec.Standalone == nil {
+			return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 		}
-		if err := r.validateSwarmConfig(); err != nil {
+		if err := r.validateStandaloneConfig(); err != nil {
 			return err
 		}
 	default:
-		return fmt.Errorf("spec.mode must be one of: Clustered, Swarm")
+		return fmt.Errorf("spec.mode must be one of: Clustered, Standalone")
 	}
 
 	return nil
@@ -1696,178 +1697,220 @@ func (r *AntflyCluster) effectiveMode() ClusterMode {
 	return r.Spec.Mode
 }
 
-func (r *AntflyCluster) validateSwarmConfig() error {
-	swarm := r.Spec.Swarm
-	if swarm == nil {
+func (r *AntflyCluster) validateStandaloneConfig() error {
+	standalone := r.Spec.Standalone
+	if standalone == nil {
 		return nil
 	}
 
-	if swarm.Inference != nil && swarm.Inference.Enabled && strings.TrimSpace(swarm.Inference.APIURL) == "" {
-		return fmt.Errorf("spec.swarm.inference.apiURL must be set when inference is enabled")
+	if standalone.Inference != nil && standalone.Inference.Enabled && strings.TrimSpace(standalone.Inference.APIURL) == "" {
+		return fmt.Errorf("spec.standalone.inference.apiURL must be set when inference is enabled")
 	}
 
-	if swarm.Inference != nil && strings.TrimSpace(swarm.Inference.APIURL) != "" {
-		parsed, err := url.Parse(swarm.Inference.APIURL)
+	if standalone.Inference != nil && strings.TrimSpace(standalone.Inference.APIURL) != "" {
+		parsed, err := url.Parse(standalone.Inference.APIURL)
 		if err != nil {
-			return fmt.Errorf("spec.swarm.inference.apiURL is invalid: %w", err)
+			return fmt.Errorf("spec.standalone.inference.apiURL is invalid: %w", err)
 		}
 		if parsed.Scheme == "" || parsed.Host == "" {
-			return fmt.Errorf("spec.swarm.inference.apiURL must include a scheme and host")
+			return fmt.Errorf("spec.standalone.inference.apiURL must include a scheme and host")
 		}
 	}
 
 	ports := map[string]int32{
-		"metadataAPI":  swarm.MetadataAPI.Port,
-		"metadataRaft": swarm.MetadataRaft.Port,
-		"storeAPI":     swarm.StoreAPI.Port,
-		"storeRaft":    swarm.StoreRaft.Port,
-		"health":       swarm.Health.Port,
+		"metadataAPI":  standalone.MetadataAPI.Port,
+		"metadataRaft": standalone.MetadataRaft.Port,
+		"storeAPI":     standalone.StoreAPI.Port,
+		"storeRaft":    standalone.StoreRaft.Port,
+		"health":       standalone.Health.Port,
 	}
 	seen := map[int32]string{}
 	var portErrors []string
 	for name, port := range ports {
 		if port <= 0 {
-			portErrors = append(portErrors, fmt.Sprintf("spec.swarm.%s.port must be greater than 0", name))
+			portErrors = append(portErrors, fmt.Sprintf("spec.standalone.%s.port must be greater than 0", name))
 			continue
 		}
 		if prev, ok := seen[port]; ok {
-			portErrors = append(portErrors, fmt.Sprintf("spec.swarm.%s.port conflicts with spec.swarm.%s.port: %d", name, prev, port))
+			portErrors = append(portErrors, fmt.Sprintf("spec.standalone.%s.port conflicts with spec.standalone.%s.port: %d", name, prev, port))
 			continue
 		}
 		seen[port] = name
 	}
 
 	if len(portErrors) > 0 {
-		return fmt.Errorf("swarm port validation failed:\n  - %s", strings.Join(portErrors, "\n  - "))
+		return fmt.Errorf("standalone port validation failed:\n  - %s", strings.Join(portErrors, "\n  - "))
 	}
 
-	if swarm.Replicas > 1 {
-		return fmt.Errorf("spec.swarm.replicas > 1 is not supported in the MVP, got %d", swarm.Replicas)
+	if standalone.Replicas > 1 {
+		return fmt.Errorf("spec.standalone.replicas > 1 is not supported in the MVP, got %d", standalone.Replicas)
 	}
 
-	if strings.TrimSpace(r.Spec.Storage.SwarmStorage) == "" {
-		return fmt.Errorf("spec.storage.swarmStorage is required when spec.mode=Swarm")
+	if strings.TrimSpace(r.Spec.Storage.StandaloneStorage) == "" {
+		return fmt.Errorf("spec.storage.standaloneStorage is required when spec.mode=Standalone")
 	}
 
-	if err := r.validateSwarmTopologyIsolation(); err != nil {
+	if err := ValidateOperatorManagedStandaloneStorageConfig(r.Spec.Config); err != nil {
+		return err
+	}
+
+	if err := r.validateStandaloneTopologyIsolation(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (r *AntflyCluster) validateSwarmTopologyIsolation() error {
+// ValidateOperatorManagedStandaloneStorageConfig prevents the operator from
+// silently rewriting an unsupported storage engine to local PVC storage. It is
+// shared by admission and reconciliation so webhook outages cannot weaken the
+// fail-closed behavior.
+func ValidateOperatorManagedStandaloneStorageConfig(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		return fmt.Errorf("spec.config must contain valid JSON: %w", err)
+	}
+	rawStorage, exists := config["storage"]
+	if !exists {
+		return nil
+	}
+	var storage map[string]json.RawMessage
+	if err := json.Unmarshal(rawStorage, &storage); err != nil {
+		return fmt.Errorf("spec.config.storage must be an object: %w", err)
+	}
+	if rawEngine, exists := storage["engine"]; exists {
+		var engine string
+		if err := json.Unmarshal(rawEngine, &engine); err != nil {
+			return fmt.Errorf("spec.config.storage.engine must be a string: %w", err)
+		}
+		if engine != "local" {
+			return fmt.Errorf("operator-managed standalone currently supports only storage.engine=local, got %q", engine)
+		}
+	}
+	if _, exists := storage["lite"]; exists {
+		return fmt.Errorf("operator-managed standalone does not yet support spec.config.storage.lite")
+	}
+	if _, exists := storage["object"]; exists {
+		return fmt.Errorf("operator-managed standalone does not support spec.config.storage.object")
+	}
+	return nil
+}
+
+func (r *AntflyCluster) validateStandaloneTopologyIsolation() error {
 	var errors []string
 
 	if r.Spec.MetadataNodes.Replicas != 0 {
-		errors = append(errors, "spec.metadataNodes.replicas must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.replicas must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.Replicas != 0 {
-		errors = append(errors, "spec.dataNodes.replicas must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.replicas must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.Suspend {
-		errors = append(errors, "spec.dataNodes.suspend must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.suspend must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.MetadataNodes.Resources != (ResourceSpec{}) {
-		errors = append(errors, "spec.metadataNodes.resources must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.resources must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.Resources != (ResourceSpec{}) {
-		errors = append(errors, "spec.dataNodes.resources must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.resources must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.MetadataNodes.MetadataAPI != (APISpec{}) {
-		errors = append(errors, "spec.metadataNodes.metadataAPI must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.metadataAPI must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.MetadataNodes.MetadataRaft != (APISpec{}) {
-		errors = append(errors, "spec.metadataNodes.metadataRaft must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.metadataRaft must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.API != (APISpec{}) {
-		errors = append(errors, "spec.dataNodes.api must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.api must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.Raft != (APISpec{}) {
-		errors = append(errors, "spec.dataNodes.raft must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.raft must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.MetadataNodes.Health != (APISpec{}) {
-		errors = append(errors, "spec.metadataNodes.health must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.health must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.Health != (APISpec{}) {
-		errors = append(errors, "spec.dataNodes.health must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.health must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.MetadataNodes.UseSpotPods {
-		errors = append(errors, "spec.metadataNodes.useSpotPods must be false when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.useSpotPods must be false when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.UseSpotPods {
-		errors = append(errors, "spec.dataNodes.useSpotPods must be false when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.useSpotPods must be false when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.AutoScaling != nil && r.Spec.DataNodes.AutoScaling.Enabled {
-		errors = append(errors, "spec.dataNodes.autoScaling.enabled must be false when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.autoScaling.enabled must be false when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.MetadataNodes.EnvFrom) > 0 {
-		errors = append(errors, "spec.metadataNodes.envFrom must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.envFrom must be empty when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.DataNodes.EnvFrom) > 0 {
-		errors = append(errors, "spec.dataNodes.envFrom must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.envFrom must be empty when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.MetadataNodes.Tolerations) > 0 {
-		errors = append(errors, "spec.metadataNodes.tolerations must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.tolerations must be empty when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.DataNodes.Tolerations) > 0 {
-		errors = append(errors, "spec.dataNodes.tolerations must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.tolerations must be empty when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.MetadataNodes.NodeSelector) > 0 {
-		errors = append(errors, "spec.metadataNodes.nodeSelector must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.nodeSelector must be empty when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.DataNodes.NodeSelector) > 0 {
-		errors = append(errors, "spec.dataNodes.nodeSelector must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.nodeSelector must be empty when spec.mode=Standalone")
 	}
 
 	if r.Spec.MetadataNodes.Affinity != nil {
-		errors = append(errors, "spec.metadataNodes.affinity must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.affinity must be unset when spec.mode=Standalone")
 	}
 
 	if r.Spec.DataNodes.Affinity != nil {
-		errors = append(errors, "spec.dataNodes.affinity must be unset when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.affinity must be unset when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.MetadataNodes.TopologySpreadConstraints) > 0 {
-		errors = append(errors, "spec.metadataNodes.topologySpreadConstraints must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.metadataNodes.topologySpreadConstraints must be empty when spec.mode=Standalone")
 	}
 
 	if len(r.Spec.DataNodes.TopologySpreadConstraints) > 0 {
-		errors = append(errors, "spec.dataNodes.topologySpreadConstraints must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.dataNodes.topologySpreadConstraints must be empty when spec.mode=Standalone")
 	}
 
 	if r.Spec.Storage.MetadataStorage != "" || r.Spec.Storage.DataStorage != "" {
-		errors = append(errors, "spec.storage.metadataStorage and spec.storage.dataStorage must be empty when spec.mode=Swarm")
+		errors = append(errors, "spec.storage.metadataStorage and spec.storage.dataStorage must be empty when spec.mode=Standalone")
 	}
 
 	if len(errors) > 0 {
-		return fmt.Errorf("swarm topology validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+		return fmt.Errorf("standalone topology validation failed:\n  - %s", strings.Join(errors, "\n  - "))
 	}
 
 	return nil
 }
 
-func (r *AntflyCluster) isSwarmMode() bool {
-	return r.effectiveMode() == ClusterModeSwarm
+func (r *AntflyCluster) isStandaloneMode() bool {
+	return r.effectiveMode() == ClusterModeStandalone
 }
 
 // hasGPUInResourceSpec checks if GPU resources are present in ResourceSpec.

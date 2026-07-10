@@ -37,9 +37,9 @@ import (
 	"go.uber.org/zap"
 )
 
-// SwarmInstance represents a running single-node Antfly swarm for testing.
+// StandaloneInstance represents a running single-node Antfly standalone for testing.
 // It includes a metadata server, store server, and Antfly inference ML server.
-type SwarmInstance struct {
+type StandaloneInstance struct {
 	T               *testing.T
 	Logger          *zap.Logger
 	Config          *common.Config
@@ -53,15 +53,15 @@ type SwarmInstance struct {
 	DataDir         string
 }
 
-// Cleanup stops the swarm and cleans up resources
-func (s *SwarmInstance) Cleanup() {
+// Cleanup stops the standalone and cleans up resources
+func (s *StandaloneInstance) Cleanup() {
 	s.Cancel()
 	// Give servers time to shutdown gracefully
 	time.Sleep(500 * time.Millisecond)
 }
 
-// SwarmOptions configures optional behaviour for startAntflySwarmWithOptions.
-type SwarmOptions struct {
+// StandaloneOptions configures optional behaviour for startAntflyStandaloneWithOptions.
+type StandaloneOptions struct {
 	// DisableInference skips starting the Antfly inference ML server. Useful for tests
 	// that don't need embeddings/chunking/reranking.
 	DisableInference bool
@@ -71,17 +71,17 @@ type SwarmOptions struct {
 	EnableAuth bool
 
 	// LocalBypass enables in-process communication between metadata and store,
-	// bypassing HTTP for shard queries and StoreRPC. Mirrors swarm mode behavior.
+	// bypassing HTTP for shard queries and StoreRPC. Mirrors standalone mode behavior.
 	LocalBypass bool
 }
 
-// startAntflySwarm starts a full Antfly swarm (metadata + store + Antfly inference) for testing.
-func startAntflySwarm(t *testing.T, ctx context.Context) *SwarmInstance {
-	return startAntflySwarmWithOptions(t, ctx, SwarmOptions{})
+// startAntflyStandalone starts a full Antfly standalone (metadata + store + Antfly inference) for testing.
+func startAntflyStandalone(t *testing.T, ctx context.Context) *StandaloneInstance {
+	return startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{})
 }
 
-// startAntflySwarmWithOptions starts an Antfly swarm with configurable options.
-func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOptions) *SwarmInstance {
+// startAntflyStandaloneWithOptions starts an Antfly standalone with configurable options.
+func startAntflyStandaloneWithOptions(t *testing.T, ctx context.Context, opts StandaloneOptions) *StandaloneInstance {
 	t.Helper()
 
 	// Reduce Pebble cache size for tests to avoid OOM (16MB vs default 320MB per shard)
@@ -130,7 +130,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	CleanupAntflyData(t, dataDir, nodeID)
 
 	// Create context for servers
-	swarmCtx, cancel := context.WithCancel(ctx)
+	standaloneCtx, cancel := context.WithCancel(ctx)
 
 	// Create readiness channels
 	metadataReadyC := make(chan struct{})
@@ -140,7 +140,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		inferenceReadyC := make(chan struct{})
 
 		go inferenceRuntime.RunAsTermite(
-			swarmCtx,
+			standaloneCtx,
 			logger.Named("antfly inference"),
 			config.Inference,
 			inferenceReadyC,
@@ -175,9 +175,9 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	}
 
 	if opts.LocalBypass {
-		startSwarmWithLocalBypass(t, swarmCtx, logger, config, metaConf, storeConf, peers, metadataReadyC, storeReadyC)
+		startStandaloneWithLocalBypass(t, standaloneCtx, logger, config, metaConf, storeConf, peers, metadataReadyC, storeReadyC)
 	} else {
-		startSwarmWithHTTP(t, swarmCtx, logger, config, metaConf, storeConf, peers, metadataReadyC, storeReadyC)
+		startStandaloneWithHTTP(t, standaloneCtx, logger, config, metaConf, storeConf, peers, metadataReadyC, storeReadyC)
 	}
 
 	// Wait for both servers to be ready
@@ -209,13 +209,13 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		t.Fatalf("Failed to create Antfly client: %v", err)
 	}
 
-	logger.Info("Swarm started successfully",
+	logger.Info("Standalone started successfully",
 		zap.String("inference_api", config.Inference.ApiUrl),
 		zap.String("metadata_api", metadataAPIURL),
 		zap.String("store_api", storeAPIURL),
 	)
 
-	return &SwarmInstance{
+	return &StandaloneInstance{
 		T:               t,
 		Logger:          logger,
 		Config:          config,
@@ -230,8 +230,8 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	}
 }
 
-// startSwarmWithHTTP starts metadata and store using the standard HTTP-based path.
-func startSwarmWithHTTP(
+// startStandaloneWithHTTP starts metadata and store using the standard HTTP-based path.
+func startStandaloneWithHTTP(
 	t *testing.T,
 	ctx context.Context,
 	logger *zap.Logger,
@@ -245,9 +245,9 @@ func startSwarmWithHTTP(
 	go store.RunAsStore(ctx, logger.Named("store"), config, storeConf, "", storeReadyC, nil)
 }
 
-// startSwarmWithLocalBypass starts metadata and store with in-process bypass,
-// mirroring the production swarm.go wiring.
-func startSwarmWithLocalBypass(
+// startStandaloneWithLocalBypass starts metadata and store with in-process bypass,
+// mirroring the production standalone.go wiring.
+func startStandaloneWithLocalBypass(
 	t *testing.T,
 	ctx context.Context,
 	logger *zap.Logger,
@@ -406,7 +406,7 @@ func waitForShardsReady(t *testing.T, ctx context.Context, client *antfly.Antfly
 			// Check if we have at least one shard
 			if len(status.Shards) > 0 {
 				//  Wait longer to ensure leader election completes and propagates
-				// In swarm mode, the shard starts quickly but leader status needs time to propagate
+				// In standalone mode, the shard starts quickly but leader status needs time to propagate
 				// to the metadata server's view
 				if pollCount >= 6 {
 					t.Logf("Shards ready after %d polls (~%dms)", pollCount, pollCount*500)

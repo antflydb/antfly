@@ -48,7 +48,7 @@ type ShardIndexes []ShardIndex
 type ShardIndexFactory func(tableSchema *schema.TableSchema, shardIDs []types.ID, peers map[types.ID][]string) (ShardIndexes, error)
 
 // ShardSearcher provides direct (in-process) shard search, bypassing HTTP.
-// Implemented by a thin adapter over store.StoreIface in swarm mode.
+// Implemented by a thin adapter over store.StoreIface in standalone mode.
 type ShardSearcher interface {
 	SearchShardTyped(ctx context.Context, shardID types.ID, req *RemoteIndexSearchRequest) (*RemoteIndexSearchResult, error)
 }

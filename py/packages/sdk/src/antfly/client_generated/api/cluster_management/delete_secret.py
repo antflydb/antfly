@@ -66,7 +66,7 @@ def sync_detailed(
 ) -> Response[Any | Error]:
     """Delete a secret
 
-     Remove a secret from the keystore. Only available in swarm (single-node) mode.
+     Remove a secret from the keystore. Only available in standalone (single-node) mode.
     Returns 503 in multi-node mode.
 
     Args:
@@ -98,7 +98,7 @@ def sync(
 ) -> Any | Error | None:
     """Delete a secret
 
-     Remove a secret from the keystore. Only available in swarm (single-node) mode.
+     Remove a secret from the keystore. Only available in standalone (single-node) mode.
     Returns 503 in multi-node mode.
 
     Args:
@@ -125,7 +125,7 @@ async def asyncio_detailed(
 ) -> Response[Any | Error]:
     """Delete a secret
 
-     Remove a secret from the keystore. Only available in swarm (single-node) mode.
+     Remove a secret from the keystore. Only available in standalone (single-node) mode.
     Returns 503 in multi-node mode.
 
     Args:
@@ -155,7 +155,7 @@ async def asyncio(
 ) -> Any | Error | None:
     """Delete a secret
 
-     Remove a secret from the keystore. Only available in swarm (single-node) mode.
+     Remove a secret from the keystore. Only available in standalone (single-node) mode.
     Returns 503 in multi-node mode.
 
     Args:

@@ -424,7 +424,7 @@ Runtime-backed work follows these boundaries:
 Current status:
 
 - `BackendRuntime` is heap-owned at node/server construction sites and borrowed
-  through DataServer, provisioned, hosted, metadata, and swarm DB open paths
+  through DataServer, provisioned, hosted, metadata, and standalone DB open paths
 - derived replay, full-text merge, enrichment replay, TTL cleanup, transaction
   recovery, and LSM background flush are under the shared runtime model
 - `DurableJobLane` has inline and threaded implementations

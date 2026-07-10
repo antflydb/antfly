@@ -69,8 +69,8 @@ pub const Config = struct {
     max_shards_per_table: ?i64 = null,
     /// Default number of shards to create for a new table.
     default_shards_per_table: ?i64 = null,
-    /// Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node.
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology. Standalone runs metadata, data, APIs, and inference in one process.
+    deployment_mode: ?[]const u8 = null,
     /// Named embedder configurations for embedding operations. Define named embedders that can be referenced by indexes, templates, and API calls. The first embedder defined becomes the default when no embedder name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add openai.api_key ``` Then reference in config: `api_key: ${secret:openai.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - OpenAI: `OPENAI_API_KEY` - Gemini: `GEMINI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` - Cohere: `COHERE_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml embedders: openai-small: provider: openai model: text-embedding-3-small antfly-local: provider: antfly model: bge-base-en-v1.5 api_url: "http://localhost:8082" ```
     embedders: ?std.json.ArrayHashMap(antfly_embeddings_openapi.EmbedderConfig) = null,
     /// Named generator configurations for AI operations. Define named generators that can be referenced by chains, templates, and API calls. The first generator defined becomes the default when no generator name is specified. **API Key Configuration:** API keys can be provided via the encrypted keystore (recommended) or environment variables: 1. **Keystore** (recommended for production): ```bash antfly keystore create antfly keystore add gemini.api_key ``` Then reference in config: `api_key: ${secret:gemini.api_key}` 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - Gemini: `GEMINI_API_KEY` - OpenAI: `OPENAI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```yaml generators: gemini-flash: provider: gemini model: gemini-2.5-flash ollama-local: provider: ollama model: llama3 openai-gpt4: provider: openai model: gpt-4.1 ```
@@ -204,6 +204,13 @@ pub const InferenceConnectionConfig = struct {
     configured_model_types: ?[]const []const u8 = null,
 };
 
+pub const LiteStorageConfig = struct {
+    /// Path to the single writable Antfly Lite database file.
+    path: []const u8,
+    /// Synchronize committed Lite state before acknowledging it.
+    fsync: ?bool = null,
+};
+
 pub const LocalStorageConfig = struct {
     /// Root directory for all antfly data storage. Defaults to 'antflydb'.
     base_dir: ?[]const u8 = null,
@@ -224,6 +231,12 @@ pub const NamedChainLink = struct {
     retry: ?antfly_generating_openapi.RetryConfig = null,
     /// When to try the next generator in chain
     condition: ?antfly_generating_openapi.ChainCondition = null,
+};
+
+pub const ObjectStorageConfig = struct {
+    provider: []const u8,
+    bucket: []const u8,
+    prefix: ?[]const u8 = null,
 };
 
 pub const S3Info = struct {
@@ -259,11 +272,75 @@ pub const StorageBackend = enum {
     }
 };
 
+/// Tagged storage-engine configuration. Engine is required and exactly the matching engine member must be present.
 pub const StorageConfig = struct {
+    engine: StorageEngine,
+    lite: ?LiteStorageConfig = null,
+    object: ?ObjectStorageConfig = null,
     local: ?LocalStorageConfig = null,
     data: ?StorageBackend = null,
     metadata: ?StorageBackend = null,
     s3: ?S3Info = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("engine");
+        try jw.write(self.engine);
+        if (self.lite) |value| {
+            try jw.objectField("lite");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.local) |value| {
+            try jw.objectField("local");
+            try jw.write(value);
+        }
+        if (self.data) |value| {
+            try jw.objectField("data");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.s3) |value| {
+            try jw.objectField("s3");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Durable storage representation, independent of deployment topology.
+pub const StorageEngine = enum {
+    lite,
+    local,
+    object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lite => "lite",
+            .local => "local",
+            .object => "object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lite", .lite },
+            .{ "local", .local },
+            .{ "object", .object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const TLSInfo = struct {

@@ -9,6 +9,7 @@ metadata:
 
 # Storage configuration
 storage:
+  engine: local
   # Local storage configuration (always required for some local data)
   local:
     base_dir: "antflydb"

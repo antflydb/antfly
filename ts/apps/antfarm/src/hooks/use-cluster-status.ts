@@ -75,7 +75,7 @@ export interface ClusterDataSection {
 export interface ClusterData {
   health: string;
   message?: string;
-  swarmMode: boolean;
+  standaloneMode: boolean;
   authEnabled: boolean;
   stores: Record<string, StoreInfo>;
   shards: Record<string, ShardStatus>;
@@ -168,7 +168,7 @@ export function useClusterStatus(refreshInterval: number | null = 10000): Cluste
   const [error, setError] = useState<string | undefined>();
   const [health, setHealth] = useState("unknown");
   const [message, setMessage] = useState<string | undefined>();
-  const [swarmMode, setSwarmMode] = useState(false);
+  const [standaloneMode, setStandaloneMode] = useState(false);
   const [authEnabled, setAuthEnabled] = useState(false);
   const [stores, setStores] = useState<Record<string, StoreInfo>>({});
   const [shards, setShards] = useState<Record<string, ShardStatus>>({});
@@ -188,7 +188,7 @@ export function useClusterStatus(refreshInterval: number | null = 10000): Cluste
       // Extract typed fields
       setHealth((raw.health as string) ?? "unknown");
       setMessage(raw.message as string | undefined);
-      setSwarmMode(Boolean(raw.swarm_mode));
+      setStandaloneMode(raw.deployment_mode === "standalone");
       setAuthEnabled(Boolean(raw.auth_enabled));
       const statusData = raw.data as ClusterDataSection | undefined;
 
@@ -242,7 +242,7 @@ export function useClusterStatus(refreshInterval: number | null = 10000): Cluste
   return {
     health,
     message,
-    swarmMode,
+    standaloneMode,
     authEnabled,
     stores,
     shards,

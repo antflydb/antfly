@@ -1,18 +1,18 @@
 apiVersion: antfly.io/v1
 kind: AntflyCluster
 metadata:
-  name: swarm-antfly-cluster
+  name: standalone-antfly-cluster
   namespace: default
   labels:
     app.kubernetes.io/name: antfly-cluster
-    app.kubernetes.io/instance: swarm-antfly-cluster
+    app.kubernetes.io/instance: standalone-antfly-cluster
     app.kubernetes.io/part-of: antfly
 spec:
   image: ghcr.io/antflydb/antfly:latest
   imagePullPolicy: IfNotPresent
-  mode: Swarm
+  mode: Standalone
 
-  swarm:
+  standalone:
     replicas: 1
     nodeID: 1
     metadataAPI:
@@ -39,7 +39,7 @@ spec:
 
   storage:
     storageClass: ""
-    swarmStorage: "5Gi"
+    standaloneStorage: "5Gi"
 
   config: |
     {
