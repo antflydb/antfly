@@ -3260,6 +3260,13 @@ const RuntimeDocumentExtractionCollectContext = struct {
                 try self.flushPendingGeneratedText();
             }
             self.pending_generated_kind = kind;
+            const unit_bytes = runtimeDocumentExtractionUnitOwnedBytes(unit.*);
+            if (self.pending_generated_units.items.len > 0 and
+                addUsizeSaturating(self.pending_generated_bytes, unit_bytes) > self.batch_policy.max_bytes)
+            {
+                try self.flushPendingGeneratedText();
+                self.pending_generated_kind = kind;
+            }
             var cloned = try cloneDocumentExtractionUnit(self.runtime.alloc, unit.*);
             var owns_cloned = true;
             errdefer if (owns_cloned) cloned.deinit(self.runtime.alloc);

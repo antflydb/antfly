@@ -331,14 +331,13 @@ batch operation.
 Execution policy is scoped to the catalog resource that owns the work. Explicit
 enrichments already name one producer operation, so their `execution` block uses
 the policy fields directly. Index shorthand can expand into multiple work
-owners, so its `execution` block uses operation namespaces such as `indexing`,
-`chunking`, `embedding`, `reading`, `generating`, `extracting`, and
-`transcribing`; the translator copies each nested policy to the generated
-resource where it becomes that resource's flat `execution` policy.
-Graph indexes are the exception because their shorthand already has an
-`artifact` object: graph root `execution` is only for graph/indexing work, and
-producer batching for the generated relation asset belongs in
-`artifact.execution`.
+owners, but this implementation only exposes namespaces that are wired through
+runtime behavior today: `chunking` and `embedding`. The translator copies each
+nested policy to the generated resource where it becomes that resource's flat
+`execution` policy. Reader, generator, extractor, and transcriber batching for
+explicit asset enrichments uses that flat enrichment `execution` block directly.
+Graph indexes do not expose a root execution block yet; producer batching for a
+graph shorthand relation asset belongs in `artifact.execution`.
 
 Embedding enrichments should use the same execution-policy model. Existing dense
 and chunked embedding workers already resolve process-level batch item and byte
@@ -363,8 +362,9 @@ and how large that request may be. They should not share one ambiguous
 `batch_items` field.
 
 For embeddings indexes that use the inline managed-embedder shorthand, the
-execution policy should live beside `embedder`, not inside it, with separate
-namespaces for indexing and embedding:
+execution policy lives beside `embedder`, not inside it. The public shorthand
+surface only accepts namespaces that are wired to generated producer
+enrichments:
 
 ```json
 {
@@ -376,9 +376,6 @@ namespaces for indexing and embedding:
     "model": "bge-base-en-v1.5"
   },
   "execution": {
-    "indexing": {
-      "batch_items": 1024
-    },
     "embedding": {
       "batch_items": 16,
       "batch_bytes": 262144
@@ -387,14 +384,14 @@ namespaces for indexing and embedding:
 }
 ```
 
-The index translator should keep `execution.indexing` on the vector index and
-copy `execution.embedding` onto the generated embedding enrichment. The vector
-index itself consumes the produced embedding artifact; the embedding batching
-policy applies to the producer that creates that artifact.
+The index translator copies `execution.embedding` onto the generated embedding
+enrichment. The vector index itself consumes the produced embedding artifact;
+the embedding batching policy applies to the producer that creates that
+artifact. Vector-index ingestion batching is not exposed here until it has a
+runtime consumer.
 
 For artifact-backed indexes that point at an existing embedding artifact,
-indexing batching belongs on the index and embedder batching belongs on the
-matching embedding enrichment:
+embedder batching belongs on the matching embedding enrichment:
 
 ```json
 {
@@ -402,12 +399,7 @@ matching embedding enrichment:
   "field": "embedding",
   "embedding_name": "document_chunk_dense_v1",
   "source_artifact_name": "document_chunks_v1",
-  "dimension": 384,
-  "execution": {
-    "indexing": {
-      "batch_items": 1024
-    }
-  }
+  "dimension": 384
 }
 ```
 
@@ -439,7 +431,7 @@ Chunking follows the same split. Chunk shape is semantic: target size, overlap,
 tokenizer/model, store-chunks behavior, and full-text side effects can change
 the chunk artifacts. Chunker execution is non-semantic: how many source texts or
 asset values are sent through the chunker per pass or per remote chunker request.
-For an inline embedding index with managed chunking there can be three separate
+For an inline embedding index with managed chunking there can be two separate
 execution namespaces:
 
 ```json
@@ -459,9 +451,6 @@ execution namespaces:
     "model": "bge-base-en-v1.5"
   },
   "execution": {
-    "indexing": {
-      "batch_items": 1024
-    },
     "chunking": {
       "batch_items": 128,
       "batch_bytes": 1048576
@@ -474,9 +463,8 @@ execution namespaces:
 }
 ```
 
-The translator should keep `execution.indexing` on the vector index, copy
-`execution.chunking` onto the generated chunk enrichment, and copy
-`execution.embedding` onto the generated embedding enrichment. For explicit
+The translator copies `execution.chunking` onto the generated chunk enrichment
+and `execution.embedding` onto the generated embedding enrichment. For explicit
 chunk enrichments, the same chunker-side policy lives directly on the
 enrichment:
 
@@ -499,11 +487,12 @@ enrichment:
 }
 ```
 
-Graph indexes use the same ownership boundary, but the useful execution knobs
-are different. A graph index consumes edge-like input from document `_edges`, a
-user-defined enrichment, or a shorthand-created asset enrichment. The graph
-indexing execution policy controls edge materialization and replay batching; the
-asset/extractor execution policy controls model calls that produce relations.
+Graph indexes use the same ownership boundary. A graph index consumes edge-like
+input from document `_edges`, a user-defined enrichment, or a shorthand-created
+asset enrichment. The graph index root does not expose an `execution` block yet,
+because graph edge materialization and replay batching are not wired to a public
+policy. Asset/extractor execution policy controls model calls that produce
+relations.
 
 ```json
 {
@@ -513,21 +502,14 @@ asset/extractor execution policy controls model calls that produce relations.
     "artifact": "relations_v1",
     "path": "$.relations[*]",
     "format": "extraction_relation"
-  },
-  "execution": {
-    "indexing": {
-      "batch_items": 4096,
-      "batch_bytes": 4194304
-    }
   }
 }
 ```
 
 If the graph index uses shorthand to create the relation-producing asset,
 producer batching belongs on that artifact object. The index translator should
-copy `artifact.execution` onto the generated asset enrichment and keep graph
-indexing batching on the graph index. Do not also put artifact producer policy
-under graph root `execution`:
+copy `artifact.execution` onto the generated asset enrichment. Do not also put
+artifact producer policy under graph root `execution`:
 
 ```json
 {
@@ -555,12 +537,6 @@ under graph root `execution`:
     "artifact": "relations_v1",
     "path": "$.relations[*]",
     "format": "extraction_relation"
-  },
-  "execution": {
-    "indexing": {
-      "batch_items": 4096,
-      "batch_bytes": 4194304
-    }
   }
 }
 ```

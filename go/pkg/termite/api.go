@@ -53,6 +53,13 @@ import (
 	_ "golang.org/x/image/webp"
 )
 
+const (
+	maxReadBatchImages = 64
+	maxReadBatchBytes  = int64(256 * 1024 * 1024)
+)
+
+var errReadBatchTooLarge = errors.New("read batch too large")
+
 // NOTE: SerializeFloatArrays is in codec.go in this package
 
 // TermiteAPI implements the generated ServerInterface
@@ -2325,6 +2332,10 @@ func (ln *TermiteNode) handleApiRead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "images are required", http.StatusBadRequest)
 		return
 	}
+	if len(req.Images) > maxReadBatchImages {
+		http.Error(w, fmt.Sprintf("images must contain at most %d items", maxReadBatchImages), http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	// Acquire reader model from registry
 	reader, err := ln.readerRegistry.Acquire(req.Model)
@@ -2341,6 +2352,10 @@ func (ln *TermiteNode) handleApiRead(w http.ResponseWriter, r *http.Request) {
 			zap.String("model", req.Model),
 			zap.Int("num_images", len(req.Images)),
 			zap.Error(err))
+		if errors.Is(err, errReadBatchTooLarge) {
+			http.Error(w, fmt.Sprintf("total downloaded image bytes must be at most %d", maxReadBatchBytes), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, fmt.Sprintf("failed to download images: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -2414,14 +2429,24 @@ func (ln *TermiteNode) handleApiRead(w http.ResponseWriter, r *http.Request) {
 // downloadAndDecodeImages downloads images from URLs and decodes them to image.Image
 func downloadAndDecodeImages(ctx context.Context, imageURLs []ImageURL, secConfig *scraping.ContentSecurityConfig, s3Creds *s3.Credentials) ([]image.Image, error) {
 	images := make([]image.Image, 0, len(imageURLs))
+	var downloadedBytes int64
 
 	for _, imgURL := range imageURLs {
+		if downloadedBytes >= maxReadBatchBytes {
+			return nil, errReadBatchTooLarge
+		}
+		remainingBytes := maxReadBatchBytes - downloadedBytes
+		boundedSecurity := boundedReadContentSecurity(secConfig, remainingBytes)
 		// Download image data - returns (mimeType, data []byte, error)
 		// scraping.DownloadContent handles data:, http://, https://, file://, s3:// URLs
 		// and returns already-decoded bytes (base64 decoding for data: URLs is handled internally)
-		_, imageData, err := scraping.DownloadContent(ctx, imgURL.Url, secConfig, s3Creds)
+		contentType, imageData, err := scraping.DownloadContent(ctx, imgURL.Url, boundedSecurity, s3Creds)
 		if err != nil {
 			return nil, fmt.Errorf("downloading image %s: %w", imgURL.Url, err)
+		}
+		downloadedBytes += int64(len(imageData)) + int64(len(contentType))
+		if downloadedBytes > maxReadBatchBytes {
+			return nil, errReadBatchTooLarge
 		}
 
 		// Decode image from bytes
@@ -2434,6 +2459,24 @@ func downloadAndDecodeImages(ctx context.Context, imageURLs []ImageURL, secConfi
 	}
 
 	return images, nil
+}
+
+func boundedReadContentSecurity(secConfig *scraping.ContentSecurityConfig, remainingBytes int64) *scraping.ContentSecurityConfig {
+	if remainingBytes < 1 {
+		remainingBytes = 1
+	}
+	downloadLimit := remainingBytes
+	if downloadLimit < maxReadBatchBytes {
+		downloadLimit++
+	}
+	if secConfig == nil {
+		return &scraping.ContentSecurityConfig{MaxDownloadSizeBytes: downloadLimit}
+	}
+	bounded := *secConfig
+	if bounded.MaxDownloadSizeBytes <= 0 || bounded.MaxDownloadSizeBytes > downloadLimit {
+		bounded.MaxDownloadSizeBytes = downloadLimit
+	}
+	return &bounded
 }
 
 // handleApiTranscribe handles speech-to-text transcription requests

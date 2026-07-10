@@ -2379,7 +2379,7 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
-    /// Non-semantic execution policy for index maintenance and any shorthand-created chunking or embedding producers.
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
 };
 
@@ -3482,14 +3482,6 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
-    /// Non-semantic execution policy for graph edge materialization. Shorthand artifact producer batching belongs on artifact.execution.
-    execution: ?GraphIndexExecutionConfig = null,
-};
-
-/// Execution policy for graph index work. Artifact producer batching belongs on graph artifact.execution.
-pub const GraphIndexExecutionConfig = struct {
-    /// Graph edge materialization, backfill, replay, or maintenance batching.
-    indexing: ?ExecutionPolicy = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -3795,7 +3787,7 @@ pub const IndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
-    /// Non-semantic execution policy for index maintenance and any shorthand-created chunking or embedding producers.
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
@@ -3902,22 +3894,12 @@ pub const IndexConfig = struct {
     }
 };
 
-/// Namespaced execution policy for index shorthand. Index configs can drive multiple operations, so each operation receives its own policy.
+/// Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted.
 pub const IndexExecutionConfig = struct {
-    /// Index maintenance, backfill, replay, or materialization batching.
-    indexing: ?ExecutionPolicy = null,
     /// Chunk producer batching for shorthand-created chunk enrichments.
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
-    /// Extraction producer batching for shorthand-created asset enrichments.
-    extracting: ?ExecutionPolicy = null,
-    /// Reader producer batching for shorthand-created asset enrichments.
-    reading: ?ExecutionPolicy = null,
-    /// Generator producer batching for shorthand-created asset enrichments.
-    generating: ?ExecutionPolicy = null,
-    /// Transcriber producer batching for shorthand-created asset enrichments.
-    transcribing: ?ExecutionPolicy = null,
 };
 
 /// Statistics for an index

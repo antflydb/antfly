@@ -16994,6 +16994,7 @@ fn computeAssetRequestDerived(
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    deferred_asset_producer_items: ?*std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
     force_reprocess: bool,
 ) !void {
     var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
@@ -17076,6 +17077,38 @@ fn computeAssetRequestDerived(
         }
     }
 
+    if (producer_cfg.type != .copy) {
+        if (deferred_asset_producer_items) |items| {
+            const request_clone = try enrichment_types.cloneGeneratedRequest(alloc, request);
+            errdefer enrichment_types.freeGeneratedRequest(alloc, request_clone);
+            const config_json = producer_cfg.config_json;
+            producer_cfg.config_json = "";
+            errdefer if (config_json.len > 0) alloc.free(@constCast(config_json));
+            const item_source_text = try alloc.dupe(u8, source_text.?);
+            errdefer alloc.free(item_source_text);
+            const item_source_parts_json = if (source_parts_json) |parts| try alloc.dupe(u8, parts) else null;
+            errdefer if (item_source_parts_json) |parts| alloc.free(parts);
+            const item_artifact_key = try alloc.dupe(u8, key);
+            errdefer alloc.free(item_artifact_key);
+            const item_state_key = try alloc.dupe(u8, state_key.?);
+            errdefer alloc.free(item_state_key);
+            const item_state_value = try alloc.dupe(u8, state_value.?);
+            errdefer alloc.free(item_state_value);
+            const item = PrecomputeAssetProducerBatchItem{
+                .request = request_clone,
+                .producer_type = producer_cfg.type,
+                .config_json = @constCast(config_json),
+                .source_text = item_source_text,
+                .source_parts_json = item_source_parts_json,
+                .artifact_key = item_artifact_key,
+                .state_key = item_state_key,
+                .state_value = item_state_value,
+            };
+            try appendPrecomputeAssetProducerBatchItem(alloc, db, items, item, artifact_writes, documents);
+            return;
+        }
+    }
+
     const value = if (producer_cfg.type == .copy) source_text.? else blk: {
         const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
         const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
@@ -17100,6 +17133,214 @@ fn computeAssetRequestDerived(
             .key = try alloc.dupe(u8, state_key.?),
             .value = try alloc.dupe(u8, state_value.?),
         });
+    }
+}
+
+const PrecomputeAssetProducerBatchItem = struct {
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    producer_type: asset_producer_mod.ProducerType,
+    config_json: []u8,
+    source_text: []u8,
+    source_parts_json: ?[]u8 = null,
+    artifact_key: []u8,
+    state_key: []u8,
+    state_value: []u8,
+
+    fn asRequest(self: *const @This()) asset_producer_mod.Request {
+        return .{
+            .producer_type = self.producer_type,
+            .config_json = self.config_json,
+            .source_text = self.source_text,
+            .source_parts_json = self.source_parts_json,
+            .content_type = self.request.content_type,
+        };
+    }
+};
+
+fn freePrecomputeAssetProducerBatchItem(alloc: Allocator, item: PrecomputeAssetProducerBatchItem) void {
+    enrichment_types.freeGeneratedRequest(alloc, item.request);
+    if (item.config_json.len > 0) alloc.free(item.config_json);
+    alloc.free(item.source_text);
+    if (item.source_parts_json) |parts| alloc.free(parts);
+    alloc.free(item.artifact_key);
+    alloc.free(item.state_key);
+    alloc.free(item.state_value);
+}
+
+fn clearPrecomputeAssetProducerBatchItems(
+    alloc: Allocator,
+    items: *std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
+) void {
+    for (items.items) |item| freePrecomputeAssetProducerBatchItem(alloc, item);
+    items.clearRetainingCapacity();
+}
+
+fn samePrecomputeAssetProducerBatchKey(lhs: PrecomputeAssetProducerBatchItem, rhs: PrecomputeAssetProducerBatchItem) bool {
+    return lhs.producer_type == rhs.producer_type and
+        std.mem.eql(u8, lhs.config_json, rhs.config_json) and
+        std.mem.eql(u8, lhs.request.content_type, rhs.request.content_type) and
+        std.mem.eql(u8, lhs.request.execution_json, rhs.request.execution_json);
+}
+
+fn addPrecomputeAssetProducerBytes(lhs: usize, rhs: usize) usize {
+    return std.math.add(usize, lhs, rhs) catch std.math.maxInt(usize);
+}
+
+fn precomputeAssetProducerBatchItemBytes(item: PrecomputeAssetProducerBatchItem) usize {
+    return addPrecomputeAssetProducerBytes(
+        addPrecomputeAssetProducerBytes(item.config_json.len, item.source_text.len),
+        if (item.source_parts_json) |parts| parts.len else 0,
+    );
+}
+
+fn precomputeAssetProducerBatchBytes(items: []const PrecomputeAssetProducerBatchItem) usize {
+    var total: usize = 0;
+    for (items) |item| total = addPrecomputeAssetProducerBytes(total, precomputeAssetProducerBatchItemBytes(item));
+    return total;
+}
+
+fn isRetryableAssetProducerError(err: anyerror) bool {
+    return switch (err) {
+        error.EmbedRateLimited,
+        error.EmbedTransientFailure,
+        error.ModelNotFound,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.Timeout,
+        error.NetworkUnreachable,
+        error.HostLacksNetworkAddresses,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.UnexpectedReadFailure,
+        error.SendFailed,
+        error.RecvFailed,
+        error.ResourceBudgetExceeded,
+        error.GenerateBatchTransientFailure,
+        => true,
+        else => false,
+    };
+}
+
+fn appendPrecomputeAssetProducerBatchItem(
+    alloc: Allocator,
+    db: *DB,
+    items: *std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
+    item: PrecomputeAssetProducerBatchItem,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
+    const policy = enrichment_types.parseExecutionPolicyJson(alloc, item.request.execution_json) catch enrichment_types.ExecutionPolicy{};
+    const max_items = @max(@as(usize, 1), policy.batch_items orelse 1);
+    const max_bytes = @max(@as(usize, 1), policy.batch_bytes orelse std.math.maxInt(usize));
+    if (items.items.len > 0) {
+        const current_bytes = precomputeAssetProducerBatchBytes(items.items);
+        const item_bytes = precomputeAssetProducerBatchItemBytes(item);
+        if (!samePrecomputeAssetProducerBatchKey(items.items[0], item) or
+            items.items.len >= max_items or
+            addPrecomputeAssetProducerBytes(current_bytes, item_bytes) > max_bytes)
+        {
+            try flushPrecomputeAssetProducerBatch(alloc, db, items, artifact_writes, documents);
+        }
+    }
+    try items.append(alloc, item);
+}
+
+fn applyPrecomputeAssetProducerOutput(
+    alloc: Allocator,
+    db: *DB,
+    item: PrecomputeAssetProducerBatchItem,
+    produced: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, item.artifact_key),
+        .value = try alloc.dupe(u8, produced),
+    });
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, item.state_key),
+        .value = try alloc.dupe(u8, item.state_value),
+    });
+
+    const artifact_name = requestArtifactName(item.request);
+    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, item.request.full_text_index);
+    defer {
+        for (text_indexes) |name| alloc.free(name);
+        alloc.free(text_indexes);
+    }
+    try appendInlineFullTextDocument(alloc, documents, item.artifact_key, produced, text_indexes);
+}
+
+fn flushPrecomputeAssetProducerBatchSequential(
+    alloc: Allocator,
+    producer: asset_producer_mod.Producer,
+    items: []const PrecomputeAssetProducerBatchItem,
+    db: *DB,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
+    for (items) |item| {
+        const produced = producer.produce(alloc, item.asRequest()) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (isRetryableAssetProducerError(err)) return err;
+            continue;
+        };
+        defer alloc.free(produced);
+        applyPrecomputeAssetProducerOutput(alloc, db, item, produced, artifact_writes, documents) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (isRetryableAssetProducerError(err)) return err;
+            continue;
+        };
+    }
+}
+
+fn flushPrecomputeAssetProducerBatch(
+    alloc: Allocator,
+    db: *DB,
+    items: *std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
+    if (items.items.len == 0) return;
+    defer clearPrecomputeAssetProducerBatchItems(alloc, items);
+
+    const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
+    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const requests = try alloc.alloc(asset_producer_mod.Request, items.items.len);
+    defer alloc.free(requests);
+    for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+
+    var produced = producer.produceBatch(alloc, requests) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        if (isRetryableAssetProducerError(err)) return err;
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+    };
+    if (produced.len != items.items.len) {
+        for (produced) |output| {
+            if (output.len > 0) alloc.free(output);
+        }
+        alloc.free(produced);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+    }
+
+    defer alloc.free(produced);
+    errdefer {
+        for (produced) |output| {
+            if (output.len > 0) alloc.free(output);
+        }
+    }
+
+    for (items.items, produced, 0..) |item, output, idx| {
+        applyPrecomputeAssetProducerOutput(alloc, db, item, output, artifact_writes, documents) catch |err| {
+            alloc.free(output);
+            produced[idx] = "";
+            if (err == error.OutOfMemory) return err;
+            if (isRetryableAssetProducerError(err)) return err;
+            continue;
+        };
+        alloc.free(output);
+        produced[idx] = "";
     }
 }
 
@@ -20439,6 +20680,11 @@ fn prepareGeneratedEnrichments(
         for (planned.items) |request| enrichment_types.freeGeneratedRef(self.alloc, request);
         planned.deinit(self.alloc);
     }
+    var deferred_asset_producer_items = std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem).empty;
+    defer {
+        clearPrecomputeAssetProducerBatchItems(self.alloc, &deferred_asset_producer_items);
+        deferred_asset_producer_items.deinit(self.alloc);
+    }
 
     for (req.writes, 0..) |write, i| {
         const cleaned = extracted[i].cleaned_value orelse continue;
@@ -20505,6 +20751,7 @@ fn prepareGeneratedEnrichments(
                     &documents,
                     &dense_embeddings,
                     &sparse_embeddings,
+                    &deferred_asset_producer_items,
                     containsName(force_generated_artifact_names, requestArtifactName(request)),
                 ),
                 .chunk_text => try computeChunkRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
@@ -20519,6 +20766,8 @@ fn prepareGeneratedEnrichments(
             }
         }
     }
+
+    try flushPrecomputeAssetProducerBatch(self.alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents);
 
     return .{
         .artifact_writes = try artifact_writes.toOwnedSlice(self.alloc),

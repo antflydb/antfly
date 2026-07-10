@@ -225,8 +225,8 @@ class EmbeddingsIndexConfig:
             top_k (int | Unset): Default number of results to return from search (sparse only) Default: 10.
             min_weight (float | Unset): Minimum weight threshold for sparse vector entries (sparse only) Default: 0.0.
             chunk_size (int | Unset): Number of documents per posting list chunk (sparse only) Default: 1024.
-            execution (IndexExecutionConfig | Unset): Namespaced execution policy for index shorthand. Index configs can
-                drive multiple operations, so each operation receives its own policy.
+            execution (IndexExecutionConfig | Unset): Namespaced execution policy for managed index shorthand. Only
+                namespaces with runtime effects are accepted.
     """
 
     external: bool | Unset = False

@@ -1052,7 +1052,7 @@ pub const Node = struct {
         const batch_byte_cap = readBatchMaxBytes();
         var batch_bytes: usize = 0;
         for (request.images, 0..) |image_url, i| {
-            var item = try downloadRemoteContent(self, allocator, image_url);
+            var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes);
             errdefer item.deinit(allocator);
             batch_bytes = try addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap);
             downloaded[i] = item;
@@ -4757,11 +4757,18 @@ pub const Node = struct {
         const batch_byte_cap = readBatchMaxBytes();
         var batch_bytes: usize = 0;
         for (body.images, 0..) |img_url, i| {
-            var item = downloadRemoteContent(self, ctx.allocator, img_url.url) catch
-                return ctx.status(400).json(.{
+            var item = downloadReadBatchContent(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
+                error.ReadBatchTooLarge,
+                error.StreamTooLong,
+                => return ctx.status(413).json(.{
+                    .@"error" = "BATCH_TOO_LARGE",
+                    .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
+                }),
+                else => return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "failed to download image content",
-                });
+                }),
+            };
             errdefer item.deinit(ctx.allocator);
             batch_bytes = addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap) catch |err| switch (err) {
                 error.ReadBatchTooLarge => return ctx.status(413).json(.{
@@ -8375,6 +8382,25 @@ fn downloadRemoteContent(self: *const Node, alloc: std.mem.Allocator, url: []con
     const security = if (self.config.content_security) |*cfg| cfg else null;
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
     return try scraping.downloadContentAlloc(alloc, url, security, s3_credentials);
+}
+
+fn downloadReadBatchContent(
+    self: *const Node,
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    current_bytes: usize,
+) !scraping.DownloadedContent {
+    if (current_bytes >= max_bytes) return error.ReadBatchTooLarge;
+    const remaining = max_bytes - current_bytes;
+    var bounded_security = if (self.config.content_security) |cfg| cfg else scraping.ContentSecurityConfig{};
+    const remaining_u64: u64 = @intCast(remaining);
+    bounded_security.max_download_size_bytes = if (bounded_security.max_download_size_bytes) |configured|
+        @min(configured, remaining_u64)
+    else
+        remaining_u64;
+    const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
+    return try scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials);
 }
 
 fn readBatchMaxBytes() usize {

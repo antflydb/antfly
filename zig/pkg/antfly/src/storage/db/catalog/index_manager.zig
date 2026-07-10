@@ -13517,23 +13517,9 @@ fn validateIndexExecutionConfigValue(execution: std.json.Value) !void {
     }
 }
 
-fn validateGraphIndexExecutionConfigValue(execution: std.json.Value) !void {
-    if (execution != .object) return error.InvalidIndexConfig;
-    var iter = execution.object.iterator();
-    while (iter.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "indexing")) return error.InvalidIndexConfig;
-        _ = enrichment_types.parseExecutionPolicyValue(entry.value_ptr.*) catch return error.InvalidIndexConfig;
-    }
-}
-
 fn isIndexExecutionNamespace(name: []const u8) bool {
-    return std.mem.eql(u8, name, "indexing") or
-        std.mem.eql(u8, name, "chunking") or
-        std.mem.eql(u8, name, "embedding") or
-        std.mem.eql(u8, name, "extracting") or
-        std.mem.eql(u8, name, "reading") or
-        std.mem.eql(u8, name, "generating") or
-        std.mem.eql(u8, name, "transcribing");
+    return std.mem.eql(u8, name, "chunking") or
+        std.mem.eql(u8, name, "embedding");
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
@@ -14193,7 +14179,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
-    if (root.object.get("execution")) |execution| try validateGraphIndexExecutionConfigValue(execution);
+    if (root.object.get("execution") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
     var artifact_source = try parseGraphArtifactSource(alloc, root);
     errdefer if (artifact_source) |*source| {
@@ -14503,8 +14489,7 @@ test "graph config parses artifact source and shorthand asset enrichment" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}},
-        \\  "execution":{"indexing":{"batch_items":4096}}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
         \\}
     );
     defer cfg.deinit(alloc);
@@ -14526,7 +14511,7 @@ test "graph config parses artifact source and shorthand asset enrichment" {
 test "graph config rejects invalid execution policy" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"execution":{"indexing":{"batch_items":0}}}
+        \\{"execution":{"indexing":{"batch_items":8}}}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"execution":{"extracting":{"batch_items":8}}}
@@ -14538,15 +14523,13 @@ test "graph shorthand asset uses artifact execution only" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "source":{"kind":"artifact","artifact":"pages_v1","path":"$.pages[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"pages_v1","kind":"asset","field":"image","producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}},
-        \\  "execution":{"indexing":{"batch_items":9}}
+        \\  "artifact":{"name":"pages_v1","kind":"asset","field":"image","producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
         \\}
     );
     defer cfg.deinit(alloc);
 
     try std.testing.expect(cfg.shorthand_asset != null);
     try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":9") == null);
 }
 
 test "graph config parses artifact mapping templates and context fields" {
@@ -16545,7 +16528,7 @@ test "parseDenseGeneratorConfig promotes chunker full text flag" {
 test "parseDenseGeneratorConfig preserves execution namespaces" {
     const alloc = std.testing.allocator;
     const json =
-        \\{"field":"embedding","dims":384,"execution":{"indexing":{"batch_items":1024},"chunking":{"batch_items":4},"embedding":{"batch_items":8,"batch_bytes":65536}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+        \\{"field":"embedding","dims":384,"execution":{"chunking":{"batch_items":4},"embedding":{"batch_items":8,"batch_bytes":65536}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
     ;
     const generator = try parseDenseGeneratorConfig(alloc, json) orelse return error.TestUnexpectedResult;
     defer generator.deinit(alloc);
@@ -16559,9 +16542,14 @@ test "parseDenseGeneratorConfig preserves execution namespaces" {
 test "parseDenseGeneratorConfig rejects invalid execution policy" {
     const alloc = std.testing.allocator;
     const invalid_value =
-        \\{"field":"embedding","dims":384,"execution":{"indexing":{"batch_items":0}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+        \\{"field":"embedding","dims":384,"execution":{"embedding":{"batch_items":0}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
     ;
     try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, invalid_value));
+
+    const unsupported_namespace =
+        \\{"field":"embedding","dims":384,"execution":{"indexing":{"batch_items":8}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, unsupported_namespace));
 
     const unknown_namespace =
         \\{"field":"embedding","dims":384,"execution":{"embeddings":{"batch_items":8}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}

@@ -192,7 +192,6 @@ pub const GeoShapeQuery = types.GeoShapeQuery;
 pub const GoogleEmbedderConfig = types.GoogleEmbedderConfig;
 pub const GoogleGeneratorConfig = types.GoogleGeneratorConfig;
 pub const GraphIndexConfig = types.GraphIndexConfig;
-pub const GraphIndexExecutionConfig = types.GraphIndexExecutionConfig;
 pub const GraphIndexStats = types.GraphIndexStats;
 pub const GraphNodeSelector = types.GraphNodeSelector;
 pub const GraphQuery = types.GraphQuery;

@@ -16,39 +16,19 @@ T = TypeVar("T", bound="IndexExecutionConfig")
 
 @_attrs_define
 class IndexExecutionConfig:
-    """Namespaced execution policy for index shorthand. Index configs can drive multiple operations, so each operation
-    receives its own policy.
+    """Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted.
 
-        Attributes:
-            indexing (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
-            chunking (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
-            embedding (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
-            extracting (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
-            reading (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
-            generating (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
-            transcribing (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-                operation. These fields tune how work is batched and do not change generated artifact identity.
+    Attributes:
+        chunking (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
+            operation. These fields tune how work is batched and do not change generated artifact identity.
+        embedding (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
+            operation. These fields tune how work is batched and do not change generated artifact identity.
     """
 
-    indexing: ExecutionPolicy | Unset = UNSET
     chunking: ExecutionPolicy | Unset = UNSET
     embedding: ExecutionPolicy | Unset = UNSET
-    extracting: ExecutionPolicy | Unset = UNSET
-    reading: ExecutionPolicy | Unset = UNSET
-    generating: ExecutionPolicy | Unset = UNSET
-    transcribing: ExecutionPolicy | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        indexing: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.indexing, Unset):
-            indexing = self.indexing.to_dict()
-
         chunking: dict[str, Any] | Unset = UNSET
         if not isinstance(self.chunking, Unset):
             chunking = self.chunking.to_dict()
@@ -57,39 +37,13 @@ class IndexExecutionConfig:
         if not isinstance(self.embedding, Unset):
             embedding = self.embedding.to_dict()
 
-        extracting: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.extracting, Unset):
-            extracting = self.extracting.to_dict()
-
-        reading: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.reading, Unset):
-            reading = self.reading.to_dict()
-
-        generating: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.generating, Unset):
-            generating = self.generating.to_dict()
-
-        transcribing: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.transcribing, Unset):
-            transcribing = self.transcribing.to_dict()
-
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
-        if indexing is not UNSET:
-            field_dict["indexing"] = indexing
         if chunking is not UNSET:
             field_dict["chunking"] = chunking
         if embedding is not UNSET:
             field_dict["embedding"] = embedding
-        if extracting is not UNSET:
-            field_dict["extracting"] = extracting
-        if reading is not UNSET:
-            field_dict["reading"] = reading
-        if generating is not UNSET:
-            field_dict["generating"] = generating
-        if transcribing is not UNSET:
-            field_dict["transcribing"] = transcribing
 
         return field_dict
 
@@ -98,13 +52,6 @@ class IndexExecutionConfig:
         from ..models.execution_policy import ExecutionPolicy
 
         d = dict(src_dict)
-        _indexing = d.pop("indexing", UNSET)
-        indexing: ExecutionPolicy | Unset
-        if isinstance(_indexing, Unset):
-            indexing = UNSET
-        else:
-            indexing = ExecutionPolicy.from_dict(_indexing)
-
         _chunking = d.pop("chunking", UNSET)
         chunking: ExecutionPolicy | Unset
         if isinstance(_chunking, Unset):
@@ -119,42 +66,9 @@ class IndexExecutionConfig:
         else:
             embedding = ExecutionPolicy.from_dict(_embedding)
 
-        _extracting = d.pop("extracting", UNSET)
-        extracting: ExecutionPolicy | Unset
-        if isinstance(_extracting, Unset):
-            extracting = UNSET
-        else:
-            extracting = ExecutionPolicy.from_dict(_extracting)
-
-        _reading = d.pop("reading", UNSET)
-        reading: ExecutionPolicy | Unset
-        if isinstance(_reading, Unset):
-            reading = UNSET
-        else:
-            reading = ExecutionPolicy.from_dict(_reading)
-
-        _generating = d.pop("generating", UNSET)
-        generating: ExecutionPolicy | Unset
-        if isinstance(_generating, Unset):
-            generating = UNSET
-        else:
-            generating = ExecutionPolicy.from_dict(_generating)
-
-        _transcribing = d.pop("transcribing", UNSET)
-        transcribing: ExecutionPolicy | Unset
-        if isinstance(_transcribing, Unset):
-            transcribing = UNSET
-        else:
-            transcribing = ExecutionPolicy.from_dict(_transcribing)
-
         index_execution_config = cls(
-            indexing=indexing,
             chunking=chunking,
             embedding=embedding,
-            extracting=extracting,
-            reading=reading,
-            generating=generating,
-            transcribing=transcribing,
         )
 
         return index_execution_config

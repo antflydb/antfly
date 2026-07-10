@@ -15360,30 +15360,15 @@ components:
     IndexExecutionConfig:
       type: object
       additionalProperties: false
-      description: Namespaced execution policy for index shorthand. Index configs can drive multiple operations,
-        so each operation receives its own policy.
+      description: Namespaced execution policy for managed index shorthand. Only namespaces with runtime
+        effects are accepted.
       properties:
-        indexing:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Index maintenance, backfill, replay, or materialization batching.
         chunking:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Chunk producer batching for shorthand-created chunk enrichments.
         embedding:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Embedding producer batching for shorthand-created embedding enrichments.
-        extracting:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Extraction producer batching for shorthand-created asset enrichments.
-        reading:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Reader producer batching for shorthand-created asset enrichments.
-        generating:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Generator producer batching for shorthand-created asset enrichments.
-        transcribing:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Transcriber producer batching for shorthand-created asset enrichments.
     EmbeddingsIndexConfig:
       type: object
       description: Unified configuration for embeddings indexes. When sparse is true, creates a sparse
@@ -15469,8 +15454,7 @@ components:
           description: Number of documents per posting list chunk (sparse only)
         execution:
           $ref: '#/components/schemas/IndexExecutionConfig'
-          description: Non-semantic execution policy for index maintenance and any shorthand-created chunking
-            or embedding producers.
+          description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
     EdgeTypeConfig:
       type: object
       description: Configuration for a specific edge type
@@ -15524,15 +15508,6 @@ components:
             type: string
       required:
         - name
-    GraphIndexExecutionConfig:
-      type: object
-      additionalProperties: false
-      description: Execution policy for graph index work. Artifact producer batching belongs on graph
-        artifact.execution.
-      properties:
-        indexing:
-          $ref: '#/components/schemas/ExecutionPolicy'
-          description: Graph edge materialization, backfill, replay, or maintenance batching.
     GraphIndexConfig:
       type: object
       description: Configuration for graph index type
@@ -15563,10 +15538,6 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           description: Maximum number of edges per document (0 = unlimited)
-        execution:
-          $ref: '#/components/schemas/GraphIndexExecutionConfig'
-          description: Non-semantic execution policy for graph edge materialization. Shorthand artifact
-            producer batching belongs on artifact.execution.
     AlgebraicIndexConfig:
       type: object
       description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema
@@ -19691,6 +19662,8 @@ components:
           example: microsoft/trocr-base-printed
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: '#/components/schemas/InferenceImageURL'
           description: >
