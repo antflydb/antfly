@@ -2810,6 +2810,7 @@ pub const DB = struct {
     nonvisible_doc_set_cache_generation: ?u64 = null,
     nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
     nonvisible_doc_set_cache_overflow: bool = false,
+    nonvisible_doc_set_cache_entries: AtomicU64 = AtomicU64.init(0),
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},
@@ -3664,6 +3665,7 @@ pub const DB = struct {
         self.nonvisible_doc_set_cache_set = null;
         self.nonvisible_doc_set_cache_generation = null;
         self.nonvisible_doc_set_cache_overflow = false;
+        self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
@@ -12533,8 +12535,7 @@ pub const DB = struct {
     }
 
     fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
-        const cache_entries: u64 = if (self.nonvisible_doc_set_cache_set != null and !self.nonvisible_doc_set_cache_overflow) 1 else 0;
-        return self.visibility_runtime_stats.snapshot(cache_entries);
+        return self.visibility_runtime_stats.snapshot(self.nonvisible_doc_set_cache_entries.load(.monotonic));
     }
 
     const DocIdentityCoverage = struct {
@@ -14274,6 +14275,7 @@ pub const DB = struct {
             self.nonvisible_doc_set_cache_set = null;
             self.nonvisible_doc_set_cache_generation = gen;
             self.nonvisible_doc_set_cache_overflow = true;
+            self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
             return null;
         };
         self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
@@ -14285,6 +14287,7 @@ pub const DB = struct {
             self.nonvisible_doc_set_cache_set = cloned;
             self.nonvisible_doc_set_cache_generation = gen;
             self.nonvisible_doc_set_cache_overflow = false;
+            self.nonvisible_doc_set_cache_entries.store(1, .monotonic);
         } else |_| {
             // Caching is best-effort; the computed set is still returned.
         }
