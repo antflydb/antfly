@@ -82,11 +82,29 @@ pub const Producer = struct {
 
     pub const VTable = struct {
         produce: *const fn (ptr: *anyopaque, alloc: Allocator, request: Request) anyerror![]u8,
+        produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
     };
 
     pub fn produce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
         return try self.vtable.produce(self.ptr, alloc, request);
+    }
+
+    pub fn produceBatch(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
+        if (self.vtable.produce_batch) |produce_batch| return try produce_batch(self.ptr, alloc, requests);
+
+        const out = try alloc.alloc([]u8, requests.len);
+        errdefer {
+            for (out) |item| {
+                if (item.len > 0) alloc.free(item);
+            }
+            alloc.free(out);
+        }
+        for (out) |*item| item.* = "";
+        for (requests, 0..) |request, i| {
+            out[i] = try self.produce(alloc, request);
+        }
+        return out;
     }
 
     pub fn deinit(self: Producer, alloc: Allocator) void {

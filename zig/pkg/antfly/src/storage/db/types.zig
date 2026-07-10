@@ -282,6 +282,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         return .{
@@ -297,6 +298,7 @@ pub const EnrichmentConfig = struct {
             .full_text_index = cfg.full_text_index,
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
             .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+            .execution = cfg.execution,
         };
     }
 
@@ -310,6 +312,11 @@ pub const EnrichmentConfig = struct {
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
         self.* = undefined;
     }
+};
+
+pub const EnrichmentExecutionConfig = struct {
+    batch_items: ?u32 = null,
+    batch_bytes: ?u64 = null,
 };
 
 pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {

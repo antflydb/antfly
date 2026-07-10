@@ -37,6 +37,7 @@ pub const RetryConfig = lib.RetryConfig;
 pub const ChainCondition = lib.ChainCondition;
 pub const ChainLink = lib.ChainLink;
 pub const GeneratorFactory = lib.GeneratorFactory;
+pub const default_max_tokens = lib.default_max_tokens;
 pub const parseConfigFromSlice = lib.parseConfigFromSlice;
 
 pub const BackendFactory = struct {
@@ -193,6 +194,7 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .remote_antfly => |*provider| blk: {
@@ -204,14 +206,17 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .vertex => |*provider| blk: {
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .gemini => |*provider| blk: {
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {

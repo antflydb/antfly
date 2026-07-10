@@ -338,11 +338,17 @@ pub const SlotStore = struct {
 
         for (mark_reseed.items) |name| try self.markReseedRequired(name);
 
-        if (active == 0 or oldest == primary_lsn + 1) oldest = primary_lsn + 1;
+        const retained_lsn_count: u64 = if (active == 0 or oldest == primary_lsn + 1) blk: {
+            oldest = primary_lsn;
+            break :blk 0;
+        } else if (oldest < primary_lsn)
+            primary_lsn - oldest
+        else
+            1;
         return .{
             .primary_lsn = primary_lsn,
             .oldest_restart_lsn = oldest,
-            .retained_lsn_count = if (oldest <= primary_lsn) primary_lsn - oldest + 1 else 0,
+            .retained_lsn_count = retained_lsn_count,
             .active_slots = active,
             .reseed_recommended = reseed,
         };
@@ -799,7 +805,7 @@ test "storage.ha slot store computes retention floor from active slots" {
 
     const snapshot = try store.retentionSnapshot(10, .{});
     try std.testing.expectEqual(@as(u64, 4), snapshot.oldest_restart_lsn);
-    try std.testing.expectEqual(@as(u64, 7), snapshot.retained_lsn_count);
+    try std.testing.expectEqual(@as(u64, 6), snapshot.retained_lsn_count);
     try std.testing.expectEqual(@as(usize, 2), snapshot.active_slots);
     try std.testing.expectEqual(@as(usize, 0), snapshot.reseed_recommended);
 }
@@ -872,7 +878,7 @@ test "storage.ha slot store drops slots and releases retention" {
     try store.drop("a");
     try std.testing.expectEqual(@as(usize, 0), store.count());
     const snapshot = try store.retentionSnapshot(10, .{});
-    try std.testing.expectEqual(@as(u64, 11), snapshot.oldest_restart_lsn);
+    try std.testing.expectEqual(@as(u64, 10), snapshot.oldest_restart_lsn);
     try std.testing.expectEqual(@as(u64, 0), snapshot.retained_lsn_count);
 }
 
@@ -929,7 +935,7 @@ test "storage.ha slot store allows backup pin ahead of standby progress" {
 
     const snapshot = try store.retentionSnapshot(12, .{});
     try std.testing.expectEqual(@as(u64, 10), snapshot.oldest_restart_lsn);
-    try std.testing.expectEqual(@as(u64, 3), snapshot.retained_lsn_count);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.retained_lsn_count);
     const slot = store.get("standby-seeding") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 9), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 9), slot.applied_lsn);

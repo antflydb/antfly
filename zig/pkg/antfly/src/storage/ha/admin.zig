@@ -312,7 +312,13 @@ pub fn markFormerPrimaryForReseed(
     assessment: rejoin.Assessment,
 ) !rejoin.ReseedResult {
     if (assessment.action != .reseed) return error.RejoinReseedNotAllowed;
-    try primary.markSlotReseedRequired(assessment.former_node_id);
+    primary.markSlotReseedRequired(assessment.former_node_id) catch |err| switch (err) {
+        error.SlotNotFound => {
+            try primary.createSlot(assessment.former_node_id, primary.lastLsn());
+            try primary.markSlotReseedRequired(assessment.former_node_id);
+        },
+        else => return err,
+    };
     return .{
         .node_id = assessment.former_node_id,
         .slot_name = assessment.former_node_id,

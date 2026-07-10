@@ -1982,6 +1982,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/generate/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate text for a synchronous batch of requests
+         * @description Runs multiple non-streaming generation requests as one synchronous batch.
+         *     Compatible native requests for the same model are executed through the
+         *     native batched KV decoder; unsupported per-item options are returned as
+         *     per-item errors without failing sibling requests.
+         *
+         *     This endpoint implements the synchronous form only. Future async durable
+         *     batching will use the same request item shape with `mode: async`.
+         */
+        post: operations["generateBatchContent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/chat/completions": {
         parameters: {
             query?: never;
@@ -7220,6 +7246,16 @@ export interface components {
          * @enum {string}
          */
         EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
+        ExecutionPolicy: {
+            /** @description Maximum items to process in one batch for this operation. */
+            batch_items?: number;
+            /**
+             * Format: uint64
+             * @description Approximate maximum source bytes to process in one batch for this operation.
+             */
+            batch_bytes?: number;
+        };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
             /** @description Stable generated artifact name. */
@@ -7248,6 +7284,8 @@ export interface components {
             content_type?: string;
             /** @description Serialized asset producer configuration. */
             producer_json?: string;
+            /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
+            execution?: components["schemas"]["ExecutionPolicy"];
         };
         FullTextIndexConfig: {
             /** @description Whether to use memory-only storage */
@@ -8151,6 +8189,13 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
+        IndexExecutionConfig: {
+            /** @description Chunk producer batching for shorthand-created chunk enrichments. */
+            chunking?: components["schemas"]["ExecutionPolicy"];
+            /** @description Embedding producer batching for shorthand-created embedding enrichments. */
+            embedding?: components["schemas"]["ExecutionPolicy"];
+        };
         /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
             /**
@@ -8201,6 +8246,8 @@ export interface components {
              * @default 1024
              */
             chunk_size?: number;
+            /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
+            execution?: components["schemas"]["IndexExecutionConfig"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -11240,6 +11287,44 @@ export interface components {
             /** @description List of completion choices (currently always 1) */
             choices: components["schemas"]["InferenceGenerateChoice"][];
             usage: components["schemas"]["InferenceGenerateUsage"];
+        };
+        /**
+         * @description Batch execution mode. Only synchronous batches are implemented.
+         * @enum {string}
+         */
+        InferenceGenerateBatchMode: "sync";
+        InferenceGenerateBatchRequest: {
+            mode?: components["schemas"]["InferenceGenerateBatchMode"];
+            requests: components["schemas"]["InferenceGenerateBatchRequestItem"][];
+        };
+        InferenceGenerateBatchRequestItem: {
+            /** @description Caller-supplied identifier echoed in the result item. */
+            custom_id: string;
+            body: components["schemas"]["InferenceGenerateRequest"];
+        };
+        InferenceGenerateBatchError: {
+            code: string;
+            message: string;
+            /** @default false */
+            retryable?: boolean;
+        };
+        InferenceGenerateBatchResultItem: {
+            custom_id: string;
+            /** @description Zero-based request index from the submitted batch. */
+            index: number;
+            response?: components["schemas"]["InferenceGenerateResponse"];
+            error?: components["schemas"]["InferenceGenerateBatchError"];
+        };
+        InferenceGenerateBatchSummary: {
+            total: number;
+            succeeded: number;
+            failed: number;
+        };
+        InferenceGenerateBatchResponse: {
+            /** @enum {string} */
+            object: "generate.batch";
+            data: components["schemas"]["InferenceGenerateBatchResultItem"][];
+            summary: components["schemas"]["InferenceGenerateBatchSummary"];
         };
         InferenceGenerateChoice: {
             /** @description Index of this choice in the list */
@@ -15483,6 +15568,57 @@ export interface operations {
                 };
             };
             /** @description Generation service unavailable (no models configured) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    generateBatchContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceGenerateBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Batch generation results in request order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceGenerateBatchResponse"];
+                };
+            };
+            /** @description Invalid batch envelope */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

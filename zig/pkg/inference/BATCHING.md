@@ -92,18 +92,90 @@ When `error_policy` is `per_item`, malformed content parts, failed media fetches
 
 This keeps the fast path fast while giving ingestion callers a way to isolate poisoned media without forcing DB batch rollback.
 
-## Future batch wrapper
+## Synchronous generation batch endpoint
 
-OCR/read, transcription, extraction, and generative LLM calls should use the same envelope-vs-item distinction, but they should not overload every native response shape independently. A future generic synchronous batch wrapper can route multiple independent endpoint requests:
+Generative LLM batching should start with a synchronous `/generate/batch`
+endpoint for artifact workers and enrichment pipelines. This endpoint batches
+independent generation requests for throughput, but it is still an online call:
+the client keeps the connection open and receives per-item results for that
+submitted batch.
+
+The single-request `/generate` endpoint should stay a normal one-request API.
+Batch transport belongs on `/generate/batch` so clients can rely on a stable
+response shape and so streaming, retries, and per-item failures are explicit.
+
+For JSON requests, the body is an envelope with an optional `mode`. The initial
+implementation only supports `sync`; `async` is reserved for future durable
+batch jobs. The synchronous envelope is capped at 128 items; larger jobs should
+be split by the client today and should move to durable async batches when that
+mode is implemented:
 
 ```json
 {
-  "endpoint": "/read",
+  "mode": "sync",
   "requests": [
-    {"custom_id": "doc-a", "body": {"model": "reader", "input": "..."}},
-    {"custom_id": "doc-b", "body": {"model": "reader", "input": "..."}}
+    {
+      "custom_id": "doc-a",
+      "body": {"model": "qwen", "messages": [{"role": "user", "content": "Summarize A"}]}
+    },
+    {
+      "custom_id": "doc-b",
+      "body": {"model": "qwen", "messages": [{"role": "user", "content": "Summarize B"}]}
+    }
   ]
 }
 ```
 
-Each item would return `custom_id`, `status`, and either `response` or `error`. That mirrors OpenAI/Gemini-style batch semantics and can later be backed by an async JSONL job API without changing the per-item result model.
+The JSON response returns one item per request. Results are matched by
+`custom_id` and `index`, not response order:
+
+```json
+{
+  "object": "generate.batch",
+  "data": [
+    {"custom_id": "doc-a", "index": 0, "response": {"object": "chat.completion", "choices": [{"message": {"content": "..."}}]}, "error": null},
+    {"custom_id": "doc-b", "index": 1, "response": null, "error": {"code": "INFERENCE_FAILED", "message": "...", "retryable": true}}
+  ],
+  "summary": {"total": 2, "succeeded": 1, "failed": 1}
+}
+```
+
+The initial implementation exposes the JSON envelope only. A future
+`application/x-ndjson` transport should imply synchronous streaming batch mode.
+The request body would be one JSON object per line, each equivalent to one
+entry in the JSON `requests` array:
+
+```jsonl
+{"custom_id":"doc-a","body":{"model":"qwen","messages":[{"role":"user","content":"Summarize A"}]}}
+{"custom_id":"doc-b","body":{"model":"qwen","messages":[{"role":"user","content":"Summarize B"}]}}
+```
+
+The response content type would also be `application/x-ndjson`, with each
+output line as a completed item:
+
+```jsonl
+{"custom_id":"doc-a","index":0,"response":{"text":"..."},"error":null}
+{"custom_id":"doc-b","index":1,"response":null,"error":{"code":"INFERENCE_FAILED","message":"...","retryable":true}}
+```
+
+Envelope failures remain HTTP failures: malformed JSON/NDJSON, unknown model,
+unsupported `mode`, oversized envelope, or invalid request options that prevent
+the batch from starting. Per-item failures are encoded in item results.
+
+Future durable async batching should reuse the same per-item result model but
+use a separate job lifecycle: `mode: "async"` on a JSON `/generate/batch`
+request, an `input_file_id` or object-store reference, a returned batch/job ID,
+status polling, and output/error files. NDJSON uploads should not imply async;
+large streamed uploads belong in a file API or object-store upload path before
+creating the durable job.
+
+## Reader/OCR batching
+
+The `/read` endpoint accepts multiple images and routes them through a reader-level batch API instead of invoking the model once per image. The public HTTP request is capped at 64 images and an aggregate downloaded-input byte cap (`ANTFLY_INFERENCE_READ_BATCH_BYTES`, default 256 MiB) so callers cannot monopolize memory before model-level budgeting runs. The reader abstraction has two layers:
+
+- `LoadedReader.readBatch`: the stable reader contract used by the server and local direct calls.
+- Model-family implementations: native Florence can use a real batch fast path; VLM, GenAI, Pix2Struct, and multistage OCR may keep the serial fallback until their runtimes expose safe batch execution.
+
+Native Florence batching is throughput-oriented. A request batch is chunked by `ANTFLY_INFERENCE_READ_BATCH_SIZE` (default 8, clamped to 1..64), preprocessed into `[batch, 3, H, W]`, then run through the Florence encoder once for the chunk. CUDA and Metal use the incremental decoder KV cache in batch mode when available: self-attention keys/values are appended per row, cross-attention keys/values are precomputed for the whole encoder batch, and the LM head is applied over `[batch, hidden]` at each generated position. Metal exposes the generic eager backend hooks needed by the preallocated KV slab path (`allocUninitF32Shape`, `copyRows2D`, and device-backed row concat/slice) and has a batched device `attention_f32` entry that dispatches all `batch * q_len * heads` rows in one Metal command. The reader pipeline does not need a Florence-specific Metal API. Rows that emit EOS stop contributing new text tokens while the rest of the batch continues. If the batched KV path is unsupported by a backend shape or operator, native Florence falls back to the full batched decoder path; non-native and unsupported reader families keep the serial fallback behind the same `LoadedReader.readBatch` contract.
+
+The current `/read` HTTP response remains all-or-error at the envelope level, matching the existing API behavior. The future generic batch wrapper above should add per-item errors for bad image bytes, media fetch failures, and per-row inference failures without changing the `/read` response schema.
