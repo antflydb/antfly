@@ -1795,6 +1795,11 @@ pub const DocIdentityStats = struct {
     state_rows: u64 = 0,
     live_ordinals: u64 = 0,
     tombstone_ordinals: u64 = 0,
+    visibility_chunk_size: u32 = 0,
+    visibility_chunks: u64 = 0,
+    visibility_deleted_ordinals: u64 = 0,
+    visibility_mask_bytes: u64 = 0,
+    visibility_repair_count: u64 = 0,
     min_created_generation: u64 = 0,
     max_created_generation: u64 = 0,
     min_deleted_generation: u64 = 0,
@@ -1822,6 +1827,16 @@ pub const DocSetPlanningStats = struct {
     stale_identity_generation_rejection_count: u64 = 0,
 };
 
+pub const VisibilityStats = struct {
+    cache_entries: u64 = 0,
+    cache_hits_total: u64 = 0,
+    cache_misses_total: u64 = 0,
+    mask_build_ns_total: u64 = 0,
+    mask_builds_total: u64 = 0,
+    full_scan_fallbacks_total: u64 = 0,
+    overflow_total: u64 = 0,
+};
+
 pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
@@ -1832,6 +1847,7 @@ pub const DBStats = struct {
     repair_issue_count_estimated: bool = false,
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
+    visibility: VisibilityStats = .{},
     enrichment: EnrichmentStats = .{},
     resolution: ReplayStageStats = .{},
     promotion: ReplayStageStats = .{},

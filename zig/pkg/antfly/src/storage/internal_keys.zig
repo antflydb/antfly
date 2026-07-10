@@ -53,9 +53,12 @@ pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
 pub const identity_canonical_to_ordinal_kind: u8 = 0x04;
+pub const identity_visibility_chunk_kind: u8 = 0x05;
+pub const identity_visibility_deleted_chunk_kind: u8 = 0x06;
 pub const identity_namespace_key = [_]u8{ identity_namespace, 0xff, 0x00 };
 pub const identity_next_ordinal_key = [_]u8{ identity_namespace, 0xff, 0x01 };
 pub const identity_visibility_summary_key = [_]u8{ identity_namespace, 0xff, 0x02 };
+pub const identity_visibility_manifest_key = [_]u8{ identity_namespace, 0xff, 0x03 };
 
 pub fn isInternalMetadataKey(key: []const u8) bool {
     if (key.len == 0) return false;
@@ -64,6 +67,34 @@ pub fn isInternalMetadataKey(key: []const u8) bool {
 
 pub fn isInternalUserKey(key: []const u8) bool {
     return key.len > 0 and key[0] == user_namespace;
+}
+
+pub fn identityVisibilityChunkKey(chunk_id: u32) [6]u8 {
+    var key: [6]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_visibility_chunk_kind;
+    std.mem.writeInt(u32, key[2..6], chunk_id, .big);
+    return key;
+}
+
+pub fn parseIdentityVisibilityChunkKey(key: []const u8) ?u32 {
+    if (key.len != 6) return null;
+    if (key[0] != identity_namespace or key[1] != identity_visibility_chunk_kind) return null;
+    return std.mem.readInt(u32, key[2..6], .big);
+}
+
+pub fn identityVisibilityDeletedChunkKey(chunk_id: u32) [6]u8 {
+    var key: [6]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_visibility_deleted_chunk_kind;
+    std.mem.writeInt(u32, key[2..6], chunk_id, .big);
+    return key;
+}
+
+pub fn parseIdentityVisibilityDeletedChunkKey(key: []const u8) ?u32 {
+    if (key.len != 6) return null;
+    if (key[0] != identity_namespace or key[1] != identity_visibility_deleted_chunk_kind) return null;
+    return std.mem.readInt(u32, key[2..6], .big);
 }
 
 pub fn encodedBodyLen(bytes: []const u8) usize {
