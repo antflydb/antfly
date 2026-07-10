@@ -2130,6 +2130,7 @@ pub const DataServer = struct {
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
+    ha_state_mutex: std.atomic.Mutex = .unlocked,
     ha_admin_server: ?antfly.ha.http_admin.Server = null,
     ha_internal_server: ?antfly.ha.http_internal.Server = null,
     ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
@@ -2477,6 +2478,8 @@ pub const DataServer = struct {
 
     fn runHAStandbyReplicationRound(self: *DataServer) !void {
         const cfg = self.ha_cfg.standby_replication orelse return;
+        lockAtomic(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
         if (try self.openPromotedPrimaryFromStandbyIfReady(cfg)) return;
         const executor = try self.haStandbyReplicationExecutor(cfg);
         self.recordHAStandbyReplicationAttempt();
@@ -2536,14 +2539,18 @@ pub const DataServer = struct {
         const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
         self.ha_cfg.admin_context.?.primary = promoted_primary;
         self.ha_cfg.admin_context.?.primary_node_id = promoted_node_id;
+        self.ha_cfg.admin_context.?.promoted_standby_handoff = handoff;
         if (self.ha_admin_server) |*server| {
             server.ctx.primary = promoted_primary;
             server.ctx.primary_node_id = promoted_node_id;
+            server.ctx.promoted_standby_handoff = handoff;
         }
         self.ha_internal_server = null;
         self.api_server_cfg.ha_internal_executor = null;
         if (self.ha_cfg.admin_context.?.primary) |handle| {
-            self.ha_internal_server = antfly.ha.http_internal.Server.init(self.alloc, handle);
+            self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(self.alloc, handle, .{
+                .state_mutex = &self.ha_state_mutex,
+            });
             self.api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
         }
         if (self.http_server) |*server| {
@@ -2672,6 +2679,7 @@ pub const DataServer = struct {
             if (self.ha_cfg.admin_context) |ctx| {
                 self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(self.alloc, ctx, .{
                     .bearer_token = self.ha_cfg.admin_bearer_token,
+                    .state_mutex = if (ctx.primary != null or self.ha_cfg.standby_replication != null) &self.ha_state_mutex else null,
                     .standby_status_extras = .{
                         .ptr = self,
                         .last_error = haStandbyReplicationLastErrorCallback,
@@ -2686,7 +2694,9 @@ pub const DataServer = struct {
         if (api_server_cfg.ha_internal_executor == null) {
             const primary = self.ha_cfg.internal_primary orelse if (self.ha_cfg.admin_context) |ctx| ctx.primary else null;
             if (primary) |handle| {
-                self.ha_internal_server = antfly.ha.http_internal.Server.init(self.alloc, handle);
+                self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(self.alloc, handle, .{
+                    .state_mutex = &self.ha_state_mutex,
+                });
                 api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
             }
         }
@@ -16691,6 +16701,32 @@ test "data server promotion rewires live HTTP internal HA executor" {
     try std.testing.expect(standby == null);
     try std.testing.expect(server.ha_promoted_primary != null);
     try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.promoted_standby_handoff != null);
+    try std.testing.expect(server.ha_admin_server.?.auth.state_mutex == &server.ha_state_mutex);
+    try std.testing.expect(server.ha_internal_server.?.state_mutex == &server.ha_state_mutex);
+
+    var write_check = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_write_check,
+        .content_type = "application/json",
+        .body = "{\"role\":\"standby\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
+    });
+    defer write_check.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), write_check.status);
+    try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"role\":\"promoted_standby\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"action\":\"open_promoted_primary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"promotion_handoff\"") != null);
+
+    var owner_job_check = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_owner_job_check,
+        .content_type = "application/json",
+        .body = "{\"role\":\"standby\",\"kind\":\"retention_advance\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
+    });
+    defer owner_job_check.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), owner_job_check.status);
+    try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"role\":\"promoted_standby\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"action\":\"open_promoted_primary\"") != null);
 
     var internal_resp = try server.http_server.?.handle(.{
         .method = .GET,

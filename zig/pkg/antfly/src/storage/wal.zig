@@ -193,6 +193,16 @@ const StoreOwner = union(enum) {
         }
     }
 
+    fn syncCommitDurability(self: *StoreOwner) !void {
+        switch (self.*) {
+            .lmdb => |backend| try backend.sync(true),
+            // The LSM transaction has already appended and fsynced its replay
+            // WAL. Sync that durable boundary without forcing an unrelated
+            // memtable flush and compaction build on every outer WAL append.
+            .lsm => |*handle| try handle.backend.syncReplayState(),
+        }
+    }
+
     fn commitStatsSnapshot(self: *StoreOwner) ?lmdb.CommitStats {
         return switch (self.*) {
             .lmdb => |backend| backend.commitStatsSnapshot(),
@@ -876,7 +886,7 @@ pub const WAL = struct {
         };
         self.next_lsn = lsn;
         if (self.sync_after_commit) {
-            self.store_owner.sync(true) catch |err| {
+            self.store_owner.syncCommitDurability() catch |err| {
                 stats.commit_ns = self.elapsedSince(commit_started);
                 return .{
                     .result = .{ .failure = err },
