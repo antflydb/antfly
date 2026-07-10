@@ -1560,6 +1560,7 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
         f"node_to_stop: {node_to_stop}\n"
         f"last shutdown status: {complete_status}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
+        f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
     )
 

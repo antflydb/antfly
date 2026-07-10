@@ -29,6 +29,7 @@ pub const HttpDriverConfig = struct {
     async_send_retry_base_ms: u64 = 50,
     async_send_retry_max_ms: u64 = 1_000,
     async_send_worker_count: u32 = 4,
+    isolated_worker_executors: bool = false,
 };
 
 pub const AsyncSendMetricsSnapshot = struct {
@@ -81,6 +82,7 @@ pub const HttpFrameDriver = struct {
     executor: common.RequestExecutor,
     io: std.Io,
     threads: []std.Thread = &.{},
+    isolated_executors: []common_http.StdHttpExecutor = &.{},
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     closing: bool = false,
@@ -139,6 +141,10 @@ pub const HttpFrameDriver = struct {
     }
 
     pub fn sendBatch(self: *HttpFrameDriver, batch: SendBatch) !void {
+        return self.sendBatchWithExecutor(batch, self.executor);
+    }
+
+    fn sendBatchWithExecutor(self: *HttpFrameDriver, batch: SendBatch, executor: common.RequestExecutor) !void {
         if (batch.body.len > self.cfg.max_batch_bytes) return error.BatchTooLarge;
         var uri_stack_buf: [256]u8 = undefined;
         const uri, const uri_owned = blk: {
@@ -152,7 +158,7 @@ pub const HttpFrameDriver = struct {
         };
         defer if (uri_owned) self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
             .source_node_id = batch.source_id,
@@ -168,6 +174,11 @@ pub const HttpFrameDriver = struct {
         if (self.threads.len != 0) return;
         if (self.cfg.async_send_worker_count == 0) return error.InvalidAsyncSendWorkerCount;
         try self.in_flight_peers.ensureTotalCapacity(self.alloc, self.cfg.async_send_worker_count);
+        if (self.cfg.isolated_worker_executors) {
+            self.isolated_executors = try self.alloc.alloc(common_http.StdHttpExecutor, self.cfg.async_send_worker_count);
+            for (self.isolated_executors) |*executor| executor.initInPlace(self.alloc, .{});
+        }
+        errdefer self.deinitIsolatedExecutors();
         self.threads = try self.alloc.alloc(std.Thread, self.cfg.async_send_worker_count);
         var started: usize = 0;
         errdefer {
@@ -180,7 +191,7 @@ pub const HttpFrameDriver = struct {
             self.threads = &.{};
         }
         while (started < self.threads.len) : (started += 1) {
-            self.threads[started] = try std.Thread.spawn(.{}, asyncSenderMain, .{self});
+            self.threads[started] = try std.Thread.spawn(.{}, asyncSenderMain, .{ self, started });
         }
     }
 
@@ -193,19 +204,31 @@ pub const HttpFrameDriver = struct {
         for (self.threads) |thread| thread.join();
         self.alloc.free(self.threads);
         self.threads = &.{};
+        self.deinitIsolatedExecutors();
     }
 
-    fn asyncSenderMain(self: *HttpFrameDriver) void {
+    fn deinitIsolatedExecutors(self: *HttpFrameDriver) void {
+        if (self.isolated_executors.len == 0) return;
+        for (self.isolated_executors) |*executor| executor.deinit();
+        self.alloc.free(self.isolated_executors);
+        self.isolated_executors = &.{};
+    }
+
+    fn asyncSenderMain(self: *HttpFrameDriver, worker_index: usize) void {
+        const executor = if (self.isolated_executors.len == 0)
+            self.executor
+        else
+            self.isolated_executors[worker_index].executor();
         while (true) {
             const frame = self.popQueuedFrame() orelse break;
             var owned = frame;
-            self.sendBatch(.{
+            self.sendBatchWithExecutor(.{
                 .source_id = owned.source_id,
                 .peer_id = owned.peer_id,
                 .base_uri = owned.base_uri,
                 .body = owned.body,
                 .content_type = owned.content_type,
-            }) catch |err| {
+            }, executor) catch |err| {
                 const retrying = self.retryQueuedFrame(&owned, err);
                 self.finishInFlightPeer(frame.peer_id);
                 if (retrying) continue;

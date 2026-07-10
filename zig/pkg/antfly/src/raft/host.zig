@@ -813,9 +813,14 @@ pub const HttpHost = struct {
         else
             null;
         const transport_io = if (deps.backend_runtime) |runtime| runtime.raftOutboundIo() else null;
+        var transport_config = cfg.transport;
+        // The std Threaded timeout path uses process signals for cancellation.
+        // Keep each asynchronous peer lane on an independent I/O pool so one
+        // canceled request cannot interrupt another lane's connect syscall.
+        transport_config.driver.isolated_worker_executors = executor != null;
         transport_stack.* = try transport.HttpTransportStack.init(
             alloc,
-            cfg.transport,
+            transport_config,
             request_executor,
             transport_io,
             snapshot_resolver,

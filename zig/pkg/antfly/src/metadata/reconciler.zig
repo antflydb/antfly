@@ -929,6 +929,15 @@ fn relocationTargetCutoverReady(current: CurrentMetadataState, intent: raft_reco
         saw_group_status = true;
         if (status.transition_pending) return false;
         if (status.replay_required and !status.replay_caught_up) return false;
+        // Ordinary replica relocation is complete when Raft has promoted the
+        // target into a stable voter set. Split/merge replay readiness remains
+        // authoritative while a data transition is pending.
+        if (status.local_voter and
+            !status.joint_consensus and
+            @as(usize, status.voter_count) >= intent.peer_node_ids.len)
+        {
+            return true;
+        }
         if (status.doc_count < intent.relocation_doc_count_watermark) return false;
         if (status.disk_bytes < intent.relocation_disk_bytes_watermark) return false;
         if (status.cutover_ready or status.reads_ready_after_cutover) return true;
@@ -971,14 +980,13 @@ fn placementSafeToRemove(
         if (!relocationTargetReady(current, target)) return false;
     }
     if (saw_replacement) return true;
-    return compactShrinkSafeToRemove(current, desired_placements, source, watermark);
+    return compactShrinkSafeToRemove(current, desired_placements, source);
 }
 
 fn compactShrinkSafeToRemove(
     current: CurrentMetadataState,
     desired_placements: []const raft_reconciler.PlacementIntent,
     source: raft_reconciler.PlacementIntent,
-    watermark: RelocationWatermark,
 ) bool {
     const current_count = countPlacementIntents(current.placement_intents, source.record.group_id);
     const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
@@ -990,16 +998,24 @@ fn compactShrinkSafeToRemove(
         if (desired.record.local_node_id == source.record.local_node_id) continue;
         const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
         if (current_target.serving_state != .serving) return false;
-        if (!placementCaughtUpForCompactShrink(current, current_target, watermark)) return false;
+        if (!placementReadyForCompactShrink(current, current_target, desired_count)) return false;
         survivors += 1;
     }
-    return survivors == desired_count;
+    if (survivors != desired_count) return false;
+
+    const group_status = mergedGroupStatus(current, source.record.group_id) orelse return false;
+    if (!group_status.leader_known) return false;
+    for (desired_placements) |desired| {
+        if (desired.record.group_id != source.record.group_id) continue;
+        if (desired.store_id != 0 and desired.store_id == group_status.leader_store_id) return true;
+    }
+    return false;
 }
 
-fn placementCaughtUpForCompactShrink(
+fn placementReadyForCompactShrink(
     current: CurrentMetadataState,
     target: raft_reconciler.PlacementIntent,
-    watermark: RelocationWatermark,
+    desired_count: usize,
 ) bool {
     const store = findStoreByNode(current.stores, target.record.local_node_id) orelse return false;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
@@ -1007,10 +1023,9 @@ fn placementCaughtUpForCompactShrink(
     for (store.group_statuses) |status| {
         if (status.group_id != target.record.group_id) continue;
         if (!status.local_voter) return false;
-        if (status.transition_pending) return false;
+        if (@as(usize, status.voter_count) < desired_count) return false;
+        if (status.joint_consensus or status.transition_pending) return false;
         if (status.replay_required and !status.replay_caught_up) return false;
-        if (status.doc_count < watermark.doc_count) return false;
-        if (status.disk_bytes < watermark.disk_bytes) return false;
         return true;
     }
     return false;
@@ -2673,7 +2688,37 @@ test "metadata reconciler does not gate empty relocation on storage overhead byt
     try std.testing.expectEqual(@as(u64, 0), source.relocation_disk_bytes_watermark);
 }
 
-test "metadata reconciler does not remove a data-bearing draining source until compact shrink survivors catch up" {
+test "metadata reconciler promotes ordinary relocation after stable raft membership" {
+    const intent: raft_reconciler.PlacementIntent = .{
+        .record = .{ .group_id = 2241, .replica_id = 3, .local_node_id = 104 },
+        .store_id = 104,
+        .peer_node_ids = &.{ 101, 102, 104 },
+        .serving_state = .replaying,
+        .relocation_source_node_id = 105,
+        .relocation_source_store_id = 105,
+        .relocation_doc_count_watermark = 12,
+        .relocation_disk_bytes_watermark = 10_052,
+    };
+    const stores = [_]table_manager.StoreRecord{.{
+        .store_id = 104,
+        .node_id = 104,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+        .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+            .group_id = 2241,
+            .doc_count = 12,
+            .disk_bytes = 8_192,
+            .empty = false,
+            .local_voter = true,
+            .voter_count = 3,
+        }})[0..]),
+    }};
+
+    try std.testing.expect(relocationTargetCutoverReady(.{ .stores = &stores }, intent));
+}
+
+test "metadata reconciler retains a compact shrink source until a survivor leads" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -2712,7 +2757,6 @@ test "metadata reconciler does not remove a data-bearing draining source until c
                 .doc_count = 18,
                 .disk_bytes = 2048,
                 .empty = false,
-                .local_leader = true,
                 .local_voter = true,
                 .voter_count = 3,
             }})[0..]),
@@ -2786,7 +2830,7 @@ test "metadata reconciler does not remove a data-bearing draining source until c
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
 }
 
-test "metadata reconciler removes a data-bearing draining source after compact shrink survivors catch up" {
+test "metadata reconciler compact shrink uses stable raft membership instead of physical bytes" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -2835,7 +2879,6 @@ test "metadata reconciler removes a data-bearing draining source after compact s
                 .doc_count = 18,
                 .disk_bytes = 2048,
                 .empty = false,
-                .local_leader = true,
                 .local_voter = true,
                 .voter_count = 3,
             }})[0..]),
@@ -2846,7 +2889,17 @@ test "metadata reconciler removes a data-bearing draining source after compact s
             .role = "data",
             .health_class = "healthy",
             .live = true,
-            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{caught_up})[0..]),
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2261,
+                // Physical LSM size is replica-local and is not a correctness
+                // watermark for a committed Raft membership transition.
+                .doc_count = 18,
+                .disk_bytes = 1024,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
         },
         .{
             .store_id = 103,
