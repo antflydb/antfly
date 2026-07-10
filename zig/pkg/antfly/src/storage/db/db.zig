@@ -17284,13 +17284,13 @@ fn flushPrecomputeAssetProducerBatchSequential(
         const produced = producer.produce(alloc, item.asRequest()) catch |err| {
             if (err == error.OutOfMemory) return err;
             if (isRetryableAssetProducerError(err)) return err;
-            continue;
+            return err;
         };
         defer alloc.free(produced);
         applyPrecomputeAssetProducerOutput(alloc, db, item, produced, artifact_writes, documents) catch |err| {
             if (err == error.OutOfMemory) return err;
             if (isRetryableAssetProducerError(err)) return err;
-            continue;
+            return err;
         };
     }
 }
@@ -17337,7 +17337,7 @@ fn flushPrecomputeAssetProducerBatch(
             produced[idx] = "";
             if (err == error.OutOfMemory) return err;
             if (isRetryableAssetProducerError(err)) return err;
-            continue;
+            return err;
         };
         alloc.free(output);
         produced[idx] = "";
@@ -38202,7 +38202,7 @@ test "db asset producer enrichments batch compatible generated assets" {
     try std.testing.expectEqualStrings("batch:beta", parsed_second.value.object.get("_artifacts").?.object.get("summary_v1").?.object.get("value").?.string);
 }
 
-test "db asset producer batch fallback isolates permanent item failure" {
+test "db asset producer sync precompute fails closed on permanent item failure" {
     const alloc = std.testing.allocator;
 
     const FallbackProducer = struct {
@@ -38258,19 +38258,50 @@ test "db asset producer batch fallback isolates permanent item failure" {
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:good", .value = "{\"body\":\"good\"}" },
-            .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
         },
         .sync_level = .enrichments,
     });
 
     try std.testing.expectEqual(@as(usize, 1), fake.batch_calls);
-    try std.testing.expectEqual(@as(usize, 2), fake.single_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.single_calls);
 
     const good_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:good", "asset", "summary_v1");
     defer alloc.free(good_key);
     const good_value = try db.core.store.get(alloc, good_key);
     defer alloc.free(good_value);
     try std.testing.expectEqualStrings("ok:good", good_value);
+
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 2), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.single_calls);
+
+    const committed_doc = (try db.get(alloc, "doc:good")) orelse return error.TestExpectedEqual;
+    defer alloc.free(committed_doc);
+    try std.testing.expectEqualStrings("{\"body\":\"good\"}", committed_doc);
+
+    const unchanged_good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(unchanged_good_value);
+    try std.testing.expectEqualStrings("ok:good", unchanged_good_value);
+
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 3), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.single_calls);
+
+    const rejected_doc = try db.get(alloc, "doc:bad");
+    defer if (rejected_doc) |value| alloc.free(value);
+    try std.testing.expect(rejected_doc == null);
 
     const bad_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bad", "asset", "summary_v1");
     defer alloc.free(bad_key);
