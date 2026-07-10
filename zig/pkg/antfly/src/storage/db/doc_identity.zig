@@ -72,6 +72,10 @@ pub const Stats = struct {
     state_rows: u64 = 0,
     live_ordinals: u64 = 0,
     tombstone_ordinals: u64 = 0,
+    visibility_chunks: u64 = 0,
+    visibility_deleted_ordinals: u64 = 0,
+    visibility_mask_bytes: u64 = 0,
+    visibility_repair_count: u64 = 0,
     min_created_generation: u64 = 0,
     max_created_generation: u64 = 0,
     min_deleted_generation: u64 = 0,
@@ -87,10 +91,306 @@ pub const VisibilitySummary = struct {
     max_deleted_generation: u64 = 0,
 };
 
+pub const visibility_chunk_size: u32 = 65536;
+const visibility_manifest_version: u8 = 1;
+const visibility_chunk_version: u8 = 1;
+const visibility_chunk_header_len: usize = 8;
+const visibility_chunk_entry_len: usize = 20;
+const visibility_deleted_chunk_version: u8 = 1;
+const visibility_deleted_chunk_header_len: usize = 8;
+const visibility_deleted_chunk_entry_len: usize = 2;
+const visibility_manifest_value = [_]u8{
+    visibility_manifest_version,
+    0,
+    0,
+    0,
+    @as(u8, @intCast((visibility_chunk_size >> 24) & 0xff)),
+    @as(u8, @intCast((visibility_chunk_size >> 16) & 0xff)),
+    @as(u8, @intCast((visibility_chunk_size >> 8) & 0xff)),
+    @as(u8, @intCast(visibility_chunk_size & 0xff)),
+};
+
+const VisibilityChunkEntry = struct {
+    offset: u16,
+    state: OrdinalState,
+
+    fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+        return lhs.offset < rhs.offset;
+    }
+};
+
+const VisibilityChunk = struct {
+    entries: std.AutoHashMapUnmanaged(u16, OrdinalState) = .empty,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.entries.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn put(self: *@This(), alloc: Allocator, offset: u16, state: OrdinalState) !void {
+        try self.entries.put(alloc, offset, state);
+    }
+
+    fn deletedCount(self: *const @This()) u64 {
+        var count: u64 = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |state| {
+            if (state.deleted_generation != null) count += 1;
+        }
+        return count;
+    }
+
+    fn appendDeletedOrdinals(
+        self: *const @This(),
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(DocOrdinal),
+        chunk_id: u32,
+        max_entries: usize,
+        overflow: *bool,
+    ) !void {
+        var entries = try alloc.alloc(VisibilityChunkEntry, self.entries.count());
+        defer alloc.free(entries);
+        var i: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| : (i += 1) {
+            entries[i] = .{ .offset = entry.key_ptr.*, .state = entry.value_ptr.* };
+        }
+        std.sort.pdq(VisibilityChunkEntry, entries, {}, VisibilityChunkEntry.lessThan);
+
+        for (entries) |entry| {
+            if (entry.state.deleted_generation == null) continue;
+            if (out.items.len >= max_entries) {
+                overflow.* = true;
+                return;
+            }
+            try out.append(alloc, ordinalFromChunkOffset(chunk_id, entry.offset));
+        }
+    }
+
+    fn appendNonVisibleOrdinals(
+        self: *const @This(),
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(DocOrdinal),
+        chunk_id: u32,
+        generation: ?u64,
+        max_entries: usize,
+        overflow: *bool,
+    ) !void {
+        var entries = try alloc.alloc(VisibilityChunkEntry, self.entries.count());
+        defer alloc.free(entries);
+        var i: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| : (i += 1) {
+            entries[i] = .{ .offset = entry.key_ptr.*, .state = entry.value_ptr.* };
+        }
+        std.sort.pdq(VisibilityChunkEntry, entries, {}, VisibilityChunkEntry.lessThan);
+
+        for (entries) |entry| {
+            const returnable = entry.state.isLive() and
+                (if (generation) |at| entry.state.isVisibleAt(at) else true);
+            if (returnable) continue;
+            if (out.items.len >= max_entries) {
+                overflow.* = true;
+                return;
+            }
+            try out.append(alloc, ordinalFromChunkOffset(chunk_id, entry.offset));
+        }
+    }
+
+    fn encodeAlloc(self: *const @This(), alloc: Allocator) ![]u8 {
+        const count = self.entries.count();
+        if (count > std.math.maxInt(u32)) return error.InvalidDocIdentity;
+
+        var entries = try alloc.alloc(VisibilityChunkEntry, count);
+        defer alloc.free(entries);
+        var i: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| : (i += 1) {
+            entries[i] = .{ .offset = entry.key_ptr.*, .state = entry.value_ptr.* };
+        }
+        std.sort.pdq(VisibilityChunkEntry, entries, {}, VisibilityChunkEntry.lessThan);
+
+        const len = visibility_chunk_header_len + count * visibility_chunk_entry_len;
+        var out = try alloc.alloc(u8, len);
+        errdefer alloc.free(out);
+        out[0] = visibility_chunk_version;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+        std.mem.writeInt(u32, out[4..8], @intCast(count), .big);
+        var pos: usize = visibility_chunk_header_len;
+        for (entries) |entry| {
+            std.mem.writeInt(u16, out[pos..][0..2], entry.offset, .big);
+            out[pos + 2] = if (entry.state.deleted_generation == null) 0 else 1;
+            out[pos + 3] = 0;
+            std.mem.writeInt(u64, out[pos + 4 ..][0..8], entry.state.created_generation, .big);
+            std.mem.writeInt(u64, out[pos + 12 ..][0..8], entry.state.deleted_generation orelse 0, .big);
+            pos += visibility_chunk_entry_len;
+        }
+        return out;
+    }
+
+    fn encodeDeletedOffsetsAlloc(self: *const @This(), alloc: Allocator) ![]u8 {
+        const deleted_count = self.deletedCount();
+        if (deleted_count > std.math.maxInt(u32)) return error.InvalidDocIdentity;
+
+        var offsets = try alloc.alloc(u16, @intCast(deleted_count));
+        defer alloc.free(offsets);
+        var i: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.deleted_generation == null) continue;
+            offsets[i] = entry.key_ptr.*;
+            i += 1;
+        }
+        std.mem.sortUnstable(u16, offsets, {}, std.sort.asc(u16));
+
+        const len = visibility_deleted_chunk_header_len + offsets.len * visibility_deleted_chunk_entry_len;
+        var out = try alloc.alloc(u8, len);
+        errdefer alloc.free(out);
+        out[0] = visibility_deleted_chunk_version;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+        std.mem.writeInt(u32, out[4..8], @intCast(offsets.len), .big);
+        var pos: usize = visibility_deleted_chunk_header_len;
+        for (offsets) |offset| {
+            std.mem.writeInt(u16, out[pos..][0..2], offset, .big);
+            pos += visibility_deleted_chunk_entry_len;
+        }
+        return out;
+    }
+
+    fn decodeAlloc(alloc: Allocator, raw: []const u8) !@This() {
+        if (raw.len < visibility_chunk_header_len) return error.InvalidVisibilityChunk;
+        if (raw[0] != visibility_chunk_version) return error.InvalidVisibilityChunk;
+        const count = std.mem.readInt(u32, raw[4..8], .big);
+        const expected_len = visibility_chunk_header_len + @as(usize, count) * visibility_chunk_entry_len;
+        if (raw.len != expected_len) return error.InvalidVisibilityChunk;
+
+        var chunk = VisibilityChunk{};
+        errdefer chunk.deinit(alloc);
+        var previous: ?u16 = null;
+        var pos: usize = visibility_chunk_header_len;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const offset = std.mem.readInt(u16, raw[pos..][0..2], .big);
+            if (previous) |prev| {
+                if (offset <= prev) return error.InvalidVisibilityChunk;
+            }
+            previous = offset;
+            const deleted_flag = raw[pos + 2];
+            const created_generation = std.mem.readInt(u64, raw[pos + 4 ..][0..8], .big);
+            const deleted_raw = std.mem.readInt(u64, raw[pos + 12 ..][0..8], .big);
+            const state = OrdinalState{
+                .canonical_doc_id = 1,
+                .created_generation = created_generation,
+                .deleted_generation = switch (deleted_flag) {
+                    0 => null,
+                    1 => deleted_raw,
+                    else => return error.InvalidVisibilityChunk,
+                },
+            };
+            if (deleted_flag == 1 and deleted_raw == 0) return error.InvalidVisibilityChunk;
+            if (state.deleted_generation) |deleted| {
+                if (deleted < state.created_generation) return error.InvalidVisibilityChunk;
+            }
+            try chunk.entries.put(alloc, offset, state);
+            pos += visibility_chunk_entry_len;
+        }
+        return chunk;
+    }
+
+    fn encodedStats(raw: []const u8) !struct { entries: u64, deleted: u64 } {
+        if (raw.len < visibility_chunk_header_len) return error.InvalidVisibilityChunk;
+        if (raw[0] != visibility_chunk_version) return error.InvalidVisibilityChunk;
+        const count = std.mem.readInt(u32, raw[4..8], .big);
+        const expected_len = visibility_chunk_header_len + @as(usize, count) * visibility_chunk_entry_len;
+        if (raw.len != expected_len) return error.InvalidVisibilityChunk;
+
+        var deleted: u64 = 0;
+        var previous: ?u16 = null;
+        var pos: usize = visibility_chunk_header_len;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const offset = std.mem.readInt(u16, raw[pos..][0..2], .big);
+            if (previous) |prev| {
+                if (offset <= prev) return error.InvalidVisibilityChunk;
+            }
+            previous = offset;
+            const deleted_flag = raw[pos + 2];
+            const created_generation = std.mem.readInt(u64, raw[pos + 4 ..][0..8], .big);
+            const deleted_raw = std.mem.readInt(u64, raw[pos + 12 ..][0..8], .big);
+            switch (deleted_flag) {
+                0 => {},
+                1 => {
+                    if (deleted_raw == 0 or deleted_raw < created_generation) return error.InvalidVisibilityChunk;
+                    deleted += 1;
+                },
+                else => return error.InvalidVisibilityChunk,
+            }
+            pos += visibility_chunk_entry_len;
+        }
+        return .{ .entries = count, .deleted = deleted };
+    }
+};
+
+fn appendDeletedChunkOrdinalsFromEncoded(
+    alloc: Allocator,
+    raw: []const u8,
+    out: *std.ArrayListUnmanaged(DocOrdinal),
+    chunk_id: u32,
+    max_entries: usize,
+    overflow: *bool,
+) !u64 {
+    if (raw.len < visibility_deleted_chunk_header_len) return error.InvalidVisibilityDeletedChunk;
+    if (raw[0] != visibility_deleted_chunk_version) return error.InvalidVisibilityDeletedChunk;
+    const count = std.mem.readInt(u32, raw[4..8], .big);
+    const expected_len = visibility_deleted_chunk_header_len + @as(usize, count) * visibility_deleted_chunk_entry_len;
+    if (raw.len != expected_len) return error.InvalidVisibilityDeletedChunk;
+
+    var previous: ?u16 = null;
+    var pos: usize = visibility_deleted_chunk_header_len;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const offset = std.mem.readInt(u16, raw[pos..][0..2], .big);
+        if (previous) |prev| {
+            if (offset <= prev) return error.InvalidVisibilityDeletedChunk;
+        }
+        previous = offset;
+        if (out.items.len >= max_entries) {
+            overflow.* = true;
+            return i;
+        }
+        try out.append(alloc, ordinalFromChunkOffset(chunk_id, offset));
+        pos += visibility_deleted_chunk_entry_len;
+    }
+    return count;
+}
+
+const VisibilityChunkMap = std.AutoHashMapUnmanaged(u32, VisibilityChunk);
+
+const PendingVisibilityChunkWrite = struct {
+    chunk_id: u32,
+    chunk: *const VisibilityChunk,
+
+    fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+        return lhs.chunk_id < rhs.chunk_id;
+    }
+};
+
 pub const AllNewTrustedState = struct {
     next_ordinal: DocOrdinal = 1,
     visibility_summary: VisibilitySummary = .{},
+    visibility_chunks: VisibilityChunkMap = .empty,
     namespace_written: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        var it = self.visibility_chunks.valueIterator();
+        while (it.next()) |chunk| chunk.deinit(alloc);
+        self.visibility_chunks.deinit(alloc);
+        self.* = .{};
+    }
 };
 
 pub fn canonicalDocId(table_id: u64, shard_id: u64, doc_id: []const u8) u64 {
@@ -366,6 +666,10 @@ pub fn ensureOrdinalForNamespaceTxn(
             state.created_generation = generation;
             state.deleted_generation = null;
             try writeOrdinalStateTxn(mutable_txn, ordinal, state);
+            var chunk = (try readVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal))) orelse VisibilityChunk{};
+            defer chunk.deinit(alloc);
+            try chunk.put(alloc, visibilityChunkOffset(ordinal), state);
+            try writeVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal), &chunk);
         }
         try ensureCanonicalOrdinalMappingTxn(mutable_txn, state.canonical_doc_id, ordinal);
         return .{
@@ -387,6 +691,10 @@ pub fn ensureOrdinalForNamespaceTxn(
     try writeOrdinalDocMappingTxn(mutable_txn, ordinal, doc_id);
     try writeOrdinalStateTxn(mutable_txn, ordinal, state);
     try writeCanonicalOrdinalMappingTxn(mutable_txn, state.canonical_doc_id, ordinal);
+    var chunk = (try readVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal))) orelse VisibilityChunk{};
+    defer chunk.deinit(alloc);
+    try chunk.put(alloc, visibilityChunkOffset(ordinal), state);
+    try writeVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal), &chunk);
     if (try readVisibilitySummaryTxn(mutable_txn)) |summary_before| {
         var summary = summary_before;
         noteSummaryLiveCreate(&summary, generation);
@@ -411,6 +719,10 @@ pub fn markDeletedTxn(alloc: Allocator, txn: anytype, generation: u64, doc_id: [
         }
         state.deleted_generation = generation;
         try writeOrdinalStateTxn(mutable_txn, ordinal, state);
+        var chunk = (try readVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal))) orelse VisibilityChunk{};
+        defer chunk.deinit(alloc);
+        try chunk.put(alloc, visibilityChunkOffset(ordinal), state);
+        try writeVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal), &chunk);
     }
 }
 
@@ -492,6 +804,198 @@ pub fn latestGenerationFromSummaryFast(store: *docstore_mod.DocStore) !?u64 {
     return latestGenerationFromSummary(summary);
 }
 
+fn visibilityChunkId(ordinal: DocOrdinal) u32 {
+    return ordinal / visibility_chunk_size;
+}
+
+fn visibilityChunkOffset(ordinal: DocOrdinal) u16 {
+    return @intCast(ordinal % visibility_chunk_size);
+}
+
+fn ordinalFromChunkOffset(chunk_id: u32, offset: u16) DocOrdinal {
+    return chunk_id * visibility_chunk_size + @as(u32, offset);
+}
+
+fn readVisibilityChunkTxn(alloc: Allocator, txn: anytype, chunk_id: u32) !?VisibilityChunk {
+    const mutable_txn = txn;
+    const key = internal_keys.identityVisibilityChunkKey(chunk_id);
+    const raw = mutable_txn.get(key[0..]) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try VisibilityChunk.decodeAlloc(alloc, raw);
+}
+
+fn readVisibilityManifestTxn(txn: anytype) !bool {
+    const mutable_txn = txn;
+    const raw = mutable_txn.get(internal_keys.identity_visibility_manifest_key[0..]) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (raw.len != visibility_manifest_value.len) return error.InvalidVisibilityManifest;
+    if (!std.mem.eql(u8, raw, visibility_manifest_value[0..])) return error.InvalidVisibilityManifest;
+    return true;
+}
+
+fn writeVisibilityChunkTxn(alloc: Allocator, txn: anytype, chunk_id: u32, chunk: *const VisibilityChunk) !void {
+    const mutable_txn = txn;
+    try mutable_txn.put(internal_keys.identity_visibility_manifest_key[0..], visibility_manifest_value[0..]);
+
+    const key = internal_keys.identityVisibilityChunkKey(chunk_id);
+    const encoded = try chunk.encodeAlloc(alloc);
+    defer alloc.free(encoded);
+    try mutable_txn.put(key[0..], encoded);
+
+    const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(chunk_id);
+    if (chunk.deletedCount() == 0) {
+        mutable_txn.delete(deleted_key[0..]) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    } else {
+        const deleted_encoded = try chunk.encodeDeletedOffsetsAlloc(alloc);
+        defer alloc.free(deleted_encoded);
+        try mutable_txn.put(deleted_key[0..], deleted_encoded);
+    }
+}
+
+fn appendVisibilityManifestWrite(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair)) !void {
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, internal_keys.identity_visibility_manifest_key[0..]),
+        .value = try alloc.dupe(u8, visibility_manifest_value[0..]),
+    });
+}
+
+fn appendVisibilityChunkWrite(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: ?*std.ArrayListUnmanaged([]u8),
+    chunk_id: u32,
+    chunk: *const VisibilityChunk,
+) !void {
+    const key = internal_keys.identityVisibilityChunkKey(chunk_id);
+    const encoded = try chunk.encodeAlloc(alloc);
+    errdefer alloc.free(encoded);
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, key[0..]),
+        .value = encoded,
+    });
+
+    const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(chunk_id);
+    if (chunk.deletedCount() == 0) {
+        if (deletes) |delete_keys| {
+            try delete_keys.append(alloc, try alloc.dupe(u8, deleted_key[0..]));
+        }
+        return;
+    }
+    const deleted_encoded = try chunk.encodeDeletedOffsetsAlloc(alloc);
+    errdefer alloc.free(deleted_encoded);
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, deleted_key[0..]),
+        .value = deleted_encoded,
+    });
+}
+
+fn ensurePendingVisibilityChunkAlloc(
+    alloc: Allocator,
+    txn: anytype,
+    chunks: *VisibilityChunkMap,
+    chunk_id: u32,
+) !*VisibilityChunk {
+    const gop = try chunks.getOrPut(alloc, chunk_id);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = (try readVisibilityChunkTxn(alloc, txn, chunk_id)) orelse .{};
+    }
+    return gop.value_ptr;
+}
+
+fn updatePendingVisibilityChunkAlloc(
+    alloc: Allocator,
+    txn: anytype,
+    chunks: *VisibilityChunkMap,
+    ordinal: DocOrdinal,
+    state: OrdinalState,
+) !void {
+    const chunk_id = visibilityChunkId(ordinal);
+    const chunk = try ensurePendingVisibilityChunkAlloc(alloc, txn, chunks, chunk_id);
+    try chunk.put(alloc, visibilityChunkOffset(ordinal), state);
+}
+
+fn updateOwnedVisibilityChunkAlloc(
+    alloc: Allocator,
+    chunks: *VisibilityChunkMap,
+    ordinal: DocOrdinal,
+    state: OrdinalState,
+) !u32 {
+    const chunk_id = visibilityChunkId(ordinal);
+    const gop = try chunks.getOrPut(alloc, chunk_id);
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    try gop.value_ptr.put(alloc, visibilityChunkOffset(ordinal), state);
+    return chunk_id;
+}
+
+fn appendPendingVisibilityChunkWritesAlloc(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: ?*std.ArrayListUnmanaged([]u8),
+    chunks: *const VisibilityChunkMap,
+) !void {
+    if (chunks.count() == 0) return;
+    try appendVisibilityManifestWrite(alloc, writes);
+    var entries = try alloc.alloc(PendingVisibilityChunkWrite, chunks.count());
+    defer alloc.free(entries);
+    var i: usize = 0;
+    var it = chunks.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        entries[i] = .{ .chunk_id = entry.key_ptr.*, .chunk = entry.value_ptr };
+    }
+    std.sort.pdq(PendingVisibilityChunkWrite, entries, {}, PendingVisibilityChunkWrite.lessThan);
+    for (entries) |entry| try appendVisibilityChunkWrite(alloc, writes, deletes, entry.chunk_id, entry.chunk);
+}
+
+fn appendDirtyOwnedVisibilityChunkWritesAlloc(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: ?*std.ArrayListUnmanaged([]u8),
+    chunks: *const VisibilityChunkMap,
+    dirty_chunk_ids: *const std.AutoHashMapUnmanaged(u32, void),
+) !void {
+    if (dirty_chunk_ids.count() == 0) return;
+    try appendVisibilityManifestWrite(alloc, writes);
+    var entries = try alloc.alloc(PendingVisibilityChunkWrite, dirty_chunk_ids.count());
+    defer alloc.free(entries);
+    var i: usize = 0;
+    var it = dirty_chunk_ids.keyIterator();
+    while (it.next()) |chunk_id| : (i += 1) {
+        entries[i] = .{ .chunk_id = chunk_id.*, .chunk = chunks.getPtr(chunk_id.*) orelse return error.InvalidDocIdentity };
+    }
+    std.sort.pdq(PendingVisibilityChunkWrite, entries, {}, PendingVisibilityChunkWrite.lessThan);
+    for (entries) |entry| try appendVisibilityChunkWrite(alloc, writes, deletes, entry.chunk_id, entry.chunk);
+}
+
+fn pruneCompletedOwnedVisibilityChunks(alloc: Allocator, chunks: *VisibilityChunkMap, next_ordinal: DocOrdinal) void {
+    const open_chunk_id = visibilityChunkId(next_ordinal);
+    var stale = std.ArrayListUnmanaged(u32).empty;
+    defer stale.deinit(alloc);
+    var it = chunks.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.* < open_chunk_id) stale.append(alloc, entry.key_ptr.*) catch return;
+    }
+    for (stale.items) |chunk_id| {
+        if (chunks.fetchRemove(chunk_id)) |removed| {
+            var chunk = removed.value;
+            chunk.deinit(alloc);
+        }
+    }
+}
+
+fn deinitVisibilityChunkMap(alloc: Allocator, chunks: *VisibilityChunkMap) void {
+    var it = chunks.valueIterator();
+    while (it.next()) |chunk| chunk.deinit(alloc);
+    chunks.deinit(alloc);
+    chunks.* = .empty;
+}
+
 pub fn visibilitySummaryFromWrites(writes: []const docstore_mod.KVPair) !?VisibilitySummary {
     var idx = writes.len;
     while (idx > 0) {
@@ -536,6 +1040,28 @@ pub fn fullStatsFromStore(store: *docstore_mod.DocStore) !Stats {
     const upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind + 1 };
     var state = State{ .stats = &stats };
     try store.scanWithContext(lower[0..], upper[0..], .{}, &state, State.scanEntry);
+
+    const ChunkScan = struct {
+        stats: *Stats,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const scan: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            _ = internal_keys.parseIdentityVisibilityChunkKey(key) orelse return .@"continue";
+            scan.stats.visibility_chunks += 1;
+            scan.stats.visibility_mask_bytes += value.len;
+            const chunk_stats = VisibilityChunk.encodedStats(value) catch {
+                scan.stats.visibility_repair_count += 1;
+                return .@"continue";
+            };
+            scan.stats.visibility_deleted_ordinals += chunk_stats.deleted;
+            return .@"continue";
+        }
+    };
+
+    const chunk_lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_chunk_kind };
+    const chunk_upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_chunk_kind + 1 };
+    var chunk_scan = ChunkScan{ .stats = &stats };
+    try store.scanWithContext(chunk_lower[0..], chunk_upper[0..], .{}, &chunk_scan, ChunkScan.scanEntry);
     stats.complete = true;
     return stats;
 }
@@ -615,7 +1141,91 @@ pub fn validateStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void
         }
     }
 
+    try validateVisibilityChunksAlloc(alloc, store, &txn);
+
     if (max_ordinal > 0 and next_ordinal <= max_ordinal) return error.InvalidDocIdentity;
+}
+
+fn validateVisibilityChunksAlloc(alloc: Allocator, store: *docstore_mod.DocStore, txn: anytype) !void {
+    const manifest_exists = try readVisibilityManifestTxn(txn);
+    const ChunkScan = struct {
+        alloc: Allocator,
+        txn: @TypeOf(txn),
+        seen_ordinals: std.AutoHashMapUnmanaged(DocOrdinal, void) = .empty,
+        seen_chunks: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        chunk_count: u64 = 0,
+
+        fn deinit(self: *@This()) void {
+            self.seen_ordinals.deinit(self.alloc);
+            self.seen_chunks.deinit(self.alloc);
+        }
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const scan: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const chunk_id = internal_keys.parseIdentityVisibilityChunkKey(key) orelse return .@"continue";
+            scan.chunk_count += 1;
+            try scan.seen_chunks.put(scan.alloc, chunk_id, {});
+            var chunk = try VisibilityChunk.decodeAlloc(scan.alloc, value);
+            defer chunk.deinit(scan.alloc);
+
+            const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(chunk_id);
+            const raw_deleted = scan.txn.get(deleted_key[0..]) catch |err| switch (err) {
+                error.NotFound => if (chunk.deletedCount() == 0) null else return error.InvalidDocIdentity,
+                else => return err,
+            };
+            if (raw_deleted) |deleted| {
+                if (chunk.deletedCount() == 0) return error.InvalidDocIdentity;
+                const expected_deleted = try chunk.encodeDeletedOffsetsAlloc(scan.alloc);
+                defer scan.alloc.free(expected_deleted);
+                if (!std.mem.eql(u8, deleted, expected_deleted)) return error.InvalidDocIdentity;
+            }
+
+            var it = chunk.entries.iterator();
+            while (it.next()) |entry| {
+                const ordinal = ordinalFromChunkOffset(chunk_id, entry.key_ptr.*);
+                const state = (try lookupStateTxn(scan.txn, ordinal)) orelse return error.InvalidDocIdentity;
+                if (state.created_generation != entry.value_ptr.created_generation) return error.InvalidDocIdentity;
+                if (state.deleted_generation != entry.value_ptr.deleted_generation) return error.InvalidDocIdentity;
+                try scan.seen_ordinals.put(scan.alloc, ordinal, {});
+            }
+            return .@"continue";
+        }
+    };
+
+    const chunk_lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_chunk_kind };
+    const chunk_upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_chunk_kind + 1 };
+    var chunk_scan = ChunkScan{ .alloc = alloc, .txn = txn };
+    defer chunk_scan.deinit();
+    try store.scanWithContext(chunk_lower[0..], chunk_upper[0..], .{}, &chunk_scan, ChunkScan.scanEntry);
+
+    var state_ordinals = std.ArrayListUnmanaged(DocOrdinal).empty;
+    defer state_ordinals.deinit(alloc);
+    try collectStateOrdinalsAlloc(alloc, store, &state_ordinals);
+    if (!manifest_exists and chunk_scan.chunk_count == 0) return;
+    for (state_ordinals.items) |ordinal| {
+        if (!chunk_scan.seen_ordinals.contains(ordinal)) return error.InvalidDocIdentity;
+    }
+
+    const DeletedScan = struct {
+        alloc: Allocator,
+        chunks: *std.AutoHashMapUnmanaged(u32, void),
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const scan: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const chunk_id = internal_keys.parseIdentityVisibilityDeletedChunkKey(key) orelse return .@"continue";
+            if (!scan.chunks.contains(chunk_id)) return error.InvalidDocIdentity;
+            var discard = std.ArrayListUnmanaged(DocOrdinal).empty;
+            defer discard.deinit(scan.alloc);
+            var overflow = false;
+            _ = try appendDeletedChunkOrdinalsFromEncoded(scan.alloc, value, &discard, chunk_id, std.math.maxInt(usize), &overflow);
+            if (overflow) return error.InvalidDocIdentity;
+            return .@"continue";
+        }
+    };
+    const deleted_lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_deleted_chunk_kind };
+    const deleted_upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_deleted_chunk_kind + 1 };
+    var deleted_scan = DeletedScan{ .alloc = alloc, .chunks = &chunk_scan.seen_chunks };
+    try store.scanWithContext(deleted_lower[0..], deleted_upper[0..], .{}, &deleted_scan, DeletedScan.scanEntry);
 }
 
 pub fn liveDocSetFromStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !doc_set.ResolvedDocSet {
@@ -742,6 +1352,157 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     if (primary_scan.inconclusive) return null;
 
     return try doc_set.fromOrdinalsAlloc(alloc, primary_scan.ordinals.items);
+}
+
+pub const default_max_nonvisible_doc_set_entries: usize = 65536;
+
+/// Complement of the broad visible-doc derivation: ordinals for docs that a
+/// query must not return — every deleted doc (query results must resolve to
+/// currently stored docs, matching the include path that drives off primary
+/// rows), plus docs created after the read generation. A single tombstone in
+/// a large table would otherwise force every query through a full-table
+/// include filter; representing the same constraint as a small exclude set
+/// keeps that cost proportional to the number of invisible docs. Returns null
+/// when the set would exceed `max_entries` so callers can fall back to the
+/// include-set representation. An ordinal without a state row is simply not
+/// excluded, which matches the include path's "no filtering" fallback for
+/// incomplete identity coverage.
+pub fn nonVisibleDocSetFromStoreAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    generation: ?u64,
+    max_entries: usize,
+) !?doc_set.ResolvedDocSet {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+
+    if (generation == null) {
+        if (try readVisibilitySummaryTxn(&txn)) |summary| {
+            if (summary.tombstone_ordinals == 0) return .none;
+            if (try currentNonVisibleDocSetFromDeletedChunksAlloc(alloc, store, &txn, summary, max_entries)) |current| {
+                return current;
+            }
+        }
+    }
+
+    return try nonVisibleDocSetFromVisibilityChunksAlloc(alloc, store, &txn, generation, max_entries);
+}
+
+fn currentNonVisibleDocSetFromDeletedChunksAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    summary: VisibilitySummary,
+    max_entries: usize,
+) !?doc_set.ResolvedDocSet {
+    var ordinals = std.ArrayListUnmanaged(DocOrdinal).empty;
+    defer ordinals.deinit(alloc);
+
+    const Scan = struct {
+        alloc: Allocator,
+        max_entries: usize,
+        ordinals: *std.ArrayListUnmanaged(DocOrdinal),
+        deleted_count: u64 = 0,
+        overflow: bool = false,
+        invalid: bool = false,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const scan: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const chunk_id = internal_keys.parseIdentityVisibilityDeletedChunkKey(key) orelse return .@"continue";
+            const appended = appendDeletedChunkOrdinalsFromEncoded(
+                scan.alloc,
+                value,
+                scan.ordinals,
+                chunk_id,
+                scan.max_entries,
+                &scan.overflow,
+            ) catch {
+                scan.invalid = true;
+                return .stop;
+            };
+            scan.deleted_count += appended;
+            if (scan.overflow) return .stop;
+            return .@"continue";
+        }
+    };
+
+    const lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_deleted_chunk_kind };
+    const upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_visibility_deleted_chunk_kind + 1 };
+    var scan = Scan{ .alloc = alloc, .max_entries = max_entries, .ordinals = &ordinals };
+    try store.scanReadTxnWithContext(txn, lower[0..], upper[0..], .{}, &scan, Scan.scanEntry);
+    if (scan.invalid) return null;
+    if (scan.overflow) return null;
+    if (scan.deleted_count != summary.tombstone_ordinals) return null;
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+}
+
+fn nonVisibleDocSetFromVisibilityChunksAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: anytype,
+    generation: ?u64,
+    max_entries: usize,
+) !?doc_set.ResolvedDocSet {
+    const mutable_txn = txn;
+
+    const next_ordinal = try readNextOrdinalTxn(mutable_txn);
+    if (next_ordinal <= 1) return .none;
+
+    const last_ordinal = next_ordinal - 1;
+    const last_chunk_id = visibilityChunkId(last_ordinal);
+    var ordinals = std.ArrayListUnmanaged(DocOrdinal).empty;
+    defer ordinals.deinit(alloc);
+
+    var chunk_id: u32 = 0;
+    while (chunk_id <= last_chunk_id) : (chunk_id += 1) {
+        var chunk = (readVisibilityChunkTxn(alloc, mutable_txn, chunk_id) catch |err| switch (err) {
+            error.InvalidVisibilityChunk => null,
+            else => return err,
+        }) orelse try rebuildVisibilityChunkFromIdentityStatesAlloc(alloc, store, mutable_txn, chunk_id);
+        defer chunk.deinit(alloc);
+        var overflow = false;
+        if (generation == null) {
+            try chunk.appendDeletedOrdinals(alloc, &ordinals, chunk_id, max_entries, &overflow);
+        } else {
+            try chunk.appendNonVisibleOrdinals(alloc, &ordinals, chunk_id, generation, max_entries, &overflow);
+        }
+        if (overflow) return null;
+    }
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+}
+
+fn rebuildVisibilityChunkFromIdentityStatesAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    chunk_id: u32,
+) !VisibilityChunk {
+    const Rebuild = struct {
+        alloc: Allocator,
+        chunk_id: u32,
+        chunk: VisibilityChunk = .{},
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const ordinal = internal_keys.parseIdentityOrdinalKey(key, internal_keys.identity_ordinal_state_kind) orelse return .@"continue";
+            if (visibilityChunkId(ordinal) != state.chunk_id) return .@"continue";
+            const ordinal_state = try decodeOrdinalState(value);
+            try state.chunk.put(state.alloc, visibilityChunkOffset(ordinal), ordinal_state);
+            return .@"continue";
+        }
+    };
+
+    const first_ordinal = chunk_id * visibility_chunk_size;
+    const next_chunk_first_ordinal = first_ordinal +| visibility_chunk_size;
+    const lower = internal_keys.identityOrdinalStateKey(first_ordinal);
+    const upper = if (next_chunk_first_ordinal > first_ordinal)
+        internal_keys.identityOrdinalStateKey(next_chunk_first_ordinal)
+    else
+        [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind + 1, 0, 0, 0, 0 };
+    var rebuild = Rebuild{ .alloc = alloc, .chunk_id = chunk_id };
+    errdefer rebuild.chunk.deinit(alloc);
+    try store.scanReadTxnWithContext(txn, lower[0..], upper[0..], .{}, &rebuild, Rebuild.scanEntry);
+    return rebuild.chunk;
 }
 
 const DocOrdinalRow = struct {
@@ -1052,6 +1813,28 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
     doc_upserts: []const []const u8,
     doc_deletes: []const []const u8,
 ) !void {
+    return try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+        alloc,
+        store,
+        namespace,
+        generation,
+        out,
+        null,
+        doc_upserts,
+        doc_deletes,
+    );
+}
+
+pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    namespace: Namespace,
+    generation: u64,
+    out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    visibility_deletes: ?*std.ArrayListUnmanaged([]u8),
+    doc_upserts: []const []const u8,
+    doc_deletes: []const []const u8,
+) !void {
     if (doc_upserts.len == 0 and doc_deletes.len == 0) return;
 
     if (try appendBatchIdentityMetadataAllNewFastPath(
@@ -1060,6 +1843,7 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
         namespace,
         generation,
         out,
+        visibility_deletes,
         doc_upserts,
         doc_deletes,
     )) return;
@@ -1085,6 +1869,8 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
     defer allocated_ordinals.deinit(alloc);
     var upsert_states = std.AutoHashMapUnmanaged(DocOrdinal, OrdinalState).empty;
     defer upsert_states.deinit(alloc);
+    var visibility_chunks = VisibilityChunkMap.empty;
+    defer deinitVisibilityChunkMap(alloc, &visibility_chunks);
 
     var next_ordinal = try readNextOrdinalTxn(&txn);
     var reserved_new_ordinal = false;
@@ -1110,6 +1896,7 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
                 state.created_generation = generation;
                 state.deleted_generation = null;
                 try appendOrdinalStateWrite(alloc, out, ordinal, state);
+                try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
             }
             if (try lookupCanonicalOrdinalTxn(&txn, state.canonical_doc_id)) |mapped| {
                 if (mapped != ordinal) return error.InvalidDocIdentity;
@@ -1135,6 +1922,7 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
             visibility_summary_dirty = true;
         }
         try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+        try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
         try upsert_states.put(alloc, ordinal, state);
     }
 
@@ -1156,12 +1944,14 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
             }
             state.deleted_generation = generation;
             try appendOrdinalStateWrite(alloc, out, ordinal, state);
+            try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
         }
     }
 
     if (reserved_new_ordinal) {
         try appendNextOrdinalWrite(alloc, out, next_ordinal);
     }
+    try appendPendingVisibilityChunkWritesAlloc(alloc, out, visibility_deletes, &visibility_chunks);
     if (visibility_summary_dirty) {
         try appendVisibilitySummaryWrite(alloc, out, visibility_summary.?);
     }
@@ -1227,6 +2017,8 @@ pub fn appendBatchIdentityMetadataAllNewTrustedForNamespaceAlloc(
     var next_ordinal = try readNextOrdinalTxn(&txn);
     const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
     if (doc_upserts.len > available_ordinals) return error.DocOrdinalExhausted;
+    var visibility_chunks = VisibilityChunkMap.empty;
+    defer deinitVisibilityChunkMap(alloc, &visibility_chunks);
 
     for (doc_upserts) |doc_id| {
         const ordinal = try reserveOrdinalLocal(&next_ordinal);
@@ -1236,8 +2028,10 @@ pub fn appendBatchIdentityMetadataAllNewTrustedForNamespaceAlloc(
         };
         if (visibility_summary) |*summary| noteSummaryLiveCreate(summary, generation);
         try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+        try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
     }
     try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    try appendPendingVisibilityChunkWritesAlloc(alloc, out, null, &visibility_chunks);
     if (visibility_summary) |summary| try appendVisibilitySummaryWrite(alloc, out, summary);
     return true;
 }
@@ -1247,6 +2041,26 @@ pub fn appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
     namespace: Namespace,
     generation: u64,
     out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    doc_upserts: []const []const u8,
+    state: *AllNewTrustedState,
+) !bool {
+    return try appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForNamespaceAlloc(
+        alloc,
+        namespace,
+        generation,
+        out,
+        null,
+        doc_upserts,
+        state,
+    );
+}
+
+pub fn appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForNamespaceAlloc(
+    alloc: Allocator,
+    namespace: Namespace,
+    generation: u64,
+    out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    visibility_deletes: ?*std.ArrayListUnmanaged([]u8),
     doc_upserts: []const []const u8,
     state: *AllNewTrustedState,
 ) !bool {
@@ -1274,6 +2088,8 @@ pub fn appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
 
     var visibility_summary = state.visibility_summary;
     if (!state.namespace_written) try appendNamespaceWrite(alloc, out, namespace);
+    var dirty_visibility_chunks = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer dirty_visibility_chunks.deinit(alloc);
 
     for (doc_upserts) |doc_id| {
         const ordinal = try reserveOrdinalLocal(&next_ordinal);
@@ -1283,9 +2099,13 @@ pub fn appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
         };
         noteSummaryLiveCreate(&visibility_summary, generation);
         try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, doc_state);
+        const chunk_id = try updateOwnedVisibilityChunkAlloc(alloc, &state.visibility_chunks, ordinal, doc_state);
+        try dirty_visibility_chunks.put(alloc, chunk_id, {});
     }
     try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    try appendDirtyOwnedVisibilityChunkWritesAlloc(alloc, out, visibility_deletes, &state.visibility_chunks, &dirty_visibility_chunks);
     try appendVisibilitySummaryWrite(alloc, out, visibility_summary);
+    pruneCompletedOwnedVisibilityChunks(alloc, &state.visibility_chunks, next_ordinal);
 
     state.next_ordinal = next_ordinal;
     state.visibility_summary = visibility_summary;
@@ -1307,6 +2127,7 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     namespace: Namespace,
     generation: u64,
     out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    visibility_deletes: ?*std.ArrayListUnmanaged([]u8),
     doc_upserts: []const []const u8,
     doc_deletes: []const []const u8,
 ) !bool {
@@ -1356,6 +2177,8 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     var next_ordinal = try readNextOrdinalTxn(&txn);
     const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
     if (doc_upserts.len > available_ordinals) return error.DocOrdinalExhausted;
+    var visibility_chunks = VisibilityChunkMap.empty;
+    defer deinitVisibilityChunkMap(alloc, &visibility_chunks);
     for (doc_upserts) |doc_id| {
         const ordinal = try reserveOrdinalLocal(&next_ordinal);
         const state = OrdinalState{
@@ -1364,8 +2187,10 @@ fn appendBatchIdentityMetadataAllNewFastPath(
         };
         if (visibility_summary) |*summary| noteSummaryLiveCreate(summary, generation);
         try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+        try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
     }
     try appendNextOrdinalWrite(alloc, out, next_ordinal);
+    try appendPendingVisibilityChunkWritesAlloc(alloc, out, visibility_deletes, &visibility_chunks);
     if (visibility_summary) |summary| try appendVisibilitySummaryWrite(alloc, out, summary);
     return true;
 }
@@ -2367,6 +3192,285 @@ test "live primary doc set requires complete live primary coverage" {
     defer visible_before_tombstone.deinit(alloc);
     try std.testing.expect(visible_before_tombstone.containsOrdinal(1));
     try std.testing.expect(visible_before_tombstone.containsOrdinal(2));
+}
+
+test "non-visible doc set complements visibility per generation" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var initial_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &initial_writes);
+    try appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        10,
+        &initial_writes,
+        &.{ "doc:a", "doc:b" },
+        &.{},
+    );
+    try store.putBatchWithReplay(null, initial_writes.items, &.{}, null);
+
+    const initial_stats = try fullStatsFromStore(&store);
+    try std.testing.expectEqual(@as(u64, 1), initial_stats.visibility_chunks);
+    try std.testing.expectEqual(@as(u64, 0), initial_stats.visibility_deleted_ordinals);
+    try std.testing.expect(initial_stats.visibility_mask_bytes > 0);
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(0);
+        try std.testing.expectError(error.NotFound, txn.get(deleted_key[0..]));
+    }
+
+    // Everything live: the current-read complement is empty from the summary
+    // without needing to load the durable chunk.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const chunk_key = internal_keys.identityVisibilityChunkKey(0);
+        try txn.delete(chunk_key[0..]);
+        try txn.commit();
+    }
+    var current_none_without_chunk = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, null, 16)) orelse return error.TestUnexpectedResult;
+    defer current_none_without_chunk.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 0), current_none_without_chunk.estimatedCardinality());
+
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var chunk = try rebuildVisibilityChunkFromIdentityStatesAlloc(alloc, &store, &txn, 0);
+        defer chunk.deinit(alloc);
+        try writeVisibilityChunkTxn(alloc, &txn, 0, &chunk);
+        try txn.commit();
+    }
+
+    // Everything live at a generation: the complement is empty.
+    var none_excluded = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 10, 16)) orelse return error.TestUnexpectedResult;
+    defer none_excluded.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 0), none_excluded.estimatedCardinality());
+
+    var tombstone_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &tombstone_writes);
+    try appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        12,
+        &tombstone_writes,
+        &.{},
+        &.{"doc:b"},
+    );
+    try store.putBatchWithReplay(null, tombstone_writes.items, &.{}, null);
+
+    var later_create_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &later_create_writes);
+    try appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        13,
+        &later_create_writes,
+        &.{"doc:c"},
+        &.{},
+    );
+    try store.putBatchWithReplay(null, later_create_writes.items, &.{}, null);
+
+    const after_mutation_stats = try fullStatsFromStore(&store);
+    try std.testing.expectEqual(@as(u64, 1), after_mutation_stats.visibility_chunks);
+    try std.testing.expectEqual(@as(u64, 1), after_mutation_stats.visibility_deleted_ordinals);
+
+    // At generation 12 the tombstoned ordinal and a later-created ordinal are
+    // the complement.
+    var excluded_at_12 = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 12, 16)) orelse return error.TestUnexpectedResult;
+    defer excluded_at_12.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 2), excluded_at_12.estimatedCardinality());
+    try std.testing.expect(!excluded_at_12.containsOrdinal(1));
+    try std.testing.expect(excluded_at_12.containsOrdinal(2));
+    try std.testing.expect(excluded_at_12.containsOrdinal(3));
+
+    // Deleted docs are excluded even at a read generation before the delete:
+    // query results must resolve to currently stored docs, matching the
+    // include-set path that drives off primary rows.
+    var excluded_at_11 = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 11, 16)) orelse return error.TestUnexpectedResult;
+    defer excluded_at_11.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 2), excluded_at_11.estimatedCardinality());
+    try std.testing.expect(excluded_at_11.containsOrdinal(2));
+    try std.testing.expect(excluded_at_11.containsOrdinal(3));
+
+    // Live semantics (no generation) exclude the tombstone but not the
+    // later-created live doc.
+    var excluded_live = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, null, 16)) orelse return error.TestUnexpectedResult;
+    defer excluded_live.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), excluded_live.estimatedCardinality());
+    try std.testing.expect(excluded_live.containsOrdinal(2));
+    try std.testing.expect(!excluded_live.containsOrdinal(3));
+
+    // The current-read side index is required for validation. Query-time falls
+    // back to the authoritative chunk when the summary says the side index is
+    // incomplete, but validation rejects the inconsistency.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(0);
+        try txn.delete(deleted_key[0..]);
+        try txn.commit();
+    }
+    var deleted_side_repaired_live = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, null, 16)) orelse return error.TestUnexpectedResult;
+    defer deleted_side_repaired_live.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), deleted_side_repaired_live.estimatedCardinality());
+    try std.testing.expect(deleted_side_repaired_live.containsOrdinal(2));
+    try std.testing.expectError(error.InvalidDocIdentity, validateStoreAlloc(alloc, &store));
+
+    // Missing chunk records repair by scanning the affected ordinal range, not
+    // the whole identity table.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const chunk_key = internal_keys.identityVisibilityChunkKey(0);
+        try txn.delete(chunk_key[0..]);
+        try txn.commit();
+    }
+    var repaired_excluded_at_12 = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, 12, 16)) orelse return error.TestUnexpectedResult;
+    defer repaired_excluded_at_12.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 2), repaired_excluded_at_12.estimatedCardinality());
+    try std.testing.expect(repaired_excluded_at_12.containsOrdinal(2));
+    try std.testing.expect(repaired_excluded_at_12.containsOrdinal(3));
+
+    // A zero budget overflows and asks the caller to fall back.
+    try std.testing.expectEqual(
+        @as(?doc_set.ResolvedDocSet, null),
+        try nonVisibleDocSetFromStoreAlloc(alloc, &store, 12, 0),
+    );
+}
+
+test "visibility deleted side index removes stale live chunks" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    {
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer freeIdentityWrites(alloc, &writes);
+        var visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (visibility_deletes.items) |key| alloc.free(key);
+            visibility_deletes.deinit(alloc);
+        }
+        try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+            alloc,
+            &store,
+            default_namespace,
+            10,
+            &writes,
+            &visibility_deletes,
+            &.{"doc:a"},
+            &.{},
+        );
+        try store.putBatchWithReplay(null, writes.items, visibility_deletes.items, null);
+    }
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(0);
+        try std.testing.expectError(error.NotFound, txn.get(deleted_key[0..]));
+    }
+
+    {
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer freeIdentityWrites(alloc, &writes);
+        var visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (visibility_deletes.items) |key| alloc.free(key);
+            visibility_deletes.deinit(alloc);
+        }
+        try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+            alloc,
+            &store,
+            default_namespace,
+            12,
+            &writes,
+            &visibility_deletes,
+            &.{},
+            &.{"doc:a"},
+        );
+        try store.putBatchWithReplay(null, writes.items, visibility_deletes.items, null);
+    }
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(0);
+        _ = try txn.get(deleted_key[0..]);
+    }
+
+    {
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer freeIdentityWrites(alloc, &writes);
+        var visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (visibility_deletes.items) |key| alloc.free(key);
+            visibility_deletes.deinit(alloc);
+        }
+        try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+            alloc,
+            &store,
+            default_namespace,
+            14,
+            &writes,
+            &visibility_deletes,
+            &.{"doc:a"},
+            &.{},
+        );
+        try store.putBatchWithReplay(null, writes.items, visibility_deletes.items, null);
+    }
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const deleted_key = internal_keys.identityVisibilityDeletedChunkKey(0);
+        try std.testing.expectError(error.NotFound, txn.get(deleted_key[0..]));
+    }
+    var current_live = (try nonVisibleDocSetFromStoreAlloc(alloc, &store, null, 16)) orelse return error.TestUnexpectedResult;
+    defer current_live.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 0), current_live.estimatedCardinality());
+    try validateStoreAlloc(alloc, &store);
+}
+
+test "trusted all-new visibility state keeps only open dirty chunks" {
+    const alloc = std.testing.allocator;
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &writes);
+
+    var state = AllNewTrustedState{
+        .next_ordinal = visibility_chunk_size - 1,
+        .namespace_written = true,
+    };
+    defer state.deinit(alloc);
+
+    try std.testing.expect(try appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
+        alloc,
+        default_namespace,
+        10,
+        &writes,
+        &.{ "doc:last-in-chunk", "doc:first-in-next" },
+        &state,
+    ));
+    try std.testing.expectEqual(visibility_chunk_size + 1, state.next_ordinal);
+    try std.testing.expectEqual(@as(usize, 1), state.visibility_chunks.count());
+    try std.testing.expect(!state.visibility_chunks.contains(0));
+    try std.testing.expect(state.visibility_chunks.contains(1));
 }
 
 fn appendPrimaryDocWrite(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), doc_id: []const u8) !void {
