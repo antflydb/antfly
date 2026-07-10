@@ -78,13 +78,12 @@ pub fn evaluatePrimary(primary: *const primary_mod.Primary, request: Request) !D
 }
 
 pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decision {
-    if (request.expected_identity) |expected| try validateIdentity(standby.identity, expected);
-
     const handoff = standby.promotedPrimaryHandoff() catch |err| switch (err) {
         error.StandbyNotPromoted => null,
         else => return err,
     };
     if (handoff) |promotion_handoff| {
+        if (request.expected_identity) |expected| try validateIdentity(promotion_handoff.identity, expected);
         return .{
             .kind = request.kind,
             .role = .promoted_standby,
@@ -95,6 +94,8 @@ pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decisio
             .promotion_handoff = promotion_handoff,
         };
     }
+
+    if (request.expected_identity) |expected| try validateIdentity(standby.identity, expected);
 
     const progress = standby.currentProgress();
     return .{
@@ -257,6 +258,24 @@ test "storage.ha owner job gate disables standby jobs until promoted-primary han
         try std.testing.expectEqual(Action.open_promoted_primary, decision.action);
         break :blk decision.promotion_handoff orelse return error.TestExpectedEqual;
     };
+
+    {
+        var recovered = try standby_mod.Standby.open(alloc, paths.log.ptr, paths.progress.ptr, identity, .{});
+        defer recovered.close();
+
+        const decision = try evaluateStandby(&recovered, .{
+            .kind = .compaction_publish,
+            .expected_identity = promoted_identity,
+        });
+        try std.testing.expect(!decision.canRun());
+        try std.testing.expectEqual(Role.promoted_standby, decision.role);
+        try std.testing.expectEqual(Action.open_promoted_primary, decision.action);
+        try std.testing.expect(decision.promotion_handoff != null);
+        try std.testing.expectError(error.WrongTimeline, evaluateStandby(&recovered, .{
+            .kind = .compaction_publish,
+            .expected_identity = identity,
+        }));
+    }
 
     var primary = try primary_mod.Primary.openPromotedFromStandby(alloc, paths.log.ptr, paths.slots.ptr, handoff, .{});
     defer primary.close();
