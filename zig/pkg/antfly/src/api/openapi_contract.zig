@@ -406,6 +406,7 @@ pub fn expectPublicIndexRuntimeStatusMetadata() !void {
     try std.testing.expect(@hasField(generated.IndexStatus, "status"));
     try std.testing.expect(@hasField(generated.IndexStatus, "shard_status"));
     try std.testing.expect(@hasField(generated.TableStatus, "artifact_enrichments"));
+    try std.testing.expect(@hasField(indexes_generated.EnrichmentConfig, "execution"));
     try std.testing.expect(@hasField(indexes_generated.EnrichmentConfig, "full_text_index"));
     try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "rebuilding"));
@@ -604,6 +605,10 @@ test "schema and indexes openapi modules are generated and wired" {
     try std.testing.expect(@hasDecl(schema_generated, "AntflyType"));
     try std.testing.expect(@hasDecl(indexes_generated, "IndexConfig"));
     try std.testing.expect(@hasDecl(indexes_generated, "EmbeddingsIndexConfig"));
+    try std.testing.expect(@hasDecl(indexes_generated, "ExecutionPolicy"));
+    try std.testing.expect(@hasDecl(indexes_generated, "IndexExecutionConfig"));
+    try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexConfig, "execution"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexConfig, "execution"));
     try std.testing.expect(@hasDecl(indexes_generated, "SortField"));
     try std.testing.expect(@hasDecl(generating_api_generated, "GenerationStepConfig"));
     try std.testing.expect(@hasDecl(generating_api_generated, "ClassificationTransformationResult"));

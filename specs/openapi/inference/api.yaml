@@ -314,6 +314,49 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /generate/batch:
+    post:
+      summary: Generate text for a synchronous batch of requests
+      description: |
+        Runs multiple non-streaming generation requests as one synchronous batch.
+        Compatible native requests for the same model are executed through the
+        native batched KV decoder; unsupported per-item options are returned as
+        per-item errors without failing sibling requests.
+
+        This endpoint implements the synchronous form only. Future async durable
+        batching will use the same request item shape with `mode: async`.
+      operationId: generateBatchContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateBatchRequest'
+      responses:
+        '200':
+          description: Batch generation results in request order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateBatchResponse'
+        '400':
+          description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Generation service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
@@ -935,6 +978,18 @@ components:
             - document
             - classification
             - clustering
+        error_policy:
+          type: string
+          description: |
+            Controls how dense embedding requests report per-input failures.
+            `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+            `per_item` returns successful embeddings in `data` and indexed
+            permanent/transient failures in `errors` without failing the
+            entire HTTP request.
+          default: fail_fast
+          enum:
+            - fail_fast
+            - per_item
     EmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
@@ -959,6 +1014,65 @@ components:
           description: Model used for embedding generation
         usage:
           $ref: '#/components/schemas/EmbeddingUsage'
+        errors:
+          type: array
+          description: Indexed per-input failures. Only populated when request error_policy is per_item.
+          items:
+            $ref: '#/components/schemas/EmbeddingItemError'
+        summary:
+          $ref: '#/components/schemas/EmbeddingBatchSummary'
+    EmbeddingItemError:
+      type: object
+      description: Per-input embedding failure for error_policy=per_item responses
+      required:
+        - index
+        - code
+        - message
+        - stage
+        - retryable
+        - status
+      properties:
+        index:
+          type: integer
+          description: Original input index that failed
+        code:
+          type: string
+          description: Stable machine-readable failure code
+        message:
+          type: string
+          description: Human-readable failure message
+        stage:
+          type: string
+          description: Pipeline stage that classified the failure
+          enum:
+            - parse
+            - fetch
+            - image_decode
+            - audio_decode
+            - text_inference
+            - image_inference
+            - audio_inference
+            - inference
+        retryable:
+          type: boolean
+          description: Whether retrying the same item may succeed
+        status:
+          type: integer
+          description: HTTP-style status classification for this item
+    EmbeddingBatchSummary:
+      type: object
+      description: Counts for per-item embedding responses
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
     SparseVector:
       type: object
       description: A sparse vector with parallel index/value arrays, sorted by index ascending
@@ -1850,6 +1964,8 @@ components:
             - John Smith is 30 years old and works at Google.
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: '#/components/schemas/ImageURL'
           description: |
@@ -1983,6 +2099,8 @@ components:
           example: microsoft/trocr-base-printed
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: '#/components/schemas/ImageURL'
           description: |
@@ -2560,6 +2678,93 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: '#/components/schemas/GenerateUsage'
+    GenerateBatchMode:
+      type: string
+      enum:
+        - sync
+      description: Batch execution mode. Only synchronous batches are implemented.
+    GenerateBatchRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        mode:
+          $ref: '#/components/schemas/GenerateBatchMode'
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/GenerateBatchRequestItem'
+    GenerateBatchRequestItem:
+      type: object
+      required:
+        - custom_id
+        - body
+      properties:
+        custom_id:
+          type: string
+          description: Caller-supplied identifier echoed in the result item.
+        body:
+          $ref: '#/components/schemas/GenerateRequest'
+    GenerateBatchError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+    GenerateBatchResultItem:
+      type: object
+      required:
+        - custom_id
+        - index
+      properties:
+        custom_id:
+          type: string
+        index:
+          type: integer
+          description: Zero-based request index from the submitted batch.
+        response:
+          $ref: '#/components/schemas/GenerateResponse'
+        error:
+          $ref: '#/components/schemas/GenerateBatchError'
+    GenerateBatchSummary:
+      type: object
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+    GenerateBatchResponse:
+      type: object
+      required:
+        - object
+        - data
+        - summary
+      properties:
+        object:
+          type: string
+          enum:
+            - generate.batch
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenerateBatchResultItem'
+        summary:
+          $ref: '#/components/schemas/GenerateBatchSummary'
     GenerateChoice:
       type: object
       required:

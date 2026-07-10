@@ -2379,6 +2379,8 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2514,6 +2516,8 @@ pub const EnrichmentConfig = struct {
     content_type: ?[]const u8 = null,
     /// Serialized asset producer configuration.
     producer_json: ?[]const u8 = null,
+    /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
+    execution: ?ExecutionPolicy = null,
 };
 
 /// Managed generated artifact kind.
@@ -2753,6 +2757,14 @@ pub const ExactSortError = struct {
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: []const u8,
     status: i32,
+};
+
+/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+pub const ExecutionPolicy = struct {
+    /// Maximum items to process in one batch for this operation.
+    batch_items: ?i64 = null,
+    /// Approximate maximum source bytes to process in one batch for this operation.
+    batch_bytes: ?i64 = null,
 };
 
 pub const ExtensionError = struct {
@@ -3775,6 +3787,8 @@ pub const IndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
@@ -3860,6 +3874,10 @@ pub const IndexConfig = struct {
             try jw.objectField("chunk_size");
             try jw.write(value);
         }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
         if (self.edge_types) |value| {
             try jw.objectField("edge_types");
             try jw.write(value);
@@ -3874,6 +3892,14 @@ pub const IndexConfig = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted.
+pub const IndexExecutionConfig = struct {
+    /// Chunk producer batching for shorthand-created chunk enrichments.
+    chunking: ?ExecutionPolicy = null,
+    /// Embedding producer batching for shorthand-created embedding enrichments.
+    embedding: ?ExecutionPolicy = null,
 };
 
 /// Statistics for an index
@@ -4240,6 +4266,8 @@ pub const InferenceEmbedRequest = struct {
     task_type: ?[]const u8 = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
     input_type: ?[]const u8 = null,
+    /// Controls how dense embedding requests report per-input failures. `fail_fast` preserves OpenAI-compatible all-or-error behavior. `per_item` returns successful embeddings in `data` and indexed permanent/transient failures in `errors` without failing the entire HTTP request.
+    error_policy: ?[]const u8 = null,
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
@@ -4251,6 +4279,32 @@ pub const InferenceEmbedResponse = struct {
     /// Model used for embedding generation
     model: []const u8,
     usage: InferenceEmbeddingUsage,
+    /// Indexed per-input failures. Only populated when request error_policy is per_item.
+    errors: ?[]const InferenceEmbeddingItemError = null,
+    summary: ?InferenceEmbeddingBatchSummary = null,
+};
+
+/// Counts for per-item embedding responses
+pub const InferenceEmbeddingBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
+/// Per-input embedding failure for error_policy=per_item responses
+pub const InferenceEmbeddingItemError = struct {
+    /// Original input index that failed
+    index: i64,
+    /// Stable machine-readable failure code
+    code: []const u8,
+    /// Human-readable failure message
+    message: []const u8,
+    /// Pipeline stage that classified the failure
+    stage: []const u8,
+    /// Whether retrying the same item may succeed
+    retryable: bool,
+    /// HTTP-style status classification for this item
+    status: i64,
 };
 
 /// A single embedding result
@@ -4321,6 +4375,66 @@ pub const InferenceFunctionDefinition = struct {
     parameters: ?std.json.Value = null,
     /// Whether to enforce strict parameter validation
     strict: ?bool = null,
+};
+
+pub const InferenceGenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const InferenceGenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceGenerateBatchRequest = struct {
+    mode: ?InferenceGenerateBatchMode = null,
+    requests: []const InferenceGenerateBatchRequestItem,
+};
+
+pub const InferenceGenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: InferenceGenerateRequest,
+};
+
+pub const InferenceGenerateBatchResponse = struct {
+    object: []const u8,
+    data: []const InferenceGenerateBatchResultItem,
+    summary: InferenceGenerateBatchSummary,
+};
+
+pub const InferenceGenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
+    index: i64,
+    response: ?InferenceGenerateResponse = null,
+    @"error": ?InferenceGenerateBatchError = null,
+};
+
+pub const InferenceGenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
 };
 
 pub const InferenceGenerateChoice = struct {

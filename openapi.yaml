@@ -6097,6 +6097,54 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ai/v1/generate/batch:
+    post:
+      summary: Generate text for a synchronous batch of requests
+      description: >
+        Runs multiple non-streaming generation requests as one synchronous batch.
+
+        Compatible native requests for the same model are executed through the
+
+        native batched KV decoder; unsupported per-item options are returned as
+
+        per-item errors without failing sibling requests.
+
+
+        This endpoint implements the synchronous form only. Future async durable
+
+        batching will use the same request item shape with `mode: async`.
+      operationId: generateBatchContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceGenerateBatchRequest'
+      responses:
+        '200':
+          description: Batch generation results in request order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceGenerateBatchResponse'
+        '400':
+          description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: Generation service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
@@ -14082,6 +14130,23 @@ components:
         - asset
         - embedding
       description: Managed generated artifact kind.
+    ExecutionPolicy:
+      type: object
+      additionalProperties: false
+      description: Non-semantic execution policy for one producer or index maintenance operation. These
+        fields tune how work is batched and do not change generated artifact identity.
+      properties:
+        batch_items:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: Maximum items to process in one batch for this operation.
+        batch_bytes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          format: uint64
+          description: Approximate maximum source bytes to process in one batch for this operation.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -14141,6 +14206,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Serialized asset producer configuration.
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Non-semantic execution policy for this enrichment producer. This does not participate
+            in generated artifact identity.
     FullTextIndexConfig:
       type: object
       properties:
@@ -15328,6 +15397,18 @@ components:
         text:
           target_tokens: 500
           overlap_tokens: 50
+    IndexExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: Namespaced execution policy for managed index shorthand. Only namespaces with runtime
+        effects are accepted.
+      properties:
+        chunking:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Chunk producer batching for shorthand-created chunk enrichments.
+        embedding:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Embedding producer batching for shorthand-created embedding enrichments.
     EmbeddingsIndexConfig:
       type: object
       description: Unified configuration for embeddings indexes. When sparse is true, creates a sparse
@@ -15411,6 +15492,9 @@ components:
           minimum: 64
           default: 1024
           description: Number of documents per posting list chunk (sparse only)
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
+          description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
     EdgeTypeConfig:
       type: object
       description: Configuration for a specific edge type
@@ -19225,6 +19309,22 @@ components:
             - document
             - classification
             - clustering
+        error_policy:
+          type: string
+          description: >
+            Controls how dense embedding requests report per-input failures.
+
+            `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+
+            `per_item` returns successful embeddings in `data` and indexed
+
+            permanent/transient failures in `errors` without failing the
+
+            entire HTTP request.
+          default: fail_fast
+          enum:
+            - fail_fast
+            - per_item
     InferenceEmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense
@@ -19250,6 +19350,65 @@ components:
           description: Model used for embedding generation
         usage:
           $ref: '#/components/schemas/InferenceEmbeddingUsage'
+        errors:
+          type: array
+          description: Indexed per-input failures. Only populated when request error_policy is per_item.
+          items:
+            $ref: '#/components/schemas/InferenceEmbeddingItemError'
+        summary:
+          $ref: '#/components/schemas/InferenceEmbeddingBatchSummary'
+    InferenceEmbeddingItemError:
+      type: object
+      description: Per-input embedding failure for error_policy=per_item responses
+      required:
+        - index
+        - code
+        - message
+        - stage
+        - retryable
+        - status
+      properties:
+        index:
+          type: integer
+          description: Original input index that failed
+        code:
+          type: string
+          description: Stable machine-readable failure code
+        message:
+          type: string
+          description: Human-readable failure message
+        stage:
+          type: string
+          description: Pipeline stage that classified the failure
+          enum:
+            - parse
+            - fetch
+            - image_decode
+            - audio_decode
+            - text_inference
+            - image_inference
+            - audio_inference
+            - inference
+        retryable:
+          type: boolean
+          description: Whether retrying the same item may succeed
+        status:
+          type: integer
+          description: HTTP-style status classification for this item
+    InferenceEmbeddingBatchSummary:
+      type: object
+      description: Counts for per-item embedding responses
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
     InferenceSparseVector:
       type: object
       description: A sparse vector with parallel index/value arrays, sorted by index ascending
@@ -19543,6 +19702,8 @@ components:
           example: microsoft/trocr-base-printed
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: '#/components/schemas/InferenceImageURL'
           description: >
@@ -20141,6 +20302,93 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceGenerateBatchMode:
+      type: string
+      enum:
+        - sync
+      description: Batch execution mode. Only synchronous batches are implemented.
+    InferenceGenerateBatchRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        mode:
+          $ref: '#/components/schemas/InferenceGenerateBatchMode'
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/InferenceGenerateBatchRequestItem'
+    InferenceGenerateBatchRequestItem:
+      type: object
+      required:
+        - custom_id
+        - body
+      properties:
+        custom_id:
+          type: string
+          description: Caller-supplied identifier echoed in the result item.
+        body:
+          $ref: '#/components/schemas/InferenceGenerateRequest'
+    InferenceGenerateBatchError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+    InferenceGenerateBatchResultItem:
+      type: object
+      required:
+        - custom_id
+        - index
+      properties:
+        custom_id:
+          type: string
+        index:
+          type: integer
+          description: Zero-based request index from the submitted batch.
+        response:
+          $ref: '#/components/schemas/InferenceGenerateResponse'
+        error:
+          $ref: '#/components/schemas/InferenceGenerateBatchError'
+    InferenceGenerateBatchSummary:
+      type: object
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+    InferenceGenerateBatchResponse:
+      type: object
+      required:
+        - object
+        - data
+        - summary
+      properties:
+        object:
+          type: string
+          enum:
+            - generate.batch
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceGenerateBatchResultItem'
+        summary:
+          $ref: '#/components/schemas/InferenceGenerateBatchSummary'
     InferenceGenerateChoice:
       type: object
       required:

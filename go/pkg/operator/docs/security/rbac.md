@@ -84,7 +84,7 @@ rules:
     verbs: ["get", "list"]
 ```
 
-The default ClusterRole intentionally does not grant access to Kubernetes Secrets or `nodes/proxy`. Storage auto-grow is the only operator feature that needs `nodes/proxy` to read kubelet volume usage from `/stats/summary`; apply this optional add-on only for clusters using `spec.storage.storageAutoGrow.enabled: true`:
+The default ClusterRole intentionally does not grant access to Kubernetes Secrets or `nodes/proxy`. HA admin tokens referenced by `spec.highAvailability.runtime.adminTokenSecretRef` are injected into runtime pods and CLI fallback Jobs by Kubernetes; the operator does not read those Secret values for status probes or typed admin actions. Storage auto-grow is the only operator feature that needs `nodes/proxy` to read kubelet volume usage from `/stats/summary`; apply this optional add-on only for clusters using `spec.storage.storageAutoGrow.enabled: true`:
 
 | Resource | Permissions |
 |----------|-------------|

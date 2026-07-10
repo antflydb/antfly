@@ -4184,6 +4184,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "api auto bulk ingest does not open sessions for normal online writes",
+            "auto bulk group writes release leases so idle finish can publish",
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
@@ -4208,6 +4209,8 @@ pub fn build(b: *std.Build) void {
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
+            "provisioned table write source preserves same-key delete then write across coalesced waiters",
+            "provisioned table write coalescer isolates invalid waiter on same-key overlap",
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",

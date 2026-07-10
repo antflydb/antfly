@@ -50,6 +50,30 @@ func TestHAStatusParserAcceptsLegacyPrimaryEnvelope(t *testing.T) {
 	}
 }
 
+func TestHAStatusParserAcceptsFreshPrimaryRetentionSentinel(t *testing.T) {
+	t.Parallel()
+
+	body := `{"schema_version":1,"snapshot":{"role":"primary","node_id":"primary-a","identity":{"cluster_id":5588500719990866000,"shard_id":0,"table_id":0,"timeline_id":1,"epoch":1},"current_lsn":0,"slots":[{"name":"standby-a","timeline_id":1,"active":true,"reseed_required":false,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"write_lag_lsn":0,"apply_lag_lsn":0,"safe_read_lag_lsn":0,"retention_lag_lsn":0,"status":"healthy","last_error":null}],"retention":{"primary_lsn":0,"oldest_restart_lsn":0,"retained_lsn_count":1,"retained_byte_count":0,"retained_age_ns":0,"active_slots":1,"reseed_recommended":0},"durability":null}}`
+
+	parsed, err := ParseHAPrimaryStatus([]byte(body))
+	if err != nil {
+		t.Fatalf("ParseHAPrimaryStatus returned error: %v", err)
+	}
+	if parsed.Response.Snapshot.Retention.RetainedLsnCount != 1 {
+		t.Fatalf("RetainedLsnCount = %d, want 1", parsed.Response.Snapshot.Retention.RetainedLsnCount)
+	}
+	if err := ValidateHAPrimaryStatusResponseEvidence([]byte(body)); err != nil {
+		t.Fatalf("ValidateHAPrimaryStatusResponseEvidence returned error: %v", err)
+	}
+	var response HAPrimaryStatusResponse
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v", err)
+	}
+	if err := ValidateHAPrimaryStatusResponse(response); err != nil {
+		t.Fatalf("ValidateHAPrimaryStatusResponse returned error: %v", err)
+	}
+}
+
 func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 	t.Parallel()
 

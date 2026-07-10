@@ -755,6 +755,7 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_finish_requested: bool = false,
 
         fn detachRuntimeHooks(self: *Entry) void {
+            self.db.setQueryVisibilityHook(null);
             self.db.setResolutionCandidateSource(null);
             self.db.setEntitySink(null);
             self.db.setPromotionOwner(null);
@@ -8718,6 +8719,25 @@ pub const ProvisionedTableWriteSource = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
+
+        // A merged batch is only correct when the waiters touch disjoint
+        // keys: DB batch application resolves writes before deletes
+        // regardless of request order, so cross-waiter same-key merging
+        // would invert enqueue order (an earlier delete beating a later
+        // write), and collapsing ops per key would acknowledge a waiter
+        // whose operation was never validated or applied. On any overlap,
+        // fall back to applying the waiters individually in enqueue order,
+        // which preserves per-key last-operation-wins and per-waiter error
+        // isolation.
+        const overlap = coalescedEntriesShareKeys(arena_alloc, entries) catch |err| {
+            self.finishCoalescedEntries(entries, err);
+            return;
+        };
+        if (overlap) {
+            self.applyCoalescedEntriesIndividually(alloc, table_name, entries);
+            return;
+        }
+
         var merged = GroupBatch{ .group_id = group_id };
         merged.writes.ensureTotalCapacity(arena_alloc, totalCoalescedWrites(entries)) catch |err| {
             self.finishCoalescedEntries(entries, err);
@@ -8764,6 +8784,26 @@ pub const ProvisionedTableWriteSource = struct {
             };
             self.finishCoalescedEntry(entry, apply_err);
         }
+    }
+
+    // True when any key appears more than once across the coalesced waiters'
+    // writes and deletes (including twice within one waiter's batch).
+    fn coalescedEntriesShareKeys(
+        arena_alloc: std.mem.Allocator,
+        entries: []const *WriteCoalesceEntry,
+    ) !bool {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        for (entries) |entry| {
+            for (entry.group.writes.items) |write| {
+                const gop = try seen.getOrPut(arena_alloc, write.key);
+                if (gop.found_existing) return true;
+            }
+            for (entry.group.deletes.items) |key| {
+                const gop = try seen.getOrPut(arena_alloc, key);
+                if (gop.found_existing) return true;
+            }
+        }
+        return false;
     }
 
     fn totalCoalescedWrites(entries: []const *WriteCoalesceEntry) usize {
@@ -19905,12 +19945,16 @@ const ProvisionedWriteCoalesceProbe = struct {
 const ProvisionedWriteCoalesceBatchWorker = struct {
     source: *ProvisionedTableWriteSource,
     key: []const u8,
-    value: []const u8,
+    value: []const u8 = "",
+    delete: bool = false,
     err: ?anyerror = null,
 
     fn run(self: *@This()) void {
+        const writes: []const db_mod.types.BatchWrite = if (self.delete) &.{} else &.{.{ .key = self.key, .value = self.value }};
+        const deletes: []const []const u8 = if (self.delete) &.{self.key} else &.{};
         _ = self.source.source().batch(std.heap.page_allocator, "docs", .{
-            .writes = &.{.{ .key = self.key, .value = self.value }},
+            .writes = writes,
+            .deletes = deletes,
             .sync_level = .write,
         }) catch |err| {
             self.err = err;
@@ -19972,6 +20016,112 @@ test "provisioned table write source coalesces same-group waiters" {
     var gamma = (try cached.db.lookup(alloc, "doc:c", .{})).?;
     defer gamma.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, gamma.json, "\"gamma\"") != null);
+}
+
+test "provisioned table write source preserves same-key delete then write across coalesced waiters" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-batch-coalesce-delete-write-order";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    var probe = ProvisionedWriteCoalesceProbe{};
+    test_before_batch_execution_hook = .{ .ptr = &probe, .run = ProvisionedWriteCoalesceProbe.beforeBatch };
+    defer test_before_batch_execution_hook = null;
+
+    var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
+    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
+    var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{\"title\":\"beta\"}" };
+    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
+    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
+    probe.release_first.store(true, .release);
+
+    first_thread.join();
+    second_thread.join();
+    third_thread.join();
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    if (third.err) |err| return err;
+
+    var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
+    defer cached.deinit(alloc);
+    try drainManagedDbBeforeClose(cached.db);
+    var order = (try cached.db.lookup(alloc, "doc:order", .{})).?;
+    defer order.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, order.json, "\"beta\"") != null);
+}
+
+test "provisioned table write coalescer isolates invalid waiter on same-key overlap" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-batch-coalesce-overlap-isolation";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    var probe = ProvisionedWriteCoalesceProbe{};
+    test_before_batch_execution_hook = .{ .ptr = &probe, .run = ProvisionedWriteCoalesceProbe.beforeBatch };
+    defer test_before_batch_execution_hook = null;
+
+    var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
+    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    // An invalid write and a later delete of the same key land in one
+    // coalesced flush. Same-key merging must not swallow the invalid
+    // operation: its waiter has to receive the validation error while the
+    // delete succeeds independently.
+    var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{not json" };
+    var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
+    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
+    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
+    probe.release_first.store(true, .release);
+
+    first_thread.join();
+    second_thread.join();
+    third_thread.join();
+    if (first.err) |err| return err;
+    try std.testing.expect(second.err != null);
+    if (third.err) |err| return err;
+
+    var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
+    defer cached.deinit(alloc);
+    try drainManagedDbBeforeClose(cached.db);
+    try std.testing.expect((try cached.db.lookup(alloc, "doc:order", .{})) == null);
 }
 
 test "provisioned table write coalescer isolates failed waiters" {

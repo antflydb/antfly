@@ -349,6 +349,8 @@ pub const EmbedRequest = struct {
     task_type: ?[]const u8 = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
     input_type: ?[]const u8 = null,
+    /// Controls how dense embedding requests report per-input failures. `fail_fast` preserves OpenAI-compatible all-or-error behavior. `per_item` returns successful embeddings in `data` and indexed permanent/transient failures in `errors` without failing the entire HTTP request.
+    error_policy: ?[]const u8 = null,
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
@@ -360,6 +362,32 @@ pub const EmbedResponse = struct {
     /// Model used for embedding generation
     model: []const u8,
     usage: EmbeddingUsage,
+    /// Indexed per-input failures. Only populated when request error_policy is per_item.
+    errors: ?[]const EmbeddingItemError = null,
+    summary: ?EmbeddingBatchSummary = null,
+};
+
+/// Counts for per-item embedding responses
+pub const EmbeddingBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
+/// Per-input embedding failure for error_policy=per_item responses
+pub const EmbeddingItemError = struct {
+    /// Original input index that failed
+    index: i64,
+    /// Stable machine-readable failure code
+    code: []const u8,
+    /// Human-readable failure message
+    message: []const u8,
+    /// Pipeline stage that classified the failure
+    stage: []const u8,
+    /// Whether retrying the same item may succeed
+    retryable: bool,
+    /// HTTP-style status classification for this item
+    status: i64,
 };
 
 /// A single embedding result
@@ -483,6 +511,66 @@ pub const FunctionDefinition = struct {
     parameters: ?std.json.Value = null,
     /// Whether to enforce strict parameter validation
     strict: ?bool = null,
+};
+
+pub const GenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const GenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GenerateBatchRequest = struct {
+    mode: ?GenerateBatchMode = null,
+    requests: []const GenerateBatchRequestItem,
+};
+
+pub const GenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: GenerateRequest,
+};
+
+pub const GenerateBatchResponse = struct {
+    object: []const u8,
+    data: []const GenerateBatchResultItem,
+    summary: GenerateBatchSummary,
+};
+
+pub const GenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
+    index: i64,
+    response: ?GenerateResponse = null,
+    @"error": ?GenerateBatchError = null,
+};
+
+pub const GenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
 };
 
 pub const GenerateChoice = struct {

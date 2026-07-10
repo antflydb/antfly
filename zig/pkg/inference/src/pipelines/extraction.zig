@@ -178,26 +178,53 @@ pub fn extractBatch(
     schemas: []const ExtractionSchema,
     config: ExtractionConfig,
 ) ![]ExtractionResult {
+    pipeline.config.threshold = config.threshold;
+    pipeline.config.flat_ner = config.flat_ner;
+
     const results = try allocator.alloc(ExtractionResult, texts.len);
+    const initialized_structures = try allocator.alloc(usize, texts.len);
+    defer allocator.free(initialized_structures);
+    @memset(initialized_structures, 0);
     var initialized: usize = 0;
     errdefer {
-        for (results[0..initialized]) |*result| result.deinit(allocator);
+        for (results[0..initialized], 0..) |*result, i| {
+            for (result.structures[0..initialized_structures[i]]) |*structure| structure.deinit(allocator);
+            allocator.free(result.structures);
+        }
         allocator.free(results);
     }
 
-    for (texts, 0..) |text, i| {
-        var structures = std.ArrayListUnmanaged(StructureResult).empty;
-        errdefer {
-            for (structures.items) |*structure| structure.deinit(allocator);
-            structures.deinit(allocator);
-        }
-
-        for (schemas) |schema| {
-            try structures.append(allocator, try extractStructure(allocator, pipeline, text, schema, config));
-        }
-
-        results[i] = .{ .structures = try structures.toOwnedSlice(allocator) };
+    for (texts, 0..) |_, i| {
+        results[i] = .{ .structures = try allocator.alloc(StructureResult, schemas.len) };
         initialized += 1;
+    }
+
+    for (schemas, 0..) |schema, schema_index| {
+        const labels = try allocator.alloc([]const u8, schema.fields.len);
+        defer allocator.free(labels);
+        for (schema.fields, 0..) |field, i| labels[i] = field.name;
+
+        const entity_batches = try pipeline.recognizeBatch(texts, labels);
+        defer {
+            for (entity_batches) |entities| {
+                for (entities) |entity| allocator.free(entity.text);
+                allocator.free(entities);
+            }
+            allocator.free(entity_batches);
+        }
+        if (entity_batches.len != texts.len) return error.InvalidExtractionResponse;
+
+        for (texts, entity_batches, 0..) |text, raw_entities, text_index| {
+            results[text_index].structures[schema_index] = try extractStructureFromEntities(
+                allocator,
+                pipeline,
+                text,
+                schema,
+                raw_entities,
+                config,
+            );
+            initialized_structures[text_index] += 1;
+        }
     }
 
     return results;
@@ -330,6 +357,17 @@ fn extractStructure(
     }
 
     const raw_entities = if (entity_batches.len > 0) entity_batches[0] else &.{};
+    return try extractStructureFromEntities(allocator, pipeline, text, schema, raw_entities, config);
+}
+
+fn extractStructureFromEntities(
+    allocator: std.mem.Allocator,
+    pipeline: *GlinerPipeline,
+    text: []const u8,
+    schema: ExtractionSchema,
+    raw_entities: []const Entity,
+    config: ExtractionConfig,
+) !StructureResult {
     const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, config.cleanup_model, text, raw_entities);
     defer if (cleaned_entities) |entities| freeOwnedEntities(allocator, entities);
 

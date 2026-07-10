@@ -357,7 +357,8 @@ fn isAllowedPublicArtifactEnrichmentField(field_name: []const u8) bool {
         std.mem.eql(u8, field_name, "chunker_json") or
         std.mem.eql(u8, field_name, "full_text_index") or
         std.mem.eql(u8, field_name, "content_type") or
-        std.mem.eql(u8, field_name, "producer_json");
+        std.mem.eql(u8, field_name, "producer_json") or
+        std.mem.eql(u8, field_name, "execution");
 }
 
 fn extractPublicIndexType(object: anytype) ?[]const u8 {

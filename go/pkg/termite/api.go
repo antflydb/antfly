@@ -53,6 +53,13 @@ import (
 	_ "golang.org/x/image/webp"
 )
 
+const (
+	maxReadBatchImages = 64
+	maxReadBatchBytes  = int64(256 * 1024 * 1024)
+)
+
+var errReadBatchTooLarge = errors.New("read batch too large")
+
 // NOTE: SerializeFloatArrays is in codec.go in this package
 
 // TermiteAPI implements the generated ServerInterface
@@ -71,6 +78,41 @@ func NewTermiteAPI(logger *zap.Logger, node *TermiteNode) http.Handler {
 		BaseURL:    "/ai/v1",
 		BaseRouter: http.NewServeMux(),
 	})
+}
+
+type captureResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func newCaptureResponseWriter() *captureResponseWriter {
+	return &captureResponseWriter{header: make(http.Header)}
+}
+
+func (w *captureResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *captureResponseWriter) WriteHeader(statusCode int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = statusCode
+}
+
+func (w *captureResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+
+func (w *captureResponseWriter) Status() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
 }
 
 // GenerateEmbeddings implements ServerInterface
@@ -101,6 +143,11 @@ func (t *TermiteAPI) RecognizeEntities(w http.ResponseWriter, r *http.Request) {
 // GenerateContent implements ServerInterface
 func (t *TermiteAPI) GenerateContent(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiGenerate(w, r)
+}
+
+// GenerateBatchContent implements ServerInterface
+func (t *TermiteAPI) GenerateBatchContent(w http.ResponseWriter, r *http.Request) {
+	t.node.handleApiGenerateBatch(w, r)
 }
 
 // RewriteText implements ServerInterface
@@ -1409,6 +1456,136 @@ func mediaPartImageURL(part MediaContentPart) string {
 	return "data:" + part.MimeType + ";base64," + base64.StdEncoding.EncodeToString(part.Data)
 }
 
+func generateBatchErrorFromHTTPStatus(status int, message string) GenerateBatchError {
+	code := "GENERATION_FAILED"
+	retryable := status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+	switch status {
+	case http.StatusBadRequest:
+		code = "INVALID_REQUEST"
+	case http.StatusNotFound:
+		code = "MODEL_NOT_FOUND"
+	case http.StatusRequestTimeout:
+		code = "REQUEST_TIMEOUT"
+	case http.StatusTooManyRequests:
+		code = "QUEUE_FULL"
+	case http.StatusServiceUnavailable:
+		code = "SERVICE_UNAVAILABLE"
+	}
+	return GenerateBatchError{
+		Code:      code,
+		Message:   strings.TrimSpace(message),
+		Retryable: retryable,
+	}
+}
+
+// handleApiGenerateBatch handles synchronous batch generation requests.
+//
+// The Go Termite runtime delegates each item through the existing single-request
+// generator path. The Zig inference server implements the native batched KV
+// scheduler for compatible GGUF-backed generation requests.
+func (ln *TermiteNode) handleApiGenerateBatch(w http.ResponseWriter, r *http.Request) {
+	defer func() { _ = r.Body.Close() }()
+
+	var req GenerateBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decoding request: %v", err), http.StatusBadRequest)
+		return
+	}
+	if req.Mode != "" && req.Mode != GenerateBatchModeSync {
+		http.Error(w, fmt.Sprintf("unsupported batch mode: %s", req.Mode), http.StatusBadRequest)
+		return
+	}
+	if len(req.Requests) == 0 {
+		http.Error(w, "requests are required", http.StatusBadRequest)
+		return
+	}
+	if len(req.Requests) > 128 {
+		http.Error(w, "requests must contain at most 128 items", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	resp := GenerateBatchResponse{
+		Object: GenerateBatchResponseObjectGenerateBatch,
+		Data:   make([]GenerateBatchResultItem, len(req.Requests)),
+		Summary: GenerateBatchSummary{
+			Total: len(req.Requests),
+		},
+	}
+
+	for i, item := range req.Requests {
+		result := GenerateBatchResultItem{
+			CustomId: item.CustomId,
+			Index:    i,
+		}
+
+		if item.Body.Stream {
+			result.Error = GenerateBatchError{
+				Code:    "UNSUPPORTED_STREAM",
+				Message: "streaming is not supported for synchronous generate batches",
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		body, err := json.Marshal(item.Body)
+		if err != nil {
+			result.Error = GenerateBatchError{
+				Code:    "INVALID_REQUEST",
+				Message: fmt.Sprintf("encoding request item: %v", err),
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		itemReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "/ai/v1/generate", bytes.NewReader(body))
+		if err != nil {
+			result.Error = GenerateBatchError{
+				Code:      "INTERNAL_ERROR",
+				Message:   fmt.Sprintf("creating request item: %v", err),
+				Retryable: true,
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+		itemReq.Header = r.Header.Clone()
+		itemReq.Header.Set("Content-Type", "application/json")
+
+		itemWriter := newCaptureResponseWriter()
+		ln.handleApiGenerate(itemWriter, itemReq)
+		status := itemWriter.Status()
+		if status < http.StatusOK || status >= http.StatusMultipleChoices {
+			result.Error = generateBatchErrorFromHTTPStatus(status, itemWriter.body.String())
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		if err := json.Unmarshal(itemWriter.body.Bytes(), &result.Response); err != nil {
+			result.Error = GenerateBatchError{
+				Code:      "INVALID_RESPONSE",
+				Message:   fmt.Sprintf("decoding generation response: %v", err),
+				Retryable: true,
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		resp.Summary.Succeeded++
+		resp.Data[i] = result
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		ln.logger.Error("encoding response", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
 // handleApiGenerate handles text generation requests using LLM models (OpenAI-compatible)
 func (ln *TermiteNode) handleApiGenerate(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
@@ -2155,6 +2332,10 @@ func (ln *TermiteNode) handleApiRead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "images are required", http.StatusBadRequest)
 		return
 	}
+	if len(req.Images) > maxReadBatchImages {
+		http.Error(w, fmt.Sprintf("images must contain at most %d items", maxReadBatchImages), http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	// Acquire reader model from registry
 	reader, err := ln.readerRegistry.Acquire(req.Model)
@@ -2171,6 +2352,10 @@ func (ln *TermiteNode) handleApiRead(w http.ResponseWriter, r *http.Request) {
 			zap.String("model", req.Model),
 			zap.Int("num_images", len(req.Images)),
 			zap.Error(err))
+		if errors.Is(err, errReadBatchTooLarge) {
+			http.Error(w, fmt.Sprintf("total downloaded image bytes must be at most %d", maxReadBatchBytes), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, fmt.Sprintf("failed to download images: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -2244,14 +2429,27 @@ func (ln *TermiteNode) handleApiRead(w http.ResponseWriter, r *http.Request) {
 // downloadAndDecodeImages downloads images from URLs and decodes them to image.Image
 func downloadAndDecodeImages(ctx context.Context, imageURLs []ImageURL, secConfig *scraping.ContentSecurityConfig, s3Creds *s3.Credentials) ([]image.Image, error) {
 	images := make([]image.Image, 0, len(imageURLs))
+	var downloadedBytes int64
 
 	for _, imgURL := range imageURLs {
+		if downloadedBytes >= maxReadBatchBytes {
+			return nil, errReadBatchTooLarge
+		}
+		remainingBytes := maxReadBatchBytes - downloadedBytes
+		boundedSecurity := boundedReadContentSecurity(secConfig, remainingBytes)
 		// Download image data - returns (mimeType, data []byte, error)
 		// scraping.DownloadContent handles data:, http://, https://, file://, s3:// URLs
 		// and returns already-decoded bytes (base64 decoding for data: URLs is handled internally)
-		_, imageData, err := scraping.DownloadContent(ctx, imgURL.Url, secConfig, s3Creds)
+		contentType, imageData, err := scraping.DownloadContent(ctx, imgURL.Url, boundedSecurity, s3Creds)
 		if err != nil {
+			if errors.Is(err, scraping.ErrDownloadTooLarge) {
+				return nil, errReadBatchTooLarge
+			}
 			return nil, fmt.Errorf("downloading image %s: %w", imgURL.Url, err)
+		}
+		downloadedBytes += int64(len(imageData)) + int64(len(contentType))
+		if downloadedBytes > maxReadBatchBytes {
+			return nil, errReadBatchTooLarge
 		}
 
 		// Decode image from bytes
@@ -2264,6 +2462,21 @@ func downloadAndDecodeImages(ctx context.Context, imageURLs []ImageURL, secConfi
 	}
 
 	return images, nil
+}
+
+func boundedReadContentSecurity(secConfig *scraping.ContentSecurityConfig, remainingBytes int64) *scraping.ContentSecurityConfig {
+	if remainingBytes < 1 {
+		remainingBytes = 1
+	}
+	downloadLimit := remainingBytes + 1
+	if secConfig == nil {
+		return &scraping.ContentSecurityConfig{MaxDownloadSizeBytes: downloadLimit}
+	}
+	bounded := *secConfig
+	if bounded.MaxDownloadSizeBytes <= 0 || bounded.MaxDownloadSizeBytes > downloadLimit {
+		bounded.MaxDownloadSizeBytes = downloadLimit
+	}
+	return &bounded
 }
 
 // handleApiTranscribe handles speech-to-text transcription requests
