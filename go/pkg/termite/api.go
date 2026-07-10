@@ -2442,6 +2442,9 @@ func downloadAndDecodeImages(ctx context.Context, imageURLs []ImageURL, secConfi
 		// and returns already-decoded bytes (base64 decoding for data: URLs is handled internally)
 		contentType, imageData, err := scraping.DownloadContent(ctx, imgURL.Url, boundedSecurity, s3Creds)
 		if err != nil {
+			if errors.Is(err, scraping.ErrDownloadTooLarge) {
+				return nil, errReadBatchTooLarge
+			}
 			return nil, fmt.Errorf("downloading image %s: %w", imgURL.Url, err)
 		}
 		downloadedBytes += int64(len(imageData)) + int64(len(contentType))
@@ -2465,10 +2468,7 @@ func boundedReadContentSecurity(secConfig *scraping.ContentSecurityConfig, remai
 	if remainingBytes < 1 {
 		remainingBytes = 1
 	}
-	downloadLimit := remainingBytes
-	if downloadLimit < maxReadBatchBytes {
-		downloadLimit++
-	}
+	downloadLimit := remainingBytes + 1
 	if secConfig == nil {
 		return &scraping.ContentSecurityConfig{MaxDownloadSizeBytes: downloadLimit}
 	}

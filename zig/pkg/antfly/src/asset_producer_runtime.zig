@@ -565,6 +565,12 @@ fn generatorConfigFromValue(alloc: Allocator, value: std.json.Value) !generating
         .credentials_path = if (jsonStringField(value, "credentials_path")) |text| try alloc.dupe(u8, text) else null,
         .tools_json = if (value.object.get("tools")) |tools| try std.json.Stringify.valueAlloc(alloc, tools, .{}) else null,
         .tool_choice_json = if (value.object.get("tool_choice")) |tool_choice| try std.json.Stringify.valueAlloc(alloc, tool_choice, .{}) else null,
+        .max_tokens = jsonIntegerField(value, "max_tokens") orelse generating_runtime.default_max_tokens,
+        .temperature = jsonFloatField(value, "temperature"),
+        .top_p = jsonFloatField(value, "top_p"),
+        .top_k = jsonIntegerField(value, "top_k"),
+        .frequency_penalty = jsonFloatField(value, "frequency_penalty"),
+        .presence_penalty = jsonFloatField(value, "presence_penalty"),
     };
     errdefer cfg.deinit(alloc);
     try cfg.validate();
@@ -585,6 +591,25 @@ fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const found = value.object.get(field) orelse return null;
     return if (found == .string) found.string else null;
+}
+
+fn jsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .integer => |integer| integer,
+        else => null,
+    };
+}
+
+fn jsonFloatField(value: std.json.Value, field: []const u8) ?f32 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .float => |float| @floatCast(float),
+        .integer => |integer| @floatFromInt(integer),
+        else => null,
+    };
 }
 
 fn forcedToolName(tool_choice: ?std.json.Value) ?[]const u8 {
@@ -799,15 +824,28 @@ fn antflyGenerateBatchRequestJsonAlloc(
         );
         defer alloc.free(item);
         try out.appendSlice(alloc, item);
-        if (cfg.max_tokens > 0) {
-            const max_tokens = try std.fmt.allocPrint(alloc, ",\"max_tokens\":{d}", .{cfg.max_tokens});
-            defer alloc.free(max_tokens);
-            try out.appendSlice(alloc, max_tokens);
-        }
+        try appendBatchI64Field(alloc, &out, "max_tokens", cfg.max_tokens);
+        if (cfg.temperature) |temperature| try appendBatchFloatField(alloc, &out, "temperature", temperature);
+        if (cfg.top_p) |top_p| try appendBatchFloatField(alloc, &out, "top_p", top_p);
+        if (cfg.top_k) |top_k| try appendBatchI64Field(alloc, &out, "top_k", top_k);
+        if (cfg.frequency_penalty) |frequency_penalty| try appendBatchFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
+        if (cfg.presence_penalty) |presence_penalty| try appendBatchFloatField(alloc, &out, "presence_penalty", presence_penalty);
         try out.appendSlice(alloc, "}}}");
     }
     try out.appendSlice(alloc, "]}");
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendBatchI64Field(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: i64) !void {
+    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{d}", .{ name, value });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
+}
+
+fn appendBatchFloatField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: f32) !void {
+    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
 }
 
 fn parseAntflyGenerateBatchResponseAlloc(alloc: Allocator, payload: []const u8, count: usize) ![][]u8 {
@@ -1154,6 +1192,12 @@ fn expectAntflyGenerateBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"local-generator\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":\"first prompt\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":\"second prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"max_tokens\":24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"temperature\":0.25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"top_p\":0.9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"top_k\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"frequency_penalty\":0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"presence_penalty\":0.2") != null);
 }
 
 test "asset producer runtime batches compatible antfly generator requests" {
@@ -1179,7 +1223,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
     var runtime = Runtime.init(alloc, &client);
     const producer = runtime.producer();
 
-    const cfg_json = try std.fmt.allocPrint(alloc, "{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"url\":\"{s}\",\"max_tokens\":24}}", .{server.baseUrl()});
+    const cfg_json = try std.fmt.allocPrint(alloc, "{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"url\":\"{s}\",\"max_tokens\":24,\"temperature\":0.25,\"top_p\":0.9,\"top_k\":40,\"frequency_penalty\":0.1,\"presence_penalty\":0.2}}", .{server.baseUrl()});
     defer alloc.free(cfg_json);
 
     var results: ?[][]u8 = null;

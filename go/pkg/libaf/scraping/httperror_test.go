@@ -15,7 +15,12 @@
 package scraping
 
 import (
+	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -43,4 +48,37 @@ func TestHTTPError(t *testing.T) {
 		var httpErr *HTTPError
 		assert.NotErrorAs(t, err, &httpErr)
 	})
+}
+
+func TestParseDataURIWithLimit(t *testing.T) {
+	t.Run("rejects base64 before decode", func(t *testing.T) {
+		payload := base64.StdEncoding.EncodeToString([]byte("0123456789"))
+		_, _, err := ParseDataURIWithLimit("data:text/plain;base64,"+payload, 9)
+		require.ErrorIs(t, err, ErrDownloadTooLarge)
+	})
+
+	t.Run("allows payload at limit", func(t *testing.T) {
+		payload := base64.StdEncoding.EncodeToString([]byte("0123456789"))
+		contentType, data, err := ParseDataURIWithLimit("data:text/plain;base64,"+payload, 10)
+		require.NoError(t, err)
+		assert.Equal(t, "text/plain", contentType)
+		assert.Equal(t, []byte("0123456789"), data)
+	})
+
+	t.Run("rejects non-base64 payload before copy", func(t *testing.T) {
+		_, _, err := ParseDataURIWithLimit("data:text/plain,0123456789", 9)
+		require.ErrorIs(t, err, ErrDownloadTooLarge)
+	})
+}
+
+func TestDownloadContentRejectsHTTPOverLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer srv.Close()
+
+	_, _, err := DownloadContent(context.Background(), srv.URL, &ContentSecurityConfig{MaxDownloadSizeBytes: 9}, nil)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrDownloadTooLarge), "expected ErrDownloadTooLarge, got %v", err)
 }

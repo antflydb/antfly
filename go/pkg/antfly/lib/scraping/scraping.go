@@ -63,6 +63,7 @@ func IsSecurityConfigEmpty(cfg ContentSecurityConfig) bool {
 // Package-level defaults for S3 credentials.
 var (
 	defaultS3Credentials *S3Credentials
+	ErrDownloadTooLarge  = libscraping.ErrDownloadTooLarge
 )
 
 // GetDefaultSecurityConfig returns the default security configuration for content downloads.
