@@ -344,7 +344,7 @@ pub const GenerateRequest = struct {
     stream: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const Tool = null,
-    /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node.
+    /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
     prompt_cache_key: ?[]const u8 = null,
     /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
     prompt_cache: ?bool = null,

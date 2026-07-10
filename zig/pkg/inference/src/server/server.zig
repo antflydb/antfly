@@ -2116,6 +2116,12 @@ pub const Node = struct {
         const effective_draft_model_name: ?[]const u8 = if (same_named_draft_model) null else body.draft_model;
 
         const want_stream = body.stream orelse false;
+        // Caching requires an explicit non-empty key: keyless requests would all
+        // share one per-model namespace, leaking prompt presence across callers.
+        const prompt_cache_key: ?[]const u8 = if (body.prompt_cache_key) |key|
+            (if (key.len > 0) key else null)
+        else
+            null;
         const configured_max_tokens: i32 = if (body.max_tokens) |mt| @intCast(mt) else 256;
         const queue_units = self.estimateGenerateQueueUnits(messages.items, configured_max_tokens);
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
@@ -2138,8 +2144,8 @@ pub const Node = struct {
             .prefill_chunk_size = 256,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
-            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and !want_stream,
-            .prompt_cache_key = body.prompt_cache_key,
+            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
+            .prompt_cache_key = prompt_cache_key,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
             return ctx.status(400).json(.{

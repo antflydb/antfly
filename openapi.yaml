@@ -20094,7 +20094,9 @@ components:
           description: >
             inference-native prompt prefix cache namespace key. Requests with the same key can
 
-            reuse matching prompt-prefix KV on the same node.
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+
+            requests without a key are never cached.
         prompt_cache:
           type: boolean
           description: >

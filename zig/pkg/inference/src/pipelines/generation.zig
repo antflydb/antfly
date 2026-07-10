@@ -2419,6 +2419,7 @@ pub const NativeGenerationPipeline = struct {
         if (self.prompt_cache) |cache| {
             const cache_eligible =
                 config.prompt_cache_enabled and
+                config.prompt_cache_key != null and
                 prepared_multimodal_prompt == null and
                 !use_speculative and
                 config.cache_compaction_ratio == null and
@@ -2430,7 +2431,7 @@ pub const NativeGenerationPipeline = struct {
             if (cache_eligible) {
                 const page_size = cache.pageSize() orelse 0;
                 if (page_size > 0 and seq_len > page_size) {
-                    if (try cache.attachLongestPrefix(config.prompt_cache_key orelse "", token_ids[0..seq_len], seq_len - page_size)) |hit| {
+                    if (try cache.attachLongestPrefix(config.prompt_cache_key.?, token_ids[0..seq_len], seq_len - page_size)) |hit| {
                         try decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count);
                         cached_prompt_tokens = hit.token_count;
                         prefill_ids = token_ids[cached_prompt_tokens..seq_len];
@@ -2460,8 +2461,10 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.prompt_cache) |cache| {
             if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
-                if (decode_state.sequence_id) |sequence_id| {
-                    try cache.storeFromSequence(config.prompt_cache_key orelse "", token_ids[0..seq_len], sequence_id);
+                if (config.prompt_cache_key) |cache_key| {
+                    if (decode_state.sequence_id) |sequence_id| {
+                        try cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id);
+                    }
                 }
             }
         }

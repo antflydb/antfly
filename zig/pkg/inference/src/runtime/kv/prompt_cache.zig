@@ -65,6 +65,12 @@ const Entry = struct {
 
 const Hash = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
+fn spinLock(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
+
 const BlockHashEntry = struct {
     hash: Hash,
     tokens: []i64,
@@ -87,6 +93,9 @@ pub const StorageEnsureResult = struct {
 
 pub const PromptPrefixCache = struct {
     allocator: std.mem.Allocator,
+    /// Serializes cache mutation (attach/store/configure/evict) against
+    /// concurrent stats() reads from the metrics endpoint.
+    mutex: std.atomic.Mutex = .unlocked,
     config: Config = .{},
     manager: manager_mod.KvManager,
     storage: ?storage_runtime_mod.KvStorageRuntime = null,
@@ -123,6 +132,8 @@ pub const PromptPrefixCache = struct {
     }
 
     pub fn configure(self: *PromptPrefixCache, config: Config) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         if (self.config.resource_usage_observer) |old_observer| {
             const same_observer = if (config.resource_usage_observer) |new_observer|
                 old_observer.context == new_observer.context and old_observer.update == new_observer.update
@@ -136,6 +147,12 @@ pub const PromptPrefixCache = struct {
     }
 
     pub fn ensurePool(self: *PromptPrefixCache, config: pool_mod.KvPoolConfig) !?block.KvPoolId {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.ensurePoolLocked(config);
+    }
+
+    fn ensurePoolLocked(self: *PromptPrefixCache, config: pool_mod.KvPoolConfig) !?block.KvPoolId {
         if (!self.config.enabled) return null;
         if (self.pool_config) |existing| {
             if (!existing.compatible(config)) return null;
@@ -148,7 +165,9 @@ pub const PromptPrefixCache = struct {
     }
 
     pub fn ensureStorage(self: *PromptPrefixCache, config: pool_mod.KvPoolConfig) !?StorageEnsureResult {
-        _ = (try self.ensurePool(config)) orelse return null;
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        _ = (try self.ensurePoolLocked(config)) orelse return null;
         if (self.pool_config) |existing| {
             if (!existing.compatible(config)) return null;
         }
@@ -179,6 +198,8 @@ pub const PromptPrefixCache = struct {
         prompt_tokens: []const i64,
         max_prefix_tokens: usize,
     ) !?AttachedPrefix {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         if (!self.config.enabled or self.pool_id == null) return null;
         if (self.config.mode == .block_hash) {
             return try self.attachLongestBlockHashPrefix(namespace, prompt_tokens, max_prefix_tokens);
@@ -240,6 +261,8 @@ pub const PromptPrefixCache = struct {
         prompt_tokens: []const i64,
         sequence_id: manager_mod.SequenceId,
     ) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         if (!self.config.enabled or self.pool_id == null) return;
         if (self.config.mode == .block_hash) {
             return try self.storeBlockHashFromSequence(namespace, prompt_tokens, sequence_id);
@@ -273,11 +296,15 @@ pub const PromptPrefixCache = struct {
         const owned_tokens = try self.allocator.dupe(i64, tokens);
         errdefer self.allocator.free(owned_tokens);
         const owned_blocks = try blocks.toOwnedSlice(self.allocator);
-        errdefer self.manager.releaseRetainedBlocks(self.pool_id.?, owned_blocks);
-        errdefer self.allocator.free(owned_blocks);
+        errdefer {
+            self.manager.releaseRetainedBlocks(self.pool_id.?, owned_blocks);
+            self.allocator.free(owned_blocks);
+        }
         const owned_storage_blocks = try storage_blocks.toOwnedSlice(self.allocator);
-        errdefer if (self.storage) |*storage| storage.releaseRetainedBlocks(owned_storage_blocks);
-        errdefer if (owned_storage_blocks.len > 0) self.allocator.free(owned_storage_blocks);
+        errdefer {
+            if (self.storage) |*storage| storage.releaseRetainedBlocks(owned_storage_blocks);
+            if (owned_storage_blocks.len > 0) self.allocator.free(owned_storage_blocks);
+        }
 
         self.tick += 1;
         const bytes = self.estimateBytes(namespace.len, cacheable_tokens, owned_blocks.len, owned_storage_blocks.len);
@@ -295,7 +322,9 @@ pub const PromptPrefixCache = struct {
         self.evictToBudget();
     }
 
-    pub fn stats(self: *const PromptPrefixCache) Stats {
+    pub fn stats(self: *PromptPrefixCache) Stats {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         var cached_tokens: u64 = 0;
         for (self.entries.items) |entry| cached_tokens += @intCast(entry.tokens.len);
         for (self.block_hash_entries.items) |entry| cached_tokens += @intCast(entry.tokens.len);
