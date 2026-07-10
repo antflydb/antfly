@@ -285,6 +285,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_cache.remote_content = self.write_source.remote_content;
         self.write_source.read_cache = &storage.read_cache;
         self.write_source.write_cache = &self.write_cache;
+        self.write_source.startup_write_cache = &storage.startup_write_cache;
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
         _ = self.write_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
@@ -3746,9 +3747,14 @@ pub const DataServer = struct {
             try group_ids.append(self.alloc, group_id);
         }
 
+        const group_ids_ptr = group_ids.items.ptr;
+        const group_ids_capacity = group_ids.capacity;
+
         self.provisioned_storage.pruneGroupVisibleRootGenerations(group_ids.items);
+        std.debug.assert(group_ids.items.ptr == group_ids_ptr and group_ids.capacity == group_ids_capacity);
         if (group_ids.items.len == 0) return;
         try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids.items);
+        std.debug.assert(group_ids.items.ptr == group_ids_ptr and group_ids.capacity == group_ids_capacity);
     }
 
     pub fn refreshVisibleProvisionedReplicaState(self: *DataServer) !void {
@@ -5443,7 +5449,7 @@ pub const DataServer = struct {
                     };
                     defer self.clearProvisionedStartupCatchUpTarget();
 
-                    break :result_blk antfly.public_api.ProvisionedTableWriteSource.catchUpTableGroupBestEffortWithMetadata(&self.write_source, self.alloc, group_id, table.name, .{
+                    break :result_blk self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table.name, .{
                         .indexes_json = table.indexes_json,
                         .schema_json = table.schema_json,
                         .identity_namespace = .{
@@ -6227,7 +6233,7 @@ pub const DataServer = struct {
         group_id: u64,
         active_target: ?ActiveStartupCatchUpTarget,
     ) !?runtime_status.LocalTableRuntimeStatus {
-        if (!self.write_source.startup_catch_up_active.load(.acquire)) return null;
+        if (!self.liveRuntimeWriteSource().startup_catch_up_active.load(.acquire)) return null;
         if (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table_name, group_id)) |cached| {
             return cached;
         }

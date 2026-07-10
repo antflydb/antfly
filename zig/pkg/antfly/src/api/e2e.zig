@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const group_ids = @import("../common/group_ids.zig");
 const raft_engine = @import("raft_engine");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -2149,6 +2150,7 @@ test "public api split e2e backs up drops and restores a table" {
 }
 
 test "public api swarm-like e2e backs up drops and restores a table" {
+    const process_alloc = platform.allocator.processAllocator(std.testing.allocator);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2211,7 +2213,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
     defer metadata_admin_listener.deinit();
     defer metadata_admin_server.deinit();
 
-    var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
+    var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
         .replica_root_dir = replica_root,
         .store_registration = .{
             .node_id = 1,
@@ -2253,6 +2255,11 @@ test "public api swarm-like e2e backs up drops and restores a table" {
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
+
+    var query_resp = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"match":{"field":"body","text":"restored"}},"limit":5}
+    );
+    defer query_resp.deinit(std.testing.allocator);
 
     const backup_body = try std.fmt.allocPrint(
         std.testing.allocator,

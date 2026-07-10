@@ -75,6 +75,17 @@ fn readBuildFileAlloc(b: *std.Build, path: []const u8) []const u8 {
     };
 }
 
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    const sdk_root = b.sysroot orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+        b.graph.environ_map.get("SDK_PATH") orelse
+        return;
+    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
+    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+}
+
 pub fn makeLmdbEngineModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -90,6 +101,7 @@ pub fn makeLmdbEngineModule(
     mod.addOptions("build_options", build_options);
     if (link_libc and target.result.os.tag != .freestanding) {
         mod.link_libc = true;
+        addMacosSdkPaths(b, mod, target);
     }
     return mod;
 }
@@ -117,5 +129,6 @@ pub fn makeLmdbModule(
     });
     mod.addIncludePath(b.path("lib/lmdb"));
     mod.link_libc = true;
+    addMacosSdkPaths(b, mod, target);
     return mod;
 }

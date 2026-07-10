@@ -12899,7 +12899,7 @@ fn buildSplitSegment(
             if (bitmap.contains(doc_idx)) continue;
         }
 
-        const stored = (try reader.storedDocDecompressed(doc_idx)) orelse continue;
+        const stored = (try reader.storedDocDecompressed(alloc, doc_idx)) orelse continue;
         errdefer alloc.free(stored.data);
 
         const keep = switch (side) {

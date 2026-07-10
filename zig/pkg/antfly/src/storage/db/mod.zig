@@ -28,6 +28,7 @@ pub const types = @import("types.zig");
 pub const docstore = @import("../docstore.zig");
 pub const lease = @import("lease.zig");
 pub const ownership = @import("ownership.zig");
+pub const generation_lifecycle = @import("generation_lifecycle.zig");
 pub const transaction_resolution = @import("transaction_resolution.zig");
 pub const apply_state = @import("derived/apply_state.zig");
 pub const embedder = @import("enrichment/embedder.zig");

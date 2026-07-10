@@ -461,12 +461,13 @@ pub const IndexSnapshot = struct {
         return try self.segments[resolved.seg_idx].reader.docOrdinal(resolved.local_id);
     }
 
-    /// Get and decompress a stored document by global doc ID. Caller owns returned data.
+    /// Get and decompress a stored document by global doc ID into `alloc`.
+    /// The caller owns the returned data.
     pub const DecompressedDoc = struct { id: []const u8, data: []u8 };
 
-    pub fn storedDocDecompressed(self: *const IndexSnapshot, global_id: u32) !?DecompressedDoc {
+    pub fn storedDocDecompressed(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?DecompressedDoc {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(resolved.local_id)) orelse return null;
+        const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
     }
 

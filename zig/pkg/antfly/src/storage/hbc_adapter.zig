@@ -446,27 +446,55 @@ fn hbcCacheNamespace(path: []const u8) u64 {
     return if (hash == 0) 1 else hash;
 }
 
-fn hbcCacheNamespaceStable(alloc: Allocator, path: []const u8) u64 {
+fn hbcCacheStablePathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
     if (comptime builtin.os.tag == .freestanding) {
-        return hbcCacheNamespace(path);
+        return try alloc.dupe(u8, path);
     } else {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
 
         const absolute_path = if (std.fs.path.isAbsolute(path))
-            alloc.dupe(u8, path) catch return hbcCacheNamespace(path)
+            try alloc.dupe(u8, path)
         else blk: {
-            const cwd = std.process.currentPathAlloc(io_impl.io(), alloc) catch return hbcCacheNamespace(path);
+            const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
             defer alloc.free(cwd);
-            break :blk std.fs.path.resolve(alloc, &.{ cwd, path }) catch return hbcCacheNamespace(path);
+            break :blk try std.fs.path.resolve(alloc, &.{ cwd, path });
         };
-        defer alloc.free(absolute_path);
-        if (!std.fs.path.isAbsolute(absolute_path)) return hbcCacheNamespace(absolute_path);
+        errdefer alloc.free(absolute_path);
+        if (!std.fs.path.isAbsolute(absolute_path)) return absolute_path;
 
-        const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io_impl.io(), absolute_path, alloc) catch return hbcCacheNamespace(absolute_path);
-        defer alloc.free(canonical);
-        return hbcCacheNamespace(canonical);
+        const canonical_z = std.Io.Dir.realPathFileAbsoluteAlloc(io_impl.io(), absolute_path, alloc) catch return absolute_path;
+        defer alloc.free(canonical_z);
+        const canonical = try alloc.dupe(u8, canonical_z);
+        alloc.free(absolute_path);
+        return canonical;
     }
+}
+
+fn hbcCacheNamespaceStable(alloc: Allocator, path: []const u8) u64 {
+    const stable_path = hbcCacheStablePathAlloc(alloc, path) catch return hbcCacheNamespace(path);
+    defer alloc.free(stable_path);
+    return hbcCacheNamespace(stable_path);
+}
+
+const HbcCacheIdentity = struct {
+    namespace: u64,
+    stable_path: []u8,
+};
+
+fn hbcCacheIdentityAlloc(alloc: Allocator, path: []const u8) !HbcCacheIdentity {
+    const stable_path = hbcCacheStablePathAlloc(alloc, path) catch try alloc.dupe(u8, path);
+    return .{
+        .namespace = hbcCacheNamespace(stable_path),
+        .stable_path = stable_path,
+    };
+}
+
+fn hbcPathHasPrefixBoundary(path: []const u8, prefix: []const u8) bool {
+    if (std.mem.eql(u8, path, prefix)) return true;
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    if (path.len <= prefix.len) return false;
+    return path[prefix.len] == std.fs.path.sep;
 }
 
 fn hbcKindStats(stats: *HbcCacheStats, kind: HbcCacheKind) *HbcCacheKindStats {
@@ -527,6 +555,8 @@ pub const Cache = struct {
     metadata_slots: std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize) = .empty,
     metadata_clock: std.ArrayListUnmanaged(HbcSharedClockEntry) = .empty,
     metadata_hand: usize = 0,
+    namespace_paths: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    namespace_registration_incomplete: bool = false,
 
     pub fn init(alloc: Allocator) Cache {
         return .{ .alloc = alloc };
@@ -550,6 +580,9 @@ pub const Cache = struct {
         self.metadata_cache.deinit(self.alloc);
         self.metadata_slots.deinit(self.alloc);
         self.metadata_clock.deinit(self.alloc);
+        var path_it = self.namespace_paths.valueIterator();
+        while (path_it.next()) |path| self.alloc.free(path.*);
+        self.namespace_paths.deinit(self.alloc);
     }
 
     pub fn attachResourceManager(self: *Cache, resource_manager: *resource_manager_mod.ResourceManager) void {
@@ -574,6 +607,59 @@ pub const Cache = struct {
         while (self.evictNamespaceEntryLocked(namespace, .metadata)) {}
         while (self.evictNamespaceEntryLocked(namespace, .quantized)) {}
         while (self.evictNamespaceEntryLocked(namespace, .node)) {}
+    }
+
+    pub fn registerNamespacePath(self: *Cache, namespace: u64, path: []const u8) void {
+        const stable_path = hbcCacheStablePathAlloc(self.alloc, path) catch {
+            self.mutex.lockExclusive();
+            defer self.mutex.unlockExclusive();
+            self.namespace_registration_incomplete = true;
+            return;
+        };
+        errdefer self.alloc.free(stable_path);
+
+        self.mutex.lockExclusive();
+        defer self.mutex.unlockExclusive();
+
+        const entry = self.namespace_paths.getOrPut(self.alloc, namespace) catch {
+            self.namespace_registration_incomplete = true;
+            self.alloc.free(stable_path);
+            return;
+        };
+        if (!entry.found_existing) {
+            entry.value_ptr.* = stable_path;
+            return;
+        }
+        if (std.mem.eql(u8, entry.value_ptr.*, stable_path)) {
+            self.alloc.free(stable_path);
+            return;
+        }
+
+        self.namespace_registration_incomplete = true;
+        self.alloc.free(stable_path);
+    }
+
+    pub fn invalidatePath(self: *Cache, path: []const u8) void {
+        const stable_prefix = hbcCacheStablePathAlloc(self.alloc, path) catch {
+            self.clear();
+            return;
+        };
+        defer self.alloc.free(stable_prefix);
+
+        self.mutex.lockExclusive();
+        defer self.mutex.unlockExclusive();
+
+        if (self.namespace_registration_incomplete) {
+            self.clearAllLocked();
+            self.clearNamespacePathsLocked();
+            self.namespace_registration_incomplete = false;
+            return;
+        }
+
+        while (self.evictPathPrefixEntryLocked(stable_prefix, .vector)) {}
+        while (self.evictPathPrefixEntryLocked(stable_prefix, .metadata)) {}
+        while (self.evictPathPrefixEntryLocked(stable_prefix, .quantized)) {}
+        while (self.evictPathPrefixEntryLocked(stable_prefix, .node)) {}
     }
 
     pub fn clear(self: *Cache) void {
@@ -1065,6 +1151,68 @@ pub const Cache = struct {
         return false;
     }
 
+    fn evictPathPrefixEntryLocked(self: *Cache, stable_prefix: []const u8, kind: HbcCacheKind) bool {
+        switch (kind) {
+            .vector => {
+                var victim: ?HbcSharedCacheKey = null;
+                {
+                    var it = self.vector_cache.keyIterator();
+                    while (it.next()) |key| {
+                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                            victim = key.*;
+                            break;
+                        }
+                    }
+                }
+                if (victim) |key| return self.removeVectorLocked(key, false);
+            },
+            .metadata => {
+                var victim: ?HbcSharedCacheKey = null;
+                {
+                    var it = self.metadata_cache.keyIterator();
+                    while (it.next()) |key| {
+                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                            victim = key.*;
+                            break;
+                        }
+                    }
+                }
+                if (victim) |key| return self.removeMetadataLocked(key, false);
+            },
+            .quantized => {
+                var victim: ?HbcSharedCacheKey = null;
+                {
+                    var it = self.quantized_cache.keyIterator();
+                    while (it.next()) |key| {
+                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                            victim = key.*;
+                            break;
+                        }
+                    }
+                }
+                if (victim) |key| return self.removeQuantizedLocked(key, false);
+            },
+            .node => {
+                var victim: ?HbcSharedCacheKey = null;
+                {
+                    var it = self.node_cache.keyIterator();
+                    while (it.next()) |key| {
+                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                            victim = key.*;
+                            break;
+                        }
+                    }
+                }
+                if (victim) |key| return self.removeNodeLocked(key, false);
+            },
+        }
+        return false;
+    }
+
     fn removeSlot(clock: *std.ArrayListUnmanaged(HbcSharedClockEntry), slots: *std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize), key: HbcSharedCacheKey) void {
         if (slots.fetchRemove(key)) |removed| {
             if (removed.value < clock.items.len) clock.items[removed.value] = .{};
@@ -1126,6 +1274,12 @@ pub const Cache = struct {
     fn clearAllLocked(self: *Cache) void {
         while (self.evictOneLocked(.{ .namespace = 0, .id = 0 })) {}
         self.observeLocked();
+    }
+
+    fn clearNamespacePathsLocked(self: *Cache) void {
+        var path_it = self.namespace_paths.valueIterator();
+        while (path_it.next()) |path| self.alloc.free(path.*);
+        self.namespace_paths.clearRetainingCapacity();
     }
 };
 
@@ -1270,6 +1424,7 @@ pub const HBCIndex = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     shared_cache: ?*Cache = null,
     cache_namespace: u64 = 0,
+    cache_path: []u8 = &.{},
     cache_enabled: bool = true,
     retained_vector_cache_enabled: bool = true,
     bypass_external_vector_cache: bool = false,
@@ -1816,6 +1971,9 @@ pub const HBCIndex = struct {
         @memset(metadata_clock_keys, 0);
         @memset(metadata_clock_refs, false);
 
+        const cache_identity = try hbcCacheIdentityAlloc(alloc, std.mem.span(path));
+        errdefer alloc.free(cache_identity.stable_path);
+
         const idx = HBCIndex{
             .alloc = alloc,
             .env_owner = env_owner,
@@ -1853,7 +2011,8 @@ pub const HBCIndex = struct {
             .metadata_clock_hand = 0,
             .resource_manager = null,
             .shared_cache = null,
-            .cache_namespace = hbcCacheNamespaceStable(alloc, std.mem.span(path)),
+            .cache_namespace = cache_identity.namespace,
+            .cache_path = cache_identity.stable_path,
             .cache_enabled = true,
             .retained_vector_cache_enabled = defaultRetainedVectorCacheEnabled(),
             .cache_mu = .{},
@@ -1947,6 +2106,7 @@ pub const HBCIndex = struct {
         self.clearVectorCache();
         self.clearMetadataCache();
         self.shared_cache = cache;
+        cache.registerNamespacePath(self.cache_namespace, self.cache_path);
         if (self.resource_manager) |manager| cache.attachResourceManager(manager);
     }
 
@@ -2407,6 +2567,7 @@ pub const HBCIndex = struct {
         self.deferred_oversized_leaves.deinit(self.alloc);
         self.rot.deinit();
         self.quantizer.deinit();
+        self.alloc.free(self.cache_path);
         self.store.deinit();
         self.env_owner.close(self.alloc);
         self.* = undefined;

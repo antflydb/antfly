@@ -8,25 +8,83 @@ For the canonical enrichment architecture and artifact identity contract, see
 
 ## DB Handle And Runtime Ownership Contract
 
-`DB.open()` must not make the caller's role ambiguous. A DB handle can be a
-storage/query handle, a foreground maintenance handle, or the authoritative
-runtime owner for a shard, but those roles have different side-effect budgets.
+`DB.open()` must not make the caller's role ambiguous. A DB handle can be the
+authoritative write owner for a shard, the shared read owner for a visible
+generation, or a tightly scoped foreground maintenance handle. Those roles have
+different side-effect budgets and must be leased by the serving layer instead
+of opened ad hoc.
 
-The serving layer may open multiple handles for the same table-group root:
+The serving-layer target shape is:
 
-- one live writer/runtime-owner handle
-- read-only query handles
-- status-only handles
-- short-lived foreground maintenance handles such as restore repair or startup
-  catch-up
+- one cached write DB owner per table group
+- one cached read DB owner per table group and visible root generation
+- many read transactions, cursors, lookups, scans, queries, and status reads as
+  leases on that read owner
+- short-lived maintenance DB opens only while an exclusive table/group
+  transition lease is held
 
-Multiple handles are acceptable only when background runtime ownership remains
-singular and explicit. The live writer/runtime owner is the only role that
-should start long-lived optional workers such as generated enrichment replay,
-TTL cleanup, transaction recovery, text merge, sparse compaction, and
-quarantine retry. Query and status handles must be side-effect-free. Restore
-repair and startup catch-up may mutate derived/index state, but only as
-exclusive foreground maintenance operations under table/group lifecycle gates.
+The important restriction is that "read profile" must not create a second cached
+DB identity over the same table-group root. Lookup, scan, query, and status may
+use different methods or lazy capabilities, but they should share the same read
+owner for a generation. Multiple independently cached DB instances over the
+same path duplicate index/cache/runtime state and make restore, drop, and schema
+mutation correctness depend on every caller remembering the same invalidation
+sequence.
+
+Restore, drop, and schema mutation are generation transitions. A transition
+lease:
+
+- blocks new table reads and writes
+- drains existing read, write, and pending-open leases
+- invalidates read, write, startup-write, runtime-status, and shared
+  path-scoped storage caches for the affected generation
+- performs the file/catalog mutation and any foreground repair under the
+  exclusive lease
+- publishes the new visible generation only after repair/invalidation complete
+
+Restore never reconstructs the live root in place. It acquires a process-wide
+exclusive capability for the exact shard root, creates a unique sibling staging
+generation, imports and validates the primary store there, runs foreground
+derived/runtime repair against that staged path, closes and recursively syncs
+the staged generation, and only then publishes it. A prepare or repair failure
+destroys staging and leaves the live generation untouched. macOS and Linux use
+atomic directory exchange when a live generation exists. Other
+platforms/filesystems use a closed-admission two-rename publication with
+rollback if the second rename fails. The exchanged or renamed old root is
+reclaimed only after publication.
+
+`DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
+capability and rejects a path that is not the capability's staging root. Raw
+path possession is therefore insufficient to mutate a serving root. Startup,
+provisioning, and API restore entry points all acquire their capability through
+the same process generation-lifecycle manager. The provisioned serving path
+uses separate prepare and publish operations so all required repair completes
+before the namespace mutation. Startup/bootstrap convenience paths publish a
+validated primary generation with a durable repair marker, allowing the normal
+startup owner to resume derived repair after a crash.
+
+The current root layout is path-relative and may lazily open run files after a
+transaction starts. Consequently, serving transitions stop admission and drain
+the old read/write owners before staging and publication. Refcounts make close
+ordering safe, but they do not make a path swap safe beneath an old reader. A
+future zero-downtime transition must place each generation under an immutable
+versioned root and atomically publish a separate current-generation pointer;
+only then may generation N readers overlap preparation and publication of N+1.
+
+LSM manifests are relocatable generation metadata. On open, run paths are
+reconstructed from the current root and run identity instead of trusting an
+absolute path encoded before a snapshot copy or staging rename. Obsolete run
+paths are similarly rebased when they refer to the prior root's `runs/`
+directory.
+
+Shared caches must be invalidated by the table-group root, not only by the
+primary store path. Primary LSM caches and LSM-backed indexes can use path-prefix
+invalidation directly. Dense/HBC uses a shared cache namespace per concrete HBC
+index root, so the cache registers namespace-to-path ownership and table restore
+or drop invalidates every HBC namespace whose path is under the restored/dropped
+table-group root. Any future shared index cache should follow the same rule:
+cache keys may be engine-specific, but lifecycle invalidation is table-root
+scoped and owned by the generation transition.
 
 The DB layer therefore separates three concepts:
 
@@ -39,23 +97,55 @@ The DB layer therefore separates three concepts:
 Restore repair is the important example. A restored shard with generated
 chunking or generated embeddings needs the enrichment runtime's replay logic to
 materialize chunk and embedding artifacts. It must not start every optional
-runtime worker just to get that capability. Instead, restore repair initializes
-only the required runtime services, drives generated enrichment replay in the
-foreground, drains derived/index replay, syncs state, and then closes the
-maintenance handle.
+runtime worker just to get that capability, and it must not race a lookup/query
+open against half-published restored files. Instead, restore repair runs as
+foreground maintenance under the table generation transition, initializes only
+the required runtime services, drives generated enrichment replay, drains
+derived/index replay, syncs state, and closes before reads become visible again.
 
 The invariant is:
 
 ```text
 one background runtime owner per shard root
-many short-lived foreground handles allowed
+one cached write DB owner per table group
+one cached read DB owner per table group/generation
+exclusive generation transitions own maintenance opens and publication
+transactions retain the backend generation until abort or commit
+cursors retain their parent transaction until cursor close
+returned owned buffers are allocated in an explicit caller ownership domain
 foreground handles do not wait on background workers they did not start
 ```
 
-If a maintenance phase needs runtime behavior, the runtime must expose a
-foreground catch-up API. Waiting for a background worker from a handle opened
-with workers disabled is a bug; starting broad optional workers to avoid that
-wait is also a bug.
+Current implementation maps this contract to generation-owned entries in
+`ProvisionedTableWriteCache` and `ProvisionedTableReadCache`, the process
+`generation_lifecycle` manager, and a local table generation transition around
+restore. Cache entries own their DB and are retired when invalidated; active
+leases keep retired entries alive until the last operation releases them. The
+transition holds the read-cache exclusive lease through staged restore, repair,
+and publication, invalidates/drains both write caches, and keeps maintenance
+opens uncached. At the storage boundary, LSM transaction opens are rejected
+after generation close begins, backend close drains active transaction readers,
+and erased cursors retain their transaction box so transaction cleanup cannot
+free cursor snapshot state. Storage-backed status and schema-capability
+inspection are reads for lifecycle purposes: they acquire the same table read
+activity as lookup/query before opening a status-only DB. A transition drains
+those activities and blocks new status opens until the repaired generation is
+published. Cache-only status snapshots do not require a DB lease. In raft-backed
+serving, the apply state machine's write source is the canonical local write
+owner. Startup catch-up and other maintenance entry points resolve that owner
+before acquiring an activity lease or opening a DB; the startup cache is
+attached to that owner and is drained at the end of each catch-up operation. A
+forwarding API source must not create a second activity or cache domain over the
+same table-group path. Its read-preparation and primary-lookup interfaces must
+delegate to the canonical local write owner even when those interfaces were
+captured before owner attachment.
+
+Allocator ownership is part of the same lifetime contract. APIs that return
+owned storage/index buffers accept the allocator that must later free them, or
+carry their allocator in a typed owner. In particular, full-text stored-document
+decompression allocates directly in the request/result allocator instead of the
+segment reader's allocator; this prevents cached index generations and HTTP
+requests from crossing allocator domains during result teardown.
 
 ## Write Contract
 

@@ -3112,6 +3112,8 @@ pub const ProvisionedTableReadSource = struct {
         table_name: []const u8,
     ) !?LsmStorageStats {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
@@ -3147,6 +3149,8 @@ pub const ProvisionedTableReadSource = struct {
         table_name: []const u8,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
@@ -5557,44 +5561,31 @@ fn lookupProvisionedLocal(
     opts: db_mod.types.LookupOptions,
     consistency: raft_mod.ReadConsistency,
 ) !?LookupResponse {
-    if (primary_lookup_db) |source| {
-        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
-            var lease = lease_value;
-            defer lease.release(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
-
-            var reads = raft_mod.FeatureDBReads.init(group_id, requester);
-            var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
-            defer result.deinit(alloc);
-            return .{
-                .json = try alloc.dupe(u8, result.json),
-                .version = try lease.db.getTimestamp(alloc, key),
-            };
-        }
-    }
+    _ = primary_lookup_db;
 
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
     if (cache) |cached| {
-        var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
-        defer db_lease.release();
-        const db = db_lease.db;
+        var lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        defer lease.release();
+        try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
 
         var reads = raft_mod.FeatureDBReads.init(group_id, requester);
-        var result = (try reads.lookupWithConsistency(alloc, db, key, opts, consistency)) orelse return null;
+        var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
+        const version = try lease.db.getTimestamp(alloc, key);
         return .{
             .json = try alloc.dupe(u8, result.json),
-            .version = try db.getTimestamp(alloc, key),
+            .version = version,
         };
     }
 
     var db = try openProvisionedLookupDbForTable(
         alloc,
         path,
-        if (cache) |cached| cached.lsm_cache else null,
+        null,
         lsm_root_generation,
-        if (cache) |cached| cached.resource_manager else null,
+        null,
         backend_runtime,
         try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
     );
@@ -6621,8 +6612,9 @@ fn openProvisionedQueryDbForTableWithCache(
 
     var enrichments = try createEnrichments(alloc, indexes_json, runtime_cfg);
     errdefer enrichments.deinit(alloc);
+    const enrichments_enabled = enrichments.enabled();
 
-    var db = if (enrichments.enabled()) blk: {
+    var db = if (enrichments_enabled) blk: {
         const enrichment_cfg = enrichments.config();
         const opened = try db_mod.DB.open(alloc, path, .{
             .open_mode = .query_readonly,
@@ -6639,18 +6631,21 @@ fn openProvisionedQueryDbForTableWithCache(
         });
         enrichments.take();
         break :blk opened;
-    } else try db_mod.DB.open(alloc, path, .{
-        .open_mode = .query_readonly,
-        .lsm_cache = lsm_cache,
-        .hbc_cache = hbc_cache,
-        .lsm_root_generation = lsm_root_generation,
-        .resource_manager = resource_manager,
-        .backend_runtime = runtime_cfg.backend_runtime,
-        .secret_store = runtime_cfg.secret_store,
-        .remote_content = runtime_cfg.remote_content,
-        .identity_namespace = identity_namespace,
-        .prefer_existing_identity_namespace = identity_namespace != null,
-    });
+    } else blk: {
+        const opened = try db_mod.DB.open(alloc, path, .{
+            .open_mode = .query_readonly,
+            .lsm_cache = lsm_cache,
+            .hbc_cache = hbc_cache,
+            .lsm_root_generation = lsm_root_generation,
+            .resource_manager = resource_manager,
+            .backend_runtime = runtime_cfg.backend_runtime,
+            .secret_store = runtime_cfg.secret_store,
+            .remote_content = runtime_cfg.remote_content,
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = identity_namespace != null,
+        });
+        break :blk opened;
+    };
     errdefer db.close();
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
 
@@ -20665,4 +20660,77 @@ test "provisioned read cache keeps leased entry cleanup reachable when retiremen
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+}
+
+test "provisioned storage inspection uses table read admission" {
+    const Tracker = struct {
+        begins: usize = 0,
+        ends: usize = 0,
+
+        fn iface(self: *@This()) ReadPreparation {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .prepare_for_read = prepareForRead,
+                    .begin_read = beginRead,
+                },
+            };
+        }
+
+        fn prepareForRead(_: *anyopaque, _: []const u8, _: ReadPreparation.Kind) void {}
+
+        fn beginRead(ptr: *anyopaque, table_name: []const u8, _: ReadPreparation.Kind) ReadPreparation.Activity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begins += 1;
+            return .{
+                .ptr = self,
+                .table_name = table_name,
+                .release_fn = endRead,
+            };
+        }
+
+        fn endRead(ptr: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ends += 1;
+        }
+    };
+
+    const EmptyCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tracker: Tracker = .{};
+    var source = ProvisionedTableReadSource.init(
+        "/tmp/unused-antfly-storage-inspection-admission",
+        EmptyCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+    );
+    source.prepare_for_read = tracker.iface();
+
+    try std.testing.expect((try source.source().lsmStorageStats(std.testing.allocator, "docs")) == null);
+    try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs")) == null);
+    try std.testing.expectEqual(@as(usize, 2), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 2), tracker.ends);
 }

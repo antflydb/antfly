@@ -28,6 +28,7 @@ const docstore_mod = @import("../docstore.zig");
 const segment_mod = @import("../../segment.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
+const generation_lifecycle = @import("generation_lifecycle.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -8146,12 +8147,14 @@ pub const DB = struct {
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepair(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
         alloc: Allocator,
         snapshot_root: []const u8,
         path: []const u8,
         opts: OpenOptions,
         identity: RestoreIdentity,
     ) !void {
+        try staged_generation.validatePath(path);
         try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity);
     }
 
@@ -8359,7 +8362,11 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "drain_async")) {
             std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
-            try self.runRestoreRepairDrainAsync();
+            if (self.core.hasGeneratedEnrichmentTargets()) {
+                try self.runRestoreRepairDrainAsync();
+            } else {
+                std.log.info("restore runtime repair skip async drain without generated enrichment targets path={s}", .{self.core.path});
+            }
             try self.updateRestoreRuntimeRepairPhase(alloc, "rebuild_replayed_artifacts", false);
             return true;
         }
@@ -61819,6 +61826,94 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
+test "db restore snapshot repeatedly validates run-backed doc identity metadata" {
+    // Exercise the allocator used by the server process. Darwin's malloc
+    // diagnostics only poison and guard allocations that cross this boundary.
+    const alloc = platform.allocator.processAllocator(std.testing.allocator);
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const identity_namespace = doc_identity.Namespace{
+        .table_id = 21,
+        .shard_id = 22,
+        .range_id = 23,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .identity_namespace = identity_namespace,
+        });
+        defer db.close();
+
+        for (0..96) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:restore-chaos-{d:0>3}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"restore chaos {d}\",\"ordinal\":{d}}}", .{ i, i });
+            defer alloc.free(value);
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .full_index,
+            });
+        }
+
+        _ = try db.snapshot("snap1");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    for (0..32) |i| {
+        var restore_buf: [256]u8 = undefined;
+        const restore_path = tempPath(&restore_buf);
+        defer cleanupTempDir(restore_path);
+
+        var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+        defer transition.deinit();
+        var staged_generation = try transition.beginStaging();
+        defer staged_generation.deinit();
+        try DB.restoreSnapshotToDeferredRuntimeRepair(
+            &staged_generation,
+            alloc,
+            snapshot_root,
+            staged_generation.path(),
+            .{
+                .primary_backend = primary_backend,
+                .identity_namespace = identity_namespace,
+            },
+            .{
+                .backup_id = "restore-chaos",
+                .location = "local",
+                .snapshot_path = "snap1",
+                .group_id = @intCast(i + 1),
+            },
+        );
+        try staged_generation.publish();
+
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer restored.close();
+
+        const doc = (try restored.get(alloc, "doc:restore-chaos-095")) orelse return error.TestExpectedEqual;
+        defer alloc.free(doc);
+        try std.testing.expect(std.mem.indexOf(u8, doc, "restore chaos 95") != null);
+    }
+}
+
 test "db restore snapshot rejects invalid doc identity metadata" {
     const alloc = std.testing.allocator;
 
@@ -61916,10 +62011,15 @@ test "db deferred restore rejects strict doc identity namespace mismatch" {
         } else |_| {}
     }
 
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged_generation = try transition.beginStaging();
+    defer staged_generation.deinit();
     try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepair(
+        &staged_generation,
         alloc,
         snapshot_root,
-        std.mem.span(restore_path),
+        staged_generation.path(),
         .{
             .primary_backend = primary_backend,
             .identity_namespace = target_namespace,

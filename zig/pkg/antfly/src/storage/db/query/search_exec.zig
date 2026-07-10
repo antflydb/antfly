@@ -11450,7 +11450,7 @@ fn collectFilteredExplicitTextStats(
             const doc_id = doc_offset + local_doc;
             if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
             global_doc_count += 1;
-            const stored = (try snapshot.storedDocDecompressed(doc_id)) orelse continue;
+            const stored = (try snapshot.storedDocDecompressed(alloc, doc_id)) orelse continue;
             defer alloc.free(stored.data);
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored.data, .{}) catch continue;
             defer parsed.deinit();

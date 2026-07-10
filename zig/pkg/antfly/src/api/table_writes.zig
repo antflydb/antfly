@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const platform = @import("antfly_platform");
 const platform_sync = @import("antfly_platform").sync;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
@@ -4988,17 +4989,30 @@ pub const ProvisionedTableWriteSource = struct {
         self.endStructuralTableActivity(table_name);
     }
 
-    fn beginLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    fn beginLocalTableGenerationTransition(self: *ProvisionedTableWriteSource, table_name: []const u8) !LocalTableGenerationTransition {
         self.beginStructuralTableActivity(table_name);
+        errdefer self.endStructuralTableActivity(table_name);
+
+        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+        errdefer {
+            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        }
+
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
+
+        return .{
+            .source = self,
+            .table_name = table_name,
+            .read_cache_exclusive = read_cache_exclusive,
+        };
     }
 
-    fn finishLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    fn finishLocalTableGenerationTransitionMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
@@ -5008,7 +5022,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.endStructuralTableActivity(table_name);
     }
 
-    fn abortLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    fn abortLocalTableGenerationTransitionMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         self.invalidateWriteCache(table_name);
@@ -5017,6 +5031,47 @@ pub const ProvisionedTableWriteSource = struct {
         self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
     }
+
+    const LocalTableGenerationTransition = struct {
+        source: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        read_cache_exclusive: ?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess = null,
+        mutation_open: bool = true,
+
+        fn finishMutation(self: *@This()) void {
+            std.debug.assert(self.mutation_open);
+            self.source.finishLocalTableGenerationTransitionMutation(self.table_name);
+            self.mutation_open = false;
+        }
+
+        fn beginShardStorageTransition(self: *@This(), path: []const u8) !db_mod.generation_lifecycle.ExclusiveTransition {
+            if (!self.mutation_open) return error.InvalidGenerationTransition;
+            return try db_mod.generation_lifecycle.beginProcessExclusive(path);
+        }
+
+        fn abort(self: *@This()) void {
+            if (self.mutation_open) {
+                self.source.abortLocalTableGenerationTransitionMutation(self.table_name);
+                self.mutation_open = false;
+            }
+            self.releaseReadExclusive();
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.mutation_open) {
+                self.source.abortLocalTableGenerationTransitionMutation(self.table_name);
+                self.mutation_open = false;
+            }
+            self.releaseReadExclusive();
+        }
+
+        fn releaseReadExclusive(self: *@This()) void {
+            if (self.read_cache_exclusive) |*exclusive| {
+                exclusive.deinit();
+                self.read_cache_exclusive = null;
+            }
+        }
+    };
 
     fn abortLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
@@ -5517,13 +5572,22 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.runtime_status_cache) |snapshot_cache| snapshot_cache.invalidateTable(table_name);
     }
 
-    fn invalidateSharedLsmCachePrefix(self: *ProvisionedTableWriteSource, path: []const u8) void {
+    fn invalidateSharedPathCaches(self: *ProvisionedTableWriteSource, path: []const u8) void {
         var write_lsm_cache: ?*lsm_backend.Cache = null;
         var startup_lsm_cache: ?*lsm_backend.Cache = null;
+        var write_hbc_cache: ?*hbc_mod.Cache = null;
+        var startup_hbc_cache: ?*hbc_mod.Cache = null;
         const read_lsm_cache = if (self.read_cache) |cache| cache.lsm_cache else null;
+        const read_hbc_cache = if (self.read_cache) |cache| cache.hbc_cache else null;
         lockAtomic(&self.local_db_mutex);
-        if (self.write_cache) |cache| write_lsm_cache = cache.lsm_cache;
-        if (self.startup_write_cache) |cache| startup_lsm_cache = cache.lsm_cache;
+        if (self.write_cache) |cache| {
+            write_lsm_cache = cache.lsm_cache;
+            write_hbc_cache = cache.hbc_cache;
+        }
+        if (self.startup_write_cache) |cache| {
+            startup_lsm_cache = cache.lsm_cache;
+            startup_hbc_cache = cache.hbc_cache;
+        }
         self.local_db_mutex.unlock();
 
         if (write_lsm_cache) |cache| cache.invalidatePrefix(path);
@@ -5537,6 +5601,19 @@ pub const ProvisionedTableWriteSource = struct {
                 (startup_lsm_cache == null or startup_lsm_cache.? != cache))
             {
                 cache.invalidatePrefix(path);
+            }
+        }
+        if (write_hbc_cache) |cache| cache.invalidatePath(path);
+        if (startup_hbc_cache) |cache| {
+            if (write_hbc_cache == null or write_hbc_cache.? != cache) {
+                cache.invalidatePath(path);
+            }
+        }
+        if (read_hbc_cache) |cache| {
+            if ((write_hbc_cache == null or write_hbc_cache.? != cache) and
+                (startup_hbc_cache == null or startup_hbc_cache.? != cache))
+            {
+                cache.invalidatePath(path);
             }
         }
     }
@@ -6059,6 +6136,9 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         metadata: StartupCatchUpMetadata,
     ) !StartupCatchUpResult {
+        if (self.local_write_owner) |owner| {
+            return try owner.catchUpTableGroupBestEffortWithMetadata(alloc, group_id, table_name, metadata);
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const lsm_root_generation = self.visibleRootGeneration(group_id);
@@ -7182,8 +7262,8 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn prepareForRead(ptr: *anyopaque, table_name: []const u8, kind: table_reads.ReadPreparation.Kind) void {
-        _ = kind;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.local_write_owner) |owner| return prepareForRead(owner, table_name, kind);
         self.waitForNoReadBlockingActivity(table_name);
         if (!self.isWriteCacheDirtyForTable(table_name)) return;
 
@@ -7197,8 +7277,8 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginRead(ptr: *anyopaque, table_name: []const u8, kind: table_reads.ReadPreparation.Kind) table_reads.ReadPreparation.Activity {
-        _ = kind;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.local_write_owner) |owner| return beginRead(owner, table_name, kind);
         self.beginReadRequest(table_name);
         if (self.isWriteCacheDirtyForTable(table_name)) {
             self.invalidateReadCache(table_name);
@@ -7226,6 +7306,9 @@ pub const ProvisionedTableWriteSource = struct {
         lsm_root_generation: u64,
     ) !?table_reads.PrimaryLookupDbLease {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.local_write_owner) |owner| {
+            return try leasePrimaryLookupDb(owner, alloc, table_name, group_id, lsm_root_generation);
+        }
         self.beginReadRequest(table_name);
         var read_request_active = true;
         errdefer if (read_request_active) self.endReadRequest(table_name);
@@ -8417,7 +8500,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (group_ids) |group_id| {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
-            self.invalidateSharedLsmCachePrefix(path);
+            self.invalidateSharedPathCaches(path);
             const trash_path = try moveDroppedGroupPathToTrash(alloc, self.replica_root_dir, table_name, group_id);
             if (trash_path) |dropped_path| {
                 try self.deleteDroppedGroupPath(alloc, dropped_path);
@@ -8990,12 +9073,9 @@ pub const ProvisionedTableWriteSource = struct {
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
         defer alloc.free(local_location);
 
-        self.beginLocalRestoreMutation(table_name);
-        errdefer self.abortLocalRestoreMutation(table_name);
-        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
-        defer {
-            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
-        }
+        var transition = try self.beginLocalTableGenerationTransition(table_name);
+        errdefer transition.abort();
+        defer transition.deinit();
         var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer restore_io_impl.deinit();
 
@@ -9013,8 +9093,10 @@ pub const ProvisionedTableWriteSource = struct {
             }
 
             runTestBeforeRestoreWorkHook();
-            self.invalidateSharedLsmCachePrefix(path);
-            backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
+            self.invalidateSharedPathCaches(path);
+            var shard_transition = try transition.beginShardStorageTransition(path);
+            errdefer shard_transition.deinit();
+            var prepared_generation = backup_restore.prepareRestoreSnapshotToPathWithExclusiveTransition(&shard_transition, alloc, path, group_id, .{
                 .backup_id = plan.manifest.backup_id,
                 .location = local_location,
                 .snapshot_path = shard.snapshot_path,
@@ -9041,16 +9123,18 @@ pub const ProvisionedTableWriteSource = struct {
                 }
                 return err;
             };
-            self.invalidateSharedLsmCachePrefix(path);
-            var needs_background_repair = false;
-            self.repairRestoredTableRuntimeStateBlocking(alloc, path, group_id, table_name) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => needs_background_repair = true,
-                else => return err,
-            };
-            if (needs_background_repair) self.requestRestoreRepairCatchUp(table_name, group_id);
+            defer if (prepared_generation) |*generation| generation.deinit();
+
+            const repair_path = if (prepared_generation) |*generation| generation.path() else path;
+            try self.repairRestoredTableRuntimeStateBlocking(alloc, repair_path, group_id, table_name);
+            if (prepared_generation) |*generation| {
+                try backup_restore.publishPreparedRestore(alloc, path, generation);
+            }
+            self.invalidateSharedPathCaches(path);
+            shard_transition.deinit();
         }
 
-        self.finishLocalRestoreMutation(table_name);
+        transition.finishMutation();
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
@@ -9499,6 +9583,8 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.localRuntimeStatuses(alloc, table_name);
+        self.beginReadRequest(table_name);
+        defer self.endReadRequest(table_name);
         return try self.snapshotRuntimeStatusesBestEffort(alloc, table_name);
     }
 
@@ -17049,6 +17135,9 @@ test "provisioned table write source backs up and restores full_text writes from
         FakeCatalog.iface(),
         raft_mod.read_gate.noopReadableLeaseRequester(),
     );
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    read_source.cache = &read_cache;
 
     var restored_lookup = (try read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer restored_lookup.deinit(alloc);
@@ -17062,12 +17151,273 @@ test "provisioned table write source backs up and restores full_text writes from
     try std.testing.expect(std.mem.indexOf(u8, restored_scan.ndjson, "\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, restored_scan.ndjson, "\"alpha\"") != null);
 
+    var restored_query_req = try query_api.parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":{"field":"content","text":"distributed consensus"}},"limit":5}
+    );
+    defer restored_query_req.deinit(alloc);
+    var restored_query = (try read_source.source().query(alloc, "docs", restored_query_req.req, .read_index)).?;
+    defer restored_query.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored_query.json, "\"doc:a\"") != null);
+
+    const FakeStatusSource = struct {
+        fn iface() http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return try FakeCatalog.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            FakeCatalog.freeAdminSnapshot(undefined, snapshot);
+        }
+    };
+
+    var server = http_server.ApiHttpServer.init(
+        alloc,
+        .{},
+        FakeStatusSource.iface(),
+        read_source.source(),
+        source.source(),
+    );
+    var public_query = try server.handlePublicTableQuery("docs",
+        \\{"full_text_search":{"match":{"field":"content","text":"distributed consensus"}},"limit":5}
+    , null);
+    defer public_query.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), public_query.status);
+    try std.testing.expect(std.mem.indexOf(u8, public_query.body, "\"doc:a\"") != null);
+
     db.close();
     db = try db_mod.DB.open(alloc, db_path, .{});
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+}
+
+test "provisioned native backup restore repeats through shared read and write owners" {
+    const alloc = platform.allocator.processAllocator(std.testing.allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(cwd);
+    const root = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/provisioned-native-restore-repeat", .{ cwd, tmp.sub_path });
+    defer alloc.free(root);
+    const backup_root = try std.fmt.allocPrint(alloc, "{s}/backup", .{root});
+    defer alloc.free(backup_root);
+
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeStatusSource = struct {
+        fn iface() http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return try FakeCatalog.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            FakeCatalog.freeAdminSnapshot(undefined, snapshot);
+        }
+    };
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    write_cache.backend_runtime = backend_runtime.ptr();
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    read_cache.backend_runtime = backend_runtime.ptr();
+
+    var source = ProvisionedTableWriteSource.init(root, FakeCatalog.iface());
+    defer source.deinit();
+    source.backend_runtime = backend_runtime.ptr();
+    source.write_cache = &write_cache;
+    source.read_cache = &read_cache;
+
+    var read_source = table_reads.ProvisionedTableReadSource.init(
+        root,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+    );
+    read_source.backend_runtime = backend_runtime.ptr();
+    read_source.cache = &read_cache;
+
+    var server = http_server.ApiHttpServer.init(
+        alloc,
+        .{},
+        FakeStatusSource.iface(),
+        read_source.source(),
+        source.source(),
+    );
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
+    defer alloc.free(db_path);
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    const iterations = 12;
+    for (0..iterations) |i| {
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+
+        const alpha_db = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"Distributed Databases {d}\",\"content\":\"Distributed databases replicate state across nodes and coordinate writes with consensus alpha {d}.\"}}",
+            .{ i, i },
+        );
+        defer alloc.free(alpha_db);
+        const alpha_vector = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"Vector Search {d}\",\"content\":\"Vector search uses embeddings to retrieve semantically similar documents alpha {d}.\"}}",
+            .{ i, i },
+        );
+        defer alloc.free(alpha_vector);
+        const alpha_raft = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"Raft Consensus {d}\",\"content\":\"Raft coordinates leaders and followers to keep replicated logs consistent alpha {d}.\"}}",
+            .{ i, i },
+        );
+        defer alloc.free(alpha_raft);
+        const beta_db = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"Mutated Databases {d}\",\"content\":\"mutated database row should disappear after restore beta {d}\"}}",
+            .{ i, i },
+        );
+        defer alloc.free(beta_db);
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{
+                .{ .key = "doc:db", .value = alpha_db },
+                .{ .key = "doc:vector", .value = alpha_vector },
+                .{ .key = "doc:raft", .value = alpha_raft },
+            },
+            .timestamp_ns = 1 + @as(u64, @intCast(i * 10)),
+            .sync_level = .full_text,
+        });
+
+        var warm_lookup = (try read_source.source().lookup(alloc, "docs", "doc:db", .{}, .read_index)).?;
+        defer warm_lookup.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, warm_lookup.json, "alpha") != null);
+
+        const backup_id = try std.fmt.allocPrint(alloc, "snap-{d}", .{i});
+        defer alloc.free(backup_id);
+        const shards = (try source.source().backupTable(alloc, "docs", .{
+            .backup_root = backup_root,
+            .backup_id = backup_id,
+        })).?;
+        defer freeBackupShards(alloc, shards);
+
+        var manifest = try backups_api.createManifest(alloc, backup_id, &.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = "",
+            .read_schema_json = "",
+            .indexes_json = tables_api.default_indexes_json,
+            .replication_sources_json = "[]",
+        }, shards);
+        defer manifest.deinit(alloc);
+        try backups_api.writeManifest(alloc, backup_root, &manifest);
+
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = "doc:db", .value = beta_db }},
+            .timestamp_ns = 2 + @as(u64, @intCast(i * 10)),
+            .sync_level = .full_text,
+        });
+
+        _ = try source.source().dropTable(alloc, "docs", &.{7001});
+        _ = try source.source().createTable(alloc, "docs", .{});
+
+        _ = try source.source().restoreTable(alloc, "docs", .{
+            .backup_root = backup_root,
+            .manifest = &manifest,
+        });
+        try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
+
+        var restored_lookup = (try read_source.source().lookup(alloc, "docs", "doc:db", .{}, .read_index)).?;
+        defer restored_lookup.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, restored_lookup.json, "alpha") != null);
+        try std.testing.expect(std.mem.indexOf(u8, restored_lookup.json, "beta") == null);
+
+        var public_query = try server.handlePublicTableQuery("docs",
+            \\{"full_text_search":{"match":{"field":"content","text":"distributed consensus"}},"limit":5}
+        , null);
+        defer public_query.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), public_query.status);
+        try std.testing.expect(std.mem.indexOf(u8, public_query.body, "\"doc:db\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, public_query.body, "alpha") != null);
+        try std.testing.expect(std.mem.indexOf(u8, public_query.body, "beta") == null);
+    }
 }
 
 test "provisioned read preparation invalidates readers without closing dirty writer cache" {
@@ -21905,6 +22255,38 @@ test "provisioned table restore lifecycle reserves forwarded owner and caller so
     owner.endGroupOperation("docs", 7001);
 }
 
+test "provisioned startup catch-up enters through forwarded write owner" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var owner = ProvisionedTableWriteSource.init("/tmp/unused-antfly-catch-up-owner", NoCatalog.iface());
+    var caller = ProvisionedTableWriteSource.init("/tmp/unused-antfly-catch-up-caller", NoCatalog.iface());
+    _ = caller.withLocalWriteOwner(&owner);
+
+    owner.testingMarkGroupOperationActive("docs", 7001);
+    defer owner.endGroupOperation("docs", 7001);
+
+    const result = try caller.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{});
+    try std.testing.expect(result.busy);
+    try std.testing.expect(!caller.startup_catch_up_active.load(.acquire));
+    try std.testing.expect(!owner.startup_catch_up_active.load(.acquire));
+}
+
 test "provisioned table write source structural activity waits for table request lease" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -22008,6 +22390,91 @@ test "provisioned table write source group operation blocks read admission" {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     thread.join();
+}
+
+test "provisioned runtime status inspection waits for structural transition" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const StatusWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        started: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            const statuses = self.source.source().localRuntimeStatuses(std.testing.allocator, "docs") catch unreachable;
+            std.debug.assert(statuses == null);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-status-transition", NoCatalog.iface());
+    source.beginStructuralTableActivity("docs");
+    var structural_active = true;
+    errdefer if (structural_active) source.endStructuralTableActivity("docs");
+
+    var worker = StatusWorker{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, StatusWorker.run, .{&worker});
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    while (!worker.started.load(.acquire)) {
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!worker.completed.load(.acquire));
+
+    source.endStructuralTableActivity("docs");
+    structural_active = false;
+    thread.join();
+    try std.testing.expect(worker.completed.load(.acquire));
+}
+
+test "provisioned read admission enters through forwarded write owner" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var owner = ProvisionedTableWriteSource.init("/tmp/unused-antfly-read-owner", NoCatalog.iface());
+    var forwarding = ProvisionedTableWriteSource.init("/tmp/unused-antfly-read-forwarder", NoCatalog.iface());
+    _ = forwarding.withLocalWriteOwner(&owner);
+
+    var activity = forwarding.readPreparation().beginRead("docs", .general).?;
+    try std.testing.expect(!owner.tryBeginGroupOperation("docs", 7001));
+    activity.deinit();
+
+    try std.testing.expect(owner.tryBeginGroupOperation("docs", 7001));
+    owner.endGroupOperation("docs", 7001);
 }
 
 test "provisioned table write source keeps structural activity blocked until last table request exits" {
@@ -22731,6 +23198,105 @@ test "provisioned table write source restore repair completion retires cached ve
     }
     const stats_after = read_cache.cacheStats();
     try std.testing.expectEqual(stats_before.miss_count + 1, stats_after.miss_count);
+}
+
+test "provisioned table write source path invalidation clears shared vector read cache" {
+    const alloc = std.testing.allocator;
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-path-cache-invalidation", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+
+    {
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
+            alloc,
+            path,
+            "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            identity_namespace,
+        );
+        defer db.close();
+        try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
+            .sync_level = .write,
+        });
+    }
+
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    read_cache.hbc_cache = &hbc_cache;
+
+    {
+        var read_lease = try read_cache.getOrOpen(path, NoCatalog.iface(), 7001, 0, "docs");
+        defer read_lease.release();
+
+        const query_vec = [_]f32{ 1.0, 2.0 };
+        const req: db_mod.types.SearchRequest = .{
+            .index_name = "semantic_idx",
+            .dense = .{ .vector = query_vec[0..], .k = 1 },
+            .limit = 1,
+            .include_stored = false,
+        };
+        var profiled = try read_lease.db.searchDenseProfiled(alloc, req, req.dense.?);
+        defer profiled.result.deinit();
+        try std.testing.expect(profiled.result.hits.len >= 1);
+    }
+
+    try std.testing.expect(hbc_cache.global_stats.total_bytes > 0);
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    defer source.deinit();
+    source.read_cache = &read_cache;
+    source.invalidateSharedPathCaches(path);
+
+    try std.testing.expectEqual(@as(u64, 0), hbc_cache.global_stats.total_bytes);
 }
 
 test "provisioned restore repair open rejects stale doc identity namespace" {

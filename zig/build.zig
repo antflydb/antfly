@@ -1090,6 +1090,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
@@ -1692,6 +1693,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
     });
     antfly_imports.configure(b, lib_mod, false, link_libc);
 
@@ -4185,7 +4187,9 @@ pub fn build(b: *std.Build) void {
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
             "provisioned table write source backs up a portable local table",
+            "provisioned native backup restore repeats through shared read and write owners",
             "provisioned table restore rejects mismatched doc identity namespace",
+            "provisioned table write source path invalidation clears shared vector read cache",
             "provisioned table restore retry skips exact incomplete restore state with active writer",
             "provisioned restore repair source deinit cancels sleeping retry worker",
             "provisioned restore repair open rejects stale doc identity namespace",
@@ -4208,6 +4212,9 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore lifecycle blocks group operations but allows foreground structural mutation",
             "provisioned table restore lifecycle blocks request admission without blocking foreground structural mutation",
             "provisioned table restore lifecycle reserves forwarded owner and caller sources",
+            "provisioned startup catch-up enters through forwarded write owner",
+            "provisioned runtime status inspection waits for structural transition",
+            "provisioned read admission enters through forwarded write owner",
             "provisioned table write source drop table waits for active read cache lease",
             "provisioned table write source drop table closes schema-bearing cached writer once",
             "provisioned table write source backup releases read cache exclusive before native snapshot copy",
@@ -4239,6 +4246,7 @@ pub fn build(b: *std.Build) void {
             "aggregation completeness requires exact total relation",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
+            "provisioned storage inspection uses table read admission",
             "parseRemoteSearchResult preserves fused index scores",
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
@@ -4303,6 +4311,13 @@ pub fn build(b: *std.Build) void {
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    const api_table_writes_restore_repeat_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"provisioned native backup restore repeats through shared read and write owners"},
+    });
+    const run_api_table_writes_restore_repeat_tests = b.addRunArtifact(api_table_writes_restore_repeat_tests);
+    const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
+    api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
     api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
@@ -5140,6 +5155,14 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_db_unit_tests.addArgs(args);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
+
+    const db_restore_identity_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"db restore snapshot repeatedly validates run-backed doc identity metadata"},
+    });
+    const run_db_restore_identity_tests = b.addRunArtifact(db_restore_identity_tests);
+    const db_restore_identity_step = b.step("db-restore-identity-test", "Run the focused run-backed identity restore regression");
+    db_restore_identity_step.dependOn(&run_db_restore_identity_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -6876,6 +6899,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("pkg/antfly/src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
         });
         mod.addImport("antfly-zig", lib_mod);
         mod.addImport("antfly-client", antfly_client_pkg_mod);
@@ -6902,6 +6926,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("pkg/antfly/src/inference_main.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
         });
         mod.addImport("inference_cli", inference_cli_mod);
         mod.addImport("antfly_platform", platform_mod);
