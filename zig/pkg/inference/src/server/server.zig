@@ -1020,6 +1020,7 @@ pub const Node = struct {
         request: readers_api.Request,
     ) ![]readers_api.Result {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
+        if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         try self.request_queue.acquire();
         self.updateQueueMetrics();
         defer self.releaseSlot();

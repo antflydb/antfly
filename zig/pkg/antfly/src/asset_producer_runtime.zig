@@ -23,6 +23,7 @@ const extracting = @import("antfly_extracting");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 
 const Allocator = std.mem.Allocator;
+const local_reader_batch_max_images: usize = 64;
 
 pub const Runtime = struct {
     alloc: Allocator,
@@ -332,16 +333,39 @@ pub const Runtime = struct {
         }
         if (flat_images.items.len == 0) return error.BatchIncompatible;
 
-        const results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
-            .images = flat_images.items,
-            .prompt = shared_prompt,
-            .max_tokens = cfg_parsed.value.max_tokens,
-        });
+        const results = try alloc.alloc(readers.Result, flat_images.items.len);
+        var results_filled: usize = 0;
+        var results_errdefer_active = true;
+        errdefer if (results_errdefer_active) {
+            for (results[0..results_filled]) |*result| readers.deinitResult(alloc, result);
+            alloc.free(results);
+        };
+        var image_offset: usize = 0;
+        while (image_offset < flat_images.items.len) {
+            const image_end = @min(image_offset + local_reader_batch_max_images, flat_images.items.len);
+            const chunk_images = flat_images.items[image_offset..image_end];
+            const chunk_results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+                .images = chunk_images,
+                .prompt = shared_prompt,
+                .max_tokens = cfg_parsed.value.max_tokens,
+            });
+            if (chunk_results.len != chunk_images.len) {
+                for (chunk_results) |*result| readers.deinitResult(alloc, result);
+                alloc.free(chunk_results);
+                return error.InvalidReaderResponse;
+            }
+            for (chunk_results, 0..) |result, j| {
+                results[image_offset + j] = result;
+            }
+            results_filled += chunk_results.len;
+            alloc.free(chunk_results);
+            image_offset = image_end;
+        }
+        results_errdefer_active = false;
         defer {
             for (results) |*result| readers.deinitResult(alloc, result);
             alloc.free(results);
         }
-        if (results.len != flat_images.items.len) return error.InvalidReaderResponse;
 
         const out = try alloc.alloc([]u8, requests.len);
         errdefer {
@@ -1401,6 +1425,96 @@ test "asset producer runtime batches compatible antfly reader requests" {
     try std.testing.expectEqualStrings("first", results[0]);
     try std.testing.expectEqualStrings("second", results[1]);
     try std.testing.expectEqual(@as(usize, 1), local.read_calls);
+}
+
+test "asset producer runtime chunks local antfly reader batches to inference cap" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        read_calls: usize = 0,
+        batch_lengths: [2]usize = .{ 0, 0 },
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .read_images = readImages,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("local-reader", model);
+            try std.testing.expect(request.images.len > 0);
+            try std.testing.expect(request.images.len <= local_reader_batch_max_images);
+            try std.testing.expect(request.prompt == null);
+            if (self.read_calls >= self.batch_lengths.len) return error.TestUnexpectedResult;
+            self.batch_lengths[self.read_calls] = request.images.len;
+            self.read_calls += 1;
+
+            const out = try a.alloc(readers.Result, request.images.len);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |*result| readers.deinitResult(a, result);
+                a.free(out);
+            }
+            for (request.images, 0..) |image, i| {
+                out[i] = .{ .text = try a.dupe(u8, image) };
+                filled += 1;
+            }
+            return out;
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    const producer = runtime.producer();
+
+    const request_count = local_reader_batch_max_images + 1;
+    var urls: [request_count][]u8 = undefined;
+    var urls_filled: usize = 0;
+    defer {
+        for (urls[0..urls_filled]) |url| alloc.free(url);
+    }
+    var requests: [request_count]asset_producer.Request = undefined;
+    for (0..request_count) |i| {
+        urls[i] = try std.fmt.allocPrint(alloc, "data:image/png;base64,{d}", .{i});
+        urls_filled += 1;
+        requests[i] = .{
+            .producer_type = .reader,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+            .source_text = urls[i],
+            .content_type = "text/plain",
+        };
+    }
+
+    const results = try producer.produceBatch(alloc, &requests);
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, request_count), results.len);
+    try std.testing.expectEqual(@as(usize, 2), local.read_calls);
+    try std.testing.expectEqual(@as(usize, local_reader_batch_max_images), local.batch_lengths[0]);
+    try std.testing.expectEqual(@as(usize, 1), local.batch_lengths[1]);
+    for (results, urls) |result, url| {
+        try std.testing.expectEqualStrings(url, result);
+    }
 }
 
 test "asset producer runtime batches compatible antfly transcriber requests" {
