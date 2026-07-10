@@ -88,7 +88,7 @@ pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
         options,
     )) orelse return;
     defer prepared.deinit();
-    try publishPreparedRestore(alloc, path, &prepared);
+    _ = try publishPreparedRestore(alloc, path, &prepared);
 }
 
 /// Builds and validates a replacement generation without mutating the live
@@ -110,10 +110,11 @@ pub fn publishPreparedRestore(
     alloc: std.mem.Allocator,
     path: []const u8,
     prepared: *db_mod.generation_lifecycle.StagedGeneration,
-) !void {
+) !db_mod.generation_lifecycle.PublicationOutcome {
     try prepared.validateLivePath(path);
-    try prepared.publish();
+    const outcome = try prepared.publish();
     cleanupSnapshotsForPublishedRestore(alloc, path);
+    return outcome;
 }
 
 pub fn restoreSnapshotMatchesPath(
@@ -151,32 +152,6 @@ pub fn applyBackupRestoreFromRecord(
         .location = restore.location,
         .snapshot_path = restore.snapshot_path,
     }, null);
-}
-
-pub fn forceApplyBackupRestoreFromRecord(
-    alloc: std.mem.Allocator,
-    replica_root_dir: []const u8,
-    group_id: u64,
-    restore: @import("../catalog.zig").BackupRestoreBootstrapRecord,
-) !void {
-    const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(path);
-    defer transition.deinit();
-    var prepared = try prepareRestoreSnapshot(
-        &transition,
-        alloc,
-        path,
-        group_id,
-        .{
-            .backup_id = restore.backup_id,
-            .location = restore.location,
-            .snapshot_path = restore.snapshot_path,
-        },
-        .{},
-    );
-    defer prepared.deinit();
-    try publishPreparedRestore(alloc, path, &prepared);
 }
 
 fn prepareRestoreSnapshotIfNeeded(

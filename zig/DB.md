@@ -61,7 +61,19 @@ the same process generation-lifecycle manager. The provisioned serving path
 uses separate prepare and publish operations so all required repair completes
 before the namespace mutation. Startup/bootstrap convenience paths publish a
 validated primary generation with a durable repair marker, allowing the normal
-startup owner to resume derived repair after a crash.
+startup owner to resume derived repair after a crash. Replica bootstrap restore
+must finish before `ensureReplica()` activates the group; an active replica is
+never force-restored by raw path.
+
+Publication errors are pre-commit errors. After a directory rename or exchange
+makes the new generation visible, publication returns either `durable` or
+`durability_uncertain` and the caller must finish cache invalidation and reopen
+admission in both cases. A post-commit sync failure must never enter the
+pre-commit abort or metadata-drop path. Replacing an existing direct-path
+generation requires an atomic directory exchange; platforms or filesystems
+without that primitive reject publication before changing the live namespace.
+If the exchange is visible but its parent-directory sync fails, the previous
+generation remains under the staging name for explicit recovery.
 
 The current root layout is path-relative and may lazily open run files after a
 transaction starts. Consequently, serving transitions stop admission and drain
@@ -70,6 +82,10 @@ ordering safe, but they do not make a path swap safe beneath an old reader. A
 future zero-downtime transition must place each generation under an immutable
 versioned root and atomically publish a separate current-generation pointer;
 only then may generation N readers overlap preparation and publication of N+1.
+The direct-path layout also cannot make multiple shard directory swaps
+crash-atomic. Until table generations are published through one durable table
+generation pointer, table backup and restore reject multi-range tables before
+staging or publishing any shard.
 
 LSM manifests are relocatable generation metadata. On open, run paths are
 reconstructed from the current root and run identity instead of trusting an
@@ -85,6 +101,11 @@ or drop invalidates every HBC namespace whose path is under the restored/dropped
 table-group root. Any future shared index cache should follow the same rule:
 cache keys may be engine-specific, but lifecycle invalidation is table-root
 scoped and owned by the generation transition.
+
+Shared HBC namespace-to-path registrations are reference counted by open index
+owners. A registration remains after the last owner closes only while retained
+cache entries still use it; clear, path invalidation, and subsequent index opens
+prune unowned registrations once those entries are gone.
 
 The DB layer therefore separates three concepts:
 

@@ -6587,6 +6587,7 @@ pub const ApiHttpServer = struct {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
+            error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
             error.InvalidBackupRequest => error.InvalidBackupRequest,
             else => error.InternalFailure,

@@ -13,6 +13,13 @@ const fs_paths = @import("../../common/fs_paths.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const PublicationOutcome = enum {
+    durable,
+    durability_uncertain,
+};
+
+var test_fail_post_publish_sync = false;
+
 const ActiveTransition = struct {
     path: []u8,
     path_key: []u8,
@@ -110,13 +117,11 @@ pub const ExclusiveTransition = struct {
         const nonce = platform.time.monotonicNs();
         const staging_path = try std.fmt.allocPrint(self.alloc, "{s}.restore-stage-{x}-{x}", .{ self.path, self.id, nonce });
         errdefer self.alloc.free(staging_path);
-        const retired_path = try std.fmt.allocPrint(self.alloc, "{s}.restore-retired-{x}-{x}", .{ self.path, self.id, nonce });
-        errdefer self.alloc.free(retired_path);
 
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        if (pathExists(io, staging_path) or pathExists(io, retired_path)) return error.GenerationStagingCollision;
+        if (pathExists(io, staging_path)) return error.GenerationStagingCollision;
         try fs_paths.createDirPathPortable(io, staging_path);
         return .{
             .alloc = self.alloc,
@@ -124,7 +129,6 @@ pub const ExclusiveTransition = struct {
             .transition_id = self.id,
             .live_path = live_path,
             .staging_path = staging_path,
-            .retired_path = retired_path,
         };
     }
 };
@@ -135,8 +139,8 @@ pub const StagedGeneration = struct {
     transition_id: u64,
     live_path: []u8,
     staging_path: []u8,
-    retired_path: []u8,
     published: bool = false,
+    preserve_retired: bool = false,
     closed: bool = false,
 
     pub fn path(self: *const StagedGeneration) []const u8 {
@@ -151,7 +155,10 @@ pub const StagedGeneration = struct {
         if (self.closed or !std.mem.eql(u8, self.live_path, path_value)) return error.InvalidGenerationTransition;
     }
 
-    pub fn publish(self: *StagedGeneration) !void {
+    /// Errors are returned only before the live namespace changes. Once the
+    /// generation is visible, durability failures are represented in the
+    /// outcome so callers must finish their committed transition.
+    pub fn publish(self: *StagedGeneration) !PublicationOutcome {
         if (self.closed or self.published) return error.InvalidGenerationTransition;
         try self.manager.validateExclusive(self.transition_id);
 
@@ -164,46 +171,36 @@ pub const StagedGeneration = struct {
         try fs_paths.syncDirPortable(io, parent);
 
         const had_live_generation = pathExists(io, self.live_path);
-        if (had_live_generation and try exchangeDirectoriesAtomic(self.alloc, self.live_path, self.staging_path)) {
+        if (had_live_generation) {
+            if (!try exchangeDirectoriesAtomic(self.alloc, self.live_path, self.staging_path)) {
+                return error.AtomicGenerationExchangeUnavailable;
+            }
             // The namespace mutation has completed. Record that before any operation
             // that can fail so deinit never mistakes the retired root for staging.
             self.published = true;
-            try fs_paths.syncDirPortable(io, parent);
-            std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch |err| {
-                std.log.warn("retired exchanged generation cleanup deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
-            };
-            fs_paths.syncDirPortable(io, parent) catch |err| {
-                std.log.warn("retired exchanged generation parent sync deferred path={s} err={s}", .{ parent, @errorName(err) });
-            };
-            return;
-        }
-        if (had_live_generation) {
-            try std.Io.Dir.rename(std.Io.Dir.cwd(), self.live_path, std.Io.Dir.cwd(), self.retired_path, io);
-        }
-        std.Io.Dir.rename(std.Io.Dir.cwd(), self.staging_path, std.Io.Dir.cwd(), self.live_path, io) catch |publish_err| {
-            if (had_live_generation) {
-                std.Io.Dir.rename(std.Io.Dir.cwd(), self.retired_path, std.Io.Dir.cwd(), self.live_path, io) catch |rollback_err| {
-                    std.log.err("generation publication rollback failed live={s} retired={s} err={s}", .{
-                        self.live_path,
-                        self.retired_path,
-                        @errorName(rollback_err),
-                    });
-                    return error.GenerationPublicationRollbackFailed;
+            const outcome = syncPublishedParent(io, parent);
+            if (outcome == .durable) {
+                std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch |err| {
+                    std.log.warn("retired exchanged generation cleanup deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
                 };
+                fs_paths.syncDirPortable(io, parent) catch |err| {
+                    std.log.warn("retired exchanged generation parent sync deferred path={s} err={s}", .{ parent, @errorName(err) });
+                };
+            } else {
+                // The exchange is visible but not known durable. Keep the old root
+                // available for operator recovery instead of destroying both sides
+                // of the last durable namespace state.
+                self.preserve_retired = true;
+                std.log.err("retaining previous generation after uncertain publication path={s}", .{self.staging_path});
             }
-            return publish_err;
-        };
+            return outcome;
+        }
+
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), self.staging_path, std.Io.Dir.cwd(), self.live_path, io);
 
         self.published = true;
-        try fs_paths.syncDirPortable(io, parent);
-        if (had_live_generation) {
-            std.Io.Dir.cwd().deleteTree(io, self.retired_path) catch |err| {
-                std.log.warn("retired generation cleanup deferred path={s} err={s}", .{ self.retired_path, @errorName(err) });
-            };
-            fs_paths.syncDirPortable(io, parent) catch |err| {
-                std.log.warn("retired generation parent sync deferred path={s} err={s}", .{ parent, @errorName(err) });
-            };
-        }
+        const outcome = syncPublishedParent(io, parent);
+        return outcome;
     }
 
     pub fn deinit(self: *StagedGeneration) void {
@@ -211,15 +208,11 @@ pub const StagedGeneration = struct {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         if (self.published) {
-            // A post-rename durability error can return before publish() reaches
-            // its normal cleanup. Neither name can refer to the new live root.
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), self.retired_path) catch {};
+            if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
         } else {
             std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
         }
         self.alloc.free(self.staging_path);
-        self.alloc.free(self.retired_path);
         self.alloc.free(self.live_path);
         self.closed = true;
     }
@@ -257,6 +250,18 @@ fn syncTreePortable(alloc: Allocator, io: std.Io, root: []const u8) !void {
         }
     }
     try fs_paths.syncDirPortable(io, root);
+}
+
+fn syncPublishedParent(io: std.Io, parent: []const u8) PublicationOutcome {
+    if (builtin.is_test and test_fail_post_publish_sync) {
+        test_fail_post_publish_sync = false;
+        return .durability_uncertain;
+    }
+    fs_paths.syncDirPortable(io, parent) catch |err| {
+        std.log.err("published generation parent sync failed path={s} err={s}", .{ parent, @errorName(err) });
+        return .durability_uncertain;
+    };
+    return .durable;
 }
 
 fn exchangeDirectoriesAtomic(alloc: Allocator, left: []const u8, right: []const u8) !bool {
@@ -365,8 +370,46 @@ test "staged generation preserves live root until publication" {
     defer alloc.free(before);
     try std.testing.expectEqualStrings("old", before);
 
-    try staged.publish();
+    try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
     const after = try std.Io.Dir.cwd().readFileAlloc(io, live_value_path, alloc, .limited(16));
     defer alloc.free(after);
     try std.testing.expectEqualStrings("new", after);
+}
+
+test "published generation reports post-commit sync failure without returning an error" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/uncertain", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    const old_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(old_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = old_value_path, .data = "previous" });
+
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    var transition = try manager.beginExclusive(live_path);
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+
+    const value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
+    defer alloc.free(value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = value_path, .data = "committed" });
+
+    test_fail_post_publish_sync = true;
+    defer test_fail_post_publish_sync = false;
+    try std.testing.expectEqual(PublicationOutcome.durability_uncertain, try staged.publish());
+
+    const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(live_value_path);
+    const value = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(32));
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("committed", value);
+
+    const retired_value = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, value_path, alloc, .limited(32));
+    defer alloc.free(retired_value);
+    try std.testing.expectEqualStrings("previous", retired_value);
 }

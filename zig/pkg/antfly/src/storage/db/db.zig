@@ -61899,7 +61899,7 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
                 .group_id = @intCast(i + 1),
             },
         );
-        try staged_generation.publish();
+        _ = try staged_generation.publish();
 
         var restored = try DB.open(alloc, std.mem.span(restore_path), .{
             .primary_backend = primary_backend,

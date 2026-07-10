@@ -482,6 +482,11 @@ const HbcCacheIdentity = struct {
     stable_path: []u8,
 };
 
+const HbcNamespacePathRegistration = struct {
+    path: []u8,
+    active_owners: usize,
+};
+
 fn hbcCacheIdentityAlloc(alloc: Allocator, path: []const u8) !HbcCacheIdentity {
     const stable_path = hbcCacheStablePathAlloc(alloc, path) catch try alloc.dupe(u8, path);
     return .{
@@ -555,8 +560,7 @@ pub const Cache = struct {
     metadata_slots: std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize) = .empty,
     metadata_clock: std.ArrayListUnmanaged(HbcSharedClockEntry) = .empty,
     metadata_hand: usize = 0,
-    namespace_paths: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
-    namespace_registration_incomplete: bool = false,
+    namespace_paths: std.AutoHashMapUnmanaged(u64, HbcNamespacePathRegistration) = .empty,
 
     pub fn init(alloc: Allocator) Cache {
         return .{ .alloc = alloc };
@@ -581,7 +585,7 @@ pub const Cache = struct {
         self.metadata_slots.deinit(self.alloc);
         self.metadata_clock.deinit(self.alloc);
         var path_it = self.namespace_paths.valueIterator();
-        while (path_it.next()) |path| self.alloc.free(path.*);
+        while (path_it.next()) |registration| self.alloc.free(registration.path);
         self.namespace_paths.deinit(self.alloc);
     }
 
@@ -609,34 +613,49 @@ pub const Cache = struct {
         while (self.evictNamespaceEntryLocked(namespace, .node)) {}
     }
 
-    pub fn registerNamespacePath(self: *Cache, namespace: u64, path: []const u8) void {
-        const stable_path = hbcCacheStablePathAlloc(self.alloc, path) catch {
-            self.mutex.lockExclusive();
-            defer self.mutex.unlockExclusive();
-            self.namespace_registration_incomplete = true;
-            return;
-        };
+    pub fn registerNamespacePath(self: *Cache, namespace: u64, path: []const u8) bool {
+        const stable_path = hbcCacheStablePathAlloc(self.alloc, path) catch return false;
         errdefer self.alloc.free(stable_path);
 
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
+        self.pruneUnusedNamespacePathsLocked();
+
+        // Registered namespaces always have an accounting slot. This makes
+        // retained-entry detection O(1) without adding cache hot-path state.
+        const stats_entry = self.namespace_stats.getOrPut(self.alloc, namespace) catch {
+            self.alloc.free(stable_path);
+            return false;
+        };
+        if (!stats_entry.found_existing) stats_entry.value_ptr.* = .{};
 
         const entry = self.namespace_paths.getOrPut(self.alloc, namespace) catch {
-            self.namespace_registration_incomplete = true;
+            if (!stats_entry.found_existing) _ = self.namespace_stats.remove(namespace);
             self.alloc.free(stable_path);
-            return;
+            return false;
         };
         if (!entry.found_existing) {
-            entry.value_ptr.* = stable_path;
-            return;
+            entry.value_ptr.* = .{ .path = stable_path, .active_owners = 1 };
+            return true;
         }
-        if (std.mem.eql(u8, entry.value_ptr.*, stable_path)) {
+        if (std.mem.eql(u8, entry.value_ptr.path, stable_path)) {
+            entry.value_ptr.active_owners += 1;
             self.alloc.free(stable_path);
-            return;
+            return true;
         }
 
-        self.namespace_registration_incomplete = true;
         self.alloc.free(stable_path);
+        return false;
+    }
+
+    pub fn unregisterNamespacePath(self: *Cache, namespace: u64, stable_path: []const u8) void {
+        self.mutex.lockExclusive();
+        defer self.mutex.unlockExclusive();
+
+        const registration = self.namespace_paths.getPtr(namespace) orelse return;
+        if (!std.mem.eql(u8, registration.path, stable_path) or registration.active_owners == 0) return;
+        registration.active_owners -= 1;
+        self.removeNamespacePathIfUnusedLocked(namespace);
     }
 
     pub fn invalidatePath(self: *Cache, path: []const u8) void {
@@ -649,23 +668,18 @@ pub const Cache = struct {
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
 
-        if (self.namespace_registration_incomplete) {
-            self.clearAllLocked();
-            self.clearNamespacePathsLocked();
-            self.namespace_registration_incomplete = false;
-            return;
-        }
-
         while (self.evictPathPrefixEntryLocked(stable_prefix, .vector)) {}
         while (self.evictPathPrefixEntryLocked(stable_prefix, .metadata)) {}
         while (self.evictPathPrefixEntryLocked(stable_prefix, .quantized)) {}
         while (self.evictPathPrefixEntryLocked(stable_prefix, .node)) {}
+        self.pruneUnusedNamespacePathsLocked();
     }
 
     pub fn clear(self: *Cache) void {
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
         self.clearAllLocked();
+        self.pruneUnusedNamespacePathsLocked();
     }
 
     pub fn clearNodeNamespace(self: *Cache, namespace: u64) void {
@@ -973,7 +987,10 @@ pub const Cache = struct {
 
     fn removeStatsLocked(self: *Cache, kind: HbcCacheKind, namespace: u64, bytes: u64) void {
         removeHbcKindBytes(&self.global_stats, kind, bytes);
-        if (self.namespace_stats.getPtr(namespace)) |stats| removeHbcKindBytes(stats, kind, bytes);
+        if (self.namespace_stats.getPtr(namespace)) |stats| {
+            removeHbcKindBytes(stats, kind, bytes);
+            if (stats.total_bytes == 0) self.removeNamespacePathIfUnusedLocked(namespace);
+        }
     }
 
     fn noteInsertionLocked(self: *Cache, kind: HbcCacheKind, namespace: u64) void {
@@ -1158,8 +1175,8 @@ pub const Cache = struct {
                 {
                     var it = self.vector_cache.keyIterator();
                     while (it.next()) |key| {
-                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
-                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                        const registration = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(registration.path, stable_prefix)) {
                             victim = key.*;
                             break;
                         }
@@ -1172,8 +1189,8 @@ pub const Cache = struct {
                 {
                     var it = self.metadata_cache.keyIterator();
                     while (it.next()) |key| {
-                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
-                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                        const registration = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(registration.path, stable_prefix)) {
                             victim = key.*;
                             break;
                         }
@@ -1186,8 +1203,8 @@ pub const Cache = struct {
                 {
                     var it = self.quantized_cache.keyIterator();
                     while (it.next()) |key| {
-                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
-                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                        const registration = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(registration.path, stable_prefix)) {
                             victim = key.*;
                             break;
                         }
@@ -1200,8 +1217,8 @@ pub const Cache = struct {
                 {
                     var it = self.node_cache.keyIterator();
                     while (it.next()) |key| {
-                        const namespace_path = self.namespace_paths.get(key.namespace) orelse continue;
-                        if (hbcPathHasPrefixBoundary(namespace_path, stable_prefix)) {
+                        const registration = self.namespace_paths.get(key.namespace) orelse continue;
+                        if (hbcPathHasPrefixBoundary(registration.path, stable_prefix)) {
                             victim = key.*;
                             break;
                         }
@@ -1276,10 +1293,31 @@ pub const Cache = struct {
         self.observeLocked();
     }
 
-    fn clearNamespacePathsLocked(self: *Cache) void {
-        var path_it = self.namespace_paths.valueIterator();
-        while (path_it.next()) |path| self.alloc.free(path.*);
-        self.namespace_paths.clearRetainingCapacity();
+    fn namespaceHasEntriesLocked(self: *Cache, namespace: u64) bool {
+        const stats = self.namespace_stats.get(namespace) orelse return false;
+        return stats.total_bytes != 0;
+    }
+
+    fn removeNamespacePathIfUnusedLocked(self: *Cache, namespace: u64) void {
+        const registration = self.namespace_paths.get(namespace) orelse return;
+        if (registration.active_owners != 0 or self.namespaceHasEntriesLocked(namespace)) return;
+        const removed = self.namespace_paths.fetchRemove(namespace) orelse return;
+        self.alloc.free(removed.value.path);
+    }
+
+    fn pruneUnusedNamespacePathsLocked(self: *Cache) void {
+        while (true) {
+            var victim: ?u64 = null;
+            var it = self.namespace_paths.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.active_owners == 0 and !self.namespaceHasEntriesLocked(entry.key_ptr.*)) {
+                    victim = entry.key_ptr.*;
+                    break;
+                }
+            }
+            const namespace = victim orelse return;
+            self.removeNamespacePathIfUnusedLocked(namespace);
+        }
     }
 };
 
@@ -1423,6 +1461,7 @@ pub const HBCIndex = struct {
     metadata_clock_hand: usize,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     shared_cache: ?*Cache = null,
+    shared_cache_registered: bool = false,
     cache_namespace: u64 = 0,
     cache_path: []u8 = &.{},
     cache_enabled: bool = true,
@@ -2011,6 +2050,7 @@ pub const HBCIndex = struct {
             .metadata_clock_hand = 0,
             .resource_manager = null,
             .shared_cache = null,
+            .shared_cache_registered = false,
             .cache_namespace = cache_identity.namespace,
             .cache_path = cache_identity.stable_path,
             .cache_enabled = true,
@@ -2101,12 +2141,19 @@ pub const HBCIndex = struct {
     }
 
     pub fn attachSharedCache(self: *HBCIndex, cache: *Cache) void {
+        if (self.shared_cache) |current| {
+            if (current == cache and self.shared_cache_registered) return;
+            if (self.shared_cache_registered) current.unregisterNamespacePath(self.cache_namespace, self.cache_path);
+            self.shared_cache = null;
+            self.shared_cache_registered = false;
+        }
         self.clearNodeCache();
         self.clearQuantizedCache();
         self.clearVectorCache();
         self.clearMetadataCache();
+        if (!cache.registerNamespacePath(self.cache_namespace, self.cache_path)) return;
         self.shared_cache = cache;
-        cache.registerNamespacePath(self.cache_namespace, self.cache_path);
+        self.shared_cache_registered = true;
         if (self.resource_manager) |manager| cache.attachResourceManager(manager);
     }
 
@@ -2537,6 +2584,11 @@ pub const HBCIndex = struct {
             self.clearLocalNodeCacheLocked();
             self.clearLocalQuantizedCacheLocked();
             self.cache_mu.unlockExclusive();
+        }
+        if (self.shared_cache) |cache| {
+            if (self.shared_cache_registered) cache.unregisterNamespacePath(self.cache_namespace, self.cache_path);
+            self.shared_cache = null;
+            self.shared_cache_registered = false;
         }
         self.alloc.free(self.node_clock_keys);
         self.alloc.free(self.node_clock_refs);
@@ -6590,6 +6642,37 @@ test "hbc index close does not clear shared namespace bytes" {
 
     try std.testing.expect(cache.namespaceStats(namespace).total_bytes > 0);
     try std.testing.expect(cache.namespaceStats(namespace).vector.used_bytes > 0);
+}
+
+test "hbc shared cache releases unused namespace path registrations" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+
+    var first = try HBCIndex.open(alloc, path, .{ .dims = 4 });
+    var first_open = true;
+    defer if (first_open) first.close();
+    first.attachSharedCache(&cache);
+    const namespace = first.cache_namespace;
+    try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
+
+    var second = try HBCIndex.open(alloc, path, .{ .dims = 4 });
+    var second_open = true;
+    defer if (second_open) second.close();
+    second.attachSharedCache(&cache);
+    try std.testing.expectEqual(@as(usize, 2), cache.namespace_paths.get(namespace).?.active_owners);
+
+    first.close();
+    first_open = false;
+    try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
+
+    second.close();
+    second_open = false;
+    try std.testing.expect(!cache.namespace_paths.contains(namespace));
 }
 
 test "hbc cache reports byte usage to resource manager" {

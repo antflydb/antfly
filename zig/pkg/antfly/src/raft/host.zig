@@ -332,19 +332,6 @@ pub const Host = struct {
         };
         self.metrics.ensure_replica_calls += 1;
         if (record.backup_restore_bootstrap != null) {
-            if (self.cfg.replica_root_dir) |replica_root_dir| {
-                backup_restore.forceApplyBackupRestoreFromRecord(
-                    self.alloc,
-                    replica_root_dir,
-                    record.group_id,
-                    record.backup_restore_bootstrap.?,
-                ) catch |err| {
-                    self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
-                    return err;
-                };
-            }
-        }
-        if (record.backup_restore_bootstrap != null) {
             self.noteBootstrapSuccess(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
         }
         if (self.deps.replica_catalog) |replica_catalog| {
@@ -1359,7 +1346,7 @@ test "host drops stale inbound peer batch groups without leaking pending storage
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
 }
 
-test "host invokes backup restore bootstrapper before creating a replica" {
+test "host invokes backup restore bootstrapper exactly once before creating a replica" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -1429,7 +1416,13 @@ test "host invokes backup restore bootstrapper before creating a replica" {
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
     var bootstrapper = Bootstrapper{};
-    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+    var host = Host.init(std.testing.allocator, .{
+        .local_node_id = 1,
+        // The injected bootstrapper owns preparation. This deliberately invalid
+        // fallback root proves ensureReplica does not force a second path restore
+        // after the raft group becomes active.
+        .replica_root_dir = "/tmp/antfly-bootstrap-must-not-run-path-restore",
+    }, .{
         .descriptor_factory = factory.iface(),
         .backup_restore_bootstrapper = bootstrapper.iface(),
     });

@@ -9069,6 +9069,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.restoreTable(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
+        if (plan.manifest.shards.len != 1) return error.UnsupportedMultiRangeTable;
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
         defer alloc.free(local_location);
@@ -9128,7 +9129,10 @@ pub const ProvisionedTableWriteSource = struct {
             const repair_path = if (prepared_generation) |*generation| generation.path() else path;
             try self.repairRestoredTableRuntimeStateBlocking(alloc, repair_path, group_id, table_name);
             if (prepared_generation) |*generation| {
-                try backup_restore.publishPreparedRestore(alloc, path, generation);
+                const outcome = try backup_restore.publishPreparedRestore(alloc, path, generation);
+                if (outcome == .durability_uncertain) {
+                    std.log.err("restore generation published with uncertain durability table={s} group_id={d} path={s}", .{ table_name, group_id, path });
+                }
             }
             self.invalidateSharedPathCaches(path);
             shard_transition.deinit();
@@ -16615,6 +16619,34 @@ test "provisioned table write source backs up and restores a local table" {
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
+}
+
+test "provisioned table restore rejects multi-range manifests before opening storage" {
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-multi-range-restore",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+
+    const shards = [_]backups_api.ShardSnapshot{
+        .{ .group_id = 7001, .start_key = "", .end_key = "m", .snapshot_path = "snap/groups/7001" },
+        .{ .group_id = 7002, .start_key = "m", .snapshot_path = "snap/groups/7002" },
+    };
+    const manifest = backups_api.TableBackupManifest{
+        .backup_id = "snap",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = &shards,
+    };
+
+    try std.testing.expectError(error.UnsupportedMultiRangeTable, source.source().restoreTable(std.testing.allocator, "docs", .{
+        .backup_root = "/tmp/unused-antfly-multi-range-backup",
+        .manifest = &manifest,
+    }));
 }
 
 test "provisioned table restore retry skips exact incomplete restore state with active writer" {
