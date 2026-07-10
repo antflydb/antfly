@@ -5443,56 +5443,60 @@ pub const ApiHttpServer = struct {
         try backups_api.writeManifestToLocation(self.alloc, backup_location, &manifest);
     }
 
-    fn restoreOwnedTable(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
-        return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, backup_id, false);
+    const OwnedRestoreOutcome = enum { started, durability_confirmed };
+
+    fn restoreOwnedTable(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, source_location: []const u8, backup_id: []const u8) !OwnedRestoreOutcome {
+        return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, false);
     }
 
     fn restoreOwnedTableWithLifecycle(
         self: *ApiHttpServer,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
+        source_location: []const u8,
         backup_id: []const u8,
         restore_lifecycle_already_active: bool,
-    ) !void {
+    ) !OwnedRestoreOutcome {
         var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
         defer manifest.deinit(self.alloc);
 
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
         if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         try backups_api.validateRestorableManifestLayout(&manifest);
-        if (try self.tableExists(table_name)) return error.TableAlreadyExists;
+        const target_exists = try self.tableExists(table_name);
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const restore_lifecycle_active = if (restore_lifecycle_already_active) false else try table_writes_source.beginRestoreLifecycle(table_name);
         defer if (restore_lifecycle_active) table_writes_source.finishRestoreLifecycle(table_name);
 
-        var create_req = backups_api.createTableRequestFromManifest(self.alloc, &manifest) catch {
-            return error.UnsupportedBackupFormat;
-        };
-        defer create_req.deinit(self.alloc);
-
         var created_metadata = false;
         var storage_committed = false;
-        self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
-            error.UnsupportedOperation => {},
-            else => return err,
-        };
-        self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
-            error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
-            else => return err,
-        };
-        if (try self.tableExists(table_name)) created_metadata = true;
+        if (!target_exists) {
+            var create_req = backups_api.createTableRequestFromManifest(self.alloc, &manifest) catch {
+                return error.UnsupportedBackupFormat;
+            };
+            defer create_req.deinit(self.alloc);
+            self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
+                error.UnsupportedOperation => {},
+                else => return err,
+            };
+            self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
+                error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
+                else => return err,
+            };
+            if (try self.tableExists(table_name)) created_metadata = true;
+        }
         errdefer if (created_metadata and !storage_committed) self.source.dropTable(self.alloc, table_name) catch {};
 
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
-            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+            .remote => if (target_exists) "" else try createBackupStagingRoot(self.alloc, backup_id),
         };
         defer switch (backup_location.*) {
             .file => {},
-            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+            .remote => if (!target_exists) destroyBackupStagingRoot(self.alloc, local_backup_root),
         };
-        if (switch (backup_location.*) {
+        if (!target_exists and switch (backup_location.*) {
             .remote => true,
             .file => false,
         }) {
@@ -5515,6 +5519,8 @@ pub const ApiHttpServer = struct {
                 if ((table_writes_source.restoreTable(self.alloc, table_name, .{
                     .backup_root = local_backup_root,
                     .manifest = &manifest,
+                    .source_location = source_location,
+                    .reconcile_only = target_exists,
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
                     error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
@@ -5522,6 +5528,7 @@ pub const ApiHttpServer = struct {
                         storage_committed = true;
                         return error.RestoreDurabilityPending;
                     },
+                    error.RestoreIdentityMismatch => return error.TableAlreadyExists,
                     else => {
                         std.log.err("restoreOwnedTable restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
                         return err;
@@ -5532,8 +5539,9 @@ pub const ApiHttpServer = struct {
                 sleepNs(poll_interval_ns);
             }
 
-            return;
+            return if (target_exists) .durability_confirmed else .started;
         }
+        unreachable;
     }
 
     fn restoreLocalTableDataFromManifest(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
@@ -5618,21 +5626,23 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
+        source_location: []const u8,
         backup_id: []const u8,
-    ) !void {
-        return try self.restoreOwnedTableWithRetryAndLifecycle(table_name, backup_location, backup_id, false);
+    ) !OwnedRestoreOutcome {
+        return try self.restoreOwnedTableWithRetryAndLifecycle(table_name, backup_location, source_location, backup_id, false);
     }
 
     fn restoreOwnedTableWithRetryAndLifecycle(
         self: *ApiHttpServer,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
+        source_location: []const u8,
         backup_id: []const u8,
         restore_lifecycle_already_active: bool,
-    ) !void {
+    ) !OwnedRestoreOutcome {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            self.restoreOwnedTableWithLifecycle(table_name, backup_location, backup_id, restore_lifecycle_already_active) catch |err| switch (err) {
+            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, restore_lifecycle_already_active) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     if (attempt + 1 >= 3) return err;
                     if ((self.tableExists(table_name) catch false)) {
@@ -5643,8 +5653,9 @@ pub const ApiHttpServer = struct {
                 },
                 else => return err,
             };
-            return;
+            return outcome;
         }
+        unreachable;
     }
 
     fn createBackupStagingRoot(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {
@@ -6562,9 +6573,9 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)) return error.TableAlreadyExists;
+        const target_exists = self.tableExists(table_name) catch |err| return metadataAccessFailure(err);
 
-        if (!self.cfg.swarm_mode) {
+        if (!target_exists and !self.cfg.swarm_mode) {
             if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
@@ -6578,7 +6589,7 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        self.restoreOwnedTableWithRetry(table_name, location, backup_id) catch |err| switch (err) {
+        const outcome = self.restoreOwnedTableWithRetry(table_name, location, location_uri, backup_id) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidBackupRequest => {
@@ -6587,6 +6598,7 @@ pub const ApiHttpServer = struct {
             },
             else => return mapExecuteRestoreError(err),
         };
+        if (outcome == .durability_confirmed) return error.RestoreDurabilityConfirmed;
     }
 
     fn mapExecuteRestoreError(err: anyerror) public_table_http.TableApi.ExecuteRestoreError {
@@ -6597,6 +6609,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
             error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => error.RestoreDurabilityPending,
+            error.RestoreDurabilityConfirmed => error.RestoreDurabilityConfirmed,
             error.InvalidBackupRequest => error.InvalidBackupRequest,
             else => error.InternalFailure,
         };
@@ -7234,7 +7247,7 @@ pub const ApiHttpServer = struct {
                 }
             }
 
-            self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, table_backup_id, restore_lifecycle_active[i]) catch |err| {
+            const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, restore_lifecycle_active[i]) catch |err| {
                 if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                 std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
                     table_name,
@@ -7257,7 +7270,7 @@ pub const ApiHttpServer = struct {
                 }
                 continue;
             };
-            statuses[i].status = "triggered";
+            statuses[i].status = if (outcome == .durability_confirmed) "committed" else "triggered";
         }
 
         if (req.table_names == null and clusterRestoreStatusesHaveNoErrors(statuses)) {
@@ -8155,7 +8168,7 @@ pub const ApiHttpServer = struct {
         var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            200, 202 => try jsonBodyResponseWithStatus(self.alloc, resp.status, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -23728,6 +23741,8 @@ test "api http server durability-pending restore preserves committed metadata" {
 
     const RestoreWrites = struct {
         restored: bool = false,
+        restore_calls: usize = 0,
+        expected_location: []const u8,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -23747,14 +23762,17 @@ test "api http server durability-pending restore preserves committed metadata" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("snap1", plan.manifest.backup_id);
+            try std.testing.expectEqualStrings(self.expected_location, plan.source_location orelse return error.TestUnexpectedResult);
+            self.restore_calls += 1;
             self.restored = true;
+            if (plan.reconcile_only) return;
             return error.GenerationDurabilityUncertain;
         }
     };
 
     var source = FakeSource{};
     var read_source = EmptyReadSource{};
-    var write_source = RestoreWrites{};
+    var write_source = RestoreWrites{ .expected_location = location_uri };
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
 
     const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\"}}", .{location_uri});
@@ -23788,6 +23806,21 @@ test "api http server durability-pending restore preserves committed metadata" {
     try std.testing.expect(!source.dropped);
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"committed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"pending\"") != null);
+
+    var retry_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/restore",
+        .content_type = "application/json",
+        .body = restore_body,
+    });
+    defer retry_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), retry_resp.status);
+    try std.testing.expectEqualStrings("application/json", retry_resp.content_type.?);
+    try std.testing.expectEqual(@as(usize, 2), write_source.restore_calls);
+    try std.testing.expect(source.created);
+    try std.testing.expect(!source.dropped);
+    try std.testing.expect(std.mem.indexOf(u8, retry_resp.body, "\"committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retry_resp.body, "\"durable\"") != null);
 }
 
 test "api http server cluster overwrite restore tolerates already absent metadata drop" {

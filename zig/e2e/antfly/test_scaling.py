@@ -1121,7 +1121,7 @@ def _insert_docs(
             api_urls = _data_api_urls_for_table(
                 cluster,
                 table_name,
-                require_all_group_leaders=False,
+                require_all_group_leaders=True,
                 min_group_count=min_group_count,
             )
         except (AssertionError, requests.RequestException, ValueError):

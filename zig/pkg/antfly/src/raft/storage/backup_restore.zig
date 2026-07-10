@@ -23,8 +23,14 @@ const portable_backup = @import("../../storage/portable_backup.zig");
 pub const RestoreSource = struct {
     backup_id: []const u8,
     location: []const u8,
+    identity_location: ?[]const u8 = null,
     snapshot_path: []const u8,
+    manifest: ?*const backups_api.TableBackupManifest = null,
 };
+
+fn restoreIdentityLocation(restore: RestoreSource) []const u8 {
+    return restore.identity_location orelse restore.location;
+}
 
 pub const RestoreOptions = struct {
     expected_table_name: ?[]const u8 = null,
@@ -119,6 +125,28 @@ pub fn publishPreparedRestore(
     return outcome;
 }
 
+pub fn reconcileCommittedRestoreWithExclusiveTransition(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    try transition.validate(path);
+    try transition.reconcilePublished();
+    var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse return error.RestoreIdentityMismatch;
+    defer state.deinit(alloc);
+    if (!state.primary_restored or
+        !state.runtime_repair_complete or
+        state.group_id != group_id or
+        !std.mem.eql(u8, state.backup_id, restore.backup_id) or
+        !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
+        !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
+    {
+        return error.RestoreIdentityMismatch;
+    }
+}
+
 pub fn restoreSnapshotMatchesPath(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -169,7 +197,7 @@ fn prepareRestoreSnapshotIfNeeded(
         defer state.deinit(alloc);
         if (state.primary_restored and
             std.mem.eql(u8, state.backup_id, restore.backup_id) and
-            std.mem.eql(u8, state.location, restore.location) and
+            std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) and
             std.mem.eql(u8, state.snapshot_path, restore.snapshot_path) and
             state.group_id == group_id)
         {
@@ -194,8 +222,12 @@ fn prepareRestoreSnapshot(
 ) !db_mod.generation_lifecycle.StagedGeneration {
     var location = try backups_api.openBackupLocation(alloc, restore.location);
     defer location.deinit(alloc);
-    var manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
-    defer manifest.deinit(alloc);
+    var owned_manifest: ?backups_api.TableBackupManifest = null;
+    defer if (owned_manifest) |*manifest| manifest.deinit(alloc);
+    const manifest = restore.manifest orelse blk: {
+        owned_manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
+        break :blk &owned_manifest.?;
+    };
     if (options.expected_table_name) |table_name| {
         if (!std.mem.eql(u8, manifest.table_name, table_name)) {
             std.log.err("restore manifest table mismatch expected={s} actual={s} backup_id={s} snapshot_path={s}", .{
@@ -211,7 +243,7 @@ fn prepareRestoreSnapshot(
     const snapshot_path = if (restore.snapshot_path.len > 0)
         restore.snapshot_path
     else blk: {
-        const shard = backups_api.findShardSnapshot(&manifest, group_id) orelse return error.UnsupportedBackupFormat;
+        const shard = backups_api.findShardSnapshot(manifest, group_id) orelse return error.UnsupportedBackupFormat;
         break :blk shard.snapshot_path;
     };
 
@@ -220,7 +252,7 @@ fn prepareRestoreSnapshot(
     const staged_path = staged_generation.path();
 
     if (std.mem.endsWith(u8, snapshot_path, ".afb")) {
-        try applyPortableRestore(alloc, staged_path, group_id, restore, snapshot_path, &manifest, options);
+        try applyPortableRestore(alloc, staged_path, group_id, restore, snapshot_path, manifest, options);
         return staged_generation;
     }
 
@@ -238,7 +270,7 @@ fn prepareRestoreSnapshot(
         .identity_namespace = options.expected_identity_namespace,
     }, .{
         .backup_id = restore.backup_id,
-        .location = restore.location,
+        .location = restoreIdentityLocation(restore),
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     });
@@ -330,7 +362,7 @@ fn applyPortableRestore(
     db.close();
     db_closed = true;
     destroyPathIfExists(indexes_path);
-    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, restore.backup_id, restore.location, snapshot_path, group_id);
+    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, restore.backup_id, restoreIdentityLocation(restore), snapshot_path, group_id);
 }
 
 fn portableEmbeddingSourceFieldsFromIndexesJson(

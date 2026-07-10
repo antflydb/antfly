@@ -28,6 +28,7 @@ pub const HttpDriverConfig = struct {
     async_send_max_attempts: u32 = 32,
     async_send_retry_base_ms: u64 = 50,
     async_send_retry_max_ms: u64 = 1_000,
+    async_send_worker_count: u32 = 4,
 };
 
 pub const AsyncSendMetricsSnapshot = struct {
@@ -79,12 +80,13 @@ pub const HttpFrameDriver = struct {
     cfg: HttpDriverConfig,
     executor: common.RequestExecutor,
     io: std.Io,
-    thread: ?std.Thread = null,
+    threads: []std.Thread = &.{},
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     closing: bool = false,
     queue: std.ArrayListUnmanaged(QueuedFrame) = .empty,
     queue_head: usize = 0,
+    in_flight_peers: std.AutoHashMapUnmanaged(u64, void) = .empty,
     metrics: AsyncSendMetrics = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: HttpDriverConfig, executor: common.RequestExecutor, io: std.Io) HttpFrameDriver {
@@ -107,6 +109,7 @@ pub const HttpFrameDriver = struct {
         self.mutex.lockUncancelable(self.io);
         self.clearQueueLocked();
         self.queue.deinit(self.alloc);
+        self.in_flight_peers.deinit(self.alloc);
         self.mutex.unlock(self.io);
         self.* = undefined;
     }
@@ -162,18 +165,34 @@ pub const HttpFrameDriver = struct {
     }
 
     fn startAsyncSender(self: *HttpFrameDriver) !void {
-        if (self.thread != null) return;
-        self.thread = try std.Thread.spawn(.{}, asyncSenderMain, .{self});
+        if (self.threads.len != 0) return;
+        if (self.cfg.async_send_worker_count == 0) return error.InvalidAsyncSendWorkerCount;
+        try self.in_flight_peers.ensureTotalCapacity(self.alloc, self.cfg.async_send_worker_count);
+        self.threads = try self.alloc.alloc(std.Thread, self.cfg.async_send_worker_count);
+        var started: usize = 0;
+        errdefer {
+            self.mutex.lockUncancelable(self.io);
+            self.closing = true;
+            self.cond.broadcast(self.io);
+            self.mutex.unlock(self.io);
+            for (self.threads[0..started]) |thread| thread.join();
+            self.alloc.free(self.threads);
+            self.threads = &.{};
+        }
+        while (started < self.threads.len) : (started += 1) {
+            self.threads[started] = try std.Thread.spawn(.{}, asyncSenderMain, .{self});
+        }
     }
 
     fn stopAsyncSender(self: *HttpFrameDriver) void {
-        const thread = self.thread orelse return;
+        if (self.threads.len == 0) return;
         self.mutex.lockUncancelable(self.io);
         self.closing = true;
         self.cond.broadcast(self.io);
         self.mutex.unlock(self.io);
-        thread.join();
-        self.thread = null;
+        for (self.threads) |thread| thread.join();
+        self.alloc.free(self.threads);
+        self.threads = &.{};
     }
 
     fn asyncSenderMain(self: *HttpFrameDriver) void {
@@ -187,10 +206,22 @@ pub const HttpFrameDriver = struct {
                 .body = owned.body,
                 .content_type = owned.content_type,
             }) catch |err| {
-                if (self.retryQueuedFrame(&owned, err)) continue;
+                const retrying = self.retryQueuedFrame(&owned, err);
+                self.finishInFlightPeer(frame.peer_id);
+                if (retrying) continue;
+                owned.deinit(self.alloc);
+                continue;
             };
+            self.finishInFlightPeer(frame.peer_id);
             owned.deinit(self.alloc);
         }
+    }
+
+    fn finishInFlightPeer(self: *HttpFrameDriver, peer_id: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        std.debug.assert(self.in_flight_peers.remove(peer_id));
+        self.cond.broadcast(self.io);
+        self.mutex.unlock(self.io);
     }
 
     fn retryQueuedFrame(self: *HttpFrameDriver, frame: *QueuedFrame, err: anyerror) bool {
@@ -246,7 +277,7 @@ pub const HttpFrameDriver = struct {
     }
 
     fn enqueueFrame(self: *HttpFrameDriver, req: raft_engine.runtime.frame_driver_iface.SendFrameRequest) !void {
-        if (self.thread == null) {
+        if (self.threads.len == 0) {
             return try self.sendBatch(.{
                 .source_id = req.source_id,
                 .peer_id = req.peer_id,
@@ -312,6 +343,7 @@ pub const HttpFrameDriver = struct {
         self.compactQueueIfNeededLocked();
         for (self.queue.items, 0..) |frame, index| {
             if (frame.not_before_ms > now_ms) continue;
+            if (self.in_flight_peers.contains(frame.peer_id)) continue;
             const out = frame;
             if (index + 1 < self.queue.items.len) {
                 std.mem.copyForwards(
@@ -321,6 +353,7 @@ pub const HttpFrameDriver = struct {
                 );
             }
             self.queue.items.len -= 1;
+            self.in_flight_peers.putAssumeCapacity(frame.peer_id, {});
             return out;
         }
         return null;
@@ -470,7 +503,7 @@ test "http frame driver posts batch frames to raft batch route" {
     try std.testing.expectEqualStrings("frame-bytes", executor.last_req.?.body);
 }
 
-test "http frame driver queues raft frames without executing synchronously" {
+test "http frame driver isolates blocked peers without reordering a peer lane" {
     const BlockingExecutor = struct {
         io: std.Io,
         mutex: std.Io.Mutex = .init,
@@ -525,6 +558,7 @@ test "http frame driver queues raft frames without executing synchronously" {
     var driver: HttpFrameDriver = undefined;
     try driver.initAsyncInPlace(std.testing.allocator, .{}, executor.iface(), io);
     defer driver.deinit();
+    defer executor.release();
 
     const frame_driver = driver.frameDriver();
     const frame_bytes = try std.testing.allocator.dupe(u8, "frame-bytes");
@@ -538,7 +572,29 @@ test "http frame driver queues raft frames without executing synchronously" {
             .media_type = "application/x-antflydb-raft-binary-v1",
         },
     });
+    try frame_driver.sendFrame(.{
+        .source_id = 1,
+        .peer_id = 2,
+        .endpoint = .{ .protocol = .http1, .address = "http://n2:8080" },
+        .frame = .{
+            .bytes = frame_bytes,
+            .media_type = "application/x-antflydb-raft-binary-v1",
+        },
+    });
+    try frame_driver.sendFrame(.{
+        .source_id = 1,
+        .peer_id = 3,
+        .endpoint = .{ .protocol = .http1, .address = "http://n3:8080" },
+        .frame = .{
+            .bytes = frame_bytes,
+            .media_type = "application/x-antflydb-raft-binary-v1",
+        },
+    });
 
+    const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (executor.callCount() < 2 and platform_time.monotonicNs() < deadline_ns) std.Thread.yield() catch {};
+    // One worker may block per peer. The second peer-2 frame stays queued while
+    // peer 3 progresses independently.
+    try std.testing.expectEqual(@as(usize, 2), executor.callCount());
     executor.release();
-    while (executor.callCount() == 0) std.Thread.yield() catch {};
 }

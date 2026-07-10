@@ -48,10 +48,9 @@ generation, imports and validates the primary store there, runs foreground
 derived/runtime repair against that staged path, closes and recursively syncs
 the staged generation, and only then publishes it. A prepare or repair failure
 destroys staging and leaves the live generation untouched. macOS and Linux use
-atomic directory exchange when a live generation exists. Other
-platforms/filesystems use a closed-admission two-rename publication with
-rollback if the second rename fails. The exchanged or renamed old root is
-reclaimed only after publication.
+atomic directory exchange when a live generation exists. Platforms or
+filesystems without atomic exchange reject replacement before mutating the live
+namespace. The exchanged old root is reclaimed only after publication.
 
 `DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
 capability and rejects a path that is not the capability's staging root. Raw
@@ -74,9 +73,22 @@ durability pending, while raft bootstrap remains inactive. Every staged
 candidate contains a publication marker that moves into the live root at
 commit. DB open reconciles that marker by syncing the parent namespace, pruning
 retained or abandoned sibling generations, and clearing the marker before the
-root is admitted. Reconciliation is cached per process generation and a new
-exclusive transition invalidates that cache entry, keeping normal opens at an
-O(1) hash lookup after the first check.
+root is admitted. Every open DB retains a shared generation lease and a shared
+filesystem publication lock through `DB.close()`. An exclusive transition
+blocks new opens and cannot publish until all prior DB owners have closed.
+Reconciliation is cached per process generation and a new exclusive transition
+invalidates that cache entry, keeping normal opens at an O(1) hash lookup after
+the first check. The persistent sibling lock file also excludes overlapping
+restore publishers across processes. Stale-stage GC only considers names with
+Antfly's complete generated-stage grammar while holding that exclusive lock;
+it removes marked abandoned candidates and markerless retired roots left by a
+completed exchange, while ignoring arbitrary prefix-matching directories.
+
+A restore whose namespace exchange committed but whose parent sync failed is
+reported as durability pending. Retrying the same backup is idempotent: Antfly
+matches the persisted backup, source location, shard, and repair-complete state,
+reconciles publication, and reports committed/durable. A retry against an
+unrelated existing table is rejected without modifying storage.
 
 Replacing an existing direct-path generation requires an atomic directory
 exchange; platforms or filesystems without that primitive reject publication

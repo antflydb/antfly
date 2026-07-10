@@ -4649,7 +4649,7 @@ components:
           example: "users"
         status:
           type: string
-          enum: [triggered, durability_pending, skipped, failed]
+          enum: [triggered, committed, durability_pending, skipped, failed]
           description: Restore status for this table
           example: "triggered"
         error:
@@ -8671,22 +8671,44 @@ paths:
             schema:
               $ref: "#/components/schemas/RestoreRequest"
       responses:
+        "200":
+          description: A previously committed restore is now durably published
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [restore, durability]
+                properties:
+                  restore:
+                    type: string
+                    enum: [committed]
+                  durability:
+                    type: string
+                    enum: [durable]
         "202":
           description: Restore committed or triggered successfully
           content:
             application/json:
               schema:
-                type: object
-                required: [restore]
-                properties:
-                  restore:
-                    type: string
-                    enum: [triggered, committed]
-                    example: triggered
-                  durability:
-                    type: string
-                    enum: [pending]
-                    description: Present when publication committed but filesystem durability confirmation is pending
+                oneOf:
+                  - type: object
+                    additionalProperties: false
+                    required: [restore]
+                    properties:
+                      restore:
+                        type: string
+                        enum: [triggered]
+                  - type: object
+                    additionalProperties: false
+                    required: [restore, durability]
+                    properties:
+                      restore:
+                        type: string
+                        enum: [committed]
+                      durability:
+                        type: string
+                        enum: [pending]
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":

@@ -2715,6 +2715,7 @@ const ShadowState = struct {
 pub const DB = struct {
     alloc: Allocator,
     runtime_alloc: Allocator,
+    generation_read_lease: ?generation_lifecycle.ReadLease,
     open_mode: OpenOptions.OpenMode,
     primary_backend: PrimaryBackend,
     primary_lsm_storage: ?lsm_backend_mod.Storage,
@@ -2886,7 +2887,8 @@ pub const DB = struct {
 
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return blk: {
-            try generation_lifecycle.ensurePublishedGenerationDurable(alloc, path);
+            var generation_read_lease = try generation_lifecycle.acquirePublishedGenerationRead(alloc, path);
+            errdefer if (generation_read_lease) |*lease| lease.deinit();
             const open_started_ns = monotonicTimeNs();
             var profile = OpenProfile{};
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
@@ -2995,6 +2997,7 @@ pub const DB = struct {
             var db = DB{
                 .alloc = alloc,
                 .runtime_alloc = runtime_alloc,
+                .generation_read_lease = generation_read_lease,
                 .open_mode = opts.open_mode,
                 .primary_backend = stored_primary_backend,
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
@@ -3032,6 +3035,7 @@ pub const DB = struct {
             owned_async_context = null;
             owned_backend_runtime = null;
             owned_executor = null;
+            generation_read_lease = null;
             errdefer db.deinitWrapperState(executor_ready);
             db.core.setIndexOpenParallelism(opts.index_open_parallelism);
             const init_async_started_ns = monotonicTimeNs();
@@ -3681,6 +3685,8 @@ pub const DB = struct {
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.async_context);
+        if (self.generation_read_lease) |*lease| lease.deinit();
+        self.generation_read_lease = null;
         self.* = undefined;
     }
 

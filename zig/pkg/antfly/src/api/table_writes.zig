@@ -3860,6 +3860,7 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try backups_api.validateRestorableManifestLayout(plan.manifest);
+        if (plan.reconcile_only) return error.RestoreIdentityMismatch;
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
         defer alloc.free(snapshot_root);
@@ -5091,12 +5092,27 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         mode: ManagedDbOpenMode,
     ) !ProvisionedTableWriteCache.CachedDb {
+        const deadline_ns = platform_time.monotonicNs() +| replicated_apply_writer_open_timeout_ns;
         while (true) {
             const cached = cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, mode) catch |err| switch (err) {
                 error.LsmRootWriterAlreadyOpen => {
-                    if (!cache.hasPendingCloseForGroupTableLocked(group_id, table_name)) return err;
+                    const cache_pending = cache.hasPendingCloseForGroupTableLocked(group_id, table_name);
+                    const startup_cache = self.startup_write_cache;
+                    const startup_pending = if (startup_cache) |startup|
+                        startup != cache and startup.hasPendingCloseForGroupTableLocked(group_id, table_name)
+                    else
+                        false;
+                    if (!cache_pending and !startup_pending) return err;
                     self.local_db_mutex.unlock();
                     cache.drainPendingClosesForGroupTable(group_id, table_name);
+                    if (startup_cache) |startup| {
+                        if (startup != cache) startup.drainPendingClosesForGroupTable(group_id, table_name);
+                    }
+                    if (platform_time.monotonicNs() >= deadline_ns) {
+                        lockAtomic(&self.local_db_mutex);
+                        return err;
+                    }
+                    sleepNs(replicated_apply_writer_open_retry_ns);
                     lockAtomic(&self.local_db_mutex);
                     continue;
                 },
@@ -5115,6 +5131,17 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         allow_bulk_session: bool,
     ) !ProvisionedTableWriteCache.CachedDb {
+        if (self.startup_write_cache) |startup_cache| {
+            if (startup_cache != cache and
+                (startup_cache.hasForegroundStateForGroupTableLocked(group_id, table_name) or
+                    startup_cache.hasPendingCloseForGroupTableLocked(group_id, table_name)))
+            {
+                startup_cache.invalidateTable(table_name);
+                self.local_db_mutex.unlock();
+                startup_cache.drainPendingClosesForGroupTable(group_id, table_name);
+                lockAtomic(&self.local_db_mutex);
+            }
+        }
         if (try self.leaseLiveEntryForLocalMutationLocked(cache, group_id, table_name, allow_bulk_session)) |cached| {
             return cached;
         }
@@ -9097,11 +9124,20 @@ pub const ProvisionedTableWriteSource = struct {
             self.invalidateSharedPathCaches(path);
             var shard_transition = try transition.beginShardStorageTransition(path);
             errdefer shard_transition.deinit();
-            var prepared_generation = backup_restore.prepareRestoreSnapshotToPathWithExclusiveTransition(&shard_transition, alloc, path, group_id, .{
+            const restore_source: backup_restore.RestoreSource = .{
                 .backup_id = plan.manifest.backup_id,
                 .location = local_location,
+                .identity_location = plan.source_location,
                 .snapshot_path = shard.snapshot_path,
-            }, .{
+                .manifest = plan.manifest,
+            };
+            if (plan.reconcile_only) {
+                try backup_restore.reconcileCommittedRestoreWithExclusiveTransition(&shard_transition, alloc, path, group_id, restore_source);
+                self.invalidateSharedPathCaches(path);
+                shard_transition.deinit();
+                continue;
+            }
+            var prepared_generation = backup_restore.prepareRestoreSnapshotToPathWithExclusiveTransition(&shard_transition, alloc, path, group_id, restore_source, .{
                 .expected_table_name = table_name,
                 .expected_identity_namespace = identity_namespace,
             }) catch |err| {
@@ -16613,17 +16649,23 @@ test "provisioned table write source backs up and restores a local table" {
     try std.testing.expectError(error.GenerationDurabilityUncertain, source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = "file:///stable-backup-location",
     }));
-
-    db_mod.generation_lifecycle.failNextReconciliationSyncForTest();
-    try std.testing.expectError(error.GenerationDurabilityUncertain, db_mod.DB.open(alloc, db_path, .{}));
 
     // Retry reconciles the committed marker and retained prior generation
     // before reporting the restore complete.
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = "file:///stable-backup-location",
+        .reconcile_only = true,
     });
+    try std.testing.expectError(error.RestoreIdentityMismatch, source.source().restoreTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .manifest = &manifest,
+        .source_location = "file:///different-backup-location",
+        .reconcile_only = true,
+    }));
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
     var db = try db_mod.DB.open(alloc, db_path, .{});

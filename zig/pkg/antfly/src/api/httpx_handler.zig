@@ -103,7 +103,7 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    fn respondWithAllocator(ctx: *httpx.Context, resp: *http_common.HttpResponse, alloc: std.mem.Allocator) !httpx.Response {
+    pub fn respondWithAllocator(ctx: *httpx.Context, resp: *http_common.HttpResponse, alloc: std.mem.Allocator) !httpx.Response {
         defer resp.deinit(alloc);
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {

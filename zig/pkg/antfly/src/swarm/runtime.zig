@@ -1834,7 +1834,7 @@ fn haAdminBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     };
 
     var resp = try server.handle(legacy_req);
-    return AntflyApiHandler.respond(ctx, &resp);
+    return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
 fn haInternalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1864,7 +1864,7 @@ fn haInternalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     };
 
     var resp = try server.handle(legacy_req);
-    return AntflyApiHandler.respond(ctx, &resp);
+    return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
 fn antfarmContentType(path: []const u8) []const u8 {
@@ -2017,7 +2017,7 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         _ = ctx.status(404);
         return ctx.text("not found");
     };
-    return AntflyApiHandler.respond(ctx, &resp);
+    return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
 fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -2035,7 +2035,7 @@ fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     };
 
     var resp = try server.handle(legacy_req);
-    return AntflyApiHandler.respond(ctx, &resp);
+    return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
 fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -2053,7 +2053,7 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     };
 
     var resp = try server.handle(legacy_req);
-    return AntflyApiHandler.respond(ctx, &resp);
+    return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
 // Module-level pointer set by the serve thread before listen().

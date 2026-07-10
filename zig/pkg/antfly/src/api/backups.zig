@@ -95,6 +95,8 @@ pub const TableBackupPlan = struct {
 pub const TableRestorePlan = struct {
     backup_root: []const u8,
     manifest: *const TableBackupManifest,
+    source_location: ?[]const u8 = null,
+    reconcile_only: bool = false,
 };
 
 pub fn validateRestorableManifestLayout(manifest: *const TableBackupManifest) !void {
@@ -881,6 +883,10 @@ pub fn encodeRestoreTriggered(alloc: std.mem.Allocator) ![]u8 {
 
 pub fn encodeRestoreDurabilityPending(alloc: std.mem.Allocator) ![]u8 {
     return try alloc.dupe(u8, "{\"restore\":\"committed\",\"durability\":\"pending\"}");
+}
+
+pub fn encodeRestoreDurabilityConfirmed(alloc: std.mem.Allocator) ![]u8 {
+    return try alloc.dupe(u8, "{\"restore\":\"committed\",\"durability\":\"durable\"}");
 }
 
 pub fn clusterTableBackupId(alloc: std.mem.Allocator, cluster_backup_id: []const u8, table_name: []const u8) ![]u8 {

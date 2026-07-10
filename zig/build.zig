@@ -4275,6 +4275,7 @@ pub fn build(b: *std.Build) void {
             "public table backup handler accepts portable format",
             "public table restore handler maps unsupported multi-range error",
             "public table restore handler reports committed durability pending",
+            "public table restore handler reports confirmed durability",
             "public table query view handler maps HA read gate errors",
             "public document artifact manifest handlers map HA read gate errors",
             "public document artifact manifest handler returns summary and raw state",
