@@ -1666,6 +1666,9 @@ pub const ApiHttpServer = struct {
                 .edge_count = index.edge_count,
                 .node_count = index.node_count,
                 .root_node = index.root_node,
+                .coverage_produced_count = index.coverage_produced_count,
+                .coverage_skipped_count = index.coverage_skipped_count,
+                .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
                 .backfill_active = index.backfill_active,
                 .backfill_progress = @as(f64, @floatFromInt(index.backfill_progress_millis)) / 1000.0,
                 .replay_applied_sequence = index.replay_applied_sequence,
@@ -1693,6 +1696,7 @@ pub const ApiHttpServer = struct {
                 .node_id = report.node_id,
             },
             .stats = .{
+                .source_doc_count = report.doc_identity.live_ordinals,
                 .doc_count = report.doc_count,
                 .index_count = report.index_count,
                 .indexes = indexes,
@@ -22318,6 +22322,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .namespace_shard_id = 10,
             .namespace_range_id = 1001,
             .next_ordinal = 44,
+            .live_ordinals = 40,
             .rebuild_required = true,
         },
         .doc_set_planning = .{
@@ -22331,6 +22336,9 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .kind = "dense_vector",
             .doc_count = 56_250,
             .node_count = 756,
+            .coverage_produced_count = 31,
+            .coverage_skipped_count = 7,
+            .coverage_terminal_failed_count = 2,
             .replay_applied_sequence = 225,
             .replay_target_sequence = 300,
             .replay_catch_up_required = true,
@@ -22348,6 +22356,10 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);
+    try std.testing.expectEqual(@as(u64, 31), index.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 7), index.coverage_skipped_count);
+    try std.testing.expectEqual(@as(u64, 2), index.coverage_terminal_failed_count);
+    try std.testing.expectEqual(@as(u64, 40), status.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_identity.namespace_table_id);
     try std.testing.expectEqual(@as(u64, 10), status.stats.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(@as(u64, 1001), status.stats.doc_identity.namespace_range_id);

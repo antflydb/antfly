@@ -8826,6 +8826,8 @@ export interface components {
         DerivedCoverageStatusPolicy: "strict" | "partial" | "best_effort" | "external";
         DerivedCoverageStatus: {
             policy: components["schemas"]["DerivedCoverageStatusPolicy"];
+            /** @description Whether every expected shard contributed a fresh runtime observation to this projection. */
+            observation_complete: boolean;
             /** Format: uint64 */
             source_total: number;
             /**

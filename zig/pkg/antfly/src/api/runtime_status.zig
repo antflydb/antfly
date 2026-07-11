@@ -460,6 +460,9 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
     if (preserved_visibility and incoming.stats.doc_count < previous.stats.doc_count) {
         incoming.stats.doc_count = previous.stats.doc_count;
     }
+    if (preserved_visibility and incoming.stats.source_doc_count < previous.stats.source_doc_count) {
+        incoming.stats.source_doc_count = previous.stats.source_doc_count;
+    }
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
@@ -558,6 +561,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     var merged = try placeholder.clone(alloc);
     errdefer merged.deinit(alloc);
 
+    merged.stats.source_doc_count = previous.stats.source_doc_count;
     merged.stats.doc_count = previous.stats.doc_count;
     merged.stats.enrichment = previous.stats.enrichment;
     merged.stats.ttl_cleanup = previous.stats.ttl_cleanup;
@@ -1055,6 +1059,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     return .{
+        .source_doc_count = stats.source_doc_count,
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,

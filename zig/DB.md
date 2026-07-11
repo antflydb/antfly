@@ -327,6 +327,15 @@ degraded = complete and terminal_failed > 0
 
 This keeps "no work remains" distinct from "all desired outputs exist".
 
+`source_total` comes from the durable document-identity `live_ordinals`
+cardinality maintained in the primary write transaction. It is O(1) to read and
+does not depend on query-visible index entries. This distinction is required for
+chunked projections, where one source document may produce many physical vector
+entries. Distributed projections sum cardinality and outcomes only from fresh
+shard observations; `observation_complete` is false if any expected shard is
+missing, stale, or remotely unknown, and an incomplete observation can never
+report complete or healthy coverage.
+
 ### Coverage Policy
 
 Derived configs should declare how missing or non-embeddable source units affect
@@ -390,7 +399,11 @@ the same DB apply-lock domain as replay mutations, and each marker/counter batch
 commits atomically. Outcome transitions remove any prior outcome and update all
 affected counters in that one batch. Generated enrichment applies `produced`
 only after publishing its replay record, and non-retryable isolated request
-errors publish `terminal_failed`; retryable failures remain pending. Batch
+errors publish `terminal_failed`; shared embedding failures fan that outcome out
+to every consuming index, while retryable failures remain pending. Direct
+field-backed vector indexes classify source writes as `produced` or `skipped` at
+the successful derived-index apply boundary. Replay windows carry mixed
+outcomes and persist them under one apply lock and one store transaction; batch
 mutation paths deduplicate source keys with hash sets, keeping cleanup linear in
 the number of distinct source units rather than quadratic in batch size.
 

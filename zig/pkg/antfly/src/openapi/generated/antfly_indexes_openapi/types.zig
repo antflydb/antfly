@@ -217,6 +217,8 @@ pub const DerivedCoveragePolicy = enum {
 
 pub const DerivedCoverageStatus = struct {
     policy: DerivedCoverageStatusPolicy,
+    /// Whether every expected shard contributed a fresh runtime observation to this projection.
+    observation_complete: bool,
     source_total: i64,
     /// Source documents with a durable produced outcome for this index generation.
     produced: i64,

@@ -12846,6 +12846,7 @@ pub const DB = struct {
         }
 
         return .{
+            .source_doc_count = identity_stats.live_ordinals,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
@@ -13037,13 +13038,8 @@ pub const DB = struct {
             index_count += 1;
         }
 
-        // This is a v1 query-visible count, not a canonical primary-store
-        // cardinality. Do not add a second public stats count backed by a
-        // docstore scan for managed-index coverage; the long-term replacement
-        // is a durable table cardinality counter updated on writes/deletes.
-        // The full-text index count is the current efficient proxy when
-        // present; tables without full-text still fall back to the docstore.
         return .{
+            .source_doc_count = identity_stats.live_ordinals,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
@@ -13162,6 +13158,7 @@ pub const DB = struct {
         }
 
         return .{
+            .source_doc_count = identity_stats.live_ordinals,
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
@@ -24465,6 +24462,137 @@ fn derivedCoverageOutcomeCounterValueForStore(
         try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, outcome);
 }
 
+const DerivedCoverageOutcome = enum { produced, skipped, terminal_failed };
+
+const DerivedCoverageDocOutcome = struct {
+    doc_key: []const u8,
+    outcome: DerivedCoverageOutcome,
+};
+
+fn setDerivedCoverageOutcomes(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    outcomes: []const DerivedCoverageDocOutcome,
+) !void {
+    if (outcomes.len == 0) return;
+    const generation = index_manager.coverageGenerationForIndex(index_name) orelse return;
+    const tags = std.meta.tags(DerivedCoverageOutcome);
+
+    var counter_counts: [tags.len]u64 = undefined;
+    var counter_keys: [tags.len][]u8 = undefined;
+    var initialized_counters: usize = 0;
+    defer for (counter_keys[0..initialized_counters]) |key| alloc.free(key);
+    inline for (tags, 0..) |outcome, i| {
+        counter_counts[i] = try derivedCoverageOutcomeCounterValueForStore(alloc, store, index_name, generation, @tagName(outcome));
+        counter_keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(outcome));
+        initialized_counters += 1;
+    }
+
+    var owned_marker_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_marker_keys.items) |key| alloc.free(key);
+        owned_marker_keys.deinit(alloc);
+    }
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    var changed = false;
+
+    for (outcomes) |transition| {
+        if (seen.contains(transition.doc_key)) continue;
+        try seen.put(alloc, transition.doc_key, {});
+        const target_index = @intFromEnum(transition.outcome);
+        inline for (tags, 0..) |existing_outcome, i| {
+            const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, transition.doc_key, @tagName(existing_outcome));
+            owned_marker_keys.append(alloc, marker_key) catch |err| {
+                alloc.free(marker_key);
+                return err;
+            };
+            const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (existing) |value| alloc.free(value);
+            const present = existing != null;
+            if (i == target_index) {
+                if (!present) {
+                    counter_counts[i] +|= 1;
+                    try writes.append(alloc, .{ .key = marker_key, .value = @tagName(transition.outcome) });
+                    changed = true;
+                }
+            } else if (present) {
+                if (counter_counts[i] == 0) return error.InvalidDerivedCoverageCounter;
+                counter_counts[i] -= 1;
+                try deletes.append(alloc, marker_key);
+                changed = true;
+            }
+        }
+    }
+    if (!changed) return;
+
+    var counter_values: [tags.len][8]u8 = undefined;
+    inline for (tags, 0..) |_, i| {
+        try writes.append(alloc, .{
+            .key = counter_keys[i],
+            .value = internal_keys.encodeDerivedCoverageOutcomeCount(&counter_values[i], counter_counts[i]),
+        });
+    }
+    try store.putBatch(writes.items, deletes.items);
+}
+
+fn accountDirectDenseCoverage(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    batch: derived_types.DerivedBatch,
+    writes: []const mapper.DenseEmbeddingWrite,
+) !void {
+    if (!ctx.index_manager.denseIndexUsesManagedDirectField(index_name)) return;
+    var produced = std.StringHashMapUnmanaged(void).empty;
+    defer produced.deinit(ctx.alloc);
+    for (writes) |write| {
+        try produced.put(ctx.alloc, write.parent_doc_key orelse write.doc_key, {});
+    }
+    var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
+    defer outcomes.deinit(ctx.alloc);
+    for (batch.documents) |doc| {
+        if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
+        try outcomes.append(ctx.alloc, .{
+            .doc_key = doc.key,
+            .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+        });
+    }
+    try setDerivedCoverageOutcomes(ctx.alloc, ctx.store, ctx.index_manager, index_name, outcomes.items);
+}
+
+fn accountDirectSparseCoverage(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    batch: derived_types.DerivedBatch,
+    writes: []const mapper.SparseEmbeddingWrite,
+) !void {
+    if (!ctx.index_manager.sparseIndexUsesManagedDirectField(index_name)) return;
+    var produced = std.StringHashMapUnmanaged(void).empty;
+    defer produced.deinit(ctx.alloc);
+    for (writes) |write| {
+        try produced.put(ctx.alloc, write.doc_key, {});
+    }
+    var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
+    defer outcomes.deinit(ctx.alloc);
+    for (batch.documents) |doc| {
+        if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
+        try outcomes.append(ctx.alloc, .{
+            .doc_key = doc.key,
+            .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+        });
+    }
+    try setDerivedCoverageOutcomes(ctx.alloc, ctx.store, ctx.index_manager, index_name, outcomes.items);
+}
+
 fn deleteDerivedCoverageForDocKeys(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -25144,6 +25272,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
 
             const dense_embedding_start_ns = monotonicTimeNs();
             try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, dense_embeddings.writes, batch_options);
+            try accountDirectDenseCoverage(ctx, index_ref.name, batch, dense_embeddings.writes);
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.dense_embedding_apply_ns, dense_embedding_start_ns);
                 if (before_hbc_profile) |before| {
@@ -25216,6 +25345,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
 
             const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
+            try accountDirectSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
             if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
             if (before_sparse_profile) |before| {
                 if (ctx.index_manager.sparseWriteProfileByName(index_ref.name)) |after| {
@@ -42069,6 +42199,20 @@ test "db document extraction skips stable unit local rewrites while replaying fu
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
     });
+    const chunk_vector_indexes = try db.core.index_manager.vectorIndexesForChunk(alloc, "document_chunks_v1");
+    defer {
+        for (chunk_vector_indexes) |index_name| alloc.free(index_name);
+        alloc.free(chunk_vector_indexes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), chunk_vector_indexes.len);
+    try std.testing.expectEqualStrings("dv_document_chunks", chunk_vector_indexes[0]);
+    const asset_vector_indexes = try db.core.index_manager.vectorIndexesDependingOnArtifact(alloc, "document_units_v1");
+    defer {
+        for (asset_vector_indexes) |index_name| alloc.free(index_name);
+        alloc.free(asset_vector_indexes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), asset_vector_indexes.len);
+    try std.testing.expectEqualStrings("dv_document_chunks", asset_vector_indexes[0]);
 
     const first_value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}";
     try db.batch(.{
@@ -51866,15 +52010,32 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
         .kind = .dense_vector,
         .config_json = "{\"field\":\"body\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"semantic_idx\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
     });
+    try std.testing.expect(db.core.index_manager.denseIndexUsesManagedDirectField("dv_v1"));
+    try std.testing.expect(db.core.index_manager.sparseIndexUsesManagedDirectField("sp_v1"));
+    try std.testing.expect(!db.core.index_manager.denseIndexUsesManagedDirectField("semantic_idx"));
 
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[0,1,0],\"sparse\":{\"indices\":[3],\"values\":[1.0]}}" },
             .{ .key = "doc:c", .value = "{\"embedding\":[0,0,1],\"sparse\":{\"indices\":[11],\"values\":[1.0]}}" },
+            .{ .key = "doc:missing", .value = "{\"title\":\"no vectors\"}" },
         },
         .sync_level = .full_index,
     });
+
+    const coverage_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, coverage_stats);
+    try std.testing.expectEqual(@as(u64, 4), coverage_stats.source_doc_count);
+    var checked_direct_indexes: usize = 0;
+    for (coverage_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dv_v1") and !std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 3), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_skipped_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        checked_direct_indexes += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked_direct_indexes);
 
     const stored = (try db.get(alloc, "doc:a")).?;
     defer alloc.free(stored);

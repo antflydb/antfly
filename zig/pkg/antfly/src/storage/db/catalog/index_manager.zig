@@ -919,6 +919,7 @@ pub const IndexManager = struct {
         dims: u32,
         metric: vector_mod.DistanceMetric,
         external: bool,
+        managed_direct_field: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         index: hbc_mod.HBCIndex,
@@ -1237,6 +1238,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         field_name: []u8,
+        managed_direct_field: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         rebuild_root_path: []u8,
@@ -5540,6 +5542,46 @@ pub const IndexManager = struct {
         return try names.toOwnedSlice(alloc);
     }
 
+    pub fn vectorIndexesForChunk(self: *const IndexManager, alloc: Allocator, chunk_name: []const u8) ![][]u8 {
+        return self.vectorIndexesDependingOnArtifact(alloc, chunk_name);
+    }
+
+    pub fn vectorIndexesDependingOnArtifact(self: *const IndexManager, alloc: Allocator, artifact_name: []const u8) ![][]u8 {
+        var dependent_artifacts = std.StringHashMapUnmanaged(void).empty;
+        defer dependent_artifacts.deinit(alloc);
+        try dependent_artifacts.put(alloc, artifact_name, {});
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.enrichments.items) |enrichment| {
+                if (enrichment.source_artifact_name.len == 0 or !dependent_artifacts.contains(enrichment.source_artifact_name)) continue;
+                if (dependent_artifacts.contains(enrichment.name)) continue;
+                try dependent_artifacts.put(alloc, enrichment.name, {});
+                changed = true;
+            }
+        }
+
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        for (self.dense_indexes.items) |entry| {
+            const depends = (if (entry.chunk_name) |name| dependent_artifacts.contains(name) else false) or
+                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false);
+            if (!depends) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+        for (self.sparse_indexes.items) |entry| {
+            const depends = (if (entry.chunk_name) |name| dependent_artifacts.contains(name) else false) or
+                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false);
+            if (!depends) continue;
+            if (containsOwnedString(names.items, entry.config.name)) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+        return try names.toOwnedSlice(alloc);
+    }
+
     pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
         for (self.dense_indexes.items) |entry| {
             if (std.mem.eql(u8, entry.config.name, index_name)) return coverageGenerationForConfig(entry.config);
@@ -5553,6 +5595,22 @@ pub const IndexManager = struct {
             }
         }
         return null;
+    }
+
+    pub fn denseIndexUsesManagedDirectField(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.dense_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.managed_direct_field;
+        }
+        return false;
+    }
+
+    pub fn sparseIndexUsesManagedDirectField(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.sparse_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.managed_direct_field;
+        }
+        return false;
     }
 
     pub fn sparseIndex(self: *IndexManager, name: ?[]const u8) ?*SparseIndex {
@@ -7449,6 +7507,7 @@ pub const IndexManager = struct {
                     .dims = dense_cfg.dims,
                     .metric = dense_cfg.metric,
                     .external = dense_cfg.external,
+                    .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null,
                     .chunk_name = if (dense_generator) |generator|
                         if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
                     else if (referenced_embedding) |embedding_cfg|
@@ -7521,6 +7580,7 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
+                    .managed_direct_field = sparse_generator == null and referenced_embedding == null,
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;

@@ -1859,7 +1859,7 @@ pub const RaftApplyStore = struct {
 };
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 4;
+const runtime_status_record_version: u16 = 5;
 const group_status_record_version: u16 = 1;
 
 const TransitionTag = enum(u8) {
@@ -2638,7 +2638,7 @@ fn readRuntimeGroupStatusRecord(
     pos: *usize,
 ) !metadata.RuntimeGroupStatusReport {
     const version = try readInt(encoded, pos, u16);
-    if (version != 1 and version != 2 and version != 3 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version != 1 and version != 2 and version != 3 and version != 4 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const table_id = try readInt(encoded, pos, u64);
     const table_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(table_name);
@@ -2686,7 +2686,7 @@ fn readRuntimeGroupStatusRecord(
         if (indexes.len > 0) alloc.free(indexes);
     }
     while (initialized < runtime_index_count) : (initialized += 1) {
-        indexes[initialized] = try readRuntimeIndexStatusRecord(alloc, encoded, pos);
+        indexes[initialized] = try readRuntimeIndexStatusRecord(alloc, encoded, pos, version);
     }
     return .{
         .table_id = table_id,
@@ -2853,6 +2853,9 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.edge_count);
     try appendInt(alloc, out, u64, record.node_count);
     try appendInt(alloc, out, u64, record.root_node);
+    try appendInt(alloc, out, u64, record.coverage_produced_count);
+    try appendInt(alloc, out, u64, record.coverage_skipped_count);
+    try appendInt(alloc, out, u64, record.coverage_terminal_failed_count);
     try out.append(alloc, if (record.backfill_active) 1 else 0);
     try appendInt(alloc, out, u16, record.backfill_progress_millis);
     try appendInt(alloc, out, u64, record.replay_applied_sequence);
@@ -2864,6 +2867,7 @@ fn readRuntimeIndexStatusRecord(
     alloc: std.mem.Allocator,
     encoded: []const u8,
     pos: *usize,
+    version: u16,
 ) !metadata.RuntimeIndexStatusReport {
     const name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(name);
@@ -2874,6 +2878,9 @@ fn readRuntimeIndexStatusRecord(
     const edge_count = try readInt(encoded, pos, u64);
     const node_count = try readInt(encoded, pos, u64);
     const root_node = try readInt(encoded, pos, u64);
+    const coverage_produced_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
+    const coverage_skipped_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
+    const coverage_terminal_failed_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const backfill_active = encoded[pos.*] != 0;
     pos.* += 1;
@@ -2891,6 +2898,9 @@ fn readRuntimeIndexStatusRecord(
         .edge_count = edge_count,
         .node_count = node_count,
         .root_node = root_node,
+        .coverage_produced_count = coverage_produced_count,
+        .coverage_skipped_count = coverage_skipped_count,
+        .coverage_terminal_failed_count = coverage_terminal_failed_count,
         .backfill_active = backfill_active,
         .backfill_progress_millis = backfill_progress_millis,
         .replay_applied_sequence = replay_applied_sequence,
@@ -5603,6 +5613,13 @@ test "metadata raft apply store runtime status codec preserves document identity
             .missing_ordinal_coverage_count = 6,
             .stale_identity_generation_rejection_count = 5,
         },
+        .indexes = @constCast((&[_]metadata.RuntimeIndexStatusReport{.{
+            .name = "visual_idx",
+            .kind = "dense_vector",
+            .coverage_produced_count = 31,
+            .coverage_skipped_count = 7,
+            .coverage_terminal_failed_count = 2,
+        }})[0..]),
     }};
 
     const encoded = try encodeStoreRecord(alloc, .{
@@ -5629,6 +5646,10 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 7), status.doc_set_planning.ordinal_list_docs);
     try std.testing.expectEqual(@as(u64, 6), status.doc_set_planning.missing_ordinal_coverage_count);
     try std.testing.expectEqual(@as(u64, 5), status.doc_set_planning.stale_identity_generation_rejection_count);
+    try std.testing.expectEqual(@as(usize, 1), status.indexes.len);
+    try std.testing.expectEqual(@as(u64, 31), status.indexes[0].coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 7), status.indexes[0].coverage_skipped_count);
+    try std.testing.expectEqual(@as(u64, 2), status.indexes[0].coverage_terminal_failed_count);
 }
 
 test "metadata apply store replay is idempotent when applied watermark lags WAL state" {

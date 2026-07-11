@@ -1838,6 +1838,9 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Canonical live primary-document cardinality from durable identity metadata.
+    /// Unlike doc_count, this is independent of derived index fan-out.
+    source_doc_count: u64 = 0,
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},

@@ -15,6 +15,8 @@ class DerivedCoverageStatus:
     """
     Attributes:
         policy (DerivedCoverageStatusPolicy):
+        observation_complete (bool): Whether every expected shard contributed a fresh runtime observation to this
+            projection.
         source_total (int):
         produced (int): Source documents with a durable produced outcome for this index generation.
         skipped (int): Source documents intentionally producing no indexable output.
@@ -27,6 +29,7 @@ class DerivedCoverageStatus:
     """
 
     policy: DerivedCoverageStatusPolicy
+    observation_complete: bool
     source_total: int
     produced: int
     skipped: int
@@ -39,6 +42,8 @@ class DerivedCoverageStatus:
 
     def to_dict(self) -> dict[str, Any]:
         policy = self.policy.value
+
+        observation_complete = self.observation_complete
 
         source_total = self.source_total
 
@@ -63,6 +68,7 @@ class DerivedCoverageStatus:
         field_dict.update(
             {
                 "policy": policy,
+                "observation_complete": observation_complete,
                 "source_total": source_total,
                 "produced": produced,
                 "skipped": skipped,
@@ -81,6 +87,8 @@ class DerivedCoverageStatus:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         policy = DerivedCoverageStatusPolicy(d.pop("policy"))
+
+        observation_complete = d.pop("observation_complete")
 
         source_total = d.pop("source_total")
 
@@ -102,6 +110,7 @@ class DerivedCoverageStatus:
 
         derived_coverage_status = cls(
             policy=policy,
+            observation_complete=observation_complete,
             source_total=source_total,
             produced=produced,
             skipped=skipped,

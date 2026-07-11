@@ -470,6 +470,7 @@ components:
       additionalProperties: false
       required:
         - policy
+        - observation_complete
         - source_total
         - produced
         - skipped
@@ -482,6 +483,9 @@ components:
       properties:
         policy:
           $ref: "#/components/schemas/DerivedCoverageStatusPolicy"
+        observation_complete:
+          type: boolean
+          description: "Whether every expected shard contributed a fresh runtime observation to this projection."
         source_total:
           type: integer
           format: uint64
