@@ -82,10 +82,20 @@ pub const Server = struct {
         }
     };
 
+    pub const StateChangedHook = struct {
+        ptr: *anyopaque,
+        run_fn: *const fn (ptr: *anyopaque) void,
+
+        pub fn run(self: StateChangedHook) void {
+            self.run_fn(self.ptr);
+        }
+    };
+
     pub const AuthOptions = struct {
         bearer_token: ?[]const u8 = null,
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
+        state_changed: ?StateChangedHook = null,
     };
 
     pub fn init(alloc: Allocator, ctx: admin_exec.Context) Server {
@@ -125,6 +135,7 @@ pub const Server = struct {
             platform_sync.lockYielding(mutex);
             defer mutex.unlock();
         }
+        defer if (self.auth.state_changed) |hook| hook.run();
         switch (req.method) {
             .GET => {
                 if (std.mem.eql(u8, path, Routes.ready)) {

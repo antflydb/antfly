@@ -39,7 +39,6 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const portable_backup = @import("../storage/portable_backup.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const ha_primary_mod = @import("../storage/ha/primary.zig");
-const ha_write_gate_mod = @import("../storage/ha/write_gate.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lmdb = @import("../storage/lmdb.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -911,6 +910,7 @@ pub const ProvisionedTableWriteCache = struct {
                 .primary => |right| left == right,
                 .fenced_primary => false,
                 .standby => false,
+                .shared => false,
             },
             .fenced_primary => |left| switch (b.?) {
                 .primary => false,
@@ -918,11 +918,17 @@ pub const ProvisionedTableWriteCache = struct {
                     left.fence_store == right.fence_store and
                     std.mem.eql(u8, left.node_id, right.node_id),
                 .standby => false,
+                .shared => false,
             },
             .standby => |left| switch (b.?) {
                 .primary => false,
                 .fenced_primary => false,
                 .standby => |right| left == right,
+                .shared => false,
+            },
+            .shared => |left| switch (b.?) {
+                .primary, .fenced_primary, .standby => false,
+                .shared => |right| left.state == right.state and left.generation == right.generation,
             },
         };
     }
@@ -10003,17 +10009,7 @@ pub const ProvisionedTableWriteSource = struct {
 
 fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
     const configured = gate orelse return;
-    const decision = switch (configured) {
-        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
-        .fenced_primary => |gate_value| try ha_write_gate_mod.evaluateFencedPrimary(gate_value, .{}),
-        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
-    };
-    switch (decision.action) {
-        .allow_write => return,
-        .reject_read_only_standby => return error.HAReadOnlyStandby,
-        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
-        .reject_fenced_primary => return error.HAFencedPrimary,
-    }
+    try configured.check();
 }
 
 pub const HostedProvisionedTableWriteSource = struct {
