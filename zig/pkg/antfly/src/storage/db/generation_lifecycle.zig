@@ -124,7 +124,7 @@ const PathState = struct {
     }
 };
 
-pub const Manager = struct {
+const Manager = struct {
     allocator: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     next_id: u64 = 1,
@@ -275,11 +275,11 @@ pub const Manager = struct {
         self.allocator.free(removed.value.path_key);
     }
 
-    fn validateExclusive(self: *Manager, id: u64) !void {
+    fn validateExclusive(self: *Manager, id: u64, path: []const u8) !void {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const entry = self.active.get(id) orelse return error.InvalidGenerationTransition;
-        if (entry.kind == .exclusive) return;
+        if (entry.kind == .exclusive and std.mem.eql(u8, entry.path, path)) return;
         return error.InvalidGenerationTransition;
     }
 
@@ -489,10 +489,12 @@ pub const StagedGeneration = struct {
 
     pub fn validatePath(self: *const StagedGeneration, path_value: []const u8) !void {
         if (self.closed or !std.mem.eql(u8, self.staging_path, path_value)) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
     }
 
     pub fn validateLivePath(self: *const StagedGeneration, path_value: []const u8) !void {
         if (self.closed or !std.mem.eql(u8, self.live_path, path_value)) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
     }
 
     /// Errors are returned only before the live namespace changes. Once the
@@ -500,7 +502,7 @@ pub const StagedGeneration = struct {
     /// outcome so callers must finish their committed transition.
     pub fn publish(self: *StagedGeneration) !PublicationOutcome {
         if (self.closed or self.published) return error.InvalidGenerationTransition;
-        try self.manager.validateExclusive(self.transition_id);
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
 
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -687,7 +689,6 @@ fn reconcilePublishedGeneration(alloc: Allocator, io: std.Io, live_path: []const
 }
 
 pub fn acquirePublishedGenerationRead(alloc: Allocator, path: []const u8) !?ReadLease {
-    if (std.mem.indexOf(u8, std.fs.path.basename(path), ".restore-stage-") != null) return null;
     var reconciliation = (try process_manager.beginReconciliation(path)) orelse {
         var read_lease = try process_manager.beginRead(path);
         errdefer read_lease.deinit();
@@ -897,6 +898,8 @@ test "staged generation cannot publish after its exclusive capability is release
     defer staged.deinit();
 
     transition.deinit();
+    try std.testing.expectError(error.InvalidGenerationTransition, staged.validatePath(staged.path()));
+    try std.testing.expectError(error.InvalidGenerationTransition, staged.validateLivePath(live_path));
     try std.testing.expectError(error.InvalidGenerationTransition, staged.publish());
 }
 

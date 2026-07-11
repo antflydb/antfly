@@ -1172,6 +1172,7 @@ pub fn findClusterTable(
 
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
+    try tables_api.validateIndexesJson(alloc, manifest.indexes_json);
     return .{
         .description = if (manifest.description.len > 0) try alloc.dupe(u8, manifest.description) else null,
         .indexes_json = try alloc.dupe(u8, manifest.indexes_json),

@@ -20,6 +20,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const tables_api = @import("tables.zig");
 const runtime_status = @import("runtime_status.zig");
+const coverage_policy_mod = @import("coverage_policy.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -30,6 +31,7 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8
         .object => {},
         else => return error.InvalidCreateIndexRequest,
     }
+    coverage_policy_mod.validateIndexConfig(parsed.value) catch return error.InvalidCreateIndexRequest;
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
 
@@ -49,6 +51,7 @@ pub fn addIndexToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
+    coverage_policy_mod.validateIndexConfig(config.value) catch return error.InvalidCreateIndexRequest;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -750,12 +753,7 @@ fn canonicalIndexConfigJson(
     return try out.toOwnedSlice(alloc);
 }
 
-const EmbeddingsCoveragePolicy = enum {
-    strict,
-    partial,
-    best_effort,
-    external,
-};
+const EmbeddingsCoveragePolicy = coverage_policy_mod.Policy;
 
 fn embeddingsCoveragePolicyName(policy: EmbeddingsCoveragePolicy) []const u8 {
     return switch (policy) {
@@ -774,15 +772,6 @@ fn embeddingsCoveragePolicyRequiresTableCoverage(policy: EmbeddingsCoveragePolic
     return policy == .strict;
 }
 
-fn parseEmbeddingsCoveragePolicy(value: std.json.Value) ?EmbeddingsCoveragePolicy {
-    if (value != .string) return null;
-    if (std.mem.eql(u8, value.string, "strict")) return .strict;
-    if (std.mem.eql(u8, value.string, "full")) return .strict;
-    if (std.mem.eql(u8, value.string, "partial")) return .partial;
-    if (std.mem.eql(u8, value.string, "best_effort")) return .best_effort;
-    return null;
-}
-
 fn embeddingsCoveragePolicy(config: std.json.Value) EmbeddingsCoveragePolicy {
     if (config != .object) return .strict;
     if (config.object.get("external")) |external| {
@@ -791,17 +780,8 @@ fn embeddingsCoveragePolicy(config: std.json.Value) EmbeddingsCoveragePolicy {
             else => {},
         }
     }
-    if (config.object.get("partial")) |partial| {
-        switch (partial) {
-            .bool => |value| if (value) return .partial,
-            else => {},
-        }
-    }
     if (config.object.get("coverage_policy")) |policy| {
-        if (parseEmbeddingsCoveragePolicy(policy)) |parsed| return parsed;
-    }
-    if (config.object.get("coverage")) |policy| {
-        if (parseEmbeddingsCoveragePolicy(policy)) |parsed| return parsed;
+        return coverage_policy_mod.parse(policy) catch .strict;
     }
     return .strict;
 }
@@ -1063,6 +1043,7 @@ const AggregatedIndexStatus = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
     replay_applied_sequence: u64 = 0,
@@ -1194,6 +1175,7 @@ fn aggregateIndexStatus(
         aggregate.edge_count += item.edge_count;
         aggregate.node_count += item.node_count;
         aggregate.root_node = if (runtime_count == 1) item.root_node else 0;
+        aggregate.coverage_produced_count += item.coverage_produced_count;
         aggregate.coverage_skipped_count += item.coverage_skipped_count;
         aggregate.coverage_terminal_failed_count += item.coverage_terminal_failed_count;
         aggregate.replay_applied_sequence += item.replay_applied_sequence;
@@ -1471,15 +1453,18 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         .replay_catch_up_required = item.replay_catch_up_required,
     };
     const coverage_incomplete = aggregateRuntimeCoverageIncomplete(item);
+    const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
     const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
     const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
-    const covered_source_count = item.doc_count +| skipped_count +| if (coverage_policy == .best_effort) terminal_failed_count else 0;
+    const covered_source_count = produced_count +| skipped_count +| if (coverage_policy == .best_effort) terminal_failed_count else 0;
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
-    const source_coverage_visible = item.doc_count > 0 or (embeddingsCoveragePolicyAllowsSkips(coverage_policy) and skipped_count > 0);
+    const source_coverage_visible = table_doc_count == 0 or produced_count > 0 or
+        (coverage_policy == .external and item.doc_count > 0) or
+        (embeddingsCoveragePolicyAllowsSkips(coverage_policy) and skipped_count > 0);
     const dense_coverage_complete = if (coverage_policy == .external)
         true
     else if (require_table_coverage)
-        table_doc_count > 0 and item.doc_count >= table_doc_count
+        table_doc_count == 0 or produced_count >= table_doc_count
     else if (embeddingsCoveragePolicyAllowsSkips(coverage_policy) and table_doc_count > 0)
         covered_source_count >= table_doc_count
     else
@@ -1541,7 +1526,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         }
         view.backfill_progress = @min(
             1.0,
-            @as(f64, @floatFromInt(if (require_table_coverage) item.doc_count else covered_source_count)) /
+            @as(f64, @floatFromInt(if (require_table_coverage) produced_count else covered_source_count)) /
                 @as(f64, @floatFromInt(table_doc_count)),
         );
     }
@@ -1783,13 +1768,13 @@ fn appendSingleIndexRuntimeStatus(
     if (index_type == .embeddings) {
         const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
         const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
-        const produced_count = item.doc_count;
+        const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
         const counted_terminal_failed = if (embeddings_coverage_policy == .best_effort) terminal_failed_count else 0;
         const covered_source_count = produced_count +| skipped_count +| counted_terminal_failed;
         const coverage_complete = if (embeddings_coverage_policy == .external)
             !backfill_active
         else if (embeddingsCoveragePolicyRequiresTableCoverage(embeddings_coverage_policy))
-            table_doc_count > 0 and produced_count >= table_doc_count
+            table_doc_count == 0 or produced_count >= table_doc_count
         else if (table_doc_count > 0)
             covered_source_count >= table_doc_count
         else
@@ -4000,6 +3985,7 @@ test "partial coverage embeddings readiness counts skipped source units" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .coverage_produced_count = 1,
         .coverage_skipped_count = 1,
         .replay_applied_sequence = 2,
         .replay_target_sequence = 2,
@@ -4032,7 +4018,7 @@ test "partial coverage embeddings readiness counts skipped source units" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"visual_idx\":{\"type\":\"embeddings\",\"coverage\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512}}",
+            .indexes_json = "{\"visual_idx\":{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4061,6 +4047,7 @@ test "partial coverage embeddings readiness does not mask pending enrichment" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .coverage_produced_count = 1,
         .coverage_skipped_count = 1,
         .replay_applied_sequence = 1,
         .replay_target_sequence = 3,

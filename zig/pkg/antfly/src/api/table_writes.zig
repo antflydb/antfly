@@ -3565,6 +3565,11 @@ pub const BoundTableWriteSource = struct {
         };
     }
 
+    fn activeDb(self: *BoundTableWriteSource) !*db_mod.DB {
+        if (self.db.isClosed()) return error.StorageUnavailable;
+        return self.db;
+    }
+
     pub fn source(self: *BoundTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
@@ -3612,10 +3617,11 @@ pub const BoundTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        const db = try self.activeDb();
         const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
         items[0] = .{
             .group_id = 0,
-            .stats = try self.db.runtimeStatusStatsConsistent(alloc),
+            .stats = try db.runtimeStatusStatsConsistent(alloc),
         };
         return .{ .items = items };
     }
@@ -3629,7 +3635,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        if (!try corruptEmbeddingArtifactInDb(alloc, self.db, doc_key, index_name)) return error.NotFound;
+        if (!try corruptEmbeddingArtifactInDb(alloc, try self.activeDb(), doc_key, index_name)) return error.NotFound;
     }
 
     fn reprocessDocumentArtifact(
@@ -3641,7 +3647,7 @@ pub const BoundTableWriteSource = struct {
     ) !?bool {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+        return try (try self.activeDb()).reprocessDocumentArtifact(alloc, doc_key, artifact_name);
     }
 
     fn reprocessDocumentArtifactRange(
@@ -3653,7 +3659,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
+        return try (try self.activeDb()).reprocessDocumentArtifactRange(alloc, artifact_name, req);
     }
 
     fn listArtifactRepairIssues(
@@ -3664,7 +3670,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairListResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.listArtifactRepairIssuesPage(alloc, req);
+        return try (try self.activeDb()).listArtifactRepairIssuesPage(alloc, req);
     }
 
     fn repairArtifactIssues(
@@ -3675,7 +3681,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.repairArtifactIssuesWithRequest(alloc, req);
+        return try (try self.activeDb()).repairArtifactIssuesWithRequest(alloc, req);
     }
 
     fn repairArtifactIssuesControlled(
@@ -3687,7 +3693,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+        return try (try self.activeDb()).repairArtifactIssuesWithRequestOptions(alloc, req, options);
     }
 
     fn listArtifactRepairIssuesGroupLocal(
@@ -3734,7 +3740,7 @@ pub const BoundTableWriteSource = struct {
     ) !?bool {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
+        return try (try self.activeDb()).updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
     }
 
     fn applyDocumentArtifactChildRangeBatch(
@@ -3760,7 +3766,7 @@ pub const BoundTableWriteSource = struct {
     ) !?u64 {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.applyDocumentArtifactChildRangeBatch(child_batch);
+        return try (try self.activeDb()).applyDocumentArtifactChildRangeBatch(child_batch);
     }
 
     fn createTable(
@@ -3771,6 +3777,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        const db = try self.activeDb();
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
@@ -3789,14 +3796,14 @@ pub const BoundTableWriteSource = struct {
             const kind = try parseIndexKind(entry.value_ptr.*);
             const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
             defer alloc.free(config_json);
-            try self.db.addIndex(.{
+            try db.addIndex(.{
                 .name = entry.key_ptr.*,
                 .kind = kind,
                 .config_json = config_json,
             });
         }
 
-        try applyLocalTableSchemaJson(alloc, self.db, schema_json);
+        try applyLocalTableSchemaJson(alloc, db, schema_json);
     }
 
     fn updateSchema(
@@ -3807,7 +3814,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try applyLocalTableSchemaJson(alloc, self.db, schema_json);
+        try applyLocalTableSchemaJson(alloc, try self.activeDb(), schema_json);
     }
 
     fn batch(
@@ -3818,8 +3825,9 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try validateTableBatchAgainstLocalSchema(alloc, self.db, req.writes, req.deletes, req.transforms);
-        try self.db.batch(req);
+        const db = try self.activeDb();
+        try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+        try db.batch(req);
     }
 
     fn beginBulkIngest(
@@ -3829,7 +3837,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try self.db.beginBulkIngestSession();
+        try (try self.activeDb()).beginBulkIngestSession();
     }
 
     fn finishBulkIngest(
@@ -3840,13 +3848,14 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try self.db.finishBulkIngestSessionWithOptions(options);
+        try (try self.activeDb()).finishBulkIngestSessionWithOptions(options);
     }
 
     fn abortBulkIngest(ptr: *anyopaque, table_name: []const u8) void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return;
-        self.db.abortBulkIngestSession();
+        const db = self.activeDb() catch return;
+        db.abortBulkIngestSession();
     }
 
     fn backupTable(
@@ -3857,15 +3866,16 @@ pub const BoundTableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        const db = try self.activeDb();
         if (plan.format == .portable) {
-            return try exportPortableBackupShard(alloc, self.db, plan.backup_root, plan.backup_id, 0);
+            return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0);
         }
 
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
         defer alloc.free(snapshot_token);
-        _ = try self.db.snapshot(snapshot_token);
+        _ = try db.snapshot(snapshot_token);
 
-        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ self.db.core.path, snapshot_token });
+        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
         defer alloc.free(snapshot_root);
         const dest_root = try backups_api.shardSnapshotPath(alloc, plan.backup_root, plan.backup_id, 0);
         defer alloc.free(dest_root);
@@ -3873,7 +3883,7 @@ pub const BoundTableWriteSource = struct {
 
         const rel_path = try backups_api.shardSnapshotRelPath(alloc, plan.backup_id, 0);
         errdefer alloc.free(rel_path);
-        const byte_range = self.db.getRange();
+        const byte_range = db.getRange();
         const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
         shards[0] = .{
             .group_id = 0,
@@ -3894,23 +3904,24 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try backups_api.validateRestorableManifestLayout(plan.manifest);
         if (plan.reconcile_only) return error.RestoreIdentityMismatch;
+        const db = try self.activeDb();
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
         defer alloc.free(snapshot_root);
 
-        const db_path = try alloc.dupe(u8, self.db.core.path);
+        const db_path = try alloc.dupe(u8, db.core.path);
         defer alloc.free(db_path);
-        const primary_backend = self.db.primary_backend;
-        var owned_backend_runtime = self.db.owned_backend_runtime;
-        self.db.owned_backend_runtime = null;
+        const primary_backend = db.primary_backend;
+        var owned_backend_runtime = db.owned_backend_runtime;
+        db.owned_backend_runtime = null;
         errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
         const backend_runtime = if (owned_backend_runtime) |*runtime|
             runtime.runtime
         else
-            self.db.backend_runtime;
-        const identity_namespace = self.db.core.identity_namespace;
+            db.backend_runtime;
+        const identity_namespace = db.core.identity_namespace;
 
-        self.db.close();
+        db.close();
         const open_options: db_mod.OpenOptions = .{
             .primary_backend = primary_backend,
             .backend_runtime = backend_runtime,
@@ -3935,7 +3946,10 @@ pub const BoundTableWriteSource = struct {
             owned_backend_runtime = null;
             return restore_err;
         };
-        self.db.* = try db_mod.DB.open(alloc, db_path, open_options);
+        self.db.* = db_mod.DB.open(alloc, db_path, open_options) catch |reopen_err| {
+            std.log.err("bound restore committed but published generation could not be reopened path={s} err={s}", .{ db_path, @errorName(reopen_err) });
+            return reopen_err;
+        };
         self.db.owned_backend_runtime = owned_backend_runtime;
         owned_backend_runtime = null;
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
@@ -3957,7 +3971,9 @@ pub const BoundTableWriteSource = struct {
             const body = try readBackupFileAlloc(alloc, snapshot_root);
             defer alloc.free(body);
             {
-                var restored = try db_mod.DB.open(alloc, staged.path(), open_options);
+                var staged_open_options = open_options;
+                staged_open_options.staged_generation = &staged;
+                var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
                 try portable_backup.importPortable(alloc, restored.core.store, body);
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
@@ -3993,24 +4009,25 @@ pub const BoundTableWriteSource = struct {
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
-        try validateTransactionAgainstLocalSchema(alloc, self.db, table.writes, table.deletes, table.transforms);
+        const db = try self.activeDb();
+        try validateTransactionAgainstLocalSchema(alloc, db, table.writes, table.deletes, table.transforms);
 
         const commit_version = begin_timestamp + 1;
 
-        _ = try self.db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
-        self.db.writeTransaction(txn_id, .{
+        _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
+        db.writeTransaction(txn_id, .{
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
             .predicates = table.predicates,
         }) catch |err| switch (err) {
             error.VersionConflict, error.IntentConflict => {
-                self.db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
+                db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
                 return .{ .conflict = boundConflict(table, err) };
             },
             else => return err,
         };
-        try self.db.resolveTransactionIntents(txn_id, .committed, commit_version);
+        try db.resolveTransactionIntents(txn_id, .committed, commit_version);
         return .{ .committed = .{ .participant_count = 1 } };
     }
 
@@ -4023,7 +4040,8 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        const schema_json = try loadLocalTableSchemaJson(alloc, self.db);
+        const db = try self.activeDb();
+        const schema_json = try loadLocalTableSchemaJson(alloc, db);
         defer if (schema_json) |value| alloc.free(value);
         const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table_name, index_json, tables_api.effectiveSchemaJson(schema_json));
         defer alloc.free(expanded_index_json);
@@ -4032,7 +4050,7 @@ pub const BoundTableWriteSource = struct {
             alloc.free(cfg.name);
             alloc.free(cfg.config_json);
         }
-        try self.db.addIndex(cfg);
+        try db.addIndex(cfg);
     }
 
     fn putArtifactEnrichment(
@@ -4050,7 +4068,7 @@ pub const BoundTableWriteSource = struct {
         });
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.name, artifact_name)) return error.InvalidEnrichmentConfig;
-        _ = try self.db.upsertEnrichment(parsed.value);
+        _ = try (try self.activeDb()).upsertEnrichment(parsed.value);
     }
 
     fn deleteArtifactEnrichment(
@@ -4061,7 +4079,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        _ = try deleteArtifactEnrichmentFromDbByName(alloc, self.db, artifact_name);
+        _ = try deleteArtifactEnrichmentFromDbByName(alloc, try self.activeDb(), artifact_name);
     }
 
     fn dropIndex(
@@ -4072,7 +4090,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        _ = try self.db.deleteIndex(index_name);
+        _ = try (try self.activeDb()).deleteIndex(index_name);
     }
 
     fn batchGroupLocal(
@@ -4097,7 +4115,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        _ = try self.db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, participants);
+        _ = try (try self.activeDb()).beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, participants);
     }
 
     fn txnPrepareGroupLocal(
@@ -4111,8 +4129,9 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try validateTransactionAgainstLocalSchema(alloc, self.db, req.writes, req.deletes, req.transforms);
-        try self.db.writeTransaction(txn_id, req);
+        const db = try self.activeDb();
+        try validateTransactionAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+        try db.writeTransaction(txn_id, req);
     }
 
     fn txnResolveGroupLocal(
@@ -4126,10 +4145,11 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try self.db.resolveTransactionIntents(txn_id, status, commit_version);
-        const participant = try std.fmt.allocPrint(self.db.alloc, "group:{d}", .{group_id});
-        defer self.db.alloc.free(participant);
-        try self.db.markTransactionParticipantResolved(txn_id, participant);
+        const db = try self.activeDb();
+        try db.resolveTransactionIntents(txn_id, status, commit_version);
+        const participant = try std.fmt.allocPrint(db.alloc, "group:{d}", .{group_id});
+        defer db.alloc.free(participant);
+        try db.markTransactionParticipantResolved(txn_id, participant);
     }
 
     fn txnStatusGroupLocal(
@@ -4141,7 +4161,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        return try self.db.getTransactionStatus(txn_id);
+        return try (try self.activeDb()).getTransactionStatus(txn_id);
     }
 };
 
@@ -7659,9 +7679,10 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
         indexes_json: []const u8,
+        staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration,
     ) !db_mod.DB {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
             path,
             indexes_json,
@@ -7675,6 +7696,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.secret_store,
             self.remote_content,
             identity_namespace,
+            .{ .staged_generation = staged_generation },
         );
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
@@ -7687,6 +7709,7 @@ pub const ProvisionedTableWriteSource = struct {
         path: []const u8,
         group_id: u64,
         table_name: []const u8,
+        staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration,
     ) !void {
         const open_retry_timeout_ns = 2 * std.time.ns_per_s;
         const open_start_ns = platform_time.monotonicNs();
@@ -7705,6 +7728,7 @@ pub const ProvisionedTableWriteSource = struct {
                 group_id,
                 table_name,
                 indexes_json,
+                staged_generation,
             ) catch |err| switch (err) {
                 error.LsmRootWriterAlreadyOpen, error.WriterLocked => {
                     if (platform_time.monotonicNs() -| open_start_ns >= open_retry_timeout_ns) return err;
@@ -7824,6 +7848,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.group_id,
                 self.table_name,
                 indexes_json,
+                null,
             ) catch |err| switch (err) {
                 error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
                 else => return err,
@@ -9313,7 +9338,13 @@ pub const ProvisionedTableWriteSource = struct {
             defer if (prepared_generation) |*generation| generation.deinit();
 
             const repair_path = if (prepared_generation) |*generation| generation.path() else path;
-            try self.repairRestoredTableRuntimeStateBlocking(alloc, repair_path, group_id, table_name);
+            try self.repairRestoredTableRuntimeStateBlocking(
+                alloc,
+                repair_path,
+                group_id,
+                table_name,
+                if (prepared_generation) |*generation| generation else null,
+            );
             if (prepared_generation) |*generation| {
                 const outcome = try backup_restore.publishPreparedRestore(alloc, path, generation);
                 publication_outcome = outcome;
@@ -13639,6 +13670,7 @@ const ManagedDbOpenOptions = struct {
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
+    staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
 };
 
 const ManagedDbEnrichmentSet = struct {
@@ -13863,6 +13895,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
+                        .staged_generation = open_options.staged_generation,
                     })
                 else
                     try db_mod.DB.open(allocator, db_path, .{
@@ -13882,6 +13915,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
+                        .staged_generation = open_options.staged_generation,
                     }),
                 .query_readonly => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -23701,6 +23735,7 @@ test "provisioned restore repair open rejects stale doc identity namespace" {
         7001,
         "docs",
         "{}",
+        null,
     ));
 }
 

@@ -267,10 +267,13 @@ syntax or artifact counts.
 
 ### Coverage State
 
-Coverage is tracked per derived generation over source units, not just per table
-document. For simple document embeddings the source unit is a document. For
-chunked embeddings it may be a chunk artifact. For media extraction it may be an
-asset artifact. The coverage key should identify:
+Coverage is tracked per derived generation over logical source units, not over
+physical index entries. For the current embeddings API the source unit is one
+table document, including chunked embeddings: one document may produce many
+vectors but receives one `produced` outcome. This keeps the durable numerator
+comparable with the table-document denominator. Future artifact-to-artifact
+producers may use artifact identities only when their API exposes a matching
+source-total denominator. The coverage key identifies:
 
 - table or shard
 - derived artifact or index name
@@ -304,16 +307,18 @@ Aggregate status is derived from those durable per-source outcomes:
 - `healthy`
 - `degraded`
 
-The core completion predicate is:
+Completion is policy-specific. For the current document-level embeddings
+contract:
 
 ```text
-complete =
-    produced + skipped + terminal_failed >= source_total
-    and pending == 0
-    and in_flight == 0
+strict complete      = produced >= source_total
+partial complete     = produced + skipped >= source_total
+best_effort complete = produced + skipped + terminal_failed >= source_total
 ```
 
-Health is stricter:
+Counts are mutually exclusive per `(index, generation, source document)`, and
+`pending` is `source_total - min(source_total, covered-by-policy)`. Runtime replay
+debt remains an independent readiness gate. Health is stricter:
 
 ```text
 healthy = complete and terminal_failed == 0
@@ -379,14 +384,20 @@ Coverage-gap repair should regenerate missing `produced` artifacts, leave
 current-generation `skipped` units alone, and retry or surface
 `terminal_failed` units according to policy.
 
-Per-source outcome markers are the durable source of truth. Their aggregate
-counters are updated in the same DB apply-lock domain as replay mutations, and
-each marker/counter batch commits atomically. Generated enrichment rechecks a
-queued marker after publishing its replay record before decrementing the
-counter; it does not rely on state observed while the generation window was
-being assembled. Batch mutation paths deduplicate source keys with hash sets,
-keeping cleanup linear in the number of distinct source units rather than
-quadratic in batch size.
+Per-source outcome markers are the durable source of truth. Generation-scoped
+`produced`, `skipped`, and `terminal_failed` aggregate counters are updated in
+the same DB apply-lock domain as replay mutations, and each marker/counter batch
+commits atomically. Outcome transitions remove any prior outcome and update all
+affected counters in that one batch. Generated enrichment applies `produced`
+only after publishing its replay record, and non-retryable isolated request
+errors publish `terminal_failed`; retryable failures remain pending. Batch
+mutation paths deduplicate source keys with hash sets, keeping cleanup linear in
+the number of distinct source units rather than quadratic in batch size.
+
+Public status reports physical vector or sparse-entry `doc_count` separately
+from source coverage. Readiness must never substitute physical cardinality for
+the durable `produced` source count because chunked documents can create many
+entries and complete early under that approximation.
 
 ### Scope
 

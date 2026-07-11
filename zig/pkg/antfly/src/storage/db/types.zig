@@ -2121,6 +2121,7 @@ pub const DBIndexStats = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
     backfill_active: bool = false,

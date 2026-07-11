@@ -372,6 +372,14 @@ components:
         When sparse is false (default), creates a dense vector index (HNSW).
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
       properties:
+        coverage_policy:
+          $ref: "#/components/schemas/DerivedCoveragePolicy"
+          description: >-
+            Source-unit completeness policy for managed embeddings. `strict`
+            requires one produced outcome per source document; `partial` permits
+            intentional skips; `best_effort` also treats terminal failures as
+            complete while reporting the index unhealthy. External indexes use
+            `external: true` and must not set this field.
         external:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -442,6 +450,66 @@ components:
         execution:
           $ref: "#/components/schemas/IndexExecutionConfig"
           description: "Non-semantic execution policy for shorthand-created chunking or embedding producers."
+    DerivedCoveragePolicy:
+      type: string
+      enum:
+        - strict
+        - partial
+        - best_effort
+      default: strict
+      description: "How generation-scoped source outcomes determine derived-index completeness."
+    DerivedCoverageStatusPolicy:
+      type: string
+      enum:
+        - strict
+        - partial
+        - best_effort
+        - external
+    DerivedCoverageStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - policy
+        - source_total
+        - produced
+        - skipped
+        - terminal_failed
+        - covered
+        - pending
+        - complete
+        - healthy
+        - degraded
+      properties:
+        policy:
+          $ref: "#/components/schemas/DerivedCoverageStatusPolicy"
+        source_total:
+          type: integer
+          format: uint64
+        produced:
+          type: integer
+          format: uint64
+          description: "Source documents with a durable produced outcome for this index generation."
+        skipped:
+          type: integer
+          format: uint64
+          description: "Source documents intentionally producing no indexable output."
+        terminal_failed:
+          type: integer
+          format: uint64
+          description: "Source documents whose generation failed non-retryably."
+        covered:
+          type: integer
+          format: uint64
+          description: "Terminal source outcomes counted by the configured policy."
+        pending:
+          type: integer
+          format: uint64
+        complete:
+          type: boolean
+        healthy:
+          type: boolean
+        degraded:
+          type: boolean
     EmbeddingsIndexStats:
       type: object
       description: "Statistics for an embeddings index (dense or sparse)"
@@ -509,7 +577,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-          description: "Number of documents visible to the index."
+          description: "Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document."
+        coverage:
+          $ref: "#/components/schemas/DerivedCoverageStatus"
+          description: "Generation-scoped source-document coverage, separate from physical index cardinality."
         query_visible_doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer

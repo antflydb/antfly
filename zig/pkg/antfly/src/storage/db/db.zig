@@ -263,6 +263,7 @@ pub const OpenOptions = struct {
     lsm_cache: ?*lsm_backend_mod.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
+    staged_generation: ?*const generation_lifecycle.StagedGeneration = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     change_journal_backend: ?change_journal_mod.StorageBackend = null,
     change_journal_storage: ?lsm_backend_mod.Storage = null,
@@ -2792,6 +2793,7 @@ const ShadowState = struct {
 };
 
 pub const DB = struct {
+    closed: bool = false,
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -2972,7 +2974,10 @@ pub const DB = struct {
 
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return blk: {
-            var generation_read_lease = try generation_lifecycle.acquirePublishedGenerationRead(alloc, path);
+            var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
+                try staged_generation.validatePath(path);
+                break :staged_blk null;
+            } else try generation_lifecycle.acquirePublishedGenerationRead(alloc, path);
             errdefer if (generation_read_lease) |*lease| lease.deinit();
             const open_started_ns = monotonicTimeNs();
             const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
@@ -3199,7 +3204,13 @@ pub const DB = struct {
     }
 
     pub fn close(self: *DB) void {
+        if (self.closed) return;
+        self.closed = true;
         self.deinitWrapperState(true);
+    }
+
+    pub fn isClosed(self: *const DB) bool {
+        return self.closed;
     }
 
     fn resumeGeneratedReplayFromJournalIfNeeded(self: *DB) !void {
@@ -3788,6 +3799,7 @@ pub const DB = struct {
         if (self.generation_read_lease) |*lease| lease.deinit();
         self.generation_read_lease = null;
         self.* = undefined;
+        self.closed = true;
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
@@ -8271,7 +8283,9 @@ pub const DB = struct {
         opts: OpenOptions,
     ) !void {
         try staged_generation.validatePath(path);
-        try restoreSnapshotTo(alloc, snapshot_root, path, opts);
+        var staged_opts = opts;
+        staged_opts.staged_generation = staged_generation;
+        try restoreSnapshotTo(alloc, snapshot_root, path, staged_opts);
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepair(
@@ -12461,7 +12475,7 @@ pub const DB = struct {
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                     }
                     if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
-                        item.coverage_skipped_count = self.countDerivedCoverageSkipped(item.name, generation) catch item.coverage_skipped_count;
+                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, item);
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
@@ -12475,7 +12489,7 @@ pub const DB = struct {
                         item.term_count = sparse_stats.term_count;
                     }
                     if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
-                        item.coverage_skipped_count = self.countDerivedCoverageSkipped(item.name, generation) catch item.coverage_skipped_count;
+                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, item);
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
@@ -12787,7 +12801,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
@@ -12810,7 +12824,7 @@ pub const DB = struct {
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
@@ -12963,7 +12977,7 @@ pub const DB = struct {
                             }
                         }
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
                         item.backfill_progress = @min(
                             1.0,
@@ -12993,7 +13007,7 @@ pub const DB = struct {
                             item.backfill_progress = progress;
                         }
                     }
-                    item.coverage_skipped_count = try self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json));
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0) {
                         item.backfill_progress = @min(
                             1.0,
@@ -13131,7 +13145,7 @@ pub const DB = struct {
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
-                item.coverage_skipped_count = self.countDerivedCoverageSkipped(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json)) catch item.coverage_skipped_count;
+                self.populateDerivedCoverageCountsBestEffort(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
             }
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
@@ -13457,17 +13471,19 @@ pub const DB = struct {
         return doc_count;
     }
 
-    fn countDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
-        if (try self.loadDerivedCoverageSkippedCounter(self.core.alloc, index_name, generation)) |count| return count;
-        return try self.scanDerivedCoverageSkipped(index_name, generation);
+    fn countDerivedCoverageOutcome(self: *DB, index_name: []const u8, generation: u64, outcome: []const u8) !u64 {
+        if (try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, outcome)) |count| return count;
+        return try scanDerivedCoverageOutcomeFromStore(self.core.alloc, self.core.store, index_name, generation, outcome);
     }
 
-    fn loadDerivedCoverageSkippedCounter(self: *DB, alloc: Allocator, index_name: []const u8, generation: u64) !?u64 {
-        return try loadDerivedCoverageSkippedCounterFromStore(alloc, self.core.store, index_name, generation);
+    fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, item: *types.DBIndexStats) !void {
+        item.coverage_produced_count = try self.countDerivedCoverageOutcome(index_name, generation, "produced");
+        item.coverage_skipped_count = try self.countDerivedCoverageOutcome(index_name, generation, "skipped");
+        item.coverage_terminal_failed_count = try self.countDerivedCoverageOutcome(index_name, generation, "terminal_failed");
     }
 
-    fn scanDerivedCoverageSkipped(self: *DB, index_name: []const u8, generation: u64) !u64 {
-        return try scanDerivedCoverageSkippedFromStore(self.core.alloc, self.core.store, index_name, generation);
+    fn populateDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, generation: u64, item: *types.DBIndexStats) void {
+        self.populateDerivedCoverageCounts(index_name, generation, item) catch {};
     }
 
     fn deleteDerivedCoverageForIndex(self: *DB, index_name: []const u8) !void {
@@ -24390,29 +24406,31 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
-fn loadDerivedCoverageSkippedCounterFromStore(
+fn loadDerivedCoverageOutcomeCounterFromStore(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_name: []const u8,
     generation: u64,
+    outcome: []const u8,
 ) !?u64 {
-    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
+    const counter_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
     defer alloc.free(counter_key);
     const raw = store.get(alloc, counter_key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
-    return try internal_keys.decodeDerivedCoverageSkippedCount(raw);
+    return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
 }
 
-fn scanDerivedCoverageSkippedFromStore(
+fn scanDerivedCoverageOutcomeFromStore(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_name: []const u8,
     generation: u64,
+    outcome: []const u8,
 ) !u64 {
-    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(alloc, index_name, generation, "skipped");
+    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(alloc, index_name, generation, outcome);
     defer alloc.free(lower);
     const upper = try internal_keys.nextPrefixAlloc(alloc, lower);
     defer if (upper) |key| alloc.free(key);
@@ -24436,17 +24454,18 @@ fn scanDerivedCoverageSkippedFromStore(
     return skipped;
 }
 
-fn derivedCoverageSkippedCounterValueForStore(
+fn derivedCoverageOutcomeCounterValueForStore(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_name: []const u8,
     generation: u64,
+    outcome: []const u8,
 ) !u64 {
-    return (try loadDerivedCoverageSkippedCounterFromStore(alloc, store, index_name, generation)) orelse
-        try scanDerivedCoverageSkippedFromStore(alloc, store, index_name, generation);
+    return (try loadDerivedCoverageOutcomeCounterFromStore(alloc, store, index_name, generation, outcome)) orelse
+        try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, outcome);
 }
 
-fn deleteDerivedCoverageSkippedForDocKeys(
+fn deleteDerivedCoverageForDocKeys(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_manager: *index_manager_mod.IndexManager,
@@ -24464,44 +24483,56 @@ fn deleteDerivedCoverageSkippedForDocKeys(
     var unique_deletes = std.StringHashMapUnmanaged(void).empty;
     defer unique_deletes.deinit(alloc);
 
-    var removed_count: u64 = 0;
+    const outcomes = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+    var removed_counts = [_]u64{0} ** outcomes.len;
     for (doc_keys) |doc_key| {
-        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, "skipped");
-        errdefer alloc.free(marker_key);
-        if (unique_deletes.contains(marker_key)) {
-            alloc.free(marker_key);
-            continue;
-        }
-        const had_marker = blk: {
-            const existing = store.get(alloc, marker_key) catch |err| switch (err) {
-                error.NotFound => break :blk false,
-                else => return err,
+        for (outcomes, 0..) |outcome, outcome_index| {
+            const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, outcome);
+            errdefer alloc.free(marker_key);
+            if (unique_deletes.contains(marker_key)) {
+                alloc.free(marker_key);
+                continue;
+            }
+            const had_marker = blk: {
+                const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+                    error.NotFound => break :blk false,
+                    else => return err,
+                };
+                alloc.free(existing);
+                break :blk true;
             };
-            alloc.free(existing);
-            break :blk true;
-        };
-        if (had_marker) removed_count +|= 1;
-        try deletes.append(alloc, marker_key);
-        errdefer _ = deletes.pop();
-        try unique_deletes.put(alloc, marker_key, {});
+            if (had_marker) removed_counts[outcome_index] +|= 1;
+            try deletes.append(alloc, marker_key);
+            errdefer _ = deletes.pop();
+            try unique_deletes.put(alloc, marker_key, {});
+        }
     }
 
     if (deletes.items.len == 0) return;
-    if (removed_count == 0) {
+    var total_removed: u64 = 0;
+    for (removed_counts) |count| total_removed +|= count;
+    if (total_removed == 0) {
         try store.putBatch(&.{}, deletes.items);
         return;
     }
 
-    const current_count = try derivedCoverageSkippedCounterValueForStore(alloc, store, index_name, generation);
-    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(alloc, index_name, generation);
-    defer alloc.free(counter_key);
-    var counter_value: [8]u8 = undefined;
-    const new_count = if (current_count > removed_count) current_count - removed_count else 0;
-    const write = docstore_mod.KVPair{
-        .key = counter_key,
-        .value = internal_keys.encodeDerivedCoverageSkippedCount(&counter_value, new_count),
-    };
-    try store.putBatch(&.{write}, deletes.items);
+    var counter_keys: [outcomes.len]?[]u8 = .{null} ** outcomes.len;
+    defer for (counter_keys) |key| if (key) |value| alloc.free(value);
+    var counter_values: [outcomes.len][8]u8 = undefined;
+    var counter_writes: [outcomes.len]docstore_mod.KVPair = undefined;
+    var counter_write_count: usize = 0;
+    for (outcomes, removed_counts, 0..) |outcome, removed_count, outcome_index| {
+        if (removed_count == 0) continue;
+        const current_count = try derivedCoverageOutcomeCounterValueForStore(alloc, store, index_name, generation, outcome);
+        if (current_count < removed_count) return error.InvalidDerivedCoverageCounter;
+        counter_keys[outcome_index] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
+        counter_writes[counter_write_count] = .{
+            .key = counter_keys[outcome_index].?,
+            .value = internal_keys.encodeDerivedCoverageOutcomeCount(&counter_values[outcome_index], current_count - removed_count),
+        };
+        counter_write_count += 1;
+    }
+    try store.putBatch(counter_writes[0..counter_write_count], deletes.items);
 }
 
 fn artifactRepairIssueKeyForIssueAlloc(alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
@@ -25090,8 +25121,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const dense_delete_start_ns = monotonicTimeNs();
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.deleted_keys, batch_options);
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
-            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
             var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
@@ -25154,8 +25185,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
-            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-            try deleteDerivedCoverageSkippedForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
             var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);

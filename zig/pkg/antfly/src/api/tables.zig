@@ -30,9 +30,25 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
 const table_reads = @import("table_reads.zig");
+const coverage_policy_mod = @import("coverage_policy.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
+
+fn validateIndexesValue(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidCreateTableRequest;
+    var index_it = value.object.iterator();
+    while (index_it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        coverage_policy_mod.validateIndexConfig(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
+    }
+}
+
+pub fn validateIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
+    defer parsed.deinit();
+    try validateIndexesValue(parsed.value);
+}
 pub const default_schema_json = "{\"version\":0,\"default_type\":\"doc\",\"enforce_types\":false,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"x-antfly-dynamic-indexing\":{\"mode\":\"infer_types\"}}}}}";
 
 pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
@@ -590,10 +606,10 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
         };
     }
     if (root.get("indexes")) |value| {
-        if (value != .null)
-            req.indexes_json = try stringifyJsonValue(alloc, value)
-        else
-            req.indexes_json = try alloc.dupe(u8, default_indexes_json);
+        if (value != .null) {
+            try validateIndexesValue(value);
+            req.indexes_json = try stringifyJsonValue(alloc, value);
+        } else req.indexes_json = try alloc.dupe(u8, default_indexes_json);
     } else {
         req.indexes_json = try alloc.dupe(u8, default_indexes_json);
     }

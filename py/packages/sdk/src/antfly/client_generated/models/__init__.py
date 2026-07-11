@@ -114,6 +114,9 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .derived_coverage_policy import DerivedCoveragePolicy
+from .derived_coverage_status import DerivedCoverageStatus
+from .derived_coverage_status_policy import DerivedCoverageStatusPolicy
 from .disjunction_query import DisjunctionQuery
 from .distance_metric import DistanceMetric
 from .distance_range import DistanceRange
@@ -522,7 +525,14 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
-from .restore_table_response_202 import RestoreTableResponse202
+from .restore_table_response_200 import RestoreTableResponse200
+from .restore_table_response_200_durability import RestoreTableResponse200Durability
+from .restore_table_response_200_restore import RestoreTableResponse200Restore
+from .restore_table_response_202_type_0 import RestoreTableResponse202Type0
+from .restore_table_response_202_type_0_restore import RestoreTableResponse202Type0Restore
+from .restore_table_response_202_type_1 import RestoreTableResponse202Type1
+from .restore_table_response_202_type_1_durability import RestoreTableResponse202Type1Durability
+from .restore_table_response_202_type_1_restore import RestoreTableResponse202Type1Restore
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
@@ -759,6 +769,9 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DerivedCoveragePolicy",
+    "DerivedCoverageStatus",
+    "DerivedCoverageStatusPolicy",
     "DisjunctionQuery",
     "DistanceMetric",
     "DistanceRange",
@@ -1165,7 +1178,14 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
-    "RestoreTableResponse202",
+    "RestoreTableResponse200",
+    "RestoreTableResponse200Durability",
+    "RestoreTableResponse200Restore",
+    "RestoreTableResponse202Type0",
+    "RestoreTableResponse202Type0Restore",
+    "RestoreTableResponse202Type1",
+    "RestoreTableResponse202Type1Durability",
+    "RestoreTableResponse202Type1Restore",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",

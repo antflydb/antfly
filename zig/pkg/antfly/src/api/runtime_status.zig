@@ -965,6 +965,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .edge_count = item.edge_count,
             .node_count = item.node_count,
             .root_node = item.root_node,
+            .coverage_produced_count = item.coverage_produced_count,
             .coverage_skipped_count = item.coverage_skipped_count,
             .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
             .backfill_active = item.backfill_active,
@@ -1115,6 +1116,7 @@ test "table runtime snapshot cache clones stored status" {
         .kind = .dense_vector,
         .doc_count = 11,
         .node_count = 5,
+        .coverage_produced_count = 5,
         .coverage_skipped_count = 6,
         .coverage_terminal_failed_count = 7,
         .backfill_active = true,
@@ -1238,6 +1240,7 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(u64, 8), cloned.items[0].stats.doc_set_planning.ordinal_list_count);
     try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.doc_set_planning.stale_identity_generation_rejection_count);
     try std.testing.expectEqualStrings("vec", cloned.items[0].stats.indexes[0].name);
+    try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.indexes[0].coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 6), cloned.items[0].stats.indexes[0].coverage_skipped_count);
     try std.testing.expectEqual(@as(u64, 7), cloned.items[0].stats.indexes[0].coverage_terminal_failed_count);
     try std.testing.expect(cloned.items[0].stats.indexes[0].backfill_active);

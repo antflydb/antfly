@@ -4735,7 +4735,7 @@ export interface components {
              * @example triggered
              * @enum {string}
              */
-            status: "triggered" | "skipped" | "failed";
+            status: "triggered" | "committed" | "durability_pending" | "skipped" | "failed";
             /** @description Error message if restore failed */
             error?: string;
         };
@@ -7292,6 +7292,12 @@ export interface components {
             mem_only?: boolean;
         };
         /**
+         * @description How generation-scoped source outcomes determine derived-index completeness.
+         * @default strict
+         * @enum {string}
+         */
+        DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /**
          * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
          * @default l2_squared
          * @enum {string}
@@ -8198,6 +8204,8 @@ export interface components {
         };
         /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
+            /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /**
              * @description When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
              * @default false
@@ -8814,6 +8822,38 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @enum {string} */
+        DerivedCoverageStatusPolicy: "strict" | "partial" | "best_effort" | "external";
+        DerivedCoverageStatus: {
+            policy: components["schemas"]["DerivedCoverageStatusPolicy"];
+            /** Format: uint64 */
+            source_total: number;
+            /**
+             * Format: uint64
+             * @description Source documents with a durable produced outcome for this index generation.
+             */
+            produced: number;
+            /**
+             * Format: uint64
+             * @description Source documents intentionally producing no indexable output.
+             */
+            skipped: number;
+            /**
+             * Format: uint64
+             * @description Source documents whose generation failed non-retryably.
+             */
+            terminal_failed: number;
+            /**
+             * Format: uint64
+             * @description Terminal source outcomes counted by the configured policy.
+             */
+            covered: number;
+            /** Format: uint64 */
+            pending: number;
+            complete: boolean;
+            healthy: boolean;
+            degraded: boolean;
+        };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
             /**
@@ -8866,9 +8906,11 @@ export interface components {
             backfill_state?: string;
             /**
              * Format: uint64
-             * @description Number of documents visible to the index.
+             * @description Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
              */
             doc_count?: number;
+            /** @description Generation-scoped source-document coverage, separate from physical index cardinality. */
+            coverage?: components["schemas"]["DerivedCoverageStatus"];
             /**
              * Format: uint64
              * @description Documents currently visible to queries.
@@ -13355,15 +13397,34 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Restore process triggered successfully */
+            /** @description A previously committed restore is now durably published */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        restore: "committed";
+                        /** @enum {string} */
+                        durability: "durable";
+                    };
+                };
+            };
+            /** @description Restore committed or triggered successfully */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        /** @example triggered */
-                        restore?: string;
+                        /** @enum {string} */
+                        restore: "triggered";
+                    } | {
+                        /** @enum {string} */
+                        restore: "committed";
+                        /** @enum {string} */
+                        durability: "pending";
                     };
                 };
             };

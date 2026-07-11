@@ -279,7 +279,7 @@ fn prepareRestoreSnapshot(
     const staged_path = staged_generation.path();
 
     if (std.mem.endsWith(u8, snapshot_path, ".afb")) {
-        try applyPortableRestore(alloc, staged_path, group_id, restore, snapshot_path, manifest, options);
+        try applyPortableRestore(&staged_generation, alloc, staged_path, group_id, restore, snapshot_path, manifest, options);
         return staged_generation;
     }
 
@@ -344,6 +344,7 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
 }
 
 fn applyPortableRestore(
+    staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
@@ -371,6 +372,7 @@ fn applyPortableRestore(
     var db = try db_mod.DB.open(alloc, path, .{
         .identity_namespace = options.expected_identity_namespace,
         .start_index_workers = false,
+        .staged_generation = staged_generation,
     });
     var db_closed = false;
     defer if (!db_closed) db.close();
