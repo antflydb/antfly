@@ -313,6 +313,7 @@ test {
     _ = storage_backend_scan;
     _ = mem_backend;
     _ = lsm_backend;
+    _ = storage_maintenance;
     _ = backend_conformance_test;
     _ = lsm_backend_sim_test;
     _ = db;

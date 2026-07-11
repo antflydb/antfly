@@ -60,7 +60,9 @@ The implementation now consists of:
   page allocation, free map, crash recovery, integrity checks, stable snapshots,
   and atomic vacuum replacement.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
-  snapshots, replay lanes, and prefix-bounded logical namespaces.
+  snapshots, replay lanes, and prefix-bounded logical namespaces. Snapshot
+  caches are maintained per namespace: commits rebuild only the affected
+  table's live view while disjoint table caches remain hot.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
 - `storage/lite/backend.zig` caches one runtime per logical table/group and
@@ -172,6 +174,12 @@ operation returns `422`. Completed jobs are retained in a bounded in-memory
 history. Checkpoint inspection, index writes, document commits, compaction, and
 vacuum share the Lite store mutex and single-writer reservation, so the online
 operations cannot race checkpoint publication or file replacement.
+
+The standalone listener binds exclusively and reports bind/listen failure to
+the owning runtime before startup is declared ready. A failed listener cannot
+leave a headless process holding the `.aflite` writer lock. Standalone metadata
+updates retain a copy-on-write checkpoint until the catalog commit is durable,
+so failed persistence restores the exact prior in-memory state.
 
 The `antfly lite check`, `compact`, and `vacuum` commands remain useful for
 offline files and automation that does not run a server.

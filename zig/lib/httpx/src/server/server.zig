@@ -79,6 +79,10 @@ pub const ServerConfig = struct {
     request_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
+    /// Permit rebinding an address that has recently been used. Disable for
+    /// exclusive production listeners where two live servers must never share
+    /// an address (notably macOS SO_REUSEADDR semantics).
+    reuse_address: bool = true,
     keep_alive: bool = true,
     max_requests_per_connection: u32 = 1000,
     /// Idle timeout for HTTP/2 connections (ms). The server initiates graceful
@@ -778,7 +782,7 @@ pub const Server = struct {
         const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
         self.listener = try TcpListener.initWithOptions(addr, self.io, .{
             .kernel_backlog = backlog,
-            .reuse_address = true,
+            .reuse_address = self.config.reuse_address,
         });
     }
 

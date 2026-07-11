@@ -93,13 +93,14 @@ pub const Coordinator = struct {
         started_at_ms: ?i64 = null,
         completed_at_ms: ?i64 = null,
         result: ?Result = null,
-        error_name: ?[]u8 = null,
+        // @errorName strings have static lifetime, so response snapshots never
+        // borrow heap memory from a prunable Job.
+        error_name: ?[]const u8 = null,
         thread: ?std.Thread = null,
 
         fn deinit(self: *Job, allocator: std.mem.Allocator) void {
             if (self.thread) |thread| thread.join();
             if (self.idempotency_key) |key| allocator.free(key);
-            if (self.error_name) |name| allocator.free(name);
             allocator.destroy(self);
         }
     };
@@ -189,7 +190,7 @@ pub const Coordinator = struct {
             job.result = result;
             job.state = .succeeded;
         } else |err| {
-            job.error_name = self.allocator.dupe(u8, @errorName(err)) catch null;
+            job.error_name = @errorName(err);
             job.state = .failed;
         }
         job.completed_at_ms = nowMs();
@@ -258,4 +259,43 @@ test "storage maintenance coordinator is idempotent and single flight" {
     }
     try std.testing.expectEqual(@as(u64, 1), fake.runs.load(.monotonic));
     try std.testing.expectError(error.IdempotencyConflict, coordinator.start(.vacuum, "same-key"));
+}
+
+test "storage maintenance snapshots remain valid after job pruning" {
+    const Fake = struct {
+        fn source(self: *@This()) Source {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
+        }
+        fn status(_: *anyopaque) Status {
+            return .{ .engine = "fake", .maintenance = .{ .check = true } };
+        }
+        fn run(_: *anyopaque, _: Operation) anyerror!Result {
+            return error.InjectedMaintenanceFailure;
+        }
+    };
+    var fake = Fake{};
+    var coordinator = Coordinator.init(std.testing.allocator, fake.source());
+    defer coordinator.deinit();
+
+    const first = try coordinator.start(.check, null);
+    const retained = blk: {
+        while (true) {
+            const snapshot = coordinator.get(first.job_id).?;
+            if (snapshot.state == .failed) break :blk snapshot;
+            std.Thread.yield() catch {};
+        }
+    };
+    try std.testing.expectEqualStrings("InjectedMaintenanceFailure", retained.error_name.?);
+
+    var i: usize = 1;
+    while (i <= Coordinator.max_retained_jobs) : (i += 1) {
+        const next = try coordinator.start(.check, null);
+        while (true) {
+            const snapshot = coordinator.get(next.job_id).?;
+            if (snapshot.state == .failed) break;
+            std.Thread.yield() catch {};
+        }
+    }
+    try std.testing.expect(coordinator.get(first.job_id) == null);
+    try std.testing.expectEqualStrings("InjectedMaintenanceFailure", retained.error_name.?);
 }

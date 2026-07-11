@@ -165,6 +165,61 @@ fn standaloneReadyFromState(api_server_initialized: bool, unified_api_ready: boo
     return api_server_initialized and unified_api_ready;
 }
 
+const UnifiedServerLifecycle = struct {
+    const State = enum(u8) { starting, ready, failed, stopping, stopped };
+
+    state: std.atomic.Value(State) = .init(.starting),
+    mutex: std.atomic.Mutex = .unlocked,
+    server: ?*httpx.Server = null,
+    failure: anyerror = error.Unexpected,
+
+    fn attach(self: *UnifiedServerLifecycle, server: *httpx.Server) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.server = server;
+    }
+
+    fn detach(self: *UnifiedServerLifecycle, server: *httpx.Server) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.server == server) self.server = null;
+    }
+
+    fn publishReady(self: *UnifiedServerLifecycle) void {
+        self.state.store(.ready, .release);
+    }
+
+    fn publishFailure(self: *UnifiedServerLifecycle, err: anyerror) void {
+        if (self.state.load(.acquire) == .stopping) {
+            self.state.store(.stopped, .release);
+            return;
+        }
+        self.failure = err;
+        self.state.store(.failed, .release);
+    }
+
+    fn waitForStartup(self: *UnifiedServerLifecycle) !void {
+        while (true) switch (self.state.load(.acquire)) {
+            .starting => std.Thread.yield() catch {},
+            .ready => return,
+            .failed => return self.failure,
+            .stopping, .stopped => return error.ServerStopped,
+        };
+    }
+
+    fn runtimeFailure(self: *UnifiedServerLifecycle) ?anyerror {
+        return if (self.state.load(.acquire) == .failed) self.failure else null;
+    }
+
+    fn stop(self: *UnifiedServerLifecycle) void {
+        const prior = self.state.swap(.stopping, .acq_rel);
+        if (prior == .failed or prior == .stopped) return;
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.server) |server| server.stop();
+    }
+};
+
 const LocalStandaloneMetadata = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
@@ -189,6 +244,46 @@ const LocalStandaloneMetadata = struct {
         extension_members: []const antfly.extensions.ExtensionMember = &.{},
         extension_dependencies: []const antfly.extensions.ExtensionDependency = &.{},
     };
+
+    const CatalogMutation = struct {
+        previous_manager: antfly.metadata.TableManager,
+        previous_extensions: antfly.extensions.ExtensionCatalog,
+        previous_epoch: u64,
+        committed: bool = false,
+
+        fn commit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) !void {
+            try metadata.persistLocked();
+            self.committed = true;
+        }
+
+        fn deinit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) void {
+            if (self.committed) {
+                self.previous_extensions.deinit();
+                self.previous_manager.deinit();
+                return;
+            }
+            metadata.extension_catalog.deinit();
+            metadata.manager.deinit();
+            metadata.manager = self.previous_manager;
+            metadata.extension_catalog = self.previous_extensions;
+            metadata.epoch = self.previous_epoch;
+        }
+    };
+
+    fn beginCatalogMutationLocked(self: *LocalStandaloneMetadata) !CatalogMutation {
+        var manager = antfly.metadata.TableManager.init(self.alloc);
+        errdefer manager.deinit();
+        const tables = try self.manager.listTables(self.alloc);
+        defer self.manager.freeTables(self.alloc, tables);
+        const ranges = try self.manager.listRanges(self.alloc);
+        defer self.manager.freeRanges(self.alloc, ranges);
+        _ = try manager.replaceProjectedTopology(tables, ranges);
+        return .{
+            .previous_manager = manager,
+            .previous_extensions = try self.cloneExtensionCatalogLocked(),
+            .previous_epoch = self.epoch,
+        };
+    }
 
     fn init(
         alloc: std.mem.Allocator,
@@ -398,10 +493,12 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.manager.upsertTable(table);
         for (ranges) |range| try self.manager.upsertRange(range);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
@@ -422,10 +519,12 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.manager.upsertTable(table);
         for (ranges) |range| try self.manager.upsertRange(range);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
@@ -433,9 +532,11 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         _ = self.manager.removeTableTopology(table.table_id);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -445,9 +546,11 @@ const LocalStandaloneMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -458,9 +561,11 @@ const LocalStandaloneMetadata = struct {
         var updated = table.*;
         updated.indexes_json = try antfly.public_api.indexes.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
@@ -472,9 +577,11 @@ const LocalStandaloneMetadata = struct {
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
@@ -486,9 +593,11 @@ const LocalStandaloneMetadata = struct {
         updated.indexes_json = try antfly.public_api.indexes.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn deleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
@@ -501,9 +610,11 @@ const LocalStandaloneMetadata = struct {
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn waitTableLifecycle(_: *anyopaque, _: []const u8, _: antfly.public_api.http_server.TableVisibility) !void {}
@@ -543,10 +654,12 @@ const LocalStandaloneMetadata = struct {
             defer planned.deinitOwned(self.alloc);
             return try antfly.extensions.cloneInstalledExtensionAlloc(alloc, planned);
         }
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         var installed = try self.extension_catalog.installManifestOnly(extension_name, extension_name, persisted_req, installed_at_ms);
         defer installed.deinitOwned(self.alloc);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
@@ -563,10 +676,12 @@ const LocalStandaloneMetadata = struct {
             defer planned.deinitOwned(self.alloc);
             return try antfly.extensions.cloneInstalledExtensionAlloc(alloc, planned);
         }
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         var installed = try self.extension_catalog.updateManifestOnly(extension_name, persisted_req);
         defer installed.deinitOwned(self.alloc);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
@@ -581,18 +696,22 @@ const LocalStandaloneMetadata = struct {
             defer catalog.deinit();
             return try catalog.dropInstalledWithMode(extension_name, persisted_req);
         }
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.extension_catalog.dropInstalledWithMode(extension_name, persisted_req);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.extensions.InstalledExtension {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.extension_catalog.enableInstalled(extension_name);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
@@ -600,9 +719,11 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.extension_catalog.disableInstalled(extension_name);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
@@ -610,9 +731,11 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         try self.extension_catalog.configureInstalled(extension_name, req);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
@@ -627,11 +750,13 @@ const LocalStandaloneMetadata = struct {
         if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         for (installed) |extension| try self.extension_catalog.upsertInstalled(extension);
         for (members) |member| try self.extension_catalog.upsertMember(member);
         for (dependencies) |dependency| try self.extension_catalog.upsertDependency(dependency);
         self.epoch +|= 1;
-        try self.persistLocked();
+        try mutation.commit(self);
     }
 
     fn cloneExtensionCatalogLocked(self: *LocalStandaloneMetadata) !antfly.extensions.ExtensionCatalog {
@@ -652,10 +777,12 @@ const LocalStandaloneMetadata = struct {
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var mutation = if (entries.len > 0) try self.beginCatalogMutationLocked() else null;
+        defer if (mutation) |*active| active.deinit(self);
         for (entries) |entry| try self.extension_catalog.registerPackage(entry.manifest);
         if (entries.len > 0) {
             self.epoch +|= 1;
-            try self.persistLocked();
+            try mutation.?.commit(self);
         }
         return entries.len;
     }
@@ -707,6 +834,8 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
         var changed = false;
         for (progress) |record| {
             const table = self.manager.tables.get(record.table_id) orelse continue;
@@ -733,7 +862,9 @@ const LocalStandaloneMetadata = struct {
 
         if (changed) {
             self.epoch +|= 1;
-            try self.persistLocked();
+            try mutation.commit(self);
+        } else {
+            mutation.committed = true;
         }
     }
 
@@ -1116,23 +1247,6 @@ pub fn runFromIterator(
     const bind_port = public_listener.bind_port;
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
-    const thread = std.Thread.spawn(.{}, serveUnified, .{
-        alloc,
-        bind_host,
-        bind_port,
-        &handler,
-        &antfly_node,
-        api_server,
-        &unified_api_ready,
-    }) catch |err| {
-        std.log.err("standalone startup failed step=spawn_unified_http err={}", .{err});
-        return err;
-    };
-    _ = thread; // detach happens on process exit
-
-    // Print bound address. The thread will print it after bind().
-    std.debug.print("standalone local metadata enabled (raft disabled)\n", .{});
-
     var standalone_health = StandaloneHealthSource{
         .data_server = &data_server,
         .unified_api_ready = &unified_api_ready,
@@ -1155,12 +1269,39 @@ pub fn runFromIterator(
     };
     defer if (health_server) |hs| hs.deinit();
 
+    var unified_lifecycle = UnifiedServerLifecycle{};
+    const thread = std.Thread.spawn(.{}, serveUnified, .{
+        alloc,
+        bind_host,
+        bind_port,
+        &handler,
+        &antfly_node,
+        api_server,
+        &unified_api_ready,
+        &unified_lifecycle,
+    }) catch |err| {
+        std.log.err("standalone startup failed step=spawn_unified_http err={}", .{err});
+        return err;
+    };
+    errdefer {
+        unified_lifecycle.stop();
+        thread.join();
+    }
+    unified_lifecycle.waitForStartup() catch |err| {
+        std.log.err("standalone startup failed step=bind_unified_http err={}", .{err});
+        return err;
+    };
+
+    // Print only after the public listener has successfully bound.
+    std.debug.print("standalone local metadata enabled (raft disabled)\n", .{});
+
     const tick_ms = cli.tick_ms orelse 100;
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
     while (true) {
+        if (unified_lifecycle.runtimeFailure()) |err| return err;
         try data_server.runRound();
         try LocalStandaloneMetadata.runRound(&local_metadata);
         const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
@@ -1585,9 +1726,11 @@ fn serveUnified(
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
+    lifecycle: *UnifiedServerLifecycle,
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready) catch |err| {
+    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready, lifecycle) catch |err| {
         unified_api_ready.store(false, .release);
+        lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
     };
 }
@@ -1600,12 +1743,15 @@ fn serveUnifiedInner(
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
+    lifecycle: *UnifiedServerLifecycle,
 ) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
 
     var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
+    lifecycle.attach(&server);
+    defer lifecycle.detach(&server);
 
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (antfly_node) |node| {
@@ -1639,6 +1785,7 @@ fn serveUnifiedInner(
 
     try server.bind();
     unified_api_ready.store(true, .release);
+    lifecycle.publishReady();
 
     if (server.boundAddress()) |addr| {
         std.debug.print("standalone public api listening on http://{}\n", .{addr});
@@ -1654,6 +1801,7 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
         .request_timeout_ms = 300_000,
         .max_requests_per_connection = public_api_max_requests_per_connection,
+        .reuse_address = false,
     };
 }
 
@@ -4219,8 +4367,9 @@ test "standalone runtime defaults public listener to antfarm port" {
     try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
 }
 
-test "standalone public HTTP server uses public API request body limit" {
+test "standalone public HTTP server is exclusive and uses public API request body limit" {
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
+    try std.testing.expect(!cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
 }
 
@@ -4419,4 +4568,53 @@ test "standalone runtime data dir overrides common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/from-cli/data/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/from-cli/metadata/local-metadata.json", resolved.local_metadata_catalog_path);
     try std.testing.expectEqualStrings("/tmp/from-cli/data/snapshots", resolved.snapshot_root_dir);
+}
+
+test "standalone metadata rolls back an undurable catalog mutation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-directory", .{tmp.sub_path});
+    defer alloc.free(catalog_dir);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try ensureDirPath(io_impl.io(), catalog_dir);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_dir),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+
+    {
+        var mutation = try metadata.beginCatalogMutationLocked();
+        defer mutation.deinit(&metadata);
+        const table = antfly.public_api.tables.deriveTableRecord("docs", .{});
+        try metadata.manager.upsertTable(table);
+        metadata.epoch = 9;
+        var persist_failed = false;
+        mutation.commit(&metadata) catch {
+            persist_failed = true;
+        };
+        try std.testing.expect(persist_failed);
+    }
+    try std.testing.expectEqual(@as(u64, 1), metadata.epoch);
+    try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone unified server lifecycle propagates startup failure" {
+    var lifecycle = UnifiedServerLifecycle{};
+    lifecycle.publishFailure(error.AddressInUse);
+    try std.testing.expectError(error.AddressInUse, lifecycle.waitForStartup());
+    try std.testing.expectEqual(error.AddressInUse, lifecycle.runtimeFailure().?);
 }

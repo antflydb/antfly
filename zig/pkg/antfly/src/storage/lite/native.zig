@@ -1268,6 +1268,14 @@ pub const NativeFile = struct {
     }
 
     pub fn snapshotDocumentsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedDocument {
+        return try self.snapshotDocumentsWithPrefixAlloc(allocator, "");
+    }
+
+    /// Materializes only live documents in `prefix`. The document log is still
+    /// walked newest-to-oldest for v1 format compatibility, but memory and sort
+    /// work are bounded by the selected logical namespace rather than the
+    /// entire database.
+    pub fn snapshotDocumentsWithPrefixAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8) ![]OwnedDocument {
         var docs = std.ArrayListUnmanaged(OwnedDocument).empty;
         errdefer {
             for (docs.items) |doc| {
@@ -1293,6 +1301,11 @@ pub const NativeFile = struct {
             const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
             defer allocator.free(payload);
             const entry = try decodeDocumentEntry(payload);
+
+            if (!std.mem.startsWith(u8, entry.key, prefix)) {
+                page_id = entry.previous_page;
+                continue;
+            }
 
             if (!seen.contains(entry.key)) {
                 try seen.ensureUnusedCapacity(allocator, 1);

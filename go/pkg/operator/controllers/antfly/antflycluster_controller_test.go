@@ -159,6 +159,38 @@ func TestCleanupDoesNotDeleteUnownedCanonicalNameStatefulSet(t *testing.T) {
 	}
 }
 
+func TestCleanupDoesNotTreatInstanceLabelAsOwnership(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	foreign := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "another-application", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+	}}
+	foreignPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "foreign-data", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, foreign, foreignPVC).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: foreign.Name, Namespace: foreign.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("label-only StatefulSet was deleted: %v", err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: foreignPVC.Name, Namespace: foreignPVC.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("label-only PVC was deleted: %v", err)
+	}
+}
+
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }

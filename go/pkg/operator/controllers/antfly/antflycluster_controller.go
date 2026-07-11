@@ -528,17 +528,24 @@ func buildPVCRetentionPolicy(policy *antflyv1.PVCRetentionPolicy) *appsv1.Statef
 func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, cluster *antflyv1.AntflyCluster) (*ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// Step 1: Delete all owned or instance-labeled StatefulSets. This also covers
-	// workloads whose historical component/name is no longer recognized.
+	// Step 1: Delete StatefulSets controlled by this exact AntflyCluster UID.
+	// app.kubernetes.io/instance is a discovery label, not an ownership proof:
+	// another controller or Helm release can legitimately use the same value.
 	var namespaceStatefulSets appsv1.StatefulSetList
 	if err := r.List(ctx, &namespaceStatefulSets, client.InNamespace(cluster.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list StatefulSets for PVC cleanup: %w", err)
 	}
 	discoveredClaimPrefixes := make([]string, 0)
+	ownedStatefulSetNames := make(map[string]struct{})
+	ownedStatefulSetUIDs := make(map[types.UID]struct{})
 	for i := range namespaceStatefulSets.Items {
 		sts := &namespaceStatefulSets.Items[i]
-		if sts.Labels["app.kubernetes.io/instance"] != cluster.Name && !metav1.IsControlledBy(sts, cluster) {
+		if !metav1.IsControlledBy(sts, cluster) {
 			continue
+		}
+		ownedStatefulSetNames[sts.Name] = struct{}{}
+		if sts.UID != "" {
+			ownedStatefulSetUIDs[sts.UID] = struct{}{}
 		}
 		for claimIndex := range sts.Spec.VolumeClaimTemplates {
 			discoveredClaimPrefixes = append(discoveredClaimPrefixes,
@@ -578,7 +585,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		stsName := cluster.Name + suffix
 		err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 		if err == nil {
-			if sts.Labels["app.kubernetes.io/instance"] != cluster.Name && !metav1.IsControlledBy(sts, cluster) {
+			if !metav1.IsControlledBy(sts, cluster) {
 				log.Info("Skipping canonical-name StatefulSet not owned by cluster", "statefulset", stsName)
 				continue
 			}
@@ -593,12 +600,23 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 
 	// Step 2: Check if pods still exist — requeue if they do
 	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace),
-		client.MatchingLabels{"app.kubernetes.io/instance": cluster.Name}); err != nil {
+	if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list pods for PVC cleanup: %w", err)
 	}
-	if len(podList.Items) > 0 {
-		log.Info("Waiting for pods to terminate", "remaining", len(podList.Items))
+	remainingOwnedPods := 0
+	for i := range podList.Items {
+		owner := metav1.GetControllerOf(&podList.Items[i])
+		if owner == nil || owner.Kind != "StatefulSet" {
+			continue
+		}
+		_, uidMatch := ownedStatefulSetUIDs[owner.UID]
+		_, nameMatch := ownedStatefulSetNames[owner.Name]
+		if uidMatch || (owner.UID == "" && nameMatch) {
+			remainingOwnedPods++
+		}
+	}
+	if remainingOwnedPods > 0 {
+		log.Info("Waiting for pods to terminate", "remaining", remainingOwnedPods)
 		result := ctrl.Result{RequeueAfter: 5 * time.Second}
 		return &result, nil
 	}
@@ -619,7 +637,6 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		return nil, fmt.Errorf("failed to list PVCs: %w", err)
 	}
 
-	labeledPVCs := len(pvcList.Items) > 0
 	// If no labeled PVCs found, fall back to namespace-wide list with prefix matching
 	// (backward compatibility for clusters created before labels were added to VolumeClaimTemplates)
 	if len(pvcList.Items) == 0 {
@@ -630,7 +647,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if labeledPVCs || hasAnyPrefix(pvc.Name, prefixes) {
+		if hasAnyPrefix(pvc.Name, prefixes) {
 			// In the fallback path (namespace-wide listing), skip PVCs that are
 			// labeled for a different cluster to avoid cross-cluster deletion.
 			if inst, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && inst != cluster.Name {

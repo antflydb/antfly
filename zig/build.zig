@@ -3925,6 +3925,22 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
 
+    const lib_storage_maintenance_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "storage maintenance coordinator is idempotent and single flight",
+            "storage maintenance snapshots remain valid after job pruning",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_storage_maintenance_tests = b.addRunArtifact(lib_storage_maintenance_tests);
+    const lib_storage_maintenance_test_step = b.step("lib-storage-maintenance-test", "Run storage maintenance coordinator ownership and concurrency tests");
+    lib_storage_maintenance_test_step.dependOn(&run_lib_storage_maintenance_tests.step);
+    unit_test_step.dependOn(lib_storage_maintenance_test_step);
+
     const lib_api_docid_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -4719,11 +4735,13 @@ pub fn build(b: *std.Build) void {
             "antfly config uses cli override before common config",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
-            "standalone public HTTP server uses public API request body limit",
+            "standalone public HTTP server is exclusive and uses public API request body limit",
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
+            "standalone metadata rolls back an undurable catalog mutation",
+            "standalone unified server lifecycle propagates startup failure",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
