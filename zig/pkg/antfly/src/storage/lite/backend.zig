@@ -420,7 +420,10 @@ pub const Handle = struct {
             .engine = "lite",
             .format = status.format,
             .fsync = status.fsync,
-            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = true },
+            // Native maintenance takes the file's exclusive maintenance gate.
+            // It is callable through the asynchronous admin surface, but is
+            // deliberately not advertised as availability-preserving.
+            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = false },
         };
     }
 

@@ -37,56 +37,63 @@ This gives the product names precise meanings:
 Storage is a tagged union. Exactly one member matching `storage.engine` may be
 configured.
 
-The examples below use YAML for readability and match the OpenAPI schema. The
-current Zig `--config` loader consumes the equivalent JSON representation.
+The Zig runtime consumes JSON configuration validated against the OpenAPI
+schema. The selected command supplies the deployment topology; an optional
+`deployment_mode` in the file is an assertion and must match the command.
 
-```yaml
-# Single-file standalone
-deployment_mode: standalone
-storage:
-  engine: lite
-  lite:
-    path: ./data.antfly.aflite
-    fsync: true
+Single-file standalone:
+
+```json
+{
+  "storage": {
+    "engine": "lite",
+    "lite": { "path": "./data.antfly.aflite", "fsync": true }
+  }
+}
 ```
 
-```yaml
-# Directory-backed standalone or distributed deployment
-deployment_mode: standalone
-storage:
-  engine: local
-  local:
-    base_dir: ~/.antfly
+Directory-backed standalone or distributed deployment:
+
+```json
+{
+  "storage": {
+    "engine": "local",
+    "local": { "base_dir": "~/.antfly" }
+  }
+}
 ```
 
 The local engine is entirely directory-backed. Object storage is a distinct
 engine rather than a per-subsystem override; mixed local/S3 configurations are
 rejected so data placement cannot silently diverge from the selected engine.
 
-```yaml
-# Object-backed serverless deployment
-deployment_mode: serverless
-connections:
-  primary-storage:
-    kind: external_io
-    capabilities: [storage.primary]
-    external_io:
-      protocol: s3
-      endpoint: s3.amazonaws.com
-      region: us-west-2
-      buckets: [antfly-data, antfly-wal]
-      access_key_id: ${secret:storage.access_key_id}
-      secret_access_key: ${secret:storage.secret_access_key}
-storage:
-  engine: object
-  object:
-    connection: primary-storage
-    bucket: antfly-data
-    prefix: production/
-    lanes:
-      wal:
-        bucket: antfly-wal
-        prefix: production/
+Object-backed serverless deployment:
+
+```json
+{
+  "connections": {
+    "primary-storage": {
+      "kind": "external_io",
+      "capabilities": ["storage.primary"],
+      "external_io": {
+        "protocol": "s3",
+        "region": "us-west-2",
+        "buckets": ["antfly-data", "antfly-wal"],
+        "prefix": "production",
+        "bucket_provisioning": "require_existing"
+      }
+    }
+  },
+  "storage": {
+    "engine": "object",
+    "object": {
+      "connection": "primary-storage",
+      "bucket": "antfly-data",
+      "prefix": "production",
+      "lanes": { "wal": { "bucket": "antfly-wal", "prefix": "production/wal" } }
+    }
+  }
+}
 ```
 
 Serverless derives its `artifacts`, `manifests`, `wal`, `progress`, and
@@ -102,10 +109,13 @@ credential profiles remain isolated.
 Primary storage credentials are deliberately independent from
 `remote_content.s3`. The former grants Antfly write authority over database
 state; the latter grants read authority over user-provided content and may
-contain several named credentials selected by bucket. Credential values should
-come from secret references (or standard AWS environment variables for one
-default profile), never committed plaintext.
-The Zig config loader accepts JSON; pass `--secret-store-path` (or
+contain several named credentials selected by bucket. When a storage connection
+omits static keys, Antfly uses the refreshable AWS default credential chain
+shared with Bedrock: environment credentials, web identity/IRSA, shared
+profiles, ECS task credentials, and EC2 instance metadata. Expiring credentials
+refresh before their safety window. Static keys remain available through secret
+references for S3-compatible systems, but should never be committed plaintext.
+Pass `--secret-store-path` (or
 `ANTFLY_SECRET_STORE_PATH`) when those JSON values use `${secret:...}`.
 
 The canonical and convenience forms are equivalent:
@@ -125,13 +135,16 @@ Durable multi-request transaction sessions have bounded, configurable
 retention. Defaults are one hour, cleanup every minute, 1,024 sessions, a
 16 MiB encoded record per session, and 64 savepoints:
 
-```yaml
-transaction_sessions:
-  ttl_seconds: 3600
-  cleanup_interval_seconds: 60
-  max_count: 1024
-  max_record_bytes: 16777216
-  max_savepoints: 64
+```json
+{
+  "transaction_sessions": {
+    "ttl_seconds": 3600,
+    "cleanup_interval_seconds": 60,
+    "max_count": 1024,
+    "max_record_bytes": 16777216,
+    "max_savepoints": 64
+  }
+}
 ```
 
 Session changes use persist-before-publish copy-on-write semantics. A failed
@@ -149,9 +162,11 @@ session unchanged.
   on the file lock; readers must use a stable snapshot or a read-only mode.
 - Raft, shard replication, horizontal scaling, and distributed role settings
   are invalid with Lite.
-- A Lite file contains metadata, documents, indexes, schemas, enrichments, and
-  transactional state. Sidecar files are temporary recovery artifacts, not
-  independently required database state.
+- A Lite file contains database metadata, documents, indexes, schemas,
+  enrichments, and transactional state. Server identity/RBAC, encrypted
+  secrets, model files, and extension packages are deployment control-plane
+  state and are intentionally external. Moving a complete secured deployment
+  requires both the `.aflite` file and its control-plane configuration.
 - Lite durability is controlled by `fsync`. High availability is a separate
   WAL/file-replication concern and must not be described as Raft replication.
   `fsync: false` is intended only for disposable or externally protected data;
@@ -166,8 +181,8 @@ Lite installs a scoped DB-open provider on the standalone backend runtime.
 Logical group paths become cached key and index namespaces inside the file, so
 the existing `/db/v1`, SQL, transaction, indexing, and inference code paths are
 reused unchanged. Prefix-bounded cursors prevent cross-table scans;
-per-namespace snapshots bound materialized memory and allow writes to update
-only the affected table cache. A checkpointed namespace-head directory and
+per-namespace snapshots share unchanged document payloads and allow writes to
+merge only the affected table cache. A checkpointed namespace-head directory and
 per-namespace document links make cold materialization proportional to the
 selected namespace's history. Missing namespace metadata fails closed as file
 corruption. Cached namespace runtimes avoid allocations and storage
@@ -183,6 +198,12 @@ and `GET /admin/v1/maintenance/jobs/{job_id}` reports progress and results.
 With normal API authentication enabled, admin RBAC protects these routes.
 Otherwise they are disabled unless standalone is started with
 `--admin-token-env <ENV_NAME>`; callers then send that value as a Bearer token.
-The same routes exist for every engine and return `422` when unsupported. Lite
-also keeps `lite check`, `compact`, and `vacuum` for offline files. Backup and
-restore remain portable `/db/v1` operations rather than storage maintenance.
+The same routes exist for every engine and return `422` when unsupported. The
+status capability reports whether maintenance preserves request availability.
+Lite maintenance is currently coordinated but exclusive (`online: false`): the
+asynchronous job acquires the file maintenance gate and requests may wait until
+it completes. Vacuum retains live keys and source page references, streams one
+value at a time into a durable replacement file, and atomically renames it; it
+does not allocate a second database-sized output image. Lite also keeps `lite
+check`, `compact`, and `vacuum` for offline files. Backup and restore remain
+portable `/db/v1` operations rather than storage maintenance.

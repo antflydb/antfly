@@ -9,6 +9,7 @@
         "endpoint": "localhost:9000",
         "use_ssl": false,
         "addressing_style": "path",
+        "bucket_provisioning": "create_if_missing",
         "buckets": ["antfly-test"]
       }
     }

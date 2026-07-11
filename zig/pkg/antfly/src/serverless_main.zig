@@ -18,6 +18,40 @@ const antfly = @import("antfly-zig");
 const serverless = antfly.serverless;
 const serverless_default_max_request_bytes: usize = antfly.public_api.http_server.public_api_max_request_body_bytes;
 const serverless_default_max_connection_threads: u32 = 64;
+const serverless_default_query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024;
+const serverless_default_query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024;
+
+var termination_requested: std.atomic.Value(bool) = .init(false);
+
+fn terminationSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    termination_requested.store(true, .release);
+}
+
+const TerminationSignalScope = struct {
+    old_int: std.posix.Sigaction,
+    old_term: std.posix.Sigaction,
+
+    fn install() TerminationSignalScope {
+        termination_requested.store(false, .release);
+        const action = std.posix.Sigaction{
+            .handler = .{ .handler = terminationSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_int: std.posix.Sigaction = undefined;
+        var old_term: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.INT, &action, &old_int);
+        std.posix.sigaction(.TERM, &action, &old_term);
+        return .{ .old_int = old_int, .old_term = old_term };
+    }
+
+    fn deinit(self: *TerminationSignalScope) void {
+        std.posix.sigaction(.INT, &self.old_int, null);
+        std.posix.sigaction(.TERM, &self.old_term, null);
+        termination_requested.store(false, .release);
+        self.* = undefined;
+    }
+};
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -72,6 +106,8 @@ pub fn runFromIterator(
     forced_combined_mode: ?bool,
 ) !void {
     const alloc = init.gpa;
+    var termination_signals = TerminationSignalScope.install();
+    defer termination_signals.deinit();
     const cli = try parseCli(args);
     if (cli.help) {
         printUsage(argv0);
@@ -84,7 +120,7 @@ pub fn runFromIterator(
         null;
     defer if (secret_store) |*store| store.deinit();
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |path|
-        try antfly.common.config.loadFromPathWithSecrets(alloc, path, if (secret_store) |*store| store else null)
+        try antfly.common.config.loadFromPathWithSecretsForDeployment(alloc, path, if (secret_store) |*store| store else null, .serverless)
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
@@ -108,8 +144,8 @@ pub fn runFromIterator(
         .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, configured_uris.catalog, "ANTFLY_SERVERLESS_CATALOG_URI"),
         .s3_options = configured_uris.s3_options,
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
-        .query_cache_max_bytes = cli.query_cache_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", 0),
-        .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", 0),
+        .query_cache_max_bytes = cli.query_cache_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", serverless_default_query_cache_max_bytes),
+        .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", serverless_default_query_cache_payload_max_bytes),
         .embedding_indexes_json = cli.embedding_indexes_json orelse init.environ_map.get("ANTFLY_SERVERLESS_EMBEDDING_INDEXES_JSON"),
         .sparse_embedding_index_name = cli.sparse_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME") orelse "serverless_sparse",
         .chunk_embedding_index_name = cli.chunk_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_CHUNK_EMBEDDING_INDEX_NAME") orelse "serverless_chunk",
@@ -160,8 +196,10 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    while (true) {
-        sleepMs(init.io, 60_000);
+    while (!termination_requested.load(.acquire)) {
+        // A short interruptible wait bounds graceful termination latency even
+        // on platforms whose clock sleep is automatically restarted.
+        sleepMs(init.io, 250);
     }
 }
 
@@ -412,6 +450,7 @@ fn storageS3Options(
             .path => .path,
             .virtual_hosted => .virtual_hosted,
         },
+        .create_bucket = external.bucket_provisioning == .create_if_missing,
     };
 }
 
@@ -548,8 +587,8 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_CATALOG_URI
         \\  ANTFLY_SECRET_STORE_PATH
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_DIR
-        \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 0 (unbounded)
-        \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 0 (unbounded)
+        \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 4294967296
+        \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 67108864
         \\  ANTFLY_SERVERLESS_BIND_HOST      default: 127.0.0.1
         \\  ANTFLY_SERVERLESS_BIND_PORT      default: 8080
         \\  ANTFLY_SERVERLESS_HEALTH_PORT    default: unset (disables dedicated health server)
@@ -580,10 +619,14 @@ fn startupErrorHint(err: anyerror) ?[]const u8 {
         error.InvalidRemoteUri => "invalid storage URI; expected a non-empty path or bucket/prefix",
         error.InvalidTickInterval => "invalid tick interval; ANTFLY_SERVERLESS_TICK_INTERVAL_MS must be greater than zero",
         error.InvalidQueryCacheDir => "invalid query cache dir; ANTFLY_SERVERLESS_QUERY_CACHE_DIR must be non-empty when set",
+        error.InvalidQueryCacheBudget => "invalid query cache budget; ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES must be greater than zero when the cache is enabled",
+        error.InvalidQueryCachePayloadBudget => "invalid query cache payload budget; ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES must be greater than zero when the cache is enabled",
+        error.QueryCachePayloadExceedsBudget => "invalid query cache budgets; the per-payload limit cannot exceed the total cache limit",
         error.InvalidRuntimeRole => "invalid runtime role; expected combined, api, query, or maintenance",
         error.MissingEndpoint => "missing S3-compatible endpoint; configure the storage connection endpoint or AWS_ENDPOINT_URL",
         error.MissingAccessKeyId => "missing S3 access key; configure the storage connection secret or AWS_ACCESS_KEY_ID",
         error.MissingSecretAccessKey => "missing S3 secret key; configure the storage connection secret or AWS_SECRET_ACCESS_KEY",
+        error.BucketNotFound => "configured object-storage bucket does not exist; provision it or set bucket_provisioning=create_if_missing for development",
         error.MissingServiceAccount => "missing GCS auth; set GCS_BEARER_TOKEN, GOOGLE_OAUTH_ACCESS_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, or GOOGLE_APPLICATION_CREDENTIALS for gs:// backends",
         error.MissingProjectId => "missing GCS project id; set GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT, or use a service account that includes project_id",
         else => null,

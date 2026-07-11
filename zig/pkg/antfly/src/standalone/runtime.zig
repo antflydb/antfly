@@ -1133,10 +1133,11 @@ pub fn runFromIterator(
     }
 
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPathWithSecrets(
+        try antfly.common.config.loadFromPathWithSecretsForDeployment(
             alloc,
             config_path,
             if (secret_store_initialized) &secret_store else null,
+            .standalone,
         )
     else
         null;

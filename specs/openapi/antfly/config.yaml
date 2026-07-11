@@ -548,6 +548,13 @@ components:
           enum: [path, virtual_hosted]
           default: virtual_hosted
           description: S3 request addressing style.
+        bucket_provisioning:
+          type: string
+          enum: [require_existing, create_if_missing]
+          default: require_existing
+          description: >-
+            Whether runtime startup may create missing buckets. Production
+            connections should require infrastructure-provisioned buckets.
         buckets:
           type: array
           items:
@@ -555,7 +562,7 @@ components:
           description: Buckets this connection is configured for.
         prefix:
           type: string
-          description: Key prefix when configured.
+          description: Key-prefix boundary enforced for every use of this connection.
         hosts:
           type: array
           items:

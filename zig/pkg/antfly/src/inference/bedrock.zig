@@ -18,13 +18,13 @@ const single_input_batch_size: usize = 1;
 const imds_default_endpoint = "http://169.254.169.254";
 const ecs_credentials_endpoint = "http://169.254.170.2";
 
-const Credentials = struct {
+pub const Credentials = struct {
     access_key_id: []const u8,
     secret_access_key: []const u8,
     session_token: ?[]const u8 = null,
     expires_at_unix: ?u64 = null,
 
-    fn deinit(self: *Credentials, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Credentials, alloc: std.mem.Allocator) void {
         alloc.free(self.access_key_id);
         alloc.free(self.secret_access_key);
         if (self.session_token) |value| alloc.free(value);
@@ -69,7 +69,7 @@ pub const CredentialCache = struct {
         self.cached = null;
     }
 
-    fn get(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
+    pub fn get(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
         const now = currentUnixSeconds();
         self.lock();
         if (self.cached) |creds| {

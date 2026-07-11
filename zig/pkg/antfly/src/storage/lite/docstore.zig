@@ -40,6 +40,50 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
+const DocumentAllocation = struct {
+    allocator: Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    key: []u8,
+    value: []u8,
+
+    fn release(self: *DocumentAllocation) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        allocator.free(self.key);
+        allocator.free(self.value);
+        allocator.destroy(self);
+    }
+};
+
+const SharedDocument = struct {
+    allocation: *DocumentAllocation,
+    key: []const u8,
+    value: []const u8,
+
+    fn adopt(allocator: Allocator, doc: native.OwnedDocument) !SharedDocument {
+        const allocation = try allocator.create(DocumentAllocation);
+        allocation.* = .{ .allocator = allocator, .key = doc.key, .value = doc.value };
+        return .{ .allocation = allocation, .key = allocation.key, .value = allocation.value };
+    }
+
+    fn create(allocator: Allocator, key: []const u8, value: []const u8) !SharedDocument {
+        const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
+        const owned_value = try allocator.dupe(u8, value);
+        errdefer allocator.free(owned_value);
+        return try adopt(allocator, .{ .key = owned_key, .value = owned_value });
+    }
+
+    fn retain(self: SharedDocument) SharedDocument {
+        _ = self.allocation.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    fn release(self: SharedDocument) void {
+        self.allocation.release();
+    }
+};
+
 /// Immutable, refcounted materialized view of the document store at one
 /// checkpoint. The store caches the latest snapshot so transactions can share
 /// it instead of re-walking the document page chain per transaction; open
@@ -50,12 +94,12 @@ const SharedSnapshot = struct {
     refs: std.atomic.Value(usize),
     commit_sequence: u64,
     document_root_page: u64,
-    docs: []native.OwnedDocument,
+    docs: []SharedDocument,
     resource_reservation: ?resource_manager_mod.Reservation = null,
 
     fn create(
         allocator: Allocator,
-        docs: []native.OwnedDocument,
+        docs: []SharedDocument,
         commit_sequence: u64,
         document_root_page: u64,
         initial_refs: usize,
@@ -81,7 +125,8 @@ const SharedSnapshot = struct {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
             const allocator = self.allocator;
             if (self.resource_reservation) |*reservation| reservation.release();
-            native.NativeFile.freeSnapshotDocuments(allocator, self.docs);
+            for (self.docs) |doc| doc.release();
+            allocator.free(self.docs);
             allocator.destroy(self);
         }
     }
@@ -553,8 +598,8 @@ fn installCachedSnapshotLocked(store: *Store, prefix: []const u8, snapshot: *Sha
     try store.snapshot_caches.put(store.allocator, owned_prefix, snapshot);
 }
 
-fn snapshotByteCost(docs: []const native.OwnedDocument) u64 {
-    var total: u64 = @sizeOf(SharedSnapshot) + @as(u64, @intCast(docs.len)) * @as(u64, @sizeOf(native.OwnedDocument));
+fn snapshotByteCost(docs: []const SharedDocument) u64 {
+    var total: u64 = @sizeOf(SharedSnapshot) + @as(u64, @intCast(docs.len)) * @as(u64, @sizeOf(SharedDocument));
     for (docs) |doc| {
         total +|= @intCast(doc.key.len);
         total +|= @intCast(doc.value.len);
@@ -564,7 +609,7 @@ fn snapshotByteCost(docs: []const native.OwnedDocument) u64 {
 
 fn createCachedSnapshotLocked(
     store: *Store,
-    docs: []native.OwnedDocument,
+    docs: []SharedDocument,
     commit_sequence: u64,
     document_root_page: u64,
     initial_refs: usize,
@@ -579,11 +624,27 @@ fn createCachedSnapshotLocked(
 
 fn createUncachedSnapshot(
     store: *Store,
-    docs: []native.OwnedDocument,
+    docs: []SharedDocument,
     commit_sequence: u64,
     document_root_page: u64,
 ) !*SharedSnapshot {
     return try SharedSnapshot.create(store.allocator, docs, commit_sequence, document_root_page, 1, null);
+}
+
+fn sharedDocumentsFromOwned(allocator: Allocator, owned: []native.OwnedDocument) ![]SharedDocument {
+    const docs = try allocator.alloc(SharedDocument, owned.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (docs[0..initialized]) |doc| doc.release();
+        allocator.free(docs);
+    }
+    for (owned, 0..) |doc, i| {
+        docs[i] = try SharedDocument.adopt(allocator, doc);
+        initialized += 1;
+    }
+    // Ownership of every key/value moved into DocumentAllocation objects.
+    allocator.free(owned);
+    return docs;
 }
 
 /// Returns a retained snapshot for the store's active checkpoint, reusing the
@@ -604,10 +665,18 @@ fn acquireSnapshotLocked(store: *Store, prefix: []const u8) !*SharedSnapshot {
         return snap;
     }
 
-    const docs = try store.file.snapshotDocumentsWithPrefixAlloc(store.allocator, prefix);
-    errdefer native.NativeFile.freeSnapshotDocuments(store.allocator, docs);
+    var owned_docs = try store.file.snapshotDocumentsWithPrefixAlloc(store.allocator, prefix);
+    errdefer if (owned_docs.len > 0) native.NativeFile.freeSnapshotDocuments(store.allocator, owned_docs);
+    const docs = try sharedDocumentsFromOwned(store.allocator, owned_docs);
+    owned_docs = &.{};
+    var docs_owned = true;
+    errdefer if (docs_owned) {
+        for (docs) |doc| doc.release();
+        store.allocator.free(docs);
+    };
     // Two refs: one owned by the store cache, one handed to the caller.
     if (try createCachedSnapshotLocked(store, docs, checkpoint.commit_sequence, checkpoint.document_root_page, 2)) |snap| {
+        docs_owned = false;
         installCachedSnapshotLocked(store, prefix, snap) catch |err| {
             snap.release();
             snap.release();
@@ -615,7 +684,9 @@ fn acquireSnapshotLocked(store: *Store, prefix: []const u8) !*SharedSnapshot {
         };
         return snap;
     }
-    return try createUncachedSnapshot(store, docs, checkpoint.commit_sequence, checkpoint.document_root_page);
+    const snapshot = try createUncachedSnapshot(store, docs, checkpoint.commit_sequence, checkpoint.document_root_page);
+    docs_owned = false;
+    return snapshot;
 }
 
 /// After a successful `putDocumentBatch`, publish the committing
@@ -624,7 +695,7 @@ fn acquireSnapshotLocked(store: *Store, prefix: []const u8) !*SharedSnapshot {
 /// between the base snapshot and this commit because the committer held the
 /// writer slot throughout. Failure just drops the cache; the next transaction
 /// rebuilds from disk. Must be called with `store.mutex` held.
-fn publishAppliedSnapshotLocked(store: *Store, prefix: []const u8, base: []const native.OwnedDocument, pending: []const PendingMutation) void {
+fn publishAppliedSnapshotLocked(store: *Store, prefix: []const u8, base: []const SharedDocument, pending: []const PendingMutation) void {
     const checkpoint = store.file.activeCheckpoint();
     store.known_document_root_page = checkpoint.document_root_page;
     // Valid non-empty prefixes end in NUL and are therefore mutually
@@ -643,7 +714,8 @@ fn publishAppliedSnapshotLocked(store: *Store, prefix: []const u8, base: []const
         checkpoint.document_root_page,
         1,
     ) catch {
-        native.NativeFile.freeSnapshotDocuments(store.allocator, applied);
+        for (applied) |doc| doc.release();
+        store.allocator.free(applied);
         return;
     };
     if (maybe_snap) |snap| {
@@ -651,7 +723,8 @@ fn publishAppliedSnapshotLocked(store: *Store, prefix: []const u8, base: []const
             snap.release();
         };
     } else {
-        native.NativeFile.freeSnapshotDocuments(store.allocator, applied);
+        for (applied) |doc| doc.release();
+        store.allocator.free(applied);
     }
 }
 
@@ -662,56 +735,77 @@ fn publishAppliedSnapshotLocked(store: *Store, prefix: []const u8, base: []const
 /// `putDocumentBatch` appended the same mutations in order.
 fn buildAppliedSnapshotDocs(
     allocator: Allocator,
-    base: []const native.OwnedDocument,
+    base: []const SharedDocument,
     pending: []const PendingMutation,
-) ![]native.OwnedDocument {
+) ![]SharedDocument {
     var updates = std.StringHashMapUnmanaged(?[]const u8).empty;
     defer updates.deinit(allocator);
     for (pending) |mutation| {
         try updates.put(allocator, mutation.key, mutation.value);
     }
 
-    var docs = std.ArrayListUnmanaged(native.OwnedDocument).empty;
-    errdefer {
-        for (docs.items) |doc| {
-            allocator.free(doc.key);
-            allocator.free(doc.value);
+    const Update = struct { key: []const u8, value: ?[]const u8 };
+    const sorted_updates = try allocator.alloc(Update, updates.count());
+    defer allocator.free(sorted_updates);
+    var update_it = updates.iterator();
+    var update_count: usize = 0;
+    while (update_it.next()) |entry| : (update_count += 1) {
+        sorted_updates[update_count] = .{ .key = entry.key_ptr.*, .value = entry.value_ptr.* };
+    }
+    std.mem.sort(Update, sorted_updates, {}, struct {
+        fn lessThan(_: void, lhs: Update, rhs: Update) bool {
+            return std.mem.order(u8, lhs.key, rhs.key) == .lt;
         }
+    }.lessThan);
+
+    var docs = std.ArrayListUnmanaged(SharedDocument).empty;
+    errdefer {
+        for (docs.items) |doc| doc.release();
         docs.deinit(allocator);
     }
     try docs.ensureTotalCapacity(allocator, base.len + updates.count());
 
-    for (base) |doc| {
-        if (updates.contains(doc.key)) continue;
-        const key = try allocator.dupe(u8, doc.key);
-        errdefer allocator.free(key);
-        const value = try allocator.dupe(u8, doc.value);
-        docs.appendAssumeCapacity(.{ .key = key, .value = value });
-    }
-
-    var it = updates.iterator();
-    while (it.next()) |entry| {
-        const value_src = entry.value_ptr.* orelse continue;
-        const key = try allocator.dupe(u8, entry.key_ptr.*);
-        errdefer allocator.free(key);
-        const value = try allocator.dupe(u8, value_src);
-        docs.appendAssumeCapacity(.{ .key = key, .value = value });
-    }
-
-    const owned = try docs.toOwnedSlice(allocator);
-    std.mem.sort(native.OwnedDocument, owned, {}, struct {
-        fn lessThan(_: void, lhs: native.OwnedDocument, rhs: native.OwnedDocument) bool {
-            return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+    var base_index: usize = 0;
+    var update_index: usize = 0;
+    while (base_index < base.len or update_index < sorted_updates.len) {
+        if (base_index == base.len) {
+            const update = sorted_updates[update_index];
+            if (update.value) |value| docs.appendAssumeCapacity(try SharedDocument.create(allocator, update.key, value));
+            update_index += 1;
+            continue;
         }
-    }.lessThan);
-    return owned;
+        if (update_index == sorted_updates.len) {
+            docs.appendAssumeCapacity(base[base_index].retain());
+            base_index += 1;
+            continue;
+        }
+        const order = std.mem.order(u8, base[base_index].key, sorted_updates[update_index].key);
+        switch (order) {
+            .lt => {
+                docs.appendAssumeCapacity(base[base_index].retain());
+                base_index += 1;
+            },
+            .eq => {
+                const update = sorted_updates[update_index];
+                if (update.value) |value| docs.appendAssumeCapacity(try SharedDocument.create(allocator, update.key, value));
+                base_index += 1;
+                update_index += 1;
+            },
+            .gt => {
+                const update = sorted_updates[update_index];
+                if (update.value) |value| docs.appendAssumeCapacity(try SharedDocument.create(allocator, update.key, value));
+                update_index += 1;
+            },
+        }
+    }
+    return try docs.toOwnedSlice(allocator);
 }
 
 pub const Txn = struct {
     allocator: Allocator,
     store: ?*Store = null,
     snapshot: ?*SharedSnapshot = null,
-    docs: []native.OwnedDocument = &.{},
+    docs: []SharedDocument = &.{},
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
     read_only: bool = true,
     writer_reserved: bool = false,
@@ -989,7 +1083,7 @@ pub const Cursor = struct {
     }
 };
 
-fn lowerBoundDocs(docs: []const native.OwnedDocument, key: []const u8) usize {
+fn lowerBoundDocs(docs: []const SharedDocument, key: []const u8) usize {
     var low: usize = 0;
     var high: usize = docs.len;
     while (low < high) {
@@ -1532,6 +1626,37 @@ test "lite native docstore applied snapshot matches disk rebuild across mixed co
     try std.testing.expectError(error.NotFound, read.get("doc:c"));
     try std.testing.expectEqualStrings("d2-resurrected", try read.get("doc:d"));
     try std.testing.expectError(error.NotFound, read.get("doc:e"));
+}
+
+test "lite native docstore snapshots share unchanged document payloads across commits" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-shared-payloads.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    {
+        var batch = try store.beginWrite();
+        errdefer batch.abort();
+        try batch.put("doc:a", "a-value-that-must-not-be-copied");
+        try batch.put("doc:b", "b-v1");
+        try batch.commit();
+    }
+    const before = store.snapshot_caches.get("").?;
+    const a_index = lowerBoundDocs(before.docs, "doc:a");
+    const a_allocation = before.docs[a_index].allocation;
+    {
+        var batch = try store.beginWrite();
+        errdefer batch.abort();
+        try batch.put("doc:b", "b-v2");
+        try batch.commit();
+    }
+    const after = store.snapshot_caches.get("").?;
+    const after_a_index = lowerBoundDocs(after.docs, "doc:a");
+    try std.testing.expect(after.docs[after_a_index].allocation == a_allocation);
+    try std.testing.expectEqualStrings("a-value-that-must-not-be-copied", after.docs[after_a_index].value);
 }
 
 test "lite native docstore read transactions pin their snapshot across commits" {

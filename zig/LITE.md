@@ -66,13 +66,15 @@ The implementation now consists of:
   deltas. This makes the normal commit cost proportional to the namespaces
   touched by the transaction instead of every namespace in the database while
   bounding cold-open replay. The checkpoint links the directory delta and
-  document pages atomically, and snapshot publication makes the old delta chain
-  reclaimable. Missing directory or namespace-link metadata is treated as
-  corruption.
+  document pages atomically. Normal commits remain append-only; explicit vacuum
+  reclaims superseded pages without putting a reachability walk on the write
+  path. Missing directory or namespace-link metadata is treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Snapshot
-  caches are maintained per namespace: commits rebuild only the affected
-  table's live view while disjoint table caches remain hot.
+  caches are maintained per namespace: commits merge the affected table's
+  sorted mutations with its live view, retain unchanged payload allocations by
+  reference, and leave disjoint table caches hot. This avoids copying and
+  sorting all live document bytes for a small write.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
 - `storage/lite/backend.zig` caches one runtime per logical table/group and
@@ -153,13 +155,13 @@ configured production listener.
 
 The equivalent tagged configuration is:
 
-```yaml
-deployment_mode: standalone
-storage:
-  engine: lite
-  lite:
-    path: ./app.aflite
-    fsync: true
+```json
+{
+  "storage": {
+    "engine": "lite",
+    "lite": { "path": "./app.aflite", "fsync": true }
+  }
+}
 ```
 
 Storage configuration is a tagged union: `engine` is required and exactly the
@@ -177,7 +179,7 @@ Portable backup and restore remain normal `/db/v1` operations. A physical
 `.aflite` copy is a stable snapshot, not the portable archival contract; `.afb`
 remains the cross-engine backup format.
 
-Online maintenance is an authenticated, storage-neutral admin surface:
+Coordinated maintenance is an authenticated, storage-neutral admin surface:
 
 ```text
 POST /admin/v1/maintenance/check
@@ -195,9 +197,17 @@ POST requests return `202` and a job document. `Idempotency-Key` safely returns
 the original job on retries. Only one maintenance job runs at a time; a
 conflicting request returns `409`, and an engine that does not support an
 operation returns `422`. Completed jobs are retained in a bounded in-memory
-history. Checkpoint inspection, index writes, document commits, compaction, and
-vacuum share the Lite store mutex and single-writer reservation, so the online
-operations cannot race checkpoint publication or file replacement.
+history. Lite reports `online: false`: check, compaction, and vacuum acquire the
+exclusive maintenance gate, so requests may wait while a job runs. This honest
+availability contract avoids calling a stop-the-world file rewrite "online".
+Checkpoint inspection, index writes, document commits, compaction, and vacuum
+share the Lite store mutex and single-writer reservation, so maintenance cannot
+race checkpoint publication or file replacement. Vacuum keeps only live keys
+and source page references in its working set, reads one live value at a time,
+and streams compact pages to the replacement file. It therefore avoids a
+second whole-database value snapshot and a whole-file output image in memory;
+the replacement is fsynced and atomically renamed before the parent directory
+is fsynced.
 
 The standalone listener holds an advisory lease for its host/port while using
 restart-safe address reuse. Cross-thread shutdown only publishes an atomic stop

@@ -26,6 +26,7 @@ pub const S3Options = struct {
     session_token: ?[]const u8 = null,
     use_ssl: bool = true,
     addressing_style: object_storage.S3.AddressingStyle = .path,
+    create_bucket: bool = false,
 };
 
 pub fn s3ConfigAlloc(alloc: Allocator, options: ?S3Options) !object_storage.S3.Config {

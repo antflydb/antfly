@@ -32,6 +32,7 @@ const enrichment_mod = @import("../enrichment/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
+const bedrock = @import("../../inference/bedrock.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("../object_store_support.zig");
@@ -46,8 +47,8 @@ pub const BootstrapConfig = struct {
     catalog_uri: []const u8,
     s3_options: [5]?S3Options = .{ null, null, null, null, null },
     query_cache_dir: ?[]const u8 = null,
-    query_cache_max_bytes: u64 = 0,
-    query_cache_payload_max_bytes: u64 = 0,
+    query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024,
+    query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024,
     embedding_indexes_json: ?[]const u8 = null,
     sparse_embedding_index_name: []const u8 = search_sources.default_sparse_embedding_index_name,
     chunk_embedding_index_name: []const u8 = search_sources.default_chunk_embedding_index_name,
@@ -66,10 +67,52 @@ pub const BootstrapConfig = struct {
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
 
 const S3ClientPool = struct {
+    const AwsCredentialContext = struct {
+        alloc: Allocator,
+        io_impl: std.Io.Threaded,
+        http: @import("httpx").Client,
+        cache: bedrock.CredentialCache = .{},
+        region: []u8,
+
+        fn init(alloc: Allocator, region: []const u8) !AwsCredentialContext {
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            errdefer io_impl.deinit();
+            return .{
+                .alloc = alloc,
+                .io_impl = io_impl,
+                .http = @import("httpx").Client.init(alloc, io_impl.io()),
+                .region = try alloc.dupe(u8, region),
+            };
+        }
+
+        fn deinit(self: *AwsCredentialContext) void {
+            self.cache.deinit(self.alloc);
+            self.http.deinit();
+            self.io_impl.deinit();
+            self.alloc.free(self.region);
+            self.* = undefined;
+        }
+
+        fn provider(self: *AwsCredentialContext) objectstore.S3.CredentialProvider {
+            return .{ .ptr = self, .get_fn = get };
+        }
+
+        fn get(ptr: *anyopaque, alloc: Allocator) anyerror!objectstore.S3.DynamicCredentials {
+            const self: *AwsCredentialContext = @ptrCast(@alignCast(ptr));
+            const credentials = try self.cache.get(alloc, &self.http, self.region);
+            return .{
+                .access_key_id = @constCast(credentials.access_key_id),
+                .secret_access_key = @constCast(credentials.secret_access_key),
+                .session_token = if (credentials.session_token) |value| @constCast(value) else null,
+            };
+        }
+    };
+
     const Entry = struct {
         options: object_store_support.S3Options,
         impl: *objectstore.S3.Client,
         client: objectstore.Client,
+        credential_context: ?*AwsCredentialContext = null,
     };
 
     alloc: Allocator,
@@ -82,6 +125,10 @@ const S3ClientPool = struct {
     fn deinit(self: *S3ClientPool) void {
         for (self.entries.items) |*entry| {
             entry.client.deinit();
+            if (entry.credential_context) |context| {
+                context.deinit();
+                self.alloc.destroy(context);
+            }
             self.alloc.destroy(entry.impl);
         }
         self.entries.deinit(self.alloc);
@@ -93,16 +140,39 @@ const S3ClientPool = struct {
         for (self.entries.items) |entry| {
             if (s3OptionsEql(entry.options, options)) return entry.client;
         }
+        const dynamic_credentials = options.access_key_id == null and options.secret_access_key == null;
+        if ((options.access_key_id == null) != (options.secret_access_key == null)) return error.IncompleteStaticCredentials;
+        var config_options = options;
+        if (dynamic_credentials) {
+            config_options.access_key_id = "dynamic-provider";
+            config_options.secret_access_key = "dynamic-provider";
+        }
+        var config = try object_store_support.s3ConfigAlloc(self.alloc, config_options);
+        var config_owned = true;
+        errdefer if (config_owned) config.deinit(self.alloc);
+        var credential_context: ?*AwsCredentialContext = null;
+        errdefer if (credential_context) |context| {
+            context.deinit();
+            self.alloc.destroy(context);
+        };
+        if (dynamic_credentials) {
+            const context = try self.alloc.create(AwsCredentialContext);
+            errdefer self.alloc.destroy(context);
+            context.* = try AwsCredentialContext.init(self.alloc, config.credentials.region);
+            credential_context = context;
+            config.credential_provider = context.provider();
+        }
         const impl = try self.alloc.create(objectstore.S3.Client);
         errdefer self.alloc.destroy(impl);
-        const config = try object_store_support.s3ConfigAlloc(self.alloc, options);
         impl.* = try objectstore.S3.Client.init(self.alloc, config);
+        config_owned = false;
         errdefer {
             var client = impl.client();
             client.deinit();
         }
         const client = impl.client();
-        try self.entries.append(self.alloc, .{ .options = options, .impl = impl, .client = client });
+        try self.entries.append(self.alloc, .{ .options = options, .impl = impl, .client = client, .credential_context = credential_context });
+        credential_context = null;
         return client;
     }
 };
@@ -119,6 +189,17 @@ fn s3OptionsEql(a: object_store_support.S3Options, b: object_store_support.S3Opt
 fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn ensureConfiguredBucket(client: objectstore.Client, bucket: []const u8, create_if_missing: bool) !void {
+    var bucket_client = client;
+    if (try bucket_client.bucketExists(bucket)) return;
+    if (!create_if_missing) return error.BucketNotFound;
+    try bucket_client.makeBucket(bucket);
+}
+
+fn shouldCreateBucket(options: ?object_store_support.S3Options) bool {
+    return if (options) |value| value.create_bucket else false;
 }
 
 const OwnedS3Target = struct {
@@ -187,46 +268,51 @@ pub const OwnedStack = struct {
         self.owned_foreign_registry = null;
         var artifacts_target = try s3TargetAlloc(alloc, cfg.artifacts_uri);
         defer if (artifacts_target) |*target| target.deinit(alloc);
-        self.artifacts_impl = if (artifacts_target) |target|
-            try artifacts_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[0]), target.bucket, target.prefix)
-        else
-            try artifacts_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.artifacts_uri, cfg.s3_options[0]);
+        self.artifacts_impl = if (artifacts_target) |target| blk: {
+            const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[0]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[0]));
+            break :blk try artifacts_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else try artifacts_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.artifacts_uri, cfg.s3_options[0]);
         self.artifacts = self.artifacts_impl.artifactStore();
         errdefer self.artifacts.deinit();
 
         var manifests_target = try s3TargetAlloc(alloc, cfg.manifests_uri);
         defer if (manifests_target) |*target| target.deinit(alloc);
-        self.manifests_impl = if (manifests_target) |target|
-            try manifest_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[1]), target.bucket, target.prefix)
-        else
-            try manifest_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.manifests_uri, cfg.s3_options[1]);
+        self.manifests_impl = if (manifests_target) |target| blk: {
+            const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[1]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[1]));
+            break :blk try manifest_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else try manifest_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.manifests_uri, cfg.s3_options[1]);
         self.manifests = self.manifests_impl.manifestStore();
         errdefer self.manifests.deinit();
 
         var wal_target = try s3TargetAlloc(alloc, cfg.wal_uri);
         defer if (wal_target) |*target| target.deinit(alloc);
-        self.wal_impl = if (wal_target) |target|
-            try wal_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[2]), target.bucket, target.prefix)
-        else
-            try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
+        self.wal_impl = if (wal_target) |target| blk: {
+            const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[2]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[2]));
+            break :blk try wal_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
         self.wal = self.wal_impl.walStore();
         errdefer self.wal.deinit();
 
         var progress_target = try s3TargetAlloc(alloc, cfg.progress_uri);
         defer if (progress_target) |*target| target.deinit(alloc);
-        self.progress_impl = if (progress_target) |target|
-            try progress_object_store.ObjectProgressStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[3]), target.bucket, target.prefix)
-        else
-            try progress_object_store.ObjectProgressStore.initRemoteUriWithS3Options(alloc, cfg.progress_uri, cfg.s3_options[3]);
+        self.progress_impl = if (progress_target) |target| blk: {
+            const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[3]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[3]));
+            break :blk try progress_object_store.ObjectProgressStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else try progress_object_store.ObjectProgressStore.initRemoteUriWithS3Options(alloc, cfg.progress_uri, cfg.s3_options[3]);
         self.progress = self.progress_impl.progressStore();
         errdefer self.progress.deinit();
 
         var catalog_target = try s3TargetAlloc(alloc, cfg.catalog_uri);
         defer if (catalog_target) |*target| target.deinit(alloc);
-        self.catalog_impl = if (catalog_target) |target|
-            try catalog_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[4]), target.bucket, target.prefix)
-        else
-            try catalog_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.catalog_uri, cfg.s3_options[4]);
+        self.catalog_impl = if (catalog_target) |target| blk: {
+            const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[4]);
+            try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[4]));
+            break :blk try catalog_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
+        } else try catalog_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.catalog_uri, cfg.s3_options[4]);
         self.catalog_store = self.catalog_impl.catalogStore();
         errdefer self.catalog_store.deinit();
 
@@ -333,6 +419,9 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.query_cache_dir) |path| {
         if (std.mem.trim(u8, path, &std.ascii.whitespace).len == 0) return error.InvalidQueryCacheDir;
+        if (cfg.query_cache_max_bytes == 0) return error.InvalidQueryCacheBudget;
+        if (cfg.query_cache_payload_max_bytes == 0) return error.InvalidQueryCachePayloadBudget;
+        if (cfg.query_cache_payload_max_bytes > cfg.query_cache_max_bytes) return error.QueryCachePayloadExceedsBudget;
     }
 
     var requires_gcs = false;
@@ -910,6 +999,44 @@ test "runtime bootstrap validation rejects zero tick interval" {
         .catalog_uri = "file:///tmp/antfly-catalog",
         .tick_interval_ms = 0,
     }));
+}
+
+test "runtime bootstrap requires bounded query cache budgets" {
+    const alloc = std.testing.allocator;
+    const base = BootstrapConfig{
+        .artifacts_uri = "file:///tmp/antfly-artifacts",
+        .manifests_uri = "file:///tmp/antfly-manifests",
+        .wal_uri = "file:///tmp/antfly-wal",
+        .progress_uri = "file:///tmp/antfly-progress",
+        .catalog_uri = "file:///tmp/antfly-catalog",
+        .query_cache_dir = "/tmp/antfly-query-cache",
+        .query_cache_max_bytes = 1024,
+        .query_cache_payload_max_bytes = 128,
+    };
+    try validateConfig(alloc, base);
+
+    var invalid = base;
+    invalid.query_cache_max_bytes = 0;
+    try std.testing.expectError(error.InvalidQueryCacheBudget, validateConfig(alloc, invalid));
+    invalid = base;
+    invalid.query_cache_payload_max_bytes = 0;
+    try std.testing.expectError(error.InvalidQueryCachePayloadBudget, validateConfig(alloc, invalid));
+    invalid = base;
+    invalid.query_cache_payload_max_bytes = 2048;
+    try std.testing.expectError(error.QueryCachePayloadExceedsBudget, validateConfig(alloc, invalid));
+}
+
+test "runtime bootstrap bucket provisioning fails closed" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    const client = memory.client();
+
+    try std.testing.expectError(error.BucketNotFound, ensureConfiguredBucket(client, "production", false));
+    try ensureConfiguredBucket(client, "development", true);
+    var check_client = client;
+    try std.testing.expect(try check_client.bucketExists("development"));
+    try std.testing.expect(!(try check_client.bucketExists("production")));
 }
 
 test "runtime status describes configured backends" {

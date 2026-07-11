@@ -138,9 +138,11 @@ pub const ExternalIoConnectionConfig = struct {
     region: ?[]const u8 = null,
     /// S3 request addressing style.
     addressing_style: ?[]const u8 = null,
+    /// Whether runtime startup may create missing buckets. Production connections should require infrastructure-provisioned buckets.
+    bucket_provisioning: ?[]const u8 = null,
     /// Buckets this connection is configured for.
     buckets: ?[]const []const u8 = null,
-    /// Key prefix when configured.
+    /// Key-prefix boundary enforced for every use of this connection.
     prefix: ?[]const u8 = null,
     /// Hosts or base URLs this connection applies to.
     hosts: ?[]const []const u8 = null,

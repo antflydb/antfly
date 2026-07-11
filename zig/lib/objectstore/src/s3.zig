@@ -31,6 +31,7 @@ pub const S3Path = s3_compat.S3Path;
 pub const Config = struct {
     credentials: Credentials,
     addressing_style: AddressingStyle = .virtual_hosted,
+    credential_provider: ?CredentialProvider = null,
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         self.credentials.deinit(alloc);
@@ -47,6 +48,28 @@ pub const Config = struct {
             .scheme = if (self.credentials.use_ssl) .https else .http,
             .addressing_style = self.addressing_style,
         };
+    }
+};
+
+pub const DynamicCredentials = struct {
+    access_key_id: []u8,
+    secret_access_key: []u8,
+    session_token: ?[]u8 = null,
+
+    pub fn deinit(self: *DynamicCredentials, alloc: Allocator) void {
+        alloc.free(self.access_key_id);
+        alloc.free(self.secret_access_key);
+        if (self.session_token) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const CredentialProvider = struct {
+    ptr: *anyopaque,
+    get_fn: *const fn (*anyopaque, Allocator) anyerror!DynamicCredentials,
+
+    pub fn get(self: CredentialProvider, alloc: Allocator) !DynamicCredentials {
+        return try self.get_fn(self.ptr, alloc);
     }
 };
 
@@ -411,6 +434,14 @@ pub const Client = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
     ) !TransportResponse {
+        var dynamic_credentials = if (self.cfg.credential_provider) |provider| try provider.get(self.alloc) else null;
+        defer if (dynamic_credentials) |*credentials| credentials.deinit(self.alloc);
+        var signing_config = self.cfg;
+        if (dynamic_credentials) |credentials| {
+            signing_config.credentials.access_key_id = credentials.access_key_id;
+            signing_config.credentials.secret_access_key = credentials.secret_access_key;
+            signing_config.credentials.session_token = credentials.session_token;
+        }
         const timestamp = currentUnixSeconds();
         const payload_hash = try sha256HexAlloc(self.alloc, body orelse "");
         defer self.alloc.free(payload_hash);
@@ -422,7 +453,7 @@ pub const Client = struct {
 
         const signed = try signHeadersAlloc(
             self.alloc,
-            self.cfg,
+            signing_config,
             method,
             target.host,
             target.canonical_uri,
@@ -1385,6 +1416,74 @@ test "s3 client signs and issues object operations through request fn" {
 
     try client.deleteObject("bucket", "docs/a.txt", .{});
     try std.testing.expectEqual(steps.len, fake.index);
+}
+
+test "s3 client refreshes dynamic credentials for every signed request" {
+    const alloc = std.testing.allocator;
+
+    const Provider = struct {
+        calls: usize = 0,
+
+        fn get(ptr: *anyopaque, request_alloc: Allocator) !DynamicCredentials {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const access_key = try std.fmt.allocPrint(request_alloc, "rotating-key-{d}", .{self.calls});
+            errdefer request_alloc.free(access_key);
+            return .{
+                .access_key_id = access_key,
+                .secret_access_key = try request_alloc.dupe(u8, "rotating-secret"),
+                .session_token = try request_alloc.dupe(u8, "rotating-session"),
+            };
+        }
+    };
+    const Fake = struct {
+        requests: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            _: HttpMethod,
+            _: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.requests += 1;
+            const expected = try std.fmt.allocPrint(request_alloc, "Credential=rotating-key-{d}/", .{self.requests});
+            defer request_alloc.free(expected);
+            var found = false;
+            for (headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header[0], "Authorization") and std.mem.indexOf(u8, header[1], expected) != null) {
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+            return .{ .status = 200, .body = try request_alloc.alloc(u8, 0) };
+        }
+    };
+
+    var provider = Provider{};
+    var fake = Fake{};
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.us-west-2.amazonaws.com"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "placeholder"),
+            .secret_access_key = try alloc.dupe(u8, "placeholder"),
+            .region = try alloc.dupe(u8, "us-west-2"),
+        },
+        .credential_provider = .{ .ptr = &provider, .get_fn = Provider.get },
+    };
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &fake, Fake.request);
+    var client = s3_client.client();
+    defer client.deinit();
+
+    try std.testing.expect(try client.bucketExists("bucket"));
+    try std.testing.expect(try client.bucketExists("bucket"));
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.requests);
 }
 
 test "s3 client round-trips against env-configured endpoint" {

@@ -239,6 +239,7 @@ pub const Config = struct {
     };
 
     pub const S3AddressingStyle = enum { path, virtual_hosted };
+    pub const BucketProvisioning = enum { require_existing, create_if_missing };
 
     pub const ConnectionConfig = struct {
         display_name: ?[]u8 = null,
@@ -328,6 +329,7 @@ pub const Config = struct {
         endpoint: ?[]u8 = null,
         region: ?[]u8 = null,
         addressing_style: S3AddressingStyle = .virtual_hosted,
+        bucket_provisioning: BucketProvisioning = .require_existing,
         buckets: []const []u8 = &.{},
         prefix: ?[]u8 = null,
         hosts: []const []u8 = &.{},
@@ -398,6 +400,15 @@ pub const Config = struct {
         raw: []const u8,
         secret_store: ?*secrets.FileStore,
     ) !Config {
+        return try parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, null);
+    }
+
+    pub fn parseFromSliceWithSecretsForDeployment(
+        alloc: std.mem.Allocator,
+        raw: []const u8,
+        secret_store: ?*secrets.FileStore,
+        expected_deployment: ?DeploymentMode,
+    ) !Config {
         var raw_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
             .allocate = .alloc_always,
         });
@@ -428,7 +439,7 @@ pub const Config = struct {
         });
         defer validated.deinit();
 
-        const deployment_mode = try deploymentModeFromObject(root);
+        const deployment_mode = try deploymentModeFromObject(root, expected_deployment);
         try validateStorageFromOpenApi(deployment_mode, root, validated.value.storage);
         var storage_config = try storageFromOpenApi(alloc, validated.value.storage, root.get("storage"));
         errdefer storage_config.deinit(alloc);
@@ -669,6 +680,19 @@ pub fn loadFromPathWithSecrets(
     return try Config.parseFromSliceWithSecrets(alloc, raw, secret_store);
 }
 
+pub fn loadFromPathWithSecretsForDeployment(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    secret_store: ?*secrets.FileStore,
+    deployment_mode: DeploymentMode,
+) !Config {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(raw);
+    return try Config.parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, deployment_mode);
+}
+
 pub fn resolveLocalRoleBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config, role: []const u8) ![]u8 {
     const base = try resolveLocalBaseDir(alloc, cfg);
     defer alloc.free(base);
@@ -788,15 +812,19 @@ fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
     };
 }
 
-fn deploymentModeFromObject(root: std.json.ObjectMap) !DeploymentMode {
+fn deploymentModeFromObject(root: std.json.ObjectMap, expected: ?DeploymentMode) !DeploymentMode {
     if (root.get("deployment_mode")) |value| {
         if (value != .string) return error.InvalidConfig;
         inline for (std.meta.fields(DeploymentMode)) |field| {
-            if (std.mem.eql(u8, value.string, field.name)) return @enumFromInt(field.value);
+            if (std.mem.eql(u8, value.string, field.name)) {
+                const configured: DeploymentMode = @enumFromInt(field.value);
+                if (expected) |required| if (configured != required) return error.DeploymentModeMismatch;
+                return configured;
+            }
         }
         return error.InvalidConfig;
     }
-    return .distributed;
+    return expected orelse .distributed;
 }
 
 fn optionalU32Field(root: std.json.ObjectMap, field_name: []const u8) !?u32 {
@@ -885,6 +913,46 @@ test "common config resolves capability-scoped object storage connections and la
         \\  "deployment_mode": "serverless",
         \\  "connections": { "data": { "kind": "external_io", "capabilities": ["remote.read"], "external_io": { "protocol": "s3" } } },
         \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket" } }
+        \\}
+    ));
+}
+
+test "common config command deployment context supplies topology and rejects conflicting assertions" {
+    var cfg = try Config.parseFromSliceWithSecretsForDeployment(std.testing.allocator,
+        \\{
+        \\  "storage": { "engine": "lite", "lite": { "path": "data.aflite" } }
+        \\}
+    , null, .standalone);
+    defer cfg.deinit();
+    try std.testing.expectEqual(DeploymentMode.standalone, cfg.deployment_mode);
+    try std.testing.expectError(error.DeploymentModeMismatch, Config.parseFromSliceWithSecretsForDeployment(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "distributed",
+        \\  "storage": { "engine": "local", "local": {} }
+        \\}
+    , null, .standalone));
+}
+
+test "common config object storage connections enforce key prefix boundaries" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": {
+        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "buckets": ["data-bucket"], "prefix": "tenant-a", "bucket_provisioning": "require_existing" } }
+        \\  },
+        \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket", "prefix": "tenant-a" } }
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(Config.BucketProvisioning.require_existing, cfg.connections.get("data").?.external_io.?.bucket_provisioning);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": {
+        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "buckets": ["data-bucket"], "prefix": "tenant-a" } }
+        \\  },
+        \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket", "prefix": "tenant-b" } }
         \\}
     ));
 }
@@ -1139,18 +1207,23 @@ fn validateStorageConnections(
     if (storage.engine != .object) return;
     const default_connection = storage.object_connection orelse return error.InvalidConfig;
     const default_bucket = storage.object_bucket orelse return error.InvalidConfig;
-    try validateStorageConnection(connections, default_connection, default_bucket);
-    for ([_]Config.ObjectStorageLocation{
+    const default_prefix = storage.object_prefix orelse "";
+    const lanes = [_]Config.ObjectStorageLocation{
         storage.object_lanes.artifacts,
         storage.object_lanes.manifests,
         storage.object_lanes.wal,
         storage.object_lanes.progress,
         storage.object_lanes.catalog,
-    }) |lane| {
+    };
+    const lane_names = [_][]const u8{ "artifacts", "manifests", "wal", "progress", "catalog" };
+    for (lanes, lane_names) |lane, lane_name| {
         try validateStorageConnection(
             connections,
             lane.connection orelse default_connection,
             lane.bucket orelse default_bucket,
+            lane.prefix,
+            default_prefix,
+            lane_name,
         );
     }
 }
@@ -1159,6 +1232,9 @@ fn validateStorageConnection(
     connections: *const Config.ConnectionsConfig,
     connection_id: []const u8,
     bucket: []const u8,
+    explicit_prefix: ?[]const u8,
+    default_prefix: []const u8,
+    lane_name: []const u8,
 ) !void {
     const connection = connections.get(connection_id) orelse return error.InvalidConfig;
     if (connection.kind != .external_io) return error.InvalidConfig;
@@ -1182,6 +1258,33 @@ fn validateStorageConnection(
         }
         if (!authorized) return error.InvalidConfig;
     }
+    if (external.prefix) |scope| {
+        const normalized_scope = std.mem.trim(u8, scope, "/");
+        if (normalized_scope.len > 0) {
+            if (explicit_prefix) |target| {
+                if (!prefixContains(normalized_scope, std.mem.trim(u8, target, "/"))) return error.InvalidConfig;
+            } else {
+                const normalized_default = std.mem.trim(u8, default_prefix, "/");
+                if (normalized_default.len > 0) {
+                    if (!derivedPrefixWithin(normalized_scope, normalized_default, lane_name)) return error.InvalidConfig;
+                } else if (!prefixContains(normalized_scope, lane_name)) {
+                    return error.InvalidConfig;
+                }
+            }
+        }
+    }
+}
+
+fn derivedPrefixWithin(scope: []const u8, base: []const u8, lane: []const u8) bool {
+    if (prefixContains(scope, base)) return true;
+    if (!std.mem.startsWith(u8, scope, base) or scope.len <= base.len or scope[base.len] != '/') return false;
+    return prefixContains(scope[base.len + 1 ..], lane);
+}
+
+fn prefixContains(scope: []const u8, target: []const u8) bool {
+    if (scope.len == 0) return true;
+    if (!std.mem.startsWith(u8, target, scope)) return false;
+    return target.len == scope.len or (target.len > scope.len and target[scope.len] == '/');
 }
 
 fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.ConnectionConfig {
@@ -1252,6 +1355,7 @@ fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Val
         .endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint"),
         .region = try optionalStringFieldDup(alloc, value.object, "region"),
         .addressing_style = try optionalEnumField(Config.S3AddressingStyle, value.object, "addressing_style") orelse .virtual_hosted,
+        .bucket_provisioning = try optionalEnumField(Config.BucketProvisioning, value.object, "bucket_provisioning") orelse .require_existing,
         .buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{},
         .prefix = try optionalStringFieldDup(alloc, value.object, "prefix"),
         .hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{},
