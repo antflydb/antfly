@@ -213,8 +213,8 @@ Example configs live in `configs/`:
 |------|-------------|
 | `config-no-tls.yaml` | Local development without TLS |
 | `config-tls.yaml` | TLS-enabled configuration |
-| `config-s3-example.yaml` | S3 storage backend |
-| `config-s3-minio-local.yaml` | Local MinIO for S3 testing |
+| `config-s3-example.json` | Serverless S3 storage with named connections and multi-bucket lanes |
+| `config-s3-minio-local.json` | Serverless object storage on local MinIO |
 | `config-secrets-example.yaml` | Secrets / keystore usage |
 
 ## Releasing

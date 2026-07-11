@@ -273,6 +273,10 @@ pub const ApiHttpServerConfig = struct {
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
+    /// Dedicated bearer token for /admin/v1 operations when public API
+    /// authentication is disabled. Admin routes fail closed when neither this
+    /// token nor normal authenticated admin identity is available.
+    admin_bearer_token: ?[]const u8 = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -2184,6 +2188,15 @@ pub const ApiHttpServer = struct {
 
     fn dispatchStorageMaintenanceRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
         if (!isStorageMaintenancePath(uri_parts.path)) return null;
+        if (!self.requiresAuthentication(uri_parts.path)) {
+            const expected = self.cfg.admin_bearer_token orelse return try textResponse(self.alloc, 403, "admin API disabled without authentication");
+            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
+            if (!std.mem.startsWith(u8, authorization, "Bearer ") or
+                !constantTimeEql(expected, authorization["Bearer ".len..]))
+            {
+                return try unauthorizedResponse(self.alloc);
+            }
+        }
         const coordinator = self.cfg.storage_maintenance orelse return try textResponse(self.alloc, 422, "storage maintenance unsupported");
         if (std.mem.startsWith(u8, uri_parts.path, admin_routes.maintenance_jobs_prefix)) {
             if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
@@ -12386,7 +12399,10 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
     var maintenance_source = FakeMaintenance{};
     var coordinator = maintenance_mod.Coordinator.init(std.testing.allocator, maintenance_source.source());
     defer coordinator.deinit();
-    var server = ApiHttpServer.init(std.testing.allocator, .{ .storage_maintenance = &coordinator }, status_source.iface(), null, null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .storage_maintenance = &coordinator,
+        .admin_bearer_token = "maintenance-secret",
+    }, status_source.iface(), null, null);
     defer server.deinit();
 
     var status_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
@@ -12396,18 +12412,36 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"vacuum\":true") != null);
 
     const headers = [_]http_common.RequestHeader{.{ .name = "Idempotency-Key", .value = "check-1" }};
-    var start_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
+    var unauthorized_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
+    defer unauthorized_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_resp.status);
+
+    var start_resp = try server.handle(.{
+        .method = .POST,
+        .uri = admin_routes.maintenance_check,
+        .headers = &headers,
+        .authorization = "Bearer maintenance-secret",
+    });
     defer start_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), start_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, start_resp.body, "\"operation\":\"check\"") != null);
 
-    var replay_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
+    var replay_resp = try server.handle(.{
+        .method = .POST,
+        .uri = admin_routes.maintenance_check,
+        .headers = &headers,
+        .authorization = "Bearer maintenance-secret",
+    });
     defer replay_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), replay_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, replay_resp.body, "\"job_id\":1") != null);
 
     while (coordinator.get(1).?.state != .succeeded) std.Thread.yield() catch {};
-    var get_resp = try server.handle(.{ .method = .GET, .uri = admin_routes.maintenance_jobs_prefix ++ "1" });
+    var get_resp = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.maintenance_jobs_prefix ++ "1",
+        .authorization = "Bearer maintenance-secret",
+    });
     defer get_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), get_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "\"valid\":true") != null);

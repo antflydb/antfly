@@ -57,25 +57,56 @@ storage:
   engine: local
   local:
     base_dir: ~/.antfly
-    data: local
-    metadata: local
 ```
 
-Local-engine backend selection and any S3 connection used by that engine are
-nested under `storage.local`. Removed top-level fields such as `storage.data`,
-`storage.metadata`, and `storage.s3` are invalid; configuration loaders fail
-closed instead of interpreting multiple shapes.
+The local engine is entirely directory-backed. Object storage is a distinct
+engine rather than a per-subsystem override; mixed local/S3 configurations are
+rejected so data placement cannot silently diverge from the selected engine.
 
 ```yaml
 # Object-backed serverless deployment
 deployment_mode: serverless
+connections:
+  primary-storage:
+    kind: external_io
+    capabilities: [storage.primary]
+    external_io:
+      protocol: s3
+      endpoint: s3.amazonaws.com
+      region: us-west-2
+      buckets: [antfly-data, antfly-wal]
+      access_key_id: ${secret:storage.access_key_id}
+      secret_access_key: ${secret:storage.secret_access_key}
 storage:
   engine: object
   object:
-    provider: s3
+    connection: primary-storage
     bucket: antfly-data
     prefix: production/
+    lanes:
+      wal:
+        bucket: antfly-wal
+        prefix: production/
 ```
+
+Serverless derives its `artifacts`, `manifests`, `wal`, `progress`, and
+`catalog` object prefixes from this root. Each lane may override the connection,
+bucket, or prefix, which supports separate durability classes, accounts, and
+least-privilege credentials. Referenced connections must be S3 `external_io`
+connections with the `storage.primary` capability, and any configured bucket
+allowlist is enforced at startup. Explicit serverless URI flags or environment
+variables remain low-level location overrides. Lanes that resolve to the same
+connection share one object-store client and HTTP connection pool; distinct
+credential profiles remain isolated.
+
+Primary storage credentials are deliberately independent from
+`remote_content.s3`. The former grants Antfly write authority over database
+state; the latter grants read authority over user-provided content and may
+contain several named credentials selected by bucket. Credential values should
+come from secret references (or standard AWS environment variables for one
+default profile), never committed plaintext.
+The Zig config loader accepts JSON; pass `--secret-store-path` (or
+`ANTFLY_SECRET_STORE_PATH`) when those JSON values use `${secret:...}`.
 
 The canonical and convenience forms are equivalent:
 
@@ -149,6 +180,9 @@ file after restart rather than depending on a directory sidecar.
 Storage maintenance uses the engine-neutral authenticated admin surface:
 `POST /admin/v1/maintenance/{check,compact,vacuum}` returns an asynchronous job,
 and `GET /admin/v1/maintenance/jobs/{job_id}` reports progress and results.
+With normal API authentication enabled, admin RBAC protects these routes.
+Otherwise they are disabled unless standalone is started with
+`--admin-token-env <ENV_NAME>`; callers then send that value as a Bearer token.
 The same routes exist for every engine and return `422` when unsupported. Lite
 also keeps `lite check`, `compact`, and `vacuum` for offline files. Backup and
 restore remain portable `/db/v1` operations rather than storage maintenance.

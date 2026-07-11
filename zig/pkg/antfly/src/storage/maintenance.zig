@@ -134,6 +134,7 @@ pub const Coordinator = struct {
     pub fn start(self: *Coordinator, operation: Operation, idempotency_key: ?[]const u8) !Snapshot {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        self.reapCompletedThreadsLocked();
 
         if (idempotency_key) |key| {
             if (key.len == 0 or key.len > 256) return error.InvalidIdempotencyKey;
@@ -170,6 +171,7 @@ pub const Coordinator = struct {
     pub fn get(self: *Coordinator, job_id: u64) ?Snapshot {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        self.reapCompletedThreadsLocked();
         for (self.jobs.items) |job| {
             if (job.id == job_id) return snapshotLocked(job);
         }
@@ -209,6 +211,16 @@ pub const Coordinator = struct {
             const i = remove_index orelse return error.MaintenanceBusy;
             const job = self.jobs.orderedRemove(i);
             job.deinit(self.allocator);
+        }
+    }
+
+    fn reapCompletedThreadsLocked(self: *Coordinator) void {
+        for (self.jobs.items) |job| {
+            if (job.state != .succeeded and job.state != .failed) continue;
+            if (job.thread) |thread| {
+                thread.join();
+                job.thread = null;
+            }
         }
     }
 

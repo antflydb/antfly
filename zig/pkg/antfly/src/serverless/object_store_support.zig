@@ -18,6 +18,30 @@ const remote_uri = @import("remote_uri.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const S3Options = struct {
+    endpoint: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    access_key_id: ?[]const u8 = null,
+    secret_access_key: ?[]const u8 = null,
+    session_token: ?[]const u8 = null,
+    use_ssl: bool = true,
+    addressing_style: object_storage.S3.AddressingStyle = .path,
+};
+
+pub fn s3ConfigAlloc(alloc: Allocator, options: ?S3Options) !object_storage.S3.Config {
+    const opts = options orelse S3Options{};
+    return try object_storage.S3.fromEnvAlloc(
+        alloc,
+        opts.endpoint,
+        opts.use_ssl,
+        opts.access_key_id,
+        opts.secret_access_key,
+        opts.session_token,
+        opts.region,
+        opts.addressing_style,
+    );
+}
+
 pub const OpenedObjectStore = struct {
     alloc: Allocator,
     client: object_storage.ObjectStorage,
@@ -29,6 +53,15 @@ pub const OpenedObjectStore = struct {
     prefix: []u8,
 
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
+        return try initRemoteUriWithS3Options(alloc, uri, file_bucket, null);
+    }
+
+    pub fn initRemoteUriWithS3Options(
+        alloc: Allocator,
+        uri: []const u8,
+        file_bucket: []const u8,
+        s3_options: ?S3Options,
+    ) !OpenedObjectStore {
         var parsed = try remote_uri.parseAlloc(alloc, uri);
         defer switch (parsed) {
             .file => |value| alloc.free(value),
@@ -43,7 +76,7 @@ pub const OpenedObjectStore = struct {
                 break :blk try initFileUri(alloc, file_uri, file_bucket);
             },
             .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix),
-            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix),
+            .s3 => |value| try initS3UriWithOptions(alloc, value.bucket, value.prefix, s3_options),
         };
     }
 
@@ -83,9 +116,18 @@ pub const OpenedObjectStore = struct {
     }
 
     pub fn initS3Uri(alloc: Allocator, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        return try initS3UriWithOptions(alloc, bucket, prefix, null);
+    }
+
+    pub fn initS3UriWithOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ?S3Options,
+    ) !OpenedObjectStore {
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try object_storage.S3.fromEnvAlloc(alloc, null, true, null, null, null, null, .path);
+        const cfg = try s3ConfigAlloc(alloc, options);
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
 
         var owned_client = s3.client();

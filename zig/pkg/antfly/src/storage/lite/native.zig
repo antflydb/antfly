@@ -61,7 +61,8 @@ const document_delete_flag: u8 = 1 << 0;
 const document_external_value_flag: u8 = 1 << 1;
 const document_namespace_link_flag: u8 = 1 << 2;
 const namespace_directory_key = "\x00antfly.document_namespaces.v1";
-const namespace_directory_magic = "AFNSIDX1";
+const namespace_directory_magic = "AFNSIDX2";
+const namespace_directory_snapshot_interval: u16 = 256;
 const value_page_header_size: usize = 8;
 const free_map_format_version: u32 = 1;
 const free_map_header_size: usize = 16;
@@ -520,6 +521,9 @@ pub const NativeFile = struct {
     no_sync: bool = false,
     page_cache_enabled: std.atomic.Value(bool) = .init(true),
     page_cache: PageCache = .{},
+    namespace_directory_cache: NamespaceDirectory = .empty,
+    namespace_directory_cache_root: u64 = std.math.maxInt(u64),
+    namespace_directory_delta_depth: u16 = 0,
     /// While non-zero, page reads bypass the page cache and hit disk.
     /// Integrity checks hold this so they verify on-disk state rather than
     /// cached copies.
@@ -630,6 +634,7 @@ pub const NativeFile = struct {
     }
 
     pub fn close(self: *NativeFile) void {
+        deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(self.io_impl.io());
@@ -683,7 +688,7 @@ pub const NativeFile = struct {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         if ((checkpoint.document_root_page == 0 and namespace_directory_records != 0) or
-            (checkpoint.document_root_page != 0 and namespace_directory_records != 1))
+            (checkpoint.document_root_page != 0 and namespace_directory_records == 0))
             return invalidCheck(report, "invalid_namespace_directory");
         self.validateNamespaceDirectory(checkpoint) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
@@ -1215,6 +1220,15 @@ pub const NativeFile = struct {
     }
 
     const NamespaceDirectory = std.StringHashMapUnmanaged(u64);
+    const NamespaceDirectoryRecordKind = enum(u8) {
+        snapshot = 0,
+        delta = 1,
+    };
+
+    const LoadedNamespaceDirectory = struct {
+        entries: NamespaceDirectory,
+        delta_depth: u16,
+    };
 
     fn documentNamespace(key: []const u8) []const u8 {
         const end = (std.mem.indexOfScalar(u8, key, 0) orelse return "") + 1;
@@ -1227,41 +1241,63 @@ pub const NativeFile = struct {
         directory.deinit(allocator);
     }
 
-    fn decodeNamespaceDirectoryAlloc(allocator: Allocator, raw: []const u8) !NamespaceDirectory {
-        if (raw.len < namespace_directory_magic.len + 4 or
+    fn applyNamespaceDirectoryRecord(
+        allocator: Allocator,
+        directory: *NamespaceDirectory,
+        raw: []const u8,
+    ) !NamespaceDirectoryRecordKind {
+        if (raw.len < namespace_directory_magic.len + 1 + 4 or
             !std.mem.eql(u8, raw[0..namespace_directory_magic.len], namespace_directory_magic))
             return error.InvalidNamespaceDirectory;
         var offset: usize = namespace_directory_magic.len;
+        const kind: NamespaceDirectoryRecordKind = switch (raw[offset]) {
+            0 => .snapshot,
+            1 => .delta,
+            else => return error.InvalidNamespaceDirectory,
+        };
+        offset += 1;
         const count = std.mem.readInt(u32, raw[offset..][0..4], .little);
         offset += 4;
         if (@as(usize, count) > (raw.len - offset) / 12) return error.InvalidNamespaceDirectory;
-        var directory = NamespaceDirectory.empty;
-        errdefer deinitNamespaceDirectory(allocator, &directory);
-        try directory.ensureTotalCapacity(allocator, count);
+        try directory.ensureUnusedCapacity(allocator, count);
+        var record_keys = std.StringHashMapUnmanaged(void).empty;
+        defer record_keys.deinit(allocator);
+        try record_keys.ensureTotalCapacity(allocator, count);
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             if (raw.len - offset < 4) return error.InvalidNamespaceDirectory;
             const len = std.mem.readInt(u32, raw[offset..][0..4], .little);
             offset += 4;
             if (len > raw.len - offset or raw.len - offset - len < 8) return error.InvalidNamespaceDirectory;
-            const key = try allocator.dupe(u8, raw[offset..][0..len]);
+            const raw_key = raw[offset..][0..len];
             offset += len;
             const head = std.mem.readInt(u64, raw[offset..][0..8], .little);
             offset += 8;
-            if ((key.len > 0 and key[key.len - 1] != 0) or head == 0 or directory.contains(key)) {
-                allocator.free(key);
+            if ((raw_key.len > 0 and raw_key[raw_key.len - 1] != 0) or head == 0 or record_keys.contains(raw_key))
                 return error.InvalidNamespaceDirectory;
+            record_keys.putAssumeCapacity(raw_key, {});
+
+            // Records are replayed newest to oldest. The first head for a
+            // namespace is authoritative; older snapshots/deltas fill only
+            // namespaces not mentioned by a newer record.
+            if (!directory.contains(raw_key)) {
+                const key = try allocator.dupe(u8, raw_key);
+                directory.putAssumeCapacity(key, head);
             }
-            directory.putAssumeCapacity(key, head);
         }
         if (offset != raw.len) return error.InvalidNamespaceDirectory;
-        return directory;
+        return kind;
     }
 
-    fn encodeNamespaceDirectoryAlloc(allocator: Allocator, directory: *const NamespaceDirectory) ![]u8 {
+    fn encodeNamespaceDirectoryAlloc(
+        allocator: Allocator,
+        kind: NamespaceDirectoryRecordKind,
+        directory: *const NamespaceDirectory,
+    ) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
         try out.writer.writeAll(namespace_directory_magic);
+        try out.writer.writeByte(@intFromEnum(kind));
         try out.writer.writeInt(u32, std.math.cast(u32, directory.count()) orelse return error.RecordTooLarge, .little);
         var it = directory.iterator();
         while (it.next()) |entry| {
@@ -1272,17 +1308,55 @@ pub const NativeFile = struct {
         return try out.toOwnedSlice();
     }
 
-    fn loadNamespaceDirectoryAlloc(self: *NativeFile, allocator: Allocator) !?NamespaceDirectory {
-        const root = self.activeCheckpoint().namespace_directory_root_page;
+    fn loadNamespaceDirectoryWithDepthAlloc(self: *NativeFile, allocator: Allocator) !?LoadedNamespaceDirectory {
+        var root = self.activeCheckpoint().namespace_directory_root_page;
         if (root == 0) return null;
-        const payload = try self.readPagePayloadByKindAlloc(allocator, root, .catalog);
-        defer allocator.free(payload);
-        const entry = try decodeCatalogEntry(payload);
-        if (!std.mem.eql(u8, entry.key, namespace_directory_key) or entry.previous_page != 0 or entry.is_delete)
-            return error.InvalidNamespaceDirectory;
-        const raw = try self.catalogEntryValueAlloc(allocator, entry);
-        defer allocator.free(raw);
-        return try decodeNamespaceDirectoryAlloc(allocator, raw);
+        var directory = NamespaceDirectory.empty;
+        errdefer deinitNamespaceDirectory(allocator, &directory);
+        var depth: u16 = 0;
+        var walked: u64 = 0;
+        while (root != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, root, .catalog);
+            defer allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+            if (!std.mem.eql(u8, entry.key, namespace_directory_key) or entry.is_delete)
+                return error.InvalidNamespaceDirectory;
+            const raw = try self.catalogEntryValueAlloc(allocator, entry);
+            defer allocator.free(raw);
+            const kind = try applyNamespaceDirectoryRecord(allocator, &directory, raw);
+            walked += 1;
+            if (walked > self.activeCheckpoint().page_count) return error.InvalidNativePageChain;
+            switch (kind) {
+                .snapshot => {
+                    if (entry.previous_page != 0) return error.InvalidNamespaceDirectory;
+                    return .{ .entries = directory, .delta_depth = depth };
+                },
+                .delta => {
+                    depth = std.math.add(u16, depth, 1) catch return error.InvalidNamespaceDirectory;
+                    root = entry.previous_page;
+                    if (root == 0) return error.InvalidNamespaceDirectory;
+                },
+            }
+        }
+        return error.InvalidNamespaceDirectory;
+    }
+
+    fn loadNamespaceDirectoryAlloc(self: *NativeFile, allocator: Allocator) !?NamespaceDirectory {
+        const loaded = (try self.loadNamespaceDirectoryWithDepthAlloc(allocator)) orelse return null;
+        return loaded.entries;
+    }
+
+    fn ensureNamespaceDirectoryCache(self: *NativeFile) !void {
+        const root = self.activeCheckpoint().namespace_directory_root_page;
+        if (self.namespace_directory_cache_root == root) return;
+        const loaded = (try self.loadNamespaceDirectoryWithDepthAlloc(self.allocator)) orelse LoadedNamespaceDirectory{
+            .entries = NamespaceDirectory.empty,
+            .delta_depth = 0,
+        };
+        deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        self.namespace_directory_cache = loaded.entries;
+        self.namespace_directory_delta_depth = loaded.delta_depth;
+        self.namespace_directory_cache_root = root;
     }
 
     fn validateNamespaceDirectory(self: *NativeFile, checkpoint: CheckpointSlot) !void {
@@ -1336,14 +1410,18 @@ pub const NativeFile = struct {
         for (mutations) |mutation| try self.validateDocumentMutation(mutation);
 
         const previous = self.activeCheckpoint();
+        try self.ensureNamespaceDirectoryCache();
+        if (previous.document_root_page != 0 and self.namespace_directory_cache.count() == 0)
+            return error.InvalidNamespaceDirectory;
         var next_root_page = previous.document_root_page;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
-        var namespace_directory = (try self.loadNamespaceDirectoryAlloc(self.allocator)) orelse blk: {
-            if (previous.document_root_page != 0) return error.InvalidNamespaceDirectory;
-            break :blk NamespaceDirectory.empty;
-        };
-        defer deinitNamespaceDirectory(self.allocator, &namespace_directory);
+        var changed_heads = NamespaceDirectory.empty;
+        defer changed_heads.deinit(self.allocator);
+        try changed_heads.ensureTotalCapacity(
+            self.allocator,
+            std.math.cast(u32, mutations.len) orelse return error.RecordTooLarge,
+        );
 
         for (mutations) |mutation| {
             var external_value_root_page: u64 = 0;
@@ -1353,7 +1431,8 @@ pub const NativeFile = struct {
 
             const page_id = try page_allocator.allocate();
             const namespace = documentNamespace(mutation.key);
-            const previous_namespace_page = namespace_directory.get(namespace) orelse 0;
+            const previous_namespace_page = changed_heads.get(namespace) orelse
+                self.namespace_directory_cache.get(namespace) orelse 0;
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
             try encodeDocumentEntry(self.allocator, &payload, .{
@@ -1366,18 +1445,39 @@ pub const NativeFile = struct {
             });
             try self.writePage(page_id, .document, payload.items);
             next_root_page = page_id;
-            if (namespace_directory.getPtr(namespace)) |head| {
+            if (changed_heads.getPtr(namespace)) |head| {
                 head.* = page_id;
             } else {
-                const owned_namespace = try self.allocator.dupe(u8, namespace);
-                namespace_directory.put(self.allocator, owned_namespace, page_id) catch |err| {
-                    self.allocator.free(owned_namespace);
-                    return err;
-                };
+                // Mutation keys remain live for the duration of this commit;
+                // ownership is acquired only for namespaces newly entering
+                // the durable materialized cache below.
+                changed_heads.putAssumeCapacity(namespace, page_id);
             }
         }
 
-        const encoded_directory = try encodeNamespaceDirectoryAlloc(self.allocator, &namespace_directory);
+        const write_snapshot = previous.namespace_directory_root_page == 0 or
+            self.namespace_directory_delta_depth + 1 >= namespace_directory_snapshot_interval;
+        var snapshot = NamespaceDirectory.empty;
+        defer snapshot.deinit(self.allocator);
+        const directory_to_encode = if (write_snapshot) blk: {
+            try snapshot.ensureTotalCapacity(
+                self.allocator,
+                self.namespace_directory_cache.count() + changed_heads.count(),
+            );
+            var cached_it = self.namespace_directory_cache.iterator();
+            while (cached_it.next()) |entry|
+                snapshot.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+            var changed_it = changed_heads.iterator();
+            while (changed_it.next()) |entry| {
+                if (snapshot.getPtr(entry.key_ptr.*)) |head|
+                    head.* = entry.value_ptr.*
+                else
+                    snapshot.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+            }
+            break :blk &snapshot;
+        } else &changed_heads;
+        const record_kind: NamespaceDirectoryRecordKind = if (write_snapshot) .snapshot else .delta;
+        const encoded_directory = try encodeNamespaceDirectoryAlloc(self.allocator, record_kind, directory_to_encode);
         defer self.allocator.free(encoded_directory);
         try self.validateCatalogMutation(.{ .key = namespace_directory_key, .value = encoded_directory });
         var directory_external_root: u64 = 0;
@@ -1388,7 +1488,7 @@ pub const NativeFile = struct {
         var directory_payload = std.ArrayListUnmanaged(u8).empty;
         defer directory_payload.deinit(self.allocator);
         try encodeCatalogEntry(self.allocator, &directory_payload, .{
-            .previous_page = 0,
+            .previous_page = if (write_snapshot) 0 else previous.namespace_directory_root_page,
             .key = namespace_directory_key,
             .value = encoded_directory,
             .external_value_root_page = directory_external_root,
@@ -1407,7 +1507,37 @@ pub const NativeFile = struct {
         try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
         try self.syncIfRequired();
 
+        // Reserve and allocate all cache state before publishing. After the
+        // checkpoint is durable, cache publication is allocation-free and
+        // therefore cannot fail or diverge from disk state.
+        try self.namespace_directory_cache.ensureUnusedCapacity(self.allocator, changed_heads.count());
+        var new_entries = std.ArrayListUnmanaged(struct { key: []u8, head: u64 }).empty;
+        defer {
+            for (new_entries.items) |entry| self.allocator.free(entry.key);
+            new_entries.deinit(self.allocator);
+        }
+        try new_entries.ensureTotalCapacity(self.allocator, changed_heads.count());
+        var changed_it = changed_heads.iterator();
+        while (changed_it.next()) |entry| {
+            if (!self.namespace_directory_cache.contains(entry.key_ptr.*)) {
+                const owned = try self.allocator.dupe(u8, entry.key_ptr.*);
+                new_entries.appendAssumeCapacity(.{ .key = owned, .head = entry.value_ptr.* });
+            }
+        }
+
         try self.publishCheckpoint(next);
+
+        changed_it = changed_heads.iterator();
+        while (changed_it.next()) |entry| {
+            if (self.namespace_directory_cache.getPtr(entry.key_ptr.*)) |head|
+                head.* = entry.value_ptr.*;
+        }
+        for (new_entries.items) |entry| {
+            self.namespace_directory_cache.putAssumeCapacity(entry.key, entry.head);
+        }
+        new_entries.items.len = 0;
+        self.namespace_directory_cache_root = directory_page;
+        self.namespace_directory_delta_depth = if (write_snapshot) 0 else self.namespace_directory_delta_depth + 1;
     }
 
     pub fn getDocumentAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
@@ -1615,7 +1745,7 @@ pub const NativeFile = struct {
         }
 
         if (docs.len > 0) {
-            const encoded_directory = try encodeNamespaceDirectoryAlloc(self.allocator, &namespace_directory);
+            const encoded_directory = try encodeNamespaceDirectoryAlloc(self.allocator, .snapshot, &namespace_directory);
             defer self.allocator.free(encoded_directory);
             const directory_external_root = if (self.catalogEntryFitsInline(namespace_directory_key, encoded_directory))
                 0
@@ -1655,6 +1785,7 @@ pub const NativeFile = struct {
 
         try self.replaceOpenFileWithImage(image.items);
         self.header = compact_header;
+        self.namespace_directory_cache_root = std.math.maxInt(u64);
 
         const after_size: u64 = @intCast(image.items.len);
         return .{
@@ -2344,7 +2475,7 @@ pub const NativeFile = struct {
         if (docs.len > 0) {
             var directory = (try self.loadNamespaceDirectoryAlloc(self.allocator)) orelse return error.InvalidNamespaceDirectory;
             defer deinitNamespaceDirectory(self.allocator, &directory);
-            const encoded = try encodeNamespaceDirectoryAlloc(self.allocator, &directory);
+            const encoded = try encodeNamespaceDirectoryAlloc(self.allocator, .snapshot, &directory);
             defer self.allocator.free(encoded);
             compact_pages += 1;
             if (!self.catalogEntryFitsInline(namespace_directory_key, encoded)) compact_pages += self.valuePageCount(encoded.len);
@@ -3981,7 +4112,10 @@ test "lite native free map reuses pages released by checkpoint rotation" {
     try file.putDocument("doc:1", "v4");
     const after_size = (try file.file.stat(file.io_impl.io())).size;
 
-    try std.testing.expectEqual(before_size + default_page_size, after_size);
+    // The document/free-map pages reuse released space. The namespace delta
+    // remains reachable until the next bounded directory snapshot, so the
+    // append-only file grows by its catalog page as well.
+    try std.testing.expectEqual(before_size + 2 * default_page_size, after_size);
     const report = try file.check();
     try std.testing.expect(report.valid);
 
@@ -4306,6 +4440,52 @@ test "lite native namespace snapshot does not read unrelated document chains" {
     try std.testing.expectEqual(@as(usize, 1), docs_b.len);
     try std.testing.expectEqualStrings("b", docs_b[0].value);
     try std.testing.expectError(error.NativePageChecksumMismatch, reopened.snapshotDocumentsAlloc(allocator));
+}
+
+test "lite native namespace directory uses bounded deltas and survives cold reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-namespace-deltas.aflite");
+    defer allocator.free(path);
+    const prefix_a = [_]u8{ 't', 'a', 0 };
+    const prefix_b = [_]u8{ 't', 'b', 0 };
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        var value_buf: [32]u8 = undefined;
+        var key_buf: [64]u8 = undefined;
+        for (0..300) |i| {
+            const prefix = if (i % 2 == 0) &prefix_a else &prefix_b;
+            const key_tail = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+            var key = std.ArrayListUnmanaged(u8).empty;
+            defer key.deinit(allocator);
+            try key.appendSlice(allocator, prefix);
+            try key.appendSlice(allocator, key_tail);
+            const value = try std.fmt.bufPrint(&value_buf, "value-{d}", .{i});
+            try file.putDocument(key.items, value);
+        }
+        try std.testing.expect(file.namespace_directory_delta_depth < namespace_directory_snapshot_interval);
+        var reachable = std.AutoHashMapUnmanaged(u64, void){};
+        defer reachable.deinit(allocator);
+        const directory_pages = try file.countReachableChainPages(
+            .catalog,
+            file.activeCheckpoint().namespace_directory_root_page,
+            &reachable,
+        );
+        try std.testing.expectEqual(@as(u64, file.namespace_directory_delta_depth + 1), directory_pages);
+        try std.testing.expect((try file.check()).valid);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const docs_a = try reopened.snapshotDocumentsWithPrefixAlloc(allocator, &prefix_a);
+    defer NativeFile.freeSnapshotDocuments(allocator, docs_a);
+    const docs_b = try reopened.snapshotDocumentsWithPrefixAlloc(allocator, &prefix_b);
+    defer NativeFile.freeSnapshotDocuments(allocator, docs_b);
+    try std.testing.expectEqual(@as(usize, 150), docs_a.len);
+    try std.testing.expectEqual(@as(usize, 150), docs_b.len);
 }
 
 test "lite native check rejects incomplete namespace links with valid page checksums" {

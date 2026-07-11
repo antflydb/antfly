@@ -104,23 +104,49 @@ pub const Config = struct {
         lite_path: ?[]u8 = null,
         lite_fsync: bool = true,
         local_base_dir: ?[]u8 = null,
-        object_provider: ?[]u8 = null,
+        object_connection: ?[]u8 = null,
         object_bucket: ?[]u8 = null,
         object_prefix: ?[]u8 = null,
-        data_backend: ?common_openapi.StorageBackend = null,
-        metadata_backend: ?common_openapi.StorageBackend = null,
-        s3_bucket: ?[]u8 = null,
-        s3_prefix: ?[]u8 = null,
+        object_lanes: ObjectStorageLanes = .{},
 
         fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
             if (self.lite_path) |value| alloc.free(value);
             if (self.local_base_dir) |value| alloc.free(value);
-            if (self.object_provider) |value| alloc.free(value);
+            if (self.object_connection) |value| alloc.free(value);
             if (self.object_bucket) |value| alloc.free(value);
             if (self.object_prefix) |value| alloc.free(value);
-            if (self.s3_bucket) |value| alloc.free(value);
-            if (self.s3_prefix) |value| alloc.free(value);
+            self.object_lanes.deinit(alloc);
             self.* = undefined;
+        }
+    };
+
+    pub const ObjectStorageLocation = struct {
+        connection: ?[]u8 = null,
+        bucket: ?[]u8 = null,
+        prefix: ?[]u8 = null,
+
+        fn deinit(self: *ObjectStorageLocation, alloc: std.mem.Allocator) void {
+            if (self.connection) |value| alloc.free(value);
+            if (self.bucket) |value| alloc.free(value);
+            if (self.prefix) |value| alloc.free(value);
+            self.* = .{};
+        }
+    };
+
+    pub const ObjectStorageLanes = struct {
+        artifacts: ObjectStorageLocation = .{},
+        manifests: ObjectStorageLocation = .{},
+        wal: ObjectStorageLocation = .{},
+        progress: ObjectStorageLocation = .{},
+        catalog: ObjectStorageLocation = .{},
+
+        fn deinit(self: *ObjectStorageLanes, alloc: std.mem.Allocator) void {
+            self.artifacts.deinit(alloc);
+            self.manifests.deinit(alloc);
+            self.wal.deinit(alloc);
+            self.progress.deinit(alloc);
+            self.catalog.deinit(alloc);
+            self.* = .{};
         }
     };
 
@@ -212,6 +238,8 @@ pub const Config = struct {
         http,
     };
 
+    pub const S3AddressingStyle = enum { path, virtual_hosted };
+
     pub const ConnectionConfig = struct {
         display_name: ?[]u8 = null,
         provider: ?[]u8 = null,
@@ -298,6 +326,8 @@ pub const Config = struct {
     pub const ExternalIoConnectionConfig = struct {
         protocol: ExternalIoProtocol,
         endpoint: ?[]u8 = null,
+        region: ?[]u8 = null,
+        addressing_style: S3AddressingStyle = .virtual_hosted,
         buckets: []const []u8 = &.{},
         prefix: ?[]u8 = null,
         hosts: []const []u8 = &.{},
@@ -309,6 +339,7 @@ pub const Config = struct {
 
         fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
             if (self.endpoint) |value| alloc.free(value);
+            if (self.region) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.buckets);
             if (self.prefix) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.hosts);
@@ -399,6 +430,11 @@ pub const Config = struct {
 
         const deployment_mode = try deploymentModeFromObject(root);
         try validateStorageFromOpenApi(deployment_mode, root, validated.value.storage);
+        var storage_config = try storageFromOpenApi(alloc, validated.value.storage, root.get("storage"));
+        errdefer storage_config.deinit(alloc);
+        var connections = try parseConnectionsConfig(alloc, root.get("connections"));
+        errdefer deinitConnectionsConfig(alloc, &connections);
+        try validateStorageConnections(&storage_config, &connections);
 
         var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
@@ -441,7 +477,7 @@ pub const Config = struct {
                 root,
                 if (validated.value.metadata) |metadata| metadata.orchestration_urls else null,
             ),
-            .storage = try storageFromOpenApi(alloc, validated.value.storage),
+            .storage = storage_config,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             .inference = if (validated.value.inference) |inference| .{
                 .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
@@ -456,7 +492,7 @@ pub const Config = struct {
                 try parseRemoteContentConfig(alloc, remote_content)
             else
                 null,
-            .connections = try parseConnectionsConfig(alloc, root.get("connections")),
+            .connections = connections,
             .shard_allocation = .{
                 .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (deployment_mode.supportsLite()) default_standalone_shards_per_table else default_config_shards_per_table,
                 .max_shard_size_bytes = try optionalU64Field(root, "max_shard_size_bytes") orelse default_max_shard_size_bytes,
@@ -475,6 +511,7 @@ pub const Config = struct {
     fn storageFromOpenApi(
         alloc: std.mem.Allocator,
         storage: ?common_openapi.StorageConfig,
+        raw_storage: ?std.json.Value,
     ) !StorageConfig {
         var parsed: StorageConfig = .{};
         errdefer parsed.deinit(alloc);
@@ -490,19 +527,24 @@ pub const Config = struct {
             },
             .local => {
                 const local = value.local.?;
-                parsed.data_backend = local.data;
-                parsed.metadata_backend = local.metadata;
                 if (local.base_dir) |base_dir| parsed.local_base_dir = try alloc.dupe(u8, base_dir);
-                if (local.s3) |s3| {
-                    parsed.s3_bucket = try alloc.dupe(u8, s3.bucket);
-                    if (s3.prefix) |prefix| parsed.s3_prefix = try alloc.dupe(u8, prefix);
-                }
             },
             .object => {
-                const object = value.object.?;
-                parsed.object_provider = try alloc.dupe(u8, object.provider);
-                parsed.object_bucket = try alloc.dupe(u8, object.bucket);
-                if (object.prefix) |prefix| parsed.object_prefix = try alloc.dupe(u8, prefix);
+                const storage_value = raw_storage orelse return error.InvalidConfig;
+                if (storage_value != .object) return error.InvalidConfig;
+                const object_value = storage_value.object.get("object") orelse return error.InvalidConfig;
+                if (object_value != .object) return error.InvalidConfig;
+                parsed.object_connection = try requiredStringFieldDup(alloc, object_value.object, "connection");
+                parsed.object_bucket = try requiredStringFieldDup(alloc, object_value.object, "bucket");
+                parsed.object_prefix = try optionalStringFieldDup(alloc, object_value.object, "prefix");
+                if (object_value.object.get("lanes")) |lanes| {
+                    if (lanes != .object) return error.InvalidConfig;
+                    parsed.object_lanes.artifacts = try parseObjectStorageLocation(alloc, lanes.object.get("artifacts"));
+                    parsed.object_lanes.manifests = try parseObjectStorageLocation(alloc, lanes.object.get("manifests"));
+                    parsed.object_lanes.wal = try parseObjectStorageLocation(alloc, lanes.object.get("wal"));
+                    parsed.object_lanes.progress = try parseObjectStorageLocation(alloc, lanes.object.get("progress"));
+                    parsed.object_lanes.catalog = try parseObjectStorageLocation(alloc, lanes.object.get("catalog"));
+                }
             },
         }
 
@@ -562,25 +604,25 @@ pub const Config = struct {
             },
             .local => {
                 if (has_lite or has_object) return error.InvalidConfig;
-                const local = value.local orelse return error.InvalidConfig;
+                _ = value.local orelse return error.InvalidConfig;
                 const local_value = storage_object.get("local") orelse return error.InvalidConfig;
                 const local_object = switch (local_value) {
                     .object => |object| object,
                     else => return error.InvalidConfig,
                 };
-                if (!objectContainsOnly(local_object, &.{ "base_dir", "data", "metadata", "s3" })) return error.InvalidConfig;
-                if (local_object.get("s3") != null) {
-                    try validateObjectMemberFields(local_object, "s3", &.{ "endpoint", "use_ssl", "access_key_id", "secret_access_key", "session_token", "bucket", "prefix" });
-                }
-                if (((local.data orelse .local) == .s3 or (local.metadata orelse .local) == .s3) and local.s3 == null) return error.InvalidConfig;
+                if (!objectContainsOnly(local_object, &.{"base_dir"})) return error.InvalidConfig;
             },
             .object => {
                 if (deployment_mode != .serverless) return error.InvalidConfig;
-                try validateObjectMemberFields(storage_object, "object", &.{ "provider", "bucket", "prefix" });
-                const object = value.object orelse return error.InvalidConfig;
+                try validateObjectMemberFields(storage_object, "object", &.{ "connection", "bucket", "prefix", "lanes" });
+                _ = value.object orelse return error.InvalidConfig;
                 if (has_lite or has_local) return error.InvalidConfig;
-                if (!std.mem.eql(u8, object.provider, "s3")) return error.InvalidConfig;
-                if (object.bucket.len < 3 or object.bucket.len > 63) return error.InvalidConfig;
+                const object_value = storage_object.get("object") orelse return error.InvalidConfig;
+                if (object_value != .object) return error.InvalidConfig;
+                const connection = try requiredStringField(object_value.object, "connection");
+                const bucket = try requiredStringField(object_value.object, "bucket");
+                if (connection.len == 0 or bucket.len < 3 or bucket.len > 63) return error.InvalidConfig;
+                if (object_value.object.get("lanes")) |lanes| try validateObjectStorageLanes(lanes);
             },
         }
     }
@@ -800,6 +842,49 @@ test "common config rejects Lite storage for distributed topology" {
         \\    "engine": "lite",
         \\    "lite": { "path": "data.aflite" }
         \\  }
+        \\}
+    ));
+}
+
+test "common config resolves capability-scoped object storage connections and lane overrides" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": {
+        \\    "data": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["storage.primary"],
+        \\      "external_io": { "protocol": "s3", "region": "us-west-2", "buckets": ["data-bucket"] }
+        \\    },
+        \\    "wal": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["storage.primary"],
+        \\      "external_io": { "protocol": "s3", "endpoint": "minio:9000", "use_ssl": false, "buckets": ["wal-bucket"] }
+        \\    }
+        \\  },
+        \\  "storage": {
+        \\    "engine": "object",
+        \\    "object": {
+        \\      "connection": "data",
+        \\      "bucket": "data-bucket",
+        \\      "prefix": "cluster",
+        \\      "lanes": { "wal": { "connection": "wal", "bucket": "wal-bucket", "prefix": "cluster-wal" } }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(common_openapi.StorageEngine.object, cfg.storage.engine);
+    try std.testing.expectEqualStrings("data", cfg.storage.object_connection.?);
+    try std.testing.expectEqualStrings("wal", cfg.storage.object_lanes.wal.connection.?);
+    try std.testing.expectEqualStrings("wal-bucket", cfg.storage.object_lanes.wal.bucket.?);
+    try std.testing.expectEqualStrings("us-west-2", cfg.connections.get("data").?.external_io.?.region.?);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": { "data": { "kind": "external_io", "capabilities": ["remote.read"], "external_io": { "protocol": "s3" } } },
+        \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket" } }
         \\}
     ));
 }
@@ -1047,6 +1132,58 @@ fn deinitConnectionsConfig(alloc: std.mem.Allocator, connections: *Config.Connec
     connections.deinit(alloc);
 }
 
+fn validateStorageConnections(
+    storage: *const Config.StorageConfig,
+    connections: *const Config.ConnectionsConfig,
+) !void {
+    if (storage.engine != .object) return;
+    const default_connection = storage.object_connection orelse return error.InvalidConfig;
+    const default_bucket = storage.object_bucket orelse return error.InvalidConfig;
+    try validateStorageConnection(connections, default_connection, default_bucket);
+    for ([_]Config.ObjectStorageLocation{
+        storage.object_lanes.artifacts,
+        storage.object_lanes.manifests,
+        storage.object_lanes.wal,
+        storage.object_lanes.progress,
+        storage.object_lanes.catalog,
+    }) |lane| {
+        try validateStorageConnection(
+            connections,
+            lane.connection orelse default_connection,
+            lane.bucket orelse default_bucket,
+        );
+    }
+}
+
+fn validateStorageConnection(
+    connections: *const Config.ConnectionsConfig,
+    connection_id: []const u8,
+    bucket: []const u8,
+) !void {
+    const connection = connections.get(connection_id) orelse return error.InvalidConfig;
+    if (connection.kind != .external_io) return error.InvalidConfig;
+    const external = connection.external_io orelse return error.InvalidConfig;
+    if (external.protocol != .s3) return error.InvalidConfig;
+    var authorized = false;
+    for (connection.capabilities) |capability| {
+        if (std.mem.eql(u8, capability, "storage.primary")) {
+            authorized = true;
+            break;
+        }
+    }
+    if (!authorized) return error.InvalidConfig;
+    if (external.buckets.len > 0) {
+        authorized = false;
+        for (external.buckets) |allowed| {
+            if (std.mem.eql(u8, allowed, bucket)) {
+                authorized = true;
+                break;
+            }
+        }
+        if (!authorized) return error.InvalidConfig;
+    }
+}
+
 fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.ConnectionConfig {
     if (value != .object) return error.InvalidConfig;
     const kind = try requiredEnumField(Config.ConnectionKind, value.object, "kind");
@@ -1113,6 +1250,8 @@ fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Val
     var cfg = Config.ExternalIoConnectionConfig{
         .protocol = try requiredEnumField(Config.ExternalIoProtocol, value.object, "protocol"),
         .endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint"),
+        .region = try optionalStringFieldDup(alloc, value.object, "region"),
+        .addressing_style = try optionalEnumField(Config.S3AddressingStyle, value.object, "addressing_style") orelse .virtual_hosted,
         .buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{},
         .prefix = try optionalStringFieldDup(alloc, value.object, "prefix"),
         .hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{},
@@ -1163,6 +1302,49 @@ fn parseCdcConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Co
 
 fn requiredEnumField(comptime T: type, object: std.json.ObjectMap, field_name: []const u8) !T {
     const value = object.get(field_name) orelse return error.InvalidConfig;
+    if (value != .string) return error.InvalidConfig;
+    return std.meta.stringToEnum(T, value.string) orelse error.InvalidConfig;
+}
+
+fn requiredStringField(object: std.json.ObjectMap, field_name: []const u8) ![]const u8 {
+    const value = object.get(field_name) orelse return error.InvalidConfig;
+    if (value != .string) return error.InvalidConfig;
+    return value.string;
+}
+
+fn parseObjectStorageLocation(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) !Config.ObjectStorageLocation {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidConfig;
+    var location: Config.ObjectStorageLocation = .{};
+    errdefer location.deinit(alloc);
+    location.connection = try optionalStringFieldDup(alloc, value.object, "connection");
+    location.bucket = try optionalStringFieldDup(alloc, value.object, "bucket");
+    location.prefix = try optionalStringFieldDup(alloc, value.object, "prefix");
+    return location;
+}
+
+fn validateObjectStorageLanes(value: std.json.Value) !void {
+    if (value != .object or !objectContainsOnly(value.object, &.{ "artifacts", "manifests", "wal", "progress", "catalog" }))
+        return error.InvalidConfig;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object or
+            !objectContainsOnly(entry.value_ptr.object, &.{ "connection", "bucket", "prefix" }))
+            return error.InvalidConfig;
+        if (entry.value_ptr.object.get("connection")) |connection| {
+            if (connection != .string or connection.string.len == 0) return error.InvalidConfig;
+        }
+        if (entry.value_ptr.object.get("bucket")) |bucket| {
+            if (bucket != .string or bucket.string.len < 3 or bucket.string.len > 63) return error.InvalidConfig;
+        }
+    }
+}
+
+fn optionalEnumField(comptime T: type, object: std.json.ObjectMap, field_name: []const u8) !?T {
+    const value = object.get(field_name) orelse return null;
     if (value != .string) return error.InvalidConfig;
     return std.meta.stringToEnum(T, value.string) orelse error.InvalidConfig;
 }
@@ -1581,12 +1763,7 @@ test "common config preserves remote content logging and storage fields" {
         \\  "deployment_mode": "standalone",
         \\  "storage": {
         \\    "engine": "local",
-        \\    "local": {
-        \\      "base_dir": "antflydb",
-        \\      "data": "s3",
-        \\      "metadata": "local",
-        \\      "s3": { "endpoint": "s3.amazonaws.com", "bucket": "antfly-prod", "prefix": "cluster-a/" }
-        \\    }
+        \\    "local": { "base_dir": "antflydb" }
         \\  },
         \\  "remote_content": {
         \\    "security": {
@@ -1628,10 +1805,7 @@ test "common config preserves remote content logging and storage fields" {
     try std.testing.expectEqual(@as(?u16, 4200), cfg.health_port);
     try std.testing.expectEqual(logging_openapi.Level.debug, cfg.log.?.level.?);
     try std.testing.expectEqual(logging_openapi.Style.json, cfg.log.?.style.?);
-    try std.testing.expectEqual(common_openapi.StorageBackend.s3, cfg.storage.data_backend.?);
-    try std.testing.expectEqual(common_openapi.StorageBackend.local, cfg.storage.metadata_backend.?);
-    try std.testing.expectEqualStrings("antfly-prod", cfg.storage.s3_bucket.?);
-    try std.testing.expectEqualStrings("cluster-a/", cfg.storage.s3_prefix.?);
+    try std.testing.expectEqualStrings("antflydb", cfg.storage.local_base_dir.?);
 
     const remote_content = cfg.remote_content.?;
     try std.testing.expectEqualStrings("primary", remote_content.default_s3.?);
@@ -2124,7 +2298,7 @@ test "common config accepts partial metadata and storage objects" {
         \\  "metadata": {},
         \\  "storage": {
         \\    "engine": "local",
-        \\    "local": { "data": "local" }
+        \\    "local": {}
         \\  }
         \\}
     );
@@ -2132,7 +2306,6 @@ test "common config accepts partial metadata and storage objects" {
 
     try std.testing.expectEqual(@as(usize, 0), cfg.metadata.orchestration_urls.len);
     try std.testing.expect(cfg.storage.local_base_dir == null);
-    try std.testing.expectEqual(common_openapi.StorageBackend.local, cfg.storage.data_backend.?);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
 }
 
@@ -2144,6 +2317,15 @@ test "common config rejects removed top-level storage backend fields" {
         \\    "engine": "local",
         \\    "local": {},
         \\    "data": "local"
+        \\  }
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "storage": {
+        \\    "engine": "local",
+        \\    "local": { "base_dir": "antflydb", "data": "s3" }
         \\  }
         \\}
     ));

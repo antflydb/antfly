@@ -540,6 +540,14 @@ components:
         endpoint:
           type: string
           description: Custom endpoint URL when configured.
+        region:
+          type: string
+          description: Object-store signing region when configured.
+        addressing_style:
+          type: string
+          enum: [path, virtual_hosted]
+          default: virtual_hosted
+          description: S3 request addressing style.
         buckets:
           type: array
           items:
@@ -633,41 +641,6 @@ components:
           default: "antflydb"
           minLength: 1
           example: "antflydb"
-        data:
-          $ref: "#/components/schemas/StorageBackend"
-        metadata:
-          $ref: "#/components/schemas/StorageBackend"
-        s3:
-          $ref: "#/components/schemas/S3Info"
-
-    S3Info:
-      type: object
-      allOf:
-        - $ref: "../shared/s3.yaml#/components/schemas/Credentials"
-        - type: object
-          required:
-            - endpoint
-            - bucket
-          properties:
-            bucket:
-              type: string
-              description: "S3 bucket name where SST files will be stored"
-              minLength: 3
-              maxLength: 63
-              example: "my-antfly-bucket"
-            prefix:
-              type: string
-              description: "Optional path prefix within the bucket (e.g., 'antfly/production/')"
-              example: "production/"
-
-    StorageBackend:
-      type: string
-      description: "Storage backend type"
-      enum:
-        - local
-        - s3
-      default: "local"
-      example: "local"
 
     StorageEngine:
       type: string
@@ -731,13 +704,52 @@ components:
       type: object
       additionalProperties: false
       required:
-        - provider
+        - connection
         - bucket
       properties:
-        provider:
+        connection:
           type: string
-          enum:
-            - s3
+          minLength: 1
+          description: >-
+            ID of a connections entry with kind external_io, protocol s3, and
+            the storage.primary capability. Storage credentials are resolved
+            from that connection independently of remote-content credentials.
+        bucket:
+          type: string
+          minLength: 3
+          maxLength: 63
+        prefix:
+          type: string
+        lanes:
+          $ref: "#/components/schemas/ObjectStorageLanes"
+
+    ObjectStorageLanes:
+      type: object
+      additionalProperties: false
+      description: >-
+        Optional placement overrides for independently managed serverless
+        durability lanes. Unspecified fields inherit from the object-level
+        connection, bucket, and prefix.
+      properties:
+        artifacts:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        manifests:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        wal:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        progress:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        catalog:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+
+    ObjectStorageLocation:
+      type: object
+      additionalProperties: false
+      properties:
+        connection:
+          type: string
+          minLength: 1
+          description: Optional external_io connection override for this lane.
         bucket:
           type: string
           minLength: 3

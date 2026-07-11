@@ -1314,12 +1314,12 @@ pub const Server = struct {
 
         // 3. Create H2 connection and apply peer settings.
         var h2 = H2Connection.initServer(self.allocator, self.io);
+        defer h2.deinit();
         self.setH2Control(control, &h2);
         defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
-        defer h2.deinit();
         try h2.applyPeerSettings(settings_payload);
 
         // 4. Send server SETTINGS.
@@ -1454,6 +1454,10 @@ pub const Server = struct {
             data_event.* = .unset;
             stream.data_event = data_event;
 
+            // Reserve drain ownership before publishing the handler fiber. A
+            // concurrent graceful shutdown must not observe an accepted stream
+            // as idle during the scheduler handoff.
+            self.startRequest();
             stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
                 self.handleH2Stream(&h2, sock, sid, data_event) catch |err| {
                     std.debug.print("H2 stream handler error: {}\n", .{err});
@@ -1471,12 +1475,12 @@ pub const Server = struct {
     /// backend doesn't support concurrency).
     fn handleH2Connection(self: *Self, control: *ConnectionControl, sock: *Socket, initial_data: []const u8) !void {
         var h2 = H2Connection.initServer(self.allocator, self.io);
+        defer h2.deinit();
         self.setH2Control(control, &h2);
         defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
-        defer h2.deinit();
 
         // Set socket recv timeout so the receive loop unblocks periodically,
         // allowing the idle timeout check to re-evaluate. Without this,
@@ -1621,6 +1625,7 @@ pub const Server = struct {
 
             // Spawn a fiber to handle this stream's request. Falls back to
             // synchronous handling if the Io backend doesn't support fibers.
+            self.startRequest();
             stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
                 self.handleH2Stream(&h2, sock, sid, data_event) catch |err| {
                     std.debug.print("H2 stream handler error: {}\n", .{err});
@@ -1640,7 +1645,6 @@ pub const Server = struct {
     /// mailbox, routes the request, and sends the response. Dispatched as
     /// soon as HEADERS arrive — the body may still be streaming.
     fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) !void {
-        self.startRequest();
         defer self.finishRequest();
         // Ensure cleanup: detach event from stream, remove stream, free event.
         // All stream map mutations happen under write_mutex so the receive

@@ -44,6 +44,40 @@ const antfarm_asset_roots = [_][]const u8{
     "antfarm",
 };
 
+var termination_requested: std.atomic.Value(bool) = .init(false);
+
+fn terminationSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    // Atomic publication is async-signal-safe. Listener and storage teardown
+    // remain on their owning threads.
+    termination_requested.store(true, .release);
+}
+
+const TerminationSignalScope = struct {
+    old_int: std.posix.Sigaction,
+    old_term: std.posix.Sigaction,
+
+    fn install() TerminationSignalScope {
+        termination_requested.store(false, .release);
+        const action = std.posix.Sigaction{
+            .handler = .{ .handler = terminationSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_int: std.posix.Sigaction = undefined;
+        var old_term: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.INT, &action, &old_int);
+        std.posix.sigaction(.TERM, &action, &old_term);
+        return .{ .old_int = old_int, .old_term = old_term };
+    }
+
+    fn deinit(self: *TerminationSignalScope) void {
+        std.posix.sigaction(.INT, &self.old_int, null);
+        std.posix.sigaction(.TERM, &self.old_term, null);
+        termination_requested.store(false, .release);
+        self.* = undefined;
+    }
+};
+
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
@@ -79,7 +113,7 @@ const CliConfig = struct {
     ha_primary_node_id: ?[]const u8 = null,
     ha_fence_wal: ?[]const u8 = null,
     ha_former_primary_log: ?[]const u8 = null,
-    ha_admin_token_env: ?[]const u8 = null,
+    admin_token_env: ?[]const u8 = null,
     ha_retention_max_lag_lsn: ?u64 = null,
     ha_retention_max_retained_bytes: ?u64 = null,
     ha_retention_max_retained_age_ns: ?u64 = null,
@@ -203,6 +237,10 @@ const UnifiedServerLifecycle = struct {
         self.state.store(.failed, .release);
     }
 
+    fn publishStopped(self: *UnifiedServerLifecycle) void {
+        self.state.store(.stopped, .release);
+    }
+
     fn waitForStartup(self: *UnifiedServerLifecycle) !void {
         while (true) switch (self.state.load(.acquire)) {
             .starting => std.Thread.yield() catch {},
@@ -222,6 +260,14 @@ const UnifiedServerLifecycle = struct {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         if (self.server) |server| server.requestStop();
+    }
+
+    fn shutdown(self: *UnifiedServerLifecycle, timeout_ms: u64) void {
+        const prior = self.state.swap(.stopping, .acq_rel);
+        if (prior == .failed or prior == .stopped) return;
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.server) |server| server.shutdown(timeout_ms);
     }
 };
 
@@ -1074,6 +1120,9 @@ pub fn runFromIterator(
         return;
     }
 
+    var termination_signals = TerminationSignalScope.install();
+    defer termination_signals.deinit();
+
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
@@ -1245,8 +1294,8 @@ pub fn runFromIterator(
     defer if (ha_fence_store) |*store| store.close();
     var ha_former_primary_log = try openHAFormerPrimaryLogFromCli(alloc, setup_io.io(), cli);
     defer if (ha_former_primary_log) |*log| log.close();
-    const ha_admin_bearer_token = try resolveHAAdminBearerTokenFromCli(alloc, cli);
-    defer if (ha_admin_bearer_token) |token| alloc.free(token);
+    const admin_bearer_token = try resolveAdminBearerTokenFromCli(alloc, cli);
+    defer if (admin_bearer_token) |token| alloc.free(token);
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -1271,6 +1320,7 @@ pub fn runFromIterator(
             .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
             .deployment_mode = .standalone,
             .storage_maintenance = &storage_maintenance,
+            .admin_bearer_token = admin_bearer_token,
             .secret_store = &secret_store,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
@@ -1293,7 +1343,7 @@ pub fn runFromIterator(
                 .fence_store = if (ha_fence_store) |*store| store else null,
                 .former_primary_log = if (ha_former_primary_log) |*log| log else null,
             },
-            .admin_bearer_token = ha_admin_bearer_token,
+            .admin_bearer_token = admin_bearer_token,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,
             .primary_sync_policy = ha_sync_policy.policy,
@@ -1369,10 +1419,11 @@ pub fn runFromIterator(
         std.log.err("standalone startup failed step=spawn_unified_http err={}", .{err});
         return err;
     };
-    errdefer {
+    var thread_joined = false;
+    defer if (!thread_joined) {
         unified_lifecycle.stop();
         thread.join();
-    }
+    };
     unified_lifecycle.waitForStartup() catch |err| {
         std.log.err("standalone startup failed step=bind_unified_http err={}", .{err});
         return err;
@@ -1386,7 +1437,7 @@ pub fn runFromIterator(
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
-    while (true) {
+    while (!termination_requested.load(.acquire)) {
         if (unified_lifecycle.runtimeFailure()) |err| return err;
         try data_server.runRound();
         try LocalStandaloneMetadata.runRound(&local_metadata);
@@ -1397,6 +1448,11 @@ pub fn runFromIterator(
             else => return std.posix.unexpectedErrno(err),
         }
     }
+
+    unified_lifecycle.shutdown(30_000);
+    thread.join();
+    thread_joined = true;
+    if (unified_lifecycle.runtimeFailure()) |err| return err;
 }
 
 fn validateEffectiveStandaloneStorage(
@@ -1844,7 +1900,10 @@ fn serveUnified(
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
+        return;
     };
+    unified_api_ready.store(false, .release);
+    lifecycle.publishStopped();
 }
 
 fn serveUnifiedInner(
@@ -2625,8 +2684,8 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_former_primary_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-admin-token-env")) {
-            cfg.ha_admin_token_env = args.next() orelse return error.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--admin-token-env")) {
+            cfg.admin_token_env = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--ha-retention-max-lag-lsn")) {
@@ -2954,17 +3013,16 @@ fn validateHARole(cli: CliConfig) !void {
     if (haIdentityRequested(cli) and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_fence_wal != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
-    if (cli.ha_admin_token_env != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_former_primary_log != null) {
         _ = try requireHAPath(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
-    if (cli.ha_admin_token_env) |env_var| {
+    if (cli.admin_token_env) |env_var| {
         switch (antfly.ha.validation.classifyHAString(env_var)) {
             .ok => {},
-            .missing => return error.HAAdminTokenEnvMissing,
-            .padded => return error.HAAdminTokenEnvInvalid,
+            .missing => return error.AdminTokenEnvMissing,
+            .padded => return error.AdminTokenEnvInvalid,
         }
-        if (!antfly.ha.validation.isEnvVarName(env_var)) return error.HAAdminTokenEnvInvalid;
+        if (!antfly.ha.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
     }
     if (primary_requested or standby_requested) {
         _ = try requireHAPath(cli.ha_fence_wal, error.HAFenceWalMissing, error.HAFenceWalInvalid);
@@ -3186,18 +3244,18 @@ fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliC
     return try antfly.ha.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
 }
 
-fn resolveHAAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]u8 {
-    const raw_env_var = cli.ha_admin_token_env orelse return null;
+fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]u8 {
+    const raw_env_var = cli.admin_token_env orelse return null;
     const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
-    if (env_var.len == 0) return error.HAAdminTokenEnvMissing;
-    if (!antfly.ha.validation.isEnvVarName(env_var)) return error.HAAdminTokenEnvInvalid;
+    if (env_var.len == 0) return error.AdminTokenEnvMissing;
+    if (!antfly.ha.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
 
-    const raw_token_z = std.c.getenv(env_var_z.ptr) orelse return error.HAAdminTokenMissing;
+    const raw_token_z = std.c.getenv(env_var_z.ptr) orelse return error.AdminTokenMissing;
     const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
-    if (token.len == 0) return error.HAAdminTokenMissing;
+    if (token.len == 0) return error.AdminTokenMissing;
     return try alloc.dupe(u8, token);
 }
 
@@ -3323,7 +3381,7 @@ fn printUsage() void {
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
         \\  --ha-fence-wal <path>                 Durable HA promotion fence WAL path
         \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
-        \\  --ha-admin-token-env <name>           Require Authorization: Bearer token from this environment variable for {s}
+        \\  --admin-token-env <name>              Require Authorization: Bearer token from this environment variable for admin and HA APIs
         \\  --ha-retention-max-lag-lsn <n>        HA primary marks slots reseed-required after this LSN retention lag
         \\  --ha-retention-max-retained-bytes <n> HA primary marks oldest slots reseed-required above this retained WAL byte cap
         \\  --ha-retention-max-retained-age-ns <n> HA primary marks oldest slots reseed-required above this retained WAL age cap
@@ -3344,7 +3402,7 @@ fn printUsage() void {
         \\  --ha-epoch <id>                       HA primary epoch
         \\  -h, --help                            Show this help
         \\
-    , .{antfly.admin.routes.ha});
+    , .{});
 }
 
 fn parseBoolFlag(raw: []const u8) ?bool {
@@ -3783,7 +3841,7 @@ test "parse cli accepts HA primary runtime flags" {
         "/tmp/ha-fence.wal",
         "--ha-former-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-admin-token-env",
+        "--admin-token-env",
         "ANTFLY_HA_ADMIN_TOKEN",
         "--ha-retention-max-lag-lsn",
         "500",
@@ -3811,7 +3869,7 @@ test "parse cli accepts HA primary runtime flags" {
     try std.testing.expectEqualStrings("primary-a", cfg.ha_primary_node_id.?);
     try std.testing.expectEqualStrings("/tmp/ha-fence.wal", cfg.ha_fence_wal.?);
     try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_former_primary_log.?);
-    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cfg.ha_admin_token_env.?);
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cfg.admin_token_env.?);
     try std.testing.expectEqual(@as(u64, 500), cfg.ha_retention_max_lag_lsn.?);
     try std.testing.expectEqual(@as(u64, 8192), cfg.ha_retention_max_retained_bytes.?);
     try std.testing.expectEqual(@as(u64, 1000000), cfg.ha_retention_max_retained_age_ns.?);
@@ -4105,28 +4163,28 @@ test "standalone HA runtime rejects ambiguous role flags" {
     try std.testing.expectError(error.HARoleMissing, validateHARole(.{
         .ha_former_primary_log = "/tmp/former-primary.wal",
     }));
-    try std.testing.expectError(error.HARoleMissing, validateHARole(.{
-        .ha_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN",
-    }));
-    try std.testing.expectError(error.HAAdminTokenEnvMissing, validateHARole(.{
+    try validateHARole(.{
+        .admin_token_env = "ANTFLY_HA_ADMIN_TOKEN",
+    });
+    try std.testing.expectError(error.AdminTokenEnvMissing, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
-        .ha_admin_token_env = " \t ",
+        .admin_token_env = " \t ",
     }));
-    try std.testing.expectError(error.HAAdminTokenEnvInvalid, validateHARole(.{
+    try std.testing.expectError(error.AdminTokenEnvInvalid, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
-        .ha_admin_token_env = " ANTFLY_HA_ADMIN_TOKEN ",
+        .admin_token_env = " ANTFLY_HA_ADMIN_TOKEN ",
     }));
-    try std.testing.expectError(error.HAAdminTokenEnvInvalid, validateHARole(.{
+    try std.testing.expectError(error.AdminTokenEnvInvalid, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
-        .ha_admin_token_env = "bad-token-env",
+        .admin_token_env = "bad-token-env",
     }));
-    try std.testing.expectError(error.HAAdminTokenEnvInvalid, validateHARole(.{
+    try std.testing.expectError(error.AdminTokenEnvInvalid, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
-        .ha_admin_token_env = "9TOKEN",
+        .admin_token_env = "9TOKEN",
     }));
     try std.testing.expectError(error.HAFenceWalMissing, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
@@ -4484,31 +4542,31 @@ test "standalone HA runtime validates bearer token env name before lookup" {
     };
     const env_name = "ANTFLY_HA_ADMIN_TOKEN_TEST_VALUE";
 
-    try std.testing.expect((try resolveHAAdminBearerTokenFromCli(alloc, .{})) == null);
-    try std.testing.expectError(error.HAAdminTokenEnvMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
-        .ha_admin_token_env = " \t ",
+    try std.testing.expect((try resolveAdminBearerTokenFromCli(alloc, .{})) == null);
+    try std.testing.expectError(error.AdminTokenEnvMissing, resolveAdminBearerTokenFromCli(alloc, .{
+        .admin_token_env = " \t ",
     }));
-    try std.testing.expectError(error.HAAdminTokenEnvInvalid, resolveHAAdminBearerTokenFromCli(alloc, .{
-        .ha_admin_token_env = "bad-token-env",
+    try std.testing.expectError(error.AdminTokenEnvInvalid, resolveAdminBearerTokenFromCli(alloc, .{
+        .admin_token_env = "bad-token-env",
     }));
-    try std.testing.expectError(error.HAAdminTokenEnvInvalid, resolveHAAdminBearerTokenFromCli(alloc, .{
-        .ha_admin_token_env = "9TOKEN",
+    try std.testing.expectError(error.AdminTokenEnvInvalid, resolveAdminBearerTokenFromCli(alloc, .{
+        .admin_token_env = "9TOKEN",
     }));
-    try std.testing.expectError(error.HAAdminTokenMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
-        .ha_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN_SHOULD_NOT_EXIST",
+    try std.testing.expectError(error.AdminTokenMissing, resolveAdminBearerTokenFromCli(alloc, .{
+        .admin_token_env = "ANTFLY_HA_ADMIN_TOKEN_SHOULD_NOT_EXIST",
     }));
 
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name, " secret-token\n", 1));
     defer _ = c.unsetenv(env_name);
-    const token = try resolveHAAdminBearerTokenFromCli(alloc, .{
-        .ha_admin_token_env = env_name,
+    const token = try resolveAdminBearerTokenFromCli(alloc, .{
+        .admin_token_env = env_name,
     });
     defer alloc.free(token.?);
     try std.testing.expectEqualStrings("secret-token", token.?);
 
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name, " \t\n", 1));
-    try std.testing.expectError(error.HAAdminTokenMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
-        .ha_admin_token_env = env_name,
+    try std.testing.expectError(error.AdminTokenMissing, resolveAdminBearerTokenFromCli(alloc, .{
+        .admin_token_env = env_name,
     }));
 }
 

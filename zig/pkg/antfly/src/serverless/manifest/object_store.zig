@@ -24,9 +24,17 @@ pub const ObjectStore = struct {
     opened: object_store_support.OpenedObjectStore,
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
+        return try initRemoteUriWithS3Options(alloc, uri, null);
+    }
+
+    pub fn initRemoteUriWithS3Options(
+        alloc: std.mem.Allocator,
+        uri: []const u8,
+        s3_options: ?object_store_support.S3Options,
+    ) !ObjectStore {
         return .{
             .alloc = alloc,
-            .opened = try object_store_support.OpenedObjectStore.initRemoteUri(alloc, uri, "serverless-manifests"),
+            .opened = try object_store_support.OpenedObjectStore.initRemoteUriWithS3Options(alloc, uri, "serverless-manifests", s3_options),
         };
     }
 

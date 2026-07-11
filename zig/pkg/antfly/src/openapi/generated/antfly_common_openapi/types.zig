@@ -134,6 +134,10 @@ pub const ExternalIoConnectionConfig = struct {
     protocol: ExternalIoProtocol,
     /// Custom endpoint URL when configured.
     endpoint: ?[]const u8 = null,
+    /// Object-store signing region when configured.
+    region: ?[]const u8 = null,
+    /// S3 request addressing style.
+    addressing_style: ?[]const u8 = null,
     /// Buckets this connection is configured for.
     buckets: ?[]const []const u8 = null,
     /// Key prefix when configured.
@@ -215,9 +219,6 @@ pub const LiteStorageConfig = struct {
 pub const LocalStorageConfig = struct {
     /// Root directory for all antfly data storage. Defaults to 'antflydb'.
     base_dir: ?[]const u8 = null,
-    data: ?StorageBackend = null,
-    metadata: ?StorageBackend = null,
-    s3: ?S3Info = null,
 };
 
 pub const MetadataInfo = struct {
@@ -238,42 +239,27 @@ pub const NamedChainLink = struct {
 };
 
 pub const ObjectStorageConfig = struct {
-    provider: []const u8,
+    /// ID of a connections entry with kind external_io, protocol s3, and the storage.primary capability. Storage credentials are resolved from that connection independently of remote-content credentials.
+    connection: []const u8,
     bucket: []const u8,
     prefix: ?[]const u8 = null,
+    lanes: ?ObjectStorageLanes = null,
 };
 
-pub const S3Info = struct {
-    /// S3 bucket name where SST files will be stored
-    bucket: []const u8,
-    /// Optional path prefix within the bucket (e.g., 'antfly/production/')
+/// Optional placement overrides for independently managed serverless durability lanes. Unspecified fields inherit from the object-level connection, bucket, and prefix.
+pub const ObjectStorageLanes = struct {
+    artifacts: ?ObjectStorageLocation = null,
+    manifests: ?ObjectStorageLocation = null,
+    wal: ?ObjectStorageLocation = null,
+    progress: ?ObjectStorageLocation = null,
+    catalog: ?ObjectStorageLocation = null,
+};
+
+pub const ObjectStorageLocation = struct {
+    /// Optional external_io connection override for this lane.
+    connection: ?[]const u8 = null,
+    bucket: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
-};
-
-/// Storage backend type
-pub const StorageBackend = enum {
-    local,
-    s3,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .local => "local",
-            .s3 => "s3",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "local", .local },
-            .{ "s3", .s3 },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
 };
 
 /// Tagged storage-engine configuration. Engine is required and exactly the matching engine member must be present.

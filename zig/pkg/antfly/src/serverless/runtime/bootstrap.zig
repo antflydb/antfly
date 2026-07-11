@@ -34,13 +34,17 @@ const runtime_manager = @import("manager.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
+const object_store_support = @import("../object_store_support.zig");
 
 pub const BootstrapConfig = struct {
+    pub const S3Options = object_store_support.S3Options;
+
     artifacts_uri: []const u8,
     manifests_uri: []const u8,
     wal_uri: []const u8,
     progress_uri: []const u8,
     catalog_uri: []const u8,
+    s3_options: [5]?S3Options = .{ null, null, null, null, null },
     query_cache_dir: ?[]const u8 = null,
     query_cache_max_bytes: u64 = 0,
     query_cache_payload_max_bytes: u64 = 0,
@@ -61,8 +65,94 @@ pub const BootstrapConfig = struct {
 
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
 
+const S3ClientPool = struct {
+    const Entry = struct {
+        options: object_store_support.S3Options,
+        impl: *objectstore.S3.Client,
+        client: objectstore.Client,
+    };
+
+    alloc: Allocator,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    fn init(alloc: Allocator) S3ClientPool {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *S3ClientPool) void {
+        for (self.entries.items) |*entry| {
+            entry.client.deinit();
+            self.alloc.destroy(entry.impl);
+        }
+        self.entries.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn getOrCreate(self: *S3ClientPool, maybe_options: ?object_store_support.S3Options) !objectstore.Client {
+        const options = maybe_options orelse object_store_support.S3Options{};
+        for (self.entries.items) |entry| {
+            if (s3OptionsEql(entry.options, options)) return entry.client;
+        }
+        const impl = try self.alloc.create(objectstore.S3.Client);
+        errdefer self.alloc.destroy(impl);
+        const config = try object_store_support.s3ConfigAlloc(self.alloc, options);
+        impl.* = try objectstore.S3.Client.init(self.alloc, config);
+        errdefer {
+            var client = impl.client();
+            client.deinit();
+        }
+        const client = impl.client();
+        try self.entries.append(self.alloc, .{ .options = options, .impl = impl, .client = client });
+        return client;
+    }
+};
+
+fn s3OptionsEql(a: object_store_support.S3Options, b: object_store_support.S3Options) bool {
+    return optionalStringEql(a.endpoint, b.endpoint) and
+        optionalStringEql(a.region, b.region) and
+        optionalStringEql(a.access_key_id, b.access_key_id) and
+        optionalStringEql(a.secret_access_key, b.secret_access_key) and
+        optionalStringEql(a.session_token, b.session_token) and
+        a.use_ssl == b.use_ssl and a.addressing_style == b.addressing_style;
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+const OwnedS3Target = struct {
+    bucket: []u8,
+    prefix: []u8,
+
+    fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
+        alloc.free(self.bucket);
+        alloc.free(self.prefix);
+        self.* = undefined;
+    }
+};
+
+fn s3TargetAlloc(alloc: Allocator, uri: []const u8) !?OwnedS3Target {
+    var parsed = try remote_uri.parseAlloc(alloc, uri);
+    return switch (parsed) {
+        .file => |value| blk: {
+            alloc.free(value);
+            break :blk null;
+        },
+        .gcs => |*value| blk: {
+            value.deinit(alloc);
+            break :blk null;
+        },
+        .s3 => |*value| .{
+            .bucket = value.bucket,
+            .prefix = value.prefix,
+        },
+    };
+}
+
 pub const OwnedStack = struct {
     alloc: Allocator,
+    s3_client_pool: S3ClientPool,
     artifacts_impl: artifacts_object_store.ObjectStore,
     artifacts: artifacts_mod.ArtifactStore,
     manifests_impl: manifest_object_store.ObjectStore,
@@ -89,32 +179,54 @@ pub const OwnedStack = struct {
     pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig) !void {
         try validateConfig(alloc, cfg);
         self.alloc = alloc;
+        self.s3_client_pool = S3ClientPool.init(alloc);
+        errdefer self.s3_client_pool.deinit();
         self.query_cache = null;
         self.managed_query_embedder = null;
         self.dense_query_index_name = null;
         self.owned_foreign_registry = null;
-        self.artifacts_impl = try artifacts_object_store.ObjectStore.initRemoteUri(alloc, cfg.artifacts_uri);
-        errdefer self.artifacts_impl.deinit();
+        var artifacts_target = try s3TargetAlloc(alloc, cfg.artifacts_uri);
+        defer if (artifacts_target) |*target| target.deinit(alloc);
+        self.artifacts_impl = if (artifacts_target) |target|
+            try artifacts_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[0]), target.bucket, target.prefix)
+        else
+            try artifacts_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.artifacts_uri, cfg.s3_options[0]);
         self.artifacts = self.artifacts_impl.artifactStore();
         errdefer self.artifacts.deinit();
 
-        self.manifests_impl = try manifest_object_store.ObjectStore.initRemoteUri(alloc, cfg.manifests_uri);
-        errdefer self.manifests_impl.deinit();
+        var manifests_target = try s3TargetAlloc(alloc, cfg.manifests_uri);
+        defer if (manifests_target) |*target| target.deinit(alloc);
+        self.manifests_impl = if (manifests_target) |target|
+            try manifest_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[1]), target.bucket, target.prefix)
+        else
+            try manifest_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.manifests_uri, cfg.s3_options[1]);
         self.manifests = self.manifests_impl.manifestStore();
         errdefer self.manifests.deinit();
 
-        self.wal_impl = try wal_object_store.ObjectStore.initRemoteUri(alloc, cfg.wal_uri);
-        errdefer self.wal_impl.deinit();
+        var wal_target = try s3TargetAlloc(alloc, cfg.wal_uri);
+        defer if (wal_target) |*target| target.deinit(alloc);
+        self.wal_impl = if (wal_target) |target|
+            try wal_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[2]), target.bucket, target.prefix)
+        else
+            try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
         self.wal = self.wal_impl.walStore();
         errdefer self.wal.deinit();
 
-        self.progress_impl = try progress_object_store.ObjectProgressStore.initRemoteUri(alloc, cfg.progress_uri);
-        errdefer self.progress_impl.deinit();
+        var progress_target = try s3TargetAlloc(alloc, cfg.progress_uri);
+        defer if (progress_target) |*target| target.deinit(alloc);
+        self.progress_impl = if (progress_target) |target|
+            try progress_object_store.ObjectProgressStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[3]), target.bucket, target.prefix)
+        else
+            try progress_object_store.ObjectProgressStore.initRemoteUriWithS3Options(alloc, cfg.progress_uri, cfg.s3_options[3]);
         self.progress = self.progress_impl.progressStore();
         errdefer self.progress.deinit();
 
-        self.catalog_impl = try catalog_object_store.ObjectStore.initRemoteUri(alloc, cfg.catalog_uri);
-        errdefer self.catalog_impl.deinit();
+        var catalog_target = try s3TargetAlloc(alloc, cfg.catalog_uri);
+        defer if (catalog_target) |*target| target.deinit(alloc);
+        self.catalog_impl = if (catalog_target) |target|
+            try catalog_object_store.ObjectStore.initWithClient(alloc, try self.s3_client_pool.getOrCreate(cfg.s3_options[4]), target.bucket, target.prefix)
+        else
+            try catalog_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.catalog_uri, cfg.s3_options[4]);
         self.catalog_store = self.catalog_impl.catalogStore();
         errdefer self.catalog_store.deinit();
 
@@ -212,6 +324,7 @@ pub const OwnedStack = struct {
         self.wal.deinit();
         self.manifests.deinit();
         self.artifacts.deinit();
+        self.s3_client_pool.deinit();
         self.* = undefined;
     }
 };
@@ -222,7 +335,6 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
         if (std.mem.trim(u8, path, &std.ascii.whitespace).len == 0) return error.InvalidQueryCacheDir;
     }
 
-    var requires_s3 = false;
     var requires_gcs = false;
 
     for ([_][]const u8{
@@ -231,7 +343,7 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
         cfg.wal_uri,
         cfg.progress_uri,
         cfg.catalog_uri,
-    }) |uri| {
+    }, 0..) |uri, lane_index| {
         var parsed = try remote_uri.parseAlloc(alloc, uri);
         defer switch (parsed) {
             .file => |value| alloc.free(value),
@@ -242,13 +354,11 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
         switch (parsed) {
             .file => {},
             .gcs => requires_gcs = true,
-            .s3 => requires_s3 = true,
+            .s3 => {
+                var s3_cfg = try object_store_support.s3ConfigAlloc(alloc, cfg.s3_options[lane_index]);
+                s3_cfg.deinit(alloc);
+            },
         }
-    }
-
-    if (requires_s3) {
-        var s3_cfg = try objectstore.S3.fromEnvAlloc(alloc, null, true, null, null, null, null, .path);
-        s3_cfg.deinit(alloc);
     }
 
     if (requires_gcs) {

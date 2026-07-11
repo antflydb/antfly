@@ -428,33 +428,40 @@ echo "sk-..." | antfly keystore add openai.api_key --stdin
 ANTFLY_KEYSTORE_PASSWORD="..." antfly standalone --config config.yaml
 ```
 
-### S3 Storage with AWS Credentials
+### Serverless S3 Storage
 
 ```yaml
 # config.yaml
-storage:
-  engine: local
-  local:
-    base_dir: antflydb
-    data: s3
-    metadata: local
-    s3:
+deployment_mode: serverless
+connections:
+  primary-storage:
+    kind: external_io
+    capabilities: [storage.primary]
+    external_io:
+      protocol: s3
       endpoint: s3.amazonaws.com
-      bucket: antfly-data
-      use_ssl: true
-      access_key_id: ${secret:aws.access_key_id}
-      secret_access_key: ${secret:aws.secret_access_key}
+      region: us-west-2
+      buckets: [antfly-data]
+      access_key_id: ${secret:storage.access_key_id}
+      secret_access_key: ${secret:storage.secret_access_key}
+storage:
+  engine: object
+  object:
+    connection: primary-storage
+    bucket: antfly-data
+    prefix: production
 ```
 
 ```bash
-# Setup
-antfly keystore create
-antfly keystore add aws.access_key_id
-antfly keystore add aws.secret_access_key
-
-# Run
-ANTFLY_KEYSTORE_PASSWORD="..." antfly standalone --config config.yaml
+# Omit explicit connection keys to use the standard AWS environment variables
+# for a single connection. Use named secret references when a process connects
+# to multiple accounts.
+antfly serverless combined --config config.json --secret-store-path ~/.antfly/secrets.json
 ```
+
+Database storage and `remote_content.s3` use separate connection sets. This
+keeps write-capable database credentials out of document fetches and permits
+different read credentials and bucket policies for each content source.
 
 ### Multi-Provider AI with Multiple Keys
 

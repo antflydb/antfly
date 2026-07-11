@@ -1,0 +1,31 @@
+{
+  "deployment_mode": "serverless",
+  "connections": {
+    "production-storage": {
+      "kind": "external_io",
+      "capabilities": ["storage.primary"],
+      "external_io": {
+        "protocol": "s3",
+        "endpoint": "s3.amazonaws.com",
+        "region": "us-west-2",
+        "buckets": ["antfly-production-data", "antfly-production-wal"],
+        "access_key_id": "${secret:storage.aws_access_key_id}",
+        "secret_access_key": "${secret:storage.aws_secret_access_key}"
+      }
+    }
+  },
+  "storage": {
+    "engine": "object",
+    "object": {
+      "connection": "production-storage",
+      "bucket": "antfly-production-data",
+      "prefix": "production/cluster-1",
+      "lanes": {
+        "wal": {
+          "bucket": "antfly-production-wal",
+          "prefix": "cluster-1"
+        }
+      }
+    }
+  }
+}

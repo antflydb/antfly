@@ -61,7 +61,14 @@ The implementation now consists of:
   and atomic vacuum replacement. Document commits publish a namespace-head
   directory and per-namespace page links in the same checkpoint, so a cold
   table snapshot walks that table's history rather than the global document
-  log. Missing directory or namespace-link metadata is treated as corruption.
+  log. Namespace-head updates are append-only deltas backed by an in-memory
+  materialized directory; a full directory snapshot is emitted every 256
+  deltas. This makes the normal commit cost proportional to the namespaces
+  touched by the transaction instead of every namespace in the database while
+  bounding cold-open replay. The checkpoint links the directory delta and
+  document pages atomically, and snapshot publication makes the old delta chain
+  reclaimable. Missing directory or namespace-link metadata is treated as
+  corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Snapshot
   caches are maintained per namespace: commits rebuild only the affected
@@ -178,6 +185,11 @@ POST /admin/v1/maintenance/compact
 POST /admin/v1/maintenance/vacuum
 GET  /admin/v1/maintenance/jobs/{job_id}
 ```
+
+Normal API authentication and admin RBAC protect these routes when enabled.
+For an otherwise unauthenticated standalone server, configure a dedicated
+token with `--admin-token-env <ENV_NAME>` and send it using `Authorization:
+Bearer ...`; without either mechanism the admin surface fails closed.
 
 POST requests return `202` and a job document. `Idempotency-Key` safely returns
 the original job on retries. Only one maintenance job runs at a time; a

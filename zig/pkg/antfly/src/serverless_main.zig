@@ -20,6 +20,8 @@ const serverless_default_max_request_bytes: usize = antfly.public_api.http_serve
 const serverless_default_max_connection_threads: u32 = 64;
 
 const CliConfig = struct {
+    config_path: ?[]const u8 = null,
+    secret_store_path: ?[]const u8 = null,
     artifacts_uri: ?[]const u8 = null,
     manifests_uri: ?[]const u8 = null,
     wal_uri: ?[]const u8 = null,
@@ -76,19 +78,35 @@ pub fn runFromIterator(
         return;
     }
 
+    var secret_store: ?antfly.common.secrets.FileStore = if (cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH")) |path|
+        try antfly.common.secrets.FileStore.init(alloc, path)
+    else
+        null;
+    defer if (secret_store) |*store| store.deinit();
+    var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |path|
+        try antfly.common.config.loadFromPathWithSecrets(alloc, path, if (secret_store) |*store| store else null)
+    else
+        null;
+    defer if (loaded_config) |*cfg| cfg.deinit();
+    var configured_uris = try ConfiguredStorageUris.init(alloc, if (loaded_config) |*cfg| cfg else null);
+    defer configured_uris.deinit(alloc);
+
     var remote_content: ?antfly.common.config.Config.RemoteContentConfig = null;
     if (cli.remote_content_block_private_ips orelse parseEnvOptionalBool(init.environ_map, "ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS")) |block_private_ips| {
         remote_content = .{
             .security = .{ .block_private_ips = block_private_ips },
         };
+    } else if (loaded_config) |*cfg| {
+        if (cfg.remote_content) |value| remote_content = value;
     }
 
     const bootstrap = serverless.BootstrapConfig{
-        .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
-        .manifests_uri = try resolveRequired(init.environ_map, cli.manifests_uri, "ANTFLY_SERVERLESS_MANIFESTS_URI"),
-        .wal_uri = try resolveRequired(init.environ_map, cli.wal_uri, "ANTFLY_SERVERLESS_WAL_URI"),
-        .progress_uri = try resolveRequired(init.environ_map, cli.progress_uri, "ANTFLY_SERVERLESS_PROGRESS_URI"),
-        .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, "ANTFLY_SERVERLESS_CATALOG_URI"),
+        .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, configured_uris.artifacts, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
+        .manifests_uri = try resolveRequired(init.environ_map, cli.manifests_uri, configured_uris.manifests, "ANTFLY_SERVERLESS_MANIFESTS_URI"),
+        .wal_uri = try resolveRequired(init.environ_map, cli.wal_uri, configured_uris.wal, "ANTFLY_SERVERLESS_WAL_URI"),
+        .progress_uri = try resolveRequired(init.environ_map, cli.progress_uri, configured_uris.progress, "ANTFLY_SERVERLESS_PROGRESS_URI"),
+        .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, configured_uris.catalog, "ANTFLY_SERVERLESS_CATALOG_URI"),
+        .s3_options = configured_uris.s3_options,
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
         .query_cache_max_bytes = cli.query_cache_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", 0),
         .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", 0),
@@ -205,6 +223,14 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.help = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--config")) {
+            cfg.config_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--secret-store-path")) {
+            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--artifacts-uri")) {
             cfg.artifacts_uri = args.next() orelse return error.InvalidArguments;
             continue;
@@ -309,13 +335,100 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
 fn resolveRequired(
     env_map: *std.process.Environ.Map,
     cli_value: ?[]const u8,
+    config_value: ?[]const u8,
     env_name: []const u8,
 ) ![]const u8 {
     if (cli_value) |value| return value;
-    return env_map.get(env_name) orelse {
+    if (env_map.get(env_name)) |value| return value;
+    return config_value orelse {
         std.debug.print("missing required config: {s}\n", .{env_name});
         return error.MissingConfiguration;
     };
+}
+
+const ConfiguredStorageUris = struct {
+    artifacts: ?[]u8 = null,
+    manifests: ?[]u8 = null,
+    wal: ?[]u8 = null,
+    progress: ?[]u8 = null,
+    catalog: ?[]u8 = null,
+    s3_options: [5]?serverless.BootstrapConfig.S3Options = .{ null, null, null, null, null },
+
+    fn init(alloc: std.mem.Allocator, cfg: ?*const antfly.common.config.Config) !ConfiguredStorageUris {
+        const config = cfg orelse return .{};
+        if (config.deployment_mode != .serverless or config.storage.engine != .object) return error.InvalidServerlessStorageConfig;
+        const connection = config.storage.object_connection orelse return error.InvalidServerlessStorageConfig;
+        const bucket = config.storage.object_bucket orelse return error.InvalidServerlessStorageConfig;
+        const prefix = config.storage.object_prefix orelse "";
+        var out: ConfiguredStorageUris = .{};
+        errdefer out.deinit(alloc);
+        const lanes = [_]antfly.common.config.Config.ObjectStorageLocation{
+            config.storage.object_lanes.artifacts,
+            config.storage.object_lanes.manifests,
+            config.storage.object_lanes.wal,
+            config.storage.object_lanes.progress,
+            config.storage.object_lanes.catalog,
+        };
+        const names = [_][]const u8{ "artifacts", "manifests", "wal", "progress", "catalog" };
+        const uris = [_]*?[]u8{ &out.artifacts, &out.manifests, &out.wal, &out.progress, &out.catalog };
+        for (lanes, names, 0..) |lane, name, index| {
+            const lane_connection = lane.connection orelse connection;
+            const lane_bucket = lane.bucket orelse bucket;
+            uris[index].* = if (lane.prefix) |lane_prefix|
+                try objectUriAlloc(alloc, lane_bucket, lane_prefix)
+            else
+                try objectLaneUriAlloc(alloc, lane_bucket, prefix, name);
+            out.s3_options[index] = try storageS3Options(config, lane_connection);
+        }
+        return out;
+    }
+
+    fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
+        if (self.artifacts) |value| alloc.free(value);
+        if (self.manifests) |value| alloc.free(value);
+        if (self.wal) |value| alloc.free(value);
+        if (self.progress) |value| alloc.free(value);
+        if (self.catalog) |value| alloc.free(value);
+        self.* = .{};
+    }
+};
+
+fn storageS3Options(
+    config: *const antfly.common.config.Config,
+    connection_id: []const u8,
+) !serverless.BootstrapConfig.S3Options {
+    const connection = config.connections.get(connection_id) orelse return error.InvalidServerlessStorageConfig;
+    if (connection.kind != .external_io) return error.InvalidServerlessStorageConfig;
+    const external = connection.external_io orelse return error.InvalidServerlessStorageConfig;
+    if (external.protocol != .s3) return error.InvalidServerlessStorageConfig;
+    return .{
+        .endpoint = external.endpoint,
+        .region = external.region,
+        .access_key_id = external.access_key_id,
+        .secret_access_key = external.secret_access_key,
+        .session_token = external.session_token,
+        .use_ssl = external.use_ssl orelse true,
+        .addressing_style = switch (external.addressing_style) {
+            .path => .path,
+            .virtual_hosted => .virtual_hosted,
+        },
+    };
+}
+
+fn objectUriAlloc(alloc: std.mem.Allocator, bucket: []const u8, raw_prefix: []const u8) ![]u8 {
+    const prefix = std.mem.trim(u8, raw_prefix, "/");
+    return if (prefix.len == 0)
+        try std.fmt.allocPrint(alloc, "s3://{s}", .{bucket})
+    else
+        try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, prefix });
+}
+
+fn objectLaneUriAlloc(alloc: std.mem.Allocator, bucket: []const u8, raw_prefix: []const u8, lane: []const u8) ![]u8 {
+    const prefix = std.mem.trim(u8, raw_prefix, "/");
+    return if (prefix.len == 0)
+        try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, lane })
+    else
+        try std.fmt.allocPrint(alloc, "s3://{s}/{s}/{s}", .{ bucket, prefix, lane });
 }
 
 fn parseEnvIntOrDefault(
@@ -398,6 +511,8 @@ fn printUsage(argv0: []const u8) void {
         \\usage: {s} [options]
         \\
         \\options:
+        \\  --config <path>                 JSON common config with deployment_mode=serverless and storage.engine=object
+        \\  --secret-store-path <path>      Resolve ${{secret:...}} references from this encrypted store
         \\  --artifacts-uri <uri>
         \\  --manifests-uri <uri>
         \\  --wal-uri <uri>
@@ -431,6 +546,7 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_WAL_URI
         \\  ANTFLY_SERVERLESS_PROGRESS_URI
         \\  ANTFLY_SERVERLESS_CATALOG_URI
+        \\  ANTFLY_SECRET_STORE_PATH
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_DIR
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 0 (unbounded)
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 0 (unbounded)
@@ -465,9 +581,9 @@ fn startupErrorHint(err: anyerror) ?[]const u8 {
         error.InvalidTickInterval => "invalid tick interval; ANTFLY_SERVERLESS_TICK_INTERVAL_MS must be greater than zero",
         error.InvalidQueryCacheDir => "invalid query cache dir; ANTFLY_SERVERLESS_QUERY_CACHE_DIR must be non-empty when set",
         error.InvalidRuntimeRole => "invalid runtime role; expected combined, api, query, or maintenance",
-        error.MissingEndpoint => "missing S3-compatible endpoint; set AWS_ENDPOINT_URL for s3:// backends",
-        error.MissingAccessKeyId => "missing S3-compatible access key; set AWS_ACCESS_KEY_ID for s3:// backends",
-        error.MissingSecretAccessKey => "missing S3-compatible secret; set AWS_SECRET_ACCESS_KEY for s3:// backends",
+        error.MissingEndpoint => "missing S3-compatible endpoint; configure the storage connection endpoint or AWS_ENDPOINT_URL",
+        error.MissingAccessKeyId => "missing S3 access key; configure the storage connection secret or AWS_ACCESS_KEY_ID",
+        error.MissingSecretAccessKey => "missing S3 secret key; configure the storage connection secret or AWS_SECRET_ACCESS_KEY",
         error.MissingServiceAccount => "missing GCS auth; set GCS_BEARER_TOKEN, GOOGLE_OAUTH_ACCESS_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, or GOOGLE_APPLICATION_CREDENTIALS for gs:// backends",
         error.MissingProjectId => "missing GCS project id; set GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT, or use a service account that includes project_id",
         else => null,
@@ -516,7 +632,7 @@ test "serverless main module compiles" {
 
 test "serverless main startup hint covers backend config errors" {
     try std.testing.expectEqualStrings(
-        "missing S3-compatible endpoint; set AWS_ENDPOINT_URL for s3:// backends",
+        "missing S3-compatible endpoint; configure the storage connection endpoint or AWS_ENDPOINT_URL",
         startupErrorHint(error.MissingEndpoint).?,
     );
     try std.testing.expectEqualStrings(
@@ -593,4 +709,26 @@ test "serverless main backend summary prefers parsed location" {
         .backend = .file,
         .path = @constCast("/tmp/antfly-artifacts"),
     }));
+}
+
+test "serverless main derives multi-bucket lanes and per-connection credentials" {
+    const alloc = std.testing.allocator;
+    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": {
+        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "region": "us-west-2", "buckets": ["data-bucket"], "access_key_id": "data-key", "secret_access_key": "data-secret" } },
+        \\    "wal": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "endpoint": "minio:9000", "use_ssl": false, "buckets": ["wal-bucket"], "access_key_id": "wal-key", "secret_access_key": "wal-secret" } }
+        \\  },
+        \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket", "prefix": "/prod/", "lanes": { "wal": { "connection": "wal", "bucket": "wal-bucket", "prefix": "/durable/" } } } }
+        \\}
+    );
+    defer cfg.deinit();
+    var configured = try ConfiguredStorageUris.init(alloc, &cfg);
+    defer configured.deinit(alloc);
+    try std.testing.expectEqualStrings("s3://data-bucket/prod/artifacts", configured.artifacts.?);
+    try std.testing.expectEqualStrings("s3://wal-bucket/durable", configured.wal.?);
+    try std.testing.expectEqualStrings("data-key", configured.s3_options[0].?.access_key_id.?);
+    try std.testing.expectEqualStrings("wal-key", configured.s3_options[2].?.access_key_id.?);
+    try std.testing.expect(!configured.s3_options[2].?.use_ssl);
 }
