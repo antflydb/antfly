@@ -19,6 +19,7 @@ import (
 	"fmt"
 	_ "net/http/pprof" // #nosec DefaultServeMux is on internal ports only.
 	"reflect"
+	"strings"
 	"sync/atomic"
 
 	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
@@ -98,6 +99,8 @@ func parseConfig(v *viper.Viper) (*common.Config, error) {
 // command-specific defaults and validation requirements.
 func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Config, error) {
 	// Set defaults before parsing
+	v.SetDefault("storage.engine", "local")
+	liteStorage := strings.EqualFold(v.GetString("storage.engine"), "lite")
 	v.SetDefault("max_shard_size_bytes", defaultMaxShardSizeBytes)
 	if v.GetInt("max_shards_per_table") == 0 {
 		v.SetDefault("max_shards_per_table", 20)
@@ -105,20 +108,34 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 	v.SetDefault("disable_shard_alloc", true)
 	if v.GetInt("replication_factor") == 0 {
 		// If the default wasn't set by standalone mode set it here
-		v.SetDefault("replication_factor", 3)
+		if liteStorage {
+			v.SetDefault("replication_factor", 1)
+		} else {
+			v.SetDefault("replication_factor", 3)
+		}
 	}
 	if v.GetInt("default_shards_per_table") == 0 {
 		// If the default wasn't set by standalone mode set it here
-		v.SetDefault("default_shards_per_table", 3)
+		if liteStorage {
+			v.SetDefault("default_shards_per_table", 1)
+		} else {
+			v.SetDefault("default_shards_per_table", 3)
+		}
 	}
 	v.SetDefault("health_enabled", true)
 	v.SetDefault("health_port", 4200)
 	// Storage defaults
-	v.SetDefault("storage.local.base_dir", common.DefaultDataDir())
-	v.SetDefault("storage.keyvalue", "local")
-	v.SetDefault("storage.metadatakv", "local")
+	if !liteStorage && strings.EqualFold(v.GetString("storage.engine"), "local") {
+		v.SetDefault("storage.local.base_dir", common.DefaultDataDir())
+		v.SetDefault("storage.local.data", "local")
+		v.SetDefault("storage.local.metadata", "local")
+	}
 	if opts.DefaultInferenceAPIURL != "" {
 		v.SetDefault("inference.api_url", opts.DefaultInferenceAPIURL)
+	}
+
+	if err := validateStorageConfigShape(v.GetStringMap("storage")); err != nil {
+		return nil, err
 	}
 
 	var config common.Config
@@ -176,6 +193,69 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 	common.InitRegistryFromConfig(&config)
 
 	return &config, nil
+}
+
+func validateStorageConfigShape(storage map[string]any) error {
+	allowed := map[string]struct{}{"engine": {}, "lite": {}, "local": {}, "object": {}}
+	if err := validateConfigObjectFields("storage", storage, allowed); err != nil {
+		return fmt.Errorf("%w; engine-specific settings belong under storage.<engine>", err)
+	}
+
+	local, err := optionalConfigObject(storage, "local", "storage.local")
+	if err != nil {
+		return err
+	}
+	if local != nil {
+		if err := validateConfigObjectFields("storage.local", local, map[string]struct{}{"base_dir": {}, "data": {}, "metadata": {}, "s3": {}}); err != nil {
+			return err
+		}
+		s3, err := optionalConfigObject(local, "s3", "storage.local.s3")
+		if err != nil {
+			return err
+		}
+		if s3 != nil {
+			if err := validateConfigObjectFields("storage.local.s3", s3, map[string]struct{}{
+				"endpoint": {}, "use_ssl": {}, "access_key_id": {}, "secret_access_key": {}, "session_token": {},
+				"bucket": {}, "prefix": {},
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	lite, err := optionalConfigObject(storage, "lite", "storage.lite")
+	if err != nil {
+		return err
+	}
+	if err := validateConfigObjectFields("storage.lite", lite, map[string]struct{}{"path": {}, "fsync": {}}); err != nil {
+		return err
+	}
+	object, err := optionalConfigObject(storage, "object", "storage.object")
+	if err != nil {
+		return err
+	}
+	return validateConfigObjectFields("storage.object", object, map[string]struct{}{"provider": {}, "bucket": {}, "prefix": {}})
+}
+
+func optionalConfigObject(parent map[string]any, key, path string) (map[string]any, error) {
+	value, ok := parent[key]
+	if !ok {
+		return nil, nil
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an object", path)
+	}
+	return object, nil
+}
+
+func validateConfigObjectFields(path string, object map[string]any, allowed map[string]struct{}) error {
+	for key := range object {
+		if _, ok := allowed[key]; !ok {
+			return fmt.Errorf("unsupported %s field %q", path, key)
+		}
+	}
+	return nil
 }
 
 func remoteContentInitOptions(v *viper.Viper, config *common.Config) scraping.RemoteContentInitOptions {

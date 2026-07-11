@@ -7,8 +7,8 @@ storage:
   engine: local
   local:
     base_dir: "antflydb"
-  keyvalue: "local"
-  metadatakv: "local"
+    data: "local"
+    metadata: "local"
 inference:
   api_url: "http://127.0.0.1:11433"
 max_shard_size_bytes: 64000000

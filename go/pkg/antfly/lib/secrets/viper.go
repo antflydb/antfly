@@ -116,9 +116,9 @@ func setEnvVarsFromViper(v *viper.Viper) {
 	envMappings := map[string]string{ //nolint:gosec // G101: env var name mapping, not credentials
 		// AWS/S3 credentials - MinIO client reads only from env vars
 		// We removed these fields from S3Info struct for security
-		"storage.s3.access_key_id":     "AWS_ACCESS_KEY_ID",
-		"storage.s3.secret_access_key": "AWS_SECRET_ACCESS_KEY",
-		"storage.s3.session_token":     "AWS_SESSION_TOKEN",
+		"storage.local.s3.access_key_id":     "AWS_ACCESS_KEY_ID",
+		"storage.local.s3.secret_access_key": "AWS_SECRET_ACCESS_KEY",
+		"storage.local.s3.session_token":     "AWS_SESSION_TOKEN",
 	}
 
 	for viperKey, envVar := range envMappings {

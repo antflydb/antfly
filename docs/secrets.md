@@ -433,14 +433,17 @@ ANTFLY_KEYSTORE_PASSWORD="..." antfly standalone --config config.yaml
 ```yaml
 # config.yaml
 storage:
-  keyvalue: s3
-  s3:
-    endpoint: s3.amazonaws.com
-    region: us-east-1
-    bucket: antfly-data
-    use_ssl: true
-    access_key_id: ${secret:aws.access_key_id}
-    secret_access_key: ${secret:aws.secret_access_key}
+  engine: local
+  local:
+    base_dir: antflydb
+    data: s3
+    metadata: local
+    s3:
+      endpoint: s3.amazonaws.com
+      bucket: antfly-data
+      use_ssl: true
+      access_key_id: ${secret:aws.access_key_id}
+      secret_access_key: ${secret:aws.secret_access_key}
 ```
 
 ```bash

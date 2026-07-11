@@ -64,6 +64,7 @@ pub const Config = struct {
     cors: ?CorsConfig = null,
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
+    transaction_sessions: TransactionSessionConfig = .{},
     inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
@@ -121,6 +122,14 @@ pub const Config = struct {
             if (self.s3_prefix) |value| alloc.free(value);
             self.* = undefined;
         }
+    };
+
+    pub const TransactionSessionConfig = struct {
+        ttl_seconds: u64 = 3600,
+        cleanup_interval_seconds: u64 = 60,
+        max_count: usize = 1024,
+        max_record_bytes: usize = 16 * 1024 * 1024,
+        max_savepoints: usize = 64,
     };
 
     pub const InferenceConfig = struct {
@@ -433,6 +442,7 @@ pub const Config = struct {
                 if (validated.value.metadata) |metadata| metadata.orchestration_urls else null,
             ),
             .storage = try storageFromOpenApi(alloc, validated.value.storage),
+            .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             .inference = if (validated.value.inference) |inference| .{
                 .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
@@ -471,8 +481,6 @@ pub const Config = struct {
 
         const value = storage orelse return parsed;
         parsed.engine = value.engine;
-        parsed.data_backend = value.data;
-        parsed.metadata_backend = value.metadata;
 
         switch (parsed.engine) {
             .lite => {
@@ -480,7 +488,16 @@ pub const Config = struct {
                 parsed.lite_path = try alloc.dupe(u8, lite.path);
                 parsed.lite_fsync = lite.fsync orelse true;
             },
-            .local => {},
+            .local => {
+                const local = value.local.?;
+                parsed.data_backend = local.data;
+                parsed.metadata_backend = local.metadata;
+                if (local.base_dir) |base_dir| parsed.local_base_dir = try alloc.dupe(u8, base_dir);
+                if (local.s3) |s3| {
+                    parsed.s3_bucket = try alloc.dupe(u8, s3.bucket);
+                    if (s3.prefix) |prefix| parsed.s3_prefix = try alloc.dupe(u8, prefix);
+                }
+            },
             .object => {
                 const object = value.object.?;
                 parsed.object_provider = try alloc.dupe(u8, object.provider);
@@ -489,15 +506,18 @@ pub const Config = struct {
             },
         }
 
-        if (value.local) |local| {
-            if (local.base_dir) |base_dir| parsed.local_base_dir = try alloc.dupe(u8, base_dir);
-        }
-        if (value.s3) |s3| {
-            parsed.s3_bucket = try alloc.dupe(u8, s3.bucket);
-            if (s3.prefix) |prefix| parsed.s3_prefix = try alloc.dupe(u8, prefix);
-        }
-
         return parsed;
+    }
+
+    fn transactionSessionConfigFromOpenApi(value: ?common_openapi.TransactionSessionConfig) !TransactionSessionConfig {
+        const cfg = value orelse return .{};
+        return .{
+            .ttl_seconds = try boundedPositiveInt(u64, cfg.ttl_seconds, 60, 604800, 3600),
+            .cleanup_interval_seconds = try boundedPositiveInt(u64, cfg.cleanup_interval_seconds, 1, 3600, 60),
+            .max_count = try boundedPositiveInt(usize, cfg.max_count, 1, 65536, 1024),
+            .max_record_bytes = try boundedPositiveInt(usize, cfg.max_record_bytes, 65536, 67108864, 16 * 1024 * 1024),
+            .max_savepoints = try boundedPositiveInt(usize, cfg.max_savepoints, 1, 1024, 64),
+        };
     }
 
     fn validateStorageFromOpenApi(
@@ -506,6 +526,12 @@ pub const Config = struct {
         storage: ?common_openapi.StorageConfig,
     ) !void {
         const value = storage orelse return;
+        const storage_value = root.get("storage") orelse return error.InvalidConfig;
+        const storage_object = switch (storage_value) {
+            .object => |object| object,
+            else => return error.InvalidConfig,
+        };
+        if (!objectContainsOnly(storage_object, &.{ "engine", "lite", "local", "object" })) return error.InvalidConfig;
         const engine = value.engine;
         const has_lite = value.lite != null;
         const has_local = value.local != null;
@@ -516,9 +542,10 @@ pub const Config = struct {
         switch (engine) {
             .lite => {
                 if (!deployment_mode.supportsLite()) return error.InvalidConfig;
+                try validateObjectMemberFields(storage_object, "lite", &.{ "path", "fsync" });
                 const lite = value.lite orelse return error.InvalidConfig;
                 if (!std.mem.endsWith(u8, lite.path, ".aflite")) return error.InvalidConfig;
-                if (has_local or has_object or value.s3 != null or value.data != null or value.metadata != null) return error.InvalidConfig;
+                if (has_local or has_object) return error.InvalidConfig;
                 if ((try optionalU32Field(root, "replication_factor") orelse 1) != 1) return error.InvalidConfig;
                 if ((try optionalU32Field(root, "default_shards_per_table") orelse 1) != 1) return error.InvalidConfig;
                 if (try optionalBoolField(root, "disable_shard_alloc")) |disabled| {
@@ -535,12 +562,23 @@ pub const Config = struct {
             },
             .local => {
                 if (has_lite or has_object) return error.InvalidConfig;
-                if (!has_local) return error.InvalidConfig;
+                const local = value.local orelse return error.InvalidConfig;
+                const local_value = storage_object.get("local") orelse return error.InvalidConfig;
+                const local_object = switch (local_value) {
+                    .object => |object| object,
+                    else => return error.InvalidConfig,
+                };
+                if (!objectContainsOnly(local_object, &.{ "base_dir", "data", "metadata", "s3" })) return error.InvalidConfig;
+                if (local_object.get("s3") != null) {
+                    try validateObjectMemberFields(local_object, "s3", &.{ "endpoint", "use_ssl", "access_key_id", "secret_access_key", "session_token", "bucket", "prefix" });
+                }
+                if (((local.data orelse .local) == .s3 or (local.metadata orelse .local) == .s3) and local.s3 == null) return error.InvalidConfig;
             },
             .object => {
                 if (deployment_mode != .serverless) return error.InvalidConfig;
+                try validateObjectMemberFields(storage_object, "object", &.{ "provider", "bucket", "prefix" });
                 const object = value.object orelse return error.InvalidConfig;
-                if (has_lite or has_local or value.s3 != null or value.data != null or value.metadata != null) return error.InvalidConfig;
+                if (has_lite or has_local) return error.InvalidConfig;
                 if (!std.mem.eql(u8, object.provider, "s3")) return error.InvalidConfig;
                 if (object.bucket.len < 3 or object.bucket.len > 63) return error.InvalidConfig;
             },
@@ -1129,6 +1167,37 @@ fn requiredEnumField(comptime T: type, object: std.json.ObjectMap, field_name: [
     return std.meta.stringToEnum(T, value.string) orelse error.InvalidConfig;
 }
 
+fn objectContainsOnly(object: std.json.ObjectMap, allowed: []const []const u8) bool {
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        var found = false;
+        for (allowed) |field| {
+            if (std.mem.eql(u8, entry.key_ptr.*, field)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn validateObjectMemberFields(parent: std.json.ObjectMap, name: []const u8, allowed: []const []const u8) !void {
+    const value = parent.get(name) orelse return error.InvalidConfig;
+    const object = switch (value) {
+        .object => |member| member,
+        else => return error.InvalidConfig,
+    };
+    if (!objectContainsOnly(object, allowed)) return error.InvalidConfig;
+}
+
+fn boundedPositiveInt(comptime T: type, value: ?i64, min: T, max: T, default_value: T) !T {
+    const raw = value orelse return default_value;
+    const cast = std.math.cast(T, raw) orelse return error.InvalidConfig;
+    if (cast < min or cast > max) return error.InvalidConfig;
+    return cast;
+}
+
 fn requiredStringFieldDup(alloc: std.mem.Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
     return try optionalStringFieldDup(alloc, object, field_name) orelse error.InvalidConfig;
 }
@@ -1512,10 +1581,12 @@ test "common config preserves remote content logging and storage fields" {
         \\  "deployment_mode": "standalone",
         \\  "storage": {
         \\    "engine": "local",
-        \\    "local": { "base_dir": "antflydb" },
-        \\    "data": "s3",
-        \\    "metadata": "local",
-        \\    "s3": { "bucket": "antfly-prod", "prefix": "cluster-a/" }
+        \\    "local": {
+        \\      "base_dir": "antflydb",
+        \\      "data": "s3",
+        \\      "metadata": "local",
+        \\      "s3": { "endpoint": "s3.amazonaws.com", "bucket": "antfly-prod", "prefix": "cluster-a/" }
+        \\    }
         \\  },
         \\  "remote_content": {
         \\    "security": {
@@ -2053,8 +2124,7 @@ test "common config accepts partial metadata and storage objects" {
         \\  "metadata": {},
         \\  "storage": {
         \\    "engine": "local",
-        \\    "local": {},
-        \\    "data": "local"
+        \\    "local": { "data": "local" }
         \\  }
         \\}
     );
@@ -2064,6 +2134,54 @@ test "common config accepts partial metadata and storage objects" {
     try std.testing.expect(cfg.storage.local_base_dir == null);
     try std.testing.expectEqual(common_openapi.StorageBackend.local, cfg.storage.data_backend.?);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
+}
+
+test "common config rejects removed top-level storage backend fields" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "storage": {
+        \\    "engine": "local",
+        \\    "local": {},
+        \\    "data": "local"
+        \\  }
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "deployment_mode": "standalone",
+        \\  "storage": {
+        \\    "engine": "lite",
+        \\    "lite": { "path": "./data.aflite", "unknown": true }
+        \\  }
+        \\}
+    ));
+}
+
+test "common config parses bounded transaction session policy" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc,
+        \\{
+        \\  "transaction_sessions": {
+        \\    "ttl_seconds": 7200,
+        \\    "cleanup_interval_seconds": 30,
+        \\    "max_count": 256,
+        \\    "max_record_bytes": 1048576,
+        \\    "max_savepoints": 16
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 7200), cfg.transaction_sessions.ttl_seconds);
+    try std.testing.expectEqual(@as(u64, 30), cfg.transaction_sessions.cleanup_interval_seconds);
+    try std.testing.expectEqual(@as(usize, 256), cfg.transaction_sessions.max_count);
+    try std.testing.expectEqual(@as(usize, 1048576), cfg.transaction_sessions.max_record_bytes);
+    try std.testing.expectEqual(@as(usize, 16), cfg.transaction_sessions.max_savepoints);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"transaction_sessions":{"ttl_seconds":1}}
+    ));
 }
 
 test "common config applies standalone shard defaults when standalone mode is set" {

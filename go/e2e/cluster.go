@@ -200,10 +200,10 @@ func (c *TestCluster) startMetadataNode(ctx context.Context, logger *zap.Logger,
 		HealthPort:            GetFreePort(c.T),
 		Storage: common.StorageConfig{
 			Local: common.LocalStorageConfig{
-				BaseDir: c.DataDir,
+				BaseDir:  c.DataDir,
+				Data:     common.StorageBackendLocal,
+				Metadata: common.StorageBackendLocal,
 			},
-			Data:     common.StorageBackendLocal,
-			Metadata: common.StorageBackendLocal,
 		},
 		Metadata: common.MetadataInfo{
 			OrchestrationUrls: map[string]string{

@@ -48,10 +48,11 @@ func TestConfigUnmarshalFromYAML(t *testing.T) {
 version: "0.0.1"
 health_port: 4200
 storage:
+  engine: "local"
   local:
     base_dir: "antflydb"
-  data: "local"
-  metadata: "local"
+    data: "local"
+    metadata: "local"
 metadata:
   orchestration_urls:
     "1": "http://localhost:5001"
@@ -64,8 +65,8 @@ default_shards_per_table: 4
 				assert.Equal(t, "0.0.1", cfg.Version)
 				assert.Equal(t, 4200, cfg.HealthPort)
 				assert.Equal(t, "antflydb", cfg.Storage.Local.BaseDir)
-				assert.Equal(t, StorageBackendLocal, cfg.Storage.Data)
-				assert.Equal(t, StorageBackendLocal, cfg.Storage.Metadata)
+				assert.Equal(t, StorageBackendLocal, cfg.Storage.Local.Data)
+				assert.Equal(t, StorageBackendLocal, cfg.Storage.Local.Metadata)
 				assert.Len(t, cfg.Metadata.OrchestrationUrls, 1)
 				assert.Equal(t, uint64(1), cfg.ReplicationFactor)
 				assert.Equal(t, uint64(1073741824), cfg.MaxShardSizeBytes)
@@ -104,15 +105,16 @@ default_shards_per_table: 4
 version: "0.0.1"
 health_port: 4200
 storage:
+  engine: "local"
   local:
     base_dir: "antflydb"
-  data: "s3"
-  metadata: "local"
-  s3:
-    endpoint: "s3.amazonaws.com"
-    bucket: "my-antfly-bucket"
-    prefix: "production/"
-    use_ssl: true
+    data: "s3"
+    metadata: "local"
+    s3:
+      endpoint: "s3.amazonaws.com"
+      bucket: "my-antfly-bucket"
+      prefix: "production/"
+      use_ssl: true
 metadata:
   orchestration_urls:
     "1": "http://localhost:5001"
@@ -122,12 +124,12 @@ max_shards_per_table: 100
 default_shards_per_table: 8
 `,
 			validate: func(t *testing.T, cfg *Config) {
-				assert.Equal(t, StorageBackendS3, cfg.Storage.Data)
-				assert.Equal(t, StorageBackendLocal, cfg.Storage.Metadata)
-				assert.Equal(t, "s3.amazonaws.com", cfg.Storage.S3.Endpoint)
-				assert.Equal(t, "my-antfly-bucket", cfg.Storage.S3.Bucket)
-				assert.Equal(t, "production/", cfg.Storage.S3.Prefix)
-				assert.True(t, cfg.Storage.S3.UseSsl)
+				assert.Equal(t, StorageBackendS3, cfg.Storage.Local.Data)
+				assert.Equal(t, StorageBackendLocal, cfg.Storage.Local.Metadata)
+				assert.Equal(t, "s3.amazonaws.com", cfg.Storage.Local.S3.Endpoint)
+				assert.Equal(t, "my-antfly-bucket", cfg.Storage.Local.S3.Bucket)
+				assert.Equal(t, "production/", cfg.Storage.Local.S3.Prefix)
+				assert.True(t, cfg.Storage.Local.S3.UseSsl)
 			},
 		},
 		{
@@ -570,10 +572,10 @@ func TestValidateStorage(t *testing.T) {
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
+						BaseDir:  "antflydb",
+						Data:     StorageBackendLocal,
+						Metadata: StorageBackendLocal,
 					},
-					Data:     StorageBackendLocal,
-					Metadata: StorageBackendLocal,
 				},
 			},
 			wantErr: false,
@@ -628,10 +630,10 @@ func TestValidateStorage(t *testing.T) {
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "",
+						BaseDir:  "",
+						Data:     StorageBackendLocal,
+						Metadata: StorageBackendLocal,
 					},
-					Data:     StorageBackendLocal,
-					Metadata: StorageBackendLocal,
 				},
 			},
 			wantErr: true,
@@ -642,57 +644,57 @@ func TestValidateStorage(t *testing.T) {
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
+						BaseDir:  "antflydb",
+						Data:     "invalid",
+						Metadata: StorageBackendLocal,
 					},
-					Data:     "invalid",
-					Metadata: StorageBackendLocal,
 				},
 			},
 			wantErr: true,
-			errMsg:  "storage.data must be 'local' or 's3'",
+			errMsg:  "storage.local.data must be 'local' or 's3'",
 		},
 		{
 			name: "invalid metadatakv backend",
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
+						BaseDir:  "antflydb",
+						Data:     StorageBackendLocal,
+						Metadata: "invalid",
 					},
-					Data:     StorageBackendLocal,
-					Metadata: "invalid",
 				},
 			},
 			wantErr: true,
-			errMsg:  "storage.metadata must be 'local' or 's3'",
+			errMsg:  "storage.local.metadata must be 'local' or 's3'",
 		},
 		{
 			name: "S3 keyvalue without S3 config",
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
+						BaseDir:  "antflydb",
+						Data:     StorageBackendS3,
+						Metadata: StorageBackendLocal,
+						S3:       S3Info{},
 					},
-					Data:     StorageBackendS3,
-					Metadata: StorageBackendLocal,
-					S3:       S3Info{},
 				},
 			},
 			wantErr: true,
-			errMsg:  "storage.s3.endpoint is required when using S3 storage",
+			errMsg:  "storage.local.s3.endpoint is required when using S3 storage",
 		},
 		{
 			name: "S3 with valid config and credentials",
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
-					},
-					Data:     StorageBackendS3,
-					Metadata: StorageBackendLocal,
-					S3: S3Info{
-						Endpoint: "s3.amazonaws.com",
-						Bucket:   "my-bucket",
-						UseSsl:   true,
+						BaseDir:  "antflydb",
+						Data:     StorageBackendS3,
+						Metadata: StorageBackendLocal,
+						S3: S3Info{
+							Endpoint: "s3.amazonaws.com",
+							Bucket:   "my-bucket",
+							UseSsl:   true,
+						},
 					},
 				},
 			},
@@ -711,14 +713,14 @@ func TestValidateStorage(t *testing.T) {
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
-					},
-					Data:     StorageBackendS3,
-					Metadata: StorageBackendLocal,
-					S3: S3Info{
-						Endpoint: "s3.amazonaws.com",
-						Bucket:   "my-bucket",
-						UseSsl:   true,
+						BaseDir:  "antflydb",
+						Data:     StorageBackendS3,
+						Metadata: StorageBackendLocal,
+						S3: S3Info{
+							Endpoint: "s3.amazonaws.com",
+							Bucket:   "my-bucket",
+							UseSsl:   true,
+						},
 					},
 				},
 			},
@@ -734,13 +736,13 @@ func TestValidateStorage(t *testing.T) {
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
-					},
-					Data:     StorageBackendS3,
-					Metadata: StorageBackendLocal,
-					S3: S3Info{
-						Endpoint: "",
-						Bucket:   "my-bucket",
+						BaseDir:  "antflydb",
+						Data:     StorageBackendS3,
+						Metadata: StorageBackendLocal,
+						S3: S3Info{
+							Endpoint: "",
+							Bucket:   "my-bucket",
+						},
 					},
 				},
 			},
@@ -753,20 +755,20 @@ func TestValidateStorage(t *testing.T) {
 				os.Unsetenv("AWS_SECRET_ACCESS_KEY")
 			},
 			wantErr: true,
-			errMsg:  "storage.s3.endpoint is required when using S3 storage",
+			errMsg:  "storage.local.s3.endpoint is required when using S3 storage",
 		},
 		{
 			name: "S3 with empty bucket",
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
-					},
-					Data:     StorageBackendS3,
-					Metadata: StorageBackendLocal,
-					S3: S3Info{
-						Endpoint: "s3.amazonaws.com",
-						Bucket:   "",
+						BaseDir:  "antflydb",
+						Data:     StorageBackendS3,
+						Metadata: StorageBackendLocal,
+						S3: S3Info{
+							Endpoint: "s3.amazonaws.com",
+							Bucket:   "",
+						},
 					},
 				},
 			},
@@ -779,20 +781,20 @@ func TestValidateStorage(t *testing.T) {
 				os.Unsetenv("AWS_SECRET_ACCESS_KEY")
 			},
 			wantErr: true,
-			errMsg:  "storage.s3.bucket is required when using S3 storage",
+			errMsg:  "storage.local.s3.bucket is required when using S3 storage",
 		},
 		{
 			name: "S3 with bucket name too short",
 			config: &Config{
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
-					},
-					Data:     StorageBackendS3,
-					Metadata: StorageBackendLocal,
-					S3: S3Info{
-						Endpoint: "s3.amazonaws.com",
-						Bucket:   "ab",
+						BaseDir:  "antflydb",
+						Data:     StorageBackendS3,
+						Metadata: StorageBackendLocal,
+						S3: S3Info{
+							Endpoint: "s3.amazonaws.com",
+							Bucket:   "ab",
+						},
 					},
 				},
 			},
@@ -972,10 +974,10 @@ func TestConfigValidate(t *testing.T) {
 				},
 				Storage: StorageConfig{
 					Local: LocalStorageConfig{
-						BaseDir: "antflydb",
+						BaseDir:  "antflydb",
+						Data:     StorageBackendLocal,
+						Metadata: StorageBackendLocal,
 					},
-					Data:     StorageBackendLocal,
-					Metadata: StorageBackendLocal,
 				},
 				ReplicationFactor:     3,
 				MaxShardSizeBytes:     1073741824,
@@ -1117,7 +1119,7 @@ func TestHelperMethods(t *testing.T) {
 				name: "empty data returns local",
 				config: &Config{
 					Storage: StorageConfig{
-						Data: "",
+						Local: LocalStorageConfig{Data: ""},
 					},
 				},
 				expected: "local",
@@ -1126,7 +1128,7 @@ func TestHelperMethods(t *testing.T) {
 				name: "s3 data",
 				config: &Config{
 					Storage: StorageConfig{
-						Data: StorageBackendS3,
+						Local: LocalStorageConfig{Data: StorageBackendS3},
 					},
 				},
 				expected: "s3",
@@ -1156,7 +1158,7 @@ func TestHelperMethods(t *testing.T) {
 				name: "empty metadata returns local",
 				config: &Config{
 					Storage: StorageConfig{
-						Metadata: "",
+						Local: LocalStorageConfig{Metadata: ""},
 					},
 				},
 				expected: "local",
@@ -1165,7 +1167,7 @@ func TestHelperMethods(t *testing.T) {
 				name: "s3 metadata",
 				config: &Config{
 					Storage: StorageConfig{
-						Metadata: StorageBackendS3,
+						Local: LocalStorageConfig{Metadata: StorageBackendS3},
 					},
 				},
 				expected: "s3",

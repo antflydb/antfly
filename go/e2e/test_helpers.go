@@ -150,10 +150,10 @@ func CreateTestConfig(t *testing.T, baseDir string, id types.ID) *common.Config 
 		HealthPort:            GetFreePort(t),
 		Storage: common.StorageConfig{
 			Local: common.LocalStorageConfig{
-				BaseDir: baseDir,
+				BaseDir:  baseDir,
+				Data:     common.StorageBackendLocal,
+				Metadata: common.StorageBackendLocal,
 			},
-			Data:     common.StorageBackendLocal,
-			Metadata: common.StorageBackendLocal,
 		},
 		Metadata: common.MetadataInfo{
 			OrchestrationUrls: map[string]string{},

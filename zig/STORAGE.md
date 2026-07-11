@@ -57,7 +57,14 @@ storage:
   engine: local
   local:
     base_dir: ~/.antfly
+    data: local
+    metadata: local
 ```
+
+Local-engine backend selection and any S3 connection used by that engine are
+nested under `storage.local`. Removed top-level fields such as `storage.data`,
+`storage.metadata`, and `storage.s3` are invalid; configuration loaders fail
+closed instead of interpreting multiple shapes.
 
 ```yaml
 # Object-backed serverless deployment
@@ -82,6 +89,23 @@ HTTP runtime. `antfly lite serve` is only an artifact-oriented constructor; it
 atomically creates the file when it does not exist and opens it otherwise.
 There is no storage-specific HTTP namespace. Clients use the same `/db/v1`
 contract regardless of whether standalone storage is `local` or `lite`.
+
+Durable multi-request transaction sessions have bounded, configurable
+retention. Defaults are one hour, cleanup every minute, 1,024 sessions, a
+16 MiB encoded record per session, and 64 savepoints:
+
+```yaml
+transaction_sessions:
+  ttl_seconds: 3600
+  cleanup_interval_seconds: 60
+  max_count: 1024
+  max_record_bytes: 16777216
+  max_savepoints: 64
+```
+
+Session changes use persist-before-publish copy-on-write semantics. A failed
+allocation, write, or fsync leaves both the durable record and the in-memory
+session unchanged.
 
 ## Validation and safety invariants
 

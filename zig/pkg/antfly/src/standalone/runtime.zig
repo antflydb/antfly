@@ -31,6 +31,11 @@ const public_api_max_body_size: usize = antfly.common.http.default_max_request_b
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 const default_public_port: u16 = 8080;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
+const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
+const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
+const standalone_session_max_count: usize = 1024;
+const standalone_session_max_record_bytes: usize = 16 * 1024 * 1024;
+const standalone_session_savepoint_limit: usize = 64;
 const antfarm_installed_asset_root = "../share/antfly/antfarm";
 const antfarm_asset_roots = [_][]const u8{
     "src/metadata/antfarm",
@@ -1273,6 +1278,11 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else null,
+            .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
+            .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
+            .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
+            .session_max_record_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_record_bytes else standalone_session_max_record_bytes,
+            .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },
         .ha = if (ha_primary != null or ha_standby != null or ha_fence_store != null or ha_former_primary_log != null) .{
             .admin_context = .{

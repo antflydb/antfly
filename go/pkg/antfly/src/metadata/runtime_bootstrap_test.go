@@ -52,10 +52,10 @@ func TestNewRuntimeDoesNotSeedAdminBeforeRaftStart(t *testing.T) {
 		SplitTimeout:             time.Minute,
 		SplitFinalizeGracePeriod: time.Second,
 		Storage: common.StorageConfig{
-			Data:     common.StorageBackendLocal,
-			Metadata: common.StorageBackendLocal,
 			Local: common.LocalStorageConfig{
-				BaseDir: t.TempDir(),
+				BaseDir:  t.TempDir(),
+				Data:     common.StorageBackendLocal,
+				Metadata: common.StorageBackendLocal,
 			},
 		},
 		Metadata: common.MetadataInfo{

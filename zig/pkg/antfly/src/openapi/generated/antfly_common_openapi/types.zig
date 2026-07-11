@@ -38,6 +38,7 @@ pub const Config = struct {
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
     storage: ?StorageConfig = null,
+    transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
     inference: ?antfly_inference_config_openapi.Config = null,
     tls: ?TLSInfo = null,
@@ -214,6 +215,9 @@ pub const LiteStorageConfig = struct {
 pub const LocalStorageConfig = struct {
     /// Root directory for all antfly data storage. Defaults to 'antflydb'.
     base_dir: ?[]const u8 = null,
+    data: ?StorageBackend = null,
+    metadata: ?StorageBackend = null,
+    s3: ?S3Info = null,
 };
 
 pub const MetadataInfo = struct {
@@ -278,9 +282,6 @@ pub const StorageConfig = struct {
     lite: ?LiteStorageConfig = null,
     object: ?ObjectStorageConfig = null,
     local: ?LocalStorageConfig = null,
-    data: ?StorageBackend = null,
-    metadata: ?StorageBackend = null,
-    s3: ?S3Info = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -296,18 +297,6 @@ pub const StorageConfig = struct {
         }
         if (self.local) |value| {
             try jw.objectField("local");
-            try jw.write(value);
-        }
-        if (self.data) |value| {
-            try jw.objectField("data");
-            try jw.write(value);
-        }
-        if (self.metadata) |value| {
-            try jw.objectField("metadata");
-            try jw.write(value);
-        }
-        if (self.s3) |value| {
-            try jw.objectField("s3");
             try jw.write(value);
         }
         try jw.endObject();
@@ -348,6 +337,15 @@ pub const TLSInfo = struct {
     cert: ?[]const u8 = null,
     /// Path to TLS key file
     key: ?[]const u8 = null,
+};
+
+/// Resource and retention limits for multi-request transaction sessions.
+pub const TransactionSessionConfig = struct {
+    ttl_seconds: ?i64 = null,
+    cleanup_interval_seconds: ?i64 = null,
+    max_count: ?i64 = null,
+    max_record_bytes: ?i64 = null,
+    max_savepoints: ?i64 = null,
 };
 
 pub const WebSearchConnectionConfig = struct {

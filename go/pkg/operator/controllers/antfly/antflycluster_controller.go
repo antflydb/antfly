@@ -521,8 +521,8 @@ func buildPVCRetentionPolicy(policy *antflyv1.PVCRetentionPolicy) *appsv1.Statef
 
 // cleanupStorageResources handles ordered deletion of StatefulSets, pods, and PVCs
 // on cluster deletion. Returns a non-nil Result if the caller should requeue.
-// Deletion order: record PVC deletion intent → delete StatefulSets → wait for
-// pods → sweep remaining PVCs → remove finalizer. Kubernetes PVC protection
+// Deletion order: validate all PVCs → record PVC deletion intent → delete
+// StatefulSets → wait for pods → remove finalizer. Kubernetes PVC protection
 // keeps claims alive until their last pod exits without losing cleanup intent
 // when a historical StatefulSet disappears between reconciles.
 func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, cluster *antflyv1.AntflyCluster) (*ctrl.Result, error) {

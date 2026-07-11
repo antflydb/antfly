@@ -26,6 +26,8 @@ components:
           example: 4200
         storage:
           $ref: "#/components/schemas/StorageConfig"
+        transaction_sessions:
+          $ref: "#/components/schemas/TransactionSessionConfig"
         metadata:
           $ref: "#/components/schemas/MetadataInfo"
         inference:
@@ -623,6 +625,7 @@ components:
 
     LocalStorageConfig:
       type: object
+      additionalProperties: false
       properties:
         base_dir:
           type: string
@@ -630,6 +633,12 @@ components:
           default: "antflydb"
           minLength: 1
           example: "antflydb"
+        data:
+          $ref: "#/components/schemas/StorageBackend"
+        metadata:
+          $ref: "#/components/schemas/StorageBackend"
+        s3:
+          $ref: "#/components/schemas/S3Info"
 
     S3Info:
       type: object
@@ -669,8 +678,40 @@ components:
         - object
       default: local
 
+    TransactionSessionConfig:
+      type: object
+      additionalProperties: false
+      description: "Resource and retention limits for multi-request transaction sessions."
+      properties:
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          default: 3600
+        cleanup_interval_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 60
+        max_count:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 1024
+        max_record_bytes:
+          type: integer
+          minimum: 65536
+          maximum: 67108864
+          default: 16777216
+        max_savepoints:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          default: 64
+
     LiteStorageConfig:
       type: object
+      additionalProperties: false
       required:
         - path
       properties:
@@ -688,6 +729,7 @@ components:
 
     ObjectStorageConfig:
       type: object
+      additionalProperties: false
       required:
         - provider
         - bucket
@@ -705,6 +747,7 @@ components:
 
     StorageConfig:
       type: object
+      additionalProperties: false
       description: >-
         Tagged storage-engine configuration. Engine is required and exactly the
         matching engine member must be present.
@@ -720,9 +763,6 @@ components:
             anyOf:
               - required: [local]
               - required: [object]
-              - required: [data]
-              - required: [metadata]
-              - required: [s3]
         - title: Local storage configuration
           required: [engine, local]
           properties:
@@ -743,9 +783,6 @@ components:
             anyOf:
               - required: [lite]
               - required: [local]
-              - required: [data]
-              - required: [metadata]
-              - required: [s3]
       properties:
         engine:
           $ref: "#/components/schemas/StorageEngine"
@@ -755,9 +792,3 @@ components:
           $ref: "#/components/schemas/ObjectStorageConfig"
         local:
           $ref: "#/components/schemas/LocalStorageConfig"
-        data:
-          $ref: "#/components/schemas/StorageBackend"
-        metadata:
-          $ref: "#/components/schemas/StorageBackend"
-        s3:
-          $ref: "#/components/schemas/S3Info"

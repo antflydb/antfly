@@ -12,13 +12,13 @@ storage:
   engine: local
   local:
     base_dir: "antflydb"
-  keyvalue: "s3"
-  metadatakv: "local"
-  s3:
-    endpoint: "localhost:9000"
-    bucket: "antfly-test"
-    prefix: "local-dev"
-    use_ssl: false  # MinIO local typically doesn't use SSL
+    data: "s3"
+    metadata: "local"
+    s3:
+      endpoint: "localhost:9000"
+      bucket: "antfly-test"
+      prefix: "local-dev"
+      use_ssl: false  # MinIO local typically doesn't use SSL
 
 # To start local MinIO:
 # docker run -p 9000:9000 -p 9001:9001 \

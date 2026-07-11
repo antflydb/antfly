@@ -108,6 +108,9 @@ func (c *Config) ValidateWithOptions(opts ValidationOptions) error {
 	if err := c.validateStorage(); err != nil {
 		return fmt.Errorf("storage config validation failed: %w", err)
 	}
+	if err := c.validateTransactionSessions(); err != nil {
+		return fmt.Errorf("transaction_sessions config validation failed: %w", err)
+	}
 
 	// Validate MaxShardSizeBytes
 	if err := c.validateMaxShardSizeBytes(); err != nil {
@@ -125,6 +128,26 @@ func (c *Config) ValidateWithOptions(opts ValidationOptions) error {
 		return errors.New("default_shards_per_table must be greater than 0")
 	}
 
+	return nil
+}
+
+func (c *Config) validateTransactionSessions() error {
+	checks := []struct {
+		name     string
+		value    int
+		min, max int
+	}{
+		{"ttl_seconds", c.TransactionSessions.TtlSeconds, 60, 604800},
+		{"cleanup_interval_seconds", c.TransactionSessions.CleanupIntervalSeconds, 1, 3600},
+		{"max_count", c.TransactionSessions.MaxCount, 1, 65536},
+		{"max_record_bytes", c.TransactionSessions.MaxRecordBytes, 65536, 67108864},
+		{"max_savepoints", c.TransactionSessions.MaxSavepoints, 1, 1024},
+	}
+	for _, check := range checks {
+		if check.value != 0 && (check.value < check.min || check.value > check.max) {
+			return fmt.Errorf("%s must be between %d and %d", check.name, check.min, check.max)
+		}
+	}
 	return nil
 }
 
@@ -223,8 +246,8 @@ func (c *Config) validateStorage() error {
 		if !strings.HasSuffix(c.Storage.Lite.Path, ".aflite") {
 			return errors.New("storage.lite.path must end in .aflite")
 		}
-		if hasLocal || hasObject || c.Storage.S3.Bucket != "" || c.Storage.Data != "" || c.Storage.Metadata != "" {
-			return errors.New("storage.lite, storage.local, storage.object, and legacy backend settings are mutually exclusive")
+		if hasLocal || hasObject || c.Storage.Local.S3.Bucket != "" || c.Storage.Local.Data != "" || c.Storage.Local.Metadata != "" {
+			return errors.New("storage.lite, storage.local, and storage.object are mutually exclusive")
 		}
 		if c.ReplicationFactor > 1 || c.DefaultShardsPerTable > 1 {
 			return errors.New("Lite storage supports one writer and one shard; replication and horizontal sharding are not supported")
@@ -237,7 +260,7 @@ func (c *Config) validateStorage() error {
 		if c.EffectiveDeploymentMode() != ConfigDeploymentModeServerless {
 			return errors.New("storage.engine=object requires deployment_mode serverless")
 		}
-		if hasLite || hasLocal || !hasObject || c.Storage.S3.Bucket != "" || c.Storage.Data != "" || c.Storage.Metadata != "" {
+		if hasLite || hasLocal || !hasObject || c.Storage.Local.S3.Bucket != "" || c.Storage.Local.Data != "" || c.Storage.Local.Metadata != "" {
 			return errors.New("storage.object is required and must be the only storage member when storage.engine=object")
 		}
 		if c.Storage.Object.Provider != ObjectStorageConfigProviderS3 {
@@ -261,35 +284,35 @@ func (c *Config) validateStorage() error {
 	}
 
 	// Validate data backend selection
-	if c.Storage.Data != "" && c.Storage.Data != StorageBackendLocal && c.Storage.Data != StorageBackendS3 {
-		return fmt.Errorf("storage.data must be 'local' or 's3', got '%s'", c.Storage.Data)
+	if c.Storage.Local.Data != "" && c.Storage.Local.Data != StorageBackendLocal && c.Storage.Local.Data != StorageBackendS3 {
+		return fmt.Errorf("storage.local.data must be 'local' or 's3', got '%s'", c.Storage.Local.Data)
 	}
 
 	// Validate metadata backend selection
-	if c.Storage.Metadata != "" && c.Storage.Metadata != StorageBackendLocal && c.Storage.Metadata != StorageBackendS3 {
-		return fmt.Errorf("storage.metadata must be 'local' or 's3', got '%s'", c.Storage.Metadata)
+	if c.Storage.Local.Metadata != "" && c.Storage.Local.Metadata != StorageBackendLocal && c.Storage.Local.Metadata != StorageBackendS3 {
+		return fmt.Errorf("storage.local.metadata must be 'local' or 's3', got '%s'", c.Storage.Local.Metadata)
 	}
 
 	// If either data or metadata uses S3, validate S3 configuration
-	if c.Storage.Data == StorageBackendS3 || c.Storage.Metadata == StorageBackendS3 {
+	if c.Storage.Local.Data == StorageBackendS3 || c.Storage.Local.Metadata == StorageBackendS3 {
 		// Validate S3 endpoint
-		if strings.TrimSpace(c.Storage.S3.Endpoint) == "" {
-			return errors.New("storage.s3.endpoint is required when using S3 storage")
+		if strings.TrimSpace(c.Storage.Local.S3.Endpoint) == "" {
+			return errors.New("storage.local.s3.endpoint is required when using S3 storage")
 		}
 
 		// Validate S3 bucket
-		if strings.TrimSpace(c.Storage.S3.Bucket) == "" {
-			return errors.New("storage.s3.bucket is required when using S3 storage")
+		if strings.TrimSpace(c.Storage.Local.S3.Bucket) == "" {
+			return errors.New("storage.local.s3.bucket is required when using S3 storage")
 		}
 
 		// Validate bucket name format (basic validation)
-		bucket := strings.TrimSpace(c.Storage.S3.Bucket)
+		bucket := strings.TrimSpace(c.Storage.Local.S3.Bucket)
 		if len(bucket) < 3 || len(bucket) > 63 {
 			return fmt.Errorf("S3 bucket name must be between 3 and 63 characters, got %d", len(bucket))
 		}
 
 		// Check for credentials from config (resolved via secrets resolver) or environment variables
-		creds := c.Storage.S3.GetS3Credentials()
+		creds := c.Storage.Local.S3.GetS3Credentials()
 		if creds.AccessKeyId == "" || creds.SecretAccessKey == "" {
 			return errors.New(
 				"S3 credentials required: set access_key_id and secret_access_key in config " +
@@ -391,10 +414,10 @@ func (c *Config) GetKeyValueStorageType() string {
 	if c == nil {
 		return "local"
 	}
-	if c.Storage.Data == "" {
+	if c.Storage.Local.Data == "" {
 		return "local"
 	}
-	return string(c.Storage.Data)
+	return string(c.Storage.Local.Data)
 }
 
 // GetMetadataStorageType returns the storage type for metadata ("local" or "s3")
@@ -402,10 +425,10 @@ func (c *Config) GetMetadataStorageType() string {
 	if c == nil {
 		return "local"
 	}
-	if c.Storage.Metadata == "" {
+	if c.Storage.Local.Metadata == "" {
 		return "local"
 	}
-	return string(c.Storage.Metadata)
+	return string(c.Storage.Local.Metadata)
 }
 
 // GetS3Credentials returns S3 credentials from config with fallback to environment variables.

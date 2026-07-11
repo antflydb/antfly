@@ -302,6 +302,8 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
+    session_max_count: ?usize = null,
+    session_max_record_bytes: ?usize = null,
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -1102,6 +1104,8 @@ pub const ApiHttpServer = struct {
                     null,
                 cfg.session_owner_lease_ttl_ns,
                 cfg.session_savepoint_limit,
+                cfg.session_max_count,
+                cfg.session_max_record_bytes,
             ),
             .join_job_store = distributed_join.JoinJobStore.init(alloc, .{
                 .join_job_store_path = cfg.join_job_store_path,
@@ -1168,6 +1172,8 @@ pub const ApiHttpServer = struct {
                 opened.leaseStore().*,
                 effective_cfg.session_owner_lease_ttl_ns,
                 effective_cfg.session_savepoint_limit,
+                effective_cfg.session_max_count,
+                effective_cfg.session_max_record_bytes,
             );
         }
         if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
@@ -3224,7 +3230,11 @@ pub const ApiHttpServer = struct {
                 const begin_req = transactions_api.parseBeginRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid transaction begin request");
                 };
-                const session = try self.txn_sessions.begin(self.alloc, begin_req, self.localSessionNodeId());
+                const session = self.txn_sessions.begin(self.alloc, begin_req, self.localSessionNodeId()) catch |err| switch (err) {
+                    error.SessionLimitExceeded => return try textResponse(self.alloc, 429, "transaction session limit exceeded"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
+                    else => return err,
+                };
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
@@ -3386,6 +3396,7 @@ pub const ApiHttpServer = struct {
 
                 const session = (self.txn_sessions.stageRead(self.alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3405,6 +3416,7 @@ pub const ApiHttpServer = struct {
 
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3424,6 +3436,7 @@ pub const ApiHttpServer = struct {
 
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3439,6 +3452,7 @@ pub const ApiHttpServer = struct {
                 const info = (self.txn_sessions.createSavepoint(self.alloc, txn_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     error.SavepointLimitExceeded => return try textResponse(self.alloc, 409, "savepoint limit exceeded"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3453,6 +3467,7 @@ pub const ApiHttpServer = struct {
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
                 const info = (self.txn_sessions.rollbackToSavepoint(self.alloc, txn_id, session_route.savepoint_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3475,6 +3490,7 @@ pub const ApiHttpServer = struct {
 
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);

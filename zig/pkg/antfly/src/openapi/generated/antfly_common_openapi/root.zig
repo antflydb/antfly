@@ -20,4 +20,5 @@ pub const StorageBackend = types.StorageBackend;
 pub const StorageConfig = types.StorageConfig;
 pub const StorageEngine = types.StorageEngine;
 pub const TLSInfo = types.TLSInfo;
+pub const TransactionSessionConfig = types.TransactionSessionConfig;
 pub const WebSearchConnectionConfig = types.WebSearchConnectionConfig;

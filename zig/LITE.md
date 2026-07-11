@@ -76,6 +76,12 @@ The implementation now consists of:
   `.aflite` file retains the complete database state. The existing data, query,
   transaction, inference, SQL, and `/db/v1` implementations are reused rather
   than forked.
+- Durable transaction sessions are copy-on-write: the candidate record is
+  committed to the Lite namespace before it replaces the in-memory session.
+  Failed writes and fsyncs cannot expose unacknowledged staged operations.
+  Standalone applies the bounded `transaction_sessions` TTL, count, encoded
+  record size, and savepoint policy documented in `STORAGE.md`, preventing
+  abandoned sessions from growing the `.aflite` file without limit.
 
 Directory-backed and LSM-container profiles remain internal development and
 conformance tools. They are not public `.aflite` formats and invalid or unknown

@@ -284,7 +284,7 @@ func (m *Store) ID() types.ID {
 }
 
 func (m *Store) S3Info() *common.S3Info {
-	return &m.antflyConfig.Storage.S3
+	return &m.antflyConfig.Storage.Local.S3
 }
 
 // ErrorcC dynamically receives new error channels from shards and fans them in
