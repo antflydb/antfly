@@ -569,7 +569,9 @@ fn hasPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) !bool {
     const marker_path = try publicationMarkerPathAlloc(alloc, root);
     defer alloc.free(marker_path);
     const marker = std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(publication_marker_data.len + 1)) catch |err| switch (err) {
-        error.FileNotFound => return false,
+        // NotDir: the live root is a file (e.g. an Antfly Lite *.aflite
+        // database), so a marker can never exist beneath it.
+        error.FileNotFound, error.NotDir => return false,
         else => return err,
     };
     defer alloc.free(marker);
@@ -581,7 +583,7 @@ fn clearPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) bool {
     const marker_path = publicationMarkerPathAlloc(alloc, root) catch return false;
     defer alloc.free(marker_path);
     std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
-        error.FileNotFound => return true,
+        error.FileNotFound, error.NotDir => return true,
         else => {
             std.log.warn("generation publication marker cleanup deferred path={s} err={s}", .{ marker_path, @errorName(err) });
             return false;

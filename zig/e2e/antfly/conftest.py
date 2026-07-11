@@ -128,7 +128,7 @@ def find_free_port() -> int:
 
 def wait_for_server(
     url: str,
-    timeout: float = 30.0,
+    timeout: float = float(os.environ.get("ANTFLY_E2E_SERVER_START_TIMEOUT_S", "30.0")),
     path: str = "/status",
     *,
     allow_unauthorized: bool = False,

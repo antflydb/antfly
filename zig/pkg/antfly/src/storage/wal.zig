@@ -3828,9 +3828,13 @@ test "wal backend adapters expose txn cursor operations" {
         errdefer txn.abort();
         var write = txn.writeAdapter();
         try write.put(&key, "value");
-        var cur = try write.openCursor();
-        defer cur.close();
-        try std.testing.expectEqualStrings(&key, (try cur.start(.{})).?.key);
+        {
+            // Cursors must close before commit: committing with an open
+            // cursor fails closed with error.TransactionCursorActive.
+            var cur = try write.openCursor();
+            defer cur.close();
+            try std.testing.expectEqualStrings(&key, (try cur.start(.{})).?.key);
+        }
         try write.commit();
     }
 

@@ -1430,7 +1430,13 @@ pub const ApiHttpServer = struct {
         else
             items.items.len == 0 or !read_statuses_present or read_needs_refresh;
         if (should_query_writes and self.table_writes != null) {
-            if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
+            // Local write-source statuses are a best-effort refresh: a shard
+            // that is not hosted locally must not fail the status request.
+            const write_statuses = self.table_writes.?.localRuntimeStatuses(self.alloc, table_name) catch |err| blk: {
+                std.log.warn("index status local write-source runtime statuses unavailable table={s} err={s}", .{ table_name, @errorName(err) });
+                break :blk null;
+            };
+            if (write_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
                 try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, if (read_needs_refresh) .replace_existing else .append);
@@ -22240,7 +22246,7 @@ test "api index status uses propagated remote store runtime status" {
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 1), reads.status_calls.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 0), writes.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
     var parsed = try std.json.parseFromSlice(Response, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?u64, 12), parsed.value.status.doc_count);
@@ -22470,7 +22476,7 @@ test "api index status ignores propagated runtime status from removed owner" {
     });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqual(@as(u32, 0), writes.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
     var parsed = try std.json.parseFromSlice(Response, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?u64, null), parsed.value.status.doc_count);
@@ -22610,7 +22616,7 @@ test "api index status reports missing remote shard as not ready" {
     });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqual(@as(u32, 0), writes.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
     var parsed = try std.json.parseFromSlice(Response, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (parsed.value.status.rebuilding) |rebuilding| try std.testing.expect(rebuilding);
