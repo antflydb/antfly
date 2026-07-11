@@ -2631,15 +2631,10 @@ pub const DataServer = struct {
             error.StandbyNotPromoted, error.PromotionNotApplied => return false,
             else => return err,
         };
-        self.ha_public_gate_state.beginPromotion();
-        try self.consumeHAStandbyForPromotion(standby);
-        self.ha_cfg.admin_context.?.standby = null;
-        if (self.ha_admin_server) |*server| {
-            server.ctx.standby = null;
-        }
-
         const log_path = cfg.standby_log_path orelse return error.HAPromotedPrimaryLogMissing;
         const progress_path = cfg.standby_progress_path orelse return error.HAPromotedPrimarySlotsMissing;
+        try self.validateHAStandbyPromotionOwner(standby);
+
         const log_path_z = try self.alloc.dupeZ(u8, log_path);
         defer self.alloc.free(log_path_z);
         const slots_path_buf = try std.fmt.allocPrint(self.alloc, "{s}.promoted-primary-slots", .{progress_path});
@@ -2647,22 +2642,32 @@ pub const DataServer = struct {
         const slots_path = try self.alloc.dupeZ(u8, slots_path_buf);
         defer self.alloc.free(slots_path);
 
-        self.ha_promoted_primary = try antfly.ha.primary.Primary.openPromotedFromStandby(
+        var promoted_primary = try antfly.ha.primary.Primary.openPromotedFromStandby(
             self.alloc,
             log_path_z.ptr,
             slots_path.ptr,
             handoff,
             .{},
         );
-        const promoted_primary = &self.ha_promoted_primary.?;
-        self.ha_cfg.internal_primary = promoted_primary;
+        errdefer promoted_primary.close();
+
+        self.ha_public_gate_state.beginPromotion();
+        try self.consumeHAStandbyForPromotion(standby);
+        self.ha_cfg.admin_context.?.standby = null;
+        if (self.ha_admin_server) |*server| {
+            server.ctx.standby = null;
+        }
+
+        self.ha_promoted_primary = promoted_primary;
+        const promoted_primary_handle = &self.ha_promoted_primary.?;
+        self.ha_cfg.internal_primary = promoted_primary_handle;
         self.ha_cfg.standby_replication = null;
         const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
-        self.ha_cfg.admin_context.?.primary = promoted_primary;
+        self.ha_cfg.admin_context.?.primary = promoted_primary_handle;
         self.ha_cfg.admin_context.?.primary_node_id = promoted_node_id;
         self.ha_cfg.admin_context.?.promoted_standby_handoff = handoff;
         if (self.ha_admin_server) |*server| {
-            server.ctx.primary = promoted_primary;
+            server.ctx.primary = promoted_primary_handle;
             server.ctx.primary_node_id = promoted_node_id;
             server.ctx.promoted_standby_handoff = handoff;
         }
@@ -2679,10 +2684,19 @@ pub const DataServer = struct {
         }
         self.rewireHAPromotionMirrors();
         self.ha_public_gate_state.publishPrimary(
-            promoted_primary,
+            promoted_primary_handle,
             haContextPrimaryIsFenced(self.ha_cfg.admin_context.?),
         );
         return true;
+    }
+
+    fn validateHAStandbyPromotionOwner(self: *DataServer, standby: *antfly.ha.standby.Standby) !void {
+        const owner = self.ha_cfg.standby_owner orelse return error.HAStandbyOwnershipRequired;
+        if (owner.*) |*owned| {
+            if (owned != standby) return error.HAStandbyOwnerMismatch;
+            return;
+        }
+        return error.HAStandbyOwnershipRequired;
     }
 
     fn consumeHAStandbyForPromotion(self: *DataServer, standby: *antfly.ha.standby.Standby) !void {
@@ -17085,6 +17099,140 @@ test "data server promotion rewires live HTTP internal HA executor" {
     defer internal_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+}
+
+test "data server promotion open failure preserves retryable standby" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+    const wrong_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-wrong-log-{d}", .{nonce});
+    defer alloc.free(wrong_log_raw);
+    const wrong_log = try alloc.dupeZ(u8, wrong_log_raw);
+    defer alloc.free(wrong_log);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
+    defer {
+        const promoted_slots = std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress}) catch null;
+        if (promoted_slots) |path| {
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+            alloc.free(path);
+        }
+    }
+
+    var standby: ?antfly.ha.standby.Standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer if (standby) |*handle| handle.close();
+    if (standby) |*handle| {
+        _ = try handle.promote(.{
+            .new_timeline_id = 2,
+            .new_epoch = 2,
+            .fencing_confirmed = true,
+        });
+    }
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = if (standby) |*handle| handle else null,
+                .standby_node_id = "standby-a",
+            },
+            .standby_owner = &standby,
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .standby_log_path = wrong_log,
+                .standby_progress_path = standby_progress,
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+
+    try std.testing.expectError(error.PromotedLogMismatch, server.runHAStandbyReplicationRound());
+    try std.testing.expect(standby != null);
+    try std.testing.expect(server.ha_promoted_primary == null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.standby != null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.primary == null);
+
+    server.ha_cfg.standby_replication.?.standby_log_path = standby_log;
+    try server.runHAStandbyReplicationRound();
+    try std.testing.expect(standby == null);
+    try std.testing.expect(server.ha_promoted_primary != null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.primary != null);
 }
 
 test "data server resumes HA standby replication from durable progress after restart" {
