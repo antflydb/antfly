@@ -480,7 +480,7 @@ func TestRequestsForClusterEnqueuesReferencingBackups(t *testing.T) {
 	requests := r.requestsForCluster(context.Background(), cluster)
 	got := make(map[string]bool, len(requests))
 	for _, req := range requests {
-		got[req.NamespacedName.String()] = true
+		got[req.String()] = true
 	}
 
 	if len(got) != 2 {

@@ -24,6 +24,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const lsm_backend = @import("../lsm_backend.zig");
 const backend_types = @import("../backend_types.zig");
+const maintenance = @import("../maintenance.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -680,6 +681,11 @@ pub const NativeFile = struct {
     }
 
     pub fn check(self: *NativeFile) !CheckReport {
+        return try self.checkWithCancel(null);
+    }
+
+    pub fn checkWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !CheckReport {
+        if (cancel) |token| try token.check();
         // Integrity checking must observe on-disk state, not cached pages.
         _ = self.page_cache_bypass.fetchAdd(1, .monotonic);
         defer _ = self.page_cache_bypass.fetchSub(1, .monotonic);
@@ -706,10 +712,11 @@ pub const NativeFile = struct {
         var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
         defer reachable_pages.deinit(self.allocator);
 
-        const catalog_records = self.countReachableChainPages(.catalog, checkpoint.catalog_root_page, &reachable_pages) catch |err| {
+        const catalog_records = self.countReachableChainPagesWithCancel(.catalog, checkpoint.catalog_root_page, &reachable_pages, cancel) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        const namespace_directory_records = self.countReachableChainPages(.catalog, checkpoint.namespace_directory_root_page, &reachable_pages) catch |err| {
+        if (cancel) |token| try token.check();
+        const namespace_directory_records = self.countReachableChainPagesWithCancel(.catalog, checkpoint.namespace_directory_root_page, &reachable_pages, cancel) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         if ((checkpoint.document_root_page == 0 and namespace_directory_records != 0) or
@@ -718,12 +725,14 @@ pub const NativeFile = struct {
         self.validateNamespaceDirectory(checkpoint) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        const index_catalog_records = self.countReachableChainPages(.catalog, checkpoint.index_catalog_root_page, &reachable_pages) catch |err| {
+        if (cancel) |token| try token.check();
+        const index_catalog_records = self.countReachableChainPagesWithCancel(.catalog, checkpoint.index_catalog_root_page, &reachable_pages, cancel) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        const document_records = self.countReachableChainPages(.document, checkpoint.document_root_page, &reachable_pages) catch |err| {
+        const document_records = self.countReachableChainPagesWithCancel(.document, checkpoint.document_root_page, &reachable_pages, cancel) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
+        if (cancel) |token| try token.check();
         self.validateReachableFreeMap(checkpoint, &reachable_pages) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
@@ -1335,7 +1344,7 @@ pub const NativeFile = struct {
         }
     };
 
-    fn buildVacuumLiveIndex(self: *NativeFile, source: VacuumRecordSource, suffix: []const u8) !VacuumLiveIndex {
+    fn buildVacuumLiveIndex(self: *NativeFile, source: VacuumRecordSource, suffix: []const u8, cancel: ?*const maintenance.CancelToken) !VacuumLiveIndex {
         const path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-vacuum-{s}-index", .{ self.path, suffix });
         errdefer self.allocator.free(path);
         const io = self.io_impl.io();
@@ -1364,6 +1373,7 @@ pub const NativeFile = struct {
             .documents => self.activeCheckpoint().document_root_page,
         };
         while (page_id != 0) {
+            if (cancel) |token| try token.check();
             const payload = switch (source) {
                 .catalog => try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog),
                 .documents => try self.readPagePayloadByKindAlloc(self.allocator, page_id, .document),
@@ -1836,8 +1846,9 @@ pub const NativeFile = struct {
         next_page_id: *u64,
         destination_root_page: *u64,
         live_bytes: *u64,
+        cancel: ?*const maintenance.CancelToken,
     ) !usize {
-        var index = try self.buildVacuumLiveIndex(.{ .catalog = root }, suffix);
+        var index = try self.buildVacuumLiveIndex(.{ .catalog = root }, suffix, cancel);
         defer index.deinit();
         var read = try index.store.beginRead();
         defer read.abort();
@@ -1849,6 +1860,7 @@ pub const NativeFile = struct {
         var count: usize = 0;
         var maybe_entry = try cursor.first();
         while (maybe_entry) |record| : (maybe_entry = try cursor.next()) {
+            if (cancel) |token| try token.check();
             if (record.value.len != 9) return error.InvalidVacuumIndex;
             if (record.value[0] != 0) continue;
             const source_page_id = std.mem.readInt(u64, record.value[1..9], .little);
@@ -1884,8 +1896,9 @@ pub const NativeFile = struct {
         document_root_page: *u64,
         namespace_directory: *NamespaceDirectory,
         live_bytes: *u64,
+        cancel: ?*const maintenance.CancelToken,
     ) !usize {
-        var index = try self.buildVacuumLiveIndex(.documents, "documents");
+        var index = try self.buildVacuumLiveIndex(.documents, "documents", cancel);
         defer index.deinit();
         var read = try index.store.beginRead();
         defer read.abort();
@@ -1897,6 +1910,7 @@ pub const NativeFile = struct {
         var count: usize = 0;
         var maybe_entry = try cursor.first();
         while (maybe_entry) |record| : (maybe_entry = try cursor.next()) {
+            if (cancel) |token| try token.check();
             if (record.value.len != 9) return error.InvalidVacuumIndex;
             if (record.value[0] != 0) continue;
             const source_page_id = std.mem.readInt(u64, record.value[1..9], .little);
@@ -1938,7 +1952,12 @@ pub const NativeFile = struct {
     }
 
     pub fn vacuum(self: *NativeFile) !VacuumReport {
+        return try self.vacuumWithCancel(null);
+    }
+
+    pub fn vacuumWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
+        if (cancel) |token| try token.check();
 
         var data_lock = try acquireDataRewriteLock(self.io_impl.io(), self.path);
         defer data_lock.file.close(self.io_impl.io());
@@ -1968,9 +1987,9 @@ pub const NativeFile = struct {
         var namespace_directory = NamespaceDirectory.empty;
         defer deinitNamespaceDirectory(self.allocator, &namespace_directory);
 
-        live_record_count += try self.copyVacuumCatalogRecords(compact_file, .metadata, "metadata", &next_page_id, &catalog_root_page, &live_bytes);
-        live_record_count += try self.copyVacuumCatalogRecords(compact_file, .index, "indexes", &next_page_id, &index_catalog_root_page, &live_bytes);
-        const document_count = try self.copyVacuumDocumentRecords(compact_file, &next_page_id, &document_root_page, &namespace_directory, &live_bytes);
+        live_record_count += try self.copyVacuumCatalogRecords(compact_file, .metadata, "metadata", &next_page_id, &catalog_root_page, &live_bytes, cancel);
+        live_record_count += try self.copyVacuumCatalogRecords(compact_file, .index, "indexes", &next_page_id, &index_catalog_root_page, &live_bytes, cancel);
+        const document_count = try self.copyVacuumDocumentRecords(compact_file, &next_page_id, &document_root_page, &namespace_directory, &live_bytes, cancel);
         live_record_count += document_count;
 
         if (document_count > 0) {
@@ -2014,6 +2033,7 @@ pub const NativeFile = struct {
         const after_size = next_page_id * @as(u64, self.header.page_size);
         try compact_file.setLength(io, after_size);
         if (!self.no_sync) try compact_file.sync(io);
+        if (cancel) |token| try token.check();
         try self.replaceOpenFileWithVacuumFile(tmp_path, compact_file, compact_header, &compact_file_open);
 
         return .{
@@ -2175,7 +2195,11 @@ pub const NativeFile = struct {
     }
 
     fn countReachableChainPages(self: *NativeFile, kind: PageKind, root_page_id: u64, reachable_pages: *ReachablePageSet) !u64 {
-        return try self.countReachableChainPagesForCheckpoint(kind, root_page_id, self.activeCheckpoint(), reachable_pages);
+        return try self.countReachableChainPagesWithCancel(kind, root_page_id, reachable_pages, null);
+    }
+
+    fn countReachableChainPagesWithCancel(self: *NativeFile, kind: PageKind, root_page_id: u64, reachable_pages: *ReachablePageSet, cancel: ?*const maintenance.CancelToken) !u64 {
+        return try self.countReachableChainPagesForCheckpoint(kind, root_page_id, self.activeCheckpoint(), reachable_pages, cancel);
     }
 
     fn countReachableChainPagesForCheckpoint(
@@ -2184,6 +2208,7 @@ pub const NativeFile = struct {
         root_page_id: u64,
         checkpoint: CheckpointSlot,
         reachable_pages: *ReachablePageSet,
+        cancel: ?*const maintenance.CancelToken,
     ) !u64 {
         var seen_catalog_keys = std.StringHashMapUnmanaged(void).empty;
         defer {
@@ -2196,6 +2221,7 @@ pub const NativeFile = struct {
         var page_id = root_page_id;
         const use_link_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         while (page_id != 0) {
+            if (cancel) |token| try token.check();
             try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
 
             if (use_link_cache) blk: {
@@ -2485,10 +2511,10 @@ pub const NativeFile = struct {
         var checkpoint_pages = std.AutoHashMapUnmanaged(u64, void){};
         defer checkpoint_pages.deinit(self.allocator);
 
-        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.catalog_root_page, checkpoint, &checkpoint_pages);
-        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.index_catalog_root_page, checkpoint, &checkpoint_pages);
-        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.namespace_directory_root_page, checkpoint, &checkpoint_pages);
-        _ = try self.countReachableChainPagesForCheckpoint(.document, checkpoint.document_root_page, checkpoint, &checkpoint_pages);
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.catalog_root_page, checkpoint, &checkpoint_pages, null);
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.index_catalog_root_page, checkpoint, &checkpoint_pages, null);
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.namespace_directory_root_page, checkpoint, &checkpoint_pages, null);
+        _ = try self.countReachableChainPagesForCheckpoint(.document, checkpoint.document_root_page, checkpoint, &checkpoint_pages, null);
         if (checkpoint.free_map_root_page != 0) {
             try self.markReachablePage(&checkpoint_pages, checkpoint.free_map_root_page, checkpoint.page_count);
         }

@@ -55,11 +55,17 @@ pub const DynamicCredentials = struct {
     access_key_id: []u8,
     secret_access_key: []u8,
     session_token: ?[]u8 = null,
+    release_ctx: ?*anyopaque = null,
+    release_fn: ?*const fn (*anyopaque) void = null,
 
     pub fn deinit(self: *DynamicCredentials, alloc: Allocator) void {
-        alloc.free(self.access_key_id);
-        alloc.free(self.secret_access_key);
-        if (self.session_token) |value| alloc.free(value);
+        if (self.release_fn) |release| {
+            release(self.release_ctx.?);
+        } else {
+            alloc.free(self.access_key_id);
+            alloc.free(self.secret_access_key);
+            if (self.session_token) |value| alloc.free(value);
+        }
         self.* = undefined;
     }
 };

@@ -531,6 +531,7 @@ pub const StorageMaintenanceState = enum {
     running,
     succeeded,
     failed,
+    canceled,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -538,6 +539,7 @@ pub const StorageMaintenanceState = enum {
             .running => "running",
             .succeeded => "succeeded",
             .failed => "failed",
+            .canceled => "canceled",
         };
         try jw.write(s);
     }
@@ -552,6 +554,7 @@ pub const StorageMaintenanceState = enum {
             .{ "running", .running },
             .{ "succeeded", .succeeded },
             .{ "failed", .failed },
+            .{ "canceled", .canceled },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

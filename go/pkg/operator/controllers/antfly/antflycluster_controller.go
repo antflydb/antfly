@@ -429,6 +429,20 @@ func serviceSelectorLabels(clusterName, component string) map[string]string {
 	}
 }
 
+const labelClusterUID = "antfly.io/cluster-uid"
+
+// persistentVolumeClaimLabels bind a claim to one immutable AntflyCluster
+// incarnation. Cluster names can be reused, so the instance label and the
+// StatefulSet-generated claim name are discovery aids rather than sufficient
+// authorization for destructive cleanup.
+func persistentVolumeClaimLabels(cluster *antflyv1.AntflyCluster, component string) map[string]string {
+	labels := serviceSelectorLabels(cluster.Name, component)
+	if cluster.UID != "" {
+		labels[labelClusterUID] = string(cluster.UID)
+	}
+	return labels
+}
+
 func haCurrentPrimaryRouteTarget(cluster *antflyv1.AntflyCluster) string {
 	if cluster.Status.HAStatus != nil && cluster.Status.HAStatus.PrimaryRoute.CurrentTarget != "" {
 		return cluster.Status.HAStatus.PrimaryRoute.CurrentTarget
@@ -589,7 +603,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		if !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) && !hasAnyPrefix(pvc.Name, canonicalClaimPrefixes) {
 			continue
 		}
-		if err := validatePVCInstanceOwnership(cluster, pvc); err != nil {
+		if err := validatePVCOwnership(cluster, pvc); err != nil {
 			return nil, err
 		}
 		cleanupPVCs = append(cleanupPVCs, pvc)
@@ -642,14 +656,21 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	return nil, nil
 }
 
-// validatePVCInstanceOwnership fails closed when canonical naming and an
-// explicit instance label disagree. Unlabeled claims are accepted because
-// historical StatefulSet PVCs did not consistently carry stable labels.
-func validatePVCInstanceOwnership(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) error {
+// validatePVCOwnership requires the immutable cluster UID before destructive
+// cleanup. Names and app.kubernetes.io/instance labels are intentionally not
+// ownership proofs because both can be reused by another cluster incarnation.
+func validatePVCOwnership(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) error {
 	if instance, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && instance != cluster.Name {
 		return fmt.Errorf(
 			"refusing PVC cleanup for %s/%s: canonical claim name matches AntflyCluster %q but app.kubernetes.io/instance identifies %q",
 			pvc.Namespace, pvc.Name, cluster.Name, instance,
+		)
+	}
+	uid, ok := pvc.Labels[labelClusterUID]
+	if !ok || uid != string(cluster.UID) {
+		return fmt.Errorf(
+			"refusing PVC cleanup for %s/%s: expected %s=%q, got %q",
+			pvc.Namespace, pvc.Name, labelClusterUID, cluster.UID, uid,
 		)
 	}
 	return nil
@@ -851,7 +872,7 @@ func validateAndSetStandaloneStorageIdentity(statefulSet *appsv1.StatefulSet, cl
 				return fmt.Errorf("existing Lite StatefulSet %s is missing storage identity annotation %q; refusing to guess its database file", statefulSet.Name, annotationLiteFileName)
 			}
 			if persistedFileName != liteFileName {
-				return fmt.Errorf("Lite filename migration requires backup and restore: existing StatefulSet %s uses %q, requested %q", statefulSet.Name, persistedFileName, liteFileName)
+				return fmt.Errorf("lite filename migration requires backup and restore: existing StatefulSet %s uses %q, requested %q", statefulSet.Name, persistedFileName, liteFileName)
 			}
 		}
 	}
@@ -2600,7 +2621,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:   "standalone-storage",
-						Labels: serviceSelectorLabels(cluster.Name, "standalone"),
+						Labels: persistentVolumeClaimLabels(cluster, "standalone"),
 					},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -2819,7 +2840,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:   "metadata-storage",
-						Labels: serviceSelectorLabels(cluster.Name, "metadata"),
+						Labels: persistentVolumeClaimLabels(cluster, "metadata"),
 					},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -3021,7 +3042,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:   "data-storage",
-						Labels: serviceSelectorLabels(cluster.Name, "data"),
+						Labels: persistentVolumeClaimLabels(cluster, "data"),
 					},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{

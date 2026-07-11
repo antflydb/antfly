@@ -219,7 +219,8 @@ file after restart rather than depending on a directory sidecar.
 
 Storage maintenance uses the engine-neutral authenticated admin surface:
 `POST /admin/v1/maintenance/{check,compact,vacuum}` returns an asynchronous job,
-and `GET /admin/v1/maintenance/jobs/{job_id}` reports progress and results.
+`GET /admin/v1/maintenance/jobs/{job_id}` reports progress and results, and
+`DELETE /admin/v1/maintenance/jobs/{job_id}` requests cooperative cancellation.
 With normal API authentication enabled, admin RBAC protects these routes.
 Otherwise they are disabled unless standalone is started with
 `--admin-token-env <ENV_NAME>`; callers then send that value as a Bearer token.
@@ -227,7 +228,12 @@ The same routes exist for every engine and return `422` when unsupported. The
 status capability reports whether maintenance preserves request availability.
 Lite maintenance is currently coordinated but exclusive (`online: false`): the
 asynchronous job acquires the file maintenance gate and requests may wait until
-it completes. Vacuum retains one logical record class at a time rather than
+it completes. Shutdown and explicit cancellation stop native checks and vacuum
+at safe page/record boundaries; a replacement file is never published after
+cancellation. Idempotency keys are retained for at least 24 hours within a
+server process. After a process restart callers must reconcile status before
+retrying, and the bounded history rejects new jobs instead of silently evicting
+an unexpired key. Vacuum retains one logical record class at a time rather than
 holding metadata, index, and document key sets simultaneously, streams one
 value at a time into a durable replacement file, and atomically renames it; it
 has no artificial distinct-key ceiling and does not allocate a second

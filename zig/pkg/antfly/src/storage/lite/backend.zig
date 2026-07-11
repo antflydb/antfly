@@ -473,13 +473,22 @@ pub const Handle = struct {
     }
 
     pub fn check(self: *Handle) !CheckReport {
+        return try self.checkWithCancel(null);
+    }
+
+    fn checkWithCancel(self: *Handle, cancel: ?*const maintenance.CancelToken) !CheckReport {
         return switch (self.engine) {
-            .bridge_lsm_container => toCheckReport(try self.bridge_storage.?.check()),
+            .bridge_lsm_container => blk: {
+                if (cancel) |token| try token.check();
+                const report = try self.bridge_storage.?.check();
+                if (cancel) |token| try token.check();
+                break :blk toCheckReport(report);
+            },
             .native_single_file => blk: {
                 const store = self.native_docstore.?;
                 platform_sync.lockYielding(&store.mutex);
                 defer store.mutex.unlock();
-                break :blk try store.file.check();
+                break :blk try store.file.checkWithCancel(cancel);
             },
         };
     }
@@ -504,11 +513,12 @@ pub const Handle = struct {
         };
     }
 
-    fn runMaintenance(ptr: *anyopaque, operation: maintenance.Operation) anyerror!maintenance.Result {
+    fn runMaintenance(ptr: *anyopaque, operation: maintenance.Operation, cancel: *const maintenance.CancelToken) anyerror!maintenance.Result {
         const self: *Handle = @ptrCast(@alignCast(ptr));
+        try cancel.check();
         return switch (operation) {
             .check => blk: {
-                const report = try self.check();
+                const report = try self.checkWithCancel(cancel);
                 break :blk .{
                     .valid = report.valid,
                     .issue = report.issue,
@@ -522,11 +532,14 @@ pub const Handle = struct {
             .compact => blk: {
                 platform_sync.lockYielding(&self.namespace_mutex);
                 defer self.namespace_mutex.unlock();
-                for (self.namespace_runtimes.items) |*runtime| try runtime.runtime_store.sync(true);
-                const report = try self.vacuum();
+                for (self.namespace_runtimes.items) |*runtime| {
+                    try cancel.check();
+                    try runtime.runtime_store.sync(true);
+                }
+                const report = try self.vacuumWithCancel(cancel);
                 break :blk vacuumMaintenanceResult(report);
             },
-            .vacuum => vacuumMaintenanceResult(try self.vacuum()),
+            .vacuum => vacuumMaintenanceResult(try self.vacuumWithCancel(cancel)),
         };
     }
 
@@ -541,9 +554,18 @@ pub const Handle = struct {
     }
 
     pub fn vacuum(self: *Handle) !VacuumReport {
+        return try self.vacuumWithCancel(null);
+    }
+
+    fn vacuumWithCancel(self: *Handle, cancel: ?*const maintenance.CancelToken) !VacuumReport {
         return switch (self.engine) {
-            .bridge_lsm_container => toVacuumReport(try self.bridge_storage.?.vacuum()),
-            .native_single_file => try nativeVacuumReport(self),
+            .bridge_lsm_container => blk: {
+                if (cancel) |token| try token.check();
+                const report = try self.bridge_storage.?.vacuum();
+                if (cancel) |token| try token.check();
+                break :blk toVacuumReport(report);
+            },
+            .native_single_file => try nativeVacuumReport(self, cancel),
         };
     }
 
@@ -712,8 +734,8 @@ fn toVacuumReport(report: bridge.ContainerStorage.VacuumReport) VacuumReport {
     };
 }
 
-fn nativeVacuumReport(handle: *Handle) !VacuumReport {
-    const report = try handle.native_docstore.?.vacuum();
+fn nativeVacuumReport(handle: *Handle, cancel: ?*const maintenance.CancelToken) !VacuumReport {
+    const report = try handle.native_docstore.?.vacuumWithCancel(cancel);
     return .{
         .before_size = report.before_size,
         .after_size = report.after_size,

@@ -27,6 +27,7 @@ const objectstore = @import("objectstore");
 const platform_time = @import("../platform/time.zig");
 const common_config = @import("../common/config.zig");
 const metadata_api = @import("../metadata/api.zig");
+const bedrock = @import("../inference/bedrock.zig");
 const list_models = @import("../inference/list_models.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 
@@ -834,8 +835,9 @@ const ProbeResult = struct {
     err_name: ?[]const u8 = null,
 };
 
-/// Probe an external-IO S3 connection by checking its first bucket.
-/// Returns null when the credentials are incomplete (no probe possible).
+/// Probe an external-IO S3 connection by checking its first bucket with the
+/// same endpoint, region, addressing style, and credential source used by the
+/// production object-store client.
 fn probeConfiguredExternalIoS3(
     arena: Allocator,
     name: []const u8,
@@ -843,14 +845,10 @@ fn probeConfiguredExternalIoS3(
     cache: ?*Cache,
     opts: BuildOptions,
 ) !?ProbeResult {
-    const endpoint = cfg.endpoint orelse return null;
-    if (cfg.credentials.source != .static) return null;
-    const access_key_id = cfg.credentials.access_key_id orelse return null;
-    const secret_access_key = cfg.credentials.secret_access_key orelse return null;
     const buckets = cfg.buckets;
     if (buckets.len == 0) return null;
 
-    const cache_key = try std.fmt.allocPrint(arena, "objectstore\x1f{s}\x1f{s}\x1f{s}", .{ name, endpoint, buckets[0] });
+    const cache_key = try std.fmt.allocPrint(arena, "objectstore\x1f{s}\x1f{s}", .{ name, buckets[0] });
     const now_ns = platform_time.monotonicNs();
     if (!opts.refresh) {
         if (cache) |c| {
@@ -864,7 +862,7 @@ fn probeConfiguredExternalIoS3(
     }
 
     const outcome: ProbeResult = blk: {
-        probeS3Bucket(arena, cfg, endpoint, access_key_id, secret_access_key, buckets[0]) catch |err| {
+        probeS3Bucket(arena, cfg, buckets[0]) catch |err| {
             break :blk .{ .status = .@"error", .err_name = @errorName(err) };
         };
         break :blk .{ .status = .connected };
@@ -885,22 +883,59 @@ fn probeConfiguredExternalIoS3(
 fn probeS3Bucket(
     arena: Allocator,
     cfg: common_config.Config.ExternalIoConnectionConfig,
-    endpoint: []const u8,
-    access_key_id: []const u8,
-    secret_access_key: []const u8,
     bucket: []const u8,
 ) !void {
-    var s3_client = try objectstore.s3.Client.init(arena, .{
-        .credentials = .{
-            .endpoint = try arena.dupe(u8, endpoint),
-            .use_ssl = cfg.use_ssl orelse std.mem.startsWith(u8, endpoint, "https://"),
-            .access_key_id = try arena.dupe(u8, access_key_id),
-            .secret_access_key = try arena.dupe(u8, secret_access_key),
-            .session_token = if (cfg.credentials.session_token) |value| try arena.dupe(u8, value) else null,
-            .region = try arena.dupe(u8, "us-east-1"),
+    var dynamic_credentials: ?bedrock.Credentials = null;
+    defer if (dynamic_credentials) |*credentials| credentials.deinit(arena);
+
+    if (cfg.credentials.source != .static) {
+        var io_impl = std.Io.Threaded.init(arena, .{});
+        defer io_impl.deinit();
+        var http = httpx.Client.init(arena, io_impl.io());
+        defer http.deinit();
+        var credential_cache: bedrock.CredentialCache = .{};
+        defer credential_cache.deinit(arena);
+        const source: bedrock.CredentialSource = switch (cfg.credentials.source) {
+            .default => .default,
+            .static => unreachable,
+            .profile => .{ .profile = .{
+                .name = cfg.credentials.profile orelse return error.InvalidConnectionCredentials,
+                .shared_credentials_file = cfg.credentials.shared_credentials_file,
+            } },
+            .web_identity => .{ .web_identity = .{
+                .role_arn = cfg.credentials.role_arn orelse return error.InvalidConnectionCredentials,
+                .token_file = cfg.credentials.token_file orelse return error.InvalidConnectionCredentials,
+                .session_name = cfg.credentials.session_name orelse "antfly-connection-probe",
+                .sts_endpoint = cfg.credentials.sts_endpoint,
+            } },
+        };
+        dynamic_credentials = try credential_cache.getForSource(arena, &http, cfg.region orelse "us-east-1", source);
+    }
+
+    const access_key_id = if (dynamic_credentials) |credentials|
+        credentials.access_key_id
+    else
+        cfg.credentials.access_key_id orelse return error.InvalidConnectionCredentials;
+    const secret_access_key = if (dynamic_credentials) |credentials|
+        credentials.secret_access_key
+    else
+        cfg.credentials.secret_access_key orelse return error.InvalidConnectionCredentials;
+    const session_token = if (dynamic_credentials) |credentials| credentials.session_token else cfg.credentials.session_token;
+
+    const s3_config = try objectstore.s3.fromEnvAlloc(
+        arena,
+        cfg.endpoint,
+        cfg.use_ssl orelse true,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        cfg.region,
+        switch (cfg.addressing_style) {
+            .path => .path,
+            .virtual_hosted => .virtual_hosted,
         },
-        .addressing_style = .path,
-    });
+    );
+    var s3_client = try objectstore.s3.Client.init(arena, s3_config);
     var client = s3_client.client();
     defer client.deinit();
     const exists = try client.bucketExists(bucket);

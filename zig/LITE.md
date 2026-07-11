@@ -212,6 +212,7 @@ POST /admin/v1/maintenance/check
 POST /admin/v1/maintenance/compact
 POST /admin/v1/maintenance/vacuum
 GET  /admin/v1/maintenance/jobs/{job_id}
+DELETE /admin/v1/maintenance/jobs/{job_id}
 ```
 
 Normal API authentication and admin RBAC protect these routes when enabled.
@@ -220,7 +221,11 @@ token with `--admin-token-env <ENV_NAME>` and send it using `Authorization:
 Bearer ...`; without either mechanism the admin surface fails closed.
 
 POST requests return `202` and a job document. `Idempotency-Key` safely returns
-the original job on retries. Only one maintenance job runs at a time; a
+the original job on retries for at least 24 hours within the current server
+process. After restart, callers reconcile storage/job status before retrying.
+The bounded history rejects new work rather than dropping an unexpired key.
+`DELETE` requests cooperative cancellation; native maintenance checks the
+token at safe page and record boundaries, including during shutdown. Only one maintenance job runs at a time; a
 conflicting request returns `409`, and an engine that does not support an
 operation returns `422`. Completed jobs are retained in a bounded in-memory
 history. Lite reports `online: false`: check, compaction, and vacuum acquire the

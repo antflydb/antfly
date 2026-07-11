@@ -101,11 +101,15 @@ const S3ClientPool = struct {
 
         fn get(ptr: *anyopaque, alloc: Allocator) anyerror!objectstore.S3.DynamicCredentials {
             const self: *AwsCredentialContext = @ptrCast(@alignCast(ptr));
-            const credentials = try self.cache.getForSource(alloc, &self.http, self.region, self.source);
+            _ = alloc;
+            const lease = try self.cache.getLeaseForSource(self.alloc, &self.http, self.region, self.source);
+            const credentials = lease.credentials();
             return .{
                 .access_key_id = @constCast(credentials.access_key_id),
                 .secret_access_key = @constCast(credentials.secret_access_key),
                 .session_token = if (credentials.session_token) |value| @constCast(value) else null,
+                .release_ctx = lease.releaseContext(),
+                .release_fn = bedrock.CredentialCache.Lease.releaseOpaque,
             };
         }
     };

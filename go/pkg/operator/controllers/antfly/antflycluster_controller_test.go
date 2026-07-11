@@ -92,7 +92,7 @@ func TestTopologySafetyRejectsUnownedCanonicalStatefulSet(t *testing.T) {
 	}
 }
 
-func TestCleanupDiscoversUnlabeledPVCFromOwnedHistoricalStatefulSet(t *testing.T) {
+func TestCleanupDeletesUIDBoundPVCFromOwnedStatefulSet(t *testing.T) {
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
 		if err := add(scheme); err != nil {
@@ -121,6 +121,7 @@ func TestCleanupDiscoversUnlabeledPVCFromOwnedHistoricalStatefulSet(t *testing.T
 	}
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: "database-example-historical-0", Namespace: "default",
+		Labels: map[string]string{labelClusterUID: string(cluster.UID)},
 	}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, historical, pvc).Build()
 	reconciler := &AntflyClusterReconciler{Client: client}
@@ -130,7 +131,7 @@ func TestCleanupDiscoversUnlabeledPVCFromOwnedHistoricalStatefulSet(t *testing.T
 	}
 	err = client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{})
 	if !errors.IsNotFound(err) {
-		t.Fatalf("expected discovered unlabeled PVC to be deleted, got %v", err)
+		t.Fatalf("expected UID-bound PVC to be deleted, got %v", err)
 	}
 }
 
@@ -191,7 +192,7 @@ func TestCleanupDoesNotTreatInstanceLabelAsOwnership(t *testing.T) {
 	}
 }
 
-func TestCleanupDeletesMixedLabeledAndUnlabeledCanonicalPVCs(t *testing.T) {
+func TestCleanupFailsClosedBeforeDeletingAnyPVCWithoutUIDOwnership(t *testing.T) {
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
 		if err := add(scheme); err != nil {
@@ -203,7 +204,10 @@ func TestCleanupDeletesMixedLabeledAndUnlabeledCanonicalPVCs(t *testing.T) {
 	}}
 	labeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: "standalone-storage-example-standalone-0", Namespace: "default",
-		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+		Labels: map[string]string{
+			"app.kubernetes.io/instance": cluster.Name,
+			labelClusterUID:              string(cluster.UID),
+		},
 	}}
 	unlabeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: "data-storage-example-data-0", Namespace: "default",
@@ -211,13 +215,13 @@ func TestCleanupDeletesMixedLabeledAndUnlabeledCanonicalPVCs(t *testing.T) {
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, labeled, unlabeled).Build()
 	reconciler := &AntflyClusterReconciler{Client: client}
 	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
-	if err != nil || result != nil {
-		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	if result != nil || err == nil || !strings.Contains(err.Error(), labelClusterUID) {
+		t.Fatalf("expected UID ownership failure: result=%v err=%v", result, err)
 	}
 	for _, name := range []string{labeled.Name, unlabeled.Name} {
 		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, &corev1.PersistentVolumeClaim{})
-		if !errors.IsNotFound(err) {
-			t.Fatalf("expected PVC %s to be deleted, got %v", name, err)
+		if err != nil {
+			t.Fatalf("PVC %s was deleted before ownership preflight completed: %v", name, err)
 		}
 	}
 }
@@ -247,7 +251,10 @@ func TestCleanupFailsClosedOnConflictingDiscoveredPVCLabel(t *testing.T) {
 	}
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: "database-example-historical-0", Namespace: "default",
-		Labels: map[string]string{"app.kubernetes.io/instance": "another-cluster"},
+		Labels: map[string]string{
+			"app.kubernetes.io/instance": "another-cluster",
+			labelClusterUID:              string(cluster.UID),
+		},
 	}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, historical, pvc).Build()
 	reconciler := &AntflyClusterReconciler{Client: client}

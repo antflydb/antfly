@@ -2203,12 +2203,12 @@ pub const ApiHttpServer = struct {
         }
         const coordinator = self.cfg.storage_maintenance orelse return try textResponse(self.alloc, 422, "storage maintenance unsupported");
         if (std.mem.startsWith(u8, uri_parts.path, admin_routes.maintenance_jobs_prefix)) {
-            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            if (req.method != .GET and req.method != .DELETE) return try textResponse(self.alloc, 405, "method not allowed");
             const raw_id = uri_parts.path[admin_routes.maintenance_jobs_prefix.len..];
             if (raw_id.len == 0 or std.mem.indexOfScalar(u8, raw_id, '/') != null) return try textResponse(self.alloc, 404, "not found");
             const job_id = std.fmt.parseUnsigned(u64, raw_id, 10) catch return try textResponse(self.alloc, 404, "not found");
-            const snapshot = coordinator.get(job_id) orelse return try textResponse(self.alloc, 404, "not found");
-            return try storageMaintenanceJobResponse(self.alloc, 200, snapshot);
+            const snapshot = if (req.method == .DELETE) coordinator.cancel(job_id) else coordinator.get(job_id);
+            return try storageMaintenanceJobResponse(self.alloc, if (req.method == .DELETE) 202 else 200, snapshot orelse return try textResponse(self.alloc, 404, "not found"));
         }
         if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
         const operation: @import("../storage/maintenance.zig").Operation = if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_check))
@@ -2230,6 +2230,7 @@ pub const ApiHttpServer = struct {
             error.MaintenanceBusy => return try textResponse(self.alloc, 409, "storage maintenance already running"),
             error.IdempotencyConflict => return try textResponse(self.alloc, 409, "idempotency key reused for another operation"),
             error.InvalidIdempotencyKey => return try textResponse(self.alloc, 400, "invalid idempotency key"),
+            error.MaintenanceHistoryFull => return try textResponse(self.alloc, 429, "maintenance job history is full; retry after retained job records expire"),
             else => return err,
         };
         return try storageMaintenanceJobResponse(self.alloc, 202, snapshot);
@@ -12394,7 +12395,8 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
         fn status(_: *anyopaque) maintenance_mod.Status {
             return .{ .engine = "lite", .format = "aflite", .fsync = true, .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = true } };
         }
-        fn run(_: *anyopaque, operation: maintenance_mod.Operation) anyerror!maintenance_mod.Result {
+        fn run(_: *anyopaque, operation: maintenance_mod.Operation, cancel: *const maintenance_mod.CancelToken) anyerror!maintenance_mod.Result {
+            try cancel.check();
             return switch (operation) {
                 .check => .{ .valid = true, .file_size = 4096 },
                 .compact, .vacuum => .{ .before_size = 8192, .after_size = 4096, .reclaimed_bytes = 4096 },
@@ -12452,6 +12454,15 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
     defer get_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), get_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "\"valid\":true") != null);
+
+    var cancel_resp = try server.handle(.{
+        .method = .DELETE,
+        .uri = admin_routes.maintenance_jobs_prefix ++ "1",
+        .authorization = "Bearer maintenance-secret",
+    });
+    defer cancel_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"succeeded\"") != null);
 }
 
 test "api http server dispatches extension lifecycle mutations" {

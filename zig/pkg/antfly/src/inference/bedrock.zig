@@ -42,6 +42,10 @@ pub const Credentials = struct {
         else
             true;
     }
+
+    fn isUnexpired(self: Credentials, now_unix: u64) bool {
+        return if (self.expires_at_unix) |expires| expires > now_unix else true;
+    }
 };
 
 pub const ProfileCredentialSource = struct {
@@ -63,28 +67,60 @@ pub const CredentialSource = union(enum) {
 };
 
 pub const CredentialCache = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    refreshing: std.atomic.Value(bool) = .init(false),
-    cached: ?Credentials = null,
+    const Snapshot = struct {
+        alloc: std.mem.Allocator,
+        refs: std.atomic.Value(usize) = .init(1), // one cache-owned reference
+        source_key: u64,
+        credentials: Credentials,
 
-    fn lock(self: *CredentialCache) void {
-        while (!self.mutex.tryLock()) {
-            if (comptime builtin.os.tag == .freestanding) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            std.Thread.yield() catch {};
+        fn retain(self: *Snapshot) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
         }
-    }
 
-    fn unlock(self: *CredentialCache) void {
-        self.mutex.unlock();
-    }
+        fn release(self: *Snapshot) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            var credentials = self.credentials;
+            credentials.deinit(self.alloc);
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    pub const Lease = struct {
+        snapshot: *Snapshot,
+
+        pub fn credentials(self: Lease) Credentials {
+            return self.snapshot.credentials;
+        }
+
+        pub fn release(self: *Lease) void {
+            self.snapshot.release();
+            self.* = undefined;
+        }
+
+        pub fn releaseOpaque(ptr: *anyopaque) void {
+            const snapshot: *Snapshot = @ptrCast(@alignCast(ptr));
+            snapshot.release();
+        }
+
+        pub fn releaseContext(self: Lease) *anyopaque {
+            return self.snapshot;
+        }
+    };
+
+    io_init_mutex: std.atomic.Mutex = .unlocked,
+    io: ?std.Io = null,
+    mutex: std.Io.Mutex = .init,
+    refreshed: std.Io.Condition = .init,
+    refreshing: bool = false,
+    cached: ?*Snapshot = null,
 
     pub fn deinit(self: *CredentialCache, alloc: std.mem.Allocator) void {
-        self.lock();
-        defer self.unlock();
-        if (self.cached) |*creds| creds.deinit(alloc);
+        _ = alloc;
+        const io = self.io orelse return;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.cached) |snapshot| snapshot.release();
         self.cached = null;
     }
 
@@ -93,50 +129,114 @@ pub const CredentialCache = struct {
     }
 
     pub fn getForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
+        var lease = try self.getLeaseForSource(alloc, http, region, source);
+        defer lease.release();
+        return try lease.credentials().clone(alloc);
+    }
+
+    /// Returns a ref-counted immutable credential snapshot. Storage clients use
+    /// this path so cached requests avoid serialized key copies and heap churn;
+    /// the lease keeps credentials alive across signing even when a concurrent
+    /// refresh replaces the cache entry.
+    pub fn getLeaseForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Lease {
+        const source_key = credentialSourceKey(region, source);
+        const io = self.bindIo(http.io);
         while (true) {
             const now = currentUnixSeconds();
-            self.lock();
-            if (self.cached) |creds| {
-                if (creds.isFresh(now)) {
-                    const cloned = creds.clone(alloc) catch |err| {
-                        self.unlock();
-                        return err;
-                    };
-                    self.unlock();
-                    return cloned;
+            self.mutex.lockUncancelable(io);
+            if (self.cached) |snapshot| {
+                if (snapshot.source_key == source_key and snapshot.credentials.isFresh(now)) {
+                    snapshot.retain();
+                    self.mutex.unlock(io);
+                    return .{ .snapshot = snapshot };
                 }
             }
-            const refresh_owner = self.refreshing.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
-            self.unlock();
 
-            if (!refresh_owner) {
-                if (comptime builtin.os.tag == .freestanding) {
-                    std.atomic.spinLoopHint();
-                } else {
-                    std.Thread.yield() catch {};
+            if (self.refreshing) {
+                // During proactive refresh, continue serving the still-valid
+                // snapshot. Only callers with expired credentials block.
+                if (self.cached) |snapshot| {
+                    if (snapshot.source_key == source_key and snapshot.credentials.isUnexpired(now)) {
+                        snapshot.retain();
+                        self.mutex.unlock(io);
+                        return .{ .snapshot = snapshot };
+                    }
                 }
+                self.refreshed.waitUncancelable(io, &self.mutex);
+                self.mutex.unlock(io);
                 continue;
             }
+            self.refreshing = true;
+            self.mutex.unlock(io);
 
-            var published = false;
-            defer self.refreshing.store(false, .release);
-            var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| return err;
-            errdefer fresh.deinit(alloc);
-            const cached_copy = try fresh.clone(alloc);
-            errdefer if (!published) {
-                var copy = cached_copy;
-                copy.deinit(alloc);
+            var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| {
+                self.mutex.lockUncancelable(io);
+                self.refreshing = false;
+                const fallback = if (self.cached) |snapshot| blk: {
+                    if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(currentUnixSeconds())) break :blk null;
+                    snapshot.retain();
+                    break :blk snapshot;
+                } else null;
+                self.refreshed.broadcast(io);
+                self.mutex.unlock(io);
+                if (fallback) |snapshot| return .{ .snapshot = snapshot };
+                return err;
             };
+            errdefer fresh.deinit(alloc);
+            const snapshot = alloc.create(Snapshot) catch |err| {
+                self.finishFailedRefresh(io);
+                return err;
+            };
+            snapshot.* = .{ .alloc = alloc, .source_key = source_key, .credentials = fresh };
+            fresh = undefined;
 
-            self.lock();
-            if (self.cached) |*old| old.deinit(alloc);
-            self.cached = cached_copy;
-            published = true;
-            self.unlock();
-            return fresh;
+            self.mutex.lockUncancelable(io);
+            const old = self.cached;
+            self.cached = snapshot;
+            snapshot.retain(); // caller lease
+            self.refreshing = false;
+            self.refreshed.broadcast(io);
+            self.mutex.unlock(io);
+            if (old) |previous| previous.release();
+            return .{ .snapshot = snapshot };
         }
     }
+
+    fn finishFailedRefresh(self: *CredentialCache, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        self.refreshing = false;
+        self.refreshed.broadcast(io);
+        self.mutex.unlock(io);
+    }
+
+    fn bindIo(self: *CredentialCache, io: std.Io) std.Io {
+        while (!self.io_init_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.io_init_mutex.unlock();
+        if (self.io == null) self.io = io;
+        return self.io.?;
+    }
 };
+
+fn credentialSourceKey(region: []const u8, source: CredentialSource) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(region);
+    const tag: [1]u8 = .{@intFromEnum(std.meta.activeTag(source))};
+    hash.update(&tag);
+    switch (source) {
+        .default => {},
+        .profile => |profile| {
+            hash.update(profile.name);
+            if (profile.shared_credentials_file) |value| hash.update(value);
+        },
+        .web_identity => |identity| {
+            hash.update(identity.role_arn);
+            hash.update(identity.token_file);
+            hash.update(identity.session_name);
+            if (identity.sts_endpoint) |value| hash.update(value);
+        },
+    }
+    return hash.final();
+}
 
 pub const Options = struct {
     region: []const u8,

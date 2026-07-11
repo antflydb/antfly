@@ -8,7 +8,19 @@ const platform_time = @import("../platform/time.zig");
 const platform_sync = @import("antfly_platform").sync;
 
 pub const Operation = enum { check, compact, vacuum };
-pub const State = enum { queued, running, succeeded, failed };
+pub const State = enum { queued, running, succeeded, failed, canceled };
+
+pub const CancelToken = struct {
+    requested: std.atomic.Value(bool) = .init(false),
+
+    pub fn request(self: *CancelToken) void {
+        self.requested.store(true, .release);
+    }
+
+    pub fn check(self: *const CancelToken) !void {
+        if (self.requested.load(.acquire)) return error.MaintenanceCanceled;
+    }
+};
 
 pub const Capabilities = struct {
     check: bool = false,
@@ -44,15 +56,15 @@ pub const Source = struct {
 
     pub const VTable = struct {
         status: *const fn (*anyopaque) Status,
-        run: *const fn (*anyopaque, Operation) anyerror!Result,
+        run: *const fn (*anyopaque, Operation, *const CancelToken) anyerror!Result,
     };
 
     pub fn status(self: Source) Status {
         return self.vtable.status(self.ptr);
     }
 
-    pub fn run(self: Source, operation: Operation) !Result {
-        return try self.vtable.run(self.ptr, operation);
+    pub fn run(self: Source, operation: Operation, cancel: *const CancelToken) !Result {
+        return try self.vtable.run(self.ptr, operation, cancel);
     }
 };
 
@@ -67,7 +79,7 @@ pub const localSource = Source{
             }
         }.call,
         .run = struct {
-            fn call(_: *anyopaque, _: Operation) anyerror!Result {
+            fn call(_: *anyopaque, _: Operation, _: *const CancelToken) anyerror!Result {
                 return error.UnsupportedStorageMaintenance;
             }
         }.call,
@@ -82,7 +94,8 @@ pub const Coordinator = struct {
     active_job_id: ?u64 = null,
     jobs: std.ArrayListUnmanaged(*Job) = .empty,
 
-    const max_retained_jobs: usize = 128;
+    const max_retained_jobs: usize = 4096;
+    const idempotency_retention_ms: i64 = 24 * 60 * 60 * 1000;
 
     pub const Job = struct {
         id: u64,
@@ -97,6 +110,7 @@ pub const Coordinator = struct {
         // borrow heap memory from a prunable Job.
         error_name: ?[]const u8 = null,
         thread: ?std.Thread = null,
+        cancel: CancelToken = .{},
 
         fn deinit(self: *Job, allocator: std.mem.Allocator) void {
             if (self.thread) |thread| thread.join();
@@ -122,6 +136,7 @@ pub const Coordinator = struct {
 
     pub fn deinit(self: *Coordinator) void {
         // No new jobs can be submitted once the owning HTTP server is down.
+        for (self.jobs.items) |job| job.cancel.request();
         for (self.jobs.items) |job| job.deinit(self.allocator);
         self.jobs.deinit(self.allocator);
         self.* = undefined;
@@ -146,7 +161,8 @@ pub const Coordinator = struct {
             }
         }
         if (self.active_job_id != null) return error.MaintenanceBusy;
-        try self.pruneLocked();
+        self.pruneExpiredLocked(nowMs());
+        if (self.jobs.items.len >= max_retained_jobs) return error.MaintenanceHistoryFull;
 
         const job = try self.allocator.create(Job);
         errdefer self.allocator.destroy(job);
@@ -181,13 +197,25 @@ pub const Coordinator = struct {
         return null;
     }
 
+    pub fn cancel(self: *Coordinator, job_id: u64) ?Snapshot {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.reapCompletedThreadsLocked();
+        for (self.jobs.items) |job| {
+            if (job.id != job_id) continue;
+            if (job.state == .queued or job.state == .running) job.cancel.request();
+            return snapshotLocked(job);
+        }
+        return null;
+    }
+
     fn runJob(self: *Coordinator, job: *Job) void {
         platform_sync.lockYielding(&self.mutex);
         job.state = .running;
         job.started_at_ms = nowMs();
         self.mutex.unlock();
 
-        const outcome = self.source.run(job.operation);
+        const outcome = self.source.run(job.operation, &job.cancel);
 
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -196,30 +224,33 @@ pub const Coordinator = struct {
             job.state = .succeeded;
         } else |err| {
             job.error_name = @errorName(err);
-            job.state = .failed;
+            job.state = if (err == error.MaintenanceCanceled) .canceled else .failed;
         }
         job.completed_at_ms = nowMs();
         if (self.active_job_id == job.id) self.active_job_id = null;
     }
 
-    fn pruneLocked(self: *Coordinator) !void {
-        while (self.jobs.items.len >= max_retained_jobs) {
-            var remove_index: ?usize = null;
-            for (self.jobs.items, 0..) |job, i| {
-                if (job.state == .succeeded or job.state == .failed) {
-                    remove_index = i;
-                    break;
-                }
+    fn pruneExpiredLocked(self: *Coordinator, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.jobs.items.len) {
+            const job = self.jobs.items[i];
+            const terminal = job.state == .succeeded or job.state == .failed or job.state == .canceled;
+            const completed = job.completed_at_ms orelse {
+                i += 1;
+                continue;
+            };
+            if (!terminal or now_ms -| completed < idempotency_retention_ms) {
+                i += 1;
+                continue;
             }
-            const i = remove_index orelse return error.MaintenanceBusy;
-            const job = self.jobs.orderedRemove(i);
+            _ = self.jobs.orderedRemove(i);
             job.deinit(self.allocator);
         }
     }
 
     fn reapCompletedThreadsLocked(self: *Coordinator) void {
         for (self.jobs.items) |job| {
-            if (job.state != .succeeded and job.state != .failed) continue;
+            if (job.state != .succeeded and job.state != .failed and job.state != .canceled) continue;
             if (job.thread) |thread| {
                 thread.join();
                 job.thread = null;
@@ -255,7 +286,8 @@ test "storage maintenance coordinator is idempotent and single flight" {
         fn status(_: *anyopaque) Status {
             return .{ .engine = "fake", .maintenance = .{ .check = true, .online = true } };
         }
-        fn run(ptr: *anyopaque, _: Operation) anyerror!Result {
+        fn run(ptr: *anyopaque, _: Operation, cancel: *const CancelToken) anyerror!Result {
+            try cancel.check();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.runs.fetchAdd(1, .monotonic);
             return .{ .valid = true };
@@ -276,7 +308,37 @@ test "storage maintenance coordinator is idempotent and single flight" {
     try std.testing.expectError(error.IdempotencyConflict, coordinator.start(.vacuum, "same-key"));
 }
 
-test "storage maintenance snapshots remain valid after job pruning" {
+test "storage maintenance cancellation reaches a cooperative engine" {
+    const Fake = struct {
+        fn source(self: *@This()) Source {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
+        }
+        fn status(_: *anyopaque) Status {
+            return .{ .engine = "fake", .maintenance = .{ .vacuum = true } };
+        }
+        fn run(_: *anyopaque, _: Operation, cancel: *const CancelToken) anyerror!Result {
+            while (true) {
+                try cancel.check();
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+    var fake = Fake{};
+    var coordinator = Coordinator.init(std.testing.allocator, fake.source());
+    defer coordinator.deinit();
+    const started = try coordinator.start(.vacuum, "cancel-me");
+    _ = coordinator.cancel(started.job_id).?;
+    while (true) {
+        const snapshot = coordinator.get(started.job_id).?;
+        if (snapshot.state == .canceled) {
+            try std.testing.expectEqualStrings("MaintenanceCanceled", snapshot.error_name.?);
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+}
+
+test "storage maintenance snapshots remain valid after retention pruning" {
     const Fake = struct {
         fn source(self: *@This()) Source {
             return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
@@ -284,7 +346,8 @@ test "storage maintenance snapshots remain valid after job pruning" {
         fn status(_: *anyopaque) Status {
             return .{ .engine = "fake", .maintenance = .{ .check = true } };
         }
-        fn run(_: *anyopaque, _: Operation) anyerror!Result {
+        fn run(_: *anyopaque, _: Operation, cancel: *const CancelToken) anyerror!Result {
+            try cancel.check();
             return error.InjectedMaintenanceFailure;
         }
     };
@@ -302,15 +365,11 @@ test "storage maintenance snapshots remain valid after job pruning" {
     };
     try std.testing.expectEqualStrings("InjectedMaintenanceFailure", retained.error_name.?);
 
-    var i: usize = 1;
-    while (i <= Coordinator.max_retained_jobs) : (i += 1) {
-        const next = try coordinator.start(.check, null);
-        while (true) {
-            const snapshot = coordinator.get(next.job_id).?;
-            if (snapshot.state == .failed) break;
-            std.Thread.yield() catch {};
-        }
-    }
+    platform_sync.lockYielding(&coordinator.mutex);
+    coordinator.jobs.items[0].completed_at_ms = nowMs() - Coordinator.idempotency_retention_ms;
+    coordinator.mutex.unlock();
+    const next = try coordinator.start(.check, null);
+    while (coordinator.get(next.job_id).?.state != .failed) std.Thread.yield() catch {};
     try std.testing.expect(coordinator.get(first.job_id) == null);
     try std.testing.expectEqualStrings("InjectedMaintenanceFailure", retained.error_name.?);
 }
@@ -323,7 +382,8 @@ test "storage maintenance append allocation failure does not wedge coordinator" 
         fn status(_: *anyopaque) Status {
             return .{ .engine = "fake", .maintenance = .{ .check = true } };
         }
-        fn run(_: *anyopaque, _: Operation) anyerror!Result {
+        fn run(_: *anyopaque, _: Operation, cancel: *const CancelToken) anyerror!Result {
+            try cancel.check();
             return .{ .valid = true };
         }
     };

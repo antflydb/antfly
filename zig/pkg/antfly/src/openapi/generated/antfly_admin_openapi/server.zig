@@ -128,6 +128,11 @@ pub const GetStorageMaintenanceJobPathParams = struct {
     job_id: []const u8,
 };
 
+/// Request cancellation of a storage maintenance job
+pub const CancelStorageMaintenanceJobPathParams = struct {
+    job_id: []const u8,
+};
+
 /// Route metadata for all operations.
 pub const Route = struct {
     method: []const u8,
@@ -162,6 +167,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/maintenance/check", .operation_id = "startStorageCheck" },
     .{ .method = "POST", .path = "/maintenance/compact", .operation_id = "startStorageCompact" },
     .{ .method = "GET", .path = "/maintenance/jobs/{job_id}", .operation_id = "getStorageMaintenanceJob" },
+    .{ .method = "DELETE", .path = "/maintenance/jobs/{job_id}", .operation_id = "cancelStorageMaintenanceJob" },
     .{ .method = "POST", .path = "/maintenance/vacuum", .operation_id = "startStorageVacuum" },
 };
 
@@ -202,6 +208,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "startStorageCheck")) @compileError("ServerRouter: Impl missing required method 'startStorageCheck'");
         if (!@hasDecl(Impl, "startStorageCompact")) @compileError("ServerRouter: Impl missing required method 'startStorageCompact'");
         if (!@hasDecl(Impl, "getStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'getStorageMaintenanceJob'");
+        if (!@hasDecl(Impl, "cancelStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'cancelStorageMaintenanceJob'");
         if (!@hasDecl(Impl, "startStorageVacuum")) @compileError("ServerRouter: Impl missing required method 'startStorageVacuum'");
     }
 
@@ -243,6 +250,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/maintenance/check", startStorageCheck);
             try server.post("/maintenance/compact", startStorageCompact);
             try server.get("/maintenance/jobs/:job_id", getStorageMaintenanceJob);
+            try server.delete("/maintenance/jobs/:job_id", cancelStorageMaintenanceJob);
             try server.post("/maintenance/vacuum", startStorageVacuum);
         }
 
@@ -445,6 +453,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getStorageMaintenanceJob(ctx, job_id);
         }
 
+        /// Request cancellation of a storage maintenance job
+        /// DELETE /maintenance/jobs/{job_id}
+        fn cancelStorageMaintenanceJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.cancelStorageMaintenanceJob(ctx, job_id);
+        }
+
         /// Start physical storage reclamation
         /// POST /maintenance/vacuum
         fn startStorageVacuum(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -482,4 +498,5 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn startStorageCheck(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startStorageCompact(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn startStorageVacuum(self: *Impl, ctx: *httpx.Context) !httpx.Response

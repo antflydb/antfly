@@ -212,12 +212,16 @@ pub const Store = struct {
     }
 
     pub fn vacuum(self: *Store) !native.VacuumReport {
+        return try self.vacuumWithCancel(null);
+    }
+
+    pub fn vacuumWithCancel(self: *Store, cancel: ?*const @import("../maintenance.zig").CancelToken) !native.VacuumReport {
         try self.reserveWriterSlot();
         defer self.releaseWriterSlot();
 
         lockStore(self);
         defer self.mutex.unlock();
-        const report = try self.file.vacuum();
+        const report = try self.file.vacuumWithCancel(cancel);
         clearCachedSnapshotsLocked(self);
         self.known_document_root_page = self.file.activeCheckpoint().document_root_page;
         return report;
