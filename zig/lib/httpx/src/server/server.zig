@@ -673,6 +673,10 @@ pub const Server = struct {
     /// thread remains the sole owner of `listener`, `running`, and the
     /// connection group; requestStop only wakes its accept loop.
     stop_requested: std.atomic.Value(bool) = .init(false),
+    listen_started: std.atomic.Value(bool) = .init(false),
+    /// Actual bound port, published for cross-thread wakeups when config.port
+    /// is zero and the kernel selects an ephemeral port.
+    wake_port: std.atomic.Value(u16) = .init(0),
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
 
@@ -788,6 +792,12 @@ pub const Server = struct {
             .kernel_backlog = backlog,
             .reuse_address = self.config.reuse_address,
         });
+        const bound = self.listener.?.getLocalAddress();
+        const port = switch (bound) {
+            .ip4 => |ip4| ip4.port,
+            .ip6 => |ip6| ip6.port,
+        };
+        self.wake_port.store(port, .release);
     }
 
     /// Returns the bound listener address, or null if not yet bound.
@@ -803,6 +813,8 @@ pub const Server = struct {
     pub fn listen(self: *Self) !void {
         if (self.listener == null) try self.bind();
         self.running = true;
+        self.listen_started.store(true, .release);
+        defer self.listen_started.store(false, .release);
 
         if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
@@ -852,7 +864,10 @@ pub const Server = struct {
         self.stop_requested.store(true, .release);
         self.conn_semaphore.post(self.io);
 
-        var addr = Address.parse(self.config.host, self.config.port) catch return;
+        const published_port = self.wake_port.load(.acquire);
+        const port = if (published_port != 0) published_port else self.config.port;
+        if (port == 0) return;
+        var addr = Address.parse(self.config.host, port) catch return;
         switch (addr) {
             .ip4 => |ip4| if (std.mem.allEqual(u8, &ip4.bytes, 0)) {
                 addr = .{ .ip4 = .loopback(ip4.port) };
@@ -866,15 +881,11 @@ pub const Server = struct {
         wake_socket.close();
     }
 
-    /// Stops the server immediately, cancelling all in-flight connections.
+    /// Requests immediate server shutdown. This method is safe to call from a
+    /// different OS thread; listener and connection teardown are performed by
+    /// the listener thread before listen() returns.
     pub fn stop(self: *Self) void {
-        self.stop_requested.store(true, .release);
-        self.running = false;
-        self.connections.cancel(self.io);
-        if (self.listener) |*l| {
-            l.deinit();
-            self.listener = null;
-        }
+        self.requestStop();
     }
 
     /// Gracefully shuts down the server: stops accepting new connections and
@@ -882,8 +893,9 @@ pub const Server = struct {
     /// forcefully cancelling them. Similar to Go's http.Server.Shutdown.
     ///
     /// Must be called from a fiber context (e.g. a route handler or a
-    /// dedicated shutdown fiber) because it calls `io.sleep`. For signal-safe
-    /// stopping without a fiber, use `stop()` instead.
+    /// dedicated shutdown fiber) because it calls `io.sleep`. This function is
+    /// not async-signal-safe; signal handlers must notify ordinary program code
+    /// which can then call `stop()`.
     pub fn shutdown(self: *Self, timeout_ms: u64) void {
         self.running = false;
         if (self.listener) |*l| {
@@ -2575,14 +2587,14 @@ test "shutdown with nonzero timeout sleeps then cancels" {
     try std.testing.expect(!server.running);
 }
 
-test "stop cancels connections immediately" {
+test "stop publishes synchronized listener-thread shutdown" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
     server.running = true;
     server.stop();
-    try std.testing.expect(!server.running);
+    try std.testing.expect(server.running);
     try std.testing.expect(server.stop_requested.load(.acquire));
     try std.testing.expect(server.listener == null);
 }
@@ -2597,6 +2609,26 @@ test "requestStop only publishes synchronized listener-thread work" {
     try std.testing.expect(server.running);
     try std.testing.expect(server.stop_requested.load(.acquire));
     try std.testing.expect(server.listener == null);
+}
+
+test "cross-thread stop wakes an ephemeral listener" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.bind();
+    try std.testing.expect(server.wake_port.load(.acquire) != 0);
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("ephemeral listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    server.stop();
+    listener_thread.join();
+    try std.testing.expect(!server.running);
 }
 
 test "containsTraversal rejects double-encoded dot-dot" {

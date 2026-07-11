@@ -571,6 +571,9 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 			if !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) {
 				continue
 			}
+			if err := validatePVCInstanceOwnership(cluster, pvc); err != nil {
+				return nil, err
+			}
 			log.Info("Deleting discovered PVC", "pvc", pvc.Name)
 			if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
 				return nil, fmt.Errorf("failed to delete discovered PVC %s: %w", pvc.Name, err)
@@ -639,10 +642,8 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
 		if hasAnyPrefix(pvc.Name, prefixes) {
-			// Skip PVCs explicitly labeled for a different cluster to avoid
-			// cross-cluster deletion even if their name resembles a canonical claim.
-			if inst, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && inst != cluster.Name {
-				continue
+			if err := validatePVCInstanceOwnership(cluster, pvc); err != nil {
+				return nil, err
 			}
 			log.Info("Deleting PVC", "pvc", pvc.Name)
 			if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
@@ -652,6 +653,19 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	}
 
 	return nil, nil
+}
+
+// validatePVCInstanceOwnership fails closed when canonical naming and an
+// explicit instance label disagree. Unlabeled claims are accepted because
+// historical StatefulSet PVCs did not consistently carry stable labels.
+func validatePVCInstanceOwnership(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) error {
+	if instance, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && instance != cluster.Name {
+		return fmt.Errorf(
+			"refusing PVC cleanup for %s/%s: canonical claim name matches AntflyCluster %q but app.kubernetes.io/instance identifies %q",
+			pvc.Namespace, pvc.Name, cluster.Name, instance,
+		)
+	}
+	return nil
 }
 
 type dataNodeShutdownStatus struct {

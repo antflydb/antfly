@@ -1288,21 +1288,37 @@ pub const NativeFile = struct {
     fn validateNamespaceDirectory(self: *NativeFile, checkpoint: CheckpointSlot) !void {
         var directory = (try self.loadNamespaceDirectoryAlloc(self.allocator)) orelse return;
         defer deinitNamespaceDirectory(self.allocator, &directory);
-        var it = directory.iterator();
-        while (it.next()) |directory_entry| {
-            const namespace = directory_entry.key_ptr.*;
-            var page_id = directory_entry.value_ptr.*;
-            var walked: u64 = 0;
-            while (page_id != 0) {
-                if (page_id >= checkpoint.page_count) return error.InvalidPageId;
-                const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .document, checkpoint);
-                defer self.allocator.free(payload);
-                const entry = try decodeDocumentEntry(payload);
-                if (!std.mem.eql(u8, documentNamespace(entry.key), namespace)) return error.InvalidNamespaceDirectory;
-                page_id = entry.previous_namespace_page;
-                walked += 1;
-                if (walked > checkpoint.page_count) return error.InvalidNativePageChain;
-            }
+
+        // Verify the complete index in one global-history pass. Each map value
+        // is the document page that the next occurrence of that namespace must
+        // have. This proves directory heads are current, every document is
+        // indexed exactly once, and every namespace link targets the next older
+        // document without adding a second O(history) namespace traversal.
+        var expected_pages = std.StringHashMapUnmanaged(u64).empty;
+        defer expected_pages.deinit(self.allocator);
+        try expected_pages.ensureTotalCapacity(self.allocator, directory.count());
+        var directory_it = directory.iterator();
+        while (directory_it.next()) |entry| {
+            expected_pages.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        var page_id = checkpoint.document_root_page;
+        var walked: u64 = 0;
+        while (page_id != 0) {
+            if (page_id >= checkpoint.page_count) return error.InvalidPageId;
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .document, checkpoint);
+            defer self.allocator.free(payload);
+            const entry = try decodeDocumentEntry(payload);
+            const expected = expected_pages.getPtr(documentNamespace(entry.key)) orelse return error.InvalidNamespaceDirectory;
+            if (expected.* != page_id) return error.InvalidNamespaceDirectory;
+            expected.* = entry.previous_namespace_page;
+            page_id = entry.previous_page;
+            walked += 1;
+            if (walked > checkpoint.page_count) return error.InvalidNativePageChain;
+        }
+        var expected_it = expected_pages.valueIterator();
+        while (expected_it.next()) |expected| {
+            if (expected.* != 0) return error.InvalidNamespaceDirectory;
         }
     }
 
@@ -4290,6 +4306,42 @@ test "lite native namespace snapshot does not read unrelated document chains" {
     try std.testing.expectEqual(@as(usize, 1), docs_b.len);
     try std.testing.expectEqualStrings("b", docs_b[0].value);
     try std.testing.expectError(error.NativePageChecksumMismatch, reopened.snapshotDocumentsAlloc(allocator));
+}
+
+test "lite native check rejects incomplete namespace links with valid page checksums" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-namespace-link-check.aflite");
+    defer allocator.free(path);
+    const prefix = [_]u8{ 't', 0 };
+    const first_key = prefix ++ "first".*;
+    const second_key = prefix ++ "second".*;
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+    try file.putDocument(&first_key, "one");
+    try file.putDocument(&second_key, "two");
+
+    const head = file.activeCheckpoint().document_root_page;
+    const payload = try file.readPagePayloadByKindAlloc(allocator, head, .document);
+    defer allocator.free(payload);
+    const entry = try decodeDocumentEntry(payload);
+    var rewritten = std.ArrayListUnmanaged(u8).empty;
+    defer rewritten.deinit(allocator);
+    try encodeDocumentEntry(allocator, &rewritten, .{
+        .previous_page = entry.previous_page,
+        .previous_namespace_page = 0,
+        .key = entry.key,
+        .value = entry.value,
+        .is_delete = entry.is_delete,
+        .external_value_root_page = entry.external_value_root_page,
+    });
+    try file.writePage(head, .document, rewritten.items);
+
+    const report = try file.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_namespace_directory", report.issue.?);
 }
 
 test "lite native check validates committed root chains" {

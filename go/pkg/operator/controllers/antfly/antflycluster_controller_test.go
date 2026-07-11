@@ -222,6 +222,44 @@ func TestCleanupDeletesMixedLabeledAndUnlabeledCanonicalPVCs(t *testing.T) {
 	}
 }
 
+func TestCleanupFailsClosedOnConflictingDiscoveredPVCLabel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	controller := true
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	historical := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-historical", Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster", Name: cluster.Name,
+				UID: cluster.UID, Controller: &controller,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+			ObjectMeta: metav1.ObjectMeta{Name: "database"},
+		}}},
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "database-example-historical-0", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": "another-cluster"},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, historical, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), "refusing PVC cleanup") {
+		t.Fatalf("expected fail-closed ownership conflict, result=%v err=%v", result, err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatalf("conflicting PVC was deleted: %v", err)
+	}
+}
+
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }

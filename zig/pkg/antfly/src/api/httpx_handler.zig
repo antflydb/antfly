@@ -1576,6 +1576,14 @@ pub const AntflyApiHandler = struct {
         const metadata_create_start_ns = platform_time.monotonicNs();
         while (true) {
             self.api_server.source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
+                error.TableAlreadyExists => {
+                    _ = ctx.status(409);
+                    return ctx.text("table already exists");
+                },
+                error.InvalidCreateTableRequest => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid table configuration");
+                },
                 error.UnsupportedOperation => {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");

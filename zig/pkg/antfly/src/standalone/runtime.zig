@@ -271,6 +271,7 @@ const LocalStandaloneMetadata = struct {
     catalog_path: []const u8,
     catalog_store: ?*antfly.storage_backend_erased.Store,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
+    storage_engine: antfly.common.config.StorageEngine = .local,
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
 
@@ -333,6 +334,7 @@ const LocalStandaloneMetadata = struct {
         catalog_path: []const u8,
         backend_runtime: *antfly.db.background_runtime.BackendRuntime,
         catalog_store: ?*antfly.storage_backend_erased.Store,
+        storage_engine: antfly.common.config.StorageEngine,
     ) !LocalStandaloneMetadata {
         const owned_api_url = try alloc.dupe(u8, api_url);
         errdefer alloc.free(owned_api_url);
@@ -351,6 +353,7 @@ const LocalStandaloneMetadata = struct {
             .catalog_path = owned_catalog_path,
             .catalog_store = catalog_store,
             .backend_runtime = backend_runtime,
+            .storage_engine = storage_engine,
         };
         errdefer self.deinit();
         try self.loadPersistedCatalog();
@@ -522,7 +525,7 @@ const LocalStandaloneMetadata = struct {
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        const table = antfly.public_api.tables.deriveTableRecord(table_name, req);
+        const table = try deriveStandaloneTableRecord(self.storage_engine, table_name, req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
@@ -547,13 +550,15 @@ const LocalStandaloneMetadata = struct {
         var manifest = antfly.public_api.backups.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
         defer manifest.deinit(alloc);
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
-        const table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest);
+        var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
         const ranges = try antfly.public_api.backups.deriveRestoreRanges(alloc, table.table_id, location_uri, &manifest);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);
         }
+        if (self.storage_engine == .lite and ranges.len != 1) return error.InvalidBackupRequest;
+        table.desired_replica_count = 1;
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -983,6 +988,21 @@ const LocalStandaloneMetadata = struct {
     }
 };
 
+fn deriveStandaloneTableRecord(
+    storage_engine: antfly.common.config.StorageEngine,
+    table_name: []const u8,
+    req: antfly.public_api.tables.CreateTableRequest,
+) !antfly.metadata.TableRecord {
+    if (storage_engine == .lite and (req.num_shards orelse 1) != 1) {
+        return error.InvalidCreateTableRequest;
+    }
+    var table = antfly.public_api.tables.deriveTableRecord(table_name, req);
+    // A standalone process owns the only replica regardless of whether its
+    // local persistence is directory-backed or Lite single-file storage.
+    table.desired_replica_count = 1;
+    return table;
+}
+
 fn localSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
     if (schema_json.len == 0) return 0;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
@@ -1075,6 +1095,8 @@ pub fn runFromIterator(
     else
         null;
     const lite_fsync = cli.storage_fsync orelse if (loaded_config) |*cfg| cfg.storage.lite_fsync else true;
+    try validateEffectiveStandaloneStorage(cli, storage_engine, lite_path, if (loaded_config) |*cfg| cfg else null);
+    if (loaded_config) |*cfg| cfg.deployment_mode = .standalone;
 
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
@@ -1187,6 +1209,7 @@ pub fn runFromIterator(
         resolved.local_metadata_catalog_path,
         node_backend_runtime.ptr(),
         if (lite_backend) |*backend| try backend.runtimeStoreForNamespace("system/metadata") else null,
+        storage_engine,
     );
     defer local_metadata.deinit();
     const synced_extension_packages = try local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
@@ -1351,6 +1374,32 @@ pub fn runFromIterator(
             .SUCCESS => {},
             .INTR => continue,
             else => return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn validateEffectiveStandaloneStorage(
+    cli: CliConfig,
+    storage_engine: antfly.common.config.StorageEngine,
+    lite_path: ?[]const u8,
+    loaded_config: ?*const antfly.common.config.Config,
+) !void {
+    if (storage_engine == .object) return error.UnsupportedStandaloneStorageEngine;
+    if (storage_engine != .lite) {
+        if (cli.storage_path != null or cli.storage_fsync != null) return error.InvalidArguments;
+        return;
+    }
+    const path = lite_path orelse return error.MissingLiteStoragePath;
+    if (!std.mem.endsWith(u8, path, ".aflite")) return error.InvalidLiteStoragePath;
+    if (loaded_config) |cfg| {
+        if (cfg.metadata.orchestration_urls.len != 0 or cfg.metadata.raft_urls.len != 0) {
+            return error.LiteExternalMetadataUnsupported;
+        }
+        if (cfg.shard_allocation.default_shards_per_table != 1 or
+            cfg.shard_allocation.min_shards_per_table != 1 or
+            !cfg.shard_allocation.disable_shard_alloc)
+        {
+            return error.LiteHorizontalShardingUnsupported;
         }
     }
 }
@@ -3371,6 +3420,42 @@ const RecordingServer = struct {
 test "standalone runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "standalone Lite enforces one shard and one replica" {
+    const lite = try deriveStandaloneTableRecord(.lite, "docs", .{});
+    try std.testing.expectEqual(@as(u32, 1), lite.min_ranges);
+    try std.testing.expectEqual(@as(u32, 1), lite.desired_replica_count);
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        deriveStandaloneTableRecord(.lite, "split", .{ .num_shards = 2 }),
+    );
+
+    const local = try deriveStandaloneTableRecord(.local, "local", .{ .num_shards = 2 });
+    try std.testing.expectEqual(@as(u32, 2), local.min_ranges);
+    try std.testing.expectEqual(@as(u32, 1), local.desired_replica_count);
+}
+
+test "standalone validates effective Lite CLI and config settings" {
+    const lite_cli = CliConfig{ .storage_engine = .lite, .storage_path = "data.aflite" };
+    try validateEffectiveStandaloneStorage(lite_cli, .lite, "data.aflite", null);
+    try std.testing.expectError(
+        error.InvalidLiteStoragePath,
+        validateEffectiveStandaloneStorage(lite_cli, .lite, "data.db", null),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEffectiveStandaloneStorage(.{ .storage_path = "unused.aflite" }, .local, null, null),
+    );
+
+    var distributed = try antfly.common.config.Config.parseFromSlice(std.testing.allocator,
+        \\{"deployment_mode":"distributed","storage":{"engine":"local","local":{"base_dir":"data"}}}
+    );
+    defer distributed.deinit();
+    try std.testing.expectError(
+        error.LiteHorizontalShardingUnsupported,
+        validateEffectiveStandaloneStorage(lite_cli, .lite, "data.aflite", &distributed),
+    );
 }
 
 test "standalone runtime local generator accepts media url data uris" {

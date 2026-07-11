@@ -4741,6 +4741,8 @@ pub fn build(b: *std.Build) void {
             "inference config falls back to common config",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
+            "standalone Lite enforces one shard and one replica",
+            "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone unified server lifecycle propagates startup failure",
         },
