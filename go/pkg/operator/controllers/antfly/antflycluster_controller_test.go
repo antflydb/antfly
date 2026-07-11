@@ -191,6 +191,37 @@ func TestCleanupDoesNotTreatInstanceLabelAsOwnership(t *testing.T) {
 	}
 }
 
+func TestCleanupDeletesMixedLabeledAndUnlabeledCanonicalPVCs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{
+		Name: "example", Namespace: "default", UID: types.UID("cluster-uid"),
+	}}
+	labeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standalone-storage-example-standalone-0", Namespace: "default",
+		Labels: map[string]string{"app.kubernetes.io/instance": cluster.Name},
+	}}
+	unlabeled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "data-storage-example-data-0", Namespace: "default",
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, labeled, unlabeled).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	result, err := reconciler.cleanupStorageResources(context.Background(), cluster)
+	if err != nil || result != nil {
+		t.Fatalf("cleanup failed: result=%v err=%v", result, err)
+	}
+	for _, name := range []string{labeled.Name, unlabeled.Name} {
+		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, &corev1.PersistentVolumeClaim{})
+		if !errors.IsNotFound(err) {
+			t.Fatalf("expected PVC %s to be deleted, got %v", name, err)
+		}
+	}
+}
+
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }

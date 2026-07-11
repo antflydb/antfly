@@ -112,10 +112,13 @@ Logical group paths become cached key and index namespaces inside the file, so
 the existing `/db/v1`, SQL, transaction, indexing, and inference code paths are
 reused unchanged. Prefix-bounded cursors prevent cross-table scans;
 per-namespace snapshots bound materialized memory and allow writes to update
-only the affected table cache. Cached namespace runtimes avoid allocations and
-storage reinitialization on repeated reader/writer opens. The standalone
-metadata catalog is stored in a reserved system namespace in the same file and
-is published in memory only with a durable catalog commit.
+only the affected table cache. A checkpointed namespace-head directory and
+per-namespace document links make cold materialization proportional to the
+selected namespace's history. Missing namespace metadata fails closed as file
+corruption. Cached namespace runtimes avoid allocations and storage
+reinitialization on repeated reader/writer opens. The standalone metadata catalog
+is stored in a reserved system namespace in the same file and is published in
+memory only with a durable catalog commit.
 
 Storage maintenance uses the engine-neutral authenticated admin surface:
 `POST /admin/v1/maintenance/{check,compact,vacuum}` returns an asynchronous job,

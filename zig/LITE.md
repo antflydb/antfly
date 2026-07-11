@@ -58,7 +58,10 @@ The implementation now consists of:
   query-readonly, and status-only.
 - `storage/lite/native.zig` owns the v1 header, alternating checkpoint roots,
   page allocation, free map, crash recovery, integrity checks, stable snapshots,
-  and atomic vacuum replacement.
+  and atomic vacuum replacement. Document commits publish a namespace-head
+  directory and per-namespace page links in the same checkpoint, so a cold
+  table snapshot walks that table's history rather than the global document
+  log. Missing directory or namespace-link metadata is treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Snapshot
   caches are maintained per namespace: commits rebuild only the affected
@@ -175,11 +178,14 @@ history. Checkpoint inspection, index writes, document commits, compaction, and
 vacuum share the Lite store mutex and single-writer reservation, so the online
 operations cannot race checkpoint publication or file replacement.
 
-The standalone listener binds exclusively and reports bind/listen failure to
-the owning runtime before startup is declared ready. A failed listener cannot
-leave a headless process holding the `.aflite` writer lock. Standalone metadata
-updates retain a copy-on-write checkpoint until the catalog commit is durable,
-so failed persistence restores the exact prior in-memory state.
+The standalone listener holds an advisory lease for its host/port while using
+restart-safe address reuse. Cross-thread shutdown only publishes an atomic stop
+request and wakes the accept loop; listener and connection teardown stay on the
+server thread. Bind/listen failure reaches the owning runtime before readiness,
+so a failed listener cannot leave a headless process holding the `.aflite`
+writer lock. Standalone metadata updates retain a copy-on-write checkpoint
+until the catalog commit is durable, so failed persistence restores the exact
+prior in-memory state.
 
 The `antfly lite check`, `compact`, and `vacuum` commands remain useful for
 offline files and automation that does not run a server.

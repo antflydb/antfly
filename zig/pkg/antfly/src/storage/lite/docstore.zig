@@ -87,18 +87,14 @@ const SharedSnapshot = struct {
     }
 };
 
-const SnapshotCache = struct {
-    prefix: []u8,
-    snapshot: *SharedSnapshot,
-};
-
 pub const Store = struct {
     allocator: Allocator,
     file: native.NativeFile,
     read_only: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     writer_active: bool = false,
-    snapshot_caches: std.ArrayListUnmanaged(SnapshotCache) = .empty,
+    snapshot_caches: std.StringHashMapUnmanaged(*SharedSnapshot) = .empty,
+    known_document_root_page: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !Store {
@@ -111,11 +107,13 @@ pub const Store = struct {
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
         });
+        const checkpoint = file.activeCheckpoint();
         return .{
             .allocator = allocator,
             .file = file,
             .read_only = opts.read_only,
             .resource_manager = opts.resource_manager,
+            .known_document_root_page = checkpoint.document_root_page,
         };
     }
 
@@ -129,11 +127,13 @@ pub const Store = struct {
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
         });
+        const checkpoint = file.activeCheckpoint();
         return .{
             .allocator = allocator,
             .file = file,
             .read_only = false,
             .resource_manager = opts.resource_manager,
+            .known_document_root_page = checkpoint.document_root_page,
         };
     }
 
@@ -168,6 +168,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         const report = try self.file.vacuum();
         clearCachedSnapshotsLocked(self);
+        self.known_document_root_page = self.file.activeCheckpoint().document_root_page;
         return report;
     }
 
@@ -531,31 +532,25 @@ const PendingMutation = struct {
 };
 
 fn clearCachedSnapshotsLocked(store: *Store) void {
-    for (store.snapshot_caches.items) |cache| {
-        cache.snapshot.release();
-        store.allocator.free(cache.prefix);
+    var it = store.snapshot_caches.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.*.release();
+        store.allocator.free(entry.key_ptr.*);
     }
     store.snapshot_caches.clearRetainingCapacity();
 }
 
-fn cachedSnapshotIndex(store: *Store, prefix: []const u8) ?usize {
-    for (store.snapshot_caches.items, 0..) |cache, i| {
-        if (std.mem.eql(u8, cache.prefix, prefix)) return i;
-    }
-    return null;
-}
-
-fn removeCachedSnapshotLocked(store: *Store, index: usize) void {
-    const cache = store.snapshot_caches.orderedRemove(index);
-    cache.snapshot.release();
-    store.allocator.free(cache.prefix);
+fn removeCachedSnapshotLocked(store: *Store, prefix: []const u8) void {
+    const removed = store.snapshot_caches.fetchRemove(prefix) orelse return;
+    removed.value.release();
+    store.allocator.free(removed.key);
 }
 
 fn installCachedSnapshotLocked(store: *Store, prefix: []const u8, snapshot: *SharedSnapshot) !void {
-    if (cachedSnapshotIndex(store, prefix)) |index| removeCachedSnapshotLocked(store, index);
+    removeCachedSnapshotLocked(store, prefix);
     const owned_prefix = try store.allocator.dupe(u8, prefix);
     errdefer store.allocator.free(owned_prefix);
-    try store.snapshot_caches.append(store.allocator, .{ .prefix = owned_prefix, .snapshot = snapshot });
+    try store.snapshot_caches.put(store.allocator, owned_prefix, snapshot);
 }
 
 fn snapshotByteCost(docs: []const native.OwnedDocument) u64 {
@@ -596,14 +591,17 @@ fn createUncachedSnapshot(
 /// held.
 fn acquireSnapshotLocked(store: *Store, prefix: []const u8) !*SharedSnapshot {
     const checkpoint = store.file.activeCheckpoint();
-    if (cachedSnapshotIndex(store, prefix)) |index| {
-        const snap = store.snapshot_caches.items[index].snapshot;
-        if (snap.document_root_page == checkpoint.document_root_page) {
-            snap.commit_sequence = checkpoint.commit_sequence;
-            snap.retain();
-            return snap;
-        }
-        removeCachedSnapshotLocked(store, index);
+    if (checkpoint.document_root_page != store.known_document_root_page) {
+        // A document commit bypassed this Store. Its namespace is unknown, so
+        // invalidate once rather than risk serving a stale logical view.
+        clearCachedSnapshotsLocked(store);
+        store.known_document_root_page = checkpoint.document_root_page;
+    }
+    if (store.snapshot_caches.get(prefix)) |snap| {
+        snap.commit_sequence = checkpoint.commit_sequence;
+        snap.document_root_page = checkpoint.document_root_page;
+        snap.retain();
+        return snap;
     }
 
     const docs = try store.file.snapshotDocumentsWithPrefixAlloc(store.allocator, prefix);
@@ -628,32 +626,16 @@ fn acquireSnapshotLocked(store: *Store, prefix: []const u8) !*SharedSnapshot {
 /// rebuilds from disk. Must be called with `store.mutex` held.
 fn publishAppliedSnapshotLocked(store: *Store, prefix: []const u8, base: []const native.OwnedDocument, pending: []const PendingMutation) void {
     const checkpoint = store.file.activeCheckpoint();
-    // A namespaced commit cannot change another namespace's logical view.
-    // Advance those cache versions in place so writes to one table do not
-    // invalidate and rematerialize every other table.
-    var cache_index: usize = 0;
-    while (cache_index < store.snapshot_caches.items.len) {
-        const cache = store.snapshot_caches.items[cache_index];
-        if (std.mem.eql(u8, cache.prefix, prefix)) {
-            cache_index += 1;
-            continue;
-        }
-        const overlaps = cache.prefix.len == 0 or prefix.len == 0 or
-            std.mem.startsWith(u8, cache.prefix, prefix) or
-            std.mem.startsWith(u8, prefix, cache.prefix);
-        if (overlaps) {
-            removeCachedSnapshotLocked(store, cache_index);
-            continue;
-        }
-        cache.snapshot.commit_sequence = checkpoint.commit_sequence;
-        cache.snapshot.document_root_page = checkpoint.document_root_page;
-        cache_index += 1;
-    }
+    store.known_document_root_page = checkpoint.document_root_page;
+    // Valid non-empty prefixes end in NUL and are therefore mutually
+    // disjoint. A scoped write only invalidates its exact cache plus the
+    // optional unscoped view; an unscoped write can affect every namespace.
+    if (prefix.len == 0) clearCachedSnapshotsLocked(store) else removeCachedSnapshotLocked(store, "");
     const applied = buildAppliedSnapshotDocs(store.allocator, base, pending) catch {
-        if (cachedSnapshotIndex(store, prefix)) |index| removeCachedSnapshotLocked(store, index);
+        removeCachedSnapshotLocked(store, prefix);
         return;
     };
-    if (cachedSnapshotIndex(store, prefix)) |index| removeCachedSnapshotLocked(store, index);
+    removeCachedSnapshotLocked(store, prefix);
     const maybe_snap = createCachedSnapshotLocked(
         store,
         applied,
@@ -740,6 +722,7 @@ pub const Txn = struct {
     }
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
+        try validatePrefix(prefix);
         lockStore(store);
         defer store.mutex.unlock();
         const snapshot = try acquireSnapshotLocked(store, prefix);
@@ -757,6 +740,7 @@ pub const Txn = struct {
     }
 
     pub fn openWriteWithPrefix(store: *Store, prefix: []const u8) !Txn {
+        try validatePrefix(prefix);
         try store.reserveWriterSlot();
         errdefer store.releaseWriterSlot();
 
@@ -780,6 +764,7 @@ pub const Txn = struct {
     }
 
     pub fn openWriteYieldingWithPrefix(store: *Store, prefix: []const u8) !Txn {
+        try validatePrefix(prefix);
         try store.reserveWriterSlotYielding();
         errdefer store.releaseWriterSlot();
 
@@ -910,6 +895,10 @@ pub const Txn = struct {
         return try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
     }
 };
+
+fn validatePrefix(prefix: []const u8) !void {
+    if (prefix.len > 0 and prefix[prefix.len - 1] != 0) return error.InvalidArgument;
+}
 
 pub const Cursor = struct {
     txn: *Txn,
@@ -1459,8 +1448,7 @@ test "lite native docstore reserves one writer until abort or commit" {
 
 fn expectCachedSnapshotMatchesDiskRebuild(store: *Store) !void {
     const allocator = std.testing.allocator;
-    const cache_index = cachedSnapshotIndex(store, "") orelse return error.TestUnexpectedResult;
-    const cached = store.snapshot_caches.items[cache_index].snapshot;
+    const cached = store.snapshot_caches.get("") orelse return error.TestUnexpectedResult;
 
     const checkpoint = store.file.activeCheckpoint();
     try std.testing.expectEqual(checkpoint.commit_sequence, cached.commit_sequence);
@@ -1695,14 +1683,14 @@ test "lite native docstore snapshot cache budget rejection does not fail transac
         try batch.put("doc:budget", "uncached");
         try batch.commit();
     }
-    try std.testing.expectEqual(@as(usize, 0), store.snapshot_caches.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.snapshot_caches.count());
 
     {
         var read = try store.beginRead();
         defer read.abort();
         try std.testing.expectEqualStrings("uncached", try read.get("doc:budget"));
     }
-    try std.testing.expectEqual(@as(usize, 0), store.snapshot_caches.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.snapshot_caches.count());
 
     const stats = manager.sliceStats(.lite_docstore_snapshot_cache);
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);

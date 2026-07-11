@@ -216,7 +216,46 @@ const UnifiedServerLifecycle = struct {
         if (prior == .failed or prior == .stopped) return;
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        if (self.server) |server| server.stop();
+        if (self.server) |server| server.requestStop();
+    }
+};
+
+/// Process-level ownership for a public bind tuple. Zig 0.16's POSIX
+/// `reuse_address` also enables SO_REUSEPORT, so the kernel socket alone does
+/// not provide exclusivity. Keeping this advisory lock for the listener
+/// lifetime permits SO_REUSEADDR fast restarts without allowing two Antfly
+/// processes on the same host to accept the same port.
+const PublicListenerLease = struct {
+    alloc: std.mem.Allocator,
+    io_impl: std.Io.Threaded,
+    file: std.Io.File,
+    path: []u8,
+
+    fn acquire(alloc: std.mem.Allocator, bind_port: u16) !PublicListenerLease {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        // Lease by port rather than host spelling: wildcard/specific binds and
+        // IPv6 aliases can overlap even when their input strings differ.
+        const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-listener-{d}.lock", .{bind_port});
+        errdefer alloc.free(path);
+        const file = std.Io.Dir.cwd().createFile(io_impl.io(), path, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => return error.AddressInUse,
+            error.FileLocksUnsupported => return error.ListenerLockUnsupported,
+            else => return err,
+        };
+        return .{ .alloc = alloc, .io_impl = io_impl, .file = file, .path = path };
+    }
+
+    fn deinit(self: *PublicListenerLease) void {
+        self.file.close(self.io_impl.io());
+        self.io_impl.deinit();
+        self.alloc.free(self.path);
+        self.* = undefined;
     }
 };
 
@@ -1247,6 +1286,9 @@ pub fn runFromIterator(
     const bind_port = public_listener.bind_port;
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
+    var public_listener_lease = try PublicListenerLease.acquire(alloc, bind_port);
+    defer public_listener_lease.deinit();
+
     var standalone_health = StandaloneHealthSource{
         .data_server = &data_server,
         .unified_api_ready = &unified_api_ready,
@@ -1801,7 +1843,10 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
         .request_timeout_ms = 300_000,
         .max_requests_per_connection = public_api_max_requests_per_connection,
-        .reuse_address = false,
+        // std.Io currently maps this to SO_REUSEADDR + SO_REUSEPORT on POSIX.
+        // The standalone listener lease supplies exclusivity while preserving
+        // restart-safe address reuse for connections in TIME_WAIT.
+        .reuse_address = true,
     };
 }
 
@@ -4367,10 +4412,26 @@ test "standalone runtime defaults public listener to antfarm port" {
     try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
 }
 
-test "standalone public HTTP server is exclusive and uses public API request body limit" {
+test "standalone public HTTP server is restart-safe and uses public API request body limit" {
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
-    try std.testing.expect(!cfg.reuse_address);
+    try std.testing.expect(cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
+}
+
+test "standalone public listener lease is exclusive and immediately reusable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lease_key = tmp.sub_path;
+    const lease_port: u16 = @intCast(20_000 + std.hash.Wyhash.hash(0, lease_key[0..]) % 30_000);
+    var first = PublicListenerLease.acquire(std.testing.allocator, lease_port) catch |err| switch (err) {
+        error.ListenerLockUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(error.AddressInUse, PublicListenerLease.acquire(std.testing.allocator, lease_port));
+    first.deinit();
+
+    var replacement = try PublicListenerLease.acquire(std.testing.allocator, lease_port);
+    replacement.deinit();
 }
 
 test "antfly config uses cli override before common config" {

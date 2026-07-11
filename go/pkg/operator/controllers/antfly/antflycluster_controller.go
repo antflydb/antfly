@@ -621,10 +621,10 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		return &result, nil
 	}
 
-	// Step 3: Delete PVCs belonging to this cluster.
-	// First try a label-scoped listing (works for clusters created with labeled VolumeClaimTemplates).
-	// Fall back to a namespace-wide listing with name prefix matching for older clusters
-	// whose PVCs lack instance labels.
+	// Step 3: Delete PVCs belonging to this cluster. Use one namespace-wide list
+	// so mixed-generation clusters cannot hide an unlabeled historical claim
+	// merely because a newer labeled claim also exists. Canonical claim prefixes
+	// establish scope; a conflicting instance label fails closed.
 	prefixes := []string{
 		"metadata-storage-" + cluster.Name + "-metadata-",
 		"data-storage-" + cluster.Name + "-data-",
@@ -632,24 +632,15 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	}
 
 	var pvcList corev1.PersistentVolumeClaimList
-	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace),
-		client.MatchingLabels{"app.kubernetes.io/instance": cluster.Name}); err != nil {
+	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list PVCs: %w", err)
-	}
-
-	// If no labeled PVCs found, fall back to namespace-wide list with prefix matching
-	// (backward compatibility for clusters created before labels were added to VolumeClaimTemplates)
-	if len(pvcList.Items) == 0 {
-		if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
-			return nil, fmt.Errorf("failed to list PVCs: %w", err)
-		}
 	}
 
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
 		if hasAnyPrefix(pvc.Name, prefixes) {
-			// In the fallback path (namespace-wide listing), skip PVCs that are
-			// labeled for a different cluster to avoid cross-cluster deletion.
+			// Skip PVCs explicitly labeled for a different cluster to avoid
+			// cross-cluster deletion even if their name resembles a canonical claim.
 			if inst, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && inst != cluster.Name {
 				continue
 			}

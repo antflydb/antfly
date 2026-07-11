@@ -41,7 +41,7 @@ const header_size_offset: usize = 16;
 const active_checkpoint_offset: usize = 20;
 const checkpoint_slots_offset: usize = 64;
 const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
-const checkpoint_slot_payload_size: usize = 48;
+const checkpoint_slot_payload_size: usize = 56;
 const checkpoint_slot_checksum_offset: usize = checkpoint_slot_payload_size;
 const header_checksum_offset: usize = header_size - 4;
 const page_crc_offset: usize = 12;
@@ -59,6 +59,9 @@ const catalog_delete_flag: u32 = 1 << 31;
 const catalog_external_value_flag: u32 = 1 << 30;
 const document_delete_flag: u8 = 1 << 0;
 const document_external_value_flag: u8 = 1 << 1;
+const document_namespace_link_flag: u8 = 1 << 2;
+const namespace_directory_key = "\x00antfly.document_namespaces.v1";
+const namespace_directory_magic = "AFNSIDX1";
 const value_page_header_size: usize = 8;
 const free_map_format_version: u32 = 1;
 const free_map_header_size: usize = 16;
@@ -79,6 +82,7 @@ pub const CatalogEntry = struct {
 
 pub const DocumentEntry = struct {
     previous_page: u64,
+    previous_namespace_page: u64 = 0,
     key: []const u8,
     value: []const u8 = "",
     is_delete: bool = false,
@@ -156,6 +160,7 @@ pub const CheckpointSlot = struct {
     index_catalog_root_page: u64 = 0,
     free_map_root_page: u64 = 0,
     page_count: u64 = 1,
+    namespace_directory_root_page: u64 = 0,
 };
 
 pub const LockMode = enum {
@@ -672,6 +677,15 @@ pub const NativeFile = struct {
         defer reachable_pages.deinit(self.allocator);
 
         const catalog_records = self.countReachableChainPages(.catalog, checkpoint.catalog_root_page, &reachable_pages) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        const namespace_directory_records = self.countReachableChainPages(.catalog, checkpoint.namespace_directory_root_page, &reachable_pages) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        if ((checkpoint.document_root_page == 0 and namespace_directory_records != 0) or
+            (checkpoint.document_root_page != 0 and namespace_directory_records != 1))
+            return invalidCheck(report, "invalid_namespace_directory");
+        self.validateNamespaceDirectory(checkpoint) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         const index_catalog_records = self.countReachableChainPages(.catalog, checkpoint.index_catalog_root_page, &reachable_pages) catch |err| {
@@ -1200,6 +1214,98 @@ pub const NativeFile = struct {
         allocator.free(records);
     }
 
+    const NamespaceDirectory = std.StringHashMapUnmanaged(u64);
+
+    fn documentNamespace(key: []const u8) []const u8 {
+        const end = (std.mem.indexOfScalar(u8, key, 0) orelse return "") + 1;
+        return key[0..end];
+    }
+
+    fn deinitNamespaceDirectory(allocator: Allocator, directory: *NamespaceDirectory) void {
+        var it = directory.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        directory.deinit(allocator);
+    }
+
+    fn decodeNamespaceDirectoryAlloc(allocator: Allocator, raw: []const u8) !NamespaceDirectory {
+        if (raw.len < namespace_directory_magic.len + 4 or
+            !std.mem.eql(u8, raw[0..namespace_directory_magic.len], namespace_directory_magic))
+            return error.InvalidNamespaceDirectory;
+        var offset: usize = namespace_directory_magic.len;
+        const count = std.mem.readInt(u32, raw[offset..][0..4], .little);
+        offset += 4;
+        if (@as(usize, count) > (raw.len - offset) / 12) return error.InvalidNamespaceDirectory;
+        var directory = NamespaceDirectory.empty;
+        errdefer deinitNamespaceDirectory(allocator, &directory);
+        try directory.ensureTotalCapacity(allocator, count);
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            if (raw.len - offset < 4) return error.InvalidNamespaceDirectory;
+            const len = std.mem.readInt(u32, raw[offset..][0..4], .little);
+            offset += 4;
+            if (len > raw.len - offset or raw.len - offset - len < 8) return error.InvalidNamespaceDirectory;
+            const key = try allocator.dupe(u8, raw[offset..][0..len]);
+            offset += len;
+            const head = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            if ((key.len > 0 and key[key.len - 1] != 0) or head == 0 or directory.contains(key)) {
+                allocator.free(key);
+                return error.InvalidNamespaceDirectory;
+            }
+            directory.putAssumeCapacity(key, head);
+        }
+        if (offset != raw.len) return error.InvalidNamespaceDirectory;
+        return directory;
+    }
+
+    fn encodeNamespaceDirectoryAlloc(allocator: Allocator, directory: *const NamespaceDirectory) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        try out.writer.writeAll(namespace_directory_magic);
+        try out.writer.writeInt(u32, std.math.cast(u32, directory.count()) orelse return error.RecordTooLarge, .little);
+        var it = directory.iterator();
+        while (it.next()) |entry| {
+            try out.writer.writeInt(u32, @intCast(entry.key_ptr.*.len), .little);
+            try out.writer.writeAll(entry.key_ptr.*);
+            try out.writer.writeInt(u64, entry.value_ptr.*, .little);
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn loadNamespaceDirectoryAlloc(self: *NativeFile, allocator: Allocator) !?NamespaceDirectory {
+        const root = self.activeCheckpoint().namespace_directory_root_page;
+        if (root == 0) return null;
+        const payload = try self.readPagePayloadByKindAlloc(allocator, root, .catalog);
+        defer allocator.free(payload);
+        const entry = try decodeCatalogEntry(payload);
+        if (!std.mem.eql(u8, entry.key, namespace_directory_key) or entry.previous_page != 0 or entry.is_delete)
+            return error.InvalidNamespaceDirectory;
+        const raw = try self.catalogEntryValueAlloc(allocator, entry);
+        defer allocator.free(raw);
+        return try decodeNamespaceDirectoryAlloc(allocator, raw);
+    }
+
+    fn validateNamespaceDirectory(self: *NativeFile, checkpoint: CheckpointSlot) !void {
+        var directory = (try self.loadNamespaceDirectoryAlloc(self.allocator)) orelse return;
+        defer deinitNamespaceDirectory(self.allocator, &directory);
+        var it = directory.iterator();
+        while (it.next()) |directory_entry| {
+            const namespace = directory_entry.key_ptr.*;
+            var page_id = directory_entry.value_ptr.*;
+            var walked: u64 = 0;
+            while (page_id != 0) {
+                if (page_id >= checkpoint.page_count) return error.InvalidPageId;
+                const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .document, checkpoint);
+                defer self.allocator.free(payload);
+                const entry = try decodeDocumentEntry(payload);
+                if (!std.mem.eql(u8, documentNamespace(entry.key), namespace)) return error.InvalidNamespaceDirectory;
+                page_id = entry.previous_namespace_page;
+                walked += 1;
+                if (walked > checkpoint.page_count) return error.InvalidNativePageChain;
+            }
+        }
+    }
+
     pub fn putDocument(self: *NativeFile, key: []const u8, value: []const u8) !void {
         try self.putDocumentBatch(&.{.{ .key = key, .value = value }});
     }
@@ -1217,6 +1323,11 @@ pub const NativeFile = struct {
         var next_root_page = previous.document_root_page;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        var namespace_directory = (try self.loadNamespaceDirectoryAlloc(self.allocator)) orelse blk: {
+            if (previous.document_root_page != 0) return error.InvalidNamespaceDirectory;
+            break :blk NamespaceDirectory.empty;
+        };
+        defer deinitNamespaceDirectory(self.allocator, &namespace_directory);
 
         for (mutations) |mutation| {
             var external_value_root_page: u64 = 0;
@@ -1225,10 +1336,13 @@ pub const NativeFile = struct {
             }
 
             const page_id = try page_allocator.allocate();
+            const namespace = documentNamespace(mutation.key);
+            const previous_namespace_page = namespace_directory.get(namespace) orelse 0;
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
             try encodeDocumentEntry(self.allocator, &payload, .{
                 .previous_page = next_root_page,
+                .previous_namespace_page = previous_namespace_page,
                 .key = mutation.key,
                 .value = mutation.value,
                 .is_delete = mutation.is_delete,
@@ -1236,11 +1350,39 @@ pub const NativeFile = struct {
             });
             try self.writePage(page_id, .document, payload.items);
             next_root_page = page_id;
+            if (namespace_directory.getPtr(namespace)) |head| {
+                head.* = page_id;
+            } else {
+                const owned_namespace = try self.allocator.dupe(u8, namespace);
+                namespace_directory.put(self.allocator, owned_namespace, page_id) catch |err| {
+                    self.allocator.free(owned_namespace);
+                    return err;
+                };
+            }
         }
+
+        const encoded_directory = try encodeNamespaceDirectoryAlloc(self.allocator, &namespace_directory);
+        defer self.allocator.free(encoded_directory);
+        try self.validateCatalogMutation(.{ .key = namespace_directory_key, .value = encoded_directory });
+        var directory_external_root: u64 = 0;
+        if (!self.catalogEntryFitsInline(namespace_directory_key, encoded_directory)) {
+            directory_external_root = try self.writeValuePagesAllocated(&page_allocator, encoded_directory);
+        }
+        const directory_page = try page_allocator.allocate();
+        var directory_payload = std.ArrayListUnmanaged(u8).empty;
+        defer directory_payload.deinit(self.allocator);
+        try encodeCatalogEntry(self.allocator, &directory_payload, .{
+            .previous_page = 0,
+            .key = namespace_directory_key,
+            .value = encoded_directory,
+            .external_value_root_page = directory_external_root,
+        });
+        try self.writePage(directory_page, .catalog, directory_payload.items);
 
         var next = previous;
         next.commit_sequence += 1;
         next.document_root_page = next_root_page;
+        next.namespace_directory_root_page = directory_page;
         next.free_map_root_page = try page_allocator.allocate();
         next.page_count = page_allocator.next_page_id;
 
@@ -1271,11 +1413,21 @@ pub const NativeFile = struct {
         return try self.snapshotDocumentsWithPrefixAlloc(allocator, "");
     }
 
-    /// Materializes only live documents in `prefix`. The document log is still
-    /// walked newest-to-oldest for v1 format compatibility, but memory and sort
-    /// work are bounded by the selected logical namespace rather than the
-    /// entire database.
+    /// Materializes only live documents in `prefix`. Current files use the
+    /// persisted namespace directory and per-namespace page links, making the
+    /// walk proportional to that namespace's history.
     pub fn snapshotDocumentsWithPrefixAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8) ![]OwnedDocument {
+        if (prefix.len == 0) return try self.snapshotDocumentsFromChainAlloc(allocator, prefix, self.activeCheckpoint().document_root_page, false);
+        var directory = (try self.loadNamespaceDirectoryAlloc(allocator)) orelse {
+            if (self.activeCheckpoint().document_root_page == 0) return try allocator.alloc(OwnedDocument, 0);
+            return error.InvalidNamespaceDirectory;
+        };
+        defer NativeFile.deinitNamespaceDirectory(allocator, &directory);
+        const head = directory.get(prefix) orelse return try allocator.alloc(OwnedDocument, 0);
+        return try self.snapshotDocumentsFromChainAlloc(allocator, prefix, head, true);
+    }
+
+    fn snapshotDocumentsFromChainAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8, root_page: u64, namespace_chain: bool) ![]OwnedDocument {
         var docs = std.ArrayListUnmanaged(OwnedDocument).empty;
         errdefer {
             for (docs.items) |doc| {
@@ -1296,13 +1448,14 @@ pub const NativeFile = struct {
             tombstone_keys.deinit(allocator);
         }
 
-        var page_id = self.activeCheckpoint().document_root_page;
+        var page_id = root_page;
         while (page_id != 0) {
             const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
             defer allocator.free(payload);
             const entry = try decodeDocumentEntry(payload);
 
             if (!std.mem.startsWith(u8, entry.key, prefix)) {
+                if (namespace_chain) return error.InvalidNamespaceDirectory;
                 page_id = entry.previous_page;
                 continue;
             }
@@ -1323,7 +1476,7 @@ pub const NativeFile = struct {
                     seen.putAssumeCapacity(owned_key, {});
                 }
             }
-            page_id = entry.previous_page;
+            page_id = if (namespace_chain) entry.previous_namespace_page else entry.previous_page;
         }
 
         std.mem.sort(OwnedDocument, docs.items, {}, struct {
@@ -1373,8 +1526,11 @@ pub const NativeFile = struct {
         var catalog_root_page: u64 = 0;
         var index_catalog_root_page: u64 = 0;
         var document_root_page: u64 = 0;
+        var namespace_directory_root_page: u64 = 0;
         var free_map_root_page: u64 = 0;
         var live_bytes: u64 = 0;
+        var namespace_directory = NamespaceDirectory.empty;
+        defer deinitNamespaceDirectory(self.allocator, &namespace_directory);
 
         for (catalog_records) |record| {
             const external_value_root_page = if (record.value.len == 0 or self.catalogEntryFitsInline(record.key, record.value))
@@ -1420,14 +1576,44 @@ pub const NativeFile = struct {
 
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
+            const namespace = documentNamespace(doc.key);
+            const previous_namespace_page = namespace_directory.get(namespace) orelse 0;
             try encodeDocumentEntry(self.allocator, &payload, .{
                 .previous_page = document_root_page,
+                .previous_namespace_page = previous_namespace_page,
                 .key = doc.key,
                 .value = doc.value,
                 .external_value_root_page = external_value_root_page,
             });
             document_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .document, payload.items);
+            if (namespace_directory.getPtr(namespace)) |head| {
+                head.* = document_root_page;
+            } else {
+                const owned_namespace = try self.allocator.dupe(u8, namespace);
+                namespace_directory.put(self.allocator, owned_namespace, document_root_page) catch |err| {
+                    self.allocator.free(owned_namespace);
+                    return err;
+                };
+            }
             live_bytes +|= doc.key.len + doc.value.len;
+        }
+
+        if (docs.len > 0) {
+            const encoded_directory = try encodeNamespaceDirectoryAlloc(self.allocator, &namespace_directory);
+            defer self.allocator.free(encoded_directory);
+            const directory_external_root = if (self.catalogEntryFitsInline(namespace_directory_key, encoded_directory))
+                0
+            else
+                try appendValuePagesToImage(self.allocator, &image, page_size, self.maxValuePagePayloadBytes(), &next_page_id, encoded_directory);
+            var directory_payload = std.ArrayListUnmanaged(u8).empty;
+            defer directory_payload.deinit(self.allocator);
+            try encodeCatalogEntry(self.allocator, &directory_payload, .{
+                .previous_page = 0,
+                .key = namespace_directory_key,
+                .value = encoded_directory,
+                .external_value_root_page = directory_external_root,
+            });
+            namespace_directory_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .catalog, directory_payload.items);
         }
 
         free_map_root_page = try appendFreeMapPageToImage(self.allocator, &image, page_size, &next_page_id, next_page_id + 1, &.{});
@@ -1439,6 +1625,7 @@ pub const NativeFile = struct {
             .index_catalog_root_page = index_catalog_root_page,
             .free_map_root_page = free_map_root_page,
             .page_count = next_page_id,
+            .namespace_directory_root_page = namespace_directory_root_page,
         };
         const compact_header = Header{
             .page_size = self.header.page_size,
@@ -1564,7 +1751,7 @@ pub const NativeFile = struct {
 
     fn validateDocumentMutation(self: *const NativeFile, mutation: DocumentMutation) !void {
         if (mutation.key.len > std.math.maxInt(u32) or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-        const fixed_len = 20 + mutation.key.len;
+        const fixed_len = 28 + mutation.key.len;
         if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
         if (mutation.is_delete) return;
         if (mutation.value.len <= self.maxPagePayloadBytes() - fixed_len) return;
@@ -1573,7 +1760,7 @@ pub const NativeFile = struct {
     }
 
     fn documentEntryFitsInline(self: *const NativeFile, key: []const u8, value: []const u8) bool {
-        const fixed_len = 20 + key.len;
+        const fixed_len = 28 + key.len;
         return fixed_len <= self.maxPagePayloadBytes() and value.len <= self.maxPagePayloadBytes() - fixed_len;
     }
 
@@ -1921,6 +2108,7 @@ pub const NativeFile = struct {
 
         _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.catalog_root_page, checkpoint, &checkpoint_pages);
         _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.index_catalog_root_page, checkpoint, &checkpoint_pages);
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.namespace_directory_root_page, checkpoint, &checkpoint_pages);
         _ = try self.countReachableChainPagesForCheckpoint(.document, checkpoint.document_root_page, checkpoint, &checkpoint_pages);
         if (checkpoint.free_map_root_page != 0) {
             try self.markReachablePage(&checkpoint_pages, checkpoint.free_map_root_page, checkpoint.page_count);
@@ -2136,6 +2324,14 @@ pub const NativeFile = struct {
             if (!self.documentEntryFitsInline(doc.key, doc.value)) {
                 compact_pages += self.valuePageCount(doc.value.len);
             }
+        }
+        if (docs.len > 0) {
+            var directory = (try self.loadNamespaceDirectoryAlloc(self.allocator)) orelse return error.InvalidNamespaceDirectory;
+            defer deinitNamespaceDirectory(self.allocator, &directory);
+            const encoded = try encodeNamespaceDirectoryAlloc(self.allocator, &directory);
+            defer self.allocator.free(encoded);
+            compact_pages += 1;
+            if (!self.catalogEntryFitsInline(namespace_directory_key, encoded)) compact_pages += self.valuePageCount(encoded.len);
         }
         if (self.activeCheckpoint().free_map_root_page != 0) compact_pages += 1;
 
@@ -2694,6 +2890,7 @@ fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot) void {
     std.mem.writeInt(u64, out[24..32], slot.index_catalog_root_page, .little);
     std.mem.writeInt(u64, out[32..40], slot.free_map_root_page, .little);
     std.mem.writeInt(u64, out[40..48], slot.page_count, .little);
+    std.mem.writeInt(u64, out[48..56], slot.namespace_directory_root_page, .little);
     std.mem.writeInt(u32, out[checkpoint_slot_checksum_offset..][0..4], checkpointSlotChecksum(out), .little);
 }
 
@@ -2708,6 +2905,7 @@ fn decodeCheckpointSlot(raw: []const u8) !CheckpointSlot {
         .index_catalog_root_page = std.mem.readInt(u64, raw[24..32], .little),
         .free_map_root_page = std.mem.readInt(u64, raw[32..40], .little),
         .page_count = std.mem.readInt(u64, raw[40..48], .little),
+        .namespace_directory_root_page = std.mem.readInt(u64, raw[48..56], .little),
     };
 }
 
@@ -2717,6 +2915,7 @@ fn validCheckpointSlot(slot: CheckpointSlot) bool {
     if (!validCheckpointRoot(slot.document_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.index_catalog_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.free_map_root_page, slot.page_count)) return false;
+    if (!validCheckpointRoot(slot.namespace_directory_root_page, slot.page_count)) return false;
     return true;
 }
 
@@ -2900,20 +3099,23 @@ fn encodeDocumentEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), e
 
     const start = out.items.len;
     const stored_value_len: usize = if (external_value) 8 else entry.value.len;
-    try out.resize(allocator, start + 20 + entry.key.len + stored_value_len);
+    const header_len: usize = 28;
+    try out.resize(allocator, start + header_len + entry.key.len + stored_value_len);
     const encoded = out.items[start..];
     std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
     encoded[8] =
         (if (entry.is_delete) document_delete_flag else 0) |
-        (if (external_value) document_external_value_flag else 0);
+        (if (external_value) document_external_value_flag else 0) |
+        document_namespace_link_flag;
     @memset(encoded[9..12], 0);
     std.mem.writeInt(u32, encoded[12..16], @intCast(entry.key.len), .little);
     std.mem.writeInt(u32, encoded[16..20], @intCast(entry.value.len), .little);
-    @memcpy(encoded[20..][0..entry.key.len], entry.key);
+    std.mem.writeInt(u64, encoded[20..28], entry.previous_namespace_page, .little);
+    @memcpy(encoded[header_len..][0..entry.key.len], entry.key);
     if (external_value) {
-        std.mem.writeInt(u64, encoded[20 + entry.key.len ..][0..8], entry.external_value_root_page, .little);
+        std.mem.writeInt(u64, encoded[header_len + entry.key.len ..][0..8], entry.external_value_root_page, .little);
     } else {
-        @memcpy(encoded[20 + entry.key.len ..][0..entry.value.len], entry.value);
+        @memcpy(encoded[header_len + entry.key.len ..][0..entry.value.len], entry.value);
     }
 }
 
@@ -2921,17 +3123,21 @@ fn decodeDocumentEntry(raw: []const u8) !DocumentEntry {
     if (raw.len < 20) return error.TruncatedNativeDocumentEntry;
     const previous_page = std.mem.readInt(u64, raw[0..8], .little);
     const flags = raw[8];
-    if (flags & ~(document_delete_flag | document_external_value_flag) != 0) return error.InvalidNativeDocumentEntryFlags;
+    if (flags & ~(document_delete_flag | document_external_value_flag | document_namespace_link_flag) != 0) return error.InvalidNativeDocumentEntryFlags;
     const is_delete = flags & document_delete_flag != 0;
     const external_value = flags & document_external_value_flag != 0;
+    const has_namespace_link = flags & document_namespace_link_flag != 0;
+    if (!has_namespace_link) return error.InvalidNativeDocumentEntryFlags;
     if (is_delete and external_value) return error.InvalidNativeDocumentEntryFlags;
 
     const key_len = std.mem.readInt(u32, raw[12..16], .little);
     const value_len = std.mem.readInt(u32, raw[16..20], .little);
     const stored_value_len: u64 = if (external_value) 8 else value_len;
+    const header_len: usize = 28;
+    if (raw.len < header_len) return error.TruncatedNativeDocumentEntry;
     const payload_len = @as(u64, key_len) + stored_value_len;
-    if (payload_len > raw.len - 20) return error.TruncatedNativeDocumentEntry;
-    const key_start: usize = 20;
+    if (payload_len > raw.len - header_len) return error.TruncatedNativeDocumentEntry;
+    const key_start: usize = header_len;
     const key_end = key_start + @as(usize, @intCast(key_len));
     const stored_value_end = key_end + @as(usize, @intCast(stored_value_len));
     const external_value_root_page = if (external_value) blk: {
@@ -2942,6 +3148,7 @@ fn decodeDocumentEntry(raw: []const u8) !DocumentEntry {
     } else 0;
     return .{
         .previous_page = previous_page,
+        .previous_namespace_page = std.mem.readInt(u64, raw[20..28], .little),
         .key = raw[key_start..key_end],
         .value = if (external_value) raw[key_end..key_end] else raw[key_end..stored_value_end],
         .is_delete = is_delete,
@@ -3068,6 +3275,7 @@ fn issueForPageCheckError(err: anyerror) []const u8 {
         error.InvalidNativeCatalogEntryFlags => "invalid_catalog_entry_flags",
         error.TruncatedNativeDocumentEntry => "truncated_document_entry",
         error.InvalidNativeDocumentEntryFlags => "invalid_document_entry_flags",
+        error.InvalidNamespaceDirectory => "invalid_namespace_directory",
         error.InvalidNativePageChain => "invalid_page_chain",
         error.TruncatedNativeValuePage => "truncated_value_page",
         error.InvalidNativeValueChain => "invalid_value_chain",
@@ -3876,7 +4084,7 @@ test "lite native document store spills large values into value pages" {
         defer file.close();
         const value_pages = std.math.divCeil(usize, large.len, file.maxValuePagePayloadBytes()) catch unreachable;
         try file.putDocument("doc:large", large);
-        try std.testing.expectEqual(@as(u64, @intCast(3 + value_pages)), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, @intCast(4 + value_pages)), file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -3998,7 +4206,7 @@ test "lite native document batch publishes one checkpoint" {
             .{ .key = "doc:c", .is_delete = true },
         });
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(@as(u64, 7), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, 8), file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -4045,6 +4253,45 @@ test "lite native document snapshot returns sorted live records" {
     try std.testing.expectEqualStrings("newer second", docs[1].value);
 }
 
+test "lite native namespace snapshot does not read unrelated document chains" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-namespace-index.aflite");
+    defer allocator.free(path);
+    const prefix_a = [_]u8{ 't', 'a', 0 };
+    const prefix_b = [_]u8{ 't', 'b', 0 };
+    const key_a = prefix_a ++ "doc:a".*;
+    const key_b = prefix_b ++ "doc:b".*;
+
+    var a_head: u64 = 0;
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument(&key_a, "a");
+        try file.putDocument(&key_b, "b");
+        var directory = (try file.loadNamespaceDirectoryAlloc(allocator)).?;
+        defer NativeFile.deinitNamespaceDirectory(allocator, &directory);
+        a_head = directory.get(&prefix_a).?;
+        const user_catalog = try file.snapshotCatalogRecordsAlloc(allocator);
+        defer NativeFile.freeSnapshotCatalogRecords(allocator, user_catalog);
+        try std.testing.expectEqual(@as(usize, 0), user_catalog.len);
+    }
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", a_head * default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const docs_b = try reopened.snapshotDocumentsWithPrefixAlloc(allocator, &prefix_b);
+    defer NativeFile.freeSnapshotDocuments(allocator, docs_b);
+    try std.testing.expectEqual(@as(usize, 1), docs_b.len);
+    try std.testing.expectEqualStrings("b", docs_b[0].value);
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.snapshotDocumentsAlloc(allocator));
+}
+
 test "lite native check validates committed root chains" {
     const allocator = std.testing.allocator;
 
@@ -4066,8 +4313,8 @@ test "lite native check validates committed root chains" {
     try std.testing.expectEqual(@as(u64, 2), report.record_count);
     try std.testing.expectEqual(@as(u64, 2), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.file_size);
-    try std.testing.expectEqual(@as(u64, default_page_size * 4), report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 6), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.compact_size);
     try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
     try std.testing.expectEqual(@as(u64, default_page_size), report.reclaimable_bytes);
 }
@@ -4099,8 +4346,8 @@ test "lite native check validates committed index catalog root chain" {
     try std.testing.expectEqual(@as(u64, 3), report.record_count);
     try std.testing.expectEqual(@as(u64, 3), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 7), report.file_size);
-    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 8), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 6), report.compact_size);
     try std.testing.expectEqual(@as(u64, default_page_size * 2), report.reclaimable_bytes);
 
     const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;

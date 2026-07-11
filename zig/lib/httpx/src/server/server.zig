@@ -669,6 +669,10 @@ pub const Server = struct {
     global_handler: ?Handler = null,
     listener: ?TcpListener = null,
     running: bool = false,
+    /// Cross-thread shutdown requests are published atomically. The listener
+    /// thread remains the sole owner of `listener`, `running`, and the
+    /// connection group; requestStop only wakes its accept loop.
+    stop_requested: std.atomic.Value(bool) = .init(false),
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
 
@@ -806,17 +810,24 @@ pub const Server = struct {
 
         std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
-        while (self.running) {
+        while (self.running and !self.stop_requested.load(.acquire)) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
             self.conn_semaphore.waitUncancelable(self.io);
+            if (self.stop_requested.load(.acquire)) break;
 
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.io);
-                if (!self.running or self.listener == null) break;
+                if (!self.running or self.stop_requested.load(.acquire) or self.listener == null) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
+            if (self.stop_requested.load(.acquire)) {
+                var wake_socket = conn.socket;
+                wake_socket.close();
+                self.conn_semaphore.post(self.io);
+                break;
+            }
 
             // Spawn a lightweight fiber to handle this connection concurrently.
             // If the Io backend doesn't support concurrency, fall back to sync.
@@ -827,12 +838,37 @@ pub const Server = struct {
             };
         }
 
+        self.running = false;
+        if (self.stop_requested.load(.acquire)) self.connections.cancel(self.io);
         // Wait for all in-flight connections to finish before returning.
         self.connections.await(self.io) catch {};
     }
 
+    /// Requests shutdown from another OS thread without touching listener or
+    /// connection-group state. A loopback connection wakes a blocked accept;
+    /// posting the semaphore also wakes a listener blocked at its connection
+    /// limit. All mutable server teardown remains on the listener thread.
+    pub fn requestStop(self: *Self) void {
+        self.stop_requested.store(true, .release);
+        self.conn_semaphore.post(self.io);
+
+        var addr = Address.parse(self.config.host, self.config.port) catch return;
+        switch (addr) {
+            .ip4 => |ip4| if (std.mem.allEqual(u8, &ip4.bytes, 0)) {
+                addr = .{ .ip4 = .loopback(ip4.port) };
+            },
+            .ip6 => |ip6| if (std.mem.allEqual(u8, &ip6.bytes, 0)) {
+                addr = .{ .ip6 = .loopback(ip6.port) };
+            },
+        }
+        const wake_io = std.Io.Threaded.global_single_threaded.io();
+        var wake_socket = Socket.connect(addr, wake_io) catch return;
+        wake_socket.close();
+    }
+
     /// Stops the server immediately, cancelling all in-flight connections.
     pub fn stop(self: *Self) void {
+        self.stop_requested.store(true, .release);
         self.running = false;
         self.connections.cancel(self.io);
         if (self.listener) |*l| {
@@ -2547,6 +2583,19 @@ test "stop cancels connections immediately" {
     server.running = true;
     server.stop();
     try std.testing.expect(!server.running);
+    try std.testing.expect(server.stop_requested.load(.acquire));
+    try std.testing.expect(server.listener == null);
+}
+
+test "requestStop only publishes synchronized listener-thread work" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(allocator, std.testing.io, .{ .host = "127.0.0.1", .port = 1 });
+    defer server.deinit();
+
+    server.running = true;
+    server.requestStop();
+    try std.testing.expect(server.running);
+    try std.testing.expect(server.stop_requested.load(.acquire));
     try std.testing.expect(server.listener == null);
 }
 
