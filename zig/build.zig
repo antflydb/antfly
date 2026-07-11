@@ -4216,6 +4216,8 @@ pub fn build(b: *std.Build) void {
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
+            "provisioned table write source preserves same-key delete then write across coalesced waiters",
+            "provisioned table write coalescer isolates invalid waiter on same-key overlap",
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
@@ -4236,6 +4238,7 @@ pub fn build(b: *std.Build) void {
             "managed source status-only open drains stale pending close before retry",
             "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
+            "write cache retires shared HA generation stale entries before reuse",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

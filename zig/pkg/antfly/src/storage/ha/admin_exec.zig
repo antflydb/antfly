@@ -56,6 +56,7 @@ pub const Context = struct {
     primary_node_id: ?[]const u8 = null,
     standby: ?*standby_mod.Standby = null,
     standby_node_id: ?[]const u8 = null,
+    promoted_standby_handoff: ?standby_mod.PromotionHandoff = null,
     fence_store: ?*fencing.Store = null,
     former_primary_log: ?*replication_log.ReplicationLog = null,
     metadata_applied_lsn_ctx: ?*anyopaque = null,
@@ -1089,7 +1090,14 @@ fn executeOperatorPlan(
 fn executeWriteCheck(ctx: Context, command: admin_cli.WriteCheckCommand) !write_gate.Decision {
     return switch (command.role) {
         .primary => try evaluatePrimaryWriteWithContext(ctx, command.request),
-        .standby => try admin.evaluateStandbyWrite(try requireStandby(ctx), command.request),
+        .standby => if (ctx.standby) |standby|
+            try admin.evaluateStandbyWrite(standby, command.request)
+        else
+            try admin.evaluatePromotedPrimaryWrite(
+                try requirePrimary(ctx),
+                ctx.promoted_standby_handoff orelse return error.StandbyUnavailable,
+                command.request,
+            ),
     };
 }
 
@@ -1111,7 +1119,14 @@ fn evaluatePrimaryWriteWithContext(ctx: Context, request: write_gate.Request) !w
 fn executeOwnerJobCheck(ctx: Context, command: admin_cli.OwnerJobCheckCommand) !owner_job_gate.Decision {
     return switch (command.role) {
         .primary => try admin.evaluatePrimaryOwnerJob(try requirePrimary(ctx), command.request),
-        .standby => try admin.evaluateStandbyOwnerJob(try requireStandby(ctx), command.request),
+        .standby => if (ctx.standby) |standby|
+            try admin.evaluateStandbyOwnerJob(standby, command.request)
+        else
+            try admin.evaluatePromotedPrimaryOwnerJob(
+                try requirePrimary(ctx),
+                ctx.promoted_standby_handoff orelse return error.StandbyUnavailable,
+                command.request,
+            ),
     };
 }
 

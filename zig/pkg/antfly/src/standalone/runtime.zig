@@ -730,7 +730,7 @@ const LocalStandaloneMetadata = struct {
     fn runRound(ptr: *anyopaque) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         self.finalizeReadySchemaMigrations() catch |err| switch (err) {
-            error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
+            error.FileNotFound, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
     }
@@ -1254,7 +1254,7 @@ pub fn runFromIterator(
     );
     defer alloc.free(public_api_url);
 
-    var local_metadata = try LocalStandaloneMetadata.init(
+    var local_metadata = LocalStandaloneMetadata.init(
         alloc,
         local_node_id,
         1,
@@ -1264,7 +1264,10 @@ pub fn runFromIterator(
         node_backend_runtime.ptr(),
         if (lite_backend) |*backend| try backend.runtimeStoreForNamespace("system/metadata") else null,
         storage_engine,
-    );
+    ) catch |err| {
+        std.log.err("standalone startup failed step=local_metadata_init err={}", .{err});
+        return err;
+    };
     defer local_metadata.deinit();
     // API transaction sessions are engine state, not a sidecar. Keeping them
     // in a reserved Lite namespace makes a copied/reopened .aflite file a
@@ -1276,7 +1279,10 @@ pub fn runFromIterator(
         )
     else
         null;
-    const synced_extension_packages = try local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
+    const synced_extension_packages = local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir) catch |err| {
+        std.log.err("standalone startup failed step=sync_extension_packages err={}", .{err});
+        return err;
+    };
     if (synced_extension_packages > 0) {
         std.log.info("standalone synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
     }
@@ -1286,13 +1292,25 @@ pub fn runFromIterator(
     var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
     defer ha_sync_policy.deinit(alloc);
     const ha_retention_policy = try haRetentionPolicyFromCli(cli);
-    var ha_primary = try openHAPrimaryFromCli(alloc, setup_io.io(), cli);
+    var ha_primary = openHAPrimaryFromCli(alloc, setup_io.io(), cli) catch |err| {
+        std.log.err("standalone startup failed step=open_ha_primary err={}", .{err});
+        return err;
+    };
     defer if (ha_primary) |*primary| primary.close();
-    var ha_standby = try openHAStandbyFromCli(alloc, setup_io.io(), cli);
+    var ha_standby = openHAStandbyFromCli(alloc, setup_io.io(), cli) catch |err| {
+        std.log.err("standalone startup failed step=open_ha_standby err={}", .{err});
+        return err;
+    };
     defer if (ha_standby) |*standby| standby.close();
-    var ha_fence_store = try openHAFenceStoreFromCli(alloc, setup_io.io(), cli);
+    var ha_fence_store = openHAFenceStoreFromCli(alloc, setup_io.io(), cli) catch |err| {
+        std.log.err("standalone startup failed step=open_ha_fence err={}", .{err});
+        return err;
+    };
     defer if (ha_fence_store) |*store| store.close();
-    var ha_former_primary_log = try openHAFormerPrimaryLogFromCli(alloc, setup_io.io(), cli);
+    var ha_former_primary_log = openHAFormerPrimaryLogFromCli(alloc, setup_io.io(), cli) catch |err| {
+        std.log.err("standalone startup failed step=open_ha_former_primary err={}", .{err});
+        return err;
+    };
     defer if (ha_former_primary_log) |*log| log.close();
     const admin_bearer_token = try resolveAdminBearerTokenFromCli(alloc, cli);
     defer if (admin_bearer_token) |token| alloc.free(token);
@@ -1343,6 +1361,7 @@ pub fn runFromIterator(
                 .fence_store = if (ha_fence_store) |*store| store else null,
                 .former_primary_log = if (ha_former_primary_log) |*log| log else null,
             },
+            .standby_owner = if (ha_standby != null) &ha_standby else null,
             .admin_bearer_token = admin_bearer_token,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,
@@ -1439,8 +1458,14 @@ pub fn runFromIterator(
     };
     while (!termination_requested.load(.acquire)) {
         if (unified_lifecycle.runtimeFailure()) |err| return err;
-        try data_server.runRound();
-        try LocalStandaloneMetadata.runRound(&local_metadata);
+        data_server.runRound() catch |err| switch (err) {
+            error.LsmRootWriterAlreadyOpen, error.WriterLocked => std.log.warn("standalone data round skipped err={}", .{err}),
+            else => return err,
+        };
+        LocalStandaloneMetadata.runRound(&local_metadata) catch |err| switch (err) {
+            error.LsmRootWriterAlreadyOpen, error.WriterLocked => std.log.warn("standalone metadata round skipped err={}", .{err}),
+            else => return err,
+        };
         const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
         switch (err) {
             .SUCCESS => {},
@@ -3105,6 +3130,8 @@ fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HASta
     return .{
         .upstream_base_uri = upstream,
         .slot_name = slot,
+        .standby_log_path = cli.ha_standby_log,
+        .standby_progress_path = cli.ha_standby_progress,
     };
 }
 
@@ -3235,6 +3262,12 @@ fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig)
 fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.replication_log.ReplicationLog {
     const former_primary_log_path = cli.ha_former_primary_log orelse return null;
     if (!haPrimaryRequested(cli) and !haStandbyRequested(cli)) return error.HARoleMissing;
+    if (cli.ha_primary_log) |primary_log_path| {
+        if (std.mem.eql(u8, former_primary_log_path, primary_log_path)) return null;
+    }
+    if (cli.ha_standby_log) |standby_log_path| {
+        if (std.mem.eql(u8, former_primary_log_path, standby_log_path)) return null;
+    }
 
     try ensureParent(io, former_primary_log_path);
 

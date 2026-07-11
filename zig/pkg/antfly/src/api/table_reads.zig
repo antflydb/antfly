@@ -33,6 +33,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
+const ha_public_gate_state = @import("../storage/ha/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../storage/ha/standby.zig");
 const storage_schema = @import("../storage/schema.zig");
@@ -764,21 +765,28 @@ pub const GroupVisibleRootGenerationSource = struct {
     }
 };
 
-pub const HAReadGate = struct {
+pub const HAReadGate = union(enum) {
     standby: *const ha_standby_mod.Standby,
+    shared: *const ha_public_gate_state.State,
 
     pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
-        const decision = try ha_read_gate_mod.evaluateStandby(self.standby, .{
+        const request = ha_read_gate_mod.Request{
             .consistency = switch (consistency) {
                 .stale => .stale_ok,
                 .leader_lease, .read_index => .primary,
             },
-        });
-        switch (decision.action) {
-            .serve_standby => {},
-            .wait_for_apply => return error.HAReadWaitForApply,
-            .wait_for_metadata => return error.HAReadWaitForMetadata,
-            .route_to_primary => return error.HAReadRequiresPrimary,
+        };
+        switch (self) {
+            .shared => |state| try state.checkRead(request),
+            .standby => |standby| {
+                const decision = try ha_read_gate_mod.evaluateStandby(standby, request);
+                switch (decision.action) {
+                    .serve_standby => {},
+                    .wait_for_apply => return error.HAReadWaitForApply,
+                    .wait_for_metadata => return error.HAReadWaitForMetadata,
+                    .route_to_primary => return error.HAReadRequiresPrimary,
+                }
+            },
         }
     }
 };

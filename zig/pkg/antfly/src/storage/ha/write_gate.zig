@@ -104,13 +104,12 @@ pub fn primaryFencedByReceipt(identity: standby_mod.Identity, node_id: []const u
 }
 
 pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decision {
-    if (request.expected_identity) |expected| try validateIdentity(standby.identity, expected);
-
     const handoff = standby.promotedPrimaryHandoff() catch |err| switch (err) {
         error.StandbyNotPromoted => null,
         else => return err,
     };
     if (handoff) |promotion_handoff| {
+        if (request.expected_identity) |expected| try validateIdentity(promotion_handoff.identity, expected);
         return .{
             .role = .promoted_standby,
             .action = .open_promoted_primary,
@@ -121,6 +120,8 @@ pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decisio
         };
     }
 
+    if (request.expected_identity) |expected| try validateIdentity(standby.identity, expected);
+
     const progress = standby.currentProgress();
     return .{
         .role = .standby,
@@ -128,6 +129,30 @@ pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decisio
         .identity = standby.identity,
         .durable_lsn = progress.received_lsn,
         .next_lsn = progress.received_lsn + 1,
+    };
+}
+
+pub fn evaluatePromotedPrimary(
+    primary: *const primary_mod.Primary,
+    handoff: standby_mod.PromotionHandoff,
+    request: Request,
+) !Decision {
+    try validateIdentity(primary.identity, handoff.identity);
+    if (handoff.switch_lsn == 0 or
+        handoff.switch_lsn == std.math.maxInt(u64) or
+        handoff.next_lsn != handoff.switch_lsn + 1)
+    {
+        return error.InvalidPromotionHandoff;
+    }
+    if (primary.lastLsn() < handoff.switch_lsn) return error.PromotedLogMismatch;
+    if (request.expected_identity) |expected| try validateIdentity(handoff.identity, expected);
+    return .{
+        .role = .promoted_standby,
+        .action = .open_promoted_primary,
+        .identity = handoff.identity,
+        .durable_lsn = handoff.switch_lsn,
+        .next_lsn = handoff.next_lsn,
+        .promotion_handoff = handoff,
     };
 }
 
@@ -313,9 +338,28 @@ test "storage.ha write gate rejects standby until promotion handoff is opened" {
         break :blk decision.promotion_handoff orelse return error.TestExpectedEqual;
     };
 
+    {
+        var recovered = try standby_mod.Standby.open(alloc, paths.log.ptr, paths.progress.ptr, identity, .{});
+        defer recovered.close();
+
+        const decision = try evaluateStandby(&recovered, .{ .expected_identity = promoted_identity });
+        try std.testing.expect(!decision.canWrite());
+        try std.testing.expectEqual(Role.promoted_standby, decision.role);
+        try std.testing.expectEqual(Action.open_promoted_primary, decision.action);
+        try std.testing.expect(decision.promotion_handoff != null);
+        try std.testing.expectError(error.WrongTimeline, evaluateStandby(&recovered, .{ .expected_identity = identity }));
+    }
+
     var primary = try primary_mod.Primary.openPromotedFromStandby(alloc, paths.log.ptr, paths.slots.ptr, handoff, .{});
     defer primary.close();
     const primary_decision = try evaluatePrimary(&primary, .{ .expected_identity = promoted_identity });
     try std.testing.expect(primary_decision.canWrite());
     try std.testing.expectEqual(@as(u64, 3), primary_decision.next_lsn);
+
+    const completed_handoff = try evaluatePromotedPrimary(&primary, handoff, .{ .expected_identity = promoted_identity });
+    try std.testing.expect(!completed_handoff.canWrite());
+    try std.testing.expectEqual(Role.promoted_standby, completed_handoff.role);
+    try std.testing.expectEqual(Action.open_promoted_primary, completed_handoff.action);
+    try std.testing.expectEqual(handoff.switch_lsn, completed_handoff.durable_lsn);
+    try std.testing.expect(completed_handoff.promotion_handoff != null);
 }

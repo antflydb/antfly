@@ -667,11 +667,11 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				var payload map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 				g.Expect(payload["slot_name"]).To(Equal("standby-a"))
-				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-5"))
+				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s %s", req.Method, req.URL.Path)
@@ -3268,8 +3268,8 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 					Name:             "standby-a",
 					InitialLSN:       &initial,
 					AdminURL:         "http://standby-a-ha.default.svc:8081",
-					SeedManifestPath: "/backup/base-standby-a-5.afha",
-					SeedContentRoot:  "/backup/base-standby-a-5",
+					SeedManifestPath: "/backup/base-standby-a-10.afha",
+					SeedContentRoot:  "/backup/base-standby-a-10",
 				}},
 			},
 		},
@@ -3295,26 +3295,26 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups/finish":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-10","action_kind":"base_backup_finish","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"end_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/standby/bootstrap":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
-				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-5"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
+				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-10","action_kind":"standby_bootstrap","target":"base-standby-a-10","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected direct HA admin request: %s", req.URL.Path)
@@ -3336,25 +3336,25 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(5)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(10)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(10)))
 	finish := cluster.Status.HAStatus.PlannedActions[2]
 	g.Expect(finish.Kind).To(Equal(string(haActionFinishStandbySeed)))
 	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(finish.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(finish.AdminResult).NotTo(BeNil())
-	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
-	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(5)))
+	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-10"))
+	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(10)))
 
 	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
 	g.Expect(bootstrap.Kind).To(Equal(string(haActionBootstrapStandbySeed)))
 	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(bootstrap.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(bootstrap.AdminResult).NotTo(BeNil())
-	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-5"))
-	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(5)))
+	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-10"))
+	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(10)))
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/replication-slots",
 		"POST /admin/v1/ha/base-backups",
@@ -5215,6 +5215,78 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		}
 	}
 
+	demoteCluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					ClusterID:         9002003,
+					ShardID:           1024863633216429947,
+					TableID:           7062478063073158706,
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  1,
+					ParentEpoch:       1,
+					NewTimelineID:     2,
+					NewEpoch:          2,
+					SwitchLSN:         4,
+					RequiredLSN:       3,
+					ObservedLSN:       3,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   1,
+					FenceToken:        "ha-fence-token",
+				},
+			},
+		},
+	}
+	demoteAction := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       4,
+		ObservedLSN:     4,
+		RetainedFromLSN: 3,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 1,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminNodeID:     "primary-a",
+	}
+	demoteResponse := adminsdk.HARejoinAssessResponse{
+		SchemaVersion: 1,
+		Action: adminsdk.HAActionReceipt{
+			ActionId:   "rejoin_assess:primary-a",
+			ActionKind: adminsdk.HAActionKindRejoinAssess,
+			Target:     "primary-a",
+			State:      adminsdk.HAActionStateAssessed,
+			NodeId:     "primary-a",
+		},
+		Assessment: adminsdk.HARejoinAssessment{
+			Action:            adminsdk.HARejoinActionRejectUnfenced,
+			Reason:            adminsdk.HARejoinReasonNoFence,
+			FormerNodeId:      "primary-a",
+			TargetTimelineId:  1,
+			TargetEpoch:       1,
+			ParentClusterId:   9002003,
+			ParentShardId:     1024863633216429947,
+			ParentTableId:     7062478063073158706,
+			ParentTimelineId:  1,
+			ParentEpoch:       1,
+			ForkLsn:           4,
+			FormerLastLsn:     4,
+			RetainedFromLsn:   3,
+			DataLossDiscarded: false,
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(demoteCluster, &demoteAction, demoteResponse)).To(BeTrue())
+	demoteAction.AdminJobName = haAdminDirectAPIName
+	demoteAction.AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(demoteAction.AdminResult).NotTo(BeNil())
+	g.Expect(demoteAction.AdminResult.RejoinAction).To(Equal("reject_unfenced"))
+	g.Expect(haAdminActionSucceededWithStatusEvidence(demoteCluster.Status.HAStatus, demoteAction)).To(BeTrue())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionDemoteFormerPrimary)))
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Fenced).To(BeFalse())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Reason).To(Equal("no_fence"))
+
 	cluster := newRejoinCluster()
 	rewindAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionRewindFormerPrimary),
@@ -5265,7 +5337,6 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		},
 	}
 
-	reconciler := &AntflyClusterReconciler{}
 	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(cluster, &rewindAction, response)).To(BeTrue())
 	g.Expect(rewindAction.AdminResult).NotTo(BeNil())
 	g.Expect(rewindAction.AdminResult.RejoinAction).To(Equal("rewind"))
@@ -5273,6 +5344,21 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionRewindFormerPrimary)))
+
+	staleObservedAction := rewindAction
+	staleObservedAction.AdminResult = nil
+	staleObservedAction.ObservedLSN = 13
+	staleObservedResponse := response
+	staleObservedResponse.Assessment.FormerLastLsn = 12
+	staleObservedResponse.Assessment.DataLossDiscarded = false
+	staleObservedResponse.Rewind.PreviousLastLsn = 12
+	staleObservedResponse.Rewind.CurrentLastLsn = 12
+	staleObservedResponse.Rewind.DiscardedLsnCount = 0
+	staleObservedResponse.Rewind.DataLossDiscarded = false
+	staleObservedCluster := newRejoinCluster()
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(staleObservedCluster, &staleObservedAction, staleObservedResponse)).To(BeTrue())
+	g.Expect(staleObservedAction.AdminResult).NotTo(BeNil())
+	g.Expect(staleObservedAction.AdminResult.FormerLastLSN).To(Equal(uint64(12)))
 
 	reseedAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionReseedFormerPrimary),

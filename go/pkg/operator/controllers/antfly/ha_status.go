@@ -369,6 +369,80 @@ func (r *AntflyClusterReconciler) observeHAFencingStatus(ctx context.Context, cl
 	return nil
 }
 
+func (r *AntflyClusterReconciler) observeHAFormerPrimaryFenceStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return
+	}
+	ha := cluster.Spec.HighAvailability
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	if ha == nil || promotion == nil || strings.TrimSpace(promotion.OldPrimaryID) == "" {
+		return
+	}
+	adminURL := haFormerPrimaryAdminURL(ha, haPlannedAction{
+		StandbyName: promotion.OldPrimaryID,
+		RouteFrom:   promotion.OldPrimaryID,
+	})
+	if strings.TrimSpace(adminURL) == "" {
+		haSetFormerPrimaryFenceObserved(cluster.Status.HAStatus, promotion, false)
+		return
+	}
+	adminClient, err := r.haAdminSDKClient(cluster, adminURL)
+	if err != nil {
+		haSetFormerPrimaryFenceObserved(cluster.Status.HAStatus, promotion, false)
+		return
+	}
+	current, err := adminClient.CurrentFence(ctx)
+	if err != nil {
+		haSetFormerPrimaryFenceObserved(cluster.Status.HAStatus, promotion, false)
+		return
+	}
+	haSetFormerPrimaryFenceObserved(
+		cluster.Status.HAStatus,
+		promotion,
+		haCurrentFenceMatchesPromotion(current, promotion),
+	)
+}
+
+func haSetFormerPrimaryFenceObserved(status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus, observed bool) {
+	if status == nil || promotion == nil {
+		return
+	}
+	if status.FormerPrimary == nil {
+		status.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{NodeID: promotion.OldPrimaryID}
+	}
+	former := status.FormerPrimary
+	former.NodeID = promotion.OldPrimaryID
+	former.Fenced = observed
+	former.FenceAuthority = promotion.FenceAuthority
+	former.FenceHolder = promotion.PromotedStandbyID
+	former.FenceGeneration = promotion.FenceGeneration
+	if !observed {
+		former.RejoinRequired = true
+		former.Action = string(haActionDemoteFormerPrimary)
+		former.Reason = "FormerPrimaryFenceNotObserved"
+	}
+}
+
+func haCurrentFenceMatchesPromotion(current *adminsdk.HACurrentFenceResponse, promotion *antflyv1.HAPromotionStatus) bool {
+	if current == nil || promotion == nil || !current.Held {
+		return false
+	}
+	receipt := current.Receipt
+	return receipt.Identity.ClusterId == promotion.ClusterID &&
+		receipt.Identity.ShardId == promotion.ShardID &&
+		receipt.Identity.TableId == promotion.TableID &&
+		strings.TrimSpace(string(receipt.OldPrimaryId)) == strings.TrimSpace(promotion.OldPrimaryID) &&
+		strings.TrimSpace(string(receipt.PromotedNodeId)) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		receipt.ParentTimelineId == promotion.ParentTimelineID &&
+		receipt.ParentEpoch == promotion.ParentEpoch &&
+		receipt.NewTimelineId == promotion.NewTimelineID &&
+		receipt.NewEpoch == promotion.NewEpoch &&
+		receipt.RequiredLsn == haPromotionRequiredLSN(promotion) &&
+		receipt.ObservedLsn >= haPromotionRequiredLSN(promotion) &&
+		receipt.Generation == promotion.FenceGeneration &&
+		strings.TrimSpace(receipt.Token) == strings.TrimSpace(promotion.FenceToken)
+}
+
 func haFencingLeaseName(cluster *antflyv1.AntflyCluster) string {
 	return cluster.Name + "-ha-fence"
 }
@@ -499,6 +573,9 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			observed, ok = slotByName[slotName]
 		}
 		if !standbyDesired(standby) {
+			if haStandbyMatchesFormerPrimary(status, standby.Name, slotName) {
+				continue
+			}
 			if ok && observed.Active {
 				plan.Actions = append(plan.Actions, haPlannedAction{
 					Kind:        haActionPauseSlot,
@@ -541,10 +618,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				DependsOn:   haActionCreateSlot,
 				StandbyName: standby.Name,
 				SlotName:    slotName,
-				TargetLSN:   seedTargetLSN,
+				TargetLSN:   haSeedBeginTargetLSN(status.PrimaryLSN),
 				Reason:      "StandbyNeedsBaseBackup",
 			})
-			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "StandbyNeedsBaseBackup", haActionSeedStandby)...)
+			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, haSeedBeginTargetLSN(status.PrimaryLSN), "StandbyNeedsBaseBackup", haActionSeedStandby)...)
 			continue
 		}
 		if !observed.Active && !observed.ReseedRequired {
@@ -566,14 +643,15 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		if observed.ReseedRequired || observed.Status == "reseed_required" {
 			plan.ReseedRequiredCount++
 			if status.PrimaryLSN > 0 {
+				seedTargetLSN := haSeedBeginTargetLSN(status.PrimaryLSN)
 				plan.Actions = append(plan.Actions, haPlannedAction{
 					Kind:        haActionMarkReseed,
 					StandbyName: standby.Name,
 					SlotName:    slotName,
-					TargetLSN:   status.PrimaryLSN,
+					TargetLSN:   seedTargetLSN,
 					Reason:      "SlotRequiresReseed",
 				})
-				plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "SlotRequiresReseed", haActionMarkReseed)...)
+				plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "SlotRequiresReseed", haActionMarkReseed)...)
 			}
 			continue
 		}
@@ -669,22 +747,52 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			if standby, ok := haStandbySpecByName(ha, action.StandbyName); ok {
 				slotName := standbySlotName(standby)
 				if status.PrimaryLSN > 0 {
-					seed := haPlannedAction{
-						Kind:        haActionSeedStandby,
-						DependsOn:   haActionReseedFormerPrimary,
-						StandbyName: standby.Name,
-						SlotName:    slotName,
-						TargetLSN:   status.PrimaryLSN,
-						Reason:      "FormerPrimaryRequiresReseed",
+					seedDependsOn := haActionReseedFormerPrimary
+					seedTargetLSN := haSeedBeginTargetLSN(status.PrimaryLSN)
+					seedBeginSatisfied := false
+					if observed, ok := slotByName[slotName]; ok {
+						if observed.Active && observed.RestartLSN > 0 && !observed.ReseedRequired {
+							seedTargetLSN = observed.RestartLSN
+							plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "FormerPrimaryRequiresReseed", seedDependsOn)...)
+							seedBeginSatisfied = true
+						}
 					}
-					plan.Actions = append(plan.Actions, seed)
-					plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "FormerPrimaryRequiresReseed", haActionSeedStandby)...)
+					if !seedBeginSatisfied {
+						seed := haPlannedAction{
+							Kind:        haActionSeedStandby,
+							DependsOn:   seedDependsOn,
+							StandbyName: standby.Name,
+							SlotName:    slotName,
+							TargetLSN:   seedTargetLSN,
+							Reason:      "FormerPrimaryRequiresReseed",
+						}
+						plan.Actions = append(plan.Actions, seed)
+						plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "FormerPrimaryRequiresReseed", haActionSeedStandby)...)
+					}
 				}
 			}
 		}
 	}
 
 	return plan
+}
+
+func haSeedBeginTargetLSN(primaryLSN uint64) uint64 {
+	if primaryLSN == 0 || primaryLSN == ^uint64(0) {
+		return 0
+	}
+	return primaryLSN + 1
+}
+
+func haStandbyMatchesFormerPrimary(status *antflyv1.HAStatus, standbyName string, slotName string) bool {
+	if status == nil || status.LastPromotion == nil {
+		return false
+	}
+	oldPrimaryID := strings.TrimSpace(status.LastPromotion.OldPrimaryID)
+	if oldPrimaryID == "" {
+		return false
+	}
+	return oldPrimaryID == strings.TrimSpace(standbyName) || oldPrimaryID == strings.TrimSpace(slotName)
 }
 
 func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
@@ -771,9 +879,21 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		if !haSamePlannedActionOperation(action, previous) {
 			continue
 		}
+		if haActionKind(previous.Kind) == haActionDemoteFormerPrimary &&
+			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
+			!haFormerPrimaryDemotePreserveAllowed(status, previous) {
+			return action
+		}
 		if haActionRequiresAdminResult(haActionKind(previous.Kind)) &&
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
 			!haAdminActionSucceededWithStatusEvidence(status, previous) {
+			return action
+		}
+		if previous.AdminJobPhase == haAdminJobPhaseFailed &&
+			previous.AdminJobName == haAdminDirectAPIName {
+			return action
+		}
+		if haDirectAdminTypedEvidenceFailure(previous) {
 			return action
 		}
 		action.AdminJobName = previous.AdminJobName
@@ -786,6 +906,31 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		return action
 	}
 	return action
+}
+
+func haDirectAdminTypedEvidenceFailure(action antflyv1.HAPlannedActionStatus) bool {
+	if action.AdminJobPhase != haAdminJobPhaseFailed ||
+		action.AdminJobName != haAdminDirectAPIName {
+		return false
+	}
+	err := strings.TrimSpace(action.AdminError)
+	return strings.Contains(err, "succeeded without typed") ||
+		strings.Contains(err, "missing typed result evidence")
+}
+
+func haFormerPrimaryDemotePreserveAllowed(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return false
+	}
+	if standbyName := strings.TrimSpace(action.StandbyName); standbyName != "" &&
+		standbyName != strings.TrimSpace(promotion.OldPrimaryID) {
+		return false
+	}
+	if action.FenceGeneration != 0 && action.FenceGeneration != promotion.FenceGeneration {
+		return false
+	}
+	return haFormerPrimaryFenced(status, promotion)
 }
 
 func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.HAPlannedActionStatus) bool {
@@ -2141,6 +2286,21 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 	if !evaluation.Fenced {
 		return evaluation
 	}
+	if standby, ok := haStandbyStatusByName(status)[promotion.OldPrimaryID]; ok &&
+		standby.Active &&
+		!standby.ReseedRequired &&
+		standby.Status != "reseed_required" &&
+		standby.TimelineID == promotion.NewTimelineID {
+		evaluation.ObservedTimelineID = standby.TimelineID
+		evaluation.ObservedLSN = maxHAObservedLSN(standby)
+		evaluation.RejoinRequired = false
+		evaluation.Action = "None"
+		evaluation.Reason = "FormerPrimaryOnPromotionTimeline"
+		return evaluation
+	}
+	if haApplyFormerPrimaryAssessment(&evaluation, status.FormerPrimary, promotion) {
+		return evaluation
+	}
 
 	standby, ok := haStandbyStatusByName(status)[promotion.OldPrimaryID]
 	if !ok {
@@ -2151,6 +2311,13 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 	evaluation.ObservedLSN = maxHAObservedLSN(standby)
 	if evaluation.ObservedTimelineID == 0 {
 		evaluation.Reason = "FormerPrimaryTimelineUnknown"
+		return evaluation
+	}
+	if !standby.Active || standby.ReseedRequired || standby.Status == "reseed_required" {
+		evaluation.ReseedRequired = true
+		evaluation.Diverged = true
+		evaluation.Action = string(haActionReseedFormerPrimary)
+		evaluation.Reason = "FormerPrimaryRequiresReseed"
 		return evaluation
 	}
 	if evaluation.ObservedTimelineID == promotion.NewTimelineID {
@@ -2164,9 +2331,6 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 		evaluation.Diverged = true
 		evaluation.Action = string(haActionReseedFormerPrimary)
 		evaluation.Reason = "FormerPrimaryTimelineDiverged"
-		return evaluation
-	}
-	if haApplyFormerPrimaryAssessment(&evaluation, status.FormerPrimary, promotion) {
 		return evaluation
 	}
 	if !promotion.DataLossPossible && evaluation.ObservedLSN <= promotion.SwitchLSN {
@@ -2253,7 +2417,8 @@ func haFormerPrimaryFenced(status *antflyv1.HAStatus, promotion *antflyv1.HAProm
 	if status.Fencing.Generation < promotion.FenceGeneration {
 		return false
 	}
-	if promotion.PromotedStandbyID != "" && status.Fencing.Holder != promotion.PromotedStandbyID {
+	if promotion.PromotedStandbyID != "" &&
+		status.Fencing.Holder != promotion.PromotedStandbyID {
 		return false
 	}
 	return status.Fencing.Ready

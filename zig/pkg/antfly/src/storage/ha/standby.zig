@@ -159,7 +159,17 @@ pub const Standby = struct {
 
         const durable_received_lsn = standby.receive_log.lastLsn();
         const replayed_progress = standby.progress;
-        if (standby.progress.received_lsn > durable_received_lsn) return error.ProgressAheadOfReceivedWal;
+        if (standby.progress.received_lsn > durable_received_lsn) {
+            const can_recover_truncated_promotion = try standby.progressRecordTargetsTimelineSwitch(.{
+                .identity = replayed.identity orelse standby.identity,
+                .progress = .{
+                    .received_lsn = durable_received_lsn,
+                    .applied_lsn = durable_received_lsn,
+                    .safe_read_lsn = durable_received_lsn,
+                },
+            });
+            if (!can_recover_truncated_promotion) return error.ProgressAheadOfReceivedWal;
+        }
         standby.progress.received_lsn = durable_received_lsn;
         if (try standby.recoverTimelineSwitch(replayed_progress)) |timeline_recovery| {
             standby.identity = timeline_recovery.identity;
@@ -380,19 +390,31 @@ pub const Standby = struct {
     }
 
     pub fn promotedPrimaryHandoff(self: *Standby) !PromotionHandoff {
-        if (self.progress.received_lsn == 0) return error.StandbyNotPromoted;
-        if (self.progress.applied_lsn != self.progress.received_lsn or
-            self.progress.safe_read_lsn != self.progress.received_lsn) return error.PromotionNotApplied;
+        if (self.progress.safe_read_lsn == 0) return error.StandbyNotPromoted;
+        if (self.progress.applied_lsn != self.progress.safe_read_lsn) return error.PromotionNotApplied;
 
-        var entry = (try self.receive_log.entryAt(self.alloc, self.progress.received_lsn)) orelse return error.MissingReceivedRecord;
+        const switch_lsn = self.progress.safe_read_lsn;
+        var entry = (try self.receive_log.entryAt(self.alloc, switch_lsn)) orelse return error.MissingReceivedRecord;
         defer entry.deinit(self.alloc);
         if (entry.record.kind != .timeline_switch) return error.StandbyNotPromoted;
         try self.validateRecord(entry.record);
 
+        if (self.progress.received_lsn > switch_lsn) {
+            try self.receive_log.truncateAfter(switch_lsn);
+            self.progress = .{
+                .received_lsn = switch_lsn,
+                .applied_lsn = switch_lsn,
+                .safe_read_lsn = switch_lsn,
+            };
+            try self.persistProgress(self.progress);
+        } else if (self.progress.received_lsn != switch_lsn) {
+            return error.PromotionNotApplied;
+        }
+
         return .{
             .identity = self.identity,
-            .switch_lsn = self.progress.received_lsn,
-            .next_lsn = self.progress.received_lsn + 1,
+            .switch_lsn = switch_lsn,
+            .next_lsn = switch_lsn + 1,
         };
     }
 
@@ -519,11 +541,14 @@ pub const Standby = struct {
                 if (decoded.identity.timeline_id > current.timeline_id and decoded.identity.epoch <= current.epoch) return error.InvalidTimelineSwitch;
             }
 
-            if (decoded.progress.received_lsn < replay.progress.received_lsn) return error.NonMonotonicProgress;
-            if (decoded.progress.applied_lsn < replay.progress.applied_lsn) return error.NonMonotonicProgress;
-            if (decoded.progress.safe_read_lsn < replay.progress.safe_read_lsn) return error.NonMonotonicProgress;
             if (decoded.progress.applied_lsn > decoded.progress.received_lsn) return error.AppliedAheadOfReceived;
             if (decoded.progress.safe_read_lsn > decoded.progress.applied_lsn) return error.SafeReadAheadOfApplied;
+            if (decoded.progress.received_lsn < replay.progress.received_lsn or
+                decoded.progress.applied_lsn < replay.progress.applied_lsn or
+                decoded.progress.safe_read_lsn < replay.progress.safe_read_lsn)
+            {
+                if (!try self.progressRecordTargetsTimelineSwitch(decoded)) return error.NonMonotonicProgress;
+            }
             current_identity = decoded.identity;
             replay = .{
                 .identity = decoded.identity,
@@ -532,6 +557,21 @@ pub const Standby = struct {
         }
 
         return replay;
+    }
+
+    fn progressRecordTargetsTimelineSwitch(self: *Standby, decoded: ProgressRecord) !bool {
+        if (decoded.progress.received_lsn == 0 or
+            decoded.progress.received_lsn != decoded.progress.applied_lsn or
+            decoded.progress.received_lsn != decoded.progress.safe_read_lsn) return false;
+
+        var entry = (try self.receive_log.entryAt(self.alloc, decoded.progress.received_lsn)) orelse return false;
+        defer entry.deinit(self.alloc);
+        return entry.record.kind == .timeline_switch and
+            entry.record.cluster_id == decoded.identity.cluster_id and
+            entry.record.shard_id == decoded.identity.shard_id and
+            entry.record.table_id == decoded.identity.table_id and
+            entry.record.timeline_id == decoded.identity.timeline_id and
+            entry.record.epoch == decoded.identity.epoch;
     }
 
     fn persistProgress(self: *Standby, progress: Progress) !void {
@@ -1046,6 +1086,41 @@ test "storage.ha standby promotion requires fencing and appends timeline switch"
     try std.testing.expectEqual(@as(u64, 2), switch_payload.value.required_lsn);
     try std.testing.expect(!switch_payload.value.forced);
     try std.testing.expect(!switch_payload.value.data_loss_possible);
+}
+
+test "storage.ha promoted standby handoff truncates unapplied received records after switch" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "promote-handoff-truncate-unapplied");
+    defer paths.deinit(alloc);
+
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    defer standby.close();
+    _ = try standby.receive(baseRecord(identity, 1, "one"));
+    _ = try standby.receive(baseRecord(identity, 2, "two"));
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try standby.applyAvailable(&capture, ApplyCapture.apply));
+
+    const result = try standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 2,
+        .fencing_confirmed = true,
+    });
+    try std.testing.expectEqual(@as(u64, 3), result.switch_lsn);
+
+    _ = try standby.receive(baseRecord(standby.identity, 4, "unapplied-after-switch"));
+    try std.testing.expectEqual(@as(u64, 4), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().safe_read_lsn);
+
+    const handoff = try standby.promotedPrimaryHandoff();
+    try std.testing.expectEqual(@as(u64, 3), handoff.switch_lsn);
+    try std.testing.expectEqual(@as(u64, 4), handoff.next_lsn);
+    try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), standby.receive_log.lastLsn());
 }
 
 test "storage.ha standby forced promotion records possible data loss" {
