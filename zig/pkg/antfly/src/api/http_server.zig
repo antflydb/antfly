@@ -1097,7 +1097,7 @@ pub const ApiHttpServer = struct {
             .txn_sessions = transactions_api.SessionRegistry.initWithOptions(
                 cfg.session_store,
                 if (cfg.session_store != null and cfg.session_owner_lease_ttl_ns != null)
-                    transactions_api.SessionLeaseStore.init(alloc, cfg.session_store.?.store)
+                    transactions_api.SessionLeaseStore.initFromDurable(cfg.session_store.?)
                 else
                     null,
                 cfg.session_owner_lease_ttl_ns,

@@ -672,11 +672,15 @@ pub const Server = struct {
     /// Cross-thread shutdown requests are published atomically. The listener
     /// thread remains the sole owner of `listener`, `running`, and the
     /// connection group; requestStop only wakes its accept loop.
-    stop_requested: std.atomic.Value(bool) = .init(false),
+    /// 0 = running, 1 = graceful drain, 2 = immediate cancellation. Immediate
+    /// shutdown is terminal and wins races with graceful requests.
+    shutdown_mode: std.atomic.Value(u8) = .init(0),
+    graceful_timeout_ms: std.atomic.Value(u64) = .init(0),
     listen_started: std.atomic.Value(bool) = .init(false),
     /// Actual bound port, published for cross-thread wakeups when config.port
     /// is zero and the kernel selects an ephemeral port.
     wake_port: std.atomic.Value(u16) = .init(0),
+    active_connections: std.atomic.Value(usize) = .init(0),
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
 
@@ -822,19 +826,19 @@ pub const Server = struct {
 
         std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
-        while (self.running and !self.stop_requested.load(.acquire)) {
+        while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
             self.conn_semaphore.waitUncancelable(self.io);
-            if (self.stop_requested.load(.acquire)) break;
+            if (self.shutdown_mode.load(.acquire) != 0) break;
 
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.io);
-                if (!self.running or self.stop_requested.load(.acquire) or self.listener == null) break;
+                if (!self.running or self.shutdown_mode.load(.acquire) != 0 or self.listener == null) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
-            if (self.stop_requested.load(.acquire)) {
+            if (self.shutdown_mode.load(.acquire) != 0) {
                 var wake_socket = conn.socket;
                 wake_socket.close();
                 self.conn_semaphore.post(self.io);
@@ -843,6 +847,7 @@ pub const Server = struct {
 
             // Spawn a lightweight fiber to handle this connection concurrently.
             // If the Io backend doesn't support concurrency, fall back to sync.
+            _ = self.active_connections.fetchAdd(1, .acq_rel);
             self.connections.concurrent(self.io, handleConnectionFiber, .{ self, conn.socket }) catch {
                 self.handleConnection(conn.socket) catch |err| {
                     logConnectionError(err);
@@ -851,9 +856,24 @@ pub const Server = struct {
         }
 
         self.running = false;
-        if (self.stop_requested.load(.acquire)) self.connections.cancel(self.io);
+        const shutdown_mode = self.shutdown_mode.load(.acquire);
+        if (shutdown_mode == 1) self.drainConnections(self.graceful_timeout_ms.load(.acquire));
+        if (shutdown_mode == 2 or self.active_connections.load(.acquire) != 0) self.connections.cancel(self.io);
         // Wait for all in-flight connections to finish before returning.
         self.connections.await(self.io) catch {};
+        self.shutdown_mode.store(0, .release);
+    }
+
+    fn drainConnections(self: *Self, timeout_ms: u64) void {
+        if (timeout_ms == 0) return;
+        const started_ns = Io.Clock.awake.now(self.io).nanoseconds;
+        const timeout_ns: i128 = @as(i128, timeout_ms) * std.time.ns_per_ms;
+        while (self.active_connections.load(.acquire) != 0) {
+            const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
+            if (now_ns - started_ns >= timeout_ns) return;
+            const remaining_ms: u64 = @intCast(@max(@as(i128, 1), @divFloor(timeout_ns - (now_ns - started_ns), std.time.ns_per_ms)));
+            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(@min(remaining_ms, 10))), .awake) catch return;
+        }
     }
 
     /// Requests shutdown from another OS thread without touching listener or
@@ -861,7 +881,14 @@ pub const Server = struct {
     /// posting the semaphore also wakes a listener blocked at its connection
     /// limit. All mutable server teardown remains on the listener thread.
     pub fn requestStop(self: *Self) void {
-        self.stop_requested.store(true, .release);
+        var observed = self.shutdown_mode.load(.acquire);
+        while (observed != 2) {
+            observed = self.shutdown_mode.cmpxchgWeak(observed, 2, .acq_rel, .acquire) orelse break;
+        }
+        self.wakeListener();
+    }
+
+    fn wakeListener(self: *Self) void {
         self.conn_semaphore.post(self.io);
 
         const published_port = self.wake_port.load(.acquire);
@@ -888,26 +915,15 @@ pub const Server = struct {
         self.requestStop();
     }
 
-    /// Gracefully shuts down the server: stops accepting new connections and
-    /// waits up to `timeout_ms` for in-flight requests to complete before
-    /// forcefully cancelling them. Similar to Go's http.Server.Shutdown.
-    ///
-    /// Must be called from a fiber context (e.g. a route handler or a
-    /// dedicated shutdown fiber) because it calls `io.sleep`. This function is
-    /// not async-signal-safe; signal handlers must notify ordinary program code
-    /// which can then call `stop()`.
+    /// Publishes a graceful shutdown request from any ordinary OS thread or
+    /// fiber. The listener thread stops accepting, drains active connections
+    /// for at most `timeout_ms`, then cancels the remainder before `listen()`
+    /// returns. Callers that need synchronous completion should join the thread
+    /// running `listen()`. Signal handlers must still notify ordinary code.
     pub fn shutdown(self: *Self, timeout_ms: u64) void {
-        self.running = false;
-        if (self.listener) |*l| {
-            l.deinit();
-            self.listener = null;
-        }
-        // Give in-flight connections time to finish.
-        if (timeout_ms > 0) {
-            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .awake) catch {};
-        }
-        // Force-cancel any remaining connections.
-        self.connections.cancel(self.io);
+        self.graceful_timeout_ms.store(timeout_ms, .release);
+        _ = self.shutdown_mode.cmpxchgStrong(0, 1, .acq_rel, .acquire);
+        self.wakeListener();
     }
 
     /// Fiber entry point for concurrent connection handling.
@@ -927,6 +943,7 @@ pub const Server = struct {
 
     /// Handles a single connection.
     fn handleConnection(self: *Self, socket: Socket) !void {
+        defer _ = self.active_connections.fetchSub(1, .acq_rel);
         defer self.conn_semaphore.post(self.io);
         var sock = socket;
         defer sock.close();
@@ -2560,31 +2577,17 @@ test "isH2ForbiddenHeader rejects connection-specific headers" {
     try std.testing.expect(!isH2ForbiddenHeader("accept", "*/*"));
 }
 
-test "shutdown with zero timeout closes listener and cancels connections" {
+test "shutdown publishes graceful listener-thread work" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
-    // Simulate running state.
     server.running = true;
-
-    // shutdown(0) should set running=false and not call io.sleep.
-    server.shutdown(0);
-    try std.testing.expect(!server.running);
+    server.shutdown(25);
+    try std.testing.expect(server.running);
     try std.testing.expect(server.listener == null);
-}
-
-test "shutdown with nonzero timeout sleeps then cancels" {
-    const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
-    defer server.deinit();
-
-    server.running = true;
-
-    // shutdown with a small timeout should sleep (uses .awake clock)
-    // then cancel connections. This verifies the clock enum is valid.
-    server.shutdown(1);
-    try std.testing.expect(!server.running);
+    try std.testing.expectEqual(@as(u8, 1), server.shutdown_mode.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 25), server.graceful_timeout_ms.load(.acquire));
 }
 
 test "stop publishes synchronized listener-thread shutdown" {
@@ -2595,7 +2598,7 @@ test "stop publishes synchronized listener-thread shutdown" {
     server.running = true;
     server.stop();
     try std.testing.expect(server.running);
-    try std.testing.expect(server.stop_requested.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
 }
 
@@ -2607,7 +2610,7 @@ test "requestStop only publishes synchronized listener-thread work" {
     server.running = true;
     server.requestStop();
     try std.testing.expect(server.running);
-    try std.testing.expect(server.stop_requested.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
 }
 
@@ -2629,6 +2632,33 @@ test "cross-thread stop wakes an ephemeral listener" {
     server.stop();
     listener_thread.join();
     try std.testing.expect(!server.running);
+}
+
+test "cross-thread graceful shutdown is listener-owned" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.bind();
+    const address = server.boundAddress().?;
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("graceful listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    // Hold an accepted connection idle so the listener must exercise its
+    // deadline and cancellation path rather than taking the empty fast path.
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(address, client_io);
+    defer client.close();
+    while (server.active_connections.load(.acquire) == 0) std.Thread.yield() catch {};
+    server.shutdown(25);
+    listener_thread.join();
+    try std.testing.expect(!server.running);
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
 }
 
 test "containsTraversal rejects double-encoded dot-dot" {

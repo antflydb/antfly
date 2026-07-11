@@ -258,6 +258,16 @@ func TestCleanupFailsClosedOnConflictingDiscoveredPVCLabel(t *testing.T) {
 	if err := client.Get(context.Background(), types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
 		t.Fatalf("conflicting PVC was deleted: %v", err)
 	}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: historical.Name, Namespace: historical.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("historical StatefulSet was deleted before PVC preflight completed: %v", err)
+	}
+	// A second reconcile must fail closed in exactly the same way; this catches
+	// orphaning bugs where the first attempt deletes the workload that supplied
+	// the non-canonical claim prefix.
+	result, err = reconciler.cleanupStorageResources(context.Background(), cluster)
+	if result != nil || err == nil || !strings.Contains(err.Error(), "refusing PVC cleanup") {
+		t.Fatalf("expected retry to preserve fail-closed conflict, result=%v err=%v", result, err)
+	}
 }
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

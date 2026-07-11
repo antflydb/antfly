@@ -71,8 +71,11 @@ The implementation now consists of:
 - `storage/lite/backend.zig` caches one runtime per logical table/group and
   injects those runtimes through the standalone backend-runtime DB-open hook.
 - Standalone metadata is stored in a reserved system namespace in the same
-  file. The existing data, query, transaction, inference, SQL, and `/db/v1`
-  implementations are reused rather than forked.
+  file. Durable HTTP transaction sessions, including staged writes and
+  savepoints, use a second reserved namespace so reopening or copying the
+  `.aflite` file retains the complete database state. The existing data, query,
+  transaction, inference, SQL, and `/db/v1` implementations are reused rather
+  than forked.
 
 Directory-backed and LSM-container profiles remain internal development and
 conformance tools. They are not public `.aflite` formats and invalid or unknown

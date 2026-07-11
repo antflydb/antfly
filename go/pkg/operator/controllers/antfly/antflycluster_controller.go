@@ -528,7 +528,7 @@ func buildPVCRetentionPolicy(policy *antflyv1.PVCRetentionPolicy) *appsv1.Statef
 func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, cluster *antflyv1.AntflyCluster) (*ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// Step 1: Delete StatefulSets controlled by this exact AntflyCluster UID.
+	// Step 1: Discover StatefulSets controlled by this exact AntflyCluster UID.
 	// app.kubernetes.io/instance is a discovery label, not an ownership proof:
 	// another controller or Helm release can legitimately use the same value.
 	var namespaceStatefulSets appsv1.StatefulSetList
@@ -551,38 +551,11 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 			discoveredClaimPrefixes = append(discoveredClaimPrefixes,
 				sts.Spec.VolumeClaimTemplates[claimIndex].Name+"-"+sts.Name+"-")
 		}
-		log.Info("Deleting StatefulSet for PVC cleanup", "statefulset", sts.Name)
-		if err := r.Delete(ctx, sts); err != nil && !errors.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to delete StatefulSet %s: %w", sts.Name, err)
-		}
 	}
 
-	// Delete claims discovered from every owned StatefulSet before returning to
-	// wait for pods. PVC protection keeps in-use claims until those pods exit,
-	// while recording the deletion intent now means an unlabeled claim cannot be
-	// orphaned after its historical StatefulSet has disappeared.
-	if len(discoveredClaimPrefixes) > 0 {
-		var discoveredPVCs corev1.PersistentVolumeClaimList
-		if err := r.List(ctx, &discoveredPVCs, client.InNamespace(cluster.Namespace)); err != nil {
-			return nil, fmt.Errorf("failed to discover PVCs from owned StatefulSets: %w", err)
-		}
-		for i := range discoveredPVCs.Items {
-			pvc := &discoveredPVCs.Items[i]
-			if !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) {
-				continue
-			}
-			if err := validatePVCInstanceOwnership(cluster, pvc); err != nil {
-				return nil, err
-			}
-			log.Info("Deleting discovered PVC", "pvc", pvc.Name)
-			if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
-				return nil, fmt.Errorf("failed to delete discovered PVC %s: %w", pvc.Name, err)
-			}
-		}
-	}
-
-	// Also check canonical names for workloads created before stable labels were
-	// applied. These lookups are idempotent with the labeled deletion above.
+	// Include canonical owned workloads in the deletion set. Do not mutate them
+	// yet: every matching PVC must pass ownership validation first so an error or
+	// controller restart cannot erase the only source of a historical prefix.
 	for _, suffix := range []string{"-metadata", "-data", "-standalone"} {
 		sts := &appsv1.StatefulSet{}
 		stsName := cluster.Name + suffix
@@ -592,12 +565,54 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 				log.Info("Skipping canonical-name StatefulSet not owned by cluster", "statefulset", stsName)
 				continue
 			}
-			log.Info("Deleting StatefulSet for PVC cleanup", "statefulset", stsName)
-			if err := r.Delete(ctx, sts); err != nil && !errors.IsNotFound(err) {
-				return nil, fmt.Errorf("failed to delete StatefulSet %s: %w", stsName, err)
+			ownedStatefulSetNames[sts.Name] = struct{}{}
+			if sts.UID != "" {
+				ownedStatefulSetUIDs[sts.UID] = struct{}{}
 			}
 		} else if !errors.IsNotFound(err) {
 			return nil, fmt.Errorf("failed to get StatefulSet %s: %w", stsName, err)
+		}
+	}
+
+	canonicalClaimPrefixes := []string{
+		"metadata-storage-" + cluster.Name + "-metadata-",
+		"data-storage-" + cluster.Name + "-data-",
+		"standalone-storage-" + cluster.Name + "-standalone-",
+	}
+	var pvcList corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list PVCs: %w", err)
+	}
+	cleanupPVCs := make([]*corev1.PersistentVolumeClaim, 0)
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) && !hasAnyPrefix(pvc.Name, canonicalClaimPrefixes) {
+			continue
+		}
+		if err := validatePVCInstanceOwnership(cluster, pvc); err != nil {
+			return nil, err
+		}
+		cleanupPVCs = append(cleanupPVCs, pvc)
+	}
+
+	// Record claim deletion intent before deleting StatefulSets. PVC protection
+	// keeps claims mounted by live pods until those pods terminate; issuing the
+	// delete first makes cleanup retry-safe even if reconciliation stops between
+	// the workload and claim operations.
+	for _, pvc := range cleanupPVCs {
+		log.Info("Deleting PVC", "pvc", pvc.Name)
+		if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
+		}
+	}
+	for i := range namespaceStatefulSets.Items {
+		sts := &namespaceStatefulSets.Items[i]
+		if _, owned := ownedStatefulSetNames[sts.Name]; !owned || !metav1.IsControlledBy(sts, cluster) {
+			continue
+		}
+		log.Info("Deleting StatefulSet for PVC cleanup", "statefulset", sts.Name)
+		if err := r.Delete(ctx, sts); err != nil && !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to delete StatefulSet %s: %w", sts.Name, err)
 		}
 	}
 
@@ -622,34 +637,6 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		log.Info("Waiting for pods to terminate", "remaining", remainingOwnedPods)
 		result := ctrl.Result{RequeueAfter: 5 * time.Second}
 		return &result, nil
-	}
-
-	// Step 3: Delete PVCs belonging to this cluster. Use one namespace-wide list
-	// so mixed-generation clusters cannot hide an unlabeled historical claim
-	// merely because a newer labeled claim also exists. Canonical claim prefixes
-	// establish scope; a conflicting instance label fails closed.
-	prefixes := []string{
-		"metadata-storage-" + cluster.Name + "-metadata-",
-		"data-storage-" + cluster.Name + "-data-",
-		"standalone-storage-" + cluster.Name + "-standalone-",
-	}
-
-	var pvcList corev1.PersistentVolumeClaimList
-	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
-		return nil, fmt.Errorf("failed to list PVCs: %w", err)
-	}
-
-	for i := range pvcList.Items {
-		pvc := &pvcList.Items[i]
-		if hasAnyPrefix(pvc.Name, prefixes) {
-			if err := validatePVCInstanceOwnership(cluster, pvc); err != nil {
-				return nil, err
-			}
-			log.Info("Deleting PVC", "pvc", pvc.Name)
-			if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
-				return nil, fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
-			}
-		}
 	}
 
 	return nil, nil

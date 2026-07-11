@@ -1212,6 +1212,16 @@ pub fn runFromIterator(
         storage_engine,
     );
     defer local_metadata.deinit();
+    // API transaction sessions are engine state, not a sidecar. Keeping them
+    // in a reserved Lite namespace makes a copied/reopened .aflite file a
+    // complete database and preserves staged multi-request transactions.
+    var lite_session_store = if (lite_backend) |*backend|
+        antfly.public_api.transactions.DurableSessionStore.initRuntime(
+            alloc,
+            try backend.runtimeStoreForNamespace("system/api-transaction-sessions"),
+        )
+    else
+        null;
     const synced_extension_packages = try local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
     if (synced_extension_packages > 0) {
         std.log.info("standalone synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
@@ -1262,6 +1272,7 @@ pub fn runFromIterator(
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
+            .session_store = if (lite_session_store) |*store| store else null,
         },
         .ha = if (ha_primary != null or ha_standby != null or ha_fence_store != null or ha_former_primary_log != null) .{
             .admin_context = .{
@@ -4501,6 +4512,41 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
+}
+
+test "standalone Lite transaction sessions survive file reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sessions.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var txn_id: antfly.db.types.TxnId = undefined;
+    {
+        var backend = try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{ .no_sync = false });
+        defer backend.deinit();
+        var durable = antfly.public_api.transactions.DurableSessionStore.initRuntime(
+            alloc,
+            try backend.runtimeStoreForNamespace("system/api-transaction-sessions"),
+        );
+        var registry = antfly.public_api.transactions.SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        txn_id = (try registry.begin(alloc, .{ .sync_level = .write }, 1)).txn_id;
+    }
+
+    {
+        var backend = try antfly.lite.backend.Handle.open(alloc, path, .{});
+        defer backend.deinit();
+        var durable = antfly.public_api.transactions.DurableSessionStore.initRuntime(
+            alloc,
+            try backend.runtimeStoreForNamespace("system/api-transaction-sessions"),
+        );
+        var registry = antfly.public_api.transactions.SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        const restored = registry.getInfo(txn_id) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(txn_id, restored.txn_id);
+        try std.testing.expectEqual(antfly.db.types.SyncLevel.write, restored.sync_level);
+    }
 }
 
 test "standalone public listener lease is exclusive and immediately reusable" {

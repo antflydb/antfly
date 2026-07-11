@@ -4736,6 +4736,7 @@ pub fn build(b: *std.Build) void {
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
             "standalone public HTTP server is restart-safe and uses public API request body limit",
+            "standalone Lite transaction sessions survive file reopen",
             "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",

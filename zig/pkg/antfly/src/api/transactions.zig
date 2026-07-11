@@ -17,6 +17,7 @@ const platform_sync = @import("antfly_platform").sync;
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const backend_erased = @import("../storage/backend_erased.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const lease_mod = @import("../storage/db/lease.zig");
 const platform_time = @import("../platform/time.zig");
@@ -513,13 +514,24 @@ pub const Session = struct {
 
 pub const DurableSessionStore = struct {
     alloc: std.mem.Allocator,
-    store: *docstore_mod.DocStore,
+    backend: Backend,
+
+    const Backend = union(enum) {
+        docstore: *docstore_mod.DocStore,
+        runtime: *backend_erased.Store,
+    };
 
     pub fn init(alloc: std.mem.Allocator, store: *docstore_mod.DocStore) DurableSessionStore {
         return .{
             .alloc = alloc,
-            .store = store,
+            .backend = .{ .docstore = store },
         };
+    }
+
+    /// Binds session durability to an existing storage-engine namespace. The
+    /// runtime store remains owned by the engine and must outlive this value.
+    pub fn initRuntime(alloc: std.mem.Allocator, store: *backend_erased.Store) DurableSessionStore {
+        return .{ .alloc = alloc, .backend = .{ .runtime = store } };
     }
 
     pub fn save(self: *DurableSessionStore, session: Session) !void {
@@ -527,15 +539,34 @@ pub const DurableSessionStore = struct {
         defer self.alloc.free(key);
         const value = try encodeSessionRecord(self.alloc, session);
         defer self.alloc.free(value);
-        try self.store.put(key, value);
+        switch (self.backend) {
+            .docstore => |store| try store.put(key, value),
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                try txn.put(key, value);
+                try txn.commit();
+            },
+        }
     }
 
     pub fn load(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !?Session {
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);
-        const value = self.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
+        const value = switch (self.backend) {
+            .docstore => |store| store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                const raw = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => return null,
+                    else => return err,
+                };
+                break :blk try self.alloc.dupe(u8, raw);
+            },
         };
         defer self.alloc.free(value);
         return try decodeSessionRecord(self.alloc, txn_id, value);
@@ -544,9 +575,48 @@ pub const DurableSessionStore = struct {
     pub fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);
-        self.store.delete(key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
+        switch (self.backend) {
+            .docstore => |store| store.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                try txn.commit();
+            },
+        }
+    }
+
+    pub fn scanPrefix(self: *DurableSessionStore, alloc: std.mem.Allocator, prefix: []const u8) ![]docstore_mod.OwnedKVPair {
+        return switch (self.backend) {
+            .docstore => |store| try store.scanPrefix(alloc, prefix),
+            .runtime => |store| blk: {
+                var txn = try store.beginCurrentScan();
+                defer txn.abort();
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var rows: std.ArrayListUnmanaged(docstore_mod.OwnedKVPair) = .empty;
+                errdefer {
+                    for (rows.items) |row| {
+                        alloc.free(row.key);
+                        alloc.free(row.value);
+                    }
+                    rows.deinit(alloc);
+                }
+                var entry = try cursor.seekAtOrAfter(prefix);
+                while (entry) |row| : (entry = try cursor.next()) {
+                    if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                    const key = try alloc.dupe(u8, row.key);
+                    errdefer alloc.free(key);
+                    try rows.append(alloc, .{ .key = key, .value = try alloc.dupe(u8, row.value) });
+                }
+                break :blk try rows.toOwnedSlice(alloc);
+            },
         };
     }
 };
@@ -592,19 +662,26 @@ pub const OpenedSessionStore = struct {
 
 pub const SessionLeaseStore = struct {
     alloc: std.mem.Allocator,
-    store: *docstore_mod.DocStore,
+    backend: DurableSessionStore.Backend,
 
     pub fn init(alloc: std.mem.Allocator, store: *docstore_mod.DocStore) SessionLeaseStore {
         return .{
             .alloc = alloc,
-            .store = store,
+            .backend = .{ .docstore = store },
         };
+    }
+
+    pub fn initFromDurable(durable: *DurableSessionStore) SessionLeaseStore {
+        return .{ .alloc = durable.alloc, .backend = durable.backend };
     }
 
     pub fn load(self: *const SessionLeaseStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?lease_mod.LeaseRecord {
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
         defer self.alloc.free(key);
-        var lease = try lease_mod.Lease.init(self.alloc, self.store, key);
+        var lease = switch (self.backend) {
+            .docstore => |store| try lease_mod.Lease.init(self.alloc, store, key),
+            .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
+        };
         defer lease.deinit();
         return try lease.load(alloc);
     }
@@ -612,7 +689,10 @@ pub const SessionLeaseStore = struct {
     pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ms: u64, ttl_ms: u64) !bool {
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
         defer self.alloc.free(key);
-        var lease = try lease_mod.Lease.init(self.alloc, self.store, key);
+        var lease = switch (self.backend) {
+            .docstore => |store| try lease_mod.Lease.init(self.alloc, store, key),
+            .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
+        };
         defer lease.deinit();
         const owner_id = try ownerLeaseId(self.alloc, owner_node_id);
         defer self.alloc.free(owner_id);
@@ -622,7 +702,10 @@ pub const SessionLeaseStore = struct {
     pub fn release(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
         defer self.alloc.free(key);
-        var lease = try lease_mod.Lease.init(self.alloc, self.store, key);
+        var lease = switch (self.backend) {
+            .docstore => |store| try lease_mod.Lease.init(self.alloc, store, key),
+            .runtime => |store| try lease_mod.Lease.init(self.alloc, store, key),
+        };
         defer lease.deinit();
         const owner_id = try ownerLeaseId(self.alloc, owner_node_id);
         defer self.alloc.free(owner_id);
@@ -840,7 +923,7 @@ pub const SessionRegistry = struct {
         errdefer statuses.deinit(alloc);
 
         if (self.durable) |durable| {
-            const rows = try durable.store.scanPrefix(alloc, session_prefix);
+            const rows = try durable.scanPrefix(alloc, session_prefix);
             defer docstore_mod.DocStore.freeResults(alloc, rows);
             for (rows) |row| {
                 if (row.key.len <= session_prefix.len) continue;
@@ -943,7 +1026,7 @@ pub const SessionRegistry = struct {
         }
 
         if (self.durable) |durable| {
-            const rows = try durable.store.scanPrefix(alloc, session_prefix);
+            const rows = try durable.scanPrefix(alloc, session_prefix);
             defer docstore_mod.DocStore.freeResults(alloc, rows);
             for (rows) |row| {
                 if (row.key.len <= session_prefix.len) continue;

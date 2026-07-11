@@ -116,9 +116,11 @@ only the affected table cache. A checkpointed namespace-head directory and
 per-namespace document links make cold materialization proportional to the
 selected namespace's history. Missing namespace metadata fails closed as file
 corruption. Cached namespace runtimes avoid allocations and storage
-reinitialization on repeated reader/writer opens. The standalone metadata catalog
-is stored in a reserved system namespace in the same file and is published in
-memory only with a durable catalog commit.
+reinitialization on repeated reader/writer opens. The standalone metadata
+catalog and durable HTTP transaction sessions are stored in reserved system
+namespaces in the same file. Metadata is published in memory only with a
+durable catalog commit; staged multi-request transactions are reloaded from the
+file after restart rather than depending on a directory sidecar.
 
 Storage maintenance uses the engine-neutral authenticated admin surface:
 `POST /admin/v1/maintenance/{check,compact,vacuum}` returns an asynchronous job,
