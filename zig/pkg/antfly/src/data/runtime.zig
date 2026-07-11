@@ -2423,9 +2423,13 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
         self.syncInferenceRuntimeConfig();
+        // Request allocations must share identity with the process allocator
+        // used by DB internals (c_allocator when libc is linked): search hits
+        // adopt index-owned metadata buffers, so a distinct request allocator
+        // identity turns those adoptions into cross-allocator frees.
         self.http_server = antfly.public_api.ApiHttpServer.initWithRequestAllocator(
             self.alloc,
-            std.heap.smp_allocator,
+            platform.allocator.processAllocator(std.heap.smp_allocator),
             api_server_cfg,
             self.status_source,
             self.read_source.source(),
