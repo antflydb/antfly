@@ -1423,6 +1423,11 @@ pub const Raft = struct {
     }
 
     fn applyRuntimeConfState(self: *Raft, next: types.ConfState) !void {
+        // Read-index acknowledgements are indexed by the current peer array.
+        // Configuration changes are rare; fail those transient reads so callers
+        // retry against a single, stable membership layout.
+        self.clearPendingReads();
+
         var added_targets = std.ArrayListUnmanaged(types.NodeId).empty;
         defer added_targets.deinit(self.alloc);
 
@@ -1535,6 +1540,7 @@ pub const Raft = struct {
         const old_peers = self.peers;
         const old_votes = self.votes;
         const old_progress = self.progress;
+        const old_inflights = self.inflights;
 
         const new_len = old_peers.len + 1;
         const new_peers = try self.alloc.alloc(types.NodeId, new_len);
@@ -1557,12 +1563,19 @@ pub const Raft = struct {
             .probe_sent = false,
         };
 
+        const new_inflights = try self.alloc.alloc(std.ArrayListUnmanaged(Inflight), new_len);
+        errdefer self.alloc.free(new_inflights);
+        @memcpy(new_inflights[0..old_inflights.len], old_inflights);
+        new_inflights[old_peers.len] = .empty;
+
         self.peers = new_peers;
         self.votes = new_votes;
         self.progress = new_progress;
+        self.inflights = new_inflights;
         self.alloc.free(old_peers);
         self.alloc.free(old_votes);
         self.alloc.free(old_progress);
+        self.alloc.free(old_inflights);
     }
 
     fn removeReplicationPeer(self: *Raft, node_id: types.NodeId) !void {
@@ -1572,6 +1585,7 @@ pub const Raft = struct {
         const old_peers = self.peers;
         const old_votes = self.votes;
         const old_progress = self.progress;
+        const old_inflights = self.inflights;
 
         const new_len = old_peers.len - 1;
         const new_peers = try self.alloc.alloc(types.NodeId, new_len);
@@ -1580,6 +1594,8 @@ pub const Raft = struct {
         errdefer self.alloc.free(new_votes);
         const new_progress = try self.alloc.alloc(types.Progress, new_len);
         errdefer self.alloc.free(new_progress);
+        const new_inflights = try self.alloc.alloc(std.ArrayListUnmanaged(Inflight), new_len);
+        errdefer self.alloc.free(new_inflights);
 
         var next: usize = 0;
         for (old_peers, 0..) |peer, i| {
@@ -1587,15 +1603,20 @@ pub const Raft = struct {
             new_peers[next] = peer;
             new_votes[next] = old_votes[i];
             new_progress[next] = old_progress[i];
+            new_inflights[next] = old_inflights[i];
             next += 1;
         }
+
+        old_inflights[remove_idx].deinit(self.alloc);
 
         self.peers = new_peers;
         self.votes = new_votes;
         self.progress = new_progress;
+        self.inflights = new_inflights;
         self.alloc.free(old_peers);
         self.alloc.free(old_votes);
         self.alloc.free(old_progress);
+        self.alloc.free(old_inflights);
     }
 
     fn isPromotable(self: *const Raft) bool {
@@ -1714,6 +1735,7 @@ pub const Raft = struct {
                 std.mem.swap(types.NodeId, &self.peers[i], &self.peers[j]);
                 std.mem.swap(VoteState, &self.votes[i], &self.votes[j]);
                 std.mem.swap(types.Progress, &self.progress[i], &self.progress[j]);
+                std.mem.swap(std.ArrayListUnmanaged(Inflight), &self.inflights[i], &self.inflights[j]);
             }
         }
     }

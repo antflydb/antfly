@@ -808,6 +808,34 @@ test "disable_conf_change_validation allows leave-joint proposal past pending un
     try std.testing.expectError(error.PendingConfChange, strict.proposeConfChangeV2(.{}));
 }
 
+test "applying voter changes keeps all peer-indexed leader state aligned" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.seedConfState(.{ .voters = @constCast((&[_]types.NodeId{2})[0..]) });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 2,
+        .group_id = 1,
+        .peers = &.{2},
+        .election_tick = 3,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
+
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 3 });
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 1 });
+    try std.testing.expectEqualSlices(types.NodeId, &.{ 1, 2, 3 }, raft.status().conf_state.voters);
+
+    _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
+    try std.testing.expectEqualSlices(types.NodeId, &.{ 2, 3 }, raft.status().conf_state.voters);
+    try raft.propose("still-aligned");
+}
+
 test "memory storage compaction preserves snapshot term and trimmed bounds" {
     var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();

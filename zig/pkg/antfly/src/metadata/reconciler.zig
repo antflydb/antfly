@@ -310,10 +310,17 @@ pub const Reconciler = struct {
         }
 
         for (desired_placements) |desired| {
-            const effective = effectivePlacementIntent(current, desired_tables, desired_ranges, desired);
-            const existing = findPlacementIntent(current.placement_intents, effective.record.group_id, effective.record.local_node_id);
-            if (existing == null or !placementIntentsEqual(existing.?, effective)) {
-                try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, effective));
+            {
+                const transition_peers = try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, desired);
+                defer if (transition_peers) |peers| self.alloc.free(peers);
+                var transition_intent = desired;
+                if (transition_peers) |peers| transition_intent.peer_node_ids = peers;
+
+                const effective = effectivePlacementIntent(current, desired_tables, desired_ranges, transition_intent);
+                const existing = findPlacementIntent(current.placement_intents, effective.record.group_id, effective.record.local_node_id);
+                if (existing == null or !placementIntentsEqual(existing.?, effective)) {
+                    try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, effective));
+                }
             }
         }
         for (desired_tables) |*desired| {
@@ -411,6 +418,13 @@ pub const Reconciler = struct {
                 } else {
                     var draining = intent;
                     draining.serving_state = .draining;
+                    const desired = findPlacementIntentForGroup(desired_placements, intent.record.group_id);
+                    const transition_peers = if (desired) |value|
+                        try allocExpandedTransitionPeerNodeIds(self.alloc, current.placement_intents, value)
+                    else
+                        null;
+                    defer if (transition_peers) |peers| self.alloc.free(peers);
+                    if (desired) |value| draining.peer_node_ids = transition_peers orelse value.peer_node_ids;
                     const watermark = relocationWatermarkForGroup(current, intent.record.group_id);
                     if (draining.relocation_generation == 0) draining.relocation_generation = intent.record.metadata_version + 1;
                     applyRelocationWatermark(&draining, watermark);
@@ -921,7 +935,6 @@ fn relocationTargetReady(current: CurrentMetadataState, intent: raft_reconciler.
 fn relocationTargetCutoverReady(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
     const store = findStoreByNode(current.stores, intent.record.local_node_id) orelse return false;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
-    if (store.active_backfills != 0) return false;
 
     var saw_group_status = false;
     for (store.group_statuses) |status| {
@@ -993,12 +1006,19 @@ fn compactShrinkSafeToRemove(
     if (desired_count == 0 or desired_count >= current_count) return false;
 
     var survivors: usize = 0;
+    var expected_transition_fingerprint: ?table_manager.VoterSetFingerprint = null;
     for (desired_placements) |desired| {
         if (desired.record.group_id != source.record.group_id) continue;
         if (desired.record.local_node_id == source.record.local_node_id) continue;
         const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
         if (current_target.serving_state != .serving) return false;
-        if (!placementReadyForCompactShrink(current, desired, desired_count)) return false;
+        const target_fingerprint = table_manager.voterSetFingerprint(current_target.peer_node_ids, current_target.record.local_node_id);
+        if (expected_transition_fingerprint) |expected| {
+            if (!std.mem.eql(u8, &expected, &target_fingerprint)) return false;
+        } else {
+            expected_transition_fingerprint = target_fingerprint;
+        }
+        if (!placementReadyForCompactShrink(current, current_target)) return false;
         survivors += 1;
     }
     if (survivors != desired_count) return false;
@@ -1015,15 +1035,12 @@ fn compactShrinkSafeToRemove(
 fn placementReadyForCompactShrink(
     current: CurrentMetadataState,
     target: raft_reconciler.PlacementIntent,
-    desired_count: usize,
 ) bool {
     const store = findStoreByNode(current.stores, target.record.local_node_id) orelse return false;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
-    if (store.active_backfills != 0) return false;
     for (store.group_statuses) |status| {
         if (status.group_id != target.record.group_id) continue;
         if (!status.local_voter) return false;
-        if (@as(usize, status.voter_count) != desired_count) return false;
         if (status.joint_consensus or status.transition_pending) return false;
         if (status.replay_required and !status.replay_caught_up) return false;
         if (!voterSetMatchesIntent(status, target)) return false;
@@ -1144,6 +1161,49 @@ fn countPlacementIntents(intents: []const raft_reconciler.PlacementIntent, group
         if (intent.record.group_id == group_id) count += 1;
     }
     return count;
+}
+
+fn findPlacementIntentForGroup(
+    intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+) ?raft_reconciler.PlacementIntent {
+    for (intents) |intent| {
+        if (intent.record.group_id == group_id) return intent;
+    }
+    return null;
+}
+
+fn allocExpandedTransitionPeerNodeIds(
+    alloc: std.mem.Allocator,
+    current_intents: []const raft_reconciler.PlacementIntent,
+    desired: raft_reconciler.PlacementIntent,
+) !?[]u64 {
+    var needs_expansion = false;
+    for (current_intents) |current_intent| {
+        if (current_intent.record.group_id != desired.record.group_id) continue;
+        if (!containsU64(desired.peer_node_ids, current_intent.record.local_node_id)) {
+            needs_expansion = true;
+            break;
+        }
+    }
+    if (!needs_expansion) return null;
+
+    var peers = std.ArrayListUnmanaged(u64).empty;
+    errdefer peers.deinit(alloc);
+    for (desired.peer_node_ids) |node_id| {
+        if (!containsU64(peers.items, node_id)) try peers.append(alloc, node_id);
+    }
+    if (!containsU64(peers.items, desired.record.local_node_id)) {
+        try peers.append(alloc, desired.record.local_node_id);
+    }
+    for (current_intents) |current_intent| {
+        if (current_intent.record.group_id != desired.record.group_id) continue;
+        if (!containsU64(peers.items, current_intent.record.local_node_id)) {
+            try peers.append(alloc, current_intent.record.local_node_id);
+        }
+    }
+    std.mem.sort(u64, peers.items, {}, std.sort.asc(u64));
+    return try peers.toOwnedSlice(alloc);
 }
 
 fn placementSetsEqual(group_id: u64, desired_intents: []const raft_reconciler.PlacementIntent, current_intents: []const raft_reconciler.PlacementIntent) bool {
@@ -2490,6 +2550,73 @@ test "metadata reconciler keeps relocation source serving while target bootstrap
     try std.testing.expectEqual(@as(u64, 5), target.relocation_doc_count_watermark);
     const source = findPlacementIntent(plan.placement_upserts, 2201, 1) orelse return error.MissingDrainingSource;
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, source.peer_node_ids);
+}
+
+test "metadata reconciler converges overlapping relocation intents on one desired voter set" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 2202, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{ .group_id = 2202, .table_id = 2202, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 2202, .replica_id = 1, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .draining },
+        .{ .record = .{ .group_id = 2202, .replica_id = 2, .local_node_id = 2 }, .store_id = 2, .peer_node_ids = &.{ 2, 3, 4 }, .serving_state = .draining },
+        .{ .record = .{ .group_id = 2202, .replica_id = 3, .local_node_id = 3 }, .store_id = 3, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 2202, .replica_id = 4, .local_node_id = 4 }, .store_id = 4, .peer_node_ids = &.{ 2, 3, 4 }, .serving_state = .serving },
+    };
+    const stores = [_]table_manager.StoreRecord{.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+        .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+            .group_id = 2202,
+            .doc_count = 5,
+            .disk_bytes = 2048,
+            .empty = false,
+            .local_voter = true,
+            .voter_count = 4,
+        }})[0..]),
+    }};
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 3, .store_id = 3, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+        .{ .node_id = 4, .store_id = 4, .role = "data", .failure_domain = "rack-d", .retain_current = true },
+        .{ .node_id = 5, .store_id = 5, .role = "data", .failure_domain = "rack-e", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 3, 4, 5 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    const expected = table_manager.voterSetFingerprint(&.{ 1, 2, 3, 4, 5 }, null);
+    for (plan.placement_upserts) |intent| {
+        if (intent.record.group_id != 2202) continue;
+        const actual = table_manager.voterSetFingerprint(intent.peer_node_ids, null);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+    }
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+
+    const contracted_current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 2202, .replica_id = 3, .local_node_id = 3 }, .store_id = 3, .peer_node_ids = &.{ 1, 2, 3, 4, 5 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 2202, .replica_id = 4, .local_node_id = 4 }, .store_id = 4, .peer_node_ids = &.{ 1, 2, 3, 4, 5 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 2202, .replica_id = 5, .local_node_id = 5 }, .store_id = 5, .peer_node_ids = &.{ 1, 2, 3, 4, 5 }, .serving_state = .serving },
+    };
+    var contract_plan = try reconciler.computePlan(&manager, &.{ 3, 4, 5 }, &candidates, .{
+        .placement_intents = &contracted_current,
+        .reallocate_requested = true,
+    });
+    defer contract_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), contract_plan.placement_upserts.len);
+    for (contract_plan.placement_upserts) |intent| {
+        try std.testing.expectEqualSlices(u64, &.{ 3, 4, 5 }, intent.peer_node_ids);
+    }
 }
 
 test "metadata reconciler removes relocation source only after target is durably serving" {
@@ -2826,9 +2953,9 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
                 .disk_bytes = 1024,
                 .empty = false,
                 .local_voter = true,
-                .voter_count = 2,
+                .voter_count = 3,
                 .voter_set_known = true,
-                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null),
             }})[0..]),
         },
         .{
@@ -2843,9 +2970,9 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
                 .disk_bytes = 2048,
                 .empty = false,
                 .local_voter = true,
-                .voter_count = 2,
+                .voter_count = 3,
                 .voter_set_known = true,
-                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null),
             }})[0..]),
         },
     };
@@ -2857,8 +2984,8 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
         .leader_known = true,
         .leader_store_id = 101,
         .voter_count_known = true,
-        .voter_count = 2,
-        .healthy_voter_reports = 2,
+        .voter_count = 3,
+        .healthy_voter_reports = 3,
     }};
     const candidates = [_]@import("state.zig").CandidatePlacementInfo{
         .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
@@ -2914,9 +3041,9 @@ test "metadata reconciler compact shrink uses stable raft membership instead of 
         .disk_bytes = 2048,
         .empty = false,
         .local_voter = true,
-        .voter_count = 2,
+        .voter_count = 3,
         .voter_set_known = true,
-        .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
+        .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null),
     };
     const stores = [_]table_manager.StoreRecord{
         .{
@@ -2940,6 +3067,9 @@ test "metadata reconciler compact shrink uses stable raft membership instead of 
             .role = "data",
             .health_class = "healthy",
             .live = true,
+            // Unrelated store-level work must not block this group's stable
+            // membership handoff.
+            .active_backfills = 1,
             .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
                 .group_id = 2261,
                 // Physical LSM size is replica-local and is not a correctness
@@ -2949,9 +3079,9 @@ test "metadata reconciler compact shrink uses stable raft membership instead of 
                 .empty = false,
                 .local_leader = true,
                 .local_voter = true,
-                .voter_count = 2,
+                .voter_count = 3,
                 .voter_set_known = true,
-                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null),
             }})[0..]),
         },
         .{
@@ -2960,6 +3090,7 @@ test "metadata reconciler compact shrink uses stable raft membership instead of 
             .role = "data",
             .health_class = "healthy",
             .live = true,
+            .active_backfills = 1,
             .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{caught_up})[0..]),
         },
     };

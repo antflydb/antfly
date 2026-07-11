@@ -3019,7 +3019,10 @@ pub const Backend = struct {
 
         var durable_next_run_id: u64 = 0;
         var durable_runs = std.ArrayListUnmanaged(Run).empty;
-        defer durable_runs.deinit(self.allocator);
+        defer {
+            for (durable_runs.items) |*run| run.deinit(self.allocator);
+            durable_runs.deinit(self.allocator);
+        }
         var durable_obsolete = std.ArrayListUnmanaged(ObsoletePath).empty;
         defer {
             for (durable_obsolete.items) |*obsolete| obsolete.deinit(self.allocator);

@@ -1860,6 +1860,7 @@ pub const RaftApplyStore = struct {
 
 const transition_magic = "afmd1";
 const runtime_status_record_version: u16 = 4;
+const group_status_record_version: u16 = 1;
 
 const TransitionTag = enum(u8) {
     upsert_node = 1,
@@ -2903,6 +2904,7 @@ fn appendGroupStatusRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.GroupStatusReport,
 ) !void {
+    try appendInt(alloc, out, u16, group_status_record_version);
     try appendInt(alloc, out, u64, record.group_id);
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
@@ -2919,6 +2921,8 @@ fn appendGroupStatusRecord(
     try out.append(alloc, if (record.local_voter) 1 else 0);
     try appendInt(alloc, out, u16, record.voter_count);
     try out.append(alloc, if (record.joint_consensus) 1 else 0);
+    try out.append(alloc, if (record.voter_set_known) 1 else 0);
+    try out.appendSlice(alloc, &record.voter_set_fingerprint);
 }
 
 fn readGroupStatusRecord(
@@ -2927,6 +2931,8 @@ fn readGroupStatusRecord(
     pos: *usize,
 ) !metadata.GroupStatusReport {
     _ = alloc;
+    const version = try readInt(encoded, pos, u16);
+    if (version != group_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const group_id = try readInt(encoded, pos, u64);
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = try readInt(encoded, pos, u64);
@@ -2982,6 +2988,15 @@ fn readGroupStatusRecord(
         pos.* += 1;
         break :blk value;
     } else false;
+    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const voter_set_known = encoded[pos.*] != 0;
+    pos.* += 1;
+    if (pos.* + metadata_table_manager.voter_set_fingerprint_len > encoded.len) {
+        return error.InvalidMetadataTransitionEncoding;
+    }
+    var voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = undefined;
+    @memcpy(&voter_set_fingerprint, encoded[pos.* .. pos.* + metadata_table_manager.voter_set_fingerprint_len]);
+    pos.* += metadata_table_manager.voter_set_fingerprint_len;
     return .{
         .group_id = group_id,
         .doc_count = doc_count,
@@ -2992,6 +3007,8 @@ fn readGroupStatusRecord(
         .local_leader = local_leader,
         .local_voter = local_voter,
         .voter_count = voter_count,
+        .voter_set_known = voter_set_known,
+        .voter_set_fingerprint = voter_set_fingerprint,
         .joint_consensus = joint_consensus,
         .transition_pending = transition_pending,
         .replay_required = replay_required,
@@ -5343,6 +5360,37 @@ test "metadata raft apply store projects replication source status records from 
         try std.testing.expectEqual(@as(u64, 444), statuses[0].last_success_at_ms);
         try std.testing.expectEqual(@as(u64, 555), statuses[0].last_change_applied_at_ms);
     }
+}
+
+test "metadata raft apply store transition codec preserves exact raft voter identity" {
+    const fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
+    var group_statuses = [_]metadata.GroupStatusReport{.{
+        .group_id = 5101,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = fingerprint,
+    }};
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .group_statuses = group_statuses[0..],
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded == .upsert_store);
+    const statuses = decoded.upsert_store.group_statuses;
+    try std.testing.expectEqual(@as(usize, 1), statuses.len);
+    try std.testing.expect(statuses[0].voter_set_known);
+    try std.testing.expectEqual(@as(u16, 3), statuses[0].voter_count);
+    try std.testing.expectEqualSlices(u8, &fingerprint, &statuses[0].voter_set_fingerprint);
 }
 
 test "metadata raft apply store projects placement intents from committed entries" {

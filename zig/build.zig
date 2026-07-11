@@ -4476,6 +4476,7 @@ pub fn build(b: *std.Build) void {
             "table workflow can remove a table topology from desired state",
             "table workflow can reconcile projected local placement intents",
             "metadata raft apply store ",
+            "metadata store observer ",
             "metadata state machine projects transitions through metadata apply store",
             "table provisioner restore rejects mismatched doc identity namespace",
         },

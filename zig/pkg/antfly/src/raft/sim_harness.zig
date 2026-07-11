@@ -1542,6 +1542,7 @@ const StorageRecorder = struct {
         const store = self.stores.get(group_id) orelse return error.UnknownGroup;
         if (ready.snapshot) |snapshot| try store.applySnapshot(snapshot);
         if (ready.hard_state) |hard_state| store.setHardState(hard_state);
+        if (ready.conf_state) |conf_state| try store.setConfState(conf_state);
         if (ready.entries.len > 0) try store.append(ready.entries);
     }
 };
@@ -3249,6 +3250,27 @@ test "managed http cluster simulation drives three-node churn and admin workflow
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_a, conf_target, 64));
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_b, conf_target, 64));
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_c, conf_target, 64));
+    var membership_converged = false;
+    for (0..64) |_| {
+        try cluster.stepAll();
+        membership_converged = true;
+        for (0..3) |node_index| {
+            const status = cluster.node(node_index).raftStatus(3001) orelse {
+                membership_converged = false;
+                break;
+            };
+            if (!std.mem.eql(u64, &.{ 1, 2 }, status.conf_state.voters)) {
+                membership_converged = false;
+                break;
+            }
+        }
+        if (membership_converged) break;
+    }
+    try std.testing.expect(membership_converged);
+    for (0..3) |node_index| {
+        const status = cluster.node(node_index).raftStatus(3001) orelse return error.MissingRaftStatus;
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, status.conf_state.voters);
+    }
 
     try cluster.node(2).applyBatch(&.{
         .{ .remove_peer_route = .{ .group_id = 3001, .node_id = 1 } },

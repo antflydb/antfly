@@ -146,6 +146,8 @@ fn groupStatusEqual(
         lhs.local_leader == rhs.local_leader and
         lhs.local_voter == rhs.local_voter and
         lhs.voter_count == rhs.voter_count and
+        lhs.voter_set_known == rhs.voter_set_known and
+        std.mem.eql(u8, &lhs.voter_set_fingerprint, &rhs.voter_set_fingerprint) and
         lhs.joint_consensus == rhs.joint_consensus and
         lhs.transition_pending == rhs.transition_pending and
         lhs.replay_required == rhs.replay_required and
@@ -445,6 +447,37 @@ test "store observer coalesces status heartbeat timestamps" {
     try std.testing.expect(!observationChangesRecord(existing, observation));
 
     observation.group_statuses = stale_groups[0..];
+    try std.testing.expect(observationChangesRecord(existing, observation));
+}
+
+test "metadata store observer detects exact voter set changes at a stable count" {
+    const original_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null);
+    const changed_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
+    var existing_groups = [_]table_manager.GroupStatusReport{.{
+        .group_id = 101,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = original_fingerprint,
+    }};
+    var changed_groups = [_]table_manager.GroupStatusReport{.{
+        .group_id = 101,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = changed_fingerprint,
+    }};
+    const existing = table_manager.StoreRecord{
+        .store_id = 21,
+        .node_id = 101,
+        .role = "data",
+        .group_statuses = existing_groups[0..],
+    };
+    const observation = StoreObservation{
+        .store_id = 21,
+        .group_statuses = changed_groups[0..],
+    };
+
     try std.testing.expect(observationChangesRecord(existing, observation));
 }
 

@@ -4612,7 +4612,9 @@ pub const DataServer = struct {
             if (findRangeByGroupId(ranges, group_id)) |range| {
                 if (findTableById(tables, range.table_id)) |table| {
                     if (try self.snapshotCachedActiveStartupLocalGroupStatusReport(alloc, group_id, table.name, active_target)) |cached| {
-                        try reports.append(alloc, cached);
+                        var current = cached;
+                        overlayLiveRaftGroupStatus(&current, group_leadership_source, group_membership_source);
+                        try reports.append(alloc, current);
                         continue;
                     }
                     if (self.shouldSkipActiveStartupGroupStatusOpen(table.name, group_id, active_target)) {
@@ -4620,7 +4622,9 @@ pub const DataServer = struct {
                     }
                     if (self.hasReadBlockingActivityBestEffort(table.name, group_id)) {
                         if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
-                            try reports.append(alloc, cached);
+                            var current = cached;
+                            overlayLiveRaftGroupStatus(&current, group_leadership_source, group_membership_source);
+                            try reports.append(alloc, current);
                             continue;
                         }
                         continue;
@@ -4631,13 +4635,17 @@ pub const DataServer = struct {
                     switch (writer_probe) {
                         .leased => {
                             if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
-                                try reports.append(alloc, cached);
+                                var current = cached;
+                                overlayLiveRaftGroupStatus(&current, group_leadership_source, group_membership_source);
+                                try reports.append(alloc, current);
                             }
                             continue;
                         },
                         .unknown => {
                             if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
-                                try reports.append(alloc, cached);
+                                var current = cached;
+                                overlayLiveRaftGroupStatus(&current, group_leadership_source, group_membership_source);
+                                try reports.append(alloc, current);
                                 continue;
                             }
                         },
@@ -5003,6 +5011,9 @@ pub const DataServer = struct {
         const registration = self.store_registration orelse return;
         var report = (try self.cloneHeartbeatStoreStatusReport(registration.store_id)) orelse return try self.reportStoreStatus();
         defer freeStoreStatusReportOwned(self.alloc, &report);
+        for (report.group_statuses) |*group_status| {
+            overlayLiveRaftGroupStatus(group_status, self.group_leadership_source, self.group_membership_source);
+        }
         try remote_metadata.reportNodeStatus(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         self.clearMetadataBootstrapRetry();
@@ -8160,6 +8171,9 @@ fn mergeRaftOnlyLocalGroupStatusFallbacks(
         for (reports.items) |record| antfly.metadata.table_manager.freeGroupStatus(alloc, record);
         reports.deinit(alloc);
     }
+    for (reports.items) |*report| {
+        overlayLiveRaftGroupStatus(report, group_leadership_source, group_membership_source);
+    }
     try appendRaftOnlyLocalGroupStatusFallbacks(
         alloc,
         &reports,
@@ -8168,6 +8182,22 @@ fn mergeRaftOnlyLocalGroupStatusFallbacks(
         group_membership_source,
     );
     return try reports.toOwnedSlice(alloc);
+}
+
+fn overlayLiveRaftGroupStatus(
+    report: *antfly.metadata.table_manager.GroupStatusReport,
+    group_leadership_source: ?GroupLeadershipSource,
+    group_membership_source: ?GroupMembershipSource,
+) void {
+    if (group_leadership_source) |source| report.local_leader = source.isLocalLeader(report.group_id);
+    if (group_membership_source) |source| {
+        const membership = source.membership(report.group_id);
+        report.local_voter = membership.local_voter;
+        report.voter_count = membership.voter_count;
+        report.voter_set_known = membership.voter_set_known;
+        report.voter_set_fingerprint = membership.voter_set_fingerprint;
+        report.joint_consensus = membership.joint_consensus;
+    }
 }
 
 fn appendRaftOnlyLocalGroupStatusFallbacks(
@@ -9952,6 +9982,8 @@ test "data runtime local group status fingerprint includes live raft state" {
         .membership = .{
             .local_voter = true,
             .voter_count = 3,
+            .voter_set_known = true,
+            .voter_set_fingerprint = antfly.metadata.table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null),
             .joint_consensus = false,
         },
     };
@@ -10002,6 +10034,59 @@ test "data runtime local group status fingerprint includes live raft state" {
         harness.membershipSource(),
     );
     try std.testing.expect(base != after_membership_change);
+
+    harness.membership.voter_count = 3;
+    harness.membership.voter_set_fingerprint = antfly.metadata.table_manager.voterSetFingerprint(&.{ 1, 2, 4 }, null);
+    const after_same_count_membership_change = localGroupStatusFingerprint(
+        &.{77},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        harness.leadershipSource(),
+        harness.membershipSource(),
+    );
+    try std.testing.expect(base != after_same_count_membership_change);
+}
+
+test "data runtime overlays live raft membership onto cached storage status" {
+    const Source = struct {
+        membership: GroupMembership,
+
+        fn iface(self: *@This()) GroupMembershipSource {
+            return .{ .ptr = self, .vtable = &.{ .membership = read } };
+        }
+
+        fn read(ptr: *anyopaque, _: u64) GroupMembership {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.membership;
+        }
+    };
+
+    const expected = antfly.metadata.table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
+    var source = Source{ .membership = .{
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = expected,
+    } };
+    var cached: antfly.metadata.table_manager.GroupStatusReport = .{
+        .group_id = 77,
+        .doc_count = 12,
+        .voter_count = 2,
+    };
+
+    overlayLiveRaftGroupStatus(&cached, null, source.iface());
+
+    try std.testing.expectEqual(@as(u64, 12), cached.doc_count);
+    try std.testing.expect(cached.local_voter);
+    try std.testing.expectEqual(@as(u16, 3), cached.voter_count);
+    try std.testing.expect(cached.voter_set_known);
+    try std.testing.expectEqualSlices(u8, &expected, &cached.voter_set_fingerprint);
 }
 
 test "data runtime local group status fingerprint ignores remote store status reports" {
