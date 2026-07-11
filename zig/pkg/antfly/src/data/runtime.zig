@@ -2732,7 +2732,7 @@ pub const DataServer = struct {
     fn configureHAPublicGateState(self: *DataServer) void {
         const ctx = self.ha_cfg.admin_context orelse return;
         if (ctx.standby) |standby| {
-            self.ha_public_gate_state.configureStandby(standby.currentProgress());
+            self.publishHAStandbyPublicGateState(standby, true);
             return;
         }
         if (ctx.primary) |primary| {
@@ -2743,19 +2743,34 @@ pub const DataServer = struct {
     fn refreshHAPublicGateState(self: *DataServer) void {
         const ctx = self.ha_cfg.admin_context orelse return;
         if (ctx.standby) |standby| {
-            _ = standby.promotedPrimaryHandoff() catch |err| switch (err) {
-                error.StandbyNotPromoted, error.PromotionNotApplied => {
-                    self.ha_public_gate_state.publishStandbyProgress(standby.currentProgress());
-                    return;
-                },
-                else => return,
-            };
-            self.ha_public_gate_state.beginPromotion();
+            self.publishHAStandbyPublicGateState(standby, false);
             return;
         }
         if (ctx.primary != null) {
             self.ha_public_gate_state.publishPrimaryFence(haContextPrimaryIsFenced(ctx));
         }
+    }
+
+    fn publishHAStandbyPublicGateState(
+        self: *DataServer,
+        standby: *antfly.ha.standby.Standby,
+        configure_role: bool,
+    ) void {
+        _ = standby.promotedPrimaryHandoff() catch |err| switch (err) {
+            error.StandbyNotPromoted, error.PromotionNotApplied => {
+                if (configure_role) {
+                    self.ha_public_gate_state.configureStandby(standby.currentProgress());
+                } else {
+                    self.ha_public_gate_state.publishStandbyProgress(standby.currentProgress());
+                }
+                return;
+            },
+            else => {
+                self.ha_public_gate_state.beginPromotion();
+                return;
+            },
+        };
+        self.ha_public_gate_state.beginPromotion();
     }
 
     fn haPublicGateStateChangedCallback(ptr: *anyopaque) void {
@@ -17047,6 +17062,8 @@ test "data server promotion rewires live HTTP internal HA executor" {
 
     const public_read_gate_before = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_before = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate_before.check(.stale));
+    try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate_before.check());
 
     var before = try server.http_server.?.handle(.{
         .method = .GET,
@@ -17220,6 +17237,12 @@ test "data server promotion open failure preserves retryable standby" {
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
+    server.initApiServer();
+
+    const public_read_gate = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
+    const public_write_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate.check(.stale));
+    try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate.check());
 
     try std.testing.expectError(error.PromotedLogMismatch, server.runHAStandbyReplicationRound());
     try std.testing.expect(standby != null);
