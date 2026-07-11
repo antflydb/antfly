@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const metadata_mod = @import("mod.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
@@ -120,7 +121,13 @@ pub const MetadataServer = struct {
         };
 
         if (cfg.admin_listener) |listener_cfg| {
-            const request_alloc = std.heap.smp_allocator;
+            // The request allocator must share identity with the process
+            // allocator used by DB internals (c_allocator when libc is
+            // linked): request-scoped results adopt buffers allocated by
+            // DB-owned components (index metadata, table record clones), so a
+            // distinct allocator identity here turns those adoptions into
+            // cross-allocator frees that corrupt the heap.
+            const request_alloc = platform.allocator.processAllocator(std.heap.smp_allocator);
             const admin_http_server = try alloc.create(metadata_http_server.MetadataHttpServer);
             admin_http_server.* = metadata_http_server.MetadataHttpServer.init(
                 alloc,
