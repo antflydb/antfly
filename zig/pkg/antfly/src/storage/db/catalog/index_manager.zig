@@ -2819,7 +2819,7 @@ pub const IndexManager = struct {
                 };
             }
         } else {
-            parallelism = self.resolvedLoadParallelism(configs.len);
+            parallelism = self.resolvedLoadParallelism(configs.len, allow_backfill, read_only);
             if (parallelism <= 1) {
                 for (configs) |cfg| {
                     self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
@@ -2836,7 +2836,7 @@ pub const IndexManager = struct {
                 for (configs) |cfg| {
                     try self.ensureConfiguredIndexDir(cfg);
                 }
-                try self.loadConfiguredIndexesParallel(store, configs, parallelism, allow_backfill, read_only);
+                try self.loadConfiguredIndexesParallel(store, configs, parallelism);
             }
         }
         try self.refreshGeneratedEnrichmentTargetCache();
@@ -2876,8 +2876,17 @@ pub const IndexManager = struct {
         self.status_only_index_configs = configs;
     }
 
-    fn resolvedLoadParallelism(self: *const IndexManager, config_count: usize) usize {
-        if (config_count <= 1 or builtin.single_threaded) return 1;
+    fn resolvedLoadParallelism(
+        self: *const IndexManager,
+        config_count: usize,
+        allow_backfill: bool,
+        read_only: bool,
+    ) usize {
+        // Detached index construction is only parallel-safe when it cannot
+        // mutate the shared primary store. Writable opens can publish lexical
+        // registry entries and backfills persist checkpoints, so serialize
+        // them even when no backfill is ultimately needed.
+        if (config_count <= 1 or builtin.single_threaded or allow_backfill or !read_only) return 1;
         if (self.load_parallelism) |value| return @min(@max(value, 1), config_count);
 
         var parallelism = std.Thread.getCpuCount() catch 1;
@@ -2892,8 +2901,6 @@ pub const IndexManager = struct {
         store: anytype,
         configs: []const types.IndexConfig,
         parallelism: usize,
-        allow_backfill: bool,
-        read_only: bool,
     ) !void {
         var marked_loading: usize = 0;
         errdefer {
@@ -2913,15 +2920,13 @@ pub const IndexManager = struct {
             store: Store,
             configs: []const types.IndexConfig,
             results: []OpenResult,
-            allow_backfill: bool,
-            read_only: bool,
             next_index: std.atomic.Value(usize) = .init(0),
 
             fn run(state: *@This()) void {
                 while (true) {
                     const index = state.next_index.fetchAdd(1, .monotonic);
                     if (index >= state.configs.len) return;
-                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], state.allow_backfill, state.read_only) catch |err| {
+                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true) catch |err| {
                         std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
                             state.configs[index].name,
                             @tagName(state.configs[index].kind),
@@ -2947,8 +2952,6 @@ pub const IndexManager = struct {
             .store = store,
             .configs = configs,
             .results = results,
-            .allow_backfill = allow_backfill,
-            .read_only = read_only,
         };
 
         const spawned_count = parallelism - 1;
@@ -2979,7 +2982,7 @@ pub const IndexManager = struct {
         // deferred results cleanup releases any other opened indexes).
         for (results, 0..) |*result, i| {
             if (result.err) |err| {
-                if (read_only and indexOpenErrorIsTransientRead(err)) return err;
+                if (indexOpenErrorIsTransientRead(err)) return err;
                 try self.recordFailedIndexLoad(configs[i], err);
             }
         }
@@ -18083,6 +18086,19 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
     try std.testing.expectEqualStrings("doc:inline", metadata);
 }
 
+test "configured index loading only parallelizes read-only construction" {
+    var manager = try IndexManager.init(std.testing.allocator, ".");
+    defer manager.deinit();
+    manager.setLoadParallelism(3);
+
+    try std.testing.expectEqual(@as(usize, 1), manager.resolvedLoadParallelism(4, true, false));
+    try std.testing.expectEqual(@as(usize, 1), manager.resolvedLoadParallelism(4, false, false));
+    try std.testing.expectEqual(
+        @as(usize, if (builtin.single_threaded) 1 else 3),
+        manager.resolvedLoadParallelism(4, false, true),
+    );
+}
+
 test "loadConfiguredIndexesParallel quarantines worker errors without double-joining threads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -18095,10 +18111,6 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
-
-    var manager = try IndexManager.init(alloc, path);
-    defer manager.deinit();
-    manager.updateRange(.{ .start = "", .end = "" });
 
     const configs = [_]types.IndexConfig{
         .{
@@ -18113,6 +18125,20 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
         },
     };
 
+    // Materialize the healthy index before exercising the read-only parallel
+    // reopen path. Parallel construction deliberately cannot create or
+    // backfill indexes because those operations mutate the primary store.
+    {
+        var setup_manager = try IndexManager.init(alloc, path);
+        defer setup_manager.deinit();
+        setup_manager.updateRange(.{ .start = "", .end = "" });
+        try setup_manager.openConfiguredIndex(&store, configs[0], false, false);
+    }
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
     for (configs) |cfg| {
         try manager.ensureConfiguredIndexDir(cfg);
     }
@@ -18120,7 +18146,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
     // A worker error no longer fails the load: the failing index is
     // quarantined (config retained, error recorded) while the healthy one
     // loads normally — and the worker threads still join exactly once.
-    try manager.loadConfiguredIndexesParallel(&store, &configs, 2, true, false);
+    try manager.loadConfiguredIndexesParallel(&store, &configs, 2);
     try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
     try std.testing.expect(manager.denseIndex("dv_bad") == null);
     const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;
