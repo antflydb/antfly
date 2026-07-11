@@ -1052,6 +1052,21 @@ pub const ModelManager = struct {
         while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
     }
 
+    /// Counts loaded models that currently hold an active prompt prefix cache.
+    /// Used to split the node-wide prompt cache budget evenly across models so
+    /// that loading more generators cannot multiply retained KV memory.
+    /// `include` is always counted even if its cache has not activated yet.
+    pub fn activePromptCacheCount(self: *ModelManager, include: *LoadedModel) usize {
+        var count: usize = 0;
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model == include) continue;
+            if (model.prompt_prefix_cache.isActive()) count += 1;
+        }
+        return count + 1;
+    }
+
     /// Load a model from a directory path. Returns a cached model if already loaded.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
         if (self.loaded.get(model_dir)) |model| return model;

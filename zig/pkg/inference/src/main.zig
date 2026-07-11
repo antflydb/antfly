@@ -49,7 +49,7 @@ const RunConfig = struct {
 
     const PromptCacheConfig = struct {
         enabled: bool = false,
-        mode: inference.runtime.kv.prompt_cache.Mode = .simple,
+        mode: inference.runtime.kv.prompt_cache.Mode = .block_hash,
         max_bytes_mb: usize = 512,
         min_tokens: usize = 64,
         ttl_ms: u64 = 300_000,

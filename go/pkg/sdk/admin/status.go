@@ -476,9 +476,6 @@ func haDurabilityStatusJSONConsistent(durability haDurabilityStatusJSON) error {
 	if satisfiedCount > candidateCount {
 		return fmt.Errorf("durability status inconsistent: satisfied_count=%d candidate_count=%d", satisfiedCount, candidateCount)
 	}
-	if requiredCount > candidateCount {
-		return fmt.Errorf("durability status inconsistent: required_count=%d candidate_count=%d", requiredCount, candidateCount)
-	}
 	if HADurabilityDecisionStatus(strings.TrimSpace(durability.Status)) == HADurabilityStatusSatisfied && satisfiedCount < requiredCount {
 		return fmt.Errorf("durability status inconsistent: satisfied_count=%d required_count=%d", satisfiedCount, requiredCount)
 	}

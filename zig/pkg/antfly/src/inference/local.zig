@@ -42,6 +42,11 @@ pub const Provider = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -79,6 +84,21 @@ pub const Provider = struct {
 
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
+    }
+
+    pub fn setSamplingOptions(
+        self: *Provider,
+        temperature: ?f32,
+        top_p: ?f32,
+        top_k: ?i64,
+        frequency_penalty: ?f32,
+        presence_penalty: ?f32,
+    ) void {
+        self.temperature = temperature;
+        self.top_p = top_p;
+        self.top_k = top_k;
+        self.frequency_penalty = frequency_penalty;
+        self.presence_penalty = presence_penalty;
     }
 
     fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
@@ -317,6 +337,11 @@ pub const Provider = struct {
             .tools_json = self.tools_json,
             .tool_choice_json = self.tool_choice_json,
             .max_tokens = self.max_tokens,
+            .temperature = self.temperature,
+            .top_p = self.top_p,
+            .top_k = self.top_k,
+            .frequency_penalty = self.frequency_penalty,
+            .presence_penalty = self.presence_penalty,
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{

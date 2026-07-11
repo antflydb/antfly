@@ -31,6 +31,9 @@ pub const GeminiProvider = struct {
     base_url: []const u8,
     api_key_header: [2][]const u8,
     max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: GeminiOptions) !GeminiProvider {
         var provider = GeminiProvider{
@@ -64,13 +67,24 @@ pub const GeminiProvider = struct {
         self.max_tokens = max_tokens;
     }
 
+    pub fn setSamplingOptions(self: *GeminiProvider, temperature: ?f32, top_p: ?f32, top_k: ?i64) void {
+        self.temperature = temperature;
+        self.top_p = top_p;
+        self.top_k = top_k;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/models/{s}:generateContent", .{ self.base_url, model });
         defer self.allocator.free(url);
 
-        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, self.max_tokens);
+        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, .{
+            .max_tokens = self.max_tokens,
+            .temperature = self.temperature,
+            .top_p = self.top_p,
+            .top_k = self.top_k,
+        });
         defer alloc.free(json_body);
 
         const headers = [_][2][]const u8{self.api_key_header};
@@ -102,6 +116,9 @@ pub const Provider = struct {
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
     max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: Options) !Provider {
         var provider = Provider{
@@ -160,6 +177,12 @@ pub const Provider = struct {
         self.max_tokens = max_tokens;
     }
 
+    pub fn setSamplingOptions(self: *Provider, temperature: ?f32, top_p: ?f32, top_k: ?i64) void {
+        self.temperature = temperature;
+        self.top_p = top_p;
+        self.top_k = top_k;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
@@ -172,7 +195,12 @@ pub const Provider = struct {
         );
         defer self.allocator.free(url);
 
-        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, self.max_tokens);
+        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, .{
+            .max_tokens = self.max_tokens,
+            .temperature = self.temperature,
+            .top_p = self.top_p,
+            .top_k = self.top_k,
+        });
         defer alloc.free(json_body);
 
         var headers = std.ArrayList([2][]const u8).empty;
@@ -244,7 +272,7 @@ fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8) !inference.Gen
     return .{ .content = try out.toOwnedSlice(alloc), .allocator = alloc };
 }
 
-fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessage, max_tokens: ?i64) ![]u8 {
+fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessage, options: inference.ChatRequestOptions) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
@@ -270,13 +298,41 @@ fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.
         count += 1;
     }
     try out.append(alloc, ']');
-    if (max_tokens) |value| {
-        const fragment = try std.fmt.allocPrint(alloc, ",\"generationConfig\":{{\"maxOutputTokens\":{d}}}", .{value});
-        defer alloc.free(fragment);
-        try out.appendSlice(alloc, fragment);
+    if (options.max_tokens != null or options.temperature != null or options.top_p != null or options.top_k != null) {
+        try out.appendSlice(alloc, ",\"generationConfig\":{");
+        var generation_fields: usize = 0;
+        if (options.max_tokens) |value| {
+            try appendVertexI64Field(alloc, &out, &generation_fields, "maxOutputTokens", value);
+        }
+        if (options.temperature) |value| {
+            try appendVertexFloatField(alloc, &out, &generation_fields, "temperature", value);
+        }
+        if (options.top_p) |value| {
+            try appendVertexFloatField(alloc, &out, &generation_fields, "topP", value);
+        }
+        if (options.top_k) |value| {
+            try appendVertexI64Field(alloc, &out, &generation_fields, "topK", value);
+        }
+        try out.append(alloc, '}');
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendVertexI64Field(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, name: []const u8, value: i64) !void {
+    if (count.* > 0) try out.append(alloc, ',');
+    count.* += 1;
+    const fragment = try std.fmt.allocPrint(alloc, "\"{s}\":{d}", .{ name, value });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
+}
+
+fn appendVertexFloatField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), count: *usize, name: []const u8, value: f32) !void {
+    if (count.* > 0) try out.append(alloc, ',');
+    count.* += 1;
+    const fragment = try std.fmt.allocPrint(alloc, "\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
 }
 
 fn appendVertexContent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), message: inference.ChatMessage) !void {

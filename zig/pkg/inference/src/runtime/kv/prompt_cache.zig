@@ -21,13 +21,17 @@ const storage_runtime_mod = @import("storage_runtime.zig");
 pub const max_namespace_bytes: usize = 256;
 
 pub const Mode = enum {
+    /// Whole-prefix entries with linear scan matching. O(entries) lookup and
+    /// eviction; only suitable for small caches or debugging.
     simple,
+    /// Hash-addressed KV blocks with chained per-page hashes. O(1) lookup per
+    /// block; production default.
     block_hash,
 };
 
 pub const Config = struct {
     enabled: bool = false,
-    mode: Mode = .simple,
+    mode: Mode = .block_hash,
     max_bytes: usize = 512 * 1024 * 1024,
     min_tokens: usize = 64,
     ttl_ms: u64 = 300_000,
@@ -248,6 +252,7 @@ pub const PromptPrefixCache = struct {
 
         self.tick += 1;
         self.entries.items[idx].last_used = self.tick;
+        self.entries.items[idx].expires_at_ms = self.refreshedExpiryMs();
         self.hits += 1;
         return .{
             .sequence_id = sequence_id,
@@ -276,6 +281,7 @@ pub const PromptPrefixCache = struct {
         if (self.findExact(namespace, tokens)) |idx| {
             self.tick += 1;
             self.entries.items[idx].last_used = self.tick;
+            self.entries.items[idx].expires_at_ms = self.refreshedExpiryMs();
             return;
         }
 
@@ -314,7 +320,7 @@ pub const PromptPrefixCache = struct {
             .blocks = owned_blocks,
             .storage_blocks = owned_storage_blocks,
             .estimated_bytes = bytes,
-            .expires_at_ms = nowMs() + @as(i64, @intCast(self.config.ttl_ms)),
+            .expires_at_ms = self.refreshedExpiryMs(),
             .last_used = self.tick,
         });
         self.estimated_bytes += bytes;
@@ -385,6 +391,7 @@ pub const PromptPrefixCache = struct {
             }
             self.tick += 1;
             entry.last_used = self.tick;
+            entry.expires_at_ms = self.refreshedExpiryMs();
             previous_hash = hash;
             matched_tokens += page_size;
         }
@@ -450,6 +457,7 @@ pub const PromptPrefixCache = struct {
             if (self.block_hash_index.get(hash)) |entry_idx| {
                 self.tick += 1;
                 self.block_hash_entries.items[entry_idx].last_used = self.tick;
+                self.block_hash_entries.items[entry_idx].expires_at_ms = self.refreshedExpiryMs();
                 if (!std.mem.eql(i64, self.block_hash_entries.items[entry_idx].tokens, token_block)) {
                     self.block_hash_collision_guards += 1;
                     self.releaseRetainedBlockHashBlock(blocks.items, storage_blocks.items, idx);
@@ -488,7 +496,7 @@ pub const PromptPrefixCache = struct {
             .block_id = block_id,
             .storage_block_id = storage_block_id,
             .estimated_bytes = bytes,
-            .expires_at_ms = nowMs() + @as(i64, @intCast(self.config.ttl_ms)),
+            .expires_at_ms = self.refreshedExpiryMs(),
             .last_used = self.tick,
         });
         self.estimated_bytes += bytes;
@@ -518,6 +526,17 @@ pub const PromptPrefixCache = struct {
         if (self.storage) |*storage| {
             if (start < storage_blocks.len) storage.releaseRetainedBlocks(storage_blocks[start..]);
         }
+    }
+
+    /// Idle TTL: hits refresh expiry, so only entries unused for ttl_ms expire.
+    fn refreshedExpiryMs(self: *const PromptPrefixCache) i64 {
+        return nowMs() + @as(i64, @intCast(self.config.ttl_ms));
+    }
+
+    pub fn isActive(self: *PromptPrefixCache) bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.config.enabled and self.pool_id != null;
     }
 
     fn findExact(self: *const PromptPrefixCache, namespace: []const u8, tokens: []const i64) ?usize {
@@ -700,7 +719,7 @@ test "prompt cache attaches longest retained prefix" {
     const allocator = std.testing.allocator;
     var cache = PromptPrefixCache.init(allocator);
     defer cache.deinit();
-    cache.configure(.{ .enabled = true, .min_tokens = 2, .max_bytes = 1 << 20 });
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 << 20 });
 
     const pool_id = (try cache.ensurePool(.{
         .backend = .native,
@@ -722,11 +741,38 @@ test "prompt cache attaches longest retained prefix" {
     try std.testing.expectEqual(@as(u64, 1), stats_value.hits);
 }
 
+test "prompt cache refreshes idle ttl on hit" {
+    const allocator = std.testing.allocator;
+    var cache = PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 << 20 });
+
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 4);
+    try cache.storeFromSequence("agent", &.{ 1, 2, 3, 4 }, source_id);
+
+    // Age the entry toward expiry without pushing it into the past (so expireOld
+    // keeps it), then confirm a hit pushes expiry forward by ~ttl_ms.
+    const aged_expiry = nowMs() + 1;
+    cache.entries.items[0].expires_at_ms = aged_expiry;
+    const hit = (try cache.attachLongestPrefix("agent", &.{ 1, 2, 3, 9 }, 2)).?;
+    try cache.manager.releaseSequence(hit.sequence_id);
+    try std.testing.expect(cache.entries.items[0].expires_at_ms > aged_expiry);
+}
+
 test "prompt cache evicts retained blocks by budget" {
     const allocator = std.testing.allocator;
     var cache = PromptPrefixCache.init(allocator);
     defer cache.deinit();
-    cache.configure(.{ .enabled = true, .min_tokens = 2, .max_bytes = 1 });
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 });
 
     const pool_id = (try cache.ensurePool(.{
         .backend = .native,
@@ -764,6 +810,7 @@ test "prompt cache reports retained bytes to resource observer" {
     defer cache.deinit();
     cache.configure(.{
         .enabled = true,
+        .mode = .simple,
         .min_tokens = 2,
         .max_bytes = 1,
         .resource_usage_observer = .{
@@ -803,6 +850,7 @@ test "prompt cache budgets metadata bytes" {
     defer cache.deinit();
     cache.configure(.{
         .enabled = true,
+        .mode = .simple,
         .min_tokens = 2,
         .max_bytes = 2 * pool_config.num_layers_packed * pool_config.bytesPerTokenPair(),
     });
@@ -819,7 +867,7 @@ test "prompt cache skips oversized namespace" {
     const allocator = std.testing.allocator;
     var cache = PromptPrefixCache.init(allocator);
     defer cache.deinit();
-    cache.configure(.{ .enabled = true, .min_tokens = 2, .max_bytes = 1 << 20 });
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 << 20 });
 
     const pool_id = (try cache.ensurePool(.{
         .backend = .native,
@@ -843,7 +891,7 @@ test "prompt cache attaches longest retained prefix with storage runtime" {
     const allocator = std.testing.allocator;
     var cache = PromptPrefixCache.init(allocator);
     defer cache.deinit();
-    cache.configure(.{ .enabled = true, .min_tokens = 2, .max_bytes = 1 << 20 });
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 << 20 });
 
     const ensured = (try cache.ensureStorage(.{
         .backend = .metal,
