@@ -128,7 +128,7 @@ pub fn runFromIterator(
     defer configured_uris.deinit(alloc);
 
     var remote_content: ?antfly.common.config.Config.RemoteContentConfig = null;
-    if (cli.remote_content_block_private_ips orelse parseEnvOptionalBool(init.environ_map, "ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS")) |block_private_ips| {
+    if (cli.remote_content_block_private_ips orelse try parseEnvOptionalBool(init.environ_map, "ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS")) |block_private_ips| {
         remote_content = .{
             .security = .{ .block_private_ips = block_private_ips },
         };
@@ -144,23 +144,23 @@ pub fn runFromIterator(
         .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, configured_uris.catalog, "ANTFLY_SERVERLESS_CATALOG_URI"),
         .s3_options = configured_uris.s3_options,
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
-        .query_cache_max_bytes = cli.query_cache_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", serverless_default_query_cache_max_bytes),
-        .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", serverless_default_query_cache_payload_max_bytes),
+        .query_cache_max_bytes = cli.query_cache_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", serverless_default_query_cache_max_bytes),
+        .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", serverless_default_query_cache_payload_max_bytes),
         .embedding_indexes_json = cli.embedding_indexes_json orelse init.environ_map.get("ANTFLY_SERVERLESS_EMBEDDING_INDEXES_JSON"),
         .sparse_embedding_index_name = cli.sparse_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME") orelse "serverless_sparse",
         .chunk_embedding_index_name = cli.chunk_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_CHUNK_EMBEDDING_INDEX_NAME") orelse "serverless_chunk",
-        .chunk_embedding_dimensions = cli.chunk_embedding_dimensions orelse parseEnvIntOrDefault(init.environ_map, u32, "ANTFLY_SERVERLESS_CHUNK_EMBEDDING_DIMS", 8),
-        .tick_interval_ms = cli.tick_ms orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_TICK_INTERVAL_MS", 25),
+        .chunk_embedding_dimensions = cli.chunk_embedding_dimensions orelse try parseEnvIntOrDefault(init.environ_map, u32, "ANTFLY_SERVERLESS_CHUNK_EMBEDDING_DIMS", 8),
+        .tick_interval_ms = cli.tick_ms orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_TICK_INTERVAL_MS", 25),
         .role = forced_role orelse try parseRuntimeRole(cli.role orelse init.environ_map.get("ANTFLY_SERVERLESS_ROLE") orelse "combined"),
         .combined_mode = forced_combined_mode orelse false,
-        .publish_enabled = cli.publish_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PUBLISH_ENABLED", true),
-        .compaction_enabled = cli.compaction_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_COMPACTION_ENABLED", true),
-        .prune_enabled = cli.prune_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
-        .enrichment_enabled = cli.enrichment_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
+        .publish_enabled = cli.publish_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PUBLISH_ENABLED", true),
+        .compaction_enabled = cli.compaction_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_COMPACTION_ENABLED", true),
+        .prune_enabled = cli.prune_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
+        .enrichment_enabled = cli.enrichment_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
         .remote_content = if (remote_content) |*cfg| cfg else null,
     };
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
-    const listener = if (listener_enabled) serverless_serverConfigFromEnv(init.environ_map, cli) else null;
+    const listener = if (listener_enabled) try serverless_serverConfigFromEnv(init.environ_map, cli) else null;
 
     var srv = serverless.ServerlessServer.init(alloc, .{
         .bootstrap = bootstrap,
@@ -186,7 +186,7 @@ pub fn runFromIterator(
     printRuntimeStatusSummary(srv.runtimeStatus());
 
     var health_source = ServerlessHealthSource{ .srv = &srv };
-    const health_port = cli.health_port orelse parseEnvOptionalInt(init.environ_map, u16, "ANTFLY_SERVERLESS_HEALTH_PORT");
+    const health_port = cli.health_port orelse try parseEnvOptionalInt(init.environ_map, u16, "ANTFLY_SERVERLESS_HEALTH_PORT");
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
         "serverless",
@@ -249,9 +249,9 @@ fn parseEnvOptionalInt(
     env_map: *std.process.Environ.Map,
     comptime T: type,
     env_name: []const u8,
-) ?T {
+) !?T {
     const raw = env_map.get(env_name) orelse return null;
-    return std.fmt.parseInt(T, raw, 10) catch null;
+    return std.fmt.parseInt(T, raw, 10) catch return invalidEnvironmentValue(env_name, raw, "an unsigned base-10 integer");
 }
 
 fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
@@ -475,43 +475,48 @@ fn parseEnvIntOrDefault(
     comptime T: type,
     env_name: []const u8,
     default: T,
-) T {
+) !T {
     const raw = env_map.get(env_name) orelse return default;
-    return std.fmt.parseInt(T, raw, 10) catch default;
+    return std.fmt.parseInt(T, raw, 10) catch return invalidEnvironmentValue(env_name, raw, "an unsigned base-10 integer");
 }
 
 fn parseEnvBoolOrDefault(
     env_map: *std.process.Environ.Map,
     env_name: []const u8,
     default: bool,
-) bool {
+) !bool {
     const raw = env_map.get(env_name) orelse return default;
-    return parseBool(raw) catch default;
+    return parseBool(raw) catch return invalidEnvironmentValue(env_name, raw, "true/false, yes/no, or 1/0");
 }
 
 fn parseEnvOptionalBool(
     env_map: *std.process.Environ.Map,
     env_name: []const u8,
-) ?bool {
+) !?bool {
     const raw = env_map.get(env_name) orelse return null;
-    return parseBool(raw) catch null;
+    return parseBool(raw) catch return invalidEnvironmentValue(env_name, raw, "true/false, yes/no, or 1/0");
+}
+
+fn invalidEnvironmentValue(name: []const u8, value: []const u8, expected: []const u8) error{InvalidEnvironmentValue} {
+    std.log.err("invalid environment variable {s}={s}; expected {s}", .{ name, value, expected });
+    return error.InvalidEnvironmentValue;
 }
 
 fn serverless_serverConfigFromEnv(
     env_map: *std.process.Environ.Map,
     cli: CliConfig,
-) antfly.raft.transport.StdHttpListenerConfig {
+) !antfly.raft.transport.StdHttpListenerConfig {
     return .{
         .bind_host = cli.bind_host orelse env_map.get("ANTFLY_SERVERLESS_BIND_HOST") orelse "127.0.0.1",
-        .bind_port = cli.bind_port orelse parseEnvIntOrDefault(env_map, u16, "ANTFLY_SERVERLESS_BIND_PORT", 8080),
-        .max_request_bytes = cli.max_request_bytes orelse parseEnvIntOrDefault(
+        .bind_port = cli.bind_port orelse try parseEnvIntOrDefault(env_map, u16, "ANTFLY_SERVERLESS_BIND_PORT", 8080),
+        .max_request_bytes = cli.max_request_bytes orelse try parseEnvIntOrDefault(
             env_map,
             usize,
             "ANTFLY_SERVERLESS_MAX_REQUEST_BYTES",
             serverless_default_max_request_bytes,
         ),
         .serve_in_connection_threads = true,
-        .max_connection_threads = cli.max_connection_threads orelse parseEnvIntOrDefault(
+        .max_connection_threads = cli.max_connection_threads orelse try parseEnvIntOrDefault(
             env_map,
             u32,
             "ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS",
@@ -551,7 +556,7 @@ fn printUsage(argv0: []const u8) void {
         \\
         \\options:
         \\  --config <path>                 JSON common config with deployment_mode=serverless and storage.engine=object
-        \\  --secret-store-path <path>      Resolve ${{secret:...}} references from this encrypted store
+        \\  --secret-store-path <path>      Resolve ${{secret:...}} references from this protected JSON store
         \\  --artifacts-uri <uri>
         \\  --manifests-uri <uri>
         \\  --wal-uri <uri>
@@ -623,6 +628,7 @@ fn startupErrorHint(err: anyerror) ?[]const u8 {
         error.InvalidQueryCachePayloadBudget => "invalid query cache payload budget; ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES must be greater than zero when the cache is enabled",
         error.QueryCachePayloadExceedsBudget => "invalid query cache budgets; the per-payload limit cannot exceed the total cache limit",
         error.InvalidRuntimeRole => "invalid runtime role; expected combined, api, query, or maintenance",
+        error.InvalidEnvironmentValue => "invalid serverless environment configuration; see the preceding variable-specific error",
         error.MissingEndpoint => "missing S3-compatible endpoint; configure the storage connection endpoint or AWS_ENDPOINT_URL",
         error.MissingAccessKeyId => "missing S3 access key; configure the storage connection secret or AWS_ACCESS_KEY_ID",
         error.MissingSecretAccessKey => "missing S3 secret key; configure the storage connection secret or AWS_SECRET_ACCESS_KEY",
@@ -707,7 +713,7 @@ test "serverless main listener config defaults request limit to public API limit
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
-    const cfg = serverless_serverConfigFromEnv(&env_map, .{});
+    const cfg = try serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
     try std.testing.expect(cfg.serve_in_connection_threads);
     try std.testing.expectEqual(serverless_default_max_connection_threads, cfg.max_connection_threads);
@@ -719,16 +725,30 @@ test "serverless main listener config allows env and cli listener limit override
     try env_map.put("ANTFLY_SERVERLESS_MAX_REQUEST_BYTES", "4194304");
     try env_map.put("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS", "7");
 
-    const env_cfg = serverless_serverConfigFromEnv(&env_map, .{});
+    const env_cfg = try serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), env_cfg.max_request_bytes);
     try std.testing.expectEqual(@as(u32, 7), env_cfg.max_connection_threads);
 
-    const cli_cfg = serverless_serverConfigFromEnv(&env_map, .{
+    const cli_cfg = try serverless_serverConfigFromEnv(&env_map, .{
         .max_request_bytes = 8 * 1024 * 1024,
         .max_connection_threads = 11,
     });
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), cli_cfg.max_request_bytes);
     try std.testing.expectEqual(@as(u32, 11), cli_cfg.max_connection_threads);
+}
+
+test "serverless main rejects malformed explicit environment values" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS", "many");
+    try std.testing.expectError(error.InvalidEnvironmentValue, serverless_serverConfigFromEnv(&env_map, .{}));
+
+    _ = env_map.remove("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS");
+    try env_map.put("ANTFLY_SERVERLESS_PRUNE_ENABLED", "sometimes");
+    try std.testing.expectError(
+        error.InvalidEnvironmentValue,
+        parseEnvBoolOrDefault(&env_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
+    );
 }
 
 test "serverless main parses maintenance booleans" {

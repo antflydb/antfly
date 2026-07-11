@@ -594,6 +594,50 @@ const LocalStandaloneMetadata = struct {
         try mutation.commit(self);
     }
 
+    fn adoptEmbeddedLiteRootIfNeeded(self: *LocalStandaloneMetadata, backend: *antfly.lite.backend.Handle) !void {
+        const existing = try self.manager.listTables(self.alloc);
+        defer self.manager.freeTables(self.alloc, existing);
+        if (existing.len != 0) return;
+        if (!(try backend.isEmbeddedArtifact()) and !(try backend.embeddedRootHasUserDocuments())) return;
+
+        const table = try deriveStandaloneTableRecord(.lite, "default", .{});
+        const ranges = try antfly.public_api.tables.deriveInitialRanges(self.alloc, table);
+        defer {
+            for (ranges) |record| antfly.metadata.table_manager.freeRange(self.alloc, record);
+            self.alloc.free(ranges);
+        }
+        if (ranges.len != 1) return error.InvalidCreateTableRequest;
+        const namespace = try std.fmt.allocPrint(self.alloc, "group-{d}/table-db", .{ranges[0].group_id});
+        defer self.alloc.free(namespace);
+
+        // The durable alias is published first. If catalog publication fails,
+        // startup fails and the next attempt safely retries the idempotent
+        // catalog adoption; it can never publish a table that points at an
+        // empty namespace.
+        try backend.adoptEmbeddedRootAsNamespace(namespace);
+
+        // Embedded Lite is created with the deterministic identity of the
+        // future standalone `default` table. Verify that invariant before
+        // publishing metadata; never perform an O(live documents) identity
+        // rewrite during startup or silently accept a mismatched artifact.
+        const target_identity = antfly.db.DocIdentityNamespace{
+            .table_id = table.table_id,
+            .shard_id = ranges[0].group_id,
+            .range_id = ranges[0].range_id,
+        };
+        try verifyAdoptedLiteIdentity(self.alloc, backend, namespace, target_identity);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findTableByNameLocked("default") != null) return;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        try self.manager.upsertTable(table);
+        for (ranges) |range| try self.manager.upsertRange(range);
+        self.epoch +|= 1;
+        try mutation.commit(self);
+    }
+
     fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var location = try antfly.public_api.backups.openBackupLocation(alloc, location_uri);
@@ -1039,6 +1083,28 @@ const LocalStandaloneMetadata = struct {
     }
 };
 
+fn verifyAdoptedLiteIdentity(
+    alloc: std.mem.Allocator,
+    backend: *antfly.lite.backend.Handle,
+    namespace: []const u8,
+    target_identity: antfly.db.DocIdentityNamespace,
+) !void {
+    if (!target_identity.eql(antfly.lite.connection.embeddedRootIdentity())) {
+        return error.InvalidEmbeddedLiteIdentity;
+    }
+    var db_opts = antfly.db.OpenOptions{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .identity_namespace = target_identity,
+    };
+    try backend.configureDbOpenOptionsForNamespace(&db_opts, namespace);
+    var adopted_db = try antfly.db.DB.open(alloc, namespace, db_opts);
+    defer adopted_db.close();
+    if (!adopted_db.core.identity_namespace.eql(target_identity)) return error.InvalidEmbeddedLiteIdentity;
+}
+
 fn deriveStandaloneTableRecord(
     storage_engine: antfly.common.config.StorageEngine,
     table_name: []const u8,
@@ -1270,6 +1336,13 @@ pub fn runFromIterator(
         return err;
     };
     defer local_metadata.deinit();
+    if (lite_backend) |*backend| {
+        try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
+        // Mark only after embedded adoption and metadata publication succeed.
+        // Offline root-only backup must reject every standalone artifact, not
+        // merely artifacts that originated in the embedded profile.
+        try backend.markStandaloneArtifact();
+    }
     // API transaction sessions are engine state, not a sidecar. Keeping them
     // in a reserved Lite namespace makes a copied/reopened .aflite file a
     // complete database and preserves staged multi-request transactions.
@@ -3547,6 +3620,51 @@ test "standalone Lite enforces one shard and one replica" {
     const local = try deriveStandaloneTableRecord(.local, "local", .{ .num_shards = 2 });
     try std.testing.expectEqual(@as(u32, 2), local.min_ranges);
     try std.testing.expectEqual(@as(u32, 1), local.desired_replica_count);
+}
+
+test "standalone Lite adoption preserves deterministic embedded document identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/identity-adoption.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var embedded = try antfly.lite.connection.Connection.create(alloc, path, true);
+        defer embedded.close();
+        try embedded.db.batch(.{ .writes = &.{.{ .key = "doc:portable", .value = "{\"body\":\"portable\"}" }} });
+    }
+
+    var backend = try antfly.lite.backend.Handle.open(alloc, path, .{});
+    defer backend.deinit();
+    const target = antfly.lite.connection.embeddedRootIdentity();
+    const default_table = try deriveStandaloneTableRecord(.lite, "default", .{});
+    const default_range = antfly.public_api.tables.deriveInitialRange(default_table);
+    try std.testing.expectEqual(default_table.table_id, target.table_id);
+    try std.testing.expectEqual(default_range.group_id, target.shard_id);
+    try std.testing.expectEqual(default_range.range_id, target.range_id);
+    const namespace = try std.fmt.allocPrint(alloc, "group-{d}/table-db", .{target.shard_id});
+    defer alloc.free(namespace);
+    try backend.adoptEmbeddedRootAsNamespace(namespace);
+    try verifyAdoptedLiteIdentity(alloc, &backend, namespace, target);
+    // Retry after a crash boundary is a no-op.
+    try verifyAdoptedLiteIdentity(alloc, &backend, namespace, target);
+
+    var opts = antfly.db.OpenOptions{
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .identity_namespace = target,
+    };
+    const restored_namespace = try std.fmt.allocPrint(alloc, "/restored/root/{s}", .{namespace});
+    defer alloc.free(restored_namespace);
+    try backend.configureDbOpenOptionsForNamespace(&opts, restored_namespace);
+    var adopted = try antfly.db.DB.open(alloc, namespace, opts);
+    defer adopted.close();
+    try std.testing.expect(adopted.core.identity_namespace.eql(target));
+    const value = (try adopted.get(alloc, "doc:portable")) orelse return error.MissingAdoptedDocument;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"body\":\"portable\"}", value);
 }
 
 test "standalone validates effective Lite CLI and config settings" {

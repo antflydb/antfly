@@ -3864,6 +3864,8 @@ pub const BoundTableWriteSource = struct {
             const body = try readBackupFileAlloc(alloc, snapshot_root);
             defer alloc.free(body);
             try portable_backup.importPortable(alloc, self.db.core.store, body);
+            const target_identity = self.db.core.identity_namespace;
+            try self.db.reassignIdentityNamespaceForInternalTransition(target_identity);
             return;
         }
 

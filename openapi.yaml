@@ -2210,7 +2210,7 @@ paths:
       tags:
         - cluster_management
       description: >
-        List all configured secret names and their status (keystore, env var, or both).
+        List all configured secret names and their status (secret-store file, env var, or both).
 
         Never returns secret values — only names and configuration status.
       operationId: listSecrets
@@ -2247,7 +2247,7 @@ paths:
       tags:
         - cluster_management
       description: >
-        Store a secret in the keystore. Only available in standalone (single-node) mode.
+        Store a secret in the configured writable secret-store file. Only available in standalone mode.
 
         Returns 503 in multi-node mode.
       operationId: putSecret
@@ -2287,7 +2287,7 @@ paths:
       tags:
         - cluster_management
       description: >
-        Remove a secret from the keystore. Only available in standalone (single-node) mode.
+        Remove a secret from the configured writable secret-store file. Only available in standalone mode.
 
         Returns 503 in multi-node mode.
       operationId: deleteSecret
@@ -8577,7 +8577,7 @@ components:
     SecretStatus:
       type: string
       enum:
-        - configured_keystore
+        - configured_file
         - configured_env
         - configured_both
       description: Source of the secret configuration
@@ -8617,7 +8617,7 @@ components:
       properties:
         value:
           type: string
-          description: Secret value (stored encrypted, never returned)
+          description: Secret value (stored in the configured protected secret store and never returned)
     ByteRange:
       type: array
       items:
@@ -13583,7 +13583,7 @@ components:
           description: >
             Data source name (connection string) for the foreign database.
 
-            Supports `${secret:key_name}` references that resolve from the Antfly keystore
+            Supports `${secret:key_name}` references that resolve from the Antfly secret store
 
             or environment variables.
           example: ${secret:pg_dsn}
@@ -13640,7 +13640,7 @@ components:
           description: >
             Data source name (connection string) for the PostgreSQL database.
 
-            Supports `${secret:key_name}` references that resolve from the Antfly keystore
+            Supports `${secret:key_name}` references that resolve from the Antfly secret store
 
             or environment variables. Requires `wal_level=logical` on the source.
           example: ${secret:pg_dsn}
@@ -17745,18 +17745,17 @@ components:
           default: true
         access_key_id:
           type: string
-          description: AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID
-            environment variable if not set.
+          description: AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID
+            when not set.
           example: your-access-key-id
         secret_access_key:
           type: string
-          description: AWS secret access key. Supports keystore syntax for secret lookup. Falls back to
-            AWS_SECRET_ACCESS_KEY environment variable if not set.
+          description: AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY
+            when not set.
           example: your-secret-access-key
         session_token:
           type: string
-          description: Optional AWS session token for temporary credentials. Supports keystore syntax
-            for secret lookup.
+          description: Optional AWS session token for temporary credentials. Supports secret-store references.
           example: your-session-token
     FetchConfig:
       type: object

@@ -22,7 +22,7 @@ const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
 } else struct {};
 
 pub const SecretStatus = enum {
-    configured_keystore,
+    configured_file,
     configured_env,
     configured_both,
 };
@@ -862,7 +862,7 @@ fn describeStored(alloc: std.mem.Allocator, key: []const u8, stored: StoredSecre
     const has_env = hasEnvVar(env_var);
     return .{
         .key = try alloc.dupe(u8, key),
-        .status = if (has_env) .configured_both else .configured_keystore,
+        .status = if (has_env) .configured_both else .configured_file,
         .env_var = env_var,
         .created_at = if (stored.created_at_ns > 0) try formatTimestampOwned(alloc, stored.created_at_ns) else null,
         .updated_at = if (stored.updated_at_ns > 0) try formatTimestampOwned(alloc, stored.updated_at_ns) else null,
@@ -973,26 +973,44 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    var tmp_exists = false;
+    defer if (tmp_exists) deleteFileWithIo(io, tmp_path) catch {};
 
     {
-        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true, .exclusive = true });
+        tmp_exists = true;
         defer file.close(io);
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+            try file.setPermissions(io, @enumFromInt(0o600));
+        }
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(contents);
         try writer.end();
+        try file.sync(io);
     }
 
-    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
-        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
-        return err;
-    };
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    }
+    tmp_exists = false;
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
 }
 
 fn deleteFile(path: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    try std.Io.Dir.cwd().deleteFile(io_impl.io(), path);
+    try deleteFileWithIo(io_impl.io(), path);
+}
+
+fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
+    }
 }
 
 fn nowNs() u64 {
@@ -1021,8 +1039,14 @@ test "file secret store persists values and overlays env status" {
 
     var entry = try store.put(alloc, "openai.api_key", "abc123");
     defer entry.deinit(alloc);
-    try std.testing.expectEqual(SecretStatus.configured_keystore, entry.status);
+    try std.testing.expectEqual(SecretStatus.configured_file, entry.status);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", entry.env_var.?);
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+    }
 
     const stored = try store.getOwned(alloc, "openai.api_key");
     defer if (stored) |value| alloc.free(value);

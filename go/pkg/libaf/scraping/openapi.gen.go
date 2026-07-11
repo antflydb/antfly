@@ -45,7 +45,7 @@ type HTTPCredentialConfig struct {
 	// BaseUrl Base URL prefix this credential applies to.
 	BaseUrl string `json:"base_url,omitempty,omitzero"`
 
-	// Headers HTTP headers to include. Supports keystore syntax (e.g., "${secret:token}").
+	// Headers HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
 	Headers  map[string]string     `json:"headers,omitempty,omitzero"`
 	Security ContentSecurityConfig `json:"security,omitempty,omitzero"`
 }
@@ -71,7 +71,7 @@ type RemoteContentConfig struct {
 
 // S3CredentialConfig defines model for S3CredentialConfig.
 type S3CredentialConfig struct {
-	// AccessKeyId AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+	// AccessKeyId AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
 	AccessKeyId string `json:"access_key_id,omitempty,omitzero"`
 
 	// Buckets Glob patterns for bucket names this credential handles. When a URL matches a pattern, this credential is auto-selected.
@@ -80,11 +80,11 @@ type S3CredentialConfig struct {
 	// Endpoint S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
-	// SecretAccessKey AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+	// SecretAccessKey AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
 	SecretAccessKey string                `json:"secret_access_key,omitempty,omitzero"`
 	Security        ContentSecurityConfig `json:"security,omitempty,omitzero"`
 
-	// SessionToken Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+	// SessionToken Optional AWS session token for temporary credentials. Supports secret-store references.
 	SessionToken string `json:"session_token,omitempty,omitzero"`
 
 	// UseSsl Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
@@ -94,36 +94,36 @@ type S3CredentialConfig struct {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
+	"lVI+/TcAAP//iOGyn7QTAAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

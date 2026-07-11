@@ -1,0 +1,15 @@
+{
+  "deployment_mode": "standalone",
+  "storage": {
+    "engine": "local",
+    "local": { "base_dir": "antflydb" }
+  },
+  "log": { "level": "debug", "style": "terminal" },
+  "cors": {
+    "enabled": true,
+    "allowed_origins": ["*"],
+    "allowed_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    "allowed_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+    "max_age": 3600
+  }
+}

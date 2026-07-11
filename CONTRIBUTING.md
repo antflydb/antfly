@@ -211,11 +211,11 @@ Example configs live in `configs/`:
 
 | File | Description |
 |------|-------------|
-| `config-no-tls.yaml` | Local development without TLS |
-| `config-tls.yaml` | TLS-enabled configuration |
+| `config-no-tls.json` | Local development without TLS |
+| `config-tls.json` | TLS-enabled configuration |
 | `config-s3-example.json` | Serverless S3 storage with named connections and multi-bucket lanes |
 | `config-s3-minio-local.json` | Serverless object storage on local MinIO |
-| `config-secrets-example.yaml` | Secrets / keystore usage |
+| `config-secrets-example.json` | Secrets / keystore usage |
 
 ## Releasing
 

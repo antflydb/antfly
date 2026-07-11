@@ -163,8 +163,8 @@ session unchanged.
 - Raft, shard replication, horizontal scaling, and distributed role settings
   are invalid with Lite.
 - A Lite file contains database metadata, documents, indexes, schemas,
-  enrichments, and transactional state. Server identity/RBAC, encrypted
-  secrets, model files, and extension packages are deployment control-plane
+  enrichments, and transactional state. Server identity/RBAC, protected
+  secret-store files, model files, and extension packages are deployment control-plane
   state and are intentionally external. Moving a complete secured deployment
   requires both the `.aflite` file and its control-plane configuration.
 - Lite durability is controlled by `fsync`. High availability is a separate
@@ -181,8 +181,10 @@ Lite installs a scoped DB-open provider on the standalone backend runtime.
 Logical group paths become cached key and index namespaces inside the file, so
 the existing `/db/v1`, SQL, transaction, indexing, and inference code paths are
 reused unchanged. Prefix-bounded cursors prevent cross-table scans;
-per-namespace snapshots share unchanged document payloads and allow writes to
-merge only the affected table cache. A checkpointed namespace-head directory and
+per-namespace snapshots share unchanged document payloads. Cold write-only
+transactions do not materialize a table; small hot tables update their cache
+incrementally, while large hot tables invalidate it in constant time instead
+of rebuilding every live document. A checkpointed namespace-head directory and
 per-namespace document links make cold materialization proportional to the
 selected namespace's history. Missing namespace metadata fails closed as file
 corruption. Cached namespace runtimes avoid allocations and storage
@@ -202,8 +204,10 @@ The same routes exist for every engine and return `422` when unsupported. The
 status capability reports whether maintenance preserves request availability.
 Lite maintenance is currently coordinated but exclusive (`online: false`): the
 asynchronous job acquires the file maintenance gate and requests may wait until
-it completes. Vacuum retains live keys and source page references, streams one
+it completes. Vacuum retains live keys and source page references in a bounded
+working set, streams one
 value at a time into a durable replacement file, and atomically renames it; it
-does not allocate a second database-sized output image. Lite also keeps `lite
+fails explicitly if distinct-key metadata exceeds the bound and does not
+allocate a second database-sized output image. Lite also keeps `lite
 check`, `compact`, and `vacuum` for offline files. Backup and restore remain
 portable `/db/v1` operations rather than storage maintenance.

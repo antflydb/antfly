@@ -55,15 +55,13 @@ components:
             The first provider defined becomes the default when no provider name is specified.
 
             **Example:**
-            ```yaml
-            speech_to_text:
-              antfly-whisper:
-                provider: antfly
-                api_url: "http://localhost:8080"
-                model: openai/whisper-base
-              openai-whisper:
-                provider: openai
-                model: whisper-1
+            ```json
+            {
+              "speech_to_text": {
+                "antfly-whisper": { "provider": "antfly", "api_url": "http://localhost:8080", "model": "openai/whisper-base" },
+                "openai-whisper": { "provider": "openai", "model": "whisper-1" }
+              }
+            }
             ```
 
             Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
@@ -163,14 +161,12 @@ components:
 
             **API Key Configuration:**
 
-            API keys can be provided via the encrypted keystore (recommended) or environment variables:
+            API keys can be provided through a protected secret-store file or environment variables:
 
-            1. **Keystore** (recommended for production):
-               ```bash
-               antfly keystore create
-               antfly keystore add openai.api_key
-               ```
-               Then reference in config: `api_key: ${secret:openai.api_key}`
+            1. **Secret store** (recommended for production): mount a platform-managed
+               secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`.
+               Reference its values in JSON config as
+               `"api_key": "${secret:openai.api_key}"`.
 
             2. **Environment variable** (simpler for development):
                Omit `api_key` from config and set the appropriate env var:
@@ -182,15 +178,13 @@ components:
             See [Secrets Management](/docs/secrets) for complete documentation.
 
             **Example:**
-            ```yaml
-            embedders:
-              openai-small:
-                provider: openai
-                model: text-embedding-3-small
-              antfly-local:
-                provider: antfly
-                model: bge-base-en-v1.5
-                api_url: "http://localhost:8082"
+            ```json
+            {
+              "embedders": {
+                "openai-small": { "provider": "openai", "model": "text-embedding-3-small" },
+                "antfly-local": { "provider": "antfly", "model": "bge-base-en-v1.5", "api_url": "http://localhost:8082" }
+              }
+            }
             ```
           example:
             openai-small:
@@ -212,14 +206,12 @@ components:
 
             **API Key Configuration:**
 
-            API keys can be provided via the encrypted keystore (recommended) or environment variables:
+            API keys can be provided through a protected secret-store file or environment variables:
 
-            1. **Keystore** (recommended for production):
-               ```bash
-               antfly keystore create
-               antfly keystore add gemini.api_key
-               ```
-               Then reference in config: `api_key: ${secret:gemini.api_key}`
+            1. **Secret store** (recommended for production): mount a platform-managed
+               secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`.
+               Reference its values in JSON config as
+               `"api_key": "${secret:gemini.api_key}"`.
 
             2. **Environment variable** (simpler for development):
                Omit `api_key` from config and set the appropriate env var:
@@ -230,17 +222,14 @@ components:
             See [Secrets Management](/docs/secrets) for complete documentation.
 
             **Example:**
-            ```yaml
-            generators:
-              gemini-flash:
-                provider: gemini
-                model: gemini-2.5-flash
-              ollama-local:
-                provider: ollama
-                model: llama3
-              openai-gpt4:
-                provider: openai
-                model: gpt-4.1
+            ```json
+            {
+              "generators": {
+                "gemini-flash": { "provider": "gemini", "model": "gemini-2.5-flash" },
+                "ollama-local": { "provider": "ollama", "model": "llama3" },
+                "openai-gpt4": { "provider": "openai", "model": "gpt-4.1" }
+              }
+            }
             ```
           example:
             gemini-flash:
@@ -272,19 +261,19 @@ components:
             - `always`: Always try the next generator
 
             **Example:**
-            ```yaml
-            chains:
-              default:
-                - generator: gemini-flash  # Reference by name
-                  retry:
-                    max_attempts: 3
-                  condition: on_rate_limit
-                - generator: ollama-local  # Reference by name
-              with-inline:
-                - generator: gemini-flash
-                - generator_config:  # Inline config
-                    provider: anthropic
-                    model: claude-sonnet-4-5-20250929
+            ```json
+            {
+              "chains": {
+                "default": [
+                  { "generator": "gemini-flash", "retry": { "max_attempts": 3 }, "condition": "on_rate_limit" },
+                  { "generator": "ollama-local" }
+                ],
+                "with-inline": [
+                  { "generator": "gemini-flash" },
+                  { "generator_config": { "provider": "anthropic", "model": "claude-sonnet-4-5-20250929" } }
+                ]
+              }
+            }
             ```
 
             Then in API calls: `chain: "default"` or `chain: "with-inline"`
@@ -311,15 +300,13 @@ components:
             The first reranker defined becomes the default when no reranker name is specified.
 
             **Example:**
-            ```yaml
-            rerankers:
-              cohere-english:
-                provider: cohere
-                model: rerank-english-v3.0
-              antfly-local:
-                provider: antfly
-                model: mxbai-rerank-base-v1
-                url: "http://localhost:8080"
+            ```json
+            {
+              "rerankers": {
+                "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" },
+                "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" }
+              }
+            }
             ```
           example:
             cohere-english:
@@ -340,17 +327,13 @@ components:
             The first chunker defined becomes the default when no chunker name is specified.
 
             **Example:**
-            ```yaml
-            chunkers:
-              fixed-500:
-                provider: antfly
-                model: fixed
-                target_tokens: 500
-                overlap_tokens: 50
-              semantic:
-                provider: antfly
-                model: semantic-chunker
-                api_url: "http://localhost:8080"
+            ```json
+            {
+              "chunkers": {
+                "fixed-500": { "provider": "antfly", "model": "fixed", "target_tokens": 500, "overlap_tokens": 50 },
+                "semantic": { "provider": "antfly", "model": "semantic-chunker", "api_url": "http://localhost:8080" }
+              }
+            }
             ```
           example:
             fixed-500:

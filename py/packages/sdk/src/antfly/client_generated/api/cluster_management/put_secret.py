@@ -78,7 +78,7 @@ def sync_detailed(
 ) -> Response[Error | SecretEntry]:
     """Store a secret
 
-     Store a secret in the keystore. Only available in standalone (single-node) mode.
+     Store a secret in the configured writable secret-store file. Only available in standalone mode.
     Returns 503 in multi-node mode.
 
     Args:
@@ -113,7 +113,7 @@ def sync(
 ) -> Error | SecretEntry | None:
     """Store a secret
 
-     Store a secret in the keystore. Only available in standalone (single-node) mode.
+     Store a secret in the configured writable secret-store file. Only available in standalone mode.
     Returns 503 in multi-node mode.
 
     Args:
@@ -143,7 +143,7 @@ async def asyncio_detailed(
 ) -> Response[Error | SecretEntry]:
     """Store a secret
 
-     Store a secret in the keystore. Only available in standalone (single-node) mode.
+     Store a secret in the configured writable secret-store file. Only available in standalone mode.
     Returns 503 in multi-node mode.
 
     Args:
@@ -176,7 +176,7 @@ async def asyncio(
 ) -> Error | SecretEntry | None:
     """Store a secret
 
-     Store a secret in the keystore. Only available in standalone (single-node) mode.
+     Store a secret in the configured writable secret-store file. Only available in standalone mode.
     Returns 503 in multi-node mode.
 
     Args:

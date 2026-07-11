@@ -24,7 +24,7 @@ pub const ContentSecurityConfig = struct {
 pub const HTTPCredentialConfig = struct {
     /// Base URL prefix this credential applies to.
     base_url: ?[]const u8 = null,
-    /// HTTP headers to include. Supports keystore syntax (e.g., "${secret:token}").
+    /// HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
     headers: ?std.json.ArrayHashMap([]const u8) = null,
     /// Security overrides for this credential.
     security: ?ContentSecurityConfig = null,

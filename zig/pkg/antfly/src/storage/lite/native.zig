@@ -28,6 +28,8 @@ const Allocator = std.mem.Allocator;
 pub const magic = "AFLITE\x02N";
 pub const format_version: u32 = 1;
 pub const default_page_size: u32 = 4096;
+const vacuum_key_working_set_limit_bytes: usize = 256 * 1024 * 1024;
+const vacuum_key_entry_overhead: usize = 64;
 pub const header_size: usize = 4096;
 pub const checkpoint_slot_count = 2;
 pub const checkpoint_slot_size: usize = 64;
@@ -544,6 +546,7 @@ pub const NativeFile = struct {
     /// Integrity checks hold this so they verify on-disk state rather than
     /// cached copies.
     page_cache_bypass: std.atomic.Value(u32) = .init(0),
+    test_fail_vacuum_after_adoption: bool = false,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -1244,12 +1247,16 @@ pub const NativeFile = struct {
             refs.deinit(allocator);
         }
 
+        var working_set_bytes: usize = 0;
         var page_id = catalogRootPage(self.activeCheckpoint(), root);
         while (page_id != 0) {
             const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
             defer allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
             if (!seen.contains(entry.key)) {
+                working_set_bytes = std.math.add(usize, working_set_bytes, entry.key.len + vacuum_key_entry_overhead) catch
+                    return error.LiteVacuumWorkingSetExceeded;
+                if (working_set_bytes > vacuum_key_working_set_limit_bytes) return error.LiteVacuumWorkingSetExceeded;
                 try seen.ensureUnusedCapacity(allocator, 1);
                 const key = try allocator.dupe(u8, entry.key);
                 errdefer allocator.free(key);
@@ -1280,12 +1287,16 @@ pub const NativeFile = struct {
             refs.deinit(allocator);
         }
 
+        var working_set_bytes: usize = 0;
         var page_id = self.activeCheckpoint().document_root_page;
         while (page_id != 0) {
             const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
             defer allocator.free(payload);
             const entry = try decodeDocumentEntry(payload);
             if (!seen.contains(entry.key)) {
+                working_set_bytes = std.math.add(usize, working_set_bytes, entry.key.len + vacuum_key_entry_overhead) catch
+                    return error.LiteVacuumWorkingSetExceeded;
+                if (working_set_bytes > vacuum_key_working_set_limit_bytes) return error.LiteVacuumWorkingSetExceeded;
                 try seen.ensureUnusedCapacity(allocator, 1);
                 const key = try allocator.dupe(u8, entry.key);
                 errdefer allocator.free(key);
@@ -1892,12 +1903,7 @@ pub const NativeFile = struct {
         const after_size = next_page_id * @as(u64, self.header.page_size);
         try compact_file.setLength(io, after_size);
         if (!self.no_sync) try compact_file.sync(io);
-        compact_file.close(io);
-        compact_file_open = false;
-
-        try self.replaceOpenFileWithVacuumFile(tmp_path);
-        self.header = compact_header;
-        self.namespace_directory_cache_root = std.math.maxInt(u64);
+        try self.replaceOpenFileWithVacuumFile(tmp_path, compact_file, compact_header, &compact_file_open);
 
         return .{
             .before_size = before_size,
@@ -2703,22 +2709,37 @@ pub const NativeFile = struct {
     fn syncIfRequired(self: *NativeFile) !void {
         if (!self.no_sync) try self.file.sync(self.io_impl.io());
     }
-    fn replaceOpenFileWithVacuumFile(self: *NativeFile, tmp_path: []const u8) !void {
+    /// Publishes a fully synced vacuum file and adopts its already-open handle.
+    /// Once rename succeeds there are deliberately no fallible reopen steps:
+    /// even if the parent-directory sync reports an error, subsequent requests
+    /// continue on the same inode now reachable through `self.path` rather than
+    /// writing the unlinked pre-vacuum inode.
+    fn replaceOpenFileWithVacuumFile(
+        self: *NativeFile,
+        tmp_path: []const u8,
+        replacement_file: std.Io.File,
+        replacement_header: Header,
+        caller_owns_replacement: *bool,
+    ) !void {
         const io = self.io_impl.io();
         try renameFilePath(io, tmp_path, self.path);
+
+        const previous_file = self.file;
+        self.file = replacement_file;
+        caller_owns_replacement.* = false;
+        self.header = replacement_header;
+        self.namespace_directory_cache_root = std.math.maxInt(u64);
+        self.page_cache.clear(self.allocator);
+        previous_file.close(io);
+
+        if (self.test_fail_vacuum_after_adoption) {
+            self.test_fail_vacuum_after_adoption = false;
+            return error.InjectedVacuumPostRenameFailure;
+        }
+
         if (!self.no_sync) {
             try fs_paths.syncDirPortable(io, std.fs.path.dirname(self.path) orelse ".");
         }
-        errdefer {
-            if (openDataFile(io, self.path, .writer)) |reopened| {
-                self.file = reopened.file;
-            } else |_| {}
-        }
-
-        self.page_cache.clear(self.allocator);
-        const replacement = try openDataFile(io, self.path, .writer);
-        self.file.close(io);
-        self.file = replacement.file;
     }
 };
 
@@ -2957,9 +2978,9 @@ fn pathExists(io: std.Io, path: []const u8) bool {
 
 fn createSnapshotFile(io: std.Io, path: []const u8) !std.Io.File {
     if (std.fs.path.isAbsolute(path)) {
-        return try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        return try std.Io.Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = true });
     }
-    return try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    return try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
 }
 
 fn renameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
@@ -4962,6 +4983,36 @@ test "lite native vacuum atomically replaces file and keeps writer handle usable
     const after = (try reopened.getDocumentAlloc(allocator, "doc:after-vacuum")).?;
     defer allocator.free(after);
     try std.testing.expectEqualStrings("writer still attached", after);
+}
+
+test "lite native vacuum keeps adopted replacement usable after post rename failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-vacuum-post-rename-failure.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:live", "old");
+        try file.putDocument("doc:live", "new");
+        file.test_fail_vacuum_after_adoption = true;
+        try std.testing.expectError(error.InjectedVacuumPostRenameFailure, file.vacuum());
+
+        // The failure is reported, but the process must never continue on the
+        // unlinked pre-vacuum inode.
+        try file.putDocument("doc:after", "durable on adopted file");
+        const current = (try file.getDocumentAlloc(allocator, "doc:after")).?;
+        defer allocator.free(current);
+        try std.testing.expectEqualStrings("durable on adopted file", current);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const persisted = (try reopened.getDocumentAlloc(allocator, "doc:after")).?;
+    defer allocator.free(persisted);
+    try std.testing.expectEqualStrings("durable on adopted file", persisted);
 }
 
 test "lite native check validates committed free map root" {

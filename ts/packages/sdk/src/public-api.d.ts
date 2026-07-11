@@ -82,7 +82,7 @@ export interface paths {
         };
         /**
          * List secrets status
-         * @description List all configured secret names and their status (keystore, env var, or both).
+         * @description List all configured secret names and their status (secret-store file, env var, or both).
          *     Never returns secret values — only names and configuration status.
          */
         get: operations["listSecrets"];
@@ -107,14 +107,14 @@ export interface paths {
         get?: never;
         /**
          * Store a secret
-         * @description Store a secret in the keystore. Only available in standalone (single-node) mode.
+         * @description Store a secret in the configured writable secret-store file. Only available in standalone mode.
          *     Returns 503 in multi-node mode.
          */
         put: operations["putSecret"];
         post?: never;
         /**
          * Delete a secret
-         * @description Remove a secret from the keystore. Only available in standalone (single-node) mode.
+         * @description Remove a secret from the configured writable secret-store file. Only available in standalone mode.
          *     Returns 503 in multi-node mode.
          */
         delete: operations["deleteSecret"];
@@ -3523,7 +3523,7 @@ export interface components {
          * @description Source of the secret configuration
          * @enum {string}
          */
-        SecretStatus: "configured_keystore" | "configured_env" | "configured_both";
+        SecretStatus: "configured_file" | "configured_env" | "configured_both";
         SecretEntry: {
             /** @description Secret name (e.g., openai.api_key) */
             key: string;
@@ -3539,7 +3539,7 @@ export interface components {
             secrets: components["schemas"]["SecretEntry"][];
         };
         SecretWriteRequest: {
-            /** @description Secret value (stored encrypted, never returned) */
+            /** @description Secret value (stored in the configured protected secret store and never returned) */
             value: string;
         };
         ByteRange: string[];
@@ -6836,7 +6836,7 @@ export interface components {
             type: "postgres";
             /**
              * @description Data source name (connection string) for the foreign database.
-             *     Supports `${secret:key_name}` references that resolve from the Antfly keystore
+             *     Supports `${secret:key_name}` references that resolve from the Antfly secret store
              *     or environment variables.
              * @example ${secret:pg_dsn}
              */
@@ -6879,7 +6879,7 @@ export interface components {
             type: "postgres";
             /**
              * @description Data source name (connection string) for the PostgreSQL database.
-             *     Supports `${secret:key_name}` references that resolve from the Antfly keystore
+             *     Supports `${secret:key_name}` references that resolve from the Antfly secret store
              *     or environment variables. Requires `wal_level=logical` on the source.
              * @example ${secret:pg_dsn}
              */
@@ -9681,17 +9681,17 @@ export interface components {
              */
             use_ssl?: boolean;
             /**
-             * @description AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+             * @description AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
              * @example your-access-key-id
              */
             access_key_id?: string;
             /**
-             * @description AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+             * @description AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
              * @example your-secret-access-key
              */
             secret_access_key?: string;
             /**
-             * @description Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+             * @description Optional AWS session token for temporary credentials. Supports secret-store references.
              * @example your-session-token
              */
             session_token?: string;

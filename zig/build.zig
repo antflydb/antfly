@@ -3930,6 +3930,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "storage maintenance coordinator is idempotent and single flight",
             "storage maintenance snapshots remain valid after job pruning",
+            "storage maintenance append allocation failure does not wedge coordinator",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4750,6 +4751,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
+            "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone unified server lifecycle propagates startup failure",

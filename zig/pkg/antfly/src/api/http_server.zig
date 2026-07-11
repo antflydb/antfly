@@ -10164,7 +10164,7 @@ pub fn makeSecretList(alloc: std.mem.Allocator, listed: []const common_secrets.L
 
 fn mapSecretStatus(status: common_secrets.SecretStatus) metadata_openapi.SecretStatus {
     return switch (status) {
-        .configured_keystore => .configured_keystore,
+        .configured_file => .configured_file,
         .configured_env => .configured_env,
         .configured_both => .configured_both,
     };
@@ -14926,7 +14926,7 @@ test "api http server serves secrets crud when backed by a local store" {
     var put_entry = try std.json.parseFromSlice(metadata_openapi.SecretEntry, alloc, put_resp.body, .{});
     defer put_entry.deinit();
     try std.testing.expectEqualStrings("openai.api_key", put_entry.value.key);
-    try std.testing.expectEqual(metadata_openapi.SecretStatus.configured_keystore, put_entry.value.status);
+    try std.testing.expectEqual(metadata_openapi.SecretStatus.configured_file, put_entry.value.status);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", put_entry.value.env_var.?);
     try std.testing.expect(put_entry.value.created_at != null);
     try std.testing.expect(put_entry.value.updated_at != null);

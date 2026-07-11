@@ -1433,7 +1433,7 @@ pub const ForeignColumn = struct {
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
     type: []const u8,
-    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
+    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables.
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
     postgres_table: []const u8,
@@ -2185,7 +2185,7 @@ pub const ReplicationRoute = struct {
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
     type: []const u8,
-    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
+    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables. Requires `wal_level=logical` on the source.
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
@@ -2676,13 +2676,13 @@ pub const SecretList = struct {
 
 /// Source of the secret configuration
 pub const SecretStatus = enum {
-    configured_keystore,
+    configured_file,
     configured_env,
     configured_both,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .configured_keystore => "configured_keystore",
+            .configured_file => "configured_file",
             .configured_env => "configured_env",
             .configured_both => "configured_both",
         };
@@ -2695,7 +2695,7 @@ pub const SecretStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "configured_keystore", .configured_keystore },
+            .{ "configured_file", .configured_file },
             .{ "configured_env", .configured_env },
             .{ "configured_both", .configured_both },
         });
@@ -2710,7 +2710,7 @@ pub const SecretStoreStatus = struct {
 };
 
 pub const SecretWriteRequest = struct {
-    /// Secret value (stored encrypted, never returned)
+    /// Secret value (stored in the configured protected secret store and never returned)
     value: []const u8,
 };
 

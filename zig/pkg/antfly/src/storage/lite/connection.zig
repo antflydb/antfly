@@ -16,6 +16,7 @@ const std = @import("std");
 
 const backend = @import("backend.zig");
 const db_mod = @import("../db/db.zig");
+const group_ids = @import("../../common/group_ids.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -67,7 +68,10 @@ pub const Connection = struct {
         });
         errdefer lite_backend.deinit();
 
-        return try openWithBackend(allocator, path, .writer, &lite_backend);
+        var connection = try openWithBackend(allocator, path, .writer, &lite_backend);
+        errdefer connection.close();
+        try connection.backend.markEmbeddedArtifact();
+        return connection;
     }
 
     pub fn close(self: *Connection) void {
@@ -81,6 +85,20 @@ pub const Connection = struct {
     }
 };
 
+/// Embedded Lite's root is the future standalone `default` table. Assigning
+/// that deterministic identity at file creation avoids an O(live documents)
+/// namespace rewrite when the artifact is first served through `/db/v1`.
+pub fn embeddedRootIdentity() db_mod.DocIdentityNamespace {
+    const table_name = "default";
+    const table_id = std.hash.Wyhash.hash(0x54424c45, table_name);
+    const group_id = group_ids.dataGroupIdFromHash(std.hash.Wyhash.hash(0x47525031, table_name));
+    return .{
+        .table_id = if (table_id == 0) 1 else table_id,
+        .shard_id = group_id,
+        .range_id = group_id,
+    };
+}
+
 fn openWithBackend(
     allocator: Allocator,
     path: []const u8,
@@ -90,6 +108,7 @@ fn openWithBackend(
     var opts = db_mod.OpenOptions{
         .open_mode = open_mode,
         .external_derived_checkpoints = false,
+        .identity_namespace = embeddedRootIdentity(),
     };
     try lite_backend.configureDbOpenOptions(&opts);
 

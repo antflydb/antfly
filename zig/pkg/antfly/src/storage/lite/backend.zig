@@ -30,6 +30,10 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const Allocator = std.mem.Allocator;
 const native_index_base_path = "__antfly_lite";
 const native_index_layout = "native_index_catalog_pages";
+const root_namespace_alias_catalog_key = "system/lite-root-namespace-alias";
+const artifact_profile_catalog_key = "system/lite-artifact-profile";
+const embedded_artifact_profile = "embedded-v1";
+const standalone_artifact_profile = "standalone-v1";
 
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
@@ -148,6 +152,7 @@ pub const Handle = struct {
     native_runtime_store: ?*backend_erased.Store = null,
     namespace_mutex: std.atomic.Mutex = .unlocked,
     namespace_runtimes: std.ArrayListUnmanaged(NamespaceRuntime) = .empty,
+    root_namespace_alias: ?[]u8 = null,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
@@ -203,6 +208,7 @@ pub const Handle = struct {
             .native_single_file => {
                 for (self.namespace_runtimes.items) |*runtime| runtime.deinit(self.allocator);
                 self.namespace_runtimes.deinit(self.allocator);
+                if (self.root_namespace_alias) |alias| self.allocator.free(alias);
                 if (self.native_index_storage) |storage| {
                     self.allocator.destroy(storage);
                     self.native_index_storage = null;
@@ -274,22 +280,32 @@ pub const Handle = struct {
         platform_sync.lockYielding(&self.namespace_mutex);
         defer self.namespace_mutex.unlock();
 
+        const canonical_namespace = try canonicalDbNamespaceAlloc(self.allocator, namespace);
+        defer self.allocator.free(canonical_namespace);
+
         var selected: ?*NamespaceRuntime = null;
         for (self.namespace_runtimes.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, namespace)) {
+            if (std.mem.eql(u8, entry.name, canonical_namespace)) {
                 selected = entry;
                 break;
             }
         }
         if (selected == null) {
-            const name = try self.allocator.dupe(u8, namespace);
+            const name = try self.allocator.dupe(u8, canonical_namespace);
             errdefer self.allocator.free(name);
-            const key_prefix = try std.mem.concat(self.allocator, u8, &.{ "\x02db/", namespace, "\x00" });
+            const root_alias = if (self.root_namespace_alias) |alias| std.mem.eql(u8, alias, canonical_namespace) else false;
+            const key_prefix = if (root_alias)
+                try self.allocator.dupe(u8, "")
+            else
+                try std.mem.concat(self.allocator, u8, &.{ "\x02db/", canonical_namespace, "\x00" });
             errdefer self.allocator.free(key_prefix);
             var namespace_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(namespace, &namespace_digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(canonical_namespace, &namespace_digest, .{});
             const namespace_hex = std.fmt.bytesToHex(namespace_digest, .lower);
-            const index_base_path = try std.fmt.allocPrint(self.allocator, "{s}/tables/{s}", .{ native_index_base_path, namespace_hex });
+            const index_base_path = if (root_alias)
+                try self.allocator.dupe(u8, native_index_base_path)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/tables/{s}", .{ native_index_base_path, namespace_hex });
             errdefer self.allocator.free(index_base_path);
             const runtime_store = try self.allocator.create(backend_erased.Store);
             errdefer self.allocator.destroy(runtime_store);
@@ -327,6 +343,65 @@ pub const Handle = struct {
         opts.external_derived_checkpoints = false;
     }
 
+    /// Permanently maps an existing embedded root database to a standalone
+    /// table namespace. The alias is stored in the `.aflite` catalog, so moving
+    /// the file or changing the standalone data directory cannot orphan data.
+    pub fn adoptEmbeddedRootAsNamespace(self: *Handle, namespace: []const u8) !void {
+        if (self.engine != .native_single_file) return error.InvalidArgument;
+        const canonical = try canonicalDbNamespaceAlloc(self.allocator, namespace);
+        errdefer self.allocator.free(canonical);
+        platform_sync.lockYielding(&self.namespace_mutex);
+        defer self.namespace_mutex.unlock();
+        if (self.root_namespace_alias) |existing| {
+            if (!std.mem.eql(u8, existing, canonical)) return error.LiteRootNamespaceAlreadyAdopted;
+            self.allocator.free(canonical);
+            return;
+        }
+        try self.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
+        self.root_namespace_alias = canonical;
+    }
+
+    pub fn embeddedRootHasUserDocuments(self: *Handle) !bool {
+        if (self.engine != .native_single_file) return false;
+        const docs = try self.native_docstore.?.file.snapshotDocumentsAlloc(self.allocator);
+        defer native.NativeFile.freeSnapshotDocuments(self.allocator, docs);
+        for (docs) |doc| {
+            if (!std.mem.startsWith(u8, doc.key, "\x02db/")) return true;
+        }
+        return false;
+    }
+
+    pub fn markEmbeddedArtifact(self: *Handle) !void {
+        if (self.engine != .native_single_file) return error.InvalidArgument;
+        if (try self.isEmbeddedArtifact()) return;
+        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
+    }
+
+    pub fn isEmbeddedArtifact(self: *const Handle) !bool {
+        return try self.artifactHasProfile(embedded_artifact_profile);
+    }
+
+    pub fn markStandaloneArtifact(self: *Handle) !void {
+        if (self.engine != .native_single_file) return error.InvalidArgument;
+        if (try self.isStandaloneArtifact()) return;
+        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
+    }
+
+    pub fn isStandaloneArtifact(self: *const Handle) !bool {
+        return try self.artifactHasProfile(standalone_artifact_profile);
+    }
+
+    fn artifactHasProfile(self: *const Handle, expected: []const u8) !bool {
+        if (self.engine != .native_single_file) return false;
+        const value = (try self.native_docstore.?.file.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
+        defer self.allocator.free(value);
+        return std.mem.eql(u8, value, expected);
+    }
+
+    pub fn hasStandaloneRootAdoption(self: *const Handle) bool {
+        return self.root_namespace_alias != null;
+    }
+
     /// Installs this file as the storage provider for DBs opened by a composed
     /// server runtime. The logical DB path is a stable namespace within the
     /// file; repeated opens reuse the cached runtime and index storage objects.
@@ -345,10 +420,12 @@ pub const Handle = struct {
     pub fn runtimeStoreForNamespace(self: *Handle, namespace: []const u8) !*backend_erased.Store {
         var opts: db_mod.OpenOptions = .{};
         try self.configureDbOpenOptionsForNamespace(&opts, namespace);
+        const canonical_namespace = try canonicalDbNamespaceAlloc(self.allocator, namespace);
+        defer self.allocator.free(canonical_namespace);
         platform_sync.lockYielding(&self.namespace_mutex);
         defer self.namespace_mutex.unlock();
         for (self.namespace_runtimes.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, namespace)) return entry.runtime_store;
+            if (std.mem.eql(u8, entry.name, canonical_namespace)) return entry.runtime_store;
         }
         unreachable;
     }
@@ -557,14 +634,57 @@ fn initNativeSingleFile(
     runtime_store.* = try store.runtimeStore(allocator);
     errdefer runtime_store.deinit();
 
+    const artifact_profile = try store.file.getCatalogRecordAlloc(allocator, artifact_profile_catalog_key);
+    defer if (artifact_profile) |profile| allocator.free(profile);
+    if (artifact_profile) |profile| {
+        if (!std.mem.eql(u8, profile, embedded_artifact_profile) and
+            !std.mem.eql(u8, profile, standalone_artifact_profile))
+        {
+            return error.InvalidLiteArtifactProfile;
+        }
+    }
+    const root_namespace_alias = try store.file.getCatalogRecordAlloc(allocator, root_namespace_alias_catalog_key);
+    errdefer if (root_namespace_alias) |alias| allocator.free(alias);
+    if (root_namespace_alias) |alias| {
+        if (!isStableGroupNamespace(alias)) return error.InvalidLiteRootNamespaceAlias;
+    }
     return .{
         .allocator = allocator,
         .engine = .native_single_file,
         .native_docstore = store,
         .native_index_storage = native_index_storage,
         .native_runtime_store = runtime_store,
+        .root_namespace_alias = root_namespace_alias,
         .owned_resource_manager = owned_resource_manager,
     };
+}
+
+fn canonicalDbNamespaceAlloc(allocator: Allocator, namespace: []const u8) ![]u8 {
+    const table_suffix = "/table-db";
+    if (std.mem.endsWith(u8, namespace, table_suffix)) {
+        const before_table = namespace[0 .. namespace.len - table_suffix.len];
+        const component_start = if (std.mem.lastIndexOfScalar(u8, before_table, '/')) |index| index + 1 else 0;
+        const group_component = before_table[component_start..];
+        if (std.mem.startsWith(u8, group_component, "group-") and group_component.len > "group-".len) {
+            _ = std.fmt.parseUnsigned(u64, group_component["group-".len..], 10) catch return error.InvalidArgument;
+            return try std.fmt.allocPrint(allocator, "{s}{s}", .{ group_component, table_suffix });
+        }
+    }
+    return try allocator.dupe(u8, namespace);
+}
+
+fn isStableGroupNamespace(namespace: []const u8) bool {
+    const table_suffix = "/table-db";
+    if (!std.mem.endsWith(u8, namespace, table_suffix)) return false;
+    const group_component = namespace[0 .. namespace.len - table_suffix.len];
+    if (std.mem.indexOfScalar(u8, group_component, '/') != null or
+        !std.mem.startsWith(u8, group_component, "group-") or
+        group_component.len == "group-".len)
+    {
+        return false;
+    }
+    _ = std.fmt.parseUnsigned(u64, group_component["group-".len..], 10) catch return false;
+    return true;
 }
 
 fn toCheckReport(report: bridge.ContainerStorage.CheckReport) CheckReport {
@@ -1208,6 +1328,82 @@ test "lite backend namespaced db options isolate tables in one file" {
     try std.testing.expectEqualStrings("{\"table\":\"a\"}", value_a);
     try std.testing.expectEqualStrings("{\"table\":\"b\"}", value_b);
     try std.testing.expect(!std.mem.eql(u8, opts_a.index_base_path.?, opts_b.index_base_path.?));
+}
+
+test "lite backend adopts embedded root into a move-stable standalone namespace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "embedded-standalone.aflite");
+    defer allocator.free(path);
+
+    // Model data produced by `antfly lite batch` in the embedded root.
+    {
+        var handle = try Handle.create(allocator, path, true);
+        defer handle.deinit();
+        try handle.markEmbeddedArtifact();
+        var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+        try handle.configureDbOpenOptions(&opts);
+        var db = try db_mod.DB.open(allocator, path, opts);
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:portable", .value = "{\"source\":\"embedded\"}" }}, .sync_level = .write });
+    }
+
+    // The first standalone serve persists the logical table alias before it
+    // exposes catalog metadata.
+    {
+        var handle = try Handle.open(allocator, path, .{});
+        defer handle.deinit();
+        try std.testing.expect(try handle.isEmbeddedArtifact());
+        try handle.adoptEmbeddedRootAsNamespace("/var/lib/antfly/group-42/table-db");
+        var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+        try handle.configureDbOpenOptionsForNamespace(&opts, "/different/root/group-42/table-db");
+        try std.testing.expectEqualStrings(native_index_base_path, opts.index_base_path.?);
+        var db = try db_mod.DB.open(allocator, "group-42/table-db", opts);
+        defer db.close();
+        const value = (try db.get(allocator, "doc:portable")) orelse return error.MissingAdoptedEmbeddedDocument;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("{\"source\":\"embedded\"}", value);
+    }
+
+    // Reopen after a file move/data-directory change resolves the same stable
+    // group namespace from the artifact catalog rather than the host path.
+    {
+        var handle = try Handle.open(allocator, path, .{ .read_only = true });
+        defer handle.deinit();
+        try std.testing.expect(handle.hasStandaloneRootAdoption());
+        var opts = db_mod.OpenOptions{ .open_mode = .query_readonly, .start_index_workers = false, .start_optional_runtimes = false };
+        try handle.configureDbOpenOptionsForNamespace(&opts, "/mnt/restored/group-42/table-db");
+        var db = try db_mod.DB.open(allocator, "group-42/table-db", opts);
+        defer db.close();
+        const value = (try db.get(allocator, "doc:portable")) orelse return error.MissingReopenedAdoptedDocument;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("{\"source\":\"embedded\"}", value);
+    }
+}
+
+test "lite backend fails closed on unknown artifact profile and invalid root alias" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const profile_path = try testPath(allocator, tmp, "invalid-profile.aflite");
+    defer allocator.free(profile_path);
+    {
+        var handle = try Handle.create(allocator, profile_path, true);
+        try handle.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, "future-unknown-profile");
+        handle.deinit();
+    }
+    try std.testing.expectError(error.InvalidLiteArtifactProfile, Handle.open(allocator, profile_path, .{}));
+
+    const alias_path = try testPath(allocator, tmp, "invalid-alias.aflite");
+    defer allocator.free(alias_path);
+    {
+        var handle = try Handle.create(allocator, alias_path, true);
+        try handle.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, "/host/path/group-1/table-db");
+        handle.deinit();
+    }
+    try std.testing.expectError(error.InvalidLiteRootNamespaceAlias, Handle.open(allocator, alias_path, .{}));
 }
 
 test "lite backend native open requires an existing file" {

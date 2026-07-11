@@ -80,7 +80,7 @@ components:
           description: Base URL prefix this credential applies to.
         headers:
           type: object
-          description: HTTP headers to include. Supports keystore syntax (e.g., "${secret:token}").
+          description: HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
           additionalProperties:
             type: string
         security:

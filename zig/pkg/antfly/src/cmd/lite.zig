@@ -152,6 +152,16 @@ fn status(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     writeJsonLine(io, json);
 }
 
+fn openEmbeddedDataSurface(allocator: Allocator, path: []const u8, mode: db_mod.OpenOptions.OpenMode) !LiteDb {
+    var lite = try LiteDb.open(allocator, path, mode);
+    errdefer lite.close();
+    if (try lite.backend.isStandaloneArtifact() and !lite.backend.hasStandaloneRootAdoption()) {
+        std.debug.print("error: this Lite artifact contains standalone table namespaces; use antfly lite serve and the /db/v1 API\n", .{});
+        return error.StandaloneLiteRequiresApi;
+    }
+    return lite;
+}
+
 fn batch(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
@@ -160,7 +170,7 @@ fn batch(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     const json = try batchJson(allocator, &lite.db, body);
@@ -196,7 +206,7 @@ fn lookup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
         try allocator.dupe(u8, "");
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    var lite = try openEmbeddedDataSurface(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try lookupJson(allocator, &lite.db, resolved_key, body);
@@ -212,7 +222,7 @@ fn scan(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !voi
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    var lite = try openEmbeddedDataSurface(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try scanJson(allocator, &lite.db, body);
@@ -228,7 +238,7 @@ fn query(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    var lite = try openEmbeddedDataSurface(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try searchJson(allocator, &lite.db, body);
@@ -249,7 +259,7 @@ fn indexList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .status_only);
+    var lite = try openEmbeddedDataSurface(allocator, path, .status_only);
     defer lite.close();
 
     const configs = try lite.db.listIndexes(allocator);
@@ -275,7 +285,7 @@ fn indexCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterato
     defer parsed.deinit();
     parsed.value.coverage_generation = 0;
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.addIndex(parsed.value);
@@ -289,7 +299,7 @@ fn indexDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     try requireAflitePath(path);
     const name = parseNameFlag(args, "--index");
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     const removed = try lite.db.deleteIndex(name);
@@ -311,7 +321,7 @@ fn enrichmentList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .status_only);
+    var lite = try openEmbeddedDataSurface(allocator, path, .status_only);
     defer lite.close();
 
     const configs = try lite.db.listEnrichments(allocator);
@@ -334,7 +344,7 @@ fn enrichmentCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.It
     });
     defer parsed.deinit();
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.addEnrichment(parsed.value);
@@ -362,7 +372,7 @@ fn enrichmentDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
     const resolved_kind = kind orelse cli.fatal("--kind is required", .{});
     const resolved_name = name orelse cli.fatal("--name is required", .{});
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     const removed = try lite.db.deleteEnrichment(resolved_kind, resolved_name);
@@ -383,7 +393,7 @@ fn schemaGet(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .status_only);
+    var lite = try openEmbeddedDataSurface(allocator, path, .status_only);
     defer lite.close();
 
     const schema_json = try lite.db.getSchemaJson(allocator);
@@ -403,7 +413,7 @@ fn schemaSet(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.setSchemaJson(allocator, body);
@@ -415,7 +425,7 @@ fn runUntilIdle(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.maintenanceDriver().runUntilIdle();
@@ -432,6 +442,10 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
 
     var lite = try LiteDb.open(allocator, path, .query_readonly);
     defer lite.close();
+    ensureOfflinePortableBackupSupported(&lite) catch |err| {
+        std.debug.print("error: standalone Lite databases must use the authenticated /db/v1 backup API; use 'antfly lite snapshot' for a complete physical copy\n", .{});
+        return err;
+    };
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -442,6 +456,16 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     cli.writeStdout(io, "{\"format\":\"afb\",\"path\":");
     try writeJsonString(allocator, io, out_path);
     cli.writeStdout(io, "}\n");
+}
+
+fn ensureOfflinePortableBackupSupported(lite: *const LiteDb) !void {
+    if (lite.backend.hasStandaloneRootAdoption() or try lite.backend.isStandaloneArtifact()) {
+        return error.StandaloneLitePortableBackupRequiresApi;
+    }
+}
+
+fn ensureOfflineRootOnlyOperationSupported(lite: *const LiteDb) !void {
+    if (try lite.backend.isStandaloneArtifact()) return error.StandaloneLiteRequiresApi;
 }
 
 const SnapshotOptions = struct {
@@ -576,6 +600,7 @@ fn importPortableIntoExistingLite(
     {
         var lite = try LiteDb.open(allocator, target_path, .status_only);
         defer lite.close();
+        try ensureOfflineRootOnlyOperationSupported(&lite);
         if (!(try lite_restore_staging.isImportTargetEmpty(allocator, &lite.db))) {
             return error.LiteImportTargetNotEmpty;
         }
@@ -705,6 +730,12 @@ fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
 
+    {
+        var lite = try LiteDb.open(allocator, path, .status_only);
+        defer lite.close();
+        try ensureOfflineRootOnlyOperationSupported(&lite);
+    }
+
     const opts = parsePromoteOptions(allocator, path, args) catch cli.fatal("invalid promote arguments", .{});
     defer {
         var owned_opts = opts;
@@ -826,6 +857,7 @@ fn compact(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     {
         var lite = try LiteDb.open(allocator, path, .writer);
         defer lite.close();
+        try ensureOfflineRootOnlyOperationSupported(&lite);
         try prepareCompactLite(&lite);
     }
 
@@ -1747,7 +1779,10 @@ test "lite export subcommand dispatches portable backup alias" {
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    try dispatchSubcommand(allocator, io, "antfly lite", "export", &args);
+    var init: std.process.Init = undefined;
+    init.gpa = allocator;
+    init.io = io;
+    try dispatchSubcommand(init, "antfly lite", "export", &args);
 
     const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
     defer allocator.free(body);
@@ -2308,6 +2343,42 @@ test "lite snapshot rejects same existing aflite through different path spelling
     const json = try lookupJson(allocator, &reopened.db, "doc:self-snapshot", "");
     defer allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"self snapshot rejected\"") != null);
+}
+
+test "lite offline portable backup rejects standalone-adopted artifacts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/adopted-backup.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var lite = try LiteDb.create(allocator, path, true);
+    defer lite.close();
+    try ensureOfflinePortableBackupSupported(&lite);
+    try ensureOfflineRootOnlyOperationSupported(&lite);
+    try lite.backend.adoptEmbeddedRootAsNamespace("group-42/table-db");
+    try std.testing.expectError(
+        error.StandaloneLitePortableBackupRequiresApi,
+        ensureOfflinePortableBackupSupported(&lite),
+    );
+
+    // Fresh standalone artifacts without an adopted embedded root must also
+    // reject the root-only offline archive path.
+    var fresh_tmp = std.testing.tmpDir(.{});
+    defer fresh_tmp.cleanup();
+    const fresh_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/standalone-backup.aflite", .{fresh_tmp.sub_path});
+    defer allocator.free(fresh_path);
+    var fresh = try LiteDb.create(allocator, fresh_path, true);
+    defer fresh.close();
+    try fresh.backend.markStandaloneArtifact();
+    try std.testing.expectError(
+        error.StandaloneLitePortableBackupRequiresApi,
+        ensureOfflinePortableBackupSupported(&fresh),
+    );
+    try std.testing.expectError(
+        error.StandaloneLiteRequiresApi,
+        ensureOfflineRootOnlyOperationSupported(&fresh),
+    );
 }
 
 test "lite restore malformed backup leaves target untouched" {

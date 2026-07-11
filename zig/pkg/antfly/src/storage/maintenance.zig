@@ -157,10 +157,13 @@ pub const Coordinator = struct {
             .created_at_ms = nowMs(),
         };
         errdefer if (job.idempotency_key) |key| self.allocator.free(key);
-        self.next_job_id +|= 1;
-        self.active_job_id = job.id;
         try self.jobs.append(self.allocator, job);
         errdefer _ = self.jobs.pop();
+        // Publish coordinator state only after every allocation needed to own
+        // the queued job has succeeded. In particular, an OOM growing `jobs`
+        // must not leave the coordinator permanently busy.
+        self.next_job_id +|= 1;
+        self.active_job_id = job.id;
         job.thread = std.Thread.spawn(.{}, runJob, .{ self, job }) catch |err| {
             self.active_job_id = null;
             return err;
@@ -310,4 +313,32 @@ test "storage maintenance snapshots remain valid after job pruning" {
     }
     try std.testing.expect(coordinator.get(first.job_id) == null);
     try std.testing.expectEqualStrings("InjectedMaintenanceFailure", retained.error_name.?);
+}
+
+test "storage maintenance append allocation failure does not wedge coordinator" {
+    const Fake = struct {
+        fn source(self: *@This()) Source {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
+        }
+        fn status(_: *anyopaque) Status {
+            return .{ .engine = "fake", .maintenance = .{ .check = true } };
+        }
+        fn run(_: *anyopaque, _: Operation) anyerror!Result {
+            return .{ .valid = true };
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var fake = Fake{};
+    var coordinator = Coordinator.init(failing.allocator(), fake.source());
+    defer coordinator.deinit();
+
+    // Job allocation succeeds; growing the job list fails.
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, coordinator.start(.check, null));
+    try std.testing.expectEqual(@as(?u64, null), coordinator.active_job_id);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const started = try coordinator.start(.check, null);
+    while (coordinator.get(started.job_id).?.state != .succeeded) std.Thread.yield() catch {};
 }

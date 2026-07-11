@@ -71,10 +71,11 @@ The implementation now consists of:
   path. Missing directory or namespace-link metadata is treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Snapshot
-  caches are maintained per namespace: commits merge the affected table's
-  sorted mutations with its live view, retain unchanged payload allocations by
-  reference, and leave disjoint table caches hot. This avoids copying and
-  sorting all live document bytes for a small write.
+  caches are maintained per namespace and charged to the shared resource
+  governor. Cold write-only transactions do not materialize live documents;
+  commits incrementally merge small hot snapshots and invalidate large hot
+  snapshots in constant time. Readers rebuild on demand and fail explicitly
+  when the configured snapshot budget cannot be reserved.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
 - `storage/lite/backend.zig` caches one runtime per logical table/group and
@@ -153,6 +154,24 @@ define a storage-specific HTTP namespace. The convenience command binds only
 to loopback hosts; use the canonical standalone command for an explicitly
 configured production listener.
 
+An artifact first created through embedded commands has one root database. On
+its first standalone start, Antfly atomically adopts that root as the
+standalone `default` table: it persists a stable `group-<id>/table-db` alias in
+the file before publishing table metadata. The alias deliberately omits the
+host data-directory prefix, so moving or restoring the `.aflite` file cannot
+orphan its documents or indexes. Embedded root databases use the deterministic
+document-identity namespace of that future `default` table from creation, so
+adoption is O(1) rather than rewriting every live document; an identity mismatch
+fails closed. Subsequent standalone tables use isolated
+namespaces in the same artifact. This makes `lite batch` followed by `lite
+serve` a genuine interoperability path rather than two unrelated databases.
+After that adoption, embedded data commands continue to address the `default`
+table through the persisted alias. A file created directly by standalone has
+no unambiguous root table, so root-oriented `lite batch`, query, schema, index,
+enrichment, import, promote, and compact operations fail closed and direct the
+user to `lite serve` plus `/db/v1`. Artifact `status` and the physical `check`,
+`vacuum`, and `snapshot` operations remain available.
+
 The equivalent tagged configuration is:
 
 ```json
@@ -179,6 +198,13 @@ Portable backup and restore remain normal `/db/v1` operations. A physical
 `.aflite` copy is a stable snapshot, not the portable archival contract; `.afb`
 remains the cross-engine backup format.
 
+Once an artifact has been opened by standalone, the offline `antfly lite
+backup` command refuses to emit a misleading root-only archive. Use the
+authenticated `/db/v1` backup operation for a portable all-table archive, or
+`antfly lite snapshot` for a complete physical copy of the artifact. An
+offline physical snapshot includes metadata, every table namespace, indexes,
+and durable transaction sessions.
+
 Coordinated maintenance is an authenticated, storage-neutral admin surface:
 
 ```text
@@ -203,11 +229,13 @@ availability contract avoids calling a stop-the-world file rewrite "online".
 Checkpoint inspection, index writes, document commits, compaction, and vacuum
 share the Lite store mutex and single-writer reservation, so maintenance cannot
 race checkpoint publication or file replacement. Vacuum keeps only live keys
-and source page references in its working set, reads one live value at a time,
+and source page references in a bounded working set, reads one live value at a time,
 and streams compact pages to the replacement file. It therefore avoids a
 second whole-database value snapshot and a whole-file output image in memory;
-the replacement is fsynced and atomically renamed before the parent directory
-is fsynced.
+the replacement is fsynced, atomically renamed, and adopted through its
+already-open read/write handle before the parent directory is fsynced. A
+post-rename sync error therefore cannot leave the process writing an unlinked
+old inode.
 
 The standalone listener holds an advisory lease for its host/port while using
 restart-safe address reuse. Cross-thread shutdown only publishes an atomic stop

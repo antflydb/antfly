@@ -569,17 +569,9 @@ test "restore input plan stages aflite as portable table restore" {
     ;
 
     {
-        var backend = try antfly.lite.backend.Handle.create(allocator, src_path, true);
-        defer backend.deinit();
-
-        var opts = antfly.db.OpenOptions{
-            .open_mode = .writer,
-            .external_derived_checkpoints = false,
-        };
-        try backend.configureDbOpenOptions(&opts);
-
-        var db = try antfly.db.DB.open(allocator, src_path, opts);
-        defer db.close();
+        var lite = try antfly.lite.connection.Connection.create(allocator, src_path, true);
+        defer lite.close();
+        const db = &lite.db;
         try db.setSchemaJson(allocator, schema_json);
         try db.addEnrichment(.{
             .name = "restore_input_chunks_v1",

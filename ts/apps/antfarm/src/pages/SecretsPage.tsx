@@ -44,7 +44,7 @@ import { useApiConfig } from "../hooks/use-api-config";
 
 interface SecretEntry {
   key: string;
-  status: "configured_keystore" | "configured_env" | "configured_both";
+  status: "configured_file" | "configured_env" | "configured_both";
   env_var?: string;
   created_at?: string;
   updated_at?: string;
@@ -64,7 +64,7 @@ const COMMON_SECRETS = [
 
 function statusBadge(status: SecretEntry["status"]) {
   switch (status) {
-    case "configured_keystore":
+    case "configured_file":
       return <Badge className="af-status-badge-success">Keystore</Badge>;
     case "configured_env":
       return <Badge className="af-status-badge-info">Env Var</Badge>;
@@ -253,7 +253,7 @@ export function SecretsPage() {
         id: "actions",
         header: "",
         cell: ({ row }) =>
-          row.original.status === "configured_keystore" ||
+          row.original.status === "configured_file" ||
           row.original.status === "configured_both" ? (
             <div className="text-right">
               <Button
