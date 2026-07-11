@@ -57,6 +57,28 @@ pub const LoopResult = struct {
     next_lsn: u64,
 };
 
+pub const FetchedBatch = struct {
+    alloc: Allocator,
+    identity: standby_mod.Identity,
+    requested_lsn: u64,
+    frames: []VerifiedFrame,
+    current_lsn: u64,
+    last_sent_lsn: u64,
+    next_lsn: u64,
+    end_of_wal: bool,
+
+    pub fn deinit(self: *FetchedBatch) void {
+        freeVerifiedFrames(self.alloc, self.frames);
+        self.* = undefined;
+    }
+};
+
+pub const AppliedBatch = struct {
+    received_count: usize,
+    applied_count: usize,
+    progress: standby_mod.Progress,
+};
+
 pub const Client = struct {
     alloc: Allocator,
     executor: http_common.RequestExecutor,
@@ -139,10 +161,82 @@ pub const Client = struct {
         base_uri: []const u8,
         standby: *const standby_mod.Standby,
     ) !void {
+        return try self.verifyCompatibleUpstreamIdentity(base_uri, standby.identity);
+    }
+
+    pub fn verifyCompatibleUpstreamIdentity(
+        self: *Client,
+        base_uri: []const u8,
+        identity: standby_mod.Identity,
+    ) !void {
         const identified = try self.identifySystem(base_uri);
-        try verifyIdentity(identified.identity, standby.identity);
+        try verifyIdentity(identified.identity, identity);
         const format_version = try positiveUint64FromJson(identified.record_format_version);
         if (format_version != replication_record.format_version) return error.UnsupportedReplicationFormat;
+    }
+
+    pub fn fetchAvailable(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+        identity: standby_mod.Identity,
+        requested_lsn: u64,
+        options: ReplicateOptions,
+    ) !FetchedBatch {
+        try validateSlotName(slot_name);
+        if (options.verify_upstream) {
+            try self.verifyCompatibleUpstreamIdentity(base_uri, identity);
+        }
+        var response = try self.startReplication(base_uri, slot_name, requested_lsn, options);
+        defer response.deinit();
+        try verifyStartReplicationResponse(response.parsed.value, slot_name, identity);
+
+        const current_lsn = try uint64FromJson(response.parsed.value.current_lsn);
+        const last_sent_lsn = try uint64FromJson(response.parsed.value.last_sent_lsn);
+        const next_lsn = try positiveUint64FromJson(response.parsed.value.next_lsn);
+        const frames = try decodeAndValidateFrames(
+            self.alloc,
+            response.parsed.value,
+            identity,
+            requested_lsn,
+            current_lsn,
+            last_sent_lsn,
+            next_lsn,
+            response.parsed.value.end_of_wal,
+        );
+
+        return .{
+            .alloc = self.alloc,
+            .identity = identity,
+            .requested_lsn = requested_lsn,
+            .frames = frames,
+            .current_lsn = current_lsn,
+            .last_sent_lsn = last_sent_lsn,
+            .next_lsn = next_lsn,
+            .end_of_wal = response.parsed.value.end_of_wal,
+        };
+    }
+
+    pub fn applyFetched(
+        self: *Client,
+        batch: *const FetchedBatch,
+        standby: *standby_mod.Standby,
+        apply_ctx: *anyopaque,
+        apply_fn: standby_mod.ApplyFn,
+    ) !AppliedBatch {
+        _ = self;
+        if (!std.meta.eql(standby.identity, batch.identity)) return error.HAStandbyStateChanged;
+        if (standby.nextReceiveLsn() != batch.requested_lsn) return error.HAStandbyStateChanged;
+
+        for (batch.frames) |frame| {
+            _ = try standby.receive(frame.record);
+        }
+        const applied_count = try standby.applyAvailable(apply_ctx, apply_fn);
+        return .{
+            .received_count = batch.frames.len,
+            .applied_count = applied_count,
+            .progress = standby.currentProgress(),
+        };
     }
 
     pub fn replicateAvailable(
@@ -154,51 +248,23 @@ pub const Client = struct {
         apply_fn: standby_mod.ApplyFn,
         options: ReplicateOptions,
     ) !Result {
-        try validateSlotName(slot_name);
-        if (options.verify_upstream) {
-            try self.verifyCompatibleUpstream(base_uri, standby);
-        }
         const requested_lsn = standby.nextReceiveLsn();
-        var response = try self.startReplication(base_uri, slot_name, requested_lsn, options);
-        defer response.deinit();
-        try verifyStartReplicationResponse(response.parsed.value, slot_name, standby.identity);
-
-        const current_lsn = try uint64FromJson(response.parsed.value.current_lsn);
-        const last_sent_lsn = try uint64FromJson(response.parsed.value.last_sent_lsn);
-        const next_lsn = try positiveUint64FromJson(response.parsed.value.next_lsn);
-
-        const frames = try decodeAndValidateFrames(
-            self.alloc,
-            response.parsed.value,
-            standby.identity,
-            requested_lsn,
-            current_lsn,
-            last_sent_lsn,
-            next_lsn,
-            response.parsed.value.end_of_wal,
-        );
-        defer freeVerifiedFrames(self.alloc, frames);
-
-        for (frames) |frame| {
-            _ = standby.receive(frame.record) catch |err| {
-                _ = self.updateStandbyStatus(base_uri, slot_name, standby) catch {};
-                return err;
-            };
-        }
-
-        const applied_count = standby.applyAvailable(apply_ctx, apply_fn) catch |err| {
-            try self.updateStandbyStatus(base_uri, slot_name, standby);
+        const identity = standby.identity;
+        var batch = try self.fetchAvailable(base_uri, slot_name, identity, requested_lsn, options);
+        defer batch.deinit();
+        const applied = self.applyFetched(&batch, standby, apply_ctx, apply_fn) catch |err| {
+            _ = self.updateStandbyStatusSnapshot(base_uri, slot_name, standby.identity, standby.currentProgress()) catch {};
             return err;
         };
-        try self.updateStandbyStatus(base_uri, slot_name, standby);
+        try self.updateStandbyStatusSnapshot(base_uri, slot_name, standby.identity, applied.progress);
         return .{
-            .received_count = frames.len,
-            .applied_count = applied_count,
-            .progress = standby.currentProgress(),
-            .current_lsn = current_lsn,
-            .last_sent_lsn = last_sent_lsn,
-            .next_lsn = next_lsn,
-            .end_of_wal = response.parsed.value.end_of_wal,
+            .received_count = applied.received_count,
+            .applied_count = applied.applied_count,
+            .progress = applied.progress,
+            .current_lsn = batch.current_lsn,
+            .last_sent_lsn = batch.last_sent_lsn,
+            .next_lsn = batch.next_lsn,
+            .end_of_wal = batch.end_of_wal,
         };
     }
 
@@ -313,14 +379,14 @@ pub const Client = struct {
         };
     }
 
-    fn updateStandbyStatus(
+    pub fn updateStandbyStatusSnapshot(
         self: *Client,
         base_uri: []const u8,
         slot_name: []const u8,
-        standby: *const standby_mod.Standby,
+        identity: standby_mod.Identity,
+        progress: standby_mod.Progress,
     ) !void {
         try validateSlotName(slot_name);
-        const progress = standby.currentProgress();
         const body = try std.json.Stringify.valueAlloc(
             self.alloc,
             struct {
@@ -331,7 +397,7 @@ pub const Client = struct {
                 safe_read_lsn: u64,
             }{
                 .slot_name = slot_name,
-                .timeline_id = standby.identity.timeline_id,
+                .timeline_id = identity.timeline_id,
                 .received_lsn = progress.received_lsn,
                 .applied_lsn = progress.applied_lsn,
                 .safe_read_lsn = progress.safe_read_lsn,
@@ -361,7 +427,7 @@ pub const Client = struct {
             .{ .ignore_unknown_fields = true },
         );
         defer parsed.deinit();
-        try verifyStandbyStatusUpdateResponse(parsed.value, slot_name, standby.identity, progress);
+        try verifyStandbyStatusUpdateResponse(parsed.value, slot_name, identity, progress);
     }
 
     fn execute(self: *Client, req: http_common.HttpRequest) !OwnedResponse {
