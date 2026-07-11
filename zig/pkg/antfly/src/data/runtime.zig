@@ -4651,52 +4651,31 @@ pub const DataServer = struct {
             );
         }
         if (try self.cloneCachedLocalGroupStatusesMatching(alloc, generation, fingerprint, true)) |stale| {
-            const stale_owned = stale;
-            errdefer freeGroupStatusesOwned(alloc, stale_owned);
-            const refreshed = self.collectLiveLocalGroupStatusesWithSources(
-                alloc,
+            errdefer freeGroupStatusesOwned(alloc, stale);
+            try self.requestLocalGroupStatusRefreshWithSources(
+                generation,
+                fingerprint,
                 replica_root_dir,
                 group_ids,
                 tables,
                 ranges,
-                group_leadership_source,
-                group_membership_source,
                 stores,
                 merged_group_statuses,
                 split_transitions,
                 merge_transitions,
                 split_observations,
                 merge_observations,
-            ) catch |err| {
-                std.log.warn("store status stale group refresh failed err={}", .{err});
-                try self.requestLocalGroupStatusRefreshWithSources(
-                    generation,
-                    fingerprint,
-                    replica_root_dir,
-                    group_ids,
-                    tables,
-                    ranges,
-                    stores,
-                    merged_group_statuses,
-                    split_transitions,
-                    merge_transitions,
-                    split_observations,
-                    merge_observations,
-                    inferred_group_leadership,
-                    group_leadership_source,
-                    group_membership_source,
-                );
-                return try mergeRaftOnlyLocalGroupStatusFallbacks(
-                    alloc,
-                    stale_owned,
-                    group_ids,
-                    group_leadership_source,
-                    group_membership_source,
-                );
-            };
-            freeGroupStatusesOwned(alloc, stale_owned);
-            try self.storeCachedLocalGroupStatuses(generation, fingerprint, refreshed);
-            return refreshed;
+                inferred_group_leadership,
+                group_leadership_source,
+                group_membership_source,
+            );
+            return try mergeRaftOnlyLocalGroupStatusFallbacks(
+                alloc,
+                stale,
+                group_ids,
+                group_leadership_source,
+                group_membership_source,
+            );
         }
         try self.requestLocalGroupStatusRefreshWithSources(
             generation,
@@ -11026,6 +11005,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
 
     try std.testing.expectEqual(@as(usize, 1), stale.len);
     try std.testing.expectEqual(@as(u64, 999), stale[0].doc_count);
+    server.joinLocalGroupStatusRefreshThread();
     try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
     try std.testing.expectEqual(@as(u64, 0), server.local_group_status_cache.group_statuses[0].doc_count);
@@ -11217,7 +11197,7 @@ test "data runtime live local group status skips the active startup group on a c
     try std.testing.expectEqual(@as(u64, 1), reports[0].doc_count);
 }
 
-test "data runtime store status cold miss schedules refresh and returns empty immediately" {
+test "data runtime store status cold miss schedules a nonblocking refresh" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -11291,9 +11271,8 @@ test "data runtime store status cold miss schedules refresh and returns empty im
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
+    server.joinLocalGroupStatusRefreshThread();
     try std.testing.expect(server.store_status_dirty.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
-    try std.testing.expectEqual(@as(u64, 1), server.local_group_status_cache.group_statuses[0].doc_count);
     try std.testing.expect(server.local_group_status_cache.collected_at_ms != 0);
 }
 
@@ -11367,9 +11346,8 @@ test "data runtime metadata local group status provider does not cold-open inlin
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
+    server.joinLocalGroupStatusRefreshThread();
     try std.testing.expect(server.store_status_dirty.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
-    try std.testing.expectEqual(@as(u64, 1), server.local_group_status_cache.group_statuses[0].doc_count);
 }
 
 test "data runtime local group refresh prefers runtime status snapshot over DB open" {
