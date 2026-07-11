@@ -62648,6 +62648,11 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
             },
         );
         _ = try staged_generation.publish();
+        // Release the staged generation and the exclusive transition before
+        // reopening the live path: published-generation reads fail closed with
+        // GenerationTransitionActive while an exclusive transition is active.
+        staged_generation.deinit();
+        transition.deinit();
 
         var restored = try DB.open(alloc, std.mem.span(restore_path), .{
             .primary_backend = primary_backend,
