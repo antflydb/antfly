@@ -237,6 +237,7 @@ test {
 
     // Inference
     _ = inference;
+    _ = @import("chunking/mod.zig");
     _ = pdf;
 
     // Serverless
