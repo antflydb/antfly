@@ -31,8 +31,9 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: chunking_types.Config)
     defer inference_chunker.types.freeChunks(alloc, shared_chunks);
 
     var chunks = try alloc.alloc(Chunk, shared_chunks.len);
+    var initialized: usize = 0;
     errdefer {
-        for (chunks) |*chunk| chunk.deinit(alloc);
+        for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
         alloc.free(chunks);
     }
 
@@ -46,6 +47,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: chunking_types.Config)
             .start_offset = offsets.start,
             .end_offset = offsets.end,
         };
+        initialized += 1;
     }
 
     return chunks;

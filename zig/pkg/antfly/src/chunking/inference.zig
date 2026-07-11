@@ -33,8 +33,9 @@ pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8)
     defer freeRemoteChunks(alloc, shared_chunks);
 
     var chunks = try alloc.alloc(Chunk, shared_chunks.len);
+    var initialized: usize = 0;
     errdefer {
-        for (chunks) |*chunk| chunk.deinit(alloc);
+        for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
         alloc.free(chunks);
     }
     for (shared_chunks, 0..) |shared, i| {
@@ -47,6 +48,7 @@ pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8)
             .start_offset = offsets.start,
             .end_offset = offsets.end,
         };
+        initialized += 1;
     }
     return chunks;
 }

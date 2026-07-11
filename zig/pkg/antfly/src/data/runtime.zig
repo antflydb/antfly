@@ -2040,8 +2040,8 @@ pub const DataServer = struct {
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
-    store_status_ticks: usize = 0,
-    store_status_dirty: bool = true,
+    store_status_ticks: std.atomic.Value(usize) = .init(0),
+    store_status_dirty: std.atomic.Value(bool) = .init(true),
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
     last_data_raft_placement_fingerprint: ?u64 = null,
@@ -2932,7 +2932,7 @@ pub const DataServer = struct {
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
         if (self.store_registration != null) {
-            self.store_status_dirty = true;
+            self.store_status_dirty.store(true, .release);
         }
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
@@ -3042,21 +3042,21 @@ pub const DataServer = struct {
                     break :blk true;
                 };
                 if (registration_ready) {
-                    self.store_status_ticks += 1;
+                    _ = self.store_status_ticks.fetchAdd(1, .monotonic);
                     const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
                         now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
                     const due_full_store_status = self.localGroupStatusCacheStale(now_ms);
                     const due_data_raft_status_refresh = self.data_raft != null;
                     const report_kind = chooseStoreStatusReportKind(
-                        self.store_status_ticks,
-                        self.store_status_dirty,
+                        self.store_status_ticks.load(.acquire),
+                        self.store_status_dirty.load(.acquire),
                         self.last_store_status_report_at_ms,
                         due_store_status_heartbeat,
                         due_full_store_status,
                         due_data_raft_status_refresh,
                     );
                     if (report_kind != .none) {
-                        self.store_status_ticks = 0;
+                        self.store_status_ticks.store(0, .release);
                         const result = switch (report_kind) {
                             .full => self.reportStoreStatus(),
                             .heartbeat => self.reportStoreStatusHeartbeat(),
@@ -3944,8 +3944,8 @@ pub const DataServer = struct {
     }
 
     fn markStoreStatusDirtyImmediate(self: *DataServer) void {
-        self.store_status_dirty = true;
-        self.store_status_ticks = store_status_report_interval_ticks;
+        self.store_status_dirty.store(true, .release);
+        self.store_status_ticks.store(store_status_report_interval_ticks, .release);
     }
 
     fn observeDataRaftStatusFingerprint(self: *DataServer, fingerprint: u64) void {
@@ -3975,7 +3975,7 @@ pub const DataServer = struct {
     }
 
     fn invalidateLocalGroupStatusCache(self: *DataServer) void {
-        self.store_status_dirty = true;
+        self.store_status_dirty.store(true, .release);
         _ = self.local_group_status_generation.fetchAdd(1, .monotonic);
         self.markLocalSplitKeyCacheDirty();
         {
@@ -4524,7 +4524,7 @@ pub const DataServer = struct {
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
-        self.store_status_dirty = true;
+        self.store_status_dirty.store(true, .release);
     }
 
     fn collectCachedLocalGroupStatuses(
@@ -4990,6 +4990,11 @@ pub const DataServer = struct {
     fn reportStoreStatus(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
+        // Claim the work before collecting the report. A mutation racing with
+        // collection sets the bit again and is therefore published by a later
+        // round; clearing at the end would lose that notification.
+        _ = self.store_status_dirty.swap(false, .acq_rel);
+        errdefer self.store_status_dirty.store(true, .release);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         try self.syncDataRaftFromSnapshot(&snapshot);
@@ -5060,7 +5065,6 @@ pub const DataServer = struct {
             snapshot.ranges,
         );
         try self.storeStatusHeartbeatCacheReplace(report);
-        self.store_status_dirty = false;
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         self.clearMetadataBootstrapRetry();
     }
@@ -5755,7 +5759,7 @@ pub const DataServer = struct {
                 if (result.terminal_degraded) {
                     std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
                     self.runtime_status_dirty.store(true, .release);
-                    self.store_status_dirty = true;
+                    self.store_status_dirty.store(true, .release);
                     continue;
                 }
                 if (result.cleared_debt) {
@@ -5770,7 +5774,7 @@ pub const DataServer = struct {
         inspection_complete = true;
         if (stats.groups_cleared > 0) {
             self.runtime_status_dirty.store(true, .release);
-            self.store_status_dirty = true;
+            self.store_status_dirty.store(true, .release);
             self.provisioned_root_refresh_dirty.store(true, .release);
             self.requestRuntimeStatusRefresh() catch |err| switch (err) {
                 error.ThreadQuotaExceeded,
@@ -6030,7 +6034,7 @@ pub const DataServer = struct {
         };
         if (finished) {
             self.runtime_status_dirty.store(true, .release);
-            self.store_status_dirty = true;
+            self.store_status_dirty.store(true, .release);
             self.requestRuntimeStatusRefresh() catch |err| switch (err) {
                 error.ThreadQuotaExceeded,
                 error.SystemResources,
@@ -6125,7 +6129,7 @@ pub const DataServer = struct {
             .monotonic,
         );
         self.runtime_status_dirty.store(pending_runtime_work, .release);
-        self.store_status_dirty = true;
+        self.store_status_dirty.store(true, .release);
         _ = self.runtime_status_refresh_completed.fetchAdd(1, .monotonic);
         return stats;
     }
@@ -6623,7 +6627,7 @@ pub const DataServer = struct {
             std.log.warn("store status local group cache update failed err={}", .{err});
             return;
         };
-        self.store_status_dirty = true;
+        self.store_status_dirty.store(true, .release);
     }
 
     fn localGroupStatusRefreshWorkerMain(refresh: *OwnedLocalGroupStatusRefresh) void {
@@ -6752,7 +6756,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
         self.runtime_status_dirty.store(true, .release);
         self.provisioned_startup_catch_up_dirty.store(true, .release);
-        self.store_status_dirty = true;
+        self.store_status_dirty.store(true, .release);
     }
 
     pub fn shouldDeferProvisionedReplicaRootReconcile(self: *const DataServer) bool {
@@ -10465,11 +10469,11 @@ test "data runtime local group status provider collects and caches group statuse
 
     try std.testing.expectEqual(@as(usize, 1), second.len);
     const hook = server.localChangeHook();
-    server.store_status_dirty = false;
-    server.store_status_ticks = 0;
+    server.store_status_dirty.store(false, .release);
+    server.store_status_ticks.store(0, .release);
     hook.on_change(hook.ptr, "docs", .data);
-    try std.testing.expect(server.store_status_dirty);
-    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
 
     server.invalidateLocalGroupStatusCache();
@@ -10509,21 +10513,21 @@ test "data runtime raft status changes force immediate store status publication"
     };
     defer server.deinit();
 
-    server.store_status_dirty = false;
-    server.store_status_ticks = 0;
+    server.store_status_dirty.store(false, .release);
+    server.store_status_ticks.store(0, .release);
     server.observeDataRaftStatusFingerprint(11);
-    try std.testing.expect(server.store_status_dirty);
-    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
 
-    server.store_status_dirty = false;
-    server.store_status_ticks = 0;
+    server.store_status_dirty.store(false, .release);
+    server.store_status_ticks.store(0, .release);
     server.observeDataRaftStatusFingerprint(11);
-    try std.testing.expect(!server.store_status_dirty);
-    try std.testing.expectEqual(@as(usize, 0), server.store_status_ticks);
+    try std.testing.expect(!server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.store_status_ticks.load(.acquire));
 
     server.observeDataRaftStatusFingerprint(12);
-    try std.testing.expect(server.store_status_dirty);
-    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
 }
 
 test "data runtime local split fallback preserves source identity namespace" {
@@ -11000,7 +11004,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
     lockAtomic(&server.local_group_status_cache_mutex);
     server.local_group_status_cache.collected_at_ms = 0;
     server.local_group_status_cache_mutex.unlock();
-    server.store_status_dirty = false;
+    server.store_status_dirty.store(false, .release);
 
     const stale = try server.collectStoreStatusGroupStatusesWithSources(
         alloc,
@@ -11022,7 +11026,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
 
     try std.testing.expectEqual(@as(usize, 1), stale.len);
     try std.testing.expectEqual(@as(u64, 999), stale[0].doc_count);
-    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
     try std.testing.expectEqual(@as(u64, 0), server.local_group_status_cache.group_statuses[0].doc_count);
     try std.testing.expect(server.local_group_status_cache.collected_at_ms != 0);
@@ -11287,7 +11291,7 @@ test "data runtime store status cold miss schedules refresh and returns empty im
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
-    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
     try std.testing.expectEqual(@as(u64, 1), server.local_group_status_cache.group_statuses[0].doc_count);
     try std.testing.expect(server.local_group_status_cache.collected_at_ms != 0);
@@ -11363,7 +11367,7 @@ test "data runtime metadata local group status provider does not cold-open inlin
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
-    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
     try std.testing.expectEqual(@as(u64, 1), server.local_group_status_cache.group_statuses[0].doc_count);
 }
@@ -13481,7 +13485,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
     defer server.deinit();
     server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     server.runtime_status_dirty.store(false, .release);
-    server.store_status_dirty = false;
+    server.store_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(true, .release);
 
     index_manager_mod.test_inject_index_open_error = error.FileNotFound;
@@ -13497,7 +13501,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
     try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
-    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
 
     var statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
@@ -14251,7 +14255,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     defer server.deinit();
 
     server.store_registration_confirmed = true;
-    server.store_status_dirty = false;
+    server.store_status_dirty.store(false, .release);
     server.last_store_status_report_at_ms = 1;
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
@@ -14308,7 +14312,7 @@ test "data runtime runRound backs off retryable provision metadata failures" {
     defer server.deinit();
 
     server.store_registration_confirmed = true;
-    server.store_status_dirty = false;
+    server.store_status_dirty.store(false, .release);
     server.last_store_status_report_at_ms = 1;
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
@@ -14386,7 +14390,7 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
 
     const next_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
     server.store_registration_confirmed = true;
-    server.store_status_dirty = false;
+    server.store_status_dirty.store(false, .release);
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
     server.provision_ticks = 3;

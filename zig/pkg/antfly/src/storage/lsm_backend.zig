@@ -1471,6 +1471,9 @@ pub const Backend = struct {
     }
 
     pub fn snapshotWriteStats(self: *const Backend) WriteStats {
+        const mutable = @constCast(self);
+        const locked = runtime_mod.lockBackend(Backend, mutable);
+        defer runtime_mod.unlockBackend(Backend, mutable, locked);
         return self.write_stats;
     }
 
