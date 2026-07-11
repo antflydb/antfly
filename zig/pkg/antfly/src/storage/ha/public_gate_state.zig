@@ -113,7 +113,8 @@ pub const State = struct {
 
     pub fn checkRead(self: *const State, request: read_gate.Request) !void {
         switch (self.currentRole()) {
-            .disabled, .primary, .fenced_primary => return,
+            .disabled, .primary => return,
+            .fenced_primary => return error.HAReadRequiresPrimary,
             .transitioning => return error.HAReadRequiresPrimary,
             .standby => {},
         }
@@ -211,6 +212,10 @@ test "storage.ha public gate state invalidates pinned standby writes during prom
 
     state.publishPrimaryFence(true);
     try std.testing.expectError(error.HAFencedPrimary, state.checkWrite(null));
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        state.checkRead(.{ .consistency = .stale_ok }),
+    );
     try std.testing.expect(!state.ownerJobsCanRun());
 }
 

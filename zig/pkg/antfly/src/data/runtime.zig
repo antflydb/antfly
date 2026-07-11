@@ -2787,7 +2787,7 @@ pub const DataServer = struct {
 
     fn haReadGate(self: *DataServer) ?antfly.public_api.HAReadGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
-        if (ctx.standby != null) return .{ .shared = &self.ha_public_gate_state };
+        if (ctx.standby != null or ctx.primary != null) return .{ .shared = &self.ha_public_gate_state };
         return null;
     }
 
@@ -16404,6 +16404,14 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     defer fence_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), fence_response.status);
     try std.testing.expectError(error.HAFencedPrimary, source_gate.check());
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .stale),
+    );
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .read_index),
+    );
 
     try std.testing.expectError(error.HAFencedPrimary, server.write_source.source().batchGroupLocal(alloc, 10, "docs", .{
         .writes = &.{.{ .key = "doc:local", .value = "{\"title\":\"local-write\"}" }},
