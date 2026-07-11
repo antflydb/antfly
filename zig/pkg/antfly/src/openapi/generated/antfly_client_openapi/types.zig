@@ -2379,6 +2379,8 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2514,6 +2516,8 @@ pub const EnrichmentConfig = struct {
     content_type: ?[]const u8 = null,
     /// Serialized asset producer configuration.
     producer_json: ?[]const u8 = null,
+    /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
+    execution: ?ExecutionPolicy = null,
 };
 
 /// Managed generated artifact kind.
@@ -2753,6 +2757,14 @@ pub const ExactSortError = struct {
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: []const u8,
     status: i32,
+};
+
+/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+pub const ExecutionPolicy = struct {
+    /// Maximum items to process in one batch for this operation.
+    batch_items: ?i64 = null,
+    /// Approximate maximum source bytes to process in one batch for this operation.
+    batch_bytes: ?i64 = null,
 };
 
 pub const ExtensionError = struct {
@@ -3775,6 +3787,8 @@ pub const IndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
@@ -3860,6 +3874,10 @@ pub const IndexConfig = struct {
             try jw.objectField("chunk_size");
             try jw.write(value);
         }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
         if (self.edge_types) |value| {
             try jw.objectField("edge_types");
             try jw.write(value);
@@ -3874,6 +3892,14 @@ pub const IndexConfig = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted.
+pub const IndexExecutionConfig = struct {
+    /// Chunk producer batching for shorthand-created chunk enrichments.
+    chunking: ?ExecutionPolicy = null,
+    /// Embedding producer batching for shorthand-created embedding enrichments.
+    embedding: ?ExecutionPolicy = null,
 };
 
 /// Statistics for an index
@@ -4353,6 +4379,66 @@ pub const InferenceFunctionDefinition = struct {
     strict: ?bool = null,
 };
 
+pub const InferenceGenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const InferenceGenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceGenerateBatchRequest = struct {
+    mode: ?InferenceGenerateBatchMode = null,
+    requests: []const InferenceGenerateBatchRequestItem,
+};
+
+pub const InferenceGenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: InferenceGenerateRequest,
+};
+
+pub const InferenceGenerateBatchResponse = struct {
+    object: []const u8,
+    data: []const InferenceGenerateBatchResultItem,
+    summary: InferenceGenerateBatchSummary,
+};
+
+pub const InferenceGenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
+    index: i64,
+    response: ?InferenceGenerateResponse = null,
+    @"error": ?InferenceGenerateBatchError = null,
+};
+
+pub const InferenceGenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
 pub const InferenceGenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,
@@ -4797,13 +4883,13 @@ pub const InferencePredictorsResponse = struct {
 pub const InferencePromptCacheConfig = struct {
     /// Enable inference-native prompt KV cache reuse for generator requests.
     enabled: ?bool = null,
-    /// Prompt KV cache implementation. `simple` keeps the retained-prefix cache. `block_hash` uses hash-addressed full KV blocks under prompt_cache_key.
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
-    /// Maximum retained KV cache memory per loaded generator model.
+    /// Node-wide prompt KV cache budget. Split evenly across loaded generator models that hold an active cache, so loading more models does not multiply retained KV memory.
     max_bytes_mb: ?i64 = null,
     /// Minimum prompt length eligible for prompt KV caching.
     min_tokens: ?i64 = null,
-    /// Time-to-live for idle prompt KV cache entries.
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
     ttl_ms: ?i64 = null,
 };
 

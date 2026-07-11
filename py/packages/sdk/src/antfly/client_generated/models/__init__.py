@@ -180,6 +180,7 @@ from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
+from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
 from .extension_object_decl import ExtensionObjectDecl
@@ -272,6 +273,7 @@ from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
+from .index_execution_config import IndexExecutionConfig
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
@@ -310,6 +312,14 @@ from .inference_error import InferenceError
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
+from .inference_generate_batch_error import InferenceGenerateBatchError
+from .inference_generate_batch_mode import InferenceGenerateBatchMode
+from .inference_generate_batch_request import InferenceGenerateBatchRequest
+from .inference_generate_batch_request_item import InferenceGenerateBatchRequestItem
+from .inference_generate_batch_response import InferenceGenerateBatchResponse
+from .inference_generate_batch_response_object import InferenceGenerateBatchResponseObject
+from .inference_generate_batch_result_item import InferenceGenerateBatchResultItem
+from .inference_generate_batch_summary import InferenceGenerateBatchSummary
 from .inference_generate_choice import InferenceGenerateChoice
 from .inference_generate_choice_logprobs_type_0 import InferenceGenerateChoiceLogprobsType0
 from .inference_generate_chunk import InferenceGenerateChunk
@@ -813,6 +823,7 @@ __all__ = (
     "ExactSortError",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
+    "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",
     "ExtensionObjectDecl",
@@ -905,6 +916,7 @@ __all__ = (
     "ImageURLContentPartType",
     "IncompleteDetails",
     "IncompleteDetailsReason",
+    "IndexExecutionConfig",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
@@ -943,6 +955,14 @@ __all__ = (
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
+    "InferenceGenerateBatchError",
+    "InferenceGenerateBatchMode",
+    "InferenceGenerateBatchRequest",
+    "InferenceGenerateBatchRequestItem",
+    "InferenceGenerateBatchResponse",
+    "InferenceGenerateBatchResponseObject",
+    "InferenceGenerateBatchResultItem",
+    "InferenceGenerateBatchSummary",
     "InferenceGenerateChoice",
     "InferenceGenerateChoiceLogprobsType0",
     "InferenceGenerateChunk",

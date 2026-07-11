@@ -286,6 +286,66 @@ pub const FunctionDefinition = struct {
     strict: ?bool = null,
 };
 
+pub const GenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const GenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GenerateBatchRequest = struct {
+    mode: ?GenerateBatchMode = null,
+    requests: []const GenerateBatchRequestItem,
+};
+
+pub const GenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: GenerateRequest,
+};
+
+pub const GenerateBatchResponse = struct {
+    object: []const u8,
+    data: []const GenerateBatchResultItem,
+    summary: GenerateBatchSummary,
+};
+
+pub const GenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
+    index: i64,
+    response: ?GenerateResponse = null,
+    @"error": ?GenerateBatchError = null,
+};
+
+pub const GenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
 pub const GenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,
@@ -608,13 +668,13 @@ pub const ModelsResponse = struct {
 pub const PromptCacheConfig = struct {
     /// Enable inference-native prompt KV cache reuse for generator requests.
     enabled: ?bool = null,
-    /// Prompt KV cache implementation. `simple` keeps the retained-prefix cache. `block_hash` uses hash-addressed full KV blocks under prompt_cache_key.
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
-    /// Maximum retained KV cache memory per loaded generator model.
+    /// Node-wide prompt KV cache budget. Split evenly across loaded generator models that hold an active cache, so loading more models does not multiply retained KV memory.
     max_bytes_mb: ?i64 = null,
     /// Minimum prompt length eligible for prompt KV caching.
     min_tokens: ?i64 = null,
-    /// Time-to-live for idle prompt KV cache entries.
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
     ttl_ms: ?i64 = null,
 };
 

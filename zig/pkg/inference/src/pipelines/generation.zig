@@ -1201,6 +1201,11 @@ pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+    /// Optional external lock for shared paged KV metadata/storage. Batch
+    /// generation wires every decode state in a group to the same manager and
+    /// storage runtime, so admission reads and KV mutations must share this
+    /// lock even though forward execution is serialized by the scheduler turn.
+    kv_lock: ?*std.atomic.Mutex = null,
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     pool_id: ?runtime.kv.block.KvPoolId = null,
     total_tokens: usize = 0,
@@ -1234,6 +1239,12 @@ pub const NativeDecodeState = struct {
             .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, shared_moe_cache),
             .shared_moe_cache = shared_moe_cache,
         };
+    }
+
+    fn lockPagedKv(self: *const NativeDecodeState) ?*std.atomic.Mutex {
+        const mutex = self.kv_lock orelse return null;
+        platform.sync.lockYielding(mutex);
+        return mutex;
     }
 
     pub fn isPaged(self: *const NativeDecodeState) bool {
@@ -1286,7 +1297,7 @@ pub const NativeDecodeState = struct {
         self.deepseek_v4_compressed_cache = null;
     }
 
-    pub fn ensureAttached(self: *NativeDecodeState) !void {
+    fn ensureAttachedUnlocked(self: *NativeDecodeState) !void {
         if (!self.isPaged()) return;
         if (self.sequence_id != null) return;
         self.sequence_id = try self.kv_manager.?.attachSequence(self.pool_id orelse return error.InvalidPoolId);
@@ -1297,6 +1308,8 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn seedAttachedPrefix(self: *NativeDecodeState, sequence_id: runtime.kv.manager.SequenceId, token_count: usize) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
         if (!self.isPaged()) return error.InvalidPagedKvState;
         if (self.sequence_id != null) return error.InvalidPagedKvState;
         if (self.kv_storage) |storage| {
@@ -1306,6 +1319,12 @@ pub const NativeDecodeState = struct {
         self.total_tokens = token_count;
         self.kv_compacted = false;
         self.syncPagedKvViewForPrefill();
+    }
+
+    pub fn ensureAttached(self: *NativeDecodeState) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        return self.ensureAttachedUnlocked();
     }
 
     fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
@@ -1441,6 +1460,8 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn deinit(self: *NativeDecodeState) void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
         if (self.kv_manager) |manager| {
             if (self.sequence_id) |sequence_id| {
                 manager.releaseSequence(sequence_id) catch {};
@@ -1473,7 +1494,9 @@ pub const NativeDecodeState = struct {
     pub fn notePrefill(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens = token_count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
             if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             try self.reservePagedKvReplayCapacity();
@@ -1492,7 +1515,9 @@ pub const NativeDecodeState = struct {
     pub fn appendPrefillChunk(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens += token_count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
             if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             try self.reservePagedKvReplayCapacity();
@@ -1511,7 +1536,9 @@ pub const NativeDecodeState = struct {
     pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
         self.total_tokens += 1;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
@@ -1535,7 +1562,9 @@ pub const NativeDecodeState = struct {
     pub fn appendGeneratedTokens(self: *NativeDecodeState, count: usize) !void {
         self.total_tokens += count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(count));
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
@@ -1564,6 +1593,8 @@ pub const NativeDecodeState = struct {
         const was_paged = self.isPaged();
         self.total_tokens -= count;
         if (was_paged) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
             const manager = self.kv_manager.?;
             if (self.sequence_id) |seq_id| {
                 const removed = try manager.truncateSequence(seq_id, count);
@@ -1592,6 +1623,8 @@ pub const NativeDecodeState = struct {
     /// attention output. Call after prefill, before the decode loop.
     pub fn compactKvCache(self: *NativeDecodeState, config: runtime.kv.compaction.CompactionConfig) !usize {
         if (self.deepseek_v4_compressed_cache != null) return error.DeepSeekV4CompressedKvCompactionNotSupported;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
         const manager = self.kv_manager orelse return 0;
         const seq_id = self.sequence_id orelse return 0;
         const pool_id = self.pool_id orelse return error.InvalidPoolId;
@@ -1831,8 +1864,10 @@ pub fn buildOwnedBatchDecodeContext(
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
+                .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage,
         };
     }
 
@@ -1845,6 +1880,7 @@ pub fn buildOwnedBatchDecodeContext(
             .query_sequence_len = first_ctx.query_sequence_len,
             .kv_sequence_len = first_ctx.kv_sequence_len,
             .kv_position_offset = first_ctx.kv_position_offset,
+            .kv_storage = first_ctx.kv_storage,
             .kv_batch = batch,
             .moe_runtime = first_ctx.moe_runtime,
         },
@@ -1912,8 +1948,10 @@ pub fn buildOwnedMixedBatchDecodeContext(
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
+                .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage,
             .per_item_query_len = item.query_sequence_len,
             .per_item_total_len = item.total_sequence_len,
             .per_item_kv_len = item.kv_sequence_len,
@@ -1935,6 +1973,7 @@ pub fn buildOwnedMixedBatchDecodeContext(
             .query_sequence_len = max_query_seq_len,
             .kv_sequence_len = max_kv_seq_len,
             .kv_position_offset = 0,
+            .kv_storage = items[0].state.kv_storage,
             .kv_batch = batch,
             .moe_runtime = &items[0].state.moe_runtime,
         },
@@ -7131,10 +7170,9 @@ pub const NativeGenerationPipeline = struct {
             .token_id = token_id,
             .seq_len = seq_len,
         };
-        try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
+        const pending_options = pendingWorkOptionsFromState(decode_state, 1);
+        try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
         defer if (!work.ready) scheduler.cancelDecodeWork(@ptrCast(&work));
-        notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .decode, 1);
-        notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .decode);
 
         var driver = DecodeStepDriver{
             .pipeline = self,
@@ -7171,10 +7209,9 @@ pub const NativeGenerationPipeline = struct {
             .query_seq_len = query_seq_len,
             .wants_last_logits = wants_last_logits,
         };
-        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
+        const pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
+        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
         defer if (!work.ready) scheduler.cancelPrefillWork(@ptrCast(&work));
-        notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .prefill, query_seq_len);
-        notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .prefill);
 
         var driver = PrefillStepDriver{
             .pipeline = self,
@@ -7544,6 +7581,8 @@ fn stepBudgetFromState(
     decode_state: *NativeDecodeState,
 ) runtime.scheduler.native_generate.StepBudget {
     var budget = scheduler.defaultStepBudget();
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
     const km = decode_state.kv_manager orelse return budget;
     const pool_id = decode_state.pool_id orelse return budget;
     const avail = km.poolAvailableBlocks(pool_id) orelse return budget;
@@ -7562,10 +7601,27 @@ fn notePendingKvBlocksFromState(
     phase: runtime.scheduler.native_generate.Phase,
     additional_tokens: usize,
 ) void {
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
     const km = decode_state.kv_manager orelse return;
     const seq_id = decode_state.sequence_id orelse return;
     const est = km.estimateBlocksFor(seq_id, additional_tokens) orelse return;
     scheduler.notePendingKvBlocks(work_ptr, phase, est);
+}
+
+fn pendingWorkOptionsFromState(
+    decode_state: *NativeDecodeState,
+    additional_tokens: usize,
+) runtime.scheduler.native_generate.PendingWorkOptions {
+    var options = runtime.scheduler.native_generate.PendingWorkOptions{
+        .exclusive_step = decode_state.deepseek_v4_compressed_cache != null,
+    };
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
+    const km = decode_state.kv_manager orelse return options;
+    const seq_id = decode_state.sequence_id orelse return options;
+    options.kv_blocks_estimate = km.estimateBlocksFor(seq_id, additional_tokens) orelse 0;
+    return options;
 }
 
 fn notePendingExclusiveStepFromState(
@@ -7961,7 +8017,7 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
 
     var work_byte: u8 = 1;
     coordinator.beginDecode(&lease, 4);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0, .{});
 
     const StubDriver = struct {
         coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -8086,8 +8142,8 @@ test "runStepLoop drains a multi-item step from a stub driver" {
 
     coordinator.beginDecode(&lease_a, 4);
     coordinator.beginDecode(&lease_b, 4);
-    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&work_a), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&work_b), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&work_a), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&work_b), 5, 5, 0, .{});
 
     const StubDriver = struct {
         coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -8209,7 +8265,7 @@ test "notePendingKvBlocksFromState plumbs estimate to scheduler" {
     defer coordinator.release(lease);
 
     var work_a: u8 = 0;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_a), 7, 7, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_a), 7, 7, 0, .{});
 
     notePendingKvBlocksFromState(&coordinator, &decode_state, @ptrCast(&work_a), .decode, 1);
 
@@ -8218,7 +8274,7 @@ test "notePendingKvBlocksFromState plumbs estimate to scheduler" {
 
     // A larger overflow: 5 tokens vs 2-token slack → 1 new block.
     var work_b: u8 = 1;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_b), 11, 11, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_b), 11, 11, 0, .{});
     notePendingKvBlocksFromState(&coordinator, &decode_state, @ptrCast(&work_b), .decode, 5);
     try std.testing.expectEqual(@as(?usize, 1), coordinator.pendingKvBlocksEstimate(@ptrCast(&work_b), .decode));
 }
@@ -8239,14 +8295,14 @@ test "notePendingExclusiveStepFromState marks DeepSeek V4 compressed cache work"
     defer coordinator.release(lease);
 
     var normal_work: u8 = 0;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_work), 7, 7, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_work), 7, 7, 0, .{});
     notePendingExclusiveStepFromState(&coordinator, &decode_state, @ptrCast(&normal_work), .decode);
     try std.testing.expectEqual(@as(?bool, false), coordinator.pendingRequiresExclusiveStep(@ptrCast(&normal_work), .decode));
 
     decode_state.deepseek_v4_compressed_cache = try gpt_arch.DeepSeekV4CompressedCache.init(allocator, 1);
 
     var compressed_work: u8 = 1;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&compressed_work), 8, 8, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&compressed_work), 8, 8, 0, .{});
     notePendingExclusiveStepFromState(&coordinator, &decode_state, @ptrCast(&compressed_work), .decode);
     try std.testing.expectEqual(@as(?bool, true), coordinator.pendingRequiresExclusiveStep(@ptrCast(&compressed_work), .decode));
 }
@@ -8737,10 +8793,21 @@ test "owned batch decode context captures per-item kv bindings" {
         .num_kv_heads = 8,
         .head_dim = 64,
     });
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 2,
+        .num_kv_heads = 8,
+        .head_dim = 64,
+    });
+    defer storage.deinit();
 
     var first = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    first.kv_storage = &storage;
     defer first.deinit();
     var second = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    second.kv_storage = &storage;
     defer second.deinit();
 
     try first.notePrefill(6);
@@ -8754,6 +8821,9 @@ test "owned batch decode context captures per-item kv bindings" {
     try std.testing.expect(owned.context.kv_batch != null);
     try std.testing.expectEqual(first.sequence_id.?, owned.kv_batch.?[0].kv_cache.sequence_id);
     try std.testing.expectEqual(second.sequence_id.?, owned.kv_batch.?[1].kv_cache.sequence_id);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_cache.kv_storage);
 }
 
 test "mixed batch decode context captures per-item overrides" {
@@ -8769,10 +8839,21 @@ test "mixed batch decode context captures per-item overrides" {
         .num_kv_heads = 8,
         .head_dim = 64,
     });
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 2,
+        .num_kv_heads = 8,
+        .head_dim = 64,
+    });
+    defer storage.deinit();
 
     var prefill = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    prefill.kv_storage = &storage;
     defer prefill.deinit();
     var decode = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    decode.kv_storage = &storage;
     defer decode.deinit();
 
     try prefill.notePrefill(8);
@@ -8804,6 +8885,9 @@ test "mixed batch decode context captures per-item overrides" {
     try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_prefill, owned.context.attention_mode);
     try std.testing.expectEqual(@as(?contracts.AttentionMode, .paged_decode), owned.kv_batch.?[0].per_item_mode);
     try std.testing.expectEqual(@as(?contracts.AttentionMode, .paged_prefill), owned.kv_batch.?[1].per_item_mode);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[1].kv_cache.kv_storage);
 }
 
 test "mixed batch decode context keeps single item on direct kv cache path" {

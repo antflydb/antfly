@@ -1624,6 +1624,8 @@ typedef struct termite_metal_attention_f32_params {
     uint32_t total_sequence_len;
     uint32_t has_bias;
     uint32_t has_mask;
+    uint32_t batch;
+    uint32_t reserved0;
 } termite_metal_attention_f32_params;
 
 typedef struct termite_metal_florence_window_params {
@@ -2109,7 +2111,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_reduce_axis_f32_params { uint rank; uint out_total; uint reduce_dim; uint reduce_stride; uint kind; uint reserved0; uint reserved1; uint reserved2; uint out_strides[8]; uint input_strides_for_out[8]; };\n"
            "struct termite_metal_broadcast_last_dim_params { uint rows; uint in_dim; uint out_dim; uint reserved; };\n"
            "struct termite_metal_quantize_rows_params { uint rows; uint dim; };\n"
-           "struct termite_metal_attention_f32_params { uint q_len; uint kv_len; uint num_heads; uint num_kv_heads; uint head_dim; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint total_sequence_len; uint has_bias; uint has_mask; };\n"
+           "struct termite_metal_attention_f32_params { uint q_len; uint kv_len; uint num_heads; uint num_kv_heads; uint head_dim; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint total_sequence_len; uint has_bias; uint has_mask; uint batch; uint reserved0; };\n"
            "struct termite_metal_florence_window_params { uint batch; uint height; uint width; uint dim; uint window_size; uint padded_h; uint padded_w; uint window_area; uint window_count; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_florence_channel_params { uint batch; uint seq_len; uint dim; uint groups; uint channels_per_group; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_argmax_suppress_params { uint out_dim; uint suppress_count; uint reserved0; uint reserved1; };\n"
@@ -4400,17 +4402,22 @@ static NSString *termite_metal_shader_source(void) {
            "    else output[gid] = input[gid];\n"
            "}\n"
            "kernel void termite_attention_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *output [[buffer(3)]], device const float *bias [[buffer(4)]], device const uchar *mask [[buffer(5)]], constant termite_metal_attention_f32_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.q_len * p.num_heads;\n"
+           "    uint total = p.batch * p.q_len * p.num_heads;\n"
            "    if (gid >= total) return;\n"
-           "    uint qi = gid / p.num_heads;\n"
-           "    uint h = gid - qi * p.num_heads;\n"
+           "    uint per_batch = p.q_len * p.num_heads;\n"
+           "    uint b = gid / per_batch;\n"
+           "    uint local = gid - b * per_batch;\n"
+           "    uint qi = local / p.num_heads;\n"
+           "    uint h = local - qi * p.num_heads;\n"
            "    uint heads_per_group = p.num_heads / p.num_kv_heads;\n"
            "    uint kv_h = h / heads_per_group;\n"
            "    uint q_stride = p.num_heads * p.head_dim;\n"
            "    uint kv_stride = p.num_kv_heads * p.head_dim;\n"
-           "    uint q_base = qi * q_stride + h * p.head_dim;\n"
+           "    uint q_batch_base = b * p.q_len * q_stride;\n"
+           "    uint kv_batch_base = b * p.kv_len * kv_stride;\n"
+           "    uint q_base = q_batch_base + qi * q_stride + h * p.head_dim;\n"
            "    uint kv_head_off = kv_h * p.head_dim;\n"
-           "    uint out_base = qi * q_stride + h * p.head_dim;\n"
+           "    uint out_base = q_batch_base + qi * q_stride + h * p.head_dim;\n"
            "    float best = -3.402823466e+38f;\n"
            "    float scale = rsqrt(float(p.head_dim));\n"
            "    uint query_pos = p.query_position_offset + qi;\n"
@@ -4425,7 +4432,7 @@ static NSString *termite_metal_shader_source(void) {
            "        if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window;\n"
            "        float score = -3.402823466e+38f;\n"
            "        if (allowed) {\n"
-           "            uint k_base = ki * kv_stride + kv_head_off;\n"
+           "            uint k_base = kv_batch_base + ki * kv_stride + kv_head_off;\n"
            "            float acc = 0.0f;\n"
            "            for (uint d = 0u; d < p.head_dim; ++d) acc += q[q_base + d] * k[k_base + d];\n"
            "            score = acc * scale;\n"
@@ -4445,8 +4452,8 @@ static NSString *termite_metal_shader_source(void) {
            "        if (key_pos > query_pos) allowed = false;\n"
            "        if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window;\n"
            "        if (!allowed) continue;\n"
-           "        uint k_base = ki * kv_stride + kv_head_off;\n"
-           "        uint v_base = ki * kv_stride + kv_head_off;\n"
+           "        uint k_base = kv_batch_base + ki * kv_stride + kv_head_off;\n"
+           "        uint v_base = kv_batch_base + ki * kv_stride + kv_head_off;\n"
            "        float acc = 0.0f;\n"
            "        for (uint d = 0u; d < p.head_dim; ++d) acc += q[q_base + d] * k[k_base + d];\n"
            "        float score = acc * scale;\n"
@@ -10347,6 +10354,8 @@ static int termite_metal_encode_attention_f32_on_encoder(
         .total_sequence_len = (uint32_t)total_sequence_len,
         .has_bias = 0u,
         .has_mask = 0u,
+        .batch = 1u,
+        .reserved0 = 0u,
     };
     const BOOL use_prefill_tiled = (runtime->attention_f32_prefill_pipeline != nil && q_len >= 1 && kv_tokens <= 2048u && head_dim <= 1024u);
     id<MTLComputePipelineState> pipeline = use_prefill_tiled ? runtime->attention_f32_prefill_pipeline : runtime->attention_f32_pipeline;
@@ -15972,6 +15981,8 @@ int termite_metal_decode_runtime_apply_attention_f32(
             .total_sequence_len = (uint32_t)total_sequence_len,
             .has_bias = bias != NULL ? 1u : 0u,
             .has_mask = mask != NULL ? 1u : 0u,
+            .batch = 1u,
+            .reserved0 = 0u,
         };
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_host_io_command_buffer(runtime, __func__, &frame_owned);
@@ -16100,6 +16111,8 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
             .total_sequence_len = (uint32_t)total_sequence_len,
             .has_bias = has_bias_input ? 1u : 0u,
             .has_mask = has_mask_input ? 1u : 0u,
+            .batch = 1u,
+            .reserved0 = 0u,
         };
         const bool frame_owned = (runtime->active_frame_cb == nil);
         id<MTLCommandBuffer> command_buffer = frame_owned
@@ -16147,6 +16160,109 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
             [command_buffer commit];
             [command_buffer waitUntilCompleted];
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -13;
+        }
+        return 0;
+    }
+}
+
+int termite_metal_decode_runtime_apply_attention_f32_device_batched(
+    termite_metal_decode_runtime *runtime,
+    void *q_handle,
+    size_t q_offset,
+    void *k_handle,
+    size_t k_offset,
+    void *v_handle,
+    size_t v_offset,
+    size_t batch,
+    size_t q_len,
+    size_t kv_len,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t query_position_offset,
+    size_t kv_position_offset,
+    size_t sliding_window,
+    size_t total_sequence_len,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
+    if (runtime->attention_f32_pipeline == nil) return -2;
+    if (batch == 0 || q_len == 0 || kv_len == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0) return -3;
+    if (num_heads % num_kv_heads != 0) return -4;
+    if (batch > UINT32_MAX || q_len > UINT32_MAX || kv_len > UINT32_MAX || num_heads > UINT32_MAX || num_kv_heads > UINT32_MAX || head_dim > UINT32_MAX || query_position_offset > UINT32_MAX || kv_position_offset > UINT32_MAX || sliding_window > UINT32_MAX || total_sequence_len > UINT32_MAX) return -5;
+    @autoreleasepool {
+        id<MTLBuffer> q_buffer = (__bridge id<MTLBuffer>)q_handle;
+        id<MTLBuffer> k_buffer = (__bridge id<MTLBuffer>)k_handle;
+        id<MTLBuffer> v_buffer = (__bridge id<MTLBuffer>)v_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        size_t q_rows = 0;
+        size_t kv_rows = 0;
+        size_t q_elems = 0;
+        size_t kv_elems = 0;
+        size_t q_bytes = 0;
+        size_t kv_bytes = 0;
+        if (!termite_metal_size_mul(batch, q_len, &q_rows) ||
+            !termite_metal_size_mul(q_rows, num_heads, &q_rows) ||
+            !termite_metal_size_mul(batch, kv_len, &kv_rows) ||
+            !termite_metal_size_mul(kv_rows, num_kv_heads, &kv_rows) ||
+            !termite_metal_size_mul(q_rows, head_dim, &q_elems) ||
+            !termite_metal_size_mul(kv_rows, head_dim, &kv_elems) ||
+            !termite_metal_size_mul(q_elems, sizeof(float), &q_bytes) ||
+            !termite_metal_size_mul(kv_elems, sizeof(float), &kv_bytes))
+        {
+            return -6;
+        }
+        if (q_rows > UINT32_MAX || kv_rows > UINT32_MAX || q_elems > UINT32_MAX || kv_elems > UINT32_MAX) return -6;
+        if (!termite_metal_buffer_range_valid(q_buffer, q_offset, q_bytes) ||
+            !termite_metal_buffer_range_valid(k_buffer, k_offset, kv_bytes) ||
+            !termite_metal_buffer_range_valid(v_buffer, v_offset, kv_bytes) ||
+            !termite_metal_buffer_range_valid(output_buffer, output_offset, q_bytes)) return -7;
+
+        const float zero_bias = 0.0f;
+        const uint8_t zero_mask = 0;
+        termite_metal_attention_f32_params params = {
+            .q_len = (uint32_t)q_len,
+            .kv_len = (uint32_t)kv_len,
+            .num_heads = (uint32_t)num_heads,
+            .num_kv_heads = (uint32_t)num_kv_heads,
+            .head_dim = (uint32_t)head_dim,
+            .query_position_offset = (uint32_t)query_position_offset,
+            .kv_position_offset = (uint32_t)kv_position_offset,
+            .sliding_window = (uint32_t)sliding_window,
+            .total_sequence_len = (uint32_t)total_sequence_len,
+            .has_bias = 0u,
+            .has_mask = 0u,
+            .batch = (uint32_t)batch,
+            .reserved0 = 0u,
+        };
+        const bool frame_owned = (runtime->active_frame_cb == nil);
+        id<MTLCommandBuffer> command_buffer = frame_owned
+            ? termite_metal_new_command_buffer(runtime->queue, __func__)
+            : runtime->active_frame_cb;
+        if (command_buffer == nil) return -8;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
+        if (encoder == nil) return -9;
+        [encoder setComputePipelineState:runtime->attention_f32_pipeline];
+        [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
+        [encoder setBuffer:k_buffer offset:k_offset atIndex:1];
+        [encoder setBuffer:v_buffer offset:v_offset atIndex:2];
+        [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
+        [encoder setBytes:&zero_bias length:sizeof(zero_bias) atIndex:4];
+        [encoder setBytes:&zero_mask length:sizeof(zero_mask) atIndex:5];
+        [encoder setBytes:&params length:sizeof(params) atIndex:6];
+        const size_t total_rows = q_rows;
+        MTLSize grid_size = MTLSizeMake(total_rows, 1, 1);
+        NSUInteger thread_width = runtime->attention_f32_pipeline.maxTotalThreadsPerThreadgroup;
+        if (thread_width == 0) thread_width = 64;
+        if (thread_width > total_rows && total_rows > 0) thread_width = total_rows;
+        MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        [encoder endEncoding];
+        if (frame_owned) {
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -10;
         }
         return 0;
     }
