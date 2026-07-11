@@ -25,6 +25,7 @@ class ClusterBackupRequest:
 
             The backup includes all table data, indexes, and metadata.
              Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
+        connection (str | Unset): Optional configured `external_io` connection with the `backup.write` capability.
         format_ (ClusterBackupRequestFormat | Unset): Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
@@ -38,6 +39,7 @@ class ClusterBackupRequest:
 
     backup_id: str
     location: str
+    connection: str | Unset = UNSET
     format_: ClusterBackupRequestFormat | Unset = ClusterBackupRequestFormat.PORTABLE
     table_names: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -46,6 +48,8 @@ class ClusterBackupRequest:
         backup_id = self.backup_id
 
         location = self.location
+
+        connection = self.connection
 
         format_: str | Unset = UNSET
         if not isinstance(self.format_, Unset):
@@ -63,6 +67,8 @@ class ClusterBackupRequest:
                 "location": location,
             }
         )
+        if connection is not UNSET:
+            field_dict["connection"] = connection
         if format_ is not UNSET:
             field_dict["format"] = format_
         if table_names is not UNSET:
@@ -77,6 +83,8 @@ class ClusterBackupRequest:
 
         location = d.pop("location")
 
+        connection = d.pop("connection", UNSET)
+
         _format_ = d.pop("format", UNSET)
         format_: ClusterBackupRequestFormat | Unset
         if isinstance(_format_, Unset):
@@ -89,6 +97,7 @@ class ClusterBackupRequest:
         cluster_backup_request = cls(
             backup_id=backup_id,
             location=location,
+            connection=connection,
             format_=format_,
             table_names=table_names,
         )

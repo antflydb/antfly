@@ -64,6 +64,7 @@ pub const CredentialSource = union(enum) {
 
 pub const CredentialCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
+    refreshing: std.atomic.Value(bool) = .init(false),
     cached: ?Credentials = null,
 
     fn lock(self: *CredentialCache) void {
@@ -92,33 +93,48 @@ pub const CredentialCache = struct {
     }
 
     pub fn getForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
-        const now = currentUnixSeconds();
-        self.lock();
-        if (self.cached) |creds| {
-            if (creds.isFresh(now)) {
-                const cloned = creds.clone(alloc) catch |err| {
+        while (true) {
+            const now = currentUnixSeconds();
+            self.lock();
+            if (self.cached) |creds| {
+                if (creds.isFresh(now)) {
+                    const cloned = creds.clone(alloc) catch |err| {
+                        self.unlock();
+                        return err;
+                    };
                     self.unlock();
-                    return err;
-                };
-                self.unlock();
-                return cloned;
+                    return cloned;
+                }
             }
-        }
-        self.unlock();
+            const refresh_owner = self.refreshing.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+            self.unlock();
 
-        var fresh = try resolveCredentialsUncached(alloc, http, region, source);
-        errdefer fresh.deinit(alloc);
-        const cached_copy = try fresh.clone(alloc);
-        errdefer {
-            var copy = cached_copy;
-            copy.deinit(alloc);
-        }
+            if (!refresh_owner) {
+                if (comptime builtin.os.tag == .freestanding) {
+                    std.atomic.spinLoopHint();
+                } else {
+                    std.Thread.yield() catch {};
+                }
+                continue;
+            }
 
-        self.lock();
-        defer self.unlock();
-        if (self.cached) |*old| old.deinit(alloc);
-        self.cached = cached_copy;
-        return fresh;
+            var published = false;
+            defer self.refreshing.store(false, .release);
+            var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| return err;
+            errdefer fresh.deinit(alloc);
+            const cached_copy = try fresh.clone(alloc);
+            errdefer if (!published) {
+                var copy = cached_copy;
+                copy.deinit(alloc);
+            };
+
+            self.lock();
+            if (self.cached) |*old| old.deinit(alloc);
+            self.cached = cached_copy;
+            published = true;
+            self.unlock();
+            return fresh;
+        }
     }
 };
 
@@ -592,9 +608,18 @@ fn parseProfileCredentials(alloc: std.mem.Allocator, data: []const u8, profile: 
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
-        if (std.mem.eql(u8, key, "aws_access_key_id")) access = try alloc.dupe(u8, value);
-        if (std.mem.eql(u8, key, "aws_secret_access_key")) secret = try alloc.dupe(u8, value);
-        if (std.mem.eql(u8, key, "aws_session_token")) token = try alloc.dupe(u8, value);
+        if (std.mem.eql(u8, key, "aws_access_key_id")) {
+            if (access != null) return error.DuplicateCredentialKey;
+            access = try alloc.dupe(u8, value);
+        }
+        if (std.mem.eql(u8, key, "aws_secret_access_key")) {
+            if (secret != null) return error.DuplicateCredentialKey;
+            secret = try alloc.dupe(u8, value);
+        }
+        if (std.mem.eql(u8, key, "aws_session_token")) {
+            if (token != null) return error.DuplicateCredentialKey;
+            token = try alloc.dupe(u8, value);
+        }
     }
     return .{
         .access_key_id = access orelse return error.MissingAccessKeyId,
@@ -634,19 +659,19 @@ fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, reg
     defer alloc.free(encoded_session);
     const encoded_token = try percentEncodeAlloc(alloc, std.mem.trim(u8, token, " \t\r\n"));
     defer alloc.free(encoded_token);
-    const url = try std.fmt.allocPrint(alloc, "{s}/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={s}&RoleSessionName={s}&WebIdentityToken={s}", .{
-        sts_endpoint,
+    const body = try std.fmt.allocPrint(alloc, "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={s}&RoleSessionName={s}&WebIdentityToken={s}", .{
         encoded_role,
         encoded_session,
         encoded_token,
     });
-    defer alloc.free(url);
+    defer alloc.free(body);
 
-    var resp = http.request(.GET, url, .{}) catch return error.MissingAwsCredentials;
+    const headers = [_]HeaderPair{.{ "content-type", "application/x-www-form-urlencoded" }};
+    var resp = http.request(.POST, sts_endpoint, .{ .headers = &headers, .body = body }) catch return error.MissingAwsCredentials;
     defer resp.deinit();
     if (!resp.ok()) return error.MissingAwsCredentials;
-    const body = resp.body orelse return error.MissingAwsCredentials;
-    return try parseStsCredentials(alloc, body);
+    const response_body = resp.body orelse return error.MissingAwsCredentials;
+    return try parseStsCredentials(alloc, response_body);
 }
 
 fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client) !Credentials {
@@ -1263,6 +1288,14 @@ test "titan multimodal body combines text and rejects multiple images" {
 
 test "shared credentials profile parser" {
     try testSharedCredentialsProfileParser();
+}
+
+test "shared credentials profile parser rejects duplicate keys" {
+    try std.testing.expectError(error.DuplicateCredentialKey, parseProfileCredentials(
+        std.testing.allocator,
+        "[default]\naws_access_key_id = first\naws_access_key_id = second\naws_secret_access_key = secret\n",
+        "default",
+    ));
 }
 
 test "metadata credential parsers" {

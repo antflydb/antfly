@@ -123,6 +123,22 @@ committed plaintext.
 Pass `--secret-store-path` (or
 `ANTFLY_SECRET_STORE_PATH`) when those JSON values use `${secret:...}`.
 
+Backup and restore select credentials independently from primary storage and
+remote-content reads. Requests may name an `external_io` connection while the
+`s3://` location continues to identify the artifact:
+
+```console
+antfly backup --backup-id daily --location s3://archive/prod/daily --connection archive-writer
+antfly restore --backup-id daily --location s3://archive/prod/daily --connection archive-reader
+```
+
+The server requires `backup.write` or `restore.read` respectively and verifies
+the location bucket and segment-bounded prefix against the connection. This
+supports several buckets, accounts, roles, and read/write trust domains in one
+process without promoting storage credentials to process-global environment
+variables. Omitting `--connection` retains the environment/secret-store path
+for local development and S3-compatible deployments.
+
 The canonical and convenience forms are equivalent:
 
 ```console
@@ -154,7 +170,9 @@ retention. Defaults are one hour, cleanup every minute, 1,024 sessions, a
 
 Session changes use persist-before-publish copy-on-write semantics. A failed
 allocation, write, or fsync leaves both the durable record and the in-memory
-session unchanged.
+session unchanged. Mutations are serialized by a bounded set of per-session
+locks; unrelated sessions do not hold the registry lock while cloning,
+renewing leases, encoding, or waiting for durable I/O.
 
 ## Validation and safety invariants
 

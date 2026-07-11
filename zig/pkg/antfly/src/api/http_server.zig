@@ -8166,7 +8166,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
+        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -8183,7 +8183,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableRestore(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
+        var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             202 => blk: {
@@ -8214,7 +8214,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterBackup(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
+        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => blk: {
@@ -8228,7 +8228,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterRestore(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
+        var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             202 => blk: {

@@ -14,8 +14,9 @@ func TestBuildRestoreJob_StandaloneStillUsesPublicAPIService(t *testing.T) {
 		Spec: antflyv1.AntflyRestoreSpec{
 			ClusterRef: antflyv1.ClusterReference{Name: "standalone-cluster"},
 			Source: antflyv1.RestoreSource{
-				BackupID: "backup-123",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-123",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 	}
@@ -52,6 +53,15 @@ func TestBuildRestoreJob_StandaloneStillUsesPublicAPIService(t *testing.T) {
 		if arg == "--url" {
 			t.Fatalf("expected restore job to use ANTFLY_URL instead of --url, got args: %#v", args)
 		}
+	}
+	foundConnection := false
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--connection" && args[i+1] == "archive-reader" {
+			foundConnection = true
+		}
+	}
+	if !foundConnection {
+		t.Fatalf("expected named restore connection in args: %#v", args)
 	}
 	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://standalone-cluster-public-api.default.svc.cluster.local" {
 		t.Fatalf("expected restore URL to continue using public-api service in standalone mode, got: %q", got)

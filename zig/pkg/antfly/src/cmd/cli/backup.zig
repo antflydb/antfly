@@ -34,6 +34,7 @@ const BackupArgs = struct {
     url: ?[]const u8 = null,
     output: ?[]const u8 = null,
     out_path: ?[]const u8 = null,
+    connection: ?[]const u8 = null,
     list_backups: bool = false,
 };
 
@@ -48,6 +49,7 @@ const RestoreArgs = struct {
     restore_mode: ?[]const u8 = null,
     url: ?[]const u8 = null,
     input_path: ?[]const u8 = null,
+    connection: ?[]const u8 = null,
 };
 
 const InputRestorePlan = struct {
@@ -103,7 +105,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
             break :blk out_plan.?.backup_id;
         } else opts.backup_id orelse cli.fatal("--backup-id is required", .{});
         const location = if (out_plan) |plan| plan.location else opts.location;
-        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .format = selected_format });
+        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .connection = opts.connection, .format = selected_format });
         if (out_plan) |plan| {
             validatePortableOutputFile(allocator, io, plan.out_path) catch |err| switch (err) {
                 error.EmptyPortableOutput => cli.fatal("portable backup completed but local --out file is empty: {s}", .{plan.out_path}),
@@ -132,6 +134,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     var resp = try client.clusterBackup(.{
         .backup_id = bid,
         .location = opts.location,
+        .connection = opts.connection,
         .table_names = table_names,
     });
     defer resp.deinit();
@@ -176,7 +179,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
     if (opts.table_name) |tbl| {
-        try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .format = opts.format });
+        try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = opts.connection, .format = opts.format });
         std.debug.print("Restore command successfully initiated.\n", .{});
         return;
     }
@@ -194,6 +197,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     var resp = try client.clusterRestore(.{
         .backup_id = bid,
         .location = opts.location,
+        .connection = opts.connection,
         .table_names = table_names,
         .restore_mode = opts.restore_mode,
     });
@@ -247,6 +251,8 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
             out.backup_id = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--location")) {
             out.location = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--connection")) {
+            out.connection = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--format")) {
             out.format = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--url")) {
@@ -278,6 +284,8 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
         } else if (std.mem.eql(u8, arg, "--location")) {
             out.location = try nextRequired(args);
             out.location_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--connection")) {
+            out.connection = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--format")) {
             out.format = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--mode")) {
@@ -317,9 +325,9 @@ fn defaultLiteInputRestoreLocationAlloc(allocator: std.mem.Allocator) ![]u8 {
 fn printBackupUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly backup --table <name> --backup-id <id> [--location <uri>] [--format native|portable] [--url <url>]
+        \\  antfly backup --table <name> --backup-id <id> [--location <uri>] [--connection <id>] [--format native|portable] [--url <url>]
         \\  antfly backup --table <name> --format portable --out <backup.afb> [--url <url>]
-        \\  antfly backup --tables <a,b> --backup-id <id> [--location <uri>] [--url <url>]
+        \\  antfly backup --tables <a,b> --backup-id <id> [--location <uri>] [--connection <id>] [--url <url>]
         \\  antfly backup --list [--location <uri>] [--output json] [--url <url>]
         \\
         \\notes:
@@ -331,8 +339,8 @@ fn printBackupUsage() void {
 fn printRestoreUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly restore --table <name> --backup-id <id> [--location <uri>] [--format native|portable] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> [--location <uri>] [--mode <mode>] [--url <url>]
+        \\  antfly restore --table <name> --backup-id <id> [--location <uri>] [--connection <id>] [--format native|portable] [--url <url>]
+        \\  antfly restore --tables <a,b> --backup-id <id> [--location <uri>] [--connection <id>] [--mode <mode>] [--url <url>]
         \\  antfly restore --input <db.aflite|backup.afb> --table <name> [--backup-id <id>] [--location <uri>] [--url <url>]
         \\
         \\notes:

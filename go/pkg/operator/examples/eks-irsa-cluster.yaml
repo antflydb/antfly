@@ -149,3 +149,16 @@ spec:
       "max_shard_size_bytes": 134217728,
       "raft_snapshot_threshold": 10000
     }
+---
+apiVersion: antfly.io/v1
+kind: AntflyBackup
+metadata:
+  name: antfly-eks-daily
+  namespace: antfly-eks-irsa
+spec:
+  clusterRef:
+    name: antfly-eks-irsa-cluster
+  schedule: "0 2 * * *"
+  destination:
+    location: s3://my-antfly-backups/eks-cluster/daily
+    connection: backup-store

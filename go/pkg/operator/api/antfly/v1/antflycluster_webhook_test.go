@@ -1310,6 +1310,47 @@ func TestValidateUpdate_StorageClassImmutable(t *testing.T) {
 	}
 }
 
+func TestValidateUpdate_StorageEngineImmutable(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Storage.Engine = "local"
+
+	updated := old.DeepCopy()
+	updated.Spec.Storage.Engine = "lite"
+	updated.Spec.Storage.LiteFileName = "antfly.aflite"
+
+	err := updated.ValidateUpdate(old)
+	if err == nil || !strings.Contains(err.Error(), "spec.storage.engine") {
+		t.Fatalf("expected storage engine immutability error, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_StorageEngineDefaultEqualsLocal(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Storage.Engine = ""
+
+	updated := old.DeepCopy()
+	updated.Spec.Storage.Engine = "local"
+
+	if err := updated.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected default engine and local to be equivalent, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_LiteFileNameImmutable(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Storage.Engine = "lite"
+	old.Spec.Storage.LiteFileName = ""
+
+	updated := old.DeepCopy()
+	updated.Spec.Storage.Engine = "lite"
+	updated.Spec.Storage.LiteFileName = "production.aflite"
+
+	err := updated.ValidateUpdate(old)
+	if err == nil || !strings.Contains(err.Error(), "spec.storage.liteFileName") {
+		t.Fatalf("expected Lite filename immutability error, got: %v", err)
+	}
+}
+
 func TestValidateUpdate_StorageSizeIncreaseAllowed(t *testing.T) {
 	old := baseCluster()
 	old.Spec.Storage.DataStorage = "1Gi"

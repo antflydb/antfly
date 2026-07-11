@@ -792,6 +792,10 @@ func (r *AntflyClusterReconciler) finalizeDataNodeShutdown(ctx context.Context, 
 const (
 	// annotationDefaultTopologySpread tracks whether the operator applied default topology spread
 	annotationDefaultTopologySpread = "antfly.io/default-topology-spread"
+	// These annotations are a durable guard against changing the on-disk format
+	// when admission webhooks are unavailable or bypassed.
+	annotationStorageEngine = "antfly.io/storage-engine"
+	annotationLiteFileName  = "antfly.io/lite-file-name"
 )
 
 type topologyMode string
@@ -815,6 +819,52 @@ func effectiveTopologyMode(cluster *antflyv1.AntflyCluster) topologyMode {
 
 func isStandaloneMode(cluster *antflyv1.AntflyCluster) bool {
 	return effectiveTopologyMode(cluster) == topologyModeStandalone
+}
+
+func standaloneStorageIdentity(cluster *antflyv1.AntflyCluster) (engine, liteFileName string) {
+	engine = cluster.Spec.Storage.Engine
+	if engine == "" {
+		engine = "local"
+	}
+	if engine == "lite" {
+		liteFileName = cluster.Spec.Storage.LiteFileName
+		if liteFileName == "" {
+			liteFileName = "antfly.aflite"
+		}
+	}
+	return engine, liteFileName
+}
+
+func validateAndSetStandaloneStorageIdentity(statefulSet *appsv1.StatefulSet, cluster *antflyv1.AntflyCluster) error {
+	engine, liteFileName := standaloneStorageIdentity(cluster)
+	if statefulSet.ResourceVersion != "" {
+		persistedEngine, ok := statefulSet.Annotations[annotationStorageEngine]
+		if !ok {
+			return fmt.Errorf("existing StatefulSet %s is missing storage identity annotation %q; refusing to guess its on-disk format", statefulSet.Name, annotationStorageEngine)
+		}
+		if persistedEngine != engine {
+			return fmt.Errorf("storage engine migration requires backup and restore: existing StatefulSet %s uses %q, requested %q", statefulSet.Name, persistedEngine, engine)
+		}
+		if engine == "lite" {
+			persistedFileName, ok := statefulSet.Annotations[annotationLiteFileName]
+			if !ok {
+				return fmt.Errorf("existing Lite StatefulSet %s is missing storage identity annotation %q; refusing to guess its database file", statefulSet.Name, annotationLiteFileName)
+			}
+			if persistedFileName != liteFileName {
+				return fmt.Errorf("Lite filename migration requires backup and restore: existing StatefulSet %s uses %q, requested %q", statefulSet.Name, persistedFileName, liteFileName)
+			}
+		}
+	}
+	if statefulSet.Annotations == nil {
+		statefulSet.Annotations = make(map[string]string)
+	}
+	statefulSet.Annotations[annotationStorageEngine] = engine
+	if engine == "lite" {
+		statefulSet.Annotations[annotationLiteFileName] = liteFileName
+	} else {
+		delete(statefulSet.Annotations, annotationLiteFileName)
+	}
+	return nil
 }
 
 func shouldCancelDataScaleDown(status *antflyv1.DataScaleDownStatus, currentReplicas, desiredReplicas int32) bool {
@@ -2569,6 +2619,9 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
+		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
+			return err
+		}
 		if err := controllerutil.SetControllerReference(cluster, statefulSet, r.Scheme); err != nil {
 			return err
 		}

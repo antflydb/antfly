@@ -642,6 +642,38 @@ Attempted change: "%s"`,
 			oldMode, newMode))
 	}
 
+	oldStorageEngine := effectiveStorageEngine(old.Spec.Storage)
+	newStorageEngine := effectiveStorageEngine(r.Spec.Storage)
+	if newStorageEngine != oldStorageEngine {
+		errors = append(errors, fmt.Sprintf(
+			`field 'spec.storage.engine' is immutable after deployment
+
+Problem: Changing the storage engine changes the on-disk format. Restarting the existing workload with a different engine can make its data inaccessible or initialize an empty database.
+
+Solution: Back up the cluster, create a new cluster with the desired storage engine, and restore the backup.
+
+Current value: "%s"
+Attempted change: "%s"`,
+			oldStorageEngine, newStorageEngine))
+	}
+
+	if oldStorageEngine == "lite" && newStorageEngine == "lite" {
+		oldFileName := effectiveLiteFileName(old.Spec.Storage)
+		newFileName := effectiveLiteFileName(r.Spec.Storage)
+		if newFileName != oldFileName {
+			errors = append(errors, fmt.Sprintf(
+				`field 'spec.storage.liteFileName' is immutable after deployment
+
+Problem: Changing the Lite filename points the workload at a different database file and can initialize an empty database.
+
+Solution: Use backup and restore to migrate to a differently named Lite file.
+
+Current value: "%s"
+Attempted change: "%s"`,
+				oldFileName, newFileName))
+		}
+	}
+
 	// Check if both old and new have GKE config
 	if r.Spec.GKE != nil && old.Spec.GKE != nil {
 		// Check Autopilot mode immutability
@@ -798,6 +830,20 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 	}
 
 	return nil
+}
+
+func effectiveStorageEngine(storage StorageSpec) string {
+	if storage.Engine == "" {
+		return "local"
+	}
+	return storage.Engine
+}
+
+func effectiveLiteFileName(storage StorageSpec) string {
+	if storage.LiteFileName == "" {
+		return "antfly.aflite"
+	}
+	return storage.LiteFileName
 }
 
 // validatePublicAPIConfig validates PublicAPI configuration

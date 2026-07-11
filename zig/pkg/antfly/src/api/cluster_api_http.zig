@@ -15,6 +15,7 @@
 const std = @import("std");
 const backups_api = @import("backups.zig");
 const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("../common/config.zig");
 
 pub const ClusterApi = struct {
     ptr: *anyopaque,
@@ -119,13 +120,19 @@ pub fn handleClusterBackup(
     body: []const u8,
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
 ) !OwnedResponse {
     var req = backups_api.parseClusterBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     };
     defer backups_api.freeClusterBackupRequest(alloc, &req);
 
-    var location = backups_api.openBackupLocationWithSecrets(alloc, req.location, secret_store) catch |err| {
+    var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = req.connection,
+        .required_capability = "backup.write",
+    }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -146,13 +153,19 @@ pub fn handleClusterRestore(
     body: []const u8,
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
 ) !OwnedResponse {
     var req = backups_api.parseClusterRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
     defer backups_api.freeClusterRestoreRequest(alloc, &req);
 
-    var location = backups_api.openBackupLocationWithSecrets(alloc, req.location, secret_store) catch |err| {
+    var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = req.connection,
+        .required_capability = "restore.read",
+    }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }

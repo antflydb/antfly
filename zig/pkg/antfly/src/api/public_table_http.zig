@@ -19,6 +19,7 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const query_contract = @import("query_contract.zig");
 
@@ -679,6 +680,7 @@ pub fn handleTableBackup(
     body: []const u8,
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
@@ -689,7 +691,12 @@ pub fn handleTableBackup(
         return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") };
     };
 
-    var location = backups_api.openBackupLocationWithSecrets(alloc, parsed_req.value.location, secret_store) catch |err| {
+    var location = backups_api.openBackupLocationWithOptions(alloc, parsed_req.value.location, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = parsed_req.value.connection,
+        .required_capability = "backup.write",
+    }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -724,13 +731,19 @@ pub fn handleTableRestore(
     body: []const u8,
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
     defer parsed_req.deinit();
 
-    var location = backups_api.openBackupLocationWithSecrets(alloc, parsed_req.value.location, secret_store) catch |err| {
+    var location = backups_api.openBackupLocationWithOptions(alloc, parsed_req.value.location, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = parsed_req.value.connection,
+        .required_capability = "restore.read",
+    }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         }
@@ -2307,6 +2320,7 @@ test "public table backup handler maps unsupported multi-range error" {
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
         Backend.iface(),
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -2356,6 +2370,7 @@ test "public table backup handler accepts portable format" {
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"format\":\"portable\"}",
         backend.iface(),
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -2399,6 +2414,7 @@ test "public table restore handler maps target already exists" {
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
         Backend.iface(),
+        null,
         null,
     );
     defer resp.deinit(std.testing.allocator);

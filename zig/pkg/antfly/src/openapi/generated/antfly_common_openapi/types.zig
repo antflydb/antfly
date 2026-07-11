@@ -95,6 +95,17 @@ pub const CdcConnectionConfig = struct {
     publication_name: ?[]const u8 = null,
 };
 
+pub const CdcConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: []const u8,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    cdc: CdcConnectionConfig,
+};
+
 pub const Config = struct {
     /// Internal version of antfly
     version: ?[]const u8 = null,
@@ -150,18 +161,47 @@ pub const Config = struct {
     chunkers: ?std.json.ArrayHashMap(antfly_chunking_openapi.ChunkerConfig) = null,
 };
 
-pub const ConnectionConfig = struct {
-    /// Optional display name for UIs.
-    display_name: ?[]const u8 = null,
-    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
-    provider: ?[]const u8 = null,
-    kind: ConnectionKind,
-    /// Namespaced actions and workflow uses this connection supports.
-    capabilities: []const []const u8,
-    inference: ?InferenceConnectionConfig = null,
-    web_search: ?WebSearchConnectionConfig = null,
-    external_io: ?ExternalIoConnectionConfig = null,
-    cdc: ?CdcConnectionConfig = null,
+pub const ConnectionConfig = union(enum) {
+    inference_connection_variant: InferenceConnectionVariant,
+    web_search_connection_variant: WebSearchConnectionVariant,
+    external_io_connection_variant: ExternalIoConnectionVariant,
+    cdc_connection_variant: CdcConnectionVariant,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("kind") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "inference")) {
+            return .{ .inference_connection_variant = try std.json.parseFromValueLeaky(InferenceConnectionVariant, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "web_search")) {
+            return .{ .web_search_connection_variant = try std.json.parseFromValueLeaky(WebSearchConnectionVariant, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "external_io")) {
+            return .{ .external_io_connection_variant = try std.json.parseFromValueLeaky(ExternalIoConnectionVariant, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "cdc")) {
+            return .{ .cdc_connection_variant = try std.json.parseFromValueLeaky(CdcConnectionVariant, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .inference_connection_variant => |v| try jw.write(v),
+            .web_search_connection_variant => |v| try jw.write(v),
+            .external_io_connection_variant => |v| try jw.write(v),
+            .cdc_connection_variant => |v| try jw.write(v),
+        }
+    }
 };
 
 /// Broad physical category for a configured connection.
@@ -219,6 +259,17 @@ pub const ExternalIoConnectionConfig = struct {
     use_ssl: ?bool = null,
 };
 
+pub const ExternalIoConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: []const u8,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    external_io: ExternalIoConnectionConfig,
+};
+
 /// External IO transport protocol.
 pub const ExternalIoProtocol = enum {
     s3,
@@ -270,6 +321,17 @@ pub const InferenceConnectionConfig = struct {
     names: ?[]const []const u8 = null,
     /// Model types this connection is configured to serve.
     configured_model_types: ?[]const []const u8 = null,
+};
+
+pub const InferenceConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: []const u8,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    inference: InferenceConnectionConfig,
 };
 
 pub const LiteStorageConfig = struct {
@@ -432,4 +494,15 @@ pub const WebSearchConnectionConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains when provider supports it.
     exclude_domains: ?[]const []const u8 = null,
+};
+
+pub const WebSearchConnectionVariant = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Optional provider-level service identity.
+    provider: ?[]const u8 = null,
+    kind: []const u8,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    web_search: WebSearchConnectionConfig,
 };

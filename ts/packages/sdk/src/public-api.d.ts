@@ -4628,6 +4628,12 @@ export interface components {
              */
             location: string;
             /**
+             * @description Optional ID of a configured `external_io` connection. S3 backups require
+             *     the `backup.write` capability; restores require `restore.read`. The
+             *     location bucket and prefix must be within the connection's allowlist.
+             */
+            connection?: string;
+            /**
              * @description Backup format to use:
              *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
              *     - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend)
@@ -4656,6 +4662,8 @@ export interface components {
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
              */
             location: string;
+            /** @description Optional configured `external_io` connection with the `backup.write` capability. */
+            connection?: string;
             /**
              * @description Backup format to use:
              *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
@@ -4717,6 +4725,8 @@ export interface components {
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
              */
             location: string;
+            /** @description Optional configured `external_io` connection with the `restore.read` capability. */
+            connection?: string;
             /**
              * @description Optional list of tables to restore. If omitted, all tables in the backup are restored.
              * @example [

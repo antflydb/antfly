@@ -877,7 +877,10 @@ pub const SessionLeaseStore = struct {
 };
 
 pub const SessionRegistry = struct {
+    const session_lock_count = 64;
+
     mutex: AtomicMutex = .{},
+    session_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
     sessions: std.AutoHashMapUnmanaged(db_mod.types.TxnId, Session) = .empty,
     durable: ?*DurableSessionStore = null,
     lease_store: ?SessionLeaseStore = null,
@@ -959,10 +962,23 @@ pub const SessionRegistry = struct {
     }
 
     pub fn stage(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest) !?SessionInfo {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
         self.mutex.lock();
-        defer self.mutex.unlock();
-        const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
-        var candidate = try current.clone(alloc);
+        const current = self.loadIntoCacheLocked(alloc, txn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        } orelse {
+            self.mutex.unlock();
+            return null;
+        };
+        var candidate = current.clone(alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
         errdefer candidate.deinit(alloc);
         if (candidate.staged == null) {
             candidate.staged = try req.clone(alloc);
@@ -971,8 +987,13 @@ pub const SessionRegistry = struct {
         }
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistAndPublishLocked(alloc, current, &candidate);
-        return current.info();
+        try self.persistLocked(candidate);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        return publish_target.info();
     }
 
     pub fn getReadSnapshot(
@@ -995,10 +1016,23 @@ pub const SessionRegistry = struct {
         req: *const OwnedTransactionCommitRequest,
         snapshot: StageReadSnapshot,
     ) !?SessionInfo {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
         self.mutex.lock();
-        defer self.mutex.unlock();
-        const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
-        var candidate = try current.clone(alloc);
+        const current = self.loadIntoCacheLocked(alloc, txn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        } orelse {
+            self.mutex.unlock();
+            return null;
+        };
+        var candidate = current.clone(alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
         errdefer candidate.deinit(alloc);
         try upsertReadSnapshot(alloc, &candidate.read_snapshots, snapshot);
         if (candidate.staged == null) {
@@ -1008,8 +1042,13 @@ pub const SessionRegistry = struct {
         }
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistAndPublishLocked(alloc, current, &candidate);
-        return current.info();
+        try self.persistLocked(candidate);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        return publish_target.info();
     }
 
     pub fn cloneCommitRequest(
@@ -1018,6 +1057,9 @@ pub const SessionRegistry = struct {
         txn_id: db_mod.types.TxnId,
         extra_req: ?*const OwnedTransactionCommitRequest,
     ) !?OwnedTransactionCommitRequest {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
         self.mutex.lock();
         defer self.mutex.unlock();
         const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
@@ -1042,6 +1084,9 @@ pub const SessionRegistry = struct {
     }
 
     pub fn createSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SavepointInfo {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
         self.mutex.lock();
         defer self.mutex.unlock();
         const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
@@ -1072,6 +1117,9 @@ pub const SessionRegistry = struct {
     }
 
     pub fn rollbackToSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
         self.mutex.lock();
         defer self.mutex.unlock();
         const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
@@ -1143,6 +1191,9 @@ pub const SessionRegistry = struct {
     }
 
     pub fn adopt(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.durable == null) return false;
@@ -1168,6 +1219,9 @@ pub const SessionRegistry = struct {
         owner_node_id: u64,
         now_ns: ?u64,
     ) !bool {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.durable == null) return false;
@@ -1186,6 +1240,8 @@ pub const SessionRegistry = struct {
     }
 
     pub fn cleanupExpired(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
+        self.lockAllSessions();
+        defer self.unlockAllSessions();
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -1226,6 +1282,9 @@ pub const SessionRegistry = struct {
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
         self.mutex.lock();
         defer self.mutex.unlock();
         const current = (self.loadIntoCacheLocked(alloc, txn_id) catch return false) orelse return false;
@@ -1241,6 +1300,23 @@ pub const SessionRegistry = struct {
     fn persistAndPublishLocked(self: *SessionRegistry, alloc: std.mem.Allocator, current: *Session, candidate: *Session) !void {
         try self.persistLocked(candidate.*);
         self.publishCandidateLocked(alloc, current, candidate);
+    }
+
+    fn sessionLock(self: *SessionRegistry, txn_id: db_mod.types.TxnId) *AtomicMutex {
+        const hash = std.hash.Wyhash.hash(0, &txn_id);
+        return &self.session_locks[hash % session_lock_count];
+    }
+
+    fn lockAllSessions(self: *SessionRegistry) void {
+        for (&self.session_locks) |*lock| lock.lock();
+    }
+
+    fn unlockAllSessions(self: *SessionRegistry) void {
+        var index = self.session_locks.len;
+        while (index > 0) {
+            index -= 1;
+            self.session_locks[index].unlock();
+        }
     }
 
     fn publishCandidateLocked(self: *SessionRegistry, alloc: std.mem.Allocator, current: *Session, candidate: *Session) void {

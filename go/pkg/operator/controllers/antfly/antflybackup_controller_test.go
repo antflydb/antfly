@@ -266,7 +266,7 @@ func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
 		Spec: antflyv1.AntflyBackupSpec{
 			ClusterRef:  antflyv1.ClusterReference{Name: "my-cluster"},
 			Schedule:    "0 2 * * *",
-			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
+			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups", Connection: "archive-writer"},
 		},
 	}
 	cluster := &antflyv1.AntflyCluster{
@@ -299,6 +299,9 @@ func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
 	// Location should be shell-quoted
 	if !strings.Contains(cmd, "--location 's3://my-bucket/backups'") {
 		t.Errorf("location not properly quoted: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--connection 'archive-writer'") {
+		t.Errorf("named backup connection not passed to CLI: %s", cmd)
 	}
 
 	// $(date ...) should be present for shell expansion

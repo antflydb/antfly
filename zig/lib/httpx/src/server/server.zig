@@ -861,12 +861,23 @@ pub const Server = struct {
             // Gate before accept so we don't hold open sockets while waiting.
             self.waiting_for_connection_permit.store(true, .release);
             if (self.shutdown_mode.load(.acquire) != 0) {
-                self.waiting_for_connection_permit.store(false, .release);
+                // If stop won the announcement handshake it published exactly
+                // one wake permit. Consume that permit before leaving so a
+                // later listen cycle cannot exceed max_connections.
+                if (!self.waiting_for_connection_permit.swap(false, .acq_rel)) {
+                    self.conn_semaphore.waitUncancelable(self.io);
+                }
                 break;
             }
             self.conn_semaphore.waitUncancelable(self.io);
-            self.waiting_for_connection_permit.store(false, .release);
-            if (self.shutdown_mode.load(.acquire) != 0) break;
+            const stop_published_wake = !self.waiting_for_connection_permit.swap(false, .acq_rel);
+            if (self.shutdown_mode.load(.acquire) != 0) {
+                // Without a published wake, the wait consumed a real capacity
+                // permit; restore it. With a wake, the net permit count is
+                // already unchanged even if another permit was also available.
+                if (!stop_published_wake) self.conn_semaphore.post(self.io);
+                break;
+            }
 
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.io);

@@ -385,33 +385,70 @@ components:
         - http
       description: External IO transport protocol.
     ConnectionConfig:
+      discriminator:
+        propertyName: kind
+        mapping:
+          inference: "#/components/schemas/InferenceConnectionVariant"
+          web_search: "#/components/schemas/WebSearchConnectionVariant"
+          external_io: "#/components/schemas/ExternalIoConnectionVariant"
+          cdc: "#/components/schemas/CdcConnectionVariant"
+      oneOf:
+        - $ref: "#/components/schemas/InferenceConnectionVariant"
+        - $ref: "#/components/schemas/WebSearchConnectionVariant"
+        - $ref: "#/components/schemas/ExternalIoConnectionVariant"
+        - $ref: "#/components/schemas/CdcConnectionVariant"
+    InferenceConnectionVariant:
       type: object
       additionalProperties: false
-      required:
-        - kind
-        - capabilities
+      required: [kind, capabilities, inference]
       properties:
-        display_name:
-          type: string
-          description: Optional display name for UIs.
-        provider:
-          type: string
-          description: Provider token for connection kinds that have a provider-level service identity, such as web_search.
-        kind:
-          $ref: "#/components/schemas/ConnectionKind"
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [inference] }
         capabilities:
           type: array
-          items:
-            type: string
+          items: { type: string }
           description: Namespaced actions and workflow uses this connection supports.
-        inference:
-          $ref: "#/components/schemas/InferenceConnectionConfig"
-        web_search:
-          $ref: "#/components/schemas/WebSearchConnectionConfig"
-        external_io:
-          $ref: "#/components/schemas/ExternalIoConnectionConfig"
-        cdc:
-          $ref: "#/components/schemas/CdcConnectionConfig"
+        inference: { $ref: "#/components/schemas/InferenceConnectionConfig" }
+    WebSearchConnectionVariant:
+      type: object
+      additionalProperties: false
+      required: [kind, capabilities, web_search]
+      properties:
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [web_search] }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: Namespaced actions and workflow uses this connection supports.
+        web_search: { $ref: "#/components/schemas/WebSearchConnectionConfig" }
+    ExternalIoConnectionVariant:
+      type: object
+      additionalProperties: false
+      required: [kind, capabilities, external_io]
+      properties:
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [external_io] }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: Namespaced actions and workflow uses this connection supports.
+        external_io: { $ref: "#/components/schemas/ExternalIoConnectionConfig" }
+    CdcConnectionVariant:
+      type: object
+      additionalProperties: false
+      required: [kind, capabilities, cdc]
+      properties:
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [cdc] }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: Namespaced actions and workflow uses this connection supports.
+        cdc: { $ref: "#/components/schemas/CdcConnectionConfig" }
     InferenceConnectionConfig:
       type: object
       additionalProperties: false

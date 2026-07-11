@@ -113,6 +113,12 @@ Examples:
 For GCS: Use s3:// URLs with HMAC credentials and set AWS_ENDPOINT_URL=https://storage.googleapis.com
 in your credentials secret.`, location)
 	}
+	if r.Spec.Destination.Connection != "" && r.Spec.Destination.CredentialsSecret != nil {
+		return fmt.Errorf("spec.destination.connection and spec.destination.credentialsSecret are mutually exclusive")
+	}
+	if r.Spec.Destination.Connection != "" && !strings.HasPrefix(location, "s3://") {
+		return fmt.Errorf("spec.destination.connection requires an s3:// location")
+	}
 
 	// S3 destinations should have credentials (warn if missing, don't error)
 	// The controller will handle credential validation at runtime

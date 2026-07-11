@@ -102,4 +102,8 @@ jobs:
 
       - name: Test with race detector
         working-directory: go/pkg/sdk
+        env:
+          # The race runtime is a CGO-backed build mode even though the SDK's
+          # normal test job deliberately verifies a pure-Go build above.
+          CGO_ENABLED: "1"
         run: GOWORK=off go test -race -count=1 ./...

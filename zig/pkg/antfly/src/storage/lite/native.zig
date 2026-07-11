@@ -22,8 +22,13 @@ const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const fs_paths = @import("../../common/fs_paths.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
+const lsm_backend = @import("../lsm_backend.zig");
+const backend_types = @import("../backend_types.zig");
 
 const Allocator = std.mem.Allocator;
+
+const vacuum_index_batch_keys: usize = 4096;
+const vacuum_index_flush_bytes: u64 = 8 * 1024 * 1024;
 
 pub const magic = "AFLITE\x02N";
 pub const format_version: u32 = 1;
@@ -1308,6 +1313,100 @@ pub const NativeFile = struct {
         allocator.free(refs);
     }
 
+    const VacuumRecordSource = union(enum) {
+        catalog: CatalogRoot,
+        documents,
+    };
+
+    const VacuumLiveIndex = struct {
+        alloc: Allocator,
+        io: std.Io,
+        path: []u8,
+        backend: *lsm_backend.Backend,
+        store: @import("../backend_erased.zig").Store,
+
+        fn deinit(self: *VacuumLiveIndex) void {
+            self.store.deinit();
+            self.backend.close();
+            self.alloc.destroy(self.backend);
+            std.Io.Dir.cwd().deleteTree(self.io, self.path) catch {};
+            self.alloc.free(self.path);
+            self.* = undefined;
+        }
+    };
+
+    fn buildVacuumLiveIndex(self: *NativeFile, source: VacuumRecordSource, suffix: []const u8) !VacuumLiveIndex {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-vacuum-{s}-index", .{ self.path, suffix });
+        errdefer self.allocator.free(path);
+        const io = self.io_impl.io();
+        std.Io.Dir.cwd().deleteTree(io, path) catch {};
+        errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+
+        const backend = try self.allocator.create(lsm_backend.Backend);
+        errdefer self.allocator.destroy(backend);
+        backend.* = try lsm_backend.Backend.open(self.allocator, path, .{
+            .flush_threshold = vacuum_index_batch_keys,
+            .flush_threshold_bytes = vacuum_index_flush_bytes,
+            .compact_threshold_runs = 4,
+            .wal_enabled = false,
+            .foreground_soft_compaction = true,
+        });
+        errdefer backend.close();
+        var store = try backend.runtimeStore(self.allocator, backend_types.Namespace{});
+        errdefer store.deinit();
+
+        var txn = try store.beginWrite();
+        var txn_open = true;
+        errdefer if (txn_open) txn.abort();
+        var pending: usize = 0;
+        var page_id = switch (source) {
+            .catalog => |root| catalogRootPage(self.activeCheckpoint(), root),
+            .documents => self.activeCheckpoint().document_root_page,
+        };
+        while (page_id != 0) {
+            const payload = switch (source) {
+                .catalog => try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog),
+                .documents => try self.readPagePayloadByKindAlloc(self.allocator, page_id, .document),
+            };
+            defer self.allocator.free(payload);
+            const record = switch (source) {
+                .catalog => blk: {
+                    const entry = try decodeCatalogEntry(payload);
+                    break :blk .{ entry.key, entry.is_delete, entry.previous_page };
+                },
+                .documents => blk: {
+                    const entry = try decodeDocumentEntry(payload);
+                    break :blk .{ entry.key, entry.is_delete, entry.previous_page };
+                },
+            };
+            const key = record[0];
+            const is_delete = record[1];
+            const previous_page = record[2];
+            _ = txn.get(key) catch |err| switch (err) {
+                error.NotFound => blk: {
+                    var encoded: [9]u8 = undefined;
+                    encoded[0] = @intFromBool(is_delete);
+                    std.mem.writeInt(u64, encoded[1..9], page_id, .little);
+                    try txn.put(key, &encoded);
+                    pending += 1;
+                    break :blk &encoded;
+                },
+                else => return err,
+            };
+            if (pending >= vacuum_index_batch_keys) {
+                try txn.commit();
+                txn_open = false;
+                txn = try store.beginWrite();
+                txn_open = true;
+                pending = 0;
+            }
+            page_id = previous_page;
+        }
+        try txn.commit();
+        txn_open = false;
+        return .{ .alloc = self.allocator, .io = io, .path = path, .backend = backend, .store = store };
+    }
+
     const NamespaceDirectory = std.StringHashMapUnmanaged(u64);
     const NamespaceDirectoryRecordKind = enum(u8) {
         snapshot = 0,
@@ -1729,6 +1828,115 @@ pub const NativeFile = struct {
         allocator.free(docs);
     }
 
+    fn copyVacuumCatalogRecords(
+        self: *NativeFile,
+        compact_file: std.Io.File,
+        root: CatalogRoot,
+        suffix: []const u8,
+        next_page_id: *u64,
+        destination_root_page: *u64,
+        live_bytes: *u64,
+    ) !usize {
+        var index = try self.buildVacuumLiveIndex(.{ .catalog = root }, suffix);
+        defer index.deinit();
+        var read = try index.store.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+
+        const io = self.io_impl.io();
+        const page_size: usize = @intCast(self.header.page_size);
+        var count: usize = 0;
+        var maybe_entry = try cursor.first();
+        while (maybe_entry) |record| : (maybe_entry = try cursor.next()) {
+            if (record.value.len != 9) return error.InvalidVacuumIndex;
+            if (record.value[0] != 0) continue;
+            const source_page_id = std.mem.readInt(u64, record.value[1..9], .little);
+            const source_payload = try self.readPagePayloadByKindAlloc(self.allocator, source_page_id, .catalog);
+            defer self.allocator.free(source_payload);
+            const source_entry = try decodeCatalogEntry(source_payload);
+            if (!std.mem.eql(u8, source_entry.key, record.key) or source_entry.is_delete) return error.InvalidNativePageChain;
+            const value = try self.catalogEntryValueAlloc(self.allocator, source_entry);
+            defer self.allocator.free(value);
+            const external_value_root_page = if (value.len == 0 or self.catalogEntryFitsInline(record.key, value))
+                0
+            else
+                try appendValuePagesToFile(self.allocator, compact_file, io, page_size, self.maxValuePagePayloadBytes(), next_page_id, value);
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntry(self.allocator, &payload, .{
+                .previous_page = destination_root_page.*,
+                .key = record.key,
+                .value = value,
+                .external_value_root_page = external_value_root_page,
+            });
+            destination_root_page.* = try appendPageToFile(self.allocator, compact_file, io, page_size, next_page_id, .catalog, payload.items);
+            live_bytes.* +|= record.key.len + value.len;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn copyVacuumDocumentRecords(
+        self: *NativeFile,
+        compact_file: std.Io.File,
+        next_page_id: *u64,
+        document_root_page: *u64,
+        namespace_directory: *NamespaceDirectory,
+        live_bytes: *u64,
+    ) !usize {
+        var index = try self.buildVacuumLiveIndex(.documents, "documents");
+        defer index.deinit();
+        var read = try index.store.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+
+        const io = self.io_impl.io();
+        const page_size: usize = @intCast(self.header.page_size);
+        var count: usize = 0;
+        var maybe_entry = try cursor.first();
+        while (maybe_entry) |record| : (maybe_entry = try cursor.next()) {
+            if (record.value.len != 9) return error.InvalidVacuumIndex;
+            if (record.value[0] != 0) continue;
+            const source_page_id = std.mem.readInt(u64, record.value[1..9], .little);
+            const source_payload = try self.readPagePayloadByKindAlloc(self.allocator, source_page_id, .document);
+            defer self.allocator.free(source_payload);
+            const source_entry = try decodeDocumentEntry(source_payload);
+            if (!std.mem.eql(u8, source_entry.key, record.key) or source_entry.is_delete) return error.InvalidNativePageChain;
+            const value = try self.documentEntryValueAlloc(self.allocator, source_entry);
+            defer self.allocator.free(value);
+            const external_value_root_page = if (self.documentEntryFitsInline(record.key, value))
+                0
+            else
+                try appendValuePagesToFile(self.allocator, compact_file, io, page_size, self.maxValuePagePayloadBytes(), next_page_id, value);
+            const namespace = documentNamespace(record.key);
+            const previous_namespace_page = namespace_directory.get(namespace) orelse 0;
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeDocumentEntry(self.allocator, &payload, .{
+                .previous_page = document_root_page.*,
+                .previous_namespace_page = previous_namespace_page,
+                .key = record.key,
+                .value = value,
+                .external_value_root_page = external_value_root_page,
+            });
+            document_root_page.* = try appendPageToFile(self.allocator, compact_file, io, page_size, next_page_id, .document, payload.items);
+            if (namespace_directory.getPtr(namespace)) |head| {
+                head.* = document_root_page.*;
+            } else {
+                const owned_namespace = try self.allocator.dupe(u8, namespace);
+                namespace_directory.put(self.allocator, owned_namespace, document_root_page.*) catch |err| {
+                    self.allocator.free(owned_namespace);
+                    return err;
+                };
+            }
+            live_bytes.* +|= record.key.len + value.len;
+            count += 1;
+        }
+        return count;
+    }
+
     pub fn vacuum(self: *NativeFile) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
 
@@ -1760,106 +1968,10 @@ pub const NativeFile = struct {
         var namespace_directory = NamespaceDirectory.empty;
         defer deinitNamespaceDirectory(self.allocator, &namespace_directory);
 
-        {
-            const catalog_records = try self.snapshotCatalogRefsFromRootAlloc(self.allocator, .metadata);
-            defer freeLiveRecordRefs(self.allocator, catalog_records);
-            live_record_count += catalog_records.len;
-            for (catalog_records) |record| {
-                const source_payload = try self.readPagePayloadByKindAlloc(self.allocator, record.page_id, .catalog);
-                defer self.allocator.free(source_payload);
-                const source_entry = try decodeCatalogEntry(source_payload);
-                if (!std.mem.eql(u8, source_entry.key, record.key) or source_entry.is_delete) return error.InvalidNativePageChain;
-                const value = try self.catalogEntryValueAlloc(self.allocator, source_entry);
-                defer self.allocator.free(value);
-                const external_value_root_page = if (value.len == 0 or self.catalogEntryFitsInline(record.key, value))
-                    0
-                else
-                    try appendValuePagesToFile(self.allocator, compact_file, io, page_size, self.maxValuePagePayloadBytes(), &next_page_id, value);
-
-                var payload = std.ArrayListUnmanaged(u8).empty;
-                defer payload.deinit(self.allocator);
-                try encodeCatalogEntry(self.allocator, &payload, .{
-                    .previous_page = catalog_root_page,
-                    .key = record.key,
-                    .value = value,
-                    .external_value_root_page = external_value_root_page,
-                });
-                catalog_root_page = try appendPageToFile(self.allocator, compact_file, io, page_size, &next_page_id, .catalog, payload.items);
-                live_bytes +|= record.key.len + value.len;
-            }
-        }
-
-        {
-            const index_catalog_records = try self.snapshotCatalogRefsFromRootAlloc(self.allocator, .index);
-            defer freeLiveRecordRefs(self.allocator, index_catalog_records);
-            live_record_count += index_catalog_records.len;
-            for (index_catalog_records) |record| {
-                const source_payload = try self.readPagePayloadByKindAlloc(self.allocator, record.page_id, .catalog);
-                defer self.allocator.free(source_payload);
-                const source_entry = try decodeCatalogEntry(source_payload);
-                if (!std.mem.eql(u8, source_entry.key, record.key) or source_entry.is_delete) return error.InvalidNativePageChain;
-                const value = try self.catalogEntryValueAlloc(self.allocator, source_entry);
-                defer self.allocator.free(value);
-                const external_value_root_page = if (value.len == 0 or self.catalogEntryFitsInline(record.key, value))
-                    0
-                else
-                    try appendValuePagesToFile(self.allocator, compact_file, io, page_size, self.maxValuePagePayloadBytes(), &next_page_id, value);
-
-                var payload = std.ArrayListUnmanaged(u8).empty;
-                defer payload.deinit(self.allocator);
-                try encodeCatalogEntry(self.allocator, &payload, .{
-                    .previous_page = index_catalog_root_page,
-                    .key = record.key,
-                    .value = value,
-                    .external_value_root_page = external_value_root_page,
-                });
-                index_catalog_root_page = try appendPageToFile(self.allocator, compact_file, io, page_size, &next_page_id, .catalog, payload.items);
-                live_bytes +|= record.key.len + value.len;
-            }
-        }
-
-        var document_count: usize = 0;
-        {
-            const docs = try self.snapshotDocumentRefsAlloc(self.allocator);
-            defer freeLiveRecordRefs(self.allocator, docs);
-            document_count = docs.len;
-            live_record_count += docs.len;
-            for (docs) |doc| {
-                const source_payload = try self.readPagePayloadByKindAlloc(self.allocator, doc.page_id, .document);
-                defer self.allocator.free(source_payload);
-                const source_entry = try decodeDocumentEntry(source_payload);
-                if (!std.mem.eql(u8, source_entry.key, doc.key) or source_entry.is_delete) return error.InvalidNativePageChain;
-                const value = try self.documentEntryValueAlloc(self.allocator, source_entry);
-                defer self.allocator.free(value);
-                const external_value_root_page = if (self.documentEntryFitsInline(doc.key, value))
-                    0
-                else
-                    try appendValuePagesToFile(self.allocator, compact_file, io, page_size, self.maxValuePagePayloadBytes(), &next_page_id, value);
-
-                var payload = std.ArrayListUnmanaged(u8).empty;
-                defer payload.deinit(self.allocator);
-                const namespace = documentNamespace(doc.key);
-                const previous_namespace_page = namespace_directory.get(namespace) orelse 0;
-                try encodeDocumentEntry(self.allocator, &payload, .{
-                    .previous_page = document_root_page,
-                    .previous_namespace_page = previous_namespace_page,
-                    .key = doc.key,
-                    .value = value,
-                    .external_value_root_page = external_value_root_page,
-                });
-                document_root_page = try appendPageToFile(self.allocator, compact_file, io, page_size, &next_page_id, .document, payload.items);
-                if (namespace_directory.getPtr(namespace)) |head| {
-                    head.* = document_root_page;
-                } else {
-                    const owned_namespace = try self.allocator.dupe(u8, namespace);
-                    namespace_directory.put(self.allocator, owned_namespace, document_root_page) catch |err| {
-                        self.allocator.free(owned_namespace);
-                        return err;
-                    };
-                }
-                live_bytes +|= doc.key.len + value.len;
-            }
-        }
+        live_record_count += try self.copyVacuumCatalogRecords(compact_file, .metadata, "metadata", &next_page_id, &catalog_root_page, &live_bytes);
+        live_record_count += try self.copyVacuumCatalogRecords(compact_file, .index, "indexes", &next_page_id, &index_catalog_root_page, &live_bytes);
+        const document_count = try self.copyVacuumDocumentRecords(compact_file, &next_page_id, &document_root_page, &namespace_directory, &live_bytes);
+        live_record_count += document_count;
 
         if (document_count > 0) {
             const encoded_directory = try encodeNamespaceDirectoryAlloc(self.allocator, .snapshot, &namespace_directory);

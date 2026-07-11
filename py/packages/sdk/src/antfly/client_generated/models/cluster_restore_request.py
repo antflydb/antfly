@@ -20,6 +20,7 @@ class ClusterRestoreRequest:
              Example: cluster-backup-2025-01-15.
         location (str): Storage location where the backup is stored.
              Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
+        connection (str | Unset): Optional configured `external_io` connection with the `restore.read` capability.
         table_names (list[str] | Unset): Optional list of tables to restore. If omitted, all tables in the backup are
             restored.
              Example: ['users', 'products'].
@@ -32,6 +33,7 @@ class ClusterRestoreRequest:
 
     backup_id: str
     location: str
+    connection: str | Unset = UNSET
     table_names: list[str] | Unset = UNSET
     restore_mode: ClusterRestoreRequestRestoreMode | Unset = ClusterRestoreRequestRestoreMode.FAIL_IF_EXISTS
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -40,6 +42,8 @@ class ClusterRestoreRequest:
         backup_id = self.backup_id
 
         location = self.location
+
+        connection = self.connection
 
         table_names: list[str] | Unset = UNSET
         if not isinstance(self.table_names, Unset):
@@ -57,6 +61,8 @@ class ClusterRestoreRequest:
                 "location": location,
             }
         )
+        if connection is not UNSET:
+            field_dict["connection"] = connection
         if table_names is not UNSET:
             field_dict["table_names"] = table_names
         if restore_mode is not UNSET:
@@ -71,6 +77,8 @@ class ClusterRestoreRequest:
 
         location = d.pop("location")
 
+        connection = d.pop("connection", UNSET)
+
         table_names = cast(list[str], d.pop("table_names", UNSET))
 
         _restore_mode = d.pop("restore_mode", UNSET)
@@ -83,6 +91,7 @@ class ClusterRestoreRequest:
         cluster_restore_request = cls(
             backup_id=backup_id,
             location=location,
+            connection=connection,
             table_names=table_names,
             restore_mode=restore_mode,
         )

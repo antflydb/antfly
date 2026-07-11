@@ -229,10 +229,13 @@ availability contract avoids calling a stop-the-world file rewrite "online".
 Checkpoint inspection, index writes, document commits, compaction, and vacuum
 share the Lite store mutex and FIFO writer admission gate, so blocked writers
 sleep without polling and resume in arrival order. Maintenance cannot
-race checkpoint publication or file replacement. Vacuum keeps only live keys
-and source page references for one logical record class at a time, with no
-fixed distinct-key ceiling. It reads one live value at a time and streams
-compact pages to the replacement file. It therefore avoids a
+race checkpoint publication or file replacement. Vacuum builds a temporary,
+disk-backed LSM live-key index for one logical record class at a time. The
+newest record wins, tombstones suppress older values, and a bounded mutable
+batch is flushed to sorted runs. It then streams the ordered live references,
+values, and replacement pages, so heap use does not scale with the number of
+distinct keys. Temporary index directories are removed on success and error.
+This also avoids a
 second whole-database value snapshot and a whole-file output image in memory;
 the replacement is fsynced, atomically renamed, and adopted through its
 already-open read/write handle before the parent directory is fsynced. A

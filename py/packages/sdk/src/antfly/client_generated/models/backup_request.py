@@ -25,6 +25,9 @@ class BackupRequest:
 
             The backup includes all table data, indexes, and metadata for the specified table.
              Example: s3://mybucket/antfly-backups/users-table/2025-01-15.
+        connection (str | Unset): Optional ID of a configured `external_io` connection. S3 backups require
+            the `backup.write` capability; restores require `restore.read`. The
+            location bucket and prefix must be within the connection's allowlist.
         format_ (BackupRequestFormat | Unset): Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
@@ -36,6 +39,7 @@ class BackupRequest:
 
     backup_id: str
     location: str
+    connection: str | Unset = UNSET
     format_: BackupRequestFormat | Unset = BackupRequestFormat.PORTABLE
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -43,6 +47,8 @@ class BackupRequest:
         backup_id = self.backup_id
 
         location = self.location
+
+        connection = self.connection
 
         format_: str | Unset = UNSET
         if not isinstance(self.format_, Unset):
@@ -56,6 +62,8 @@ class BackupRequest:
                 "location": location,
             }
         )
+        if connection is not UNSET:
+            field_dict["connection"] = connection
         if format_ is not UNSET:
             field_dict["format"] = format_
 
@@ -68,6 +76,8 @@ class BackupRequest:
 
         location = d.pop("location")
 
+        connection = d.pop("connection", UNSET)
+
         _format_ = d.pop("format", UNSET)
         format_: BackupRequestFormat | Unset
         if isinstance(_format_, Unset):
@@ -78,6 +88,7 @@ class BackupRequest:
         backup_request = cls(
             backup_id=backup_id,
             location=location,
+            connection=connection,
             format_=format_,
         )
 

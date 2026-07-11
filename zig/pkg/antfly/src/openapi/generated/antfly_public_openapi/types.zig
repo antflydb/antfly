@@ -576,6 +576,8 @@ pub const BackupRequest = struct {
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
+    /// Optional ID of a configured `external_io` connection. S3 backups require the `backup.write` capability; restores require `restore.read`. The location bucket and prefix must be within the connection's allowlist.
+    connection: ?[]const u8 = null,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
 };
@@ -675,6 +677,8 @@ pub const ClusterBackupRequest = struct {
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
+    /// Optional configured `external_io` connection with the `backup.write` capability.
+    connection: ?[]const u8 = null,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
     /// Optional list of tables to backup. If omitted, all tables are backed up.
@@ -801,6 +805,8 @@ pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
     /// Storage location where the backup is stored.
     location: []const u8,
+    /// Optional configured `external_io` connection with the `restore.read` capability.
+    connection: ?[]const u8 = null,
     /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
     table_names: ?[]const []const u8 = null,
     /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
@@ -2295,6 +2301,8 @@ pub const RestoreRequest = struct {
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
+    /// Optional ID of a configured `external_io` connection. S3 backups require the `backup.write` capability; restores require `restore.read`. The location bucket and prefix must be within the connection's allowlist.
+    connection: ?[]const u8 = null,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
 };

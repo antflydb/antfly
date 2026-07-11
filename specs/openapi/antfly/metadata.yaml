@@ -4524,6 +4524,12 @@ components:
 
             The backup includes all table data, indexes, and metadata for the specified table.
           example: "s3://mybucket/antfly-backups/users-table/2025-01-15"
+        connection:
+          type: string
+          description: |
+            Optional ID of a configured `external_io` connection. S3 backups require
+            the `backup.write` capability; restores require `restore.read`. The
+            location bucket and prefix must be within the connection's allowlist.
         format:
           type: string
           enum: [native, portable]
@@ -4559,6 +4565,9 @@ components:
 
             The backup includes all table data, indexes, and metadata.
           example: "s3://mybucket/antfly-backups/cluster/2025-01-15"
+        connection:
+          type: string
+          description: Optional configured `external_io` connection with the `backup.write` capability.
         format:
           type: string
           enum: [native, portable]
@@ -4632,6 +4641,9 @@ components:
           description: |
             Storage location where the backup is stored.
           example: "s3://mybucket/antfly-backups/cluster/2025-01-15"
+        connection:
+          type: string
+          description: Optional configured `external_io` connection with the `restore.read` capability.
         table_names:
           type: array
           items:

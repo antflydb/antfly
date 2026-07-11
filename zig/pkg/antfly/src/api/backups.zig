@@ -21,6 +21,9 @@ const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
 const tables_api = @import("tables.zig");
 const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("../common/config.zig");
+const bedrock = @import("../inference/bedrock.zig");
+const httpx = @import("httpx");
 const extension_domain = @import("../extensions/mod.zig");
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
@@ -28,11 +31,13 @@ pub const RestoreRequest = metadata_openapi.RestoreRequest;
 pub const ClusterBackupRequest = struct {
     backup_id: []const u8,
     location: []const u8,
+    connection: ?[]const u8 = null,
     table_names: ?[]const []const u8 = null,
 };
 pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
     location: []const u8,
+    connection: ?[]const u8 = null,
     table_names: ?[]const []const u8 = null,
     restore_mode: ?[]const u8 = null,
 };
@@ -110,16 +115,151 @@ pub const BackupLocation = union(enum) {
     }
 };
 
+pub const OpenOptions = struct {
+    secret_store: ?*common_secrets.FileStore = null,
+    node_config: ?*const common_config.Config = null,
+    connection: ?[]const u8 = null,
+    required_capability: []const u8 = "",
+};
+
+const AwsCredentialContext = struct {
+    alloc: std.mem.Allocator,
+    io_impl: std.Io.Threaded,
+    http: httpx.Client,
+    cache: bedrock.CredentialCache = .{},
+    region: []u8,
+    source: bedrock.CredentialSource,
+
+    fn init(alloc: std.mem.Allocator, region: []const u8, source: bedrock.CredentialSource) !AwsCredentialContext {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        return .{
+            .alloc = alloc,
+            .io_impl = io_impl,
+            .http = httpx.Client.init(alloc, io_impl.io()),
+            .region = try alloc.dupe(u8, region),
+            .source = source,
+        };
+    }
+
+    fn deinit(self: *AwsCredentialContext) void {
+        self.cache.deinit(self.alloc);
+        self.http.deinit();
+        self.io_impl.deinit();
+        self.alloc.free(self.region);
+        self.* = undefined;
+    }
+
+    fn provider(self: *AwsCredentialContext) object_storage.S3.CredentialProvider {
+        return .{ .ptr = self, .get_fn = get };
+    }
+
+    fn get(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!object_storage.S3.DynamicCredentials {
+        const self: *AwsCredentialContext = @ptrCast(@alignCast(ptr));
+        const credentials = try self.cache.getForSource(alloc, &self.http, self.region, self.source);
+        return .{
+            .access_key_id = @constCast(credentials.access_key_id),
+            .secret_access_key = @constCast(credentials.secret_access_key),
+            .session_token = if (credentials.session_token) |value| @constCast(value) else null,
+        };
+    }
+};
+
+fn authorizedS3Connection(
+    config: *const common_config.Config,
+    connection_id: []const u8,
+    bucket: []const u8,
+    raw_prefix: []const u8,
+    required_capability: []const u8,
+) !common_config.Config.ExternalIoConnectionConfig {
+    const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .external_io) return error.ConnectionKindMismatch;
+    const external = connection.external_io orelse return error.ConnectionKindMismatch;
+    if (external.protocol != .s3) return error.ConnectionProtocolMismatch;
+    var capability_allowed = false;
+    for (connection.capabilities) |capability| {
+        if (std.mem.eql(u8, capability, required_capability)) {
+            capability_allowed = true;
+            break;
+        }
+    }
+    if (!capability_allowed) return error.ConnectionCapabilityDenied;
+    if (external.buckets.len > 0) {
+        var bucket_allowed = false;
+        for (external.buckets) |allowed| {
+            if (std.mem.eql(u8, allowed, bucket)) {
+                bucket_allowed = true;
+                break;
+            }
+        }
+        if (!bucket_allowed) return error.ConnectionBucketDenied;
+    }
+    if (external.prefix) |scope_raw| {
+        const scope = std.mem.trim(u8, scope_raw, "/");
+        const prefix = std.mem.trim(u8, raw_prefix, "/");
+        if (scope.len > 0 and !(std.mem.eql(u8, scope, prefix) or (prefix.len > scope.len and std.mem.startsWith(u8, prefix, scope) and prefix[scope.len] == '/'))) {
+            return error.ConnectionPrefixDenied;
+        }
+    }
+    return external;
+}
+
+fn s3ConfigForConnection(
+    alloc: std.mem.Allocator,
+    external: common_config.Config.ExternalIoConnectionConfig,
+    credential_context: *?*AwsCredentialContext,
+) !object_storage.S3.Config {
+    const static = external.credentials.source == .static;
+    var cfg = try object_storage.S3.fromEnvAlloc(
+        alloc,
+        external.endpoint,
+        external.use_ssl orelse true,
+        if (static) external.credentials.access_key_id else "dynamic-provider",
+        if (static) external.credentials.secret_access_key else "dynamic-provider",
+        if (static) external.credentials.session_token else null,
+        external.region,
+        switch (external.addressing_style) {
+            .path => .path,
+            .virtual_hosted => .virtual_hosted,
+        },
+    );
+    errdefer cfg.deinit(alloc);
+    if (static) return cfg;
+
+    const source: bedrock.CredentialSource = switch (external.credentials.source) {
+        .default => .default,
+        .static => unreachable,
+        .profile => .{ .profile = .{
+            .name = external.credentials.profile orelse return error.InvalidConnectionCredentials,
+            .shared_credentials_file = external.credentials.shared_credentials_file,
+        } },
+        .web_identity => .{ .web_identity = .{
+            .role_arn = external.credentials.role_arn orelse return error.InvalidConnectionCredentials,
+            .token_file = external.credentials.token_file orelse return error.InvalidConnectionCredentials,
+            .session_name = external.credentials.session_name orelse "antfly-backup",
+            .sts_endpoint = external.credentials.sts_endpoint,
+        } },
+    };
+    const context = try alloc.create(AwsCredentialContext);
+    errdefer alloc.destroy(context);
+    context.* = try AwsCredentialContext.init(alloc, cfg.credentials.region, source);
+    credential_context.* = context;
+    cfg.credential_provider = context.provider();
+    return cfg;
+}
+
 const RemoteBackupStore = struct {
     alloc: std.mem.Allocator,
     client: object_storage.ObjectStorage,
     gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
     s3_client: ?*object_storage.S3.Client = null,
+    credential_context: ?*AwsCredentialContext = null,
     owns_client: bool = true,
+    create_bucket_if_missing: bool = false,
     bucket: []u8,
     prefix: []u8,
 
-    fn initRemoteUri(alloc: std.mem.Allocator, location: []const u8, secret_store: ?*common_secrets.FileStore) !RemoteBackupStore {
+    fn initRemoteUri(alloc: std.mem.Allocator, location: []const u8, options: OpenOptions) !RemoteBackupStore {
         const normalized = try normalizeRemoteLocationAlloc(alloc, location);
         defer alloc.free(normalized);
 
@@ -133,7 +273,7 @@ const RemoteBackupStore = struct {
         return switch (parsed) {
             .file => error.UnsupportedBackupLocation,
             .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix),
-            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix, secret_store),
+            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix, options),
         };
     }
 
@@ -156,28 +296,42 @@ const RemoteBackupStore = struct {
         alloc: std.mem.Allocator,
         bucket: []const u8,
         prefix: []const u8,
-        secret_store: ?*common_secrets.FileStore,
+        options: OpenOptions,
     ) !RemoteBackupStore {
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
-        var overrides = try loadS3SecretOverrides(alloc, secret_store);
-        defer overrides.deinit(alloc);
-        const cfg = try object_storage.S3.fromEnvAlloc(
-            alloc,
-            overrides.endpoint,
-            true,
-            overrides.access_key_id,
-            overrides.secret_access_key,
-            overrides.session_token,
-            overrides.region,
-            .path,
-        );
+        var credential_context: ?*AwsCredentialContext = null;
+        errdefer if (credential_context) |context| {
+            context.deinit();
+            alloc.destroy(context);
+        };
+        var create_bucket_if_missing = false;
+        const cfg = if (options.connection) |connection_id| blk: {
+            const connection = try authorizedS3Connection(options.node_config orelse return error.ConnectionConfigUnavailable, connection_id, bucket, prefix, options.required_capability);
+            create_bucket_if_missing = connection.bucket_provisioning == .create_if_missing;
+            break :blk try s3ConfigForConnection(alloc, connection, &credential_context);
+        } else blk: {
+            var overrides = try loadS3SecretOverrides(alloc, options.secret_store);
+            defer overrides.deinit(alloc);
+            break :blk try object_storage.S3.fromEnvAlloc(
+                alloc,
+                overrides.endpoint,
+                true,
+                overrides.access_key_id,
+                overrides.secret_access_key,
+                overrides.session_token,
+                overrides.region,
+                .path,
+            );
+        };
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
 
         return .{
             .alloc = alloc,
             .client = s3.client(),
             .s3_client = s3,
+            .credential_context = credential_context,
+            .create_bucket_if_missing = create_bucket_if_missing,
             .bucket = try alloc.dupe(u8, bucket),
             .prefix = try alloc.dupe(u8, prefix),
         };
@@ -193,6 +347,7 @@ const RemoteBackupStore = struct {
             .alloc = alloc,
             .client = client,
             .owns_client = false,
+            .create_bucket_if_missing = true,
             .bucket = try alloc.dupe(u8, bucket),
             .prefix = try alloc.dupe(u8, prefix),
         };
@@ -202,13 +357,19 @@ const RemoteBackupStore = struct {
         if (self.owns_client) self.client.deinit();
         if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
         if (self.s3_client) |s3| self.alloc.destroy(s3);
+        if (self.credential_context) |context| {
+            context.deinit();
+            self.alloc.destroy(context);
+        }
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;
     }
 
     fn ensureBucket(self: *RemoteBackupStore) !void {
-        if (!(try self.client.bucketExists(self.bucket))) try self.client.makeBucket(self.bucket);
+        if (try self.client.bucketExists(self.bucket)) return;
+        if (!self.create_bucket_if_missing) return error.BucketNotFound;
+        try self.client.makeBucket(self.bucket);
     }
 
     fn keyAlloc(self: *const RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
@@ -444,11 +605,21 @@ pub fn openBackupLocationWithSecrets(
     location: []const u8,
     secret_store: ?*common_secrets.FileStore,
 ) !BackupLocation {
+    return try openBackupLocationWithOptions(alloc, location, .{ .secret_store = secret_store });
+}
+
+pub fn openBackupLocationWithOptions(
+    alloc: std.mem.Allocator,
+    location: []const u8,
+    options: OpenOptions,
+) !BackupLocation {
     if (std.mem.startsWith(u8, location, "file://")) {
+        if (options.connection != null) return error.ConnectionProtocolMismatch;
         return .{ .file = try alloc.dupe(u8, try parseFileLocation(location)) };
     }
     if (std.mem.startsWith(u8, location, "s3://") or std.mem.startsWith(u8, location, "gs://") or std.mem.startsWith(u8, location, "gcs://")) {
-        return .{ .remote = try RemoteBackupStore.initRemoteUri(alloc, location, secret_store) };
+        if ((std.mem.startsWith(u8, location, "gs://") or std.mem.startsWith(u8, location, "gcs://")) and options.connection != null) return error.ConnectionProtocolMismatch;
+        return .{ .remote = try RemoteBackupStore.initRemoteUri(alloc, location, options) };
     }
     return error.UnsupportedBackupLocation;
 }
@@ -462,6 +633,14 @@ pub fn backupLocationErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingSecretAccessKey => "missing S3-compatible secret; set AWS_SECRET_ACCESS_KEY for s3:// backups",
         error.MissingServiceAccount => "missing GCS auth; set GCS_BEARER_TOKEN, GOOGLE_OAUTH_ACCESS_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, or GOOGLE_APPLICATION_CREDENTIALS for gs:// backups",
         error.MissingProjectId => "missing GCS project id; set GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT for gs:// backups",
+        error.ConnectionConfigUnavailable => "named backup connection is unavailable on this server",
+        error.ConnectionNotFound => "backup connection was not found",
+        error.ConnectionKindMismatch, error.ConnectionProtocolMismatch => "backup connection must be an external_io S3 connection",
+        error.ConnectionCapabilityDenied => "backup connection does not grant the required capability",
+        error.ConnectionBucketDenied => "backup location bucket is outside the connection allowlist",
+        error.ConnectionPrefixDenied => "backup location prefix is outside the connection scope",
+        error.InvalidConnectionCredentials => "backup connection credential configuration is invalid",
+        error.BucketNotFound => "backup bucket does not exist and the connection does not allow provisioning",
         else => null,
     };
 }
@@ -480,6 +659,7 @@ pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !Cl
     return .{
         .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
         .location = try alloc.dupe(u8, parsed.value.location),
+        .connection = if (parsed.value.connection) |value| try alloc.dupe(u8, value) else null,
         .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
     };
 }
@@ -490,6 +670,7 @@ pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !C
     return .{
         .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
         .location = try alloc.dupe(u8, parsed.value.location),
+        .connection = if (parsed.value.connection) |value| try alloc.dupe(u8, value) else null,
         .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
         .restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null,
     };
@@ -1619,6 +1800,7 @@ fn cloneOptionalStringSlice(alloc: std.mem.Allocator, values: ?[]const []const u
 pub fn freeClusterBackupRequest(alloc: std.mem.Allocator, req: *ClusterBackupRequest) void {
     alloc.free(req.backup_id);
     alloc.free(req.location);
+    if (req.connection) |value| alloc.free(value);
     if (req.table_names) |values| freeStringSlice(alloc, values);
     req.* = undefined;
 }
@@ -1626,6 +1808,7 @@ pub fn freeClusterBackupRequest(alloc: std.mem.Allocator, req: *ClusterBackupReq
 pub fn freeClusterRestoreRequest(alloc: std.mem.Allocator, req: *ClusterRestoreRequest) void {
     alloc.free(req.backup_id);
     alloc.free(req.location);
+    if (req.connection) |value| alloc.free(value);
     if (req.table_names) |values| freeStringSlice(alloc, values);
     if (req.restore_mode) |value| alloc.free(value);
     req.* = undefined;
@@ -1932,6 +2115,32 @@ test "backup remote location normalizes gcs alias" {
     const normalized = try normalizeRemoteLocationAlloc(std.testing.allocator, "gcs://bucket/path");
     defer std.testing.allocator.free(normalized);
     try std.testing.expectEqualStrings("gs://bucket/path", normalized);
+}
+
+test "backup connections enforce capability bucket and segment bounded prefix" {
+    const json =
+        \\{
+        \\  "connections": {
+        \\    "archive": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write", "restore.read"],
+        \\      "external_io": {
+        \\        "protocol": "s3",
+        \\        "buckets": ["prod-archive"],
+        \\        "prefix": "tenant-a/backups"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var config = try common_config.Config.parseFromSlice(std.testing.allocator, json);
+    defer config.deinit();
+
+    _ = try authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups/daily", "backup.write");
+    _ = try authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups/daily", "restore.read");
+    try std.testing.expectError(error.ConnectionCapabilityDenied, authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups/daily", "objects.delete"));
+    try std.testing.expectError(error.ConnectionBucketDenied, authorizedS3Connection(&config, "archive", "other", "tenant-a/backups/daily", "backup.write"));
+    try std.testing.expectError(error.ConnectionPrefixDenied, authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups-evil", "backup.write"));
 }
 
 test "derive restore table record returns owned table metadata" {
