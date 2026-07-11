@@ -126,6 +126,7 @@ pub fn runFromIterator(
     defer if (loaded_config) |*cfg| cfg.deinit();
     var configured_uris = try ConfiguredStorageUris.init(alloc, if (loaded_config) |*cfg| cfg else null);
     defer configured_uris.deinit(alloc);
+    if (loaded_config != null) try rejectStorageUriOverrides(init.environ_map, cli);
 
     var remote_content: ?antfly.common.config.Config.RemoteContentConfig = null;
     if (cli.remote_content_block_private_ips orelse try parseEnvOptionalBool(init.environ_map, "ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS")) |block_private_ips| {
@@ -384,6 +385,18 @@ fn resolveRequired(
     };
 }
 
+fn rejectStorageUriOverrides(env_map: *std.process.Environ.Map, cli: CliConfig) !void {
+    if (cli.artifacts_uri != null or env_map.get("ANTFLY_SERVERLESS_ARTIFACTS_URI") != null or
+        cli.manifests_uri != null or env_map.get("ANTFLY_SERVERLESS_MANIFESTS_URI") != null or
+        cli.wal_uri != null or env_map.get("ANTFLY_SERVERLESS_WAL_URI") != null or
+        cli.progress_uri != null or env_map.get("ANTFLY_SERVERLESS_PROGRESS_URI") != null or
+        cli.catalog_uri != null or env_map.get("ANTFLY_SERVERLESS_CATALOG_URI") != null)
+    {
+        std.debug.print("serverless storage URI overrides cannot be combined with --config; select per-lane connection, bucket, and prefix under storage.object.lanes\n", .{});
+        return error.ConflictingStorageConfiguration;
+    }
+}
+
 const ConfiguredStorageUris = struct {
     artifacts: ?[]u8 = null,
     manifests: ?[]u8 = null,
@@ -439,12 +452,9 @@ fn storageS3Options(
     if (connection.kind != .external_io) return error.InvalidServerlessStorageConfig;
     const external = connection.external_io orelse return error.InvalidServerlessStorageConfig;
     if (external.protocol != .s3) return error.InvalidServerlessStorageConfig;
-    return .{
+    var options = serverless.BootstrapConfig.S3Options{
         .endpoint = external.endpoint,
         .region = external.region,
-        .access_key_id = external.access_key_id,
-        .secret_access_key = external.secret_access_key,
-        .session_token = external.session_token,
         .use_ssl = external.use_ssl orelse true,
         .addressing_style = switch (external.addressing_style) {
             .path => .path,
@@ -452,6 +462,25 @@ fn storageS3Options(
         },
         .create_bucket = external.bucket_provisioning == .create_if_missing,
     };
+    switch (external.credentials.source) {
+        .default => options.credential_source = .default,
+        .static => {
+            options.access_key_id = external.credentials.access_key_id;
+            options.secret_access_key = external.credentials.secret_access_key;
+            options.session_token = external.credentials.session_token;
+        },
+        .profile => options.credential_source = .{ .profile = .{
+            .name = external.credentials.profile.?,
+            .shared_credentials_file = external.credentials.shared_credentials_file,
+        } },
+        .web_identity => options.credential_source = .{ .web_identity = .{
+            .role_arn = external.credentials.role_arn.?,
+            .token_file = external.credentials.token_file.?,
+            .session_name = external.credentials.session_name orelse "antfly-serverless",
+            .sts_endpoint = external.credentials.sts_endpoint,
+        } },
+    }
+    return options;
 }
 
 fn objectUriAlloc(alloc: std.mem.Allocator, bucket: []const u8, raw_prefix: []const u8) ![]u8 {
@@ -758,6 +787,14 @@ test "serverless main parses maintenance booleans" {
     try std.testing.expectError(error.InvalidArguments, parseBoolArg("maybe"));
 }
 
+test "serverless main rejects location-only overrides with connection config" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try std.testing.expectError(error.ConflictingStorageConfiguration, rejectStorageUriOverrides(&env_map, .{ .wal_uri = "s3://other/wal" }));
+    try env_map.put("ANTFLY_SERVERLESS_CATALOG_URI", "s3://other/catalog");
+    try std.testing.expectError(error.ConflictingStorageConfiguration, rejectStorageUriOverrides(&env_map, .{}));
+}
+
 test "serverless main backend summary prefers parsed location" {
     try std.testing.expectEqualStrings("artifacts/dev", backendSummary(.{
         .lane = @constCast("artifacts"),
@@ -780,8 +817,8 @@ test "serverless main derives multi-bucket lanes and per-connection credentials"
         \\{
         \\  "deployment_mode": "serverless",
         \\  "connections": {
-        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "region": "us-west-2", "buckets": ["data-bucket"], "access_key_id": "data-key", "secret_access_key": "data-secret" } },
-        \\    "wal": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "endpoint": "minio:9000", "use_ssl": false, "buckets": ["wal-bucket"], "access_key_id": "wal-key", "secret_access_key": "wal-secret" } }
+        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "region": "us-west-2", "buckets": ["data-bucket"], "credentials": { "source": "static", "access_key_id": "data-key", "secret_access_key": "data-secret" } } },
+        \\    "wal": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "endpoint": "minio:9000", "use_ssl": false, "buckets": ["wal-bucket"], "credentials": { "source": "static", "access_key_id": "wal-key", "secret_access_key": "wal-secret" } } }
         \\  },
         \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket", "prefix": "/prod/", "lanes": { "wal": { "connection": "wal", "bucket": "wal-bucket", "prefix": "/durable/" } } } }
         \\}

@@ -44,6 +44,24 @@ pub const Credentials = struct {
     }
 };
 
+pub const ProfileCredentialSource = struct {
+    name: []const u8,
+    shared_credentials_file: ?[]const u8 = null,
+};
+
+pub const WebIdentityCredentialSource = struct {
+    role_arn: []const u8,
+    token_file: []const u8,
+    session_name: []const u8 = "antfly",
+    sts_endpoint: ?[]const u8 = null,
+};
+
+pub const CredentialSource = union(enum) {
+    default,
+    profile: ProfileCredentialSource,
+    web_identity: WebIdentityCredentialSource,
+};
+
 pub const CredentialCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     cached: ?Credentials = null,
@@ -70,6 +88,10 @@ pub const CredentialCache = struct {
     }
 
     pub fn get(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
+        return try self.getForSource(alloc, http, region, .default);
+    }
+
+    pub fn getForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
         const now = currentUnixSeconds();
         self.lock();
         if (self.cached) |creds| {
@@ -84,7 +106,7 @@ pub const CredentialCache = struct {
         }
         self.unlock();
 
-        var fresh = try resolveCredentialsUncached(alloc, http, region);
+        var fresh = try resolveCredentialsUncached(alloc, http, region, source);
         errdefer fresh.deinit(alloc);
         const cached_copy = try fresh.clone(alloc);
         errdefer {
@@ -257,7 +279,7 @@ pub const Provider = struct {
 /// Fetch the Bedrock control-plane foundation-models listing for a region.
 /// Returns the raw JSON response body; the caller owns it.
 pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, endpoint_override: ?[]const u8, timeout_ms: u64) ![]u8 {
-    var creds = try resolveCredentialsUncached(alloc, http, region);
+    var creds = try resolveCredentialsUncached(alloc, http, region, .default);
     defer creds.deinit(alloc);
 
     const default_endpoint = try std.fmt.allocPrint(alloc, "https://bedrock.{s}.amazonaws.com", .{region});
@@ -509,25 +531,31 @@ fn vectorFromJson(alloc: std.mem.Allocator, value: std.json.Value) ![]const f32 
     return vector;
 }
 
-fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
-    if (getEnvOwned(alloc, "AWS_ACCESS_KEY_ID")) |access| {
-        errdefer alloc.free(access);
-        const secret = getEnvOwned(alloc, "AWS_SECRET_ACCESS_KEY") orelse return error.MissingSecretAccessKey;
-        errdefer alloc.free(secret);
-        const token = getEnvOwned(alloc, "AWS_SESSION_TOKEN");
-        return .{ .access_key_id = access, .secret_access_key = secret, .session_token = token };
-    }
-    if (credentialsFromWebIdentity(alloc, http, region)) |creds| return creds else |_| {}
-    if (credentialsFromSharedFiles(alloc)) |creds| return creds else |_| {}
-    if (credentialsFromEcsMetadata(alloc, http)) |creds| return creds else |_| {}
-    if (credentialsFromInstanceMetadata(alloc, http)) |creds| return creds else |_| {}
-    return error.MissingAwsCredentials;
+fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
+    return switch (source) {
+        .profile => |profile| try credentialsFromSharedFiles(alloc, profile.name, profile.shared_credentials_file),
+        .web_identity => |identity| try credentialsFromWebIdentity(alloc, http, region, identity),
+        .default => blk: {
+            if (getEnvOwned(alloc, "AWS_ACCESS_KEY_ID")) |access| {
+                errdefer alloc.free(access);
+                const secret = getEnvOwned(alloc, "AWS_SECRET_ACCESS_KEY") orelse return error.MissingSecretAccessKey;
+                errdefer alloc.free(secret);
+                const token = getEnvOwned(alloc, "AWS_SESSION_TOKEN");
+                break :blk .{ .access_key_id = access, .secret_access_key = secret, .session_token = token };
+            }
+            if (credentialsFromWebIdentityFromEnv(alloc, http, region)) |creds| break :blk creds else |_| {}
+            const profile = getEnvOwned(alloc, "AWS_PROFILE") orelse try alloc.dupe(u8, "default");
+            defer alloc.free(profile);
+            if (credentialsFromSharedFiles(alloc, profile, null)) |creds| break :blk creds else |_| {}
+            if (credentialsFromEcsMetadata(alloc, http)) |creds| break :blk creds else |_| {}
+            if (credentialsFromInstanceMetadata(alloc, http)) |creds| break :blk creds else |_| {}
+            return error.MissingAwsCredentials;
+        },
+    };
 }
 
-fn credentialsFromSharedFiles(alloc: std.mem.Allocator) !Credentials {
-    const profile = getEnvOwned(alloc, "AWS_PROFILE") orelse try alloc.dupe(u8, "default");
-    defer alloc.free(profile);
-    const path = getEnvOwned(alloc, "AWS_SHARED_CREDENTIALS_FILE") orelse blk: {
+fn credentialsFromSharedFiles(alloc: std.mem.Allocator, profile: []const u8, explicit_path: ?[]const u8) !Credentials {
+    const path = if (explicit_path) |value| try alloc.dupe(u8, value) else getEnvOwned(alloc, "AWS_SHARED_CREDENTIALS_FILE") orelse blk: {
         const home = getEnvOwned(alloc, "HOME") orelse return error.MissingAwsCredentials;
         defer alloc.free(home);
         break :blk try std.fmt.allocPrint(alloc, "{s}/.aws/credentials", .{home});
@@ -575,24 +603,34 @@ fn parseProfileCredentials(alloc: std.mem.Allocator, data: []const u8, profile: 
     };
 }
 
-fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
+fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
     const role_arn = getEnvOwned(alloc, "AWS_ROLE_ARN") orelse return error.MissingAwsCredentials;
     defer alloc.free(role_arn);
     const token_file = getEnvOwned(alloc, "AWS_WEB_IDENTITY_TOKEN_FILE") orelse return error.MissingAwsCredentials;
     defer alloc.free(token_file);
     const session_name = getEnvOwned(alloc, "AWS_ROLE_SESSION_NAME") orelse try alloc.dupe(u8, "antfly-bedrock");
     defer alloc.free(session_name);
+    const sts_endpoint = getEnvOwned(alloc, "AWS_STS_ENDPOINT");
+    defer if (sts_endpoint) |value| alloc.free(value);
+    return try credentialsFromWebIdentity(alloc, http, region, .{
+        .role_arn = role_arn,
+        .token_file = token_file,
+        .session_name = session_name,
+        .sts_endpoint = sts_endpoint,
+    });
+}
 
+fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, identity: WebIdentityCredentialSource) !Credentials {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const token = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), token_file, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
+    const token = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), identity.token_file, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
     defer alloc.free(token);
 
-    const sts_endpoint = if (getEnvOwned(alloc, "AWS_STS_ENDPOINT")) |endpoint| endpoint else try std.fmt.allocPrint(alloc, "https://sts.{s}.amazonaws.com", .{region});
+    const sts_endpoint = if (identity.sts_endpoint) |endpoint| try alloc.dupe(u8, endpoint) else try std.fmt.allocPrint(alloc, "https://sts.{s}.amazonaws.com", .{region});
     defer alloc.free(sts_endpoint);
-    const encoded_role = try percentEncodeAlloc(alloc, role_arn);
+    const encoded_role = try percentEncodeAlloc(alloc, identity.role_arn);
     defer alloc.free(encoded_role);
-    const encoded_session = try percentEncodeAlloc(alloc, session_name);
+    const encoded_session = try percentEncodeAlloc(alloc, identity.session_name);
     defer alloc.free(encoded_session);
     const encoded_token = try percentEncodeAlloc(alloc, std.mem.trim(u8, token, " \t\r\n"));
     defer alloc.free(encoded_token);

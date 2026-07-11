@@ -62,6 +62,12 @@ func (r *AntflyCluster) Default() {
 	if r.Spec.Mode != ClusterModeStandalone || r.Spec.Standalone == nil {
 		return
 	}
+	if r.Spec.Storage.Engine == "" {
+		r.Spec.Storage.Engine = "local"
+	}
+	if r.Spec.Storage.Engine == "lite" && r.Spec.Storage.LiteFileName == "" {
+		r.Spec.Storage.LiteFileName = "antfly.aflite"
+	}
 
 	if r.Spec.Standalone.Replicas == 0 {
 		r.Spec.Standalone.Replicas = 1
@@ -109,6 +115,9 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 	var allErrors []string
 
 	if err := r.validateModeConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+	if err := ValidateOperatorManagedStorageConfig(r.Spec.Config); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
@@ -1664,6 +1673,9 @@ func (r *AntflyCluster) validateResourceQuantities() error {
 }
 
 func (r *AntflyCluster) validateModeConfig() error {
+	if err := ValidateOperatorManagedStorageSpec(r.Spec.Mode, r.Spec.Storage); err != nil {
+		return err
+	}
 	if r.Spec.Mode == "" {
 		if r.Spec.Standalone != nil {
 			return fmt.Errorf("spec.standalone may only be set when spec.mode=Standalone")
@@ -1749,11 +1761,6 @@ func (r *AntflyCluster) validateStandaloneConfig() error {
 	if strings.TrimSpace(r.Spec.Storage.StandaloneStorage) == "" {
 		return fmt.Errorf("spec.storage.standaloneStorage is required when spec.mode=Standalone")
 	}
-
-	if err := ValidateOperatorManagedStandaloneStorageConfig(r.Spec.Config); err != nil {
-		return err
-	}
-
 	if err := r.validateStandaloneTopologyIsolation(); err != nil {
 		return err
 	}
@@ -1761,11 +1768,49 @@ func (r *AntflyCluster) validateStandaloneConfig() error {
 	return nil
 }
 
-// ValidateOperatorManagedStandaloneStorageConfig prevents the operator from
-// silently rewriting an unsupported storage engine to local PVC storage. It is
-// shared by admission and reconciliation so webhook outages cannot weaken the
-// fail-closed behavior.
-func ValidateOperatorManagedStandaloneStorageConfig(raw string) error {
+// ValidateOperatorManagedStorageSpec validates the typed storage tagged union.
+// It is shared by admission and reconciliation so a webhook outage cannot make
+// the controller silently reinterpret an unsupported engine as local storage.
+func ValidateOperatorManagedStorageSpec(mode ClusterMode, storage StorageSpec) error {
+	engine := storage.Engine
+	if engine == "" {
+		engine = "local"
+	}
+	if engine != "local" && engine != "lite" {
+		return fmt.Errorf("spec.storage.engine must be local or lite, got %q", engine)
+	}
+
+	effectiveMode := mode
+	if effectiveMode == "" {
+		effectiveMode = ClusterModeClustered
+	}
+	switch effectiveMode {
+	case ClusterModeClustered:
+		if engine != "local" {
+			return fmt.Errorf("spec.storage.engine=%q is not supported when spec.mode=Clustered", engine)
+		}
+		if storage.LiteFileName != "" {
+			return fmt.Errorf("spec.storage.liteFileName may only be set when spec.storage.engine=lite")
+		}
+	case ClusterModeStandalone:
+		if engine == "lite" {
+			fileName := storage.LiteFileName
+			if fileName == "" {
+				fileName = "antfly.aflite"
+			}
+			if strings.ContainsAny(fileName, `/\\`) || fileName == "." || fileName == ".." || !strings.HasSuffix(fileName, ".aflite") {
+				return fmt.Errorf("spec.storage.liteFileName must be a basename ending in .aflite, got %q", fileName)
+			}
+		} else if storage.LiteFileName != "" {
+			return fmt.Errorf("spec.storage.liteFileName may only be set when spec.storage.engine=lite")
+		}
+	}
+	return nil
+}
+
+// ValidateOperatorManagedStorageConfig keeps the raw runtime JSON
+// from competing with the typed, operator-owned storage contract.
+func ValidateOperatorManagedStorageConfig(raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
@@ -1781,22 +1826,7 @@ func ValidateOperatorManagedStandaloneStorageConfig(raw string) error {
 	if err := json.Unmarshal(rawStorage, &storage); err != nil {
 		return fmt.Errorf("spec.config.storage must be an object: %w", err)
 	}
-	if rawEngine, exists := storage["engine"]; exists {
-		var engine string
-		if err := json.Unmarshal(rawEngine, &engine); err != nil {
-			return fmt.Errorf("spec.config.storage.engine must be a string: %w", err)
-		}
-		if engine != "local" {
-			return fmt.Errorf("operator-managed standalone currently supports only storage.engine=local, got %q", engine)
-		}
-	}
-	if _, exists := storage["lite"]; exists {
-		return fmt.Errorf("operator-managed standalone does not yet support spec.config.storage.lite")
-	}
-	if _, exists := storage["object"]; exists {
-		return fmt.Errorf("operator-managed standalone does not support spec.config.storage.object")
-	}
-	return nil
+	return fmt.Errorf("spec.config.storage is operator-managed; configure persistence under spec.storage")
 }
 
 func (r *AntflyCluster) validateStandaloneTopologyIsolation() error {

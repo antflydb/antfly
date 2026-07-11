@@ -12,6 +12,72 @@ const antfly_middleware_openapi = @import("antfly_middleware_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
+/// Per-connection AWS credential identity. Each named connection owns an independent refresh cache, allowing lanes to use different accounts, profiles, or workload identities.
+pub const AwsCredentialConfig = struct {
+    source: []const u8,
+    /// Static access key or secret reference.
+    access_key_id: ?[]const u8 = null,
+    /// Static secret key or secret reference.
+    secret_access_key: ?[]const u8 = null,
+    /// Optional static session token or secret reference.
+    session_token: ?[]const u8 = null,
+    /// Shared credentials profile name.
+    profile: ?[]const u8 = null,
+    /// Optional credentials file path for this connection.
+    shared_credentials_file: ?[]const u8 = null,
+    /// IAM role assumed with web identity.
+    role_arn: ?[]const u8 = null,
+    /// Web identity token file mounted for this connection.
+    token_file: ?[]const u8 = null,
+    /// STS role session name.
+    session_name: ?[]const u8 = null,
+    /// Optional STS endpoint override.
+    sts_endpoint: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.access_key_id) |value| {
+            try jw.objectField("access_key_id");
+            try jw.write(value);
+        }
+        if (self.secret_access_key) |value| {
+            try jw.objectField("secret_access_key");
+            try jw.write(value);
+        }
+        if (self.session_token) |value| {
+            try jw.objectField("session_token");
+            try jw.write(value);
+        }
+        if (self.profile) |value| {
+            try jw.objectField("profile");
+            try jw.write(value);
+        }
+        if (self.shared_credentials_file) |value| {
+            try jw.objectField("shared_credentials_file");
+            try jw.write(value);
+        }
+        if (self.role_arn) |value| {
+            try jw.objectField("role_arn");
+            try jw.write(value);
+        }
+        if (self.token_file) |value| {
+            try jw.objectField("token_file");
+            try jw.write(value);
+        }
+        if (self.session_name) |value| {
+            try jw.objectField("session_name");
+            try jw.write(value);
+        }
+        if (self.sts_endpoint) |value| {
+            try jw.objectField("sts_endpoint");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const CdcConnectionConfig = struct {
     /// CDC provider type. Initially postgres.
     provider: []const u8,
@@ -148,12 +214,7 @@ pub const ExternalIoConnectionConfig = struct {
     hosts: ?[]const []const u8 = null,
     /// HTTP headers or secret references. Never returned by inventory APIs.
     headers: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Object-store access key or secret reference. Never returned by inventory APIs.
-    access_key_id: ?[]const u8 = null,
-    /// Object-store secret key or secret reference. Never returned by inventory APIs.
-    secret_access_key: ?[]const u8 = null,
-    /// Object-store session token or secret reference. Never returned by inventory APIs.
-    session_token: ?[]const u8 = null,
+    credentials: ?AwsCredentialConfig = null,
     /// Whether S3-compatible endpoints should use TLS.
     use_ssl: ?bool = null,
 };

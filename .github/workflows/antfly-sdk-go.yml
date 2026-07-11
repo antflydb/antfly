@@ -65,7 +65,7 @@ jobs:
 
       - name: Verify generated OpenAPI client
         run: |
-          make build-docs
+          uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
           (cd go/pkg/sdk && GOWORK=off go generate ./...)
           status="$(git status --porcelain -- \
             openapi.yaml \

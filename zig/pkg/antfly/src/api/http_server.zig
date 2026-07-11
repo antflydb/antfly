@@ -19029,11 +19029,12 @@ test "api http server reloads durable transaction sessions after restart" {
 
     var updated = (try db.lookup(alloc, "doc:a", .{})).?;
     defer updated.deinit(alloc);
-    const stored = try std.json.parseFromSliceLeaky(StoredTitle, alloc, updated.json, .{
+    var stored = try std.json.parseFromSlice(StoredTitle, alloc, updated.json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
-    try std.testing.expectEqualStrings("after restart", stored.title);
+    defer stored.deinit();
+    try std.testing.expectEqualStrings("after restart", stored.value.title);
 }
 
 test "api http server enforces configured savepoint limits and exposes remaining capacity" {

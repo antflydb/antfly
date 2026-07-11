@@ -17,7 +17,6 @@
 const std = @import("std");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
-const platform_time = antfly_platform.time;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_erased = @import("../backend_erased.zig");
 const backend_types = @import("../backend_types.zig");
@@ -138,7 +137,12 @@ pub const Store = struct {
     file: native.NativeFile,
     read_only: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
+    writer_mutex: std.Io.Mutex = .init,
+    writer_ready: std.Io.Condition = .init,
     writer_active: bool = false,
+    writer_ticketed: bool = false,
+    next_writer_ticket: u64 = 0,
+    serving_writer_ticket: u64 = 0,
     snapshot_caches: std.StringHashMapUnmanaged(*SharedSnapshot) = .empty,
     known_document_root_page: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -221,30 +225,37 @@ pub const Store = struct {
 
     pub fn reserveWriterSlot(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        lockStore(self);
-        defer self.mutex.unlock();
-        if (self.writer_active) return error.FileBusy;
+        const io = self.file.io_impl.io();
+        self.writer_mutex.lockUncancelable(io);
+        defer self.writer_mutex.unlock(io);
+        if (self.writer_active or self.next_writer_ticket != self.serving_writer_ticket) return error.FileBusy;
         self.writer_active = true;
+        self.writer_ticketed = false;
     }
 
     pub fn reserveWriterSlotYielding(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        while (true) {
-            lockStore(self);
-            if (!self.writer_active) {
-                self.writer_active = true;
-                self.mutex.unlock();
-                return;
-            }
-            self.mutex.unlock();
-            platform_time.yieldBriefly();
+        const io = self.file.io_impl.io();
+        self.writer_mutex.lockUncancelable(io);
+        defer self.writer_mutex.unlock(io);
+        const ticket = self.next_writer_ticket;
+        self.next_writer_ticket +%= 1;
+        while (self.writer_active or ticket != self.serving_writer_ticket) {
+            self.writer_ready.waitUncancelable(io, &self.writer_mutex);
         }
+        self.writer_active = true;
+        self.writer_ticketed = true;
     }
 
     pub fn releaseWriterSlot(self: *Store) void {
-        lockStore(self);
-        defer self.mutex.unlock();
+        const io = self.file.io_impl.io();
+        self.writer_mutex.lockUncancelable(io);
+        defer self.writer_mutex.unlock(io);
+        std.debug.assert(self.writer_active);
         self.writer_active = false;
+        if (self.writer_ticketed) self.serving_writer_ticket +%= 1;
+        self.writer_ticketed = false;
+        self.writer_ready.broadcast(io);
     }
 
     const NativeBackendStore = backend_adapter.Store(Store, Txn, Txn, Txn, .{
@@ -909,7 +920,7 @@ pub const Txn = struct {
         defer store.mutex.unlock();
         errdefer {
             if (self.writer_reserved) {
-                store.writer_active = false;
+                store.releaseWriterSlot();
                 self.writer_reserved = false;
             }
         }
@@ -922,7 +933,7 @@ pub const Txn = struct {
             invalidateCommittedSnapshotLocked(store, self.prefix);
         }
         if (self.writer_reserved) {
-            store.writer_active = false;
+            store.releaseWriterSlot();
             self.writer_reserved = false;
         }
 

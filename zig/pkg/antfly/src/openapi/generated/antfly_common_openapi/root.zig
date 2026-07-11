@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const AwsCredentialConfig = types.AwsCredentialConfig;
 pub const CdcConnectionConfig = types.CdcConnectionConfig;
 pub const Config = types.Config;
 pub const ConnectionConfig = types.ConnectionConfig;

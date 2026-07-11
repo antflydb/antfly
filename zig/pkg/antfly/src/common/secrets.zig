@@ -371,19 +371,23 @@ pub const FileStore = struct {
             next.deinit(self.alloc);
         }
 
-        const gop = try next.getOrPut(self.alloc, key);
         const now_ns = nowNs();
-        if (gop.found_existing) {
-            self.alloc.free(gop.value_ptr.value);
-            gop.value_ptr.value = try self.alloc.dupe(u8, value);
-            gop.value_ptr.updated_at_ns = now_ns;
-        } else {
-            gop.key_ptr.* = try self.alloc.dupe(u8, key);
-            gop.value_ptr.* = .{
-                .value = try self.alloc.dupe(u8, value),
+        if (next.getPtr(key)) |existing| {
+            const new_value = try self.alloc.dupe(u8, value);
+            self.alloc.free(existing.value);
+            existing.value = new_value;
+            existing.updated_at_ns = now_ns;
+        } else insert: {
+            const new_key = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(new_key);
+            const new_value = try self.alloc.dupe(u8, value);
+            errdefer self.alloc.free(new_value);
+            try next.put(self.alloc, new_key, .{
+                .value = new_value,
                 .created_at_ns = now_ns,
                 .updated_at_ns = now_ns,
-            };
+            });
+            break :insert;
         }
         try self.persistEntries(&next);
         try self.replaceEntriesAfterLocalWriteLocked(&next);
@@ -699,14 +703,16 @@ fn loadEntriesFromFile(alloc: std.mem.Allocator, path: []const u8) !std.StringAr
 
     for (parsed.value.secrets) |item| {
         try validateKey(item.key);
-        const gop = try entries.getOrPut(alloc, item.key);
-        if (gop.found_existing) continue;
-        gop.key_ptr.* = try alloc.dupe(u8, item.key);
-        gop.value_ptr.* = .{
-            .value = try alloc.dupe(u8, item.value),
+        if (entries.contains(item.key)) return error.DuplicateSecretKey;
+        const key = try alloc.dupe(u8, item.key);
+        errdefer alloc.free(key);
+        const value = try alloc.dupe(u8, item.value);
+        errdefer alloc.free(value);
+        try entries.put(alloc, key, .{
+            .value = value,
             .created_at_ns = item.created_at_ns orelse 0,
             .updated_at_ns = item.updated_at_ns orelse item.created_at_ns orelse 0,
-        };
+        });
     }
 
     return entries;

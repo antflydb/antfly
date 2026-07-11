@@ -386,6 +386,7 @@ components:
       description: External IO transport protocol.
     ConnectionConfig:
       type: object
+      additionalProperties: false
       required:
         - kind
         - capabilities
@@ -413,6 +414,7 @@ components:
           $ref: "#/components/schemas/CdcConnectionConfig"
     InferenceConnectionConfig:
       type: object
+      additionalProperties: false
       required:
         - provider
       properties:
@@ -454,6 +456,7 @@ components:
           description: Model types this connection is configured to serve.
     WebSearchConnectionConfig:
       type: object
+      additionalProperties: false
       properties:
         service:
           type: string
@@ -515,6 +518,7 @@ components:
           description: Exclude results from these domains when provider supports it.
     ExternalIoConnectionConfig:
       type: object
+      additionalProperties: false
       required:
         - protocol
       properties:
@@ -556,20 +560,104 @@ components:
           additionalProperties:
             type: string
           description: HTTP headers or secret references. Never returned by inventory APIs.
-        access_key_id:
-          type: string
-          description: Object-store access key or secret reference. Never returned by inventory APIs.
-        secret_access_key:
-          type: string
-          description: Object-store secret key or secret reference. Never returned by inventory APIs.
-        session_token:
-          type: string
-          description: Object-store session token or secret reference. Never returned by inventory APIs.
+        credentials:
+          $ref: "#/components/schemas/AwsCredentialConfig"
         use_ssl:
           type: boolean
           description: Whether S3-compatible endpoints should use TLS.
+    AwsCredentialConfig:
+      type: object
+      additionalProperties: false
+      required: [source]
+      description: >-
+        Per-connection AWS credential identity. Each named connection owns an
+        independent refresh cache, allowing lanes to use different accounts,
+        profiles, or workload identities.
+      oneOf:
+        - title: Default AWS credential chain
+          properties:
+            source: { type: string, enum: [default] }
+          not:
+            anyOf:
+              - required: [access_key_id]
+              - required: [secret_access_key]
+              - required: [session_token]
+              - required: [profile]
+              - required: [shared_credentials_file]
+              - required: [role_arn]
+              - required: [token_file]
+              - required: [session_name]
+              - required: [sts_endpoint]
+        - title: Static credentials
+          required: [access_key_id, secret_access_key]
+          properties:
+            source: { type: string, enum: [static] }
+          not:
+            anyOf:
+              - required: [profile]
+              - required: [shared_credentials_file]
+              - required: [role_arn]
+              - required: [token_file]
+              - required: [session_name]
+              - required: [sts_endpoint]
+        - title: Shared credentials profile
+          required: [profile]
+          properties:
+            source: { type: string, enum: [profile] }
+          not:
+            anyOf:
+              - required: [access_key_id]
+              - required: [secret_access_key]
+              - required: [session_token]
+              - required: [role_arn]
+              - required: [token_file]
+              - required: [session_name]
+              - required: [sts_endpoint]
+        - title: Web identity
+          required: [role_arn, token_file]
+          properties:
+            source: { type: string, enum: [web_identity] }
+          not:
+            anyOf:
+              - required: [access_key_id]
+              - required: [secret_access_key]
+              - required: [session_token]
+              - required: [profile]
+              - required: [shared_credentials_file]
+      properties:
+        source:
+          type: string
+          enum: [default, static, profile, web_identity]
+        access_key_id:
+          type: string
+          description: Static access key or secret reference.
+        secret_access_key:
+          type: string
+          description: Static secret key or secret reference.
+        session_token:
+          type: string
+          description: Optional static session token or secret reference.
+        profile:
+          type: string
+          description: Shared credentials profile name.
+        shared_credentials_file:
+          type: string
+          description: Optional credentials file path for this connection.
+        role_arn:
+          type: string
+          description: IAM role assumed with web identity.
+        token_file:
+          type: string
+          description: Web identity token file mounted for this connection.
+        session_name:
+          type: string
+          description: STS role session name.
+        sts_endpoint:
+          type: string
+          description: Optional STS endpoint override.
     CdcConnectionConfig:
       type: object
+      additionalProperties: false
       required:
         - provider
       properties:

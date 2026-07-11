@@ -9621,14 +9621,9 @@ func TestGenerateCompleteConfig_Standalone(t *testing.T) {
 
 	cluster := baseStandaloneControllerCluster()
 	cluster.Spec.Config = `{
-	  "replication_factor": 3,
-	  "deployment_mode": "distributed",
-	  "storage": {
-	    "s3": {
-	      "bucket": "test-bucket"
-	    }
-	  }
-	}`
+		  "replication_factor": 3,
+		  "deployment_mode": "distributed"
+		}`
 
 	configJSON, err := reconciler.generateCompleteConfig(cluster)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -9644,11 +9639,10 @@ func TestGenerateCompleteConfig_Standalone(t *testing.T) {
 
 	storage, ok := config["storage"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
+	g.Expect(storage["engine"]).To(Equal("local"))
 	localStorage, ok := storage["local"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
 	g.Expect(localStorage["base_dir"]).To(Equal("/antflydb"))
-	_, hasS3 := storage["s3"]
-	g.Expect(hasS3).To(BeTrue(), "expected user-provided S3 storage config to be preserved")
 
 	metadata, ok := config["metadata"].(map[string]any)
 	g.Expect(ok).To(BeTrue())
@@ -9657,7 +9651,7 @@ func TestGenerateCompleteConfig_Standalone(t *testing.T) {
 	g.Expect(orchestrationURLs["1"]).To(Equal("http://test-standalone-standalone.default.svc.cluster.local:8080"))
 }
 
-func TestGenerateCompleteConfig_StandaloneRejectsUnsupportedStorageEngine(t *testing.T) {
+func TestGenerateCompleteConfig_StandaloneRejectsRawStorageOverride(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
@@ -9669,7 +9663,39 @@ func TestGenerateCompleteConfig_StandaloneRejectsUnsupportedStorageEngine(t *tes
 	cluster.Spec.Config = `{"storage":{"engine":"lite","lite":{"path":"/antflydb/data.aflite"}}}`
 
 	_, err := reconciler.generateCompleteConfig(cluster)
-	g.Expect(err).To(MatchError(ContainSubstring("supports only storage.engine=local")))
+	g.Expect(err).To(MatchError(ContainSubstring("spec.config.storage is operator-managed")))
+}
+
+func TestGenerateCompleteConfig_RejectsInvalidTypedStorageWithoutAdmission(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Storage.Engine = "object"
+
+	_, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("spec.storage.engine must be local or lite")))
+}
+
+func TestGenerateCompleteConfig_StandaloneLite(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s}
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "production.aflite"
+
+	configJSON, err := reconciler.generateCompleteConfig(cluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+	storage := config["storage"].(map[string]any)
+	g.Expect(storage["engine"]).To(Equal("lite"))
+	lite := storage["lite"].(map[string]any)
+	g.Expect(lite["path"]).To(Equal("/antflydb/production.aflite"))
+	g.Expect(lite["fsync"]).To(BeTrue())
 }
 
 func TestGenerateCompleteConfig_ManagedInferenceAPIURL(t *testing.T) {

@@ -1164,6 +1164,19 @@ type StorageSpec struct {
 	// +optional
 	StandaloneStorage string `json:"standaloneStorage,omitempty"`
 
+	// Engine selects the persistence engine. Local stores a directory tree on
+	// PVCs. Lite stores the complete database in one .aflite file and is valid
+	// only with spec.mode=Standalone.
+	// +optional
+	// +kubebuilder:validation:Enum=local;lite
+	// +kubebuilder:default=local
+	Engine string `json:"engine,omitempty"`
+
+	// LiteFileName is the basename of the Lite database on the standalone PVC.
+	// It must not contain path separators and must end in .aflite.
+	// +optional
+	LiteFileName string `json:"liteFileName,omitempty"`
+
 	// PVCRetentionPolicy controls what happens to PVCs when the cluster is deleted or scaled down.
 	// Maps to StatefulSet's persistentVolumeClaimRetentionPolicy (beta in K8s 1.27, GA in 1.32).
 	// On clusters < 1.27, this field is silently ignored by the StatefulSet controller;

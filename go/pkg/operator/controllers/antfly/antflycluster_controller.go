@@ -2074,6 +2074,9 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 
 // generateCompleteConfig creates a complete Antfly configuration by merging user config with generated metadata network config
 func (r *AntflyClusterReconciler) generateCompleteConfig(cluster *antflyv1.AntflyCluster) (string, error) {
+	if err := antflyv1.ValidateOperatorManagedStorageSpec(cluster.Spec.Mode, cluster.Spec.Storage); err != nil {
+		return "", err
+	}
 	if effectiveTopologyMode(cluster) == topologyModeStandalone {
 		return r.generateStandaloneConfig(cluster)
 	}
@@ -2086,6 +2089,9 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 	var userConfig map[string]any
 	if err := json.Unmarshal([]byte(cluster.Spec.Config), &userConfig); err != nil {
 		return "", fmt.Errorf("failed to parse user config: %w", err)
+	}
+	if _, exists := userConfig["storage"]; exists {
+		return "", fmt.Errorf("spec.config.storage is operator-managed; configure PVC storage under spec.storage")
 	}
 	// Generate metadata orchestration URLs
 	metadataReplicas := int32(3)
@@ -2104,6 +2110,7 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 	// Build complete configuration structure
 	completeConfig := map[string]any{
 		"storage": map[string]any{
+			"engine": "local",
 			"local": map[string]any{
 				"base_dir": "/antflydb", // Must match PVC mount path
 			},
@@ -2127,17 +2134,12 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 		"orchestration_urls": orchestrationURLs,
 	}
 
-	// Ensure storage base_dir matches the PVC mount path (cannot be overridden)
-	// but preserve user's S3 configuration for backup/restore operations
+	// Storage placement is operator-owned and must match the PVC mount path.
 	storageConfig := map[string]any{
+		"engine": "local",
 		"local": map[string]any{
 			"base_dir": "/antflydb",
 		},
-	}
-	if userStorage, ok := userConfig["storage"].(map[string]any); ok {
-		if s3Config, ok := userStorage["s3"]; ok {
-			storageConfig["s3"] = s3Config
-		}
 	}
 	completeConfig["storage"] = storageConfig
 	if apiURL := configuredInferenceAPIURL(cluster); apiURL != "" {
@@ -2181,7 +2183,7 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	if err := json.Unmarshal([]byte(cluster.Spec.Config), &userConfig); err != nil {
 		return "", fmt.Errorf("failed to parse user config: %w", err)
 	}
-	if err := antflyv1.ValidateOperatorManagedStandaloneStorageConfig(cluster.Spec.Config); err != nil {
+	if err := antflyv1.ValidateOperatorManagedStorageConfig(cluster.Spec.Config); err != nil {
 		return "", err
 	}
 
@@ -2190,11 +2192,7 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	}
 
 	completeConfig := map[string]any{
-		"storage": map[string]any{
-			"local": map[string]any{
-				"base_dir": "/antflydb", // Must match PVC mount path
-			},
-		},
+		"storage": standaloneRuntimeStorageConfig(cluster),
 		"metadata": map[string]any{
 			"orchestration_urls": orchestrationURLs,
 		},
@@ -2225,17 +2223,7 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 		completeConfig["inference"] = inferenceConfig
 	}
 
-	storageConfig := map[string]any{
-		"local": map[string]any{
-			"base_dir": "/antflydb",
-		},
-	}
-	if userStorage, ok := userConfig["storage"].(map[string]any); ok {
-		if s3Config, ok := userStorage["s3"]; ok {
-			storageConfig["s3"] = s3Config
-		}
-	}
-	completeConfig["storage"] = storageConfig
+	completeConfig["storage"] = standaloneRuntimeStorageConfig(cluster)
 
 	configBytes, err := json.MarshalIndent(completeConfig, "", "  ")
 	if err != nil {
@@ -2243,6 +2231,28 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	}
 
 	return string(configBytes), nil
+}
+
+func standaloneRuntimeStorageConfig(cluster *antflyv1.AntflyCluster) map[string]any {
+	if cluster.Spec.Storage.Engine == "lite" {
+		fileName := cluster.Spec.Storage.LiteFileName
+		if fileName == "" {
+			fileName = "antfly.aflite"
+		}
+		return map[string]any{
+			"engine": "lite",
+			"lite": map[string]any{
+				"path":  "/antflydb/" + fileName,
+				"fsync": true,
+			},
+		}
+	}
+	return map[string]any{
+		"engine": "local",
+		"local": map[string]any{
+			"base_dir": "/antflydb",
+		},
+	}
 }
 
 func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster *antflyv1.AntflyCluster) error {

@@ -686,6 +686,7 @@ pub const Server = struct {
     connection_controls: std.ArrayListUnmanaged(*ConnectionControl) = .empty,
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
+    waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
 
     const Self = @This();
 
@@ -858,7 +859,13 @@ pub const Server = struct {
         while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
+            self.waiting_for_connection_permit.store(true, .release);
+            if (self.shutdown_mode.load(.acquire) != 0) {
+                self.waiting_for_connection_permit.store(false, .release);
+                break;
+            }
             self.conn_semaphore.waitUncancelable(self.io);
+            self.waiting_for_connection_permit.store(false, .release);
             if (self.shutdown_mode.load(.acquire) != 0) break;
 
             const conn = self.listener.?.accept() catch |err| {
@@ -933,7 +940,12 @@ pub const Server = struct {
     }
 
     fn wakeListener(self: *Self) void {
-        self.conn_semaphore.post(self.io);
+        // Only publish a permit when the listener has announced that it may
+        // block in the admission gate. The listener consumes this permit before
+        // leaving, so repeated stop/listen cycles cannot inflate capacity.
+        if (self.waiting_for_connection_permit.swap(false, .acq_rel)) {
+            self.conn_semaphore.post(self.io);
+        }
 
         const published_port = self.wake_port.load(.acquire);
         const port = if (published_port != 0) published_port else self.config.port;
@@ -2764,6 +2776,18 @@ test "requestStop only publishes synchronized listener-thread work" {
     try std.testing.expect(server.running);
     try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
+}
+
+test "repeated stop requests do not inflate connection admission permits" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = 1,
+        .max_connections = 3,
+    });
+    defer server.deinit();
+    server.requestStop();
+    server.requestStop();
+    try std.testing.expectEqual(@as(usize, 3), server.conn_semaphore.permits);
 }
 
 test "cross-thread stop wakes an ephemeral listener" {

@@ -1664,6 +1664,9 @@ func TestDefault_StandaloneDefaults(t *testing.T) {
 	if cluster.Spec.Mode != ClusterModeStandalone {
 		t.Fatalf("expected standalone mode to remain set, got %q", cluster.Spec.Mode)
 	}
+	if cluster.Spec.Storage.Engine != "local" || cluster.Spec.Storage.LiteFileName != "" {
+		t.Fatalf("expected local storage defaults without Lite-only fields, got engine=%q file=%q", cluster.Spec.Storage.Engine, cluster.Spec.Storage.LiteFileName)
+	}
 	if cluster.Spec.Standalone.Replicas != 1 {
 		t.Fatalf("expected default standalone replicas=1, got %d", cluster.Spec.Standalone.Replicas)
 	}
@@ -1696,6 +1699,16 @@ func TestDefault_StandaloneDefaults(t *testing.T) {
 	}
 }
 
+func TestDefault_StandaloneLiteDefaultsFileName(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = ""
+	cluster.Default()
+	if cluster.Spec.Storage.LiteFileName != "antfly.aflite" {
+		t.Fatalf("expected Lite filename default, got %q", cluster.Spec.Storage.LiteFileName)
+	}
+}
+
 func TestValidateCreate_ValidStandalone(t *testing.T) {
 	cluster := baseStandaloneCluster()
 
@@ -1717,16 +1730,40 @@ func TestValidateCreate_StandaloneRequiresStorage(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_StandaloneRejectsUnsupportedStorageEngine(t *testing.T) {
+func TestValidateCreate_StandaloneAcceptsTypedLiteStorage(t *testing.T) {
 	cluster := baseStandaloneCluster()
-	cluster.Spec.Config = `{"storage":{"engine":"lite","lite":{"path":"/antflydb/data.aflite"}}}`
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "data.aflite"
 
-	err := cluster.ValidateCreate()
-	if err == nil {
-		t.Fatal("expected operator-managed standalone Lite storage to fail admission")
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected typed standalone Lite storage to pass admission, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "supports only storage.engine=local") {
-		t.Fatalf("expected explicit storage engine validation error, got: %v", err)
+}
+
+func TestValidateCreate_StandaloneRejectsUnsafeLiteFileName(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "../data.aflite"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "liteFileName") {
+		t.Fatalf("expected safe Lite basename validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_StandaloneLocalRejectsLiteFileName(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Storage.Engine = "local"
+	cluster.Spec.Storage.LiteFileName = "data.aflite"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "liteFileName") {
+		t.Fatalf("expected tagged storage validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_ClusteredRejectsLiteStorage(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Storage.Engine = "lite"
+	cluster.Spec.Storage.LiteFileName = "data.aflite"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "spec.storage.engine") {
+		t.Fatalf("expected clustered Lite storage validation error, got: %v", err)
 	}
 }
 

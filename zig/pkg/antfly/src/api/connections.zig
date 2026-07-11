@@ -844,8 +844,9 @@ fn probeConfiguredExternalIoS3(
     opts: BuildOptions,
 ) !?ProbeResult {
     const endpoint = cfg.endpoint orelse return null;
-    const access_key_id = cfg.access_key_id orelse return null;
-    const secret_access_key = cfg.secret_access_key orelse return null;
+    if (cfg.credentials.source != .static) return null;
+    const access_key_id = cfg.credentials.access_key_id orelse return null;
+    const secret_access_key = cfg.credentials.secret_access_key orelse return null;
     const buckets = cfg.buckets;
     if (buckets.len == 0) return null;
 
@@ -895,7 +896,7 @@ fn probeS3Bucket(
             .use_ssl = cfg.use_ssl orelse std.mem.startsWith(u8, endpoint, "https://"),
             .access_key_id = try arena.dupe(u8, access_key_id),
             .secret_access_key = try arena.dupe(u8, secret_access_key),
-            .session_token = if (cfg.session_token) |value| try arena.dupe(u8, value) else null,
+            .session_token = if (cfg.credentials.session_token) |value| try arena.dupe(u8, value) else null,
             .region = try arena.dupe(u8, "us-east-1"),
         },
         .addressing_style = .path,

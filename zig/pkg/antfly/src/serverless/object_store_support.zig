@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const object_storage = @import("../storage/object_storage.zig");
+const bedrock = @import("../inference/bedrock.zig");
 const remote_uri = @import("remote_uri.zig");
 
 const Allocator = std.mem.Allocator;
@@ -24,6 +25,7 @@ pub const S3Options = struct {
     access_key_id: ?[]const u8 = null,
     secret_access_key: ?[]const u8 = null,
     session_token: ?[]const u8 = null,
+    credential_source: bedrock.CredentialSource = .default,
     use_ssl: bool = true,
     addressing_style: object_storage.S3.AddressingStyle = .path,
     create_bucket: bool = false,

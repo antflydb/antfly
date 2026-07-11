@@ -227,15 +227,23 @@ history. Lite reports `online: false`: check, compaction, and vacuum acquire the
 exclusive maintenance gate, so requests may wait while a job runs. This honest
 availability contract avoids calling a stop-the-world file rewrite "online".
 Checkpoint inspection, index writes, document commits, compaction, and vacuum
-share the Lite store mutex and single-writer reservation, so maintenance cannot
+share the Lite store mutex and FIFO writer admission gate, so blocked writers
+sleep without polling and resume in arrival order. Maintenance cannot
 race checkpoint publication or file replacement. Vacuum keeps only live keys
-and source page references in a bounded working set, reads one live value at a time,
-and streams compact pages to the replacement file. It therefore avoids a
+and source page references for one logical record class at a time, with no
+fixed distinct-key ceiling. It reads one live value at a time and streams
+compact pages to the replacement file. It therefore avoids a
 second whole-database value snapshot and a whole-file output image in memory;
 the replacement is fsynced, atomically renamed, and adopted through its
 already-open read/write handle before the parent directory is fsynced. A
 post-rename sync error therefore cannot leave the process writing an unlinked
 old inode.
+
+The Kubernetes operator exposes the same topology/storage separation through
+`spec.mode: Standalone` plus `spec.storage.engine: lite`. The optional
+`spec.storage.liteFileName` selects a safe `.aflite` basename on the standalone
+PVC; the operator owns the absolute mount path and rejects competing raw
+`spec.config.storage` values.
 
 The standalone listener holds an advisory lease for its host/port while using
 restart-safe address reuse. Cross-thread shutdown only publishes an atomic stop
@@ -637,7 +645,7 @@ single-node and local.
 - remote shard fanout
 - distributed transaction coordination
 - server-side autoscaling
-- Kubernetes operator behavior
+- multi-replica or horizontally scaled Kubernetes operator deployments
 - cluster heartbeat/status aggregation
 - S3/object-storage native serving as the primary Lite file
 

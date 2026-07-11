@@ -80,7 +80,8 @@ Object-backed serverless deployment:
         "region": "us-west-2",
         "buckets": ["antfly-data", "antfly-wal"],
         "prefix": "production",
-        "bucket_provisioning": "require_existing"
+        "bucket_provisioning": "require_existing",
+        "credentials": { "source": "web_identity", "role_arn": "arn:aws:iam::123456789012:role/antfly-data", "token_file": "/var/run/secrets/data/token" }
       }
     }
   },
@@ -101,20 +102,24 @@ Serverless derives its `artifacts`, `manifests`, `wal`, `progress`, and
 bucket, or prefix, which supports separate durability classes, accounts, and
 least-privilege credentials. Referenced connections must be S3 `external_io`
 connections with the `storage.primary` capability, and any configured bucket
-allowlist is enforced at startup. Explicit serverless URI flags or environment
-variables remain low-level location overrides. Lanes that resolve to the same
-connection share one object-store client and HTTP connection pool; distinct
-credential profiles remain isolated.
+allowlist is enforced at startup. Low-level URI flags and environment variables
+are supported only without a connection-based config; mixing them is rejected
+because a location override without an identity override is ambiguous. Lanes
+that resolve to the same connection share one object-store client and HTTP
+connection pool; distinct credential sources remain isolated.
 
 Primary storage credentials are deliberately independent from
 `remote_content.s3`. The former grants Antfly write authority over database
 state; the latter grants read authority over user-provided content and may
-contain several named credentials selected by bucket. When a storage connection
-omits static keys, Antfly uses the refreshable AWS default credential chain
-shared with Bedrock: environment credentials, web identity/IRSA, shared
-profiles, ECS task credentials, and EC2 instance metadata. Expiring credentials
-refresh before their safety window. Static keys remain available through secret
-references for S3-compatible systems, but should never be committed plaintext.
+contain several named credentials selected by bucket. `credentials.source` is
+one of `default`, `static`, `profile`, or `web_identity`. The default source uses
+the refreshable AWS default credential chain shared with Bedrock: environment
+credentials, web identity/IRSA, shared profiles, ECS task credentials, and EC2
+instance metadata. Profile and web-identity sources are configured per
+connection and therefore support multiple accounts in one process. Expiring
+credentials refresh before their safety window. Static keys remain available
+through secret references for S3-compatible systems, but should never be
+committed plaintext.
 Pass `--secret-store-path` (or
 `ANTFLY_SECRET_STORE_PATH`) when those JSON values use `${secret:...}`.
 
@@ -204,10 +209,10 @@ The same routes exist for every engine and return `422` when unsupported. The
 status capability reports whether maintenance preserves request availability.
 Lite maintenance is currently coordinated but exclusive (`online: false`): the
 asynchronous job acquires the file maintenance gate and requests may wait until
-it completes. Vacuum retains live keys and source page references in a bounded
-working set, streams one
+it completes. Vacuum retains one logical record class at a time rather than
+holding metadata, index, and document key sets simultaneously, streams one
 value at a time into a durable replacement file, and atomically renames it; it
-fails explicitly if distinct-key metadata exceeds the bound and does not
-allocate a second database-sized output image. Lite also keeps `lite
+has no artificial distinct-key ceiling and does not allocate a second
+database-sized output image. Lite also keeps `lite
 check`, `compact`, and `vacuum` for offline files. Backup and restore remain
 portable `/db/v1` operations rather than storage maintenance.

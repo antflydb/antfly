@@ -132,11 +132,16 @@ spec:
         "level": "info",
         "style": "json"
       },
-      "storage": {
-        "s3": {
-          "region": "us-east-2",
-          "bucket": "my-antfly-backups",
-          "prefix": "eks-cluster/"
+      "connections": {
+        "backup-store": {
+          "kind": "external_io",
+          "capabilities": ["backup.write", "restore.read"],
+          "external_io": {
+            "protocol": "s3",
+            "region": "us-east-2",
+            "buckets": ["my-antfly-backups"],
+            "prefix": "eks-cluster/"
+          }
         }
       },
       "cache_size": 1000,

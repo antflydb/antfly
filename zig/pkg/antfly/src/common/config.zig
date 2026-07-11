@@ -240,6 +240,33 @@ pub const Config = struct {
 
     pub const S3AddressingStyle = enum { path, virtual_hosted };
     pub const BucketProvisioning = enum { require_existing, create_if_missing };
+    pub const AwsCredentialSource = enum { default, static, profile, web_identity };
+
+    pub const AwsCredentialConfig = struct {
+        source: AwsCredentialSource = .default,
+        access_key_id: ?[]u8 = null,
+        secret_access_key: ?[]u8 = null,
+        session_token: ?[]u8 = null,
+        profile: ?[]u8 = null,
+        shared_credentials_file: ?[]u8 = null,
+        role_arn: ?[]u8 = null,
+        token_file: ?[]u8 = null,
+        session_name: ?[]u8 = null,
+        sts_endpoint: ?[]u8 = null,
+
+        fn deinit(self: *AwsCredentialConfig, alloc: std.mem.Allocator) void {
+            if (self.access_key_id) |value| alloc.free(value);
+            if (self.secret_access_key) |value| alloc.free(value);
+            if (self.session_token) |value| alloc.free(value);
+            if (self.profile) |value| alloc.free(value);
+            if (self.shared_credentials_file) |value| alloc.free(value);
+            if (self.role_arn) |value| alloc.free(value);
+            if (self.token_file) |value| alloc.free(value);
+            if (self.session_name) |value| alloc.free(value);
+            if (self.sts_endpoint) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
 
     pub const ConnectionConfig = struct {
         display_name: ?[]u8 = null,
@@ -334,9 +361,7 @@ pub const Config = struct {
         prefix: ?[]u8 = null,
         hosts: []const []u8 = &.{},
         headers: std.StringArrayHashMapUnmanaged([]u8) = .{},
-        access_key_id: ?[]u8 = null,
-        secret_access_key: ?[]u8 = null,
-        session_token: ?[]u8 = null,
+        credentials: AwsCredentialConfig = .{},
         use_ssl: ?bool = null,
 
         fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
@@ -351,9 +376,7 @@ pub const Config = struct {
                 alloc.free(entry.value_ptr.*);
             }
             self.headers.deinit(alloc);
-            if (self.access_key_id) |value| alloc.free(value);
-            if (self.secret_access_key) |value| alloc.free(value);
-            if (self.session_token) |value| alloc.free(value);
+            self.credentials.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -917,6 +940,34 @@ test "common config resolves capability-scoped object storage connections and la
     ));
 }
 
+test "common config isolates named AWS credential sources and rejects credential typos" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": {
+        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "buckets": ["data-bucket"], "credentials": { "source": "profile", "profile": "data-account", "shared_credentials_file": "/secrets/data-credentials" } } },
+        \\    "wal": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "buckets": ["wal-bucket"], "credentials": { "source": "web_identity", "role_arn": "arn:aws:iam::1:role/wal", "token_file": "/secrets/wal-token" } } }
+        \\  },
+        \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket", "lanes": { "wal": { "connection": "wal", "bucket": "wal-bucket" } } } }
+        \\}
+    );
+    defer cfg.deinit();
+    const data = cfg.connections.get("data").?.external_io.?.credentials;
+    try std.testing.expectEqual(Config.AwsCredentialSource.profile, data.source);
+    try std.testing.expectEqualStrings("data-account", data.profile.?);
+    const wal = cfg.connections.get("wal").?.external_io.?.credentials;
+    try std.testing.expectEqual(Config.AwsCredentialSource.web_identity, wal.source);
+    try std.testing.expectEqualStrings("/secrets/wal-token", wal.token_file.?);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": { "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "buckets": ["data-bucket"], "credentials": { "source": "static", "access_key": "typo", "secret_access_key": "secret" } } } },
+        \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket" } }
+        \\}
+    ));
+}
+
 test "common config command deployment context supplies topology and rejects conflicting assertions" {
     var cfg = try Config.parseFromSliceWithSecretsForDeployment(std.testing.allocator,
         \\{
@@ -1289,7 +1340,19 @@ fn prefixContains(scope: []const u8, target: []const u8) bool {
 
 fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.ConnectionConfig {
     if (value != .object) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "display_name", "provider", "kind", "capabilities", "inference", "web_search", "external_io", "cdc" })) return error.InvalidConfig;
     const kind = try requiredEnumField(Config.ConnectionKind, value.object, "kind");
+    const selected_member = switch (kind) {
+        .inference => "inference",
+        .web_search => "web_search",
+        .external_io => "external_io",
+        .cdc => "cdc",
+    };
+    for ([_][]const u8{ "inference", "web_search", "external_io", "cdc" }) |member| {
+        if (std.mem.eql(u8, member, selected_member)) {
+            if (value.object.get(member) == null) return error.InvalidConfig;
+        } else if (value.object.get(member) != null) return error.InvalidConfig;
+    }
     var connection = Config.ConnectionConfig{
         .display_name = try optionalStringFieldDup(alloc, value.object, "display_name"),
         .provider = try optionalStringFieldDup(alloc, value.object, "provider"),
@@ -1312,6 +1375,7 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
 
 fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
     if (value != .object) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types" })) return error.InvalidConfig;
     return .{
         .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
         .url = try optionalStringFieldDup(alloc, value.object, "url"),
@@ -1327,6 +1391,7 @@ fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Valu
 
 fn parseWebSearchConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.WebSearchConnectionConfig {
     if (value != .object) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "service", "max_results", "timeout_ms", "safe_search", "language", "region", "include_content", "include_highlights", "api_key", "endpoint", "project_id", "location", "data_store", "serving_config", "credentials_path", "include_domains", "exclude_domains" })) return error.InvalidConfig;
     return .{
         .service = try optionalStringFieldDup(alloc, value.object, "service"),
         .max_results = try optionalU32Field(value.object, "max_results"),
@@ -1350,21 +1415,20 @@ fn parseWebSearchConnectionConfig(alloc: std.mem.Allocator, value: std.json.Valu
 
 fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.ExternalIoConnectionConfig {
     if (value != .object) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "protocol", "endpoint", "region", "addressing_style", "bucket_provisioning", "buckets", "prefix", "hosts", "headers", "credentials", "use_ssl" })) return error.InvalidConfig;
     var cfg = Config.ExternalIoConnectionConfig{
         .protocol = try requiredEnumField(Config.ExternalIoProtocol, value.object, "protocol"),
-        .endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint"),
-        .region = try optionalStringFieldDup(alloc, value.object, "region"),
-        .addressing_style = try optionalEnumField(Config.S3AddressingStyle, value.object, "addressing_style") orelse .virtual_hosted,
-        .bucket_provisioning = try optionalEnumField(Config.BucketProvisioning, value.object, "bucket_provisioning") orelse .require_existing,
-        .buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{},
-        .prefix = try optionalStringFieldDup(alloc, value.object, "prefix"),
-        .hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{},
-        .access_key_id = try optionalStringFieldDup(alloc, value.object, "access_key_id"),
-        .secret_access_key = try optionalStringFieldDup(alloc, value.object, "secret_access_key"),
-        .session_token = try optionalStringFieldDup(alloc, value.object, "session_token"),
-        .use_ssl = try optionalBoolField(value.object, "use_ssl"),
     };
     errdefer cfg.deinit(alloc);
+    cfg.endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint");
+    cfg.region = try optionalStringFieldDup(alloc, value.object, "region");
+    cfg.addressing_style = try optionalEnumField(Config.S3AddressingStyle, value.object, "addressing_style") orelse .virtual_hosted;
+    cfg.bucket_provisioning = try optionalEnumField(Config.BucketProvisioning, value.object, "bucket_provisioning") orelse .require_existing;
+    cfg.buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{};
+    cfg.prefix = try optionalStringFieldDup(alloc, value.object, "prefix");
+    cfg.hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{};
+    cfg.credentials = try parseAwsCredentialConfig(alloc, value.object.get("credentials"));
+    cfg.use_ssl = try optionalBoolField(value.object, "use_ssl");
 
     if (value.object.get("headers")) |headers| {
         if (headers != .object) return error.InvalidConfig;
@@ -1391,8 +1455,40 @@ fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Val
     return cfg;
 }
 
+fn parseAwsCredentialConfig(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !Config.AwsCredentialConfig {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidConfig;
+    const source = try requiredEnumField(Config.AwsCredentialSource, value.object, "source");
+    const allowed = switch (source) {
+        .default => &[_][]const u8{"source"},
+        .static => &[_][]const u8{ "source", "access_key_id", "secret_access_key", "session_token" },
+        .profile => &[_][]const u8{ "source", "profile", "shared_credentials_file" },
+        .web_identity => &[_][]const u8{ "source", "role_arn", "token_file", "session_name", "sts_endpoint" },
+    };
+    if (!objectContainsOnly(value.object, allowed)) return error.InvalidConfig;
+    var cfg = Config.AwsCredentialConfig{ .source = source };
+    errdefer cfg.deinit(alloc);
+    cfg.access_key_id = try optionalStringFieldDup(alloc, value.object, "access_key_id");
+    cfg.secret_access_key = try optionalStringFieldDup(alloc, value.object, "secret_access_key");
+    cfg.session_token = try optionalStringFieldDup(alloc, value.object, "session_token");
+    cfg.profile = try optionalStringFieldDup(alloc, value.object, "profile");
+    cfg.shared_credentials_file = try optionalStringFieldDup(alloc, value.object, "shared_credentials_file");
+    cfg.role_arn = try optionalStringFieldDup(alloc, value.object, "role_arn");
+    cfg.token_file = try optionalStringFieldDup(alloc, value.object, "token_file");
+    cfg.session_name = try optionalStringFieldDup(alloc, value.object, "session_name");
+    cfg.sts_endpoint = try optionalStringFieldDup(alloc, value.object, "sts_endpoint");
+    switch (source) {
+        .default => {},
+        .static => if (cfg.access_key_id == null or cfg.secret_access_key == null) return error.InvalidConfig,
+        .profile => if (cfg.profile == null) return error.InvalidConfig,
+        .web_identity => if (cfg.role_arn == null or cfg.token_file == null) return error.InvalidConfig,
+    }
+    return cfg;
+}
+
 fn parseCdcConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.CdcConnectionConfig {
     if (value != .object) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "dsn", "table_name", "source_ordinal", "external_table", "slot_name", "publication_name" })) return error.InvalidConfig;
     return .{
         .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
         .dsn = try optionalStringFieldDup(alloc, value.object, "dsn"),

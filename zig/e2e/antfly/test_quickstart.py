@@ -145,7 +145,9 @@ def test_text_quickstart_and_document_artifact(serverless_api):
         return search
 
     status = serverless_api.status()
-    assert status["deployment_mode"] == "standalone"
+    assert status["role"] == "combined"
+    assert status["combined_mode"] is True
+    assert status["validated"] is True
 
     serverless_api.ensure_table("wikipedia", created_at_ns=100)
     serverless_api.ingest_table(

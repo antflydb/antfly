@@ -4038,6 +4038,14 @@ spec:
                 properties:
                   dataStorage:
                     type: string
+                  engine:
+                    default: local
+                    enum:
+                    - local
+                    - lite
+                    type: string
+                  liteFileName:
+                    type: string
                   metadataStorage:
                     type: string
                   pvcRetentionPolicy:

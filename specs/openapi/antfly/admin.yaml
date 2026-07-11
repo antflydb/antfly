@@ -25,7 +25,7 @@ paths:
     post:
       tags: [maintenance]
       operationId: startStorageCheck
-      summary: Start an online storage integrity check
+      summary: Start a coordinated storage integrity check
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       responses:

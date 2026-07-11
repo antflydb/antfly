@@ -423,7 +423,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.checkHAWrite(ctx);
         }
 
-        /// Start an online storage integrity check
+        /// Start a coordinated storage integrity check
         /// POST /maintenance/check
         fn startStorageCheck(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });

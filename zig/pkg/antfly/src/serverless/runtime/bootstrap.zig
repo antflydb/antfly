@@ -73,8 +73,9 @@ const S3ClientPool = struct {
         http: @import("httpx").Client,
         cache: bedrock.CredentialCache = .{},
         region: []u8,
+        source: bedrock.CredentialSource,
 
-        fn init(alloc: Allocator, region: []const u8) !AwsCredentialContext {
+        fn init(alloc: Allocator, region: []const u8, source: bedrock.CredentialSource) !AwsCredentialContext {
             var io_impl = std.Io.Threaded.init(alloc, .{});
             errdefer io_impl.deinit();
             return .{
@@ -82,6 +83,7 @@ const S3ClientPool = struct {
                 .io_impl = io_impl,
                 .http = @import("httpx").Client.init(alloc, io_impl.io()),
                 .region = try alloc.dupe(u8, region),
+                .source = source,
             };
         }
 
@@ -99,7 +101,7 @@ const S3ClientPool = struct {
 
         fn get(ptr: *anyopaque, alloc: Allocator) anyerror!objectstore.S3.DynamicCredentials {
             const self: *AwsCredentialContext = @ptrCast(@alignCast(ptr));
-            const credentials = try self.cache.get(alloc, &self.http, self.region);
+            const credentials = try self.cache.getForSource(alloc, &self.http, self.region, self.source);
             return .{
                 .access_key_id = @constCast(credentials.access_key_id),
                 .secret_access_key = @constCast(credentials.secret_access_key),
@@ -158,7 +160,7 @@ const S3ClientPool = struct {
         if (dynamic_credentials) {
             const context = try self.alloc.create(AwsCredentialContext);
             errdefer self.alloc.destroy(context);
-            context.* = try AwsCredentialContext.init(self.alloc, config.credentials.region);
+            context.* = try AwsCredentialContext.init(self.alloc, config.credentials.region, options.credential_source);
             credential_context = context;
             config.credential_provider = context.provider();
         }
@@ -183,7 +185,26 @@ fn s3OptionsEql(a: object_store_support.S3Options, b: object_store_support.S3Opt
         optionalStringEql(a.access_key_id, b.access_key_id) and
         optionalStringEql(a.secret_access_key, b.secret_access_key) and
         optionalStringEql(a.session_token, b.session_token) and
+        credentialSourceEql(a.credential_source, b.credential_source) and
         a.use_ssl == b.use_ssl and a.addressing_style == b.addressing_style;
+}
+
+fn credentialSourceEql(a: bedrock.CredentialSource, b: bedrock.CredentialSource) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .default => true,
+        .profile => |left| blk: {
+            const right = b.profile;
+            break :blk std.mem.eql(u8, left.name, right.name) and optionalStringEql(left.shared_credentials_file, right.shared_credentials_file);
+        },
+        .web_identity => |left| blk: {
+            const right = b.web_identity;
+            break :blk std.mem.eql(u8, left.role_arn, right.role_arn) and
+                std.mem.eql(u8, left.token_file, right.token_file) and
+                std.mem.eql(u8, left.session_name, right.session_name) and
+                optionalStringEql(left.sts_endpoint, right.sts_endpoint);
+        },
+    };
 }
 
 fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
