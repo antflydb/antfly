@@ -132,6 +132,30 @@ pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decisio
     };
 }
 
+pub fn evaluatePromotedPrimary(
+    primary: *const primary_mod.Primary,
+    handoff: standby_mod.PromotionHandoff,
+    request: Request,
+) !Decision {
+    try validateIdentity(primary.identity, handoff.identity);
+    if (handoff.switch_lsn == 0 or
+        handoff.switch_lsn == std.math.maxInt(u64) or
+        handoff.next_lsn != handoff.switch_lsn + 1)
+    {
+        return error.InvalidPromotionHandoff;
+    }
+    if (primary.lastLsn() < handoff.switch_lsn) return error.PromotedLogMismatch;
+    if (request.expected_identity) |expected| try validateIdentity(handoff.identity, expected);
+    return .{
+        .role = .promoted_standby,
+        .action = .open_promoted_primary,
+        .identity = handoff.identity,
+        .durable_lsn = handoff.switch_lsn,
+        .next_lsn = handoff.next_lsn,
+        .promotion_handoff = handoff,
+    };
+}
+
 fn validateIdentity(actual: standby_mod.Identity, expected: standby_mod.Identity) !void {
     if (actual.cluster_id != expected.cluster_id) return error.WrongCluster;
     if (actual.shard_id != expected.shard_id) return error.WrongShard;
@@ -331,4 +355,11 @@ test "storage.ha write gate rejects standby until promotion handoff is opened" {
     const primary_decision = try evaluatePrimary(&primary, .{ .expected_identity = promoted_identity });
     try std.testing.expect(primary_decision.canWrite());
     try std.testing.expectEqual(@as(u64, 3), primary_decision.next_lsn);
+
+    const completed_handoff = try evaluatePromotedPrimary(&primary, handoff, .{ .expected_identity = promoted_identity });
+    try std.testing.expect(!completed_handoff.canWrite());
+    try std.testing.expectEqual(Role.promoted_standby, completed_handoff.role);
+    try std.testing.expectEqual(Action.open_promoted_primary, completed_handoff.action);
+    try std.testing.expectEqual(handoff.switch_lsn, completed_handoff.durable_lsn);
+    try std.testing.expect(completed_handoff.promotion_handoff != null);
 }

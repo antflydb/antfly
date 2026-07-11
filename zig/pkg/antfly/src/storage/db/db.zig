@@ -52,6 +52,7 @@ const ha_effects_mod = @import("../ha/effects.zig");
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
 const ha_fencing_mod = @import("../ha/fencing.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
+const ha_public_gate_state_mod = @import("../ha/public_gate_state.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
@@ -446,10 +447,48 @@ fn haSyncPolicyIncludesStandby(policy: ha_primary_mod.SyncPolicy, slot_name: []c
 pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
 pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
 
+pub const SharedHAWriteGate = struct {
+    state: *const ha_public_gate_state_mod.State,
+    /// Sources track the live role. DB instances pin the generation they opened
+    /// with so a promotion cannot pair old runtime hooks with the new primary.
+    generation: ?u64 = null,
+};
+
 pub const HAWriteGate = union(enum) {
     primary: *ha_primary_mod.Primary,
     fenced_primary: ha_write_gate_mod.FencedPrimary,
     standby: *ha_standby_mod.Standby,
+    shared: SharedHAWriteGate,
+
+    pub fn check(self: HAWriteGate) !void {
+        switch (self) {
+            .shared => |shared| return try shared.state.checkWrite(shared.generation),
+            else => {},
+        }
+
+        const decision = switch (self) {
+            .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+            .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
+            .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
+            .shared => unreachable,
+        };
+        switch (decision.action) {
+            .allow_write => {},
+            .reject_read_only_standby => return error.HAReadOnlyStandby,
+            .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+            .reject_fenced_primary => return error.HAFencedPrimary,
+        }
+    }
+
+    pub fn pinned(self: HAWriteGate) HAWriteGate {
+        return switch (self) {
+            .shared => |shared| .{ .shared = .{
+                .state = shared.state,
+                .generation = shared.generation orelse shared.state.currentGeneration(),
+            } },
+            else => self,
+        };
+    }
 };
 
 fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
@@ -458,6 +497,7 @@ fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
         .primary => false,
         .fenced_primary => false,
         .standby => true,
+        .shared => |shared| shared.state.isStandbyRole(),
     };
 }
 
@@ -2935,6 +2975,7 @@ pub const DB = struct {
             var generation_read_lease = try generation_lifecycle.acquirePublishedGenerationRead(alloc, path);
             errdefer if (generation_read_lease) |*lease| lease.deinit();
             const open_started_ns = monotonicTimeNs();
+            const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
             var profile = OpenProfile{};
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_async_context: ?*AsyncContext = null;
@@ -3036,7 +3077,7 @@ pub const DB = struct {
                 .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                 .lmdb, .mem => {},
             }
-            const ha_standby_role = haWriteGateIsStandby(opts.ha_write_gate);
+            const ha_standby_role = haWriteGateIsStandby(ha_write_gate);
             const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !ha_standby_role;
 
             var db = DB{
@@ -3067,7 +3108,7 @@ pub const DB = struct {
                 .ha_async_effect_mirror = opts.ha_async_effect_mirror,
                 .ha_async_batch_mirror = opts.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = opts.ha_async_metadata_mirror,
-                .ha_write_gate = opts.ha_write_gate,
+                .ha_write_gate = ha_write_gate,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -22835,17 +22876,7 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
 
 fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
     const configured = gate orelse return;
-    const decision = switch (configured) {
-        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
-        .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
-        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
-    };
-    switch (decision.action) {
-        .allow_write => return,
-        .reject_read_only_standby => return error.HAReadOnlyStandby,
-        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
-        .reject_fenced_primary => return error.HAFencedPrimary,
-    }
+    try configured.check();
 }
 
 fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {

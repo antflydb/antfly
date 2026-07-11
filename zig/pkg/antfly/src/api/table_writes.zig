@@ -40,7 +40,7 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const portable_backup = @import("../storage/portable_backup.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const ha_primary_mod = @import("../storage/ha/primary.zig");
-const ha_write_gate_mod = @import("../storage/ha/write_gate.zig");
+const ha_public_gate_state_mod = @import("../storage/ha/public_gate_state.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lmdb = @import("../storage/lmdb.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -738,6 +738,7 @@ pub const ProvisionedTableWriteCache = struct {
     const Entry = struct {
         group_id: u64,
         lsm_root_generation: u64,
+        ha_write_gate_generation: ?u64 = null,
         table_name: []u8,
         promotion_owner_state: PromotionOwnerState = .{},
         db: db_mod.DB,
@@ -846,6 +847,10 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    fn entryHAWriteGateCurrent(self: *const ProvisionedTableWriteCache, entry: *const Entry) bool {
+        return entry.ha_write_gate_generation == haWriteGateCurrentGeneration(self.ha_write_gate);
+    }
+
     fn retireFailedOpenLocked(self: *ProvisionedTableWriteCache, cached: *CachedDb) void {
         const entry = cached.entry orelse {
             cached.deinit(self.alloc);
@@ -920,6 +925,7 @@ pub const ProvisionedTableWriteCache = struct {
                 .primary => |right| left == right,
                 .fenced_primary => false,
                 .standby => false,
+                .shared => false,
             },
             .fenced_primary => |left| switch (b.?) {
                 .primary => false,
@@ -927,12 +933,26 @@ pub const ProvisionedTableWriteCache = struct {
                     left.fence_store == right.fence_store and
                     std.mem.eql(u8, left.node_id, right.node_id),
                 .standby => false,
+                .shared => false,
             },
             .standby => |left| switch (b.?) {
                 .primary => false,
                 .fenced_primary => false,
                 .standby => |right| left == right,
+                .shared => false,
             },
+            .shared => |left| switch (b.?) {
+                .primary, .fenced_primary, .standby => false,
+                .shared => |right| left.state == right.state and left.generation == right.generation,
+            },
+        };
+    }
+
+    fn haWriteGateCurrentGeneration(gate: ?db_mod.HAWriteGate) ?u64 {
+        const configured = gate orelse return null;
+        return switch (configured) {
+            .shared => |shared| shared.state.currentGeneration(),
+            .primary, .fenced_primary, .standby => null,
         };
     }
 
@@ -1335,6 +1355,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
+                if (!self.entryHAWriteGateCurrent(entry)) continue;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
@@ -1387,6 +1408,7 @@ pub const ProvisionedTableWriteCache = struct {
         owned_entry.* = .{
             .group_id = group_id,
             .lsm_root_generation = lsm_root_generation,
+            .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
             .db = opened.db,
             .schema_json = if (metadata.schema_json) |value| try self.alloc.dupe(u8, value) else null,
@@ -1432,6 +1454,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
+                if (!self.entryHAWriteGateCurrent(entry)) continue;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
@@ -1449,6 +1472,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             _ = self.hit_count.fetchAdd(1, .monotonic);
             lockAtomic(&self.entry_lifecycle_mutex);
@@ -1483,6 +1507,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (entry.lsm_root_generation != lsm_root_generation) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
             return self.leaseEntryLocked(entry);
         }
         return null;
@@ -1498,6 +1523,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             return self.leaseEntryLocked(entry);
         }
@@ -1526,6 +1552,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!allow_bulk_session and (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open)) return null;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
             return self.leaseEntryLocked(entry);
         }
         return null;
@@ -1558,6 +1585,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
+                if (!self.entryHAWriteGateCurrent(entry)) continue;
                 if (opened.*) |*db| db.close();
                 opened.* = null;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -1594,6 +1622,7 @@ pub const ProvisionedTableWriteCache = struct {
         owned_entry.* = .{
             .group_id = group_id,
             .lsm_root_generation = lsm_root_generation,
+            .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
             .db = db,
             .schema_json = prepared.schema_json,
@@ -1627,6 +1656,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (entry.lsm_root_generation != lsm_root_generation) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
             if (opened.*) |*db| db.close();
             opened.* = null;
             try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
@@ -1647,6 +1677,7 @@ pub const ProvisionedTableWriteCache = struct {
         owned_entry.* = .{
             .group_id = group_id,
             .lsm_root_generation = lsm_root_generation,
+            .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
             .db = db,
             .schema_json = owned_schema_json,
@@ -1716,11 +1747,12 @@ pub const ProvisionedTableWriteCache = struct {
                 i += 1;
                 continue;
             }
-            if (entry.lsm_root_generation == lsm_root_generation) {
+            const stale_ha_write_gate = !self.entryHAWriteGateCurrent(entry);
+            if (entry.lsm_root_generation == lsm_root_generation and !stale_ha_write_gate) {
                 i += 1;
                 continue;
             }
-            if (self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) {
+            if (!stale_ha_write_gate and self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) {
                 i += 1;
                 continue;
             }
@@ -5164,6 +5196,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (cache.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!cache.entryHAWriteGateCurrent(entry)) continue;
             if (entry.auto_bulk_ingest_session_open) {
                 try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
                 return cache.leaseEntryLocked(entry);
@@ -10567,17 +10600,7 @@ pub const ProvisionedTableWriteSource = struct {
 
 fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
     const configured = gate orelse return;
-    const decision = switch (configured) {
-        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
-        .fenced_primary => |gate_value| try ha_write_gate_mod.evaluateFencedPrimary(gate_value, .{}),
-        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
-    };
-    switch (decision.action) {
-        .allow_write => return,
-        .reject_read_only_standby => return error.HAReadOnlyStandby,
-        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
-        .reject_fenced_primary => return error.HAFencedPrimary,
-    }
+    try configured.check();
 }
 
 pub const HostedProvisionedTableWriteSource = struct {
@@ -28765,6 +28788,102 @@ test "write cache HA gate clear drains inactive pending closes before returning"
     write_cache.setHAWriteGate(.{ .primary = &primary });
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+}
+
+test "write cache retires shared HA generation stale entries before reuse" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-stale", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    defer closeHostedManagedDbCacheForRoot(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var state = ha_public_gate_state_mod.State{};
+    state.configureStandby(.{
+        .received_lsn = 1,
+        .applied_lsn = 1,
+        .safe_read_lsn = 1,
+    });
+    const primary_log_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-primary-log", .{tmp.sub_path});
+    defer alloc.free(primary_log_path_raw);
+    const primary_log_path = try alloc.dupeZ(u8, primary_log_path_raw);
+    defer alloc.free(primary_log_path);
+    const primary_slots_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-primary-slots", .{tmp.sub_path});
+    defer alloc.free(primary_slots_path_raw);
+    const primary_slots_path = try alloc.dupeZ(u8, primary_slots_path_raw);
+    defer alloc.free(primary_slots_path);
+    var promoted_primary = try ha_primary_mod.Primary.open(alloc, primary_log_path.ptr, primary_slots_path.ptr, .{
+        .cluster_id = 700,
+        .shard_id = 1,
+        .table_id = 7,
+        .timeline_id = 2,
+        .epoch = 2,
+    }, .{});
+    defer promoted_primary.close();
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    write_cache.setHAWriteGate(.{ .shared = .{ .state = &state } });
+
+    var standby_cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    standby_cached.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(?u64, 1), write_cache.entries.items[0].ha_write_gate_generation);
+
+    state.publishPrimary(&promoted_primary, false);
+
+    try std.testing.expectError(
+        error.LsmRootWriterAlreadyOpen,
+        write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.closing_entries.items.len);
+
+    write_cache.drainPendingClosesForGroupTable(7001, "docs");
+    var primary_cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    primary_cached.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(?u64, 2), write_cache.entries.items[0].ha_write_gate_generation);
 }
 
 test "hosted status-only open drains stale pending close before retry" {

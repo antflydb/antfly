@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const platform_sync = @import("antfly_platform").sync;
 const http_common = @import("../../common/http/http_common.zig");
 const internal_api = @import("../../internal/mod.zig");
 const primary_mod = @import("primary.zig");
@@ -32,11 +33,21 @@ var test_path_counter: u64 = 0;
 pub const Server = struct {
     alloc: Allocator,
     primary: ?*primary_mod.Primary = null,
+    state_mutex: ?*std.atomic.Mutex = null,
+
+    pub const Options = struct {
+        state_mutex: ?*std.atomic.Mutex = null,
+    };
 
     pub fn init(alloc: Allocator, primary: ?*primary_mod.Primary) Server {
+        return initWithOptions(alloc, primary, .{});
+    }
+
+    pub fn initWithOptions(alloc: Allocator, primary: ?*primary_mod.Primary, options: Options) Server {
         return .{
             .alloc = alloc,
             .primary = primary,
+            .state_mutex = options.state_mutex,
         };
     }
 
@@ -50,6 +61,10 @@ pub const Server = struct {
     }
 
     pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (self.state_mutex) |mutex| {
+            platform_sync.lockYielding(mutex);
+            defer mutex.unlock();
+        }
         const path = requestPath(req.uri);
         switch (req.method) {
             .GET => {

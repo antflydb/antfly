@@ -4240,6 +4240,7 @@ pub fn build(b: *std.Build) void {
             "managed source status-only open drains stale pending close before retry",
             "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
+            "write cache retires shared HA generation stale entries before reuse",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
