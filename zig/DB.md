@@ -56,7 +56,11 @@ namespace. The exchanged old root is reclaimed only after publication.
 capability and rejects a path that is not the capability's staging root. Raw
 path possession is therefore insufficient to mutate a serving root. Startup,
 provisioning, and API restore entry points all acquire their capability through
-the same process generation-lifecycle manager. The provisioned serving path
+the same process generation-lifecycle manager. This includes the embedded
+`BoundTableWriteSource`: it closes its current owner, restores into a sibling
+generation, publishes atomically, and reopens either the unchanged live
+generation after a pre-commit failure or the newly published generation after
+success. The provisioned serving path
 uses separate prepare and publish operations so all required repair completes
 before the namespace mutation. Startup/bootstrap convenience paths publish a
 validated primary generation with a durable repair marker, allowing the normal
@@ -191,6 +195,10 @@ carry their allocator in a typed owner. In particular, full-text stored-document
 decompression allocates directly in the request/result allocator instead of the
 segment reader's allocator; this prevents cached index generations and HTTP
 requests from crossing allocator domains during result teardown.
+Production HTTP server construction selects the process request allocator
+internally. Arbitrary request-allocator injection is test-only, so a new serving
+call site cannot accidentally recreate cross-allocator ownership by choosing an
+allocator with a different identity.
 
 ## Write Contract
 
@@ -370,6 +378,15 @@ enough, because repair must distinguish:
 Coverage-gap repair should regenerate missing `produced` artifacts, leave
 current-generation `skipped` units alone, and retry or surface
 `terminal_failed` units according to policy.
+
+Per-source outcome markers are the durable source of truth. Their aggregate
+counters are updated in the same DB apply-lock domain as replay mutations, and
+each marker/counter batch commits atomically. Generated enrichment rechecks a
+queued marker after publishing its replay record before decrementing the
+counter; it does not rely on state observed while the generation window was
+being assembled. Batch mutation paths deduplicate source keys with hash sets,
+keeping cleanup linear in the number of distinct source units rather than
+quadratic in batch size.
 
 ### Scope
 

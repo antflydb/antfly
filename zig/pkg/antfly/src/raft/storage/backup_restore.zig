@@ -134,10 +134,37 @@ pub fn reconcileCommittedRestoreWithExclusiveTransition(
 ) !void {
     try transition.validate(path);
     try transition.reconcilePublished();
+    try validateCommittedRestoreIdentity(alloc, path, group_id, restore);
+}
+
+pub fn validateCommittedRestoreIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
     var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse return error.RestoreIdentityMismatch;
     defer state.deinit(alloc);
     if (!state.primary_restored or
         !state.runtime_repair_complete or
+        state.group_id != group_id or
+        !std.mem.eql(u8, state.backup_id, restore.backup_id) or
+        !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
+        !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
+    {
+        return error.RestoreIdentityMismatch;
+    }
+}
+
+pub fn validateImportedRestoreIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse return error.RestoreIdentityMismatch;
+    defer state.deinit(alloc);
+    if (!state.primary_restored or
         state.group_id != group_id or
         !std.mem.eql(u8, state.backup_id, restore.backup_id) or
         !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or

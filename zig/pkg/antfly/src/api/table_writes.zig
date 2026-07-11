@@ -3897,12 +3897,6 @@ pub const BoundTableWriteSource = struct {
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
         defer alloc.free(snapshot_root);
-        if (std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb")) {
-            const body = try readBackupFileAlloc(alloc, snapshot_root);
-            defer alloc.free(body);
-            try portable_backup.importPortable(alloc, self.db.core.store, body);
-            return;
-        }
 
         const db_path = try alloc.dupe(u8, self.db.core.path);
         defer alloc.free(db_path);
@@ -3917,16 +3911,64 @@ pub const BoundTableWriteSource = struct {
         const identity_namespace = self.db.core.identity_namespace;
 
         self.db.close();
-        try db_mod.DB.restoreSnapshotTo(alloc, snapshot_root, db_path, .{
-            .primary_backend = primary_backend,
-            .identity_namespace = identity_namespace,
-        });
-        self.db.* = try db_mod.DB.open(alloc, db_path, .{
+        const open_options: db_mod.OpenOptions = .{
             .primary_backend = primary_backend,
             .backend_runtime = backend_runtime,
-        });
+            .identity_namespace = identity_namespace,
+        };
+        const publication_outcome = restoreBoundTableGeneration(
+            alloc,
+            snapshot_root,
+            db_path,
+            std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb"),
+            open_options,
+        ) catch |restore_err| {
+            self.db.* = db_mod.DB.open(alloc, db_path, open_options) catch |reopen_err| {
+                std.log.err("bound restore failed and live generation could not be reopened path={s} restore_err={s} reopen_err={s}", .{
+                    db_path,
+                    @errorName(restore_err),
+                    @errorName(reopen_err),
+                });
+                return reopen_err;
+            };
+            self.db.owned_backend_runtime = owned_backend_runtime;
+            owned_backend_runtime = null;
+            return restore_err;
+        };
+        self.db.* = try db_mod.DB.open(alloc, db_path, open_options);
         self.db.owned_backend_runtime = owned_backend_runtime;
         owned_backend_runtime = null;
+        if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
+    }
+
+    fn restoreBoundTableGeneration(
+        alloc: std.mem.Allocator,
+        snapshot_root: []const u8,
+        live_path: []const u8,
+        portable: bool,
+        open_options: db_mod.OpenOptions,
+    ) !db_mod.generation_lifecycle.PublicationOutcome {
+        var transition = try db_mod.generation_lifecycle.beginProcessExclusive(live_path);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+
+        if (portable) {
+            const body = try readBackupFileAlloc(alloc, snapshot_root);
+            defer alloc.free(body);
+            {
+                var restored = try db_mod.DB.open(alloc, staged.path(), open_options);
+                defer restored.close();
+                try portable_backup.importPortable(alloc, restored.core.store, body);
+                _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
+                _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
+                try restored.rebuildGraphIndexesForTargetCoverage(alloc);
+                try restored.syncIndexes(true);
+            }
+        } else {
+            try db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), open_options);
+        }
+        return try staged.publish();
     }
 
     fn commitTransaction(
@@ -9175,6 +9217,38 @@ pub const ProvisionedTableWriteSource = struct {
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
         defer alloc.free(local_location);
+
+        var all_groups_already_admitted = true;
+        var admitted_identity_mismatch = false;
+        for (plan.manifest.shards) |shard| {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, shard.group_id);
+            defer alloc.free(path);
+            if (!try db_mod.generation_lifecycle.hasPublishedGenerationRead(path)) {
+                all_groups_already_admitted = false;
+                break;
+            }
+            const restore_source: backup_restore.RestoreSource = .{
+                .backup_id = plan.manifest.backup_id,
+                .location = local_location,
+                .identity_location = plan.source_location,
+                .snapshot_path = shard.snapshot_path,
+                .manifest = plan.manifest,
+            };
+            const validation = if (plan.reconcile_only)
+                backup_restore.validateCommittedRestoreIdentity(alloc, path, shard.group_id, restore_source)
+            else
+                backup_restore.validateImportedRestoreIdentity(alloc, path, shard.group_id, restore_source);
+            validation catch |err| switch (err) {
+                error.RestoreIdentityMismatch => {
+                    admitted_identity_mismatch = true;
+                    all_groups_already_admitted = false;
+                },
+                else => return err,
+            };
+            if (admitted_identity_mismatch) break;
+        }
+        if (all_groups_already_admitted) return;
+        if (plan.reconcile_only and admitted_identity_mismatch) return error.RestoreIdentityMismatch;
 
         var transition = try self.beginLocalTableGenerationTransition(table_name);
         errdefer transition.abort();

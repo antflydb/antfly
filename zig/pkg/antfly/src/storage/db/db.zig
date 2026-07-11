@@ -3348,6 +3348,7 @@ pub const DB = struct {
             self.core.batchExecutionResources().change_journal,
             self.core.replaySource(),
             self.core.batchExecutionResources().index_manager,
+            self.core.batchExecutionResources().apply_mutex,
             append_ctx,
             appendGeneratedBatchFromEnrichment,
             self.executor,
@@ -8250,7 +8251,7 @@ pub const DB = struct {
         if (!stored.eql(opts.identity_namespace.?)) return error.IdentityNamespaceMismatch;
     }
 
-    pub fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
+    fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
         try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null);
         // Graph reverse indexes are derived from stored outgoing edge keys, so
         // restore them after the logical store and derived log are rehydrated.
@@ -8260,6 +8261,17 @@ pub const DB = struct {
         _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
         try restored.rebuildGraphIndexesForTargetCoverage(alloc);
         try restored.core.index_manager.syncAll(true);
+    }
+
+    pub fn restoreSnapshotToStagedGeneration(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+    ) !void {
+        try staged_generation.validatePath(path);
+        try restoreSnapshotTo(alloc, snapshot_root, path, opts);
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepair(
@@ -24449,19 +24461,14 @@ fn deleteDerivedCoverageSkippedForDocKeys(
         for (deletes.items) |key| alloc.free(@constCast(key));
         deletes.deinit(alloc);
     }
+    var unique_deletes = std.StringHashMapUnmanaged(void).empty;
+    defer unique_deletes.deinit(alloc);
 
     var removed_count: u64 = 0;
     for (doc_keys) |doc_key| {
         const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, "skipped");
         errdefer alloc.free(marker_key);
-        var duplicate_delete = false;
-        for (deletes.items) |existing_delete| {
-            if (std.mem.eql(u8, existing_delete, marker_key)) {
-                duplicate_delete = true;
-                break;
-            }
-        }
-        if (duplicate_delete) {
+        if (unique_deletes.contains(marker_key)) {
             alloc.free(marker_key);
             continue;
         }
@@ -24475,6 +24482,8 @@ fn deleteDerivedCoverageSkippedForDocKeys(
         };
         if (had_marker) removed_count +|= 1;
         try deletes.append(alloc, marker_key);
+        errdefer _ = deletes.pop();
+        try unique_deletes.put(alloc, marker_key, {});
     }
 
     if (deletes.items.len == 0) return;

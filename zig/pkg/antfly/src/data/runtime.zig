@@ -2427,9 +2427,8 @@ pub const DataServer = struct {
         // used by DB internals (c_allocator when libc is linked): search hits
         // adopt index-owned metadata buffers, so a distinct request allocator
         // identity turns those adoptions into cross-allocator frees.
-        self.http_server = antfly.public_api.ApiHttpServer.initWithRequestAllocator(
+        self.http_server = antfly.public_api.ApiHttpServer.initWithProcessRequestAllocator(
             self.alloc,
-            platform.allocator.processAllocator(std.heap.smp_allocator),
             api_server_cfg,
             self.status_source,
             self.read_source.source(),

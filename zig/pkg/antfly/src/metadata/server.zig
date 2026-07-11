@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const platform = @import("antfly_platform");
 const metadata_mod = @import("mod.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
@@ -127,7 +126,6 @@ pub const MetadataServer = struct {
             // DB-owned components (index metadata, table record clones), so a
             // distinct allocator identity here turns those adoptions into
             // cross-allocator frees that corrupt the heap.
-            const request_alloc = platform.allocator.processAllocator(std.heap.smp_allocator);
             const admin_http_server = try alloc.create(metadata_http_server.MetadataHttpServer);
             admin_http_server.* = metadata_http_server.MetadataHttpServer.init(
                 alloc,
@@ -168,9 +166,8 @@ pub const MetadataServer = struct {
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
 
             const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
-            public_http_server.* = public_api_http_server.ApiHttpServer.initWithRequestAllocator(
+            public_http_server.* = public_api_http_server.ApiHttpServer.initWithProcessRequestAllocator(
                 alloc,
-                request_alloc,
                 api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
                 public_read_source.source(),
@@ -187,9 +184,9 @@ pub const MetadataServer = struct {
 
             const listener = try alloc.create(raft_transport.StdHttpListener);
             listener.* = if (svc.apiIoImpl()) |io_impl|
-                raft_transport.StdHttpListener.initShared(request_alloc, listener_cfg, mux.executor(), io_impl)
+                raft_transport.StdHttpListener.initShared(public_http_server.alloc, listener_cfg, mux.executor(), io_impl)
             else
-                raft_transport.StdHttpListener.init(request_alloc, listener_cfg, mux.executor());
+                raft_transport.StdHttpListener.init(public_http_server.alloc, listener_cfg, mux.executor());
             owned_admin_listener = listener;
         }
 

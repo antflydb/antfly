@@ -4436,7 +4436,7 @@ fn startPublicApiServers(
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
         } else .{};
-        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             alloc,
             http_alloc,
             server_config,
@@ -9329,7 +9329,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             std.testing.allocator,
             http_alloc,
             .{},
@@ -9614,7 +9614,7 @@ test "metadata http cluster simulation forwards public table io across split ran
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }
@@ -9898,7 +9898,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }

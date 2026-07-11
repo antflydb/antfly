@@ -43,6 +43,7 @@ else
 const chunk_artifact_mod = @import("../../../chunking/chunk.zig");
 const chunking_types_mod = @import("../../../chunking/types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
+const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const ownership_mod = @import("../ownership.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("../../../platform/clock.zig");
@@ -107,8 +108,7 @@ const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 
 const CoverageMarkerDelete = struct {
     key: []u8,
-    had_marker: bool,
-    counter_key: ?[]u8 = null,
+    counter_key: []u8,
 };
 
 const GeneratedReplayWindow = struct {
@@ -120,6 +120,7 @@ const GeneratedReplayWindow = struct {
     dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
     coverage_marker_deletes: std.ArrayListUnmanaged(CoverageMarkerDelete) = .empty,
+    coverage_marker_delete_keys: std.StringHashMapUnmanaged(void) = .empty,
 
     fn isEmpty(self: *const @This()) bool {
         return self.documents.items.len == 0 and
@@ -181,8 +182,9 @@ const GeneratedReplayWindow = struct {
         }
         self.sparse_embeddings.deinit(self.alloc);
 
-        clearQueuedCoverageMarkerDeletes(self.alloc, &self.coverage_marker_deletes);
+        clearQueuedCoverageMarkerDeletes(self.alloc, &self.coverage_marker_deletes, &self.coverage_marker_delete_keys);
         self.coverage_marker_deletes.deinit(self.alloc);
+        self.coverage_marker_delete_keys.deinit(self.alloc);
     }
 };
 
@@ -1045,6 +1047,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
+    coverage_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null,
     write_ctx: *anyopaque,
     write_fn: GeneratedRecordWriter,
     notify_ctx: *anyopaque,
@@ -1086,6 +1089,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         change_journal: *change_journal_mod.Journal,
         replay_source: replay_source_mod.Source,
         index_manager: *index_manager_mod.IndexManager,
+        coverage_apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
         write_ctx: *anyopaque,
         write_fn: GeneratedRecordWriter,
         notify_ctx: *anyopaque,
@@ -1101,6 +1105,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .change_journal = change_journal,
             .replay_source = replay_source,
             .index_manager = index_manager,
+            .coverage_apply_mutex = coverage_apply_mutex,
             .write_ctx = write_ctx,
             .write_fn = write_fn,
             .notify_ctx = notify_ctx,
@@ -1285,6 +1290,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
+    coverage_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null,
     write_ctx: *anyopaque,
     write_fn: GeneratedRecordWriter,
     notify_ctx: *anyopaque,
@@ -1333,6 +1339,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         change_journal: *change_journal_mod.Journal,
         replay_source: replay_source_mod.Source,
         index_manager: *index_manager_mod.IndexManager,
+        coverage_apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
         write_ctx: *anyopaque,
         write_fn: GeneratedRecordWriter,
         notify_ctx: *anyopaque,
@@ -1352,6 +1359,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .change_journal = change_journal,
             .replay_source = replay_source,
             .index_manager = index_manager,
+            .coverage_apply_mutex = coverage_apply_mutex,
             .write_ctx = write_ctx,
             .write_fn = write_fn,
             .notify_ctx = notify_ctx,
@@ -5210,7 +5218,7 @@ fn flushGeneratedReplayWindow(
     defer freeKeyList(runtime.alloc, artifact_delete_keys);
     const sequence = try appendGeneratedBatchWithRetry(runtime, batch, artifact_delete_keys);
     try deleteCoverageMarkersAfterReplayAppend(runtime, window.coverage_marker_deletes.items);
-    clearQueuedCoverageMarkerDeletes(runtime.alloc, &window.coverage_marker_deletes);
+    clearQueuedCoverageMarkerDeletes(runtime.alloc, &window.coverage_marker_deletes, &window.coverage_marker_delete_keys);
     try rememberPublishedGeneratedBatch(runtime, batch);
     runtime.notify_fn(runtime.notify_ctx, sequence);
 }
@@ -7895,6 +7903,9 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
 }
 
 fn markDerivedCoverageSkippedForIndex(runtime: *EnrichmentRuntime, index_name: []const u8, doc_key: []const u8) !void {
+    if (runtime.coverage_apply_mutex) |mutex| mutex.lockExclusive();
+    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockExclusive();
+
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
     const key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key, "skipped");
     defer runtime.alloc.free(key);
@@ -7924,17 +7935,15 @@ fn markDerivedCoverageSkippedForIndex(runtime: *EnrichmentRuntime, index_name: [
     runtime.skipped_source_count += 1;
 }
 
-fn queuedCoverageMarkerDelete(window: *GeneratedReplayWindow, key: []const u8) ?usize {
-    for (window.coverage_marker_deletes.items, 0..) |item, i| {
-        if (std.mem.eql(u8, item.key, key)) return i;
-    }
-    return null;
-}
-
-fn clearQueuedCoverageMarkerDeletes(alloc: Allocator, marker_deletes: *std.ArrayListUnmanaged(CoverageMarkerDelete)) void {
+fn clearQueuedCoverageMarkerDeletes(
+    alloc: Allocator,
+    marker_deletes: *std.ArrayListUnmanaged(CoverageMarkerDelete),
+    marker_keys: *std.StringHashMapUnmanaged(void),
+) void {
+    marker_keys.clearRetainingCapacity();
     for (marker_deletes.items) |item| {
         alloc.free(item.key);
-        if (item.counter_key) |key| alloc.free(key);
+        alloc.free(item.counter_key);
     }
     marker_deletes.clearRetainingCapacity();
 }
@@ -7981,25 +7990,15 @@ fn queueDerivedCoverageProducedForIndex(runtime: *EnrichmentRuntime, window: *Ge
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
     const key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key, "skipped");
     errdefer runtime.alloc.free(key);
-    if (queuedCoverageMarkerDelete(window, key) != null) {
+    if (window.coverage_marker_delete_keys.contains(key)) {
         runtime.alloc.free(key);
         return;
     }
-    const had_marker = blk: {
-        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
-            error.NotFound => break :blk false,
-            std.mem.Allocator.Error.OutOfMemory => return err,
-            else => break :blk false,
-        };
-        runtime.alloc.free(existing);
-        break :blk true;
-    };
-    const counter_key = if (had_marker)
-        try internal_keys.derivedCoverageSkippedCountKeyAlloc(runtime.alloc, index_name, generation)
-    else
-        null;
-    errdefer if (counter_key) |owned| runtime.alloc.free(owned);
-    try window.coverage_marker_deletes.append(runtime.alloc, .{ .key = key, .had_marker = had_marker, .counter_key = counter_key });
+    const counter_key = try internal_keys.derivedCoverageSkippedCountKeyAlloc(runtime.alloc, index_name, generation);
+    errdefer runtime.alloc.free(counter_key);
+    try window.coverage_marker_deletes.append(runtime.alloc, .{ .key = key, .counter_key = counter_key });
+    errdefer _ = window.coverage_marker_deletes.pop();
+    try window.coverage_marker_delete_keys.put(runtime.alloc, key, {});
 }
 
 fn markDerivedCoverageSkipped(runtime: *EnrichmentRuntime, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
@@ -8012,9 +8011,12 @@ fn queueDerivedCoverageProduced(runtime: *EnrichmentRuntime, window: *GeneratedR
 
 fn deleteCoverageMarkersAfterReplayAppend(runtime: *EnrichmentRuntime, marker_deletes: []const CoverageMarkerDelete) !void {
     if (marker_deletes.len == 0) return;
-    const keys = try runtime.alloc.alloc([]const u8, marker_deletes.len);
-    defer runtime.alloc.free(keys);
-    for (marker_deletes, 0..) |item, i| keys[i] = item.key;
+
+    if (runtime.coverage_apply_mutex) |mutex| mutex.lockExclusive();
+    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockExclusive();
+
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer keys.deinit(runtime.alloc);
 
     const CounterState = struct {
         key: []const u8,
@@ -8023,19 +8025,28 @@ fn deleteCoverageMarkersAfterReplayAppend(runtime: *EnrichmentRuntime, marker_de
     };
     var counter_states = std.ArrayListUnmanaged(CounterState).empty;
     defer counter_states.deinit(runtime.alloc);
+    var counter_indexes = std.StringHashMapUnmanaged(usize).empty;
+    defer counter_indexes.deinit(runtime.alloc);
     for (marker_deletes) |item| {
-        if (!item.had_marker) continue;
-        const counter_key = item.counter_key orelse continue;
-        const state_index = blk: {
-            for (counter_states.items, 0..) |state, i| {
-                if (std.mem.eql(u8, state.key, counter_key)) break :blk i;
-            }
-            const current_count = (try loadDerivedCoverageSkippedCounter(runtime, counter_key)) orelse continue;
-            try counter_states.append(runtime.alloc, .{ .key = counter_key, .count = current_count });
-            break :blk counter_states.items.len - 1;
+        const existing = storeGetAlloc(runtime, item.key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        runtime.alloc.free(existing);
+        try keys.append(runtime.alloc, item.key);
+
+        const state_index = counter_indexes.get(item.counter_key) orelse blk: {
+            const current_count = (try loadDerivedCoverageSkippedCounter(runtime, item.counter_key)) orelse
+                return error.InvalidDerivedCoverageCounter;
+            const index = counter_states.items.len;
+            try counter_states.append(runtime.alloc, .{ .key = item.counter_key, .count = current_count });
+            try counter_indexes.put(runtime.alloc, item.counter_key, index);
+            break :blk index;
         };
         if (counter_states.items[state_index].count > 0) counter_states.items[state_index].count -= 1;
     }
+
+    if (keys.items.len == 0) return;
 
     const counter_writes = try runtime.alloc.alloc(KVPair, counter_states.items.len);
     defer runtime.alloc.free(counter_writes);
@@ -8045,10 +8056,8 @@ fn deleteCoverageMarkersAfterReplayAppend(runtime: *EnrichmentRuntime, marker_de
             .value = internal_keys.encodeDerivedCoverageSkippedCount(&state.value, state.count),
         };
     }
-    try storePutBatchWithRetry(runtime, counter_writes, keys);
-    for (marker_deletes) |item| {
-        if (item.had_marker and runtime.skipped_source_count > 0) runtime.skipped_source_count -= 1;
-    }
+    try storePutBatchWithRetry(runtime, counter_writes, keys.items);
+    runtime.skipped_source_count -|= keys.items.len;
 }
 
 test "enrichment applied checkpoint stays degraded until runtime status clears" {

@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -1086,10 +1088,43 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
-        return ApiHttpServer.initWithRequestAllocator(alloc, alloc, cfg, source, table_read_source, table_write_source);
+        const request_alloc = if (builtin.is_test)
+            alloc
+        else
+            platform.allocator.processAllocator(std.heap.smp_allocator);
+        return ApiHttpServer.initWithRequestAllocator(alloc, request_alloc, cfg, source, table_read_source, table_write_source);
     }
 
-    pub fn initWithRequestAllocator(
+    pub fn initWithProcessRequestAllocator(
+        owner_alloc: std.mem.Allocator,
+        cfg: ApiHttpServerConfig,
+        source: StatusSource,
+        table_read_source: ?table_reads.TableReadSource,
+        table_write_source: ?table_writes.TableWriteSource,
+    ) ApiHttpServer {
+        return ApiHttpServer.initWithRequestAllocator(
+            owner_alloc,
+            platform.allocator.processAllocator(std.heap.smp_allocator),
+            cfg,
+            source,
+            table_read_source,
+            table_write_source,
+        );
+    }
+
+    pub fn initForTestingWithRequestAllocator(
+        owner_alloc: std.mem.Allocator,
+        request_alloc: std.mem.Allocator,
+        cfg: ApiHttpServerConfig,
+        source: StatusSource,
+        table_read_source: ?table_reads.TableReadSource,
+        table_write_source: ?table_writes.TableWriteSource,
+    ) ApiHttpServer {
+        std.debug.assert(builtin.is_test);
+        return ApiHttpServer.initWithRequestAllocator(owner_alloc, request_alloc, cfg, source, table_read_source, table_write_source);
+    }
+
+    fn initWithRequestAllocator(
         owner_alloc: std.mem.Allocator,
         request_alloc: std.mem.Allocator,
         cfg: ApiHttpServerConfig,

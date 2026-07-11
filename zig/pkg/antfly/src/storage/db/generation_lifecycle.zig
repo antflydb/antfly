@@ -159,6 +159,12 @@ pub const Manager = struct {
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
 
+        // Filesystem lock acquisition can block or fail. Keep it outside the
+        // manager mutex so rollback never has to re-enter the mutex through an
+        // ExclusiveTransition destructor.
+        const publication_lock = try openPublicationLock(self.allocator, path_key, .exclusive);
+        errdefer closePublicationLock(publication_lock);
+
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
 
@@ -177,14 +183,13 @@ pub const Manager = struct {
             self.removeEmptyPathStateLocked(path_key);
         }
         try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = path_key, .id = id, .kind = .exclusive });
-        var transition = ExclusiveTransition{
+        const transition = ExclusiveTransition{
             .manager = self,
             .alloc = self.allocator,
             .path = owned_path,
             .id = id,
+            .publication_lock = publication_lock,
         };
-        errdefer transition.deinit();
-        transition.publication_lock = try openPublicationLock(self.allocator, path_key, .exclusive);
         return transition;
     }
 
@@ -245,6 +250,15 @@ pub const Manager = struct {
         }
         try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = path_key, .id = id, .kind = .read });
         return .{ .manager = self, .path = owned_path, .path_key = path_key, .id = id };
+    }
+
+    fn hasReaders(self: *Manager, path: []const u8) !bool {
+        const path_key = try canonicalPathAlloc(self.allocator, path);
+        defer self.allocator.free(path_key);
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.path_states.get(path_key) orelse return false;
+        return state.readers != 0 and !state.exclusive and !state.reconciliation;
     }
 
     fn finishExclusive(self: *Manager, path: []const u8, id: u64) void {
@@ -774,6 +788,10 @@ pub fn beginProcessExclusive(path: []const u8) !ExclusiveTransition {
     return try process_manager.beginExclusive(path);
 }
 
+pub fn hasPublishedGenerationRead(path: []const u8) !bool {
+    return try process_manager.hasReaders(path);
+}
+
 test "generation lifecycle serializes the same root and validates capability target" {
     const alloc = std.testing.allocator;
     var manager = Manager.init(alloc);
@@ -788,6 +806,23 @@ test "generation lifecycle serializes the same root and validates capability tar
 
     var other = try manager.beginExclusive("/tmp/table-b");
     other.deinit();
+}
+
+test "generation lifecycle returns cross-manager filesystem lock contention" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cross-manager", .{tmp.sub_path});
+    defer alloc.free(path);
+    var first_manager = Manager.init(alloc);
+    defer first_manager.deinit();
+    var second_manager = Manager.init(alloc);
+    defer second_manager.deinit();
+
+    var first = try first_manager.beginExclusive(path);
+    defer first.deinit();
+    try std.testing.expectError(error.GenerationTransitionActive, second_manager.beginExclusive(path));
 }
 
 test "generation lifecycle retains shared readers until the final owner closes" {
