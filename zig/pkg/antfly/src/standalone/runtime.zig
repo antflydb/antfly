@@ -1452,7 +1452,14 @@ pub fn runFromIterator(
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
-    data_server.initApiServer();
+    try data_server.initApiServer();
+    const api_server = &data_server.http_server.?;
+    if (lite_backend) |*backend| {
+        try api_server.attachRestoreJobRuntimeStore(try backend.runtimeStoreForNamespace("system/api-restore-jobs"));
+    }
+    // Recovery is a startup concern: enqueue durable work before the listener is
+    // marked ready instead of waiting for an unrelated request to arrive.
+    try api_server.resumeRestoreJobsOnce();
     data_server.registerNodeIfConfigured() catch |err| {
         std.log.err("standalone startup failed step=register_node err={}", .{err});
         return err;
@@ -1463,8 +1470,6 @@ pub fn runFromIterator(
     data_server.requestProvisionedCacheWarmup() catch |err| {
         std.log.warn("standalone startup provisioned cache warmup skipped err={}", .{err});
     };
-
-    const api_server = &data_server.http_server.?;
 
     // ---------------------------------------------------------------
     // Unified httpx.Server — all routes on a single port

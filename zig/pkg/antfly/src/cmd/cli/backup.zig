@@ -17,7 +17,6 @@ const antfly = @import("antfly-zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 
-const backup_codec = antfly.backup_codec;
 const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 const portable_backup = antfly.portable_backup;
@@ -33,7 +32,6 @@ const BackupArgs = struct {
     format: ?[]const u8 = null,
     url: ?[]const u8 = null,
     output: ?[]const u8 = null,
-    out_path: ?[]const u8 = null,
     connection: ?[]const u8 = null,
     list_backups: bool = false,
 };
@@ -91,32 +89,13 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     }
 
     if (opts.table_name) |tbl| {
-        const selected_format = if (opts.out_path != null and opts.format == null) "portable" else opts.format orelse "native";
+        const selected_format = opts.format orelse "native";
         if (!std.mem.eql(u8, selected_format, "native") and !std.mem.eql(u8, selected_format, "portable")) {
             cli.fatal("unsupported backup format: {s}", .{selected_format});
         }
-
-        var out_plan: ?PortableOutPlan = null;
-        defer if (out_plan) |*plan| plan.deinit(allocator);
-        const bid = if (opts.out_path) |out_path| blk: {
-            if (!std.mem.eql(u8, selected_format, "portable")) {
-                cli.fatal("--out is only supported with --format portable", .{});
-            }
-            out_plan = try PortableOutPlan.init(allocator, out_path, opts.backup_id);
-            break :blk out_plan.?.backup_id;
-        } else opts.backup_id orelse cli.fatal("--backup-id is required", .{});
-        const location = if (out_plan) |plan| plan.location else opts.location;
-        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .connection = connection, .format = selected_format });
-        if (out_plan) |plan| {
-            validatePortableOutputFile(allocator, io, plan.out_path) catch |err| switch (err) {
-                error.EmptyPortableOutput => cli.fatal("portable backup completed but local --out file is empty: {s}", .{plan.out_path}),
-                error.FileNotFound => cli.fatal("portable backup completed but local --out file is not readable: {s}", .{plan.out_path}),
-                else => cli.fatal("portable backup completed but local --out file is not a valid portable AFB: {s}", .{plan.out_path}),
-            };
-            std.debug.print("Portable backup written to {s}.\n", .{plan.out_path});
-        } else {
-            std.debug.print("Backup command successful.\n", .{});
-        }
+        const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
+        try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
+        std.debug.print("Backup command successful.\n", .{});
         return;
     }
 
@@ -265,8 +244,6 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
             out.url = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
             out.output = try nextRequired(args);
-        } else if (std.mem.eql(u8, arg, "--out")) {
-            out.out_path = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--list")) {
             out.list_backups = true;
         } else {
@@ -332,12 +309,12 @@ fn printBackupUsage() void {
     std.debug.print(
         \\usage:
         \\  antfly backup --table <name> --backup-id <id> --connection <id> [--location <uri>] [--format native|portable] [--url <url>]
-        \\  antfly backup --table <name> --format portable --out <backup.afb> --connection <id> [--url <url>]
         \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> [--location <uri>] [--url <url>]
         \\  antfly backup --list --connection <id> [--location <uri>] [--output json] [--url <url>]
         \\
         \\notes:
-        \\  `--out` writes a single portable AFB file for Lite restore/import.
+        \\  Network backups are written by the server through the named connection.
+        \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local AFB artifact.
         \\
     , .{});
 }
@@ -361,72 +338,6 @@ fn nextRequired(args: *std.process.Args.Iterator) ![]const u8 {
     return args.next() orelse error.MissingArgument;
 }
 
-const PortableOutPlan = struct {
-    out_path: []u8,
-    backup_id: []u8,
-    location: []u8,
-
-    fn init(allocator: std.mem.Allocator, out_path: []const u8, requested_backup_id: ?[]const u8) !PortableOutPlan {
-        if (!std.mem.endsWith(u8, out_path, ".afb")) cli.fatal("--out path must end in .afb: {s}", .{out_path});
-
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", allocator);
-        defer allocator.free(cwd);
-        const absolute_out_path = if (std.fs.path.isAbsolute(out_path))
-            try allocator.dupe(u8, out_path)
-        else
-            try std.fs.path.join(allocator, &.{ cwd, out_path });
-        errdefer allocator.free(absolute_out_path);
-
-        const base = std.fs.path.basename(absolute_out_path);
-        const derived_backup_id = try allocator.dupe(u8, base[0 .. base.len - ".afb".len]);
-        errdefer allocator.free(derived_backup_id);
-        if (requested_backup_id) |backup_id| {
-            if (!std.mem.eql(u8, backup_id, derived_backup_id)) {
-                cli.fatal("--backup-id must match the --out file stem for portable file output", .{});
-            }
-        }
-
-        const parent = std.fs.path.dirname(absolute_out_path) orelse cwd;
-        const location = try std.fmt.allocPrint(allocator, "file://{s}", .{parent});
-        errdefer allocator.free(location);
-
-        return .{
-            .out_path = absolute_out_path,
-            .backup_id = derived_backup_id,
-            .location = location,
-        };
-    }
-
-    fn deinit(self: *PortableOutPlan, allocator: std.mem.Allocator) void {
-        allocator.free(self.out_path);
-        allocator.free(self.backup_id);
-        allocator.free(self.location);
-        self.* = undefined;
-    }
-};
-
-fn validatePortableOutputFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    const body = try readOutputFileAlloc(allocator, io, path, lite_restore_staging.max_afb_file_bytes);
-    defer allocator.free(body);
-    if (body.len == 0) return error.EmptyPortableOutput;
-    try portable_backup.validatePortable(allocator, body);
-}
-
-fn readOutputFileAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
-    if (!std.fs.path.isAbsolute(path)) {
-        return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
-    }
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    const size = (try file.stat(io)).size;
-    if (size > max_bytes or size > std.math.maxInt(usize)) return error.FileTooBig;
-    var buf: [8192]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    return try reader.interface.readAlloc(allocator, @intCast(size));
-}
-
 test "backup cli parser accepts help flag" {
     var argv = [_][*:0]const u8{"--help"};
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -440,7 +351,7 @@ test "backup cli parser rejects unknown arguments" {
     try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
 }
 
-test "backup cli parser accepts portable out path" {
+test "backup cli parser rejects local out path" {
     var argv = [_][*:0]const u8{
         "--table",
         "docs",
@@ -450,51 +361,7 @@ test "backup cli parser accepts portable out path" {
         "docs.afb",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const opts = try parseBackupArgs(&iter);
-    try std.testing.expectEqualStrings("docs", opts.table_name.?);
-    try std.testing.expectEqualStrings("portable", opts.format.?);
-    try std.testing.expectEqualStrings("docs.afb", opts.out_path.?);
-}
-
-test "portable out plan derives file location and backup id" {
-    const allocator = std.testing.allocator;
-    var plan = try PortableOutPlan.init(allocator, "docs.afb", null);
-    defer plan.deinit(allocator);
-    try std.testing.expectEqualStrings("docs", plan.backup_id);
-    try std.testing.expect(std.mem.endsWith(u8, plan.out_path, "/docs.afb"));
-    try std.testing.expect(std.mem.startsWith(u8, plan.location, "file://"));
-}
-
-test "portable output validation requires a valid afb" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
-    const valid_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/valid.afb", .{tmp.sub_path});
-    defer allocator.free(valid_path);
-    const malformed_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/malformed.afb", .{tmp.sub_path});
-    defer allocator.free(malformed_path);
-
-    var valid = std.ArrayList(u8).empty;
-    defer valid.deinit(allocator);
-    try backup_codec.writeHeader(&valid, allocator, .{
-        .format_version = backup_codec.format_version,
-        .flags = 0,
-        .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
-        .table_count = 1,
-        .shard_count = 1,
-    });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = valid_path, .data = valid.items });
-    try validatePortableOutputFile(allocator, io, valid_path);
-
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = malformed_path, .data = "not an afb" });
-    try std.testing.expectError(error.EndOfStream, validatePortableOutputFile(allocator, io, malformed_path));
+    try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
 }
 
 test "restore cli parser accepts aflite input shape" {

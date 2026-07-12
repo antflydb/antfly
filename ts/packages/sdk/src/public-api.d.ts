@@ -448,12 +448,14 @@ export interface paths {
          *     **Restore Modes:**
          *     - `fail_if_exists`: Abort if any target table already exists (default)
          *     - `skip_if_exists`: Skip existing tables and restore the rest
-         *     - `overwrite`: Drop existing tables and restore from backup
          *
          *     The restore is a durable asynchronous job. The request returns after the
          *     job record is persisted. Poll the restore job resource for progress.
-         *     Interrupted running jobs are resumed after restart. Cancellation is
-         *     cooperative between table and artifact publication boundaries.
+         *     Completed table boundaries are durably checkpointed and are not repeated
+         *     after restart. If a process stops between table publication and its
+         *     completion checkpoint, recovery fails closed for operator inspection
+         *     instead of replacing or modifying an existing table. Cancellation is
+         *     cooperative between table publication boundaries.
          */
         post: operations["restore"];
         delete?: never;
@@ -4765,12 +4767,11 @@ export interface components {
              * @description How to handle existing tables:
              *     - `fail_if_exists`: Abort if any table already exists (default)
              *     - `skip_if_exists`: Skip existing tables, restore others
-             *     - `overwrite`: Drop and recreate existing tables
              * @default fail_if_exists
              * @example skip_if_exists
              * @enum {string}
              */
-            restore_mode?: "fail_if_exists" | "skip_if_exists" | "overwrite";
+            restore_mode?: "fail_if_exists" | "skip_if_exists";
         };
         RestoreJob: {
             /** Format: int64 */
@@ -4784,6 +4785,16 @@ export interface components {
             /** @enum {string} */
             phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
             cancel_requested: boolean;
+            /**
+             * Format: int64
+             * @description Number of table restore boundaries durably completed. Completed boundaries are not repeated after restart.
+             */
+            completed_table_count?: number;
+            /**
+             * Format: int64
+             * @description Requested table count when known before execution.
+             */
+            total_table_count?: number;
             result?: {
                 [key: string]: unknown;
             };
@@ -12974,6 +12985,10 @@ export interface operations {
             /** @description Restore triggered successfully */
             202: {
                 headers: {
+                    /** @description Relative URL of the durable restore job resource. */
+                    Location?: string;
+                    /** @description Suggested polling delay in seconds. */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -13499,6 +13514,10 @@ export interface operations {
             /** @description Durable restore job accepted */
             202: {
                 headers: {
+                    /** @description Relative URL of the durable restore job resource. */
+                    Location?: string;
+                    /** @description Suggested polling delay in seconds. */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {

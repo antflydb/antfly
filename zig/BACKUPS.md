@@ -390,7 +390,7 @@ Deliverables:
 - local-filesystem backup/restore round-trip
 - cluster backup/list/restore round-trip
 - restore into missing target table
-- overwrite behavior
+- destructive overwrite rejection until atomic table-generation swap exists
 - index/search validation after restore
 - graph/text/sparse reopen checks as applicable
 
@@ -406,7 +406,7 @@ Status:
 - public Zig parity coverage now includes:
   - table backup/restore route coverage
   - cluster backup/list/restore round-trip
-  - cluster restore modes `fail_if_exists`, `skip_if_exists`, and `overwrite`
+  - cluster restore modes `fail_if_exists` and `skip_if_exists`; destructive overwrite fails closed
   - cluster partial success reporting for mixed valid and invalid table sets
   - cluster partial success reporting for unsupported multi-range tables
   - table backup rejection while schema migration is still rebuilding

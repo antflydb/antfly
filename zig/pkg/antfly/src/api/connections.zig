@@ -1166,7 +1166,7 @@ fn probeObjectBuckets(
 ) !void {
     return switch (cfg.protocol) {
         .s3 => probeS3Buckets(arena, cfg, timeout_ms, failed_bucket),
-        .gcs => probeGcsBuckets(arena, cfg, failed_bucket),
+        .gcs => probeGcsBuckets(arena, cfg, timeout_ms, failed_bucket),
         else => error.InvalidConfig,
     };
 }
@@ -1174,9 +1174,11 @@ fn probeObjectBuckets(
 fn probeGcsBuckets(
     arena: Allocator,
     cfg: common_config.Config.ExternalIoConnectionConfig,
+    timeout_ms: u64,
     failed_bucket: *?usize,
 ) !void {
-    const gcs_cfg = try backups_api.gcsConfigForConnection(arena, cfg);
+    var gcs_cfg = try backups_api.gcsConfigForConnection(arena, cfg);
+    gcs_cfg.request_timeout_ms = timeout_ms;
     var gcs = try objectstore.Gcs.JsonApiClient.init(arena, gcs_cfg);
     var client = gcs.client();
     defer client.deinit();

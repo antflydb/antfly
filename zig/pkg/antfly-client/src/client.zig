@@ -300,6 +300,12 @@ pub const AntflyClient = struct {
 
     // --- Backup / Restore ---
 
+    pub const RestoreOptions = struct {
+        /// Stable key for safely retrying job creation after a timeout or lost
+        /// response. Reusing a key with a different request returns conflict.
+        idempotency_key: ?[]const u8 = null,
+    };
+
     pub fn backupTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.BackupRequest) !void {
         var resp = try self.inner.backupTable(table_name, body);
         defer resp.deinit();
@@ -307,7 +313,11 @@ pub const AntflyClient = struct {
     }
 
     pub fn restoreTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.RestoreRequest) !openapi.ApiResponse(openapi.types.RestoreJob) {
-        var resp = try self.inner.restoreTable(table_name, body);
+        return self.restoreTableWithOptions(table_name, body, .{});
+    }
+
+    pub fn restoreTableWithOptions(self: *AntflyClient, table_name: []const u8, body: openapi.types.RestoreRequest, options: RestoreOptions) !openapi.ApiResponse(openapi.types.RestoreJob) {
+        var resp = try self.inner.restoreTable(table_name, body, options.idempotency_key);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -325,7 +335,11 @@ pub const AntflyClient = struct {
     }
 
     pub fn clusterRestore(self: *AntflyClient, body: openapi.types.ClusterRestoreRequest) !openapi.ApiResponse(openapi.types.RestoreJob) {
-        var resp = try self.inner.restore(body);
+        return self.clusterRestoreWithOptions(body, .{});
+    }
+
+    pub fn clusterRestoreWithOptions(self: *AntflyClient, body: openapi.types.ClusterRestoreRequest, options: RestoreOptions) !openapi.ApiResponse(openapi.types.RestoreJob) {
+        var resp = try self.inner.restore(body, options.idempotency_key);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);

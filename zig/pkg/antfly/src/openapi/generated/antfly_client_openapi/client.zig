@@ -733,12 +733,16 @@ pub const Client = struct {
 
     /// Restore multiple tables from a backup
     /// POST /db/v1/restore
-    pub fn restore(self: *@This(), body: types.ClusterRestoreRequest) !ApiResponse(types.RestoreJob) {
+    pub fn restore(self: *@This(), body: types.ClusterRestoreRequest, idempotency_key: ?[]const u8) !ApiResponse(types.RestoreJob) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
@@ -1298,14 +1302,18 @@ pub const Client = struct {
 
     /// Restore a table from backup
     /// POST /db/v1/tables/{tableName}/restore
-    pub fn restoreTable(self: *@This(), table_name: []const u8, body: types.RestoreRequest) !ApiResponse(types.RestoreJob) {
+    pub fn restoreTable(self: *@This(), table_name: []const u8, body: types.RestoreRequest, idempotency_key: ?[]const u8) !ApiResponse(types.RestoreJob) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/restore", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 

@@ -1452,7 +1452,7 @@ pub const ClusterRestoreRequest = struct {
     connection: []const u8,
     /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
     table_names: ?[]const []const u8 = null,
-    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others
     restore_mode: ?[]const u8 = null,
 };
 
@@ -6755,6 +6755,10 @@ pub const RestoreJob = struct {
     backup_id: []const u8,
     phase: []const u8,
     cancel_requested: bool,
+    /// Number of table restore boundaries durably completed. Completed boundaries are not repeated after restart.
+    completed_table_count: ?i64 = null,
+    /// Requested table count when known before execution.
+    total_table_count: ?i64 = null,
     result: ?std.json.Value = null,
     @"error": ?[]const u8 = null,
     created_at_ms: i64,

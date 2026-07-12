@@ -2864,6 +2864,9 @@ pub fn build(b: *std.Build) void {
     const lib_unit_default_filters = [_][]const u8{
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
+        "restore runtime store persists checkpoints and requeues interrupted work",
+        "restore job store rejects oversized request state",
+        "restore filesystem scope containment handles filesystem roots and component boundaries",
         ".test_0",
         "module compiles",
         "batch parser preserves oversized value errors",

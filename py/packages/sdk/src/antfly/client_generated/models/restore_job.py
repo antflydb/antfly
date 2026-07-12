@@ -32,6 +32,9 @@ class RestoreJob:
         expires_at_ms (int): Unix epoch milliseconds after which this terminal job record and its idempotency key may be
             removed.
         table_name (str | Unset):
+        completed_table_count (int | Unset): Number of table restore boundaries durably completed. Completed boundaries
+            are not repeated after restart.
+        total_table_count (int | Unset): Requested table count when known before execution.
         result (RestoreJobResult | Unset):
         error (str | Unset):
     """
@@ -46,6 +49,8 @@ class RestoreJob:
     updated_at_ms: int
     expires_at_ms: int
     table_name: str | Unset = UNSET
+    completed_table_count: int | Unset = UNSET
+    total_table_count: int | Unset = UNSET
     result: RestoreJobResult | Unset = UNSET
     error: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -71,6 +76,10 @@ class RestoreJob:
 
         table_name = self.table_name
 
+        completed_table_count = self.completed_table_count
+
+        total_table_count = self.total_table_count
+
         result: dict[str, Any] | Unset = UNSET
         if not isinstance(self.result, Unset):
             result = self.result.to_dict()
@@ -94,6 +103,10 @@ class RestoreJob:
         )
         if table_name is not UNSET:
             field_dict["table_name"] = table_name
+        if completed_table_count is not UNSET:
+            field_dict["completed_table_count"] = completed_table_count
+        if total_table_count is not UNSET:
+            field_dict["total_table_count"] = total_table_count
         if result is not UNSET:
             field_dict["result"] = result
         if error is not UNSET:
@@ -126,6 +139,10 @@ class RestoreJob:
 
         table_name = d.pop("table_name", UNSET)
 
+        completed_table_count = d.pop("completed_table_count", UNSET)
+
+        total_table_count = d.pop("total_table_count", UNSET)
+
         _result = d.pop("result", UNSET)
         result: RestoreJobResult | Unset
         if isinstance(_result, Unset):
@@ -146,6 +163,8 @@ class RestoreJob:
             updated_at_ms=updated_at_ms,
             expires_at_ms=expires_at_ms,
             table_name=table_name,
+            completed_table_count=completed_table_count,
+            total_table_count=total_table_count,
             result=result,
             error=error,
         )

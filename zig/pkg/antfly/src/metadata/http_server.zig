@@ -1196,7 +1196,7 @@ pub const MetadataHttpServer = struct {
                     return try textResponse(self.alloc, 201, "created");
                 }
                 if (routes.Routes.matchInternalTableRestore(req.uri)) |table| {
-                    var restore_req = backups_api.parseRestoreRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid restore request");
+                    var restore_req = parseInternalTableRestoreRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid restore request");
                     defer restore_req.deinit();
                     self.source.restoreTable(self.alloc, table.table_name, restore_req.value.location, restore_req.value.backup_id) catch |err| {
                         if (backups_api.backupLocationErrorMessage(err)) |msg| {
@@ -1591,6 +1591,22 @@ fn cloneValues(
         out[i] = record.*;
     }
     return out;
+}
+
+const InternalTableRestoreRequest = struct {
+    backup_id: []const u8,
+    location: []const u8,
+};
+
+/// Metadata-to-metadata restore dispatch is an internal control-plane request.
+/// It deliberately does not carry a public named connection: the data node
+/// resolves the location using its own configured storage authority.
+fn parseInternalTableRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(InternalTableRestoreRequest) {
+    const parsed = try std.json.parseFromSlice(InternalTableRestoreRequest, alloc, body, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    try backups_api.validateBackupId(parsed.value.backup_id);
+    if (parsed.value.location.len == 0 or parsed.value.location.len > 4096) return error.InvalidBackupRequest;
+    return parsed;
 }
 
 fn buildNodeShutdownStatus(

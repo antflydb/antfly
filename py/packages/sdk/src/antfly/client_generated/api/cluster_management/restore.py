@@ -77,12 +77,14 @@ def sync_detailed(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
 
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted. Poll the restore job resource for progress.
-    Interrupted running jobs are resumed after restart. Cancellation is
-    cooperative between table and artifact publication boundaries.
+    Completed table boundaries are durably checkpointed and are not repeated
+    after restart. If a process stops between table publication and its
+    completion checkpoint, recovery fails closed for operator inspection
+    instead of replacing or modifying an existing table. Cancellation is
+    cooperative between table publication boundaries.
 
     Args:
         idempotency_key (str | Unset):
@@ -121,12 +123,14 @@ def sync(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
 
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted. Poll the restore job resource for progress.
-    Interrupted running jobs are resumed after restart. Cancellation is
-    cooperative between table and artifact publication boundaries.
+    Completed table boundaries are durably checkpointed and are not repeated
+    after restart. If a process stops between table publication and its
+    completion checkpoint, recovery fails closed for operator inspection
+    instead of replacing or modifying an existing table. Cancellation is
+    cooperative between table publication boundaries.
 
     Args:
         idempotency_key (str | Unset):
@@ -160,12 +164,14 @@ async def asyncio_detailed(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
 
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted. Poll the restore job resource for progress.
-    Interrupted running jobs are resumed after restart. Cancellation is
-    cooperative between table and artifact publication boundaries.
+    Completed table boundaries are durably checkpointed and are not repeated
+    after restart. If a process stops between table publication and its
+    completion checkpoint, recovery fails closed for operator inspection
+    instead of replacing or modifying an existing table. Cancellation is
+    cooperative between table publication boundaries.
 
     Args:
         idempotency_key (str | Unset):
@@ -202,12 +208,14 @@ async def asyncio(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
 
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted. Poll the restore job resource for progress.
-    Interrupted running jobs are resumed after restart. Cancellation is
-    cooperative between table and artifact publication boundaries.
+    Completed table boundaries are durably checkpointed and are not repeated
+    after restart. If a process stops between table publication and its
+    completion checkpoint, recovery fails closed for operator inspection
+    instead of replacing or modifying an existing table. Cancellation is
+    cooperative between table publication boundaries.
 
     Args:
         idempotency_key (str | Unset):

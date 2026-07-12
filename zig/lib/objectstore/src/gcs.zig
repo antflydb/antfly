@@ -60,6 +60,9 @@ pub const JsonApiConfig = struct {
     upload_endpoint: []u8,
     project_id: ?[]u8 = null,
     auth: Auth = .none,
+    /// Optional end-to-end HTTP deadline. Object transfers leave this unset;
+    /// control-plane probes set a bounded deadline explicitly.
+    request_timeout_ms: ?u64 = null,
 
     pub fn deinit(self: *JsonApiConfig, alloc: Allocator) void {
         alloc.free(self.endpoint);
@@ -121,13 +124,21 @@ const HttpxTransport = struct {
     io_impl: std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator) HttpxTransport {
+    fn init(alloc: Allocator, request_timeout_ms: ?u64) HttpxTransport {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = httpx.Client.init(alloc, io_impl.io()),
+            .client = if (request_timeout_ms) |timeout_ms|
+                httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .timeouts = .{
+                    .connect_ms = timeout_ms,
+                    .read_ms = timeout_ms,
+                    .write_ms = timeout_ms,
+                    .request_ms = timeout_ms,
+                } })
+            else
+                httpx.Client.init(alloc, io_impl.io()),
         };
     }
 
@@ -180,7 +191,7 @@ pub const JsonApiClient = struct {
     pub fn init(alloc: Allocator, cfg: JsonApiConfig) !JsonApiClient {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = HttpxTransport.init(alloc);
+        transport.* = HttpxTransport.init(alloc, cfg.request_timeout_ms);
         return .{
             .alloc = alloc,
             .cfg = cfg,

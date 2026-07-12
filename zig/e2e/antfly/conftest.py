@@ -42,13 +42,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlparse
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
+E2E_BACKUP_CONNECTION = "e2e-backups"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
@@ -273,6 +274,24 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
     return status
 
 
+def _wait_for_restore_job(get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0) -> dict[str, Any]:
+    job_id = accepted.get("job_id")
+    if not isinstance(job_id, int):
+        return accepted
+    deadline = time.monotonic() + timeout_s
+    while True:
+        job = get_job(f"/restore/jobs/{job_id}")
+        phase = job.get("phase")
+        if phase == "succeeded":
+            result = job.get("result")
+            return result if isinstance(result, dict) else job
+        if phase in {"failed", "cancelled"}:
+            raise AssertionError(f"restore job {job_id} ended in {phase}: {job.get('error')}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"restore job {job_id} did not complete within {timeout_s}s: {job}")
+        time.sleep(0.1)
+
+
 def raise_request_error_with_logs(
     err: requests.RequestException,
     server_ref: AntflyServer | PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
@@ -346,7 +365,18 @@ def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
 def _write_remote_content_e2e_config(root: Path) -> Path:
     config_path = root / "antfly-e2e.json"
     config_path.write_text(
-        json.dumps({"remote_content": {"security": {"block_private_ips": False}}}),
+        json.dumps(
+            {
+                "remote_content": {"security": {"block_private_ips": False}},
+                "connections": {
+                    E2E_BACKUP_CONNECTION: {
+                        "kind": "external_io",
+                        "capabilities": ["backup.write", "restore.read"],
+                        "external_io": {"protocol": "filesystem", "root": "/"},
+                    }
+                },
+            }
+        ),
         encoding="utf-8",
     )
     return config_path
@@ -1863,6 +1893,7 @@ def stateful_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
@@ -1878,10 +1909,12 @@ def stateful_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
-                return self._check(response)
+                accepted = self._check(response)
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -1889,6 +1922,7 @@ def stateful_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -1909,6 +1943,7 @@ def stateful_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -1916,12 +1951,13 @@ def stateful_api():
                 payload["restore_mode"] = restore_mode
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                    accepted = self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def list_backups(self, *, location: str) -> dict:
-            response = self.s.get(f"{self.url}/backups?location={location}", timeout=30)
+            response = self.s.get(f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}", timeout=30)
             return self._check(response)
 
         def batch_write_with_timeout(
@@ -2368,6 +2404,7 @@ def backup_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
@@ -2383,10 +2420,12 @@ def backup_api():
                         json={
                             "backup_id": backup_id,
                             "location": location,
+                            "connection": E2E_BACKUP_CONNECTION,
                         },
                         timeout=120,
                     )
-                return self._check(response)
+                accepted = self._check(response)
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2394,6 +2433,7 @@ def backup_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -2414,6 +2454,7 @@ def backup_api():
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": E2E_BACKUP_CONNECTION,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -2421,12 +2462,13 @@ def backup_api():
                 payload["restore_mode"] = restore_mode
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                    accepted = self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def list_backups(self, *, location: str) -> dict:
-            response = self.s.get(f"{self.url}/backups?location={location}", timeout=30)
+            response = self.s.get(f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}", timeout=30)
             return self._check(response)
 
     yield PublicApi(session, base, server)

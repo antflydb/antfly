@@ -834,8 +834,19 @@ fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []c
 }
 
 fn pathIsWithin(root: []const u8, candidate: []const u8) bool {
-    return std.mem.eql(u8, root, candidate) or
-        (candidate.len > root.len and std.mem.startsWith(u8, candidate, root) and candidate[root.len] == std.fs.path.sep);
+    if (std.mem.eql(u8, root, candidate)) return true;
+    if (candidate.len <= root.len or !std.mem.startsWith(u8, candidate, root)) return false;
+
+    // Canonical filesystem roots already end in the platform separator (for
+    // example `/`). Requiring another separator after that root incorrectly
+    // rejects every descendant of a root-scoped administrative connection.
+    return root[root.len - 1] == std.fs.path.sep or candidate[root.len] == std.fs.path.sep;
+}
+
+test "restore filesystem scope containment handles filesystem roots and component boundaries" {
+    try std.testing.expect(pathIsWithin("/", "/private/tmp/backup"));
+    try std.testing.expect(pathIsWithin("/var/backups", "/var/backups/tenant-a"));
+    try std.testing.expect(!pathIsWithin("/var/backups", "/var/backups-evil"));
 }
 
 pub fn createManifest(
@@ -2035,8 +2046,7 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
 pub fn validateClusterRestoreMode(mode: ?[]const u8) ![]const u8 {
     const selected = mode orelse "fail_if_exists";
     if (!std.mem.eql(u8, selected, "fail_if_exists") and
-        !std.mem.eql(u8, selected, "skip_if_exists") and
-        !std.mem.eql(u8, selected, "overwrite")) return error.InvalidBackupRequest;
+        !std.mem.eql(u8, selected, "skip_if_exists")) return error.InvalidBackupRequest;
     return selected;
 }
 

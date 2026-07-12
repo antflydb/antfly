@@ -166,10 +166,15 @@ credentials because they run with the invoking user's filesystem authority.
 Restore through `/db/v1` is a durable asynchronous job, not request-duration
 work. The accepted response contains a job ID; status and cooperative
 cancellation use `/db/v1/restore/jobs/{job_id}`. Idempotency keys make retries
-safe; requests without a key create independent jobs. Interrupted work is
-resumed after restart. Terminal state and explicit idempotency keys are retained
-for seven days in a bounded durable 10,000-job history. Cancellation is checked
-at safe table and publication boundaries.
+safe; requests without a key create independent jobs. Restore state lives inside
+the `.aflite` file, and completed table boundaries are durably checkpointed and
+not repeated after restart. An ambiguous publication/checkpoint interruption
+fails closed for operator inspection. Destructive overwrite is not exposed until
+table generations can be staged and atomically swapped. Terminal state and
+explicit idempotency keys are retained for seven days in a history bounded by
+10,000 jobs and 64 KiB per encoded job. Cancellation is checked at safe table
+publication boundaries. A standalone process executes at most two restore jobs
+concurrently; the remainder stay durably queued inside the `.aflite` file.
 
 An artifact first created through embedded commands has one root database. On
 its first standalone start, Antfly atomically adopts that root as the
@@ -553,9 +558,16 @@ be an optimization later when the source and target backend formats match.
 The reverse path should also work:
 
 ```sh
-antfly backup --format portable --table docs --out docs.afb
+antfly backup --format portable --table docs --backup-id docs \
+  --connection archive-writer --location s3://archive/exports/docs
+# Fetch docs.afb from the configured location with the object-store tooling.
 antfly lite restore docs.afb --out docs.aflite
 ```
+
+Network backup locations are server-owned and authorized through named
+connections, so `antfly backup` intentionally does not pretend a client-local
+`--out` path is visible to the server. For a local Lite database, create the
+artifact directly with `antfly lite backup source.aflite --out docs.afb`.
 
 This makes Lite useful for local development, debugging production data slices,
 offline demos, and customer support bundles.

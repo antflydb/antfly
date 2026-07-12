@@ -6859,16 +6859,7 @@ test "public api e2e serves cluster backup list and restore routes" {
         .{backup_root},
     );
     defer std.testing.allocator.free(overwrite_restore_body);
-    var overwrite_restore_resp = try client.fetchClusterRestore(base_uri, overwrite_restore_body);
-    defer overwrite_restore_resp.deinit(std.testing.allocator);
-    var parsed_overwrite_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, overwrite_restore_resp.body, .{});
-    defer parsed_overwrite_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_overwrite_restore.value.status);
-    try std.testing.expectEqual(@as(usize, 2), parsed_overwrite_restore.value.tables.len);
-    for (parsed_overwrite_restore.value.tables) |table_status| {
-        try std.testing.expectEqualStrings("triggered", table_status.status);
-        try std.testing.expect(table_status.@"error" == null);
-    }
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchClusterRestore(base_uri, overwrite_restore_body));
 
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
@@ -6877,13 +6868,13 @@ test "public api e2e serves cluster backup list and restore routes" {
     defer docs_lookup_after_overwrite.deinit(std.testing.allocator);
     var parsed_docs_lookup_after_overwrite = try parseJsonBody(LookupTitle, std.testing.allocator, docs_lookup_after_overwrite.body);
     defer parsed_docs_lookup_after_overwrite.deinit();
-    try std.testing.expectEqualStrings("alpha", parsed_docs_lookup_after_overwrite.value.title);
+    try std.testing.expectEqualStrings("overwrite-me", parsed_docs_lookup_after_overwrite.value.title);
 
     var logs_lookup_after_overwrite = try client.fetchLookup(base_uri, "logs", "log:a", null);
     defer logs_lookup_after_overwrite.deinit(std.testing.allocator);
     var parsed_logs_lookup_after_overwrite = try parseJsonBody(LookupTitle, std.testing.allocator, logs_lookup_after_overwrite.body);
     defer parsed_logs_lookup_after_overwrite.deinit();
-    try std.testing.expectEqualStrings("entry", parsed_logs_lookup_after_overwrite.value.title);
+    try std.testing.expectEqualStrings("overwrite-log", parsed_logs_lookup_after_overwrite.value.title);
 }
 
 test "public api e2e reports partial cluster backup and restore statuses" {

@@ -2343,9 +2343,22 @@ pub const DataServer = struct {
     /// Initialize the ApiHttpServer without creating a listener.
     /// Call this when you want to use the API server with an external
     /// httpx.Server instead of the built-in StdHttpListener.
-    pub fn initApiServer(self: *DataServer) void {
+    pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        var owned_restore_job_store_path: ?[]u8 = null;
+        defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
+        // Filesystem-backed runtimes keep API job state beside their shard
+        // catalog by default. Lite overrides this after construction with an
+        // engine namespace so its artifact remains genuinely single-file.
+        if (api_server_cfg.restore_job_store_path == null and
+            api_server_cfg.session_store_path == null and
+            api_server_cfg.session_store == null and
+            api_server_cfg.deployment_mode != .serverless)
+        {
+            owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
+            api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+        }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
         api_server_cfg.backend_runtime = self.backend_runtime;
@@ -2415,7 +2428,7 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
         self.syncInferenceRuntimeConfig();
-        self.http_server = antfly.public_api.ApiHttpServer.init(
+        self.http_server = try antfly.public_api.ApiHttpServer.initWithConfig(
             self.alloc,
             api_server_cfg,
             self.status_source,
@@ -2454,7 +2467,7 @@ pub const DataServer = struct {
         slot_name: []const u8,
         options: HAStandbyReplicationOptions,
     ) !HAStandbyReplicationResult {
-        if (self.http_server == null) self.initApiServer();
+        if (self.http_server == null) try self.initApiServer();
         var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
         return try self.replicateHAStandbyAvailableWithClient(&client, upstream_base_uri, slot_name, options);
     }
@@ -2466,7 +2479,7 @@ pub const DataServer = struct {
         slot_name: []const u8,
         options: HAStandbyReplicationOptions,
     ) !HAStandbyReplicationLoopResult {
-        if (self.http_server == null) self.initApiServer();
+        if (self.http_server == null) try self.initApiServer();
         var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
         var iterations: usize = 0;
         var received_count: usize = 0;
@@ -2892,7 +2905,8 @@ pub const DataServer = struct {
     pub fn start(self: *DataServer) !void {
         _ = try self.ensureBackendRuntime();
         self.registerMetadataLocalProviders();
-        self.initApiServer();
+        try self.initApiServer();
+        try self.http_server.?.resumeRestoreJobsOnce();
         if (self.data_raft) |raft| {
             try raft.start();
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
@@ -9726,7 +9740,7 @@ test "data server can register a store without enabling data raft" {
     try std.testing.expect(server.data_raft == null);
     try std.testing.expect(server.data_raft_apply == null);
 
-    server.initApiServer();
+    try server.initApiServer();
     try std.testing.expect(server.write_source.raft_batcher == null);
 }
 
@@ -15411,7 +15425,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     };
     defer server.deinit();
     server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
-    server.initApiServer();
+    try server.initApiServer();
 
     var status_resp = try server.http_server.?.handle(.{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
     defer status_resp.deinit(std.testing.allocator);
@@ -15731,7 +15745,7 @@ test "data server wires configured HA executors into API server" {
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     try std.testing.expect(server.ha_admin_server != null);
     try std.testing.expect(server.ha_internal_server != null);
@@ -15878,7 +15892,7 @@ test "data server mirrors managed primary writes into HA replication log" {
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     const source_mirror = server.write_source.ha_async_mirror orelse return error.TestExpectedEqual;
     try std.testing.expect(source_mirror.primary == &primary);
@@ -16019,7 +16033,7 @@ test "data server fail-closed sync policy rejects primary writes before local co
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     try std.testing.expectError(error.SyncPolicyUnsatisfied, server.write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:rejected", .value = "{\"title\":\"rejected\"}" }},
@@ -16161,7 +16175,7 @@ test "data server block sync policy waits for standby acknowledgement before com
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     _ = try server.write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:block", .value = "{\"title\":\"block\"}" }},
@@ -16269,7 +16283,7 @@ test "data server propagates standby HA write gate into provisioned write source
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     switch (source_gate) {
@@ -16423,7 +16437,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     switch (source_gate) {
@@ -16563,7 +16577,7 @@ test "data server applies routed HA replication records through standby write ga
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     const payload = try antfly.ha.effects.encodeBatchMutationRequestAlloc(alloc, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -16925,7 +16939,7 @@ test "data server HA replication network wait leaves state mutex available" {
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     var replication_thread = ReplicationThread{ .server = &server };
     const thread = try std.Thread.spawn(.{}, ReplicationThread.run, .{&replication_thread});
@@ -17069,7 +17083,7 @@ test "data server promotion rewires live HTTP internal HA executor" {
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     const public_read_gate_before = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_before = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
@@ -17248,7 +17262,7 @@ test "data server promotion open failure preserves retryable standby" {
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
-    server.initApiServer();
+    try server.initApiServer();
 
     const public_read_gate = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;

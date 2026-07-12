@@ -183,14 +183,21 @@ symlink ancestors.
 Restore is a durable asynchronous job. `POST /db/v1/restore` and table restore
 persist the job before returning `202`; clients poll or cancel
 `/db/v1/restore/jobs/{job_id}`. `Idempotency-Key` safely coalesces retries,
-while requests without a key create independent jobs. Interrupted running jobs
-are re-queued after restart. Terminal job state and explicit idempotency keys
-are retained for seven days; the bounded 10,000-job history rejects new work
-instead of silently evicting an unexpired key. Job IDs are random opaque
+while requests without a key create independent jobs. Completed table boundaries
+are durably checkpointed and are not repeated after restart. An ambiguous
+publication/checkpoint interruption fails closed for operator inspection rather
+than modifying an existing table. Destructive overwrite is intentionally not a
+restore mode until the catalog supports an atomic staged-generation swap.
+Terminal job state and explicit idempotency keys are retained for seven days;
+the history is bounded by 10,000 jobs and 64 KiB per encoded job, and rejects
+new work instead of silently evicting an unexpired key. Job IDs are random opaque
 63-bit values, so multiple API processes do not share a sequential allocator.
+At most two restore jobs execute concurrently per API process; additional jobs
+remain durably queued, preventing restore traffic from creating an unbounded
+background-I/O fanout.
 Table restore jobs are visible to administrators of that table; cluster restore
-jobs require cluster administration. Cancellation is observed before each
-destructive overwrite and table-publication boundary.
+jobs require cluster administration. Cancellation is observed at table-publication
+boundaries.
 
 The canonical and convenience forms are equivalent:
 

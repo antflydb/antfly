@@ -798,6 +798,20 @@ test "public table backup and restore require named connections" {
     try std.testing.expectEqualStrings("invalid restore request", restore.body);
 }
 
+fn testBackupNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
+    return common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write", "restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
 pub fn handleTableListIndexes(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -2395,13 +2409,15 @@ test "public table backup handler accepts portable format" {
     };
 
     var backend = Backend{};
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
     var resp = try handleTableBackup(
         std.testing.allocator,
         "docs",
-        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"format\":\"portable\"}",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\",\"format\":\"portable\"}",
         backend.iface(),
         null,
-        null,
+        &node_config,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -2440,13 +2456,15 @@ test "public table restore handler maps target already exists" {
         }
     };
 
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
     var resp = try handleTableRestore(
         std.testing.allocator,
         "docs",
-        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
         Backend.iface(),
         null,
-        null,
+        &node_config,
     );
     defer resp.deinit(std.testing.allocator);
 

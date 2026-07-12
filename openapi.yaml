@@ -2866,16 +2866,20 @@ paths:
 
         - `skip_if_exists`: Skip existing tables and restore the rest
 
-        - `overwrite`: Drop existing tables and restore from backup
-
 
         The restore is a durable asynchronous job. The request returns after the
 
         job record is persisted. Poll the restore job resource for progress.
 
-        Interrupted running jobs are resumed after restart. Cancellation is
+        Completed table boundaries are durably checkpointed and are not repeated
 
-        cooperative between table and artifact publication boundaries.
+        after restart. If a process stops between table publication and its
+
+        completion checkpoint, recovery fails closed for operator inspection
+
+        instead of replacing or modifying an existing table. Cancellation is
+
+        cooperative between table publication boundaries.
       operationId: restore
       parameters:
         - name: Idempotency-Key
@@ -2896,6 +2900,16 @@ paths:
       responses:
         '202':
           description: Restore triggered successfully
+          headers:
+            Location:
+              description: Relative URL of the durable restore job resource.
+              schema:
+                type: string
+            Retry-After:
+              description: Suggested polling delay in seconds.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -3791,6 +3805,16 @@ paths:
       responses:
         '202':
           description: Durable restore job accepted
+          headers:
+            Location:
+              description: Relative URL of the durable restore job resource.
+              schema:
+                type: string
+            Retry-After:
+              description: Suggested polling delay in seconds.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -10427,6 +10451,8 @@ components:
           example: backup-2025-01-15-v2
         location:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: >
             Storage location for the backup. Supports multiple backends:
 
@@ -10441,6 +10467,8 @@ components:
           example: s3://mybucket/antfly-backups/users-table/2025-01-15
         connection:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: >
             ID of a configured `external_io` connection. Required for every
 
@@ -10486,6 +10514,8 @@ components:
           example: cluster-backup-2025-01-15
         location:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: >
             Storage location for the backup. Supports multiple backends:
 
@@ -10500,6 +10530,8 @@ components:
           example: s3://mybucket/antfly-backups/cluster/2025-01-15
         connection:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: Required configured `external_io` connection with the `backup.write` capability.
         format:
           type: string
@@ -10520,8 +10552,11 @@ components:
           example: portable
         table_names:
           type: array
+          maxItems: 256
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
           description: >
             Optional list of tables to backup. If omitted, all tables are backed up.
           example:
@@ -10589,16 +10624,23 @@ components:
           example: cluster-backup-2025-01-15
         location:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: >
             Storage location where the backup is stored.
           example: s3://mybucket/antfly-backups/cluster/2025-01-15
         connection:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: Required configured `external_io` connection with the `restore.read` capability.
         table_names:
           type: array
+          maxItems: 256
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
           description: >
             Optional list of tables to restore. If omitted, all tables in the backup are restored.
           example:
@@ -10609,7 +10651,6 @@ components:
           enum:
             - fail_if_exists
             - skip_if_exists
-            - overwrite
           default: fail_if_exists
           description: >
             How to handle existing tables:
@@ -10617,8 +10658,6 @@ components:
             - `fail_if_exists`: Abort if any table already exists (default)
 
             - `skip_if_exists`: Skip existing tables, restore others
-
-            - `overwrite`: Drop and recreate existing tables
           example: skip_if_exists
     RestoreJob:
       type: object
@@ -10658,6 +10697,17 @@ components:
             - cancelled
         cancel_requested:
           type: boolean
+        completed_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of table restore boundaries durably completed. Completed boundaries are
+            not repeated after restart.
+        total_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Requested table count when known before execution.
         result:
           type: object
           additionalProperties: true

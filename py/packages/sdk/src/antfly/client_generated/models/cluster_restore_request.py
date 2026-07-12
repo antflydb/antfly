@@ -27,7 +27,6 @@ class ClusterRestoreRequest:
         restore_mode (ClusterRestoreRequestRestoreMode | Unset): How to handle existing tables:
             - `fail_if_exists`: Abort if any table already exists (default)
             - `skip_if_exists`: Skip existing tables, restore others
-            - `overwrite`: Drop and recreate existing tables
              Default: ClusterRestoreRequestRestoreMode.FAIL_IF_EXISTS. Example: skip_if_exists.
     """
 
