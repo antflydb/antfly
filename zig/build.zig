@@ -3992,6 +3992,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_connections_test_mod,
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
+            "connection cache remains valid across every allocation failure",
             "build response reports mock connected and types filter",
             "build response reports configured external io connections",
             "build response reports configured web search connections",

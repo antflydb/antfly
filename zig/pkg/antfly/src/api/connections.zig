@@ -148,6 +148,9 @@ pub const Sources = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    /// Shared server runtime for bounded connection discovery fanout. Tests
+    /// and embedded callers without a runtime fall back to sequential work.
+    io: ?std.Io = null,
 };
 
 pub const BuildOptions = struct {
@@ -169,7 +172,7 @@ pub const Cache = struct {
     const key_lock_count = 64;
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
-    key_locks: [key_lock_count]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** key_lock_count,
+    key_locks: [key_lock_count]std.Io.Mutex = [_]std.Io.Mutex{.init} ** key_lock_count,
     entries: std.StringArrayHashMapUnmanaged(Entry) = .{},
 
     pub const Entry = struct {
@@ -201,7 +204,7 @@ pub const Cache = struct {
         self.mutex.unlock();
     }
 
-    fn keyLock(self: *Cache, key: []const u8) *std.atomic.Mutex {
+    fn keyLock(self: *Cache, key: []const u8) *std.Io.Mutex {
         return &self.key_locks[std.hash.Wyhash.hash(0, key) % key_lock_count];
     }
 
@@ -229,13 +232,17 @@ pub const Cache = struct {
         defer self.unlock();
         var owned = try copyEntry(self.alloc, entry);
         errdefer owned.deinitOwned(self.alloc);
-        const gop = try self.entries.getOrPut(self.alloc, key);
-        if (gop.found_existing) {
-            gop.value_ptr.deinitOwned(self.alloc);
-        } else {
-            gop.key_ptr.* = try self.alloc.dupe(u8, key);
+        if (self.entries.getPtr(key)) |existing| {
+            existing.deinitOwned(self.alloc);
+            existing.* = owned;
+            return;
         }
-        gop.value_ptr.* = owned;
+        // Duplicate the key before mutating the map. `getOrPut` inserts the
+        // caller-owned key immediately, which would leave a dangling key and
+        // uninitialized value if the subsequent duplication failed.
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        try self.entries.putNoClobber(self.alloc, owned_key, owned);
     }
 
     fn copyEntry(alloc: Allocator, entry: Entry) !Entry {
@@ -307,12 +314,16 @@ const ModelsJob = struct {
     ttl_ns: u64 = 0,
     refresh: bool = false,
     cached_err_name: ?[]const u8 = null,
+    io: ?std.Io = null,
 
-    fn run(job: *ModelsJob) void {
+    fn run(job: *ModelsJob) std.Io.Cancelable!void {
         const alloc = job.arena_state.allocator();
-        const key_lock = if (job.cache) |cache| cache.keyLock(job.cache_key) else null;
-        if (key_lock) |lock| platform_sync.lockYielding(lock);
-        defer if (key_lock) |lock| lock.unlock();
+        const key_lock = if (job.io) |io|
+            if (job.cache) |cache| .{ .lock = cache.keyLock(job.cache_key), .io = io } else null
+        else
+            null;
+        if (key_lock) |guard| guard.lock.lockUncancelable(guard.io);
+        defer if (key_lock) |guard| guard.lock.unlock(guard.io);
         if (job.cache) |cache| {
             const now = platform_time.monotonicNs();
             if (cache.lookupCopy(alloc, job.cache_key, now, job.ttl_ns) catch null) |entry| {
@@ -327,9 +338,10 @@ const ModelsJob = struct {
                 }
             }
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+        var fallback_io_impl: ?std.Io.Threaded = if (job.io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+        defer if (fallback_io_impl) |*io_impl| io_impl.deinit();
+        const io = job.io orelse fallback_io_impl.?.io();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
         defer client.deinit();
         job.result = list_models.listModels(alloc, &client, job.ep, job.timeout_ms) catch |err| {
             job.err = err;
@@ -364,7 +376,7 @@ pub fn buildConnectionsResponse(
     if (sources.node_config) |node_config| {
         try appendConfiguredConnections(arena, &connections, sources, cache, effective_opts, kinds, node_config);
         if (effective_opts.probe and kinds.contains(.external_io)) {
-            try resolveExternalIoProbes(arena, &connections, node_config, cache, effective_opts);
+            try resolveExternalIoProbes(arena, &connections, node_config, cache, effective_opts, sources.io);
         }
     }
 
@@ -742,7 +754,7 @@ fn modelsMapAlloc(arena: Allocator, models: []const list_models.ListedModel, ins
 }
 
 /// Resolve model listings per instance, serving from the cache when fresh and
-/// fanning out worker threads (capped) for live calls.
+/// using bounded shared-runtime fanout for live calls.
 fn resolveModels(
     arena: Allocator,
     sources: Sources,
@@ -814,24 +826,31 @@ fn resolveModels(
             .request_started_ns = now_ns,
             .ttl_ns = opts.ttl_ns,
             .refresh = opts.refresh,
+            .io = sources.io,
         };
         try pending.append(arena, .{ .index = i, .job = job });
     }
 
-    // Run pending jobs in capped batches.
+    // Run pending jobs in capped batches on the server-owned std.Io runtime.
+    // This bounds process resources across requests instead of creating an OS
+    // thread per connection. Embedded/test callers without a runtime execute
+    // sequentially and retain identical semantics.
     const max_workers = @min(@max(opts.max_workers, 1), 64);
     var offset: usize = 0;
     while (offset < pending.items.len) {
         const end = @min(pending.items.len, offset + max_workers);
-        var threads: [64]?std.Thread = @splat(null);
-        for (pending.items[offset..end], 0..) |item, slot| {
-            threads[slot] = std.Thread.spawn(.{}, ModelsJob.run, .{item.job}) catch |err| blk: {
+        if (sources.io) |io| {
+            var group: std.Io.Group = .init;
+            for (pending.items[offset..end]) |item| {
+                group.concurrent(io, ModelsJob.run, .{item.job}) catch |err| {
+                    item.job.err = err;
+                };
+            }
+            group.await(io) catch {};
+        } else {
+            for (pending.items[offset..end]) |item| item.job.run() catch |err| {
                 item.job.err = err;
-                break :blk null;
             };
-        }
-        for (threads[0 .. end - offset]) |maybe_thread| {
-            if (maybe_thread) |thread| thread.join();
         }
         offset = end;
     }
@@ -889,11 +908,15 @@ const ObjectProbeJob = struct {
     ttl_ns: u64 = 0,
     refresh: bool = false,
     cached_err_name: ?[]const u8 = null,
+    io: ?std.Io = null,
 
-    fn run(job: *ObjectProbeJob) void {
-        const key_lock = if (job.cache) |cache| cache.keyLock(job.cache_key) else null;
-        if (key_lock) |lock| platform_sync.lockYielding(lock);
-        defer if (key_lock) |lock| lock.unlock();
+    fn run(job: *ObjectProbeJob) std.Io.Cancelable!void {
+        const key_lock = if (job.io) |io|
+            if (job.cache) |cache| .{ .lock = cache.keyLock(job.cache_key), .io = io } else null
+        else
+            null;
+        if (key_lock) |guard| guard.lock.lockUncancelable(guard.io);
+        defer if (key_lock) |guard| guard.lock.unlock(guard.io);
         if (job.cache) |cache| {
             const now = platform_time.monotonicNs();
             if (cache.lookupCopy(job.arena_state.allocator(), job.cache_key, now, job.ttl_ns) catch null) |entry| {
@@ -931,6 +954,7 @@ fn resolveExternalIoProbes(
     node_config: *const common_config.Config,
     cache: ?*Cache,
     opts: BuildOptions,
+    io: ?std.Io,
 ) !void {
     const Pending = struct {
         connection_index: usize,
@@ -988,6 +1012,7 @@ fn resolveExternalIoProbes(
             .request_started_ns = now_ns,
             .ttl_ns = opts.ttl_ns,
             .refresh = opts.refresh,
+            .io = io,
         };
         try pending.append(arena, .{ .connection_index = connection_index, .cache_key = cache_key, .job = job });
     }
@@ -996,18 +1021,18 @@ fn resolveExternalIoProbes(
     var offset: usize = 0;
     while (offset < pending.items.len) {
         const end = @min(pending.items.len, offset + max_workers);
-        var threads: [64]?std.Thread = @splat(null);
-        for (pending.items[offset..end], 0..) |item, slot| {
-            threads[slot] = std.Thread.spawn(.{}, ObjectProbeJob.run, .{item.job}) catch blk: {
-                // Resource pressure must not turn a healthy connection into a
-                // cached health failure. Preserve bounded concurrency and run
-                // this probe on the request thread when a worker cannot start.
-                item.job.run();
-                break :blk null;
+        if (io) |runtime_io| {
+            var group: std.Io.Group = .init;
+            for (pending.items[offset..end]) |item| {
+                group.concurrent(runtime_io, ObjectProbeJob.run, .{item.job}) catch |err| {
+                    item.job.err = err;
+                };
+            }
+            group.await(runtime_io) catch {};
+        } else {
+            for (pending.items[offset..end]) |item| item.job.run() catch |err| {
+                item.job.err = err;
             };
-        }
-        for (threads[0 .. end - offset]) |maybe_thread| {
-            if (maybe_thread) |thread| thread.join();
         }
         offset = end;
     }
@@ -1224,6 +1249,29 @@ test "object probe cache identity covers every bucket and credential source" {
     const credential_key = try objectProbeCacheKeyAlloc(alloc, "archive", first);
     defer alloc.free(credential_key);
     try std.testing.expect(!std.mem.eql(u8, bucket_key, credential_key));
+}
+
+test "connection cache remains valid across every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var cache = Cache.init(alloc);
+            defer cache.deinit();
+            try cache.store("provider", .{
+                .captured_at_ns = 1,
+                .ok = false,
+                .err_name = @constCast("first failure"),
+            });
+            try cache.store("provider", .{
+                .captured_at_ns = 2,
+                .ok = true,
+            });
+            const entry = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
+            var owned = entry;
+            defer owned.deinitOwned(alloc);
+            try std.testing.expect(owned.ok);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "build response reports mock connected and types filter" {

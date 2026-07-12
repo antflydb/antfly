@@ -1362,6 +1362,10 @@ pub const ApiHttpServer = struct {
             .antfly_provider = self.antfly_provider,
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
+            .io = if (self.cfg.backend_runtime) |runtime|
+                if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
+            else
+                null,
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -13502,9 +13506,11 @@ test "api http server serves connections with partial provider failures" {
     defer node_config.deinit();
 
     var source = FakeSource{};
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var server = ApiHttpServer.init(
         std.testing.allocator,
-        .{ .node_config = &node_config },
+        .{ .node_config = &node_config, .backend_runtime = backend_runtime.ptr() },
         source.iface(),
         null,
         null,
