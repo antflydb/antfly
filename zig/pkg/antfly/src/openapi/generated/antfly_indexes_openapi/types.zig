@@ -195,6 +195,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
     stale_group,
     summary_unavailable,
     config_mismatch,
+    counter_mismatch,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -205,6 +206,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
             .stale_group => "stale_group",
             .summary_unavailable => "summary_unavailable",
             .config_mismatch => "config_mismatch",
+            .counter_mismatch => "counter_mismatch",
         };
         try jw.write(s);
     }
@@ -222,6 +224,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
             .{ "stale_group", .stale_group },
             .{ "summary_unavailable", .summary_unavailable },
             .{ "config_mismatch", .config_mismatch },
+            .{ "counter_mismatch", .counter_mismatch },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -258,7 +261,7 @@ pub const DerivedCoveragePolicy = enum {
 
 pub const DerivedCoverageStatus = struct {
     policy: DerivedCoverageStatusPolicy,
-    /// Whether every expected shard contributed a fresh runtime observation to this projection.
+    /// Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality.
     observation_complete: bool,
     /// Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete.
     observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
@@ -276,11 +279,11 @@ pub const DerivedCoverageStatus = struct {
     skipped: i64,
     /// Source documents whose generation failed non-retryably.
     terminal_failed: i64,
-    /// Terminal source outcomes counted by the configured policy.
+    /// Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
     covered: i64,
     /// Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
     pending: ?i64,
-    /// Whether observations are complete and every observed source has an outcome accepted by the policy.
+    /// Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy.
     complete: bool,
     /// Whether coverage is complete without terminal failures.
     healthy: bool,

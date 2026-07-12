@@ -3962,7 +3962,7 @@ pub const BoundTableWriteSource = struct {
         portable: bool,
         open_options: db_mod.OpenOptions,
     ) !db_mod.generation_lifecycle.PublicationOutcome {
-        var transition = try db_mod.generation_lifecycle.beginProcessExclusive(live_path);
+        var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(live_path, open_options.backend_runtime);
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
@@ -5142,7 +5142,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn beginShardStorageTransition(self: *@This(), path: []const u8) !db_mod.generation_lifecycle.ExclusiveTransition {
             if (!self.mutation_open) return error.InvalidGenerationTransition;
-            return try db_mod.generation_lifecycle.beginProcessExclusive(path);
+            return try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(path, self.source.backend_runtime);
         }
 
         fn abort(self: *@This()) void {

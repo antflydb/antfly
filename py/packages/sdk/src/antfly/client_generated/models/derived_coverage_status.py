@@ -16,8 +16,8 @@ class DerivedCoverageStatus:
     """
     Attributes:
         policy (DerivedCoverageStatusPolicy):
-        observation_complete (bool): Whether every expected shard contributed a fresh runtime observation to this
-            projection.
+        observation_complete (bool): Whether every expected shard contributed a fresh, configuration-compatible
+            observation with valid outcome cardinality.
         observation_incomplete_reasons (list[DerivedCoverageObservationIncompleteReason]): Empty when
             observation_complete is true; otherwise identifies every known reason the projection is incomplete.
         config_fingerprint (str): Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-
@@ -31,11 +31,12 @@ class DerivedCoverageStatus:
         produced (int): Source documents with a durable produced outcome for this index generation.
         skipped (int): Source documents intentionally producing no indexable output.
         terminal_failed (int): Source documents whose generation failed non-retryably.
-        covered (int): Terminal source outcomes counted by the configured policy.
+        covered (int): Raw terminal source outcomes counted by the configured policy. This may exceed source_total only
+            while observation_complete is false with counter_mismatch.
         pending (int | None): Source documents without a policy-accepted terminal outcome. Null when observations are
             incomplete and the global value is unknown.
-        complete (bool): Whether observations are complete and every observed source has an outcome accepted by the
-            policy.
+        complete (bool): Whether observations are complete, replay has reached its target, and every observed source has
+            an outcome accepted by the policy.
         healthy (bool): Whether coverage is complete without terminal failures.
         degraded (bool): Whether coverage is complete under best_effort but includes terminal failures.
     """

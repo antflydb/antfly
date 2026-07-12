@@ -475,6 +475,7 @@ components:
         - stale_group
         - summary_unavailable
         - config_mismatch
+        - counter_mismatch
       description: "A structured reason why the coverage projection cannot be treated as globally complete."
     DerivedCoverageStatus:
       type: object
@@ -500,7 +501,7 @@ components:
           $ref: "#/components/schemas/DerivedCoverageStatusPolicy"
         observation_complete:
           type: boolean
-          description: "Whether every expected shard contributed a fresh runtime observation to this projection."
+          description: "Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality."
         observation_incomplete_reasons:
           type: array
           items:
@@ -539,7 +540,7 @@ components:
         covered:
           type: integer
           format: uint64
-          description: "Terminal source outcomes counted by the configured policy."
+          description: "Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch."
         pending:
           x-go-type-skip-optional-pointer: false
           type: integer
@@ -548,7 +549,7 @@ components:
           description: "Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown."
         complete:
           type: boolean
-          description: "Whether observations are complete and every observed source has an outcome accepted by the policy."
+          description: "Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy."
         healthy:
           type: boolean
           description: "Whether coverage is complete without terminal failures."

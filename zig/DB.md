@@ -50,7 +50,9 @@ the staged generation, and only then publishes it. A prepare or repair failure
 destroys staging and leaves the live generation untouched. macOS and Linux use
 atomic directory exchange when a live generation exists. Platforms or
 filesystems without atomic exchange reject replacement before mutating the live
-namespace. The exchanged old root is reclaimed only after publication.
+namespace. After durable publication, the exchanged old root is submitted to
+the shared backend runtime's cleanup lane; recursive reclamation is not part of
+the admission-critical publication path.
 
 `DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
 capability and rejects a path that is not the capability's staging root. Raw
@@ -75,18 +77,23 @@ admission bookkeeping in both cases. A post-commit sync failure must never enter
 the pre-commit abort or metadata-drop path. It is reported as committed with
 durability pending, while raft bootstrap remains inactive. Every staged
 candidate contains a publication marker that moves into the live root at
-commit. DB open reconciles that marker by syncing the parent namespace, pruning
-retained or abandoned sibling generations, and clearing the marker before the
-root is admitted. Every open DB retains a shared generation lease and a shared
-filesystem publication lock through `DB.close()`. An exclusive transition
+commit. DB open reconciles that marker by syncing the parent namespace,
+submitting retained or abandoned sibling generations to the runtime cleanup
+lane, and clearing the marker before the root is admitted. Cleanup failures
+leave the generated sibling name as durable retry debt for a later exclusive
+transition or process reconciliation; they do not block read admission. Every
+open DB retains a shared generation lease and a shared filesystem publication
+lock through `DB.close()`. An exclusive transition
 blocks new opens and cannot publish until all prior DB owners have closed.
 Reconciliation is cached per process generation and a new exclusive transition
 invalidates that cache entry, keeping normal opens at an O(1) hash lookup after
 the first check. The persistent sibling lock file also excludes overlapping
 restore publishers across processes. Stale-stage GC only considers names with
 Antfly's complete generated-stage grammar while holding that exclusive lock;
-it removes marked abandoned candidates and markerless retired roots left by a
-completed exchange, while ignoring arbitrary prefix-matching directories.
+it schedules marked abandoned candidates and markerless retired roots left by a
+completed exchange, while ignoring arbitrary prefix-matching directories. A
+manual runtime never performs recursive cleanup inline; it leaves the sibling
+for a later threaded serving runtime or operator cleanup.
 
 A restore whose namespace exchange committed but whose parent sync failed is
 reported as durability pending. Retrying the same backup is idempotent: Antfly
@@ -98,7 +105,8 @@ Replacing an existing direct-path generation requires an atomic directory
 exchange; platforms or filesystems without that primitive reject publication
 before changing the live namespace. If the exchange is visible but its
 parent-directory sync fails, the previous generation remains under the staging
-name until reconciliation confirms the new namespace is durable.
+name until reconciliation confirms the new namespace is durable and submits it
+for asynchronous cleanup.
 
 The current root layout is path-relative and may lazily open run files after a
 transaction starts. Consequently, serving transitions stop admission and drain

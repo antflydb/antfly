@@ -1258,15 +1258,15 @@ fn aggregateIndexStatusIndexed(
         // remain visible in diagnostics but cannot contribute cardinality or
         // outcomes to a complete aggregate.
         if (statusFreshnessCountsAsFresh(runtime.metadata)) {
-            aggregate.table_doc_count += runtime.stats.source_doc_count;
+            aggregate.table_doc_count +|= runtime.stats.source_doc_count;
             if (item.coverage_config_hash != coverage_config_hash) {
                 aggregate.coverage_config_mismatch_count += 1;
             } else if (!item.coverage_summary_ready) {
                 aggregate.coverage_summary_ready = false;
             } else {
-                aggregate.coverage_produced_count += item.coverage_produced_count;
-                aggregate.coverage_skipped_count += item.coverage_skipped_count;
-                aggregate.coverage_terminal_failed_count += item.coverage_terminal_failed_count;
+                aggregate.coverage_produced_count +|= item.coverage_produced_count;
+                aggregate.coverage_skipped_count +|= item.coverage_skipped_count;
+                aggregate.coverage_terminal_failed_count +|= item.coverage_terminal_failed_count;
             }
         }
         aggregate.doc_count += item.doc_count;
@@ -1547,7 +1547,21 @@ const CoverageEvaluation = struct {
     healthy: bool,
     degraded: bool,
     source_visible: bool,
+    counters_valid: bool,
 };
+
+fn coverageOutcomeTotal(produced: u64, skipped: u64, terminal_failed: u64) ?u64 {
+    const produced_and_skipped = std.math.add(u64, produced, skipped) catch return null;
+    return std.math.add(u64, produced_and_skipped, terminal_failed) catch null;
+}
+
+fn coverageCountersValid(source_total: u64, produced: u64, skipped: u64, terminal_failed: u64) bool {
+    return (coverageOutcomeTotal(produced, skipped, terminal_failed) orelse return false) <= source_total;
+}
+
+fn coverageReplayCurrent(applied_sequence: u64, target_sequence: u64, catch_up_required: bool) bool {
+    return !catch_up_required and applied_sequence >= target_sequence;
+}
 
 fn evaluateCoverage(
     policy: EmbeddingsCoveragePolicy,
@@ -1556,6 +1570,7 @@ fn evaluateCoverage(
     skipped: u64,
     terminal_failed: u64,
     observation_complete: bool,
+    replay_current: bool,
 ) CoverageEvaluation {
     const policy_covered = switch (policy) {
         .strict => produced,
@@ -1563,45 +1578,58 @@ fn evaluateCoverage(
         .best_effort => produced +| skipped +| terminal_failed,
         .external => produced,
     };
-    const covered = @min(source_total, policy_covered);
-    const complete = observation_complete and covered == source_total;
+    const outcome_total = coverageOutcomeTotal(produced, skipped, terminal_failed);
+    const counters_valid = if (outcome_total) |total| total <= source_total else false;
+    const all_sources_terminal = if (outcome_total) |total| total == source_total else false;
+    const complete = observation_complete and replay_current and counters_valid and all_sources_terminal and policy_covered == source_total;
     return .{
-        .covered = covered,
-        .pending = if (observation_complete) source_total -| covered else null,
+        .covered = policy_covered,
+        .pending = if (observation_complete and counters_valid) source_total -| policy_covered else null,
         .complete = complete,
         .healthy = complete and terminal_failed == 0,
         .degraded = complete and terminal_failed > 0,
         .source_visible = source_total == 0 or policy_covered > 0,
+        .counters_valid = counters_valid,
     };
 }
 
 test "derived coverage evaluation is policy exact and observation gated" {
-    const strict = evaluateCoverage(.strict, 3, 1, 1, 1, true);
+    const strict = evaluateCoverage(.strict, 3, 1, 1, 1, true, true);
     try std.testing.expectEqual(@as(u64, 1), strict.covered);
     try std.testing.expectEqual(@as(?u64, 2), strict.pending);
     try std.testing.expect(!strict.complete);
 
-    const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true);
+    const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true, true);
     try std.testing.expectEqual(@as(u64, 3), partial.covered);
     try std.testing.expect(partial.complete);
     try std.testing.expect(partial.healthy);
 
-    const best_effort = evaluateCoverage(.best_effort, 3, 1, 1, 1, true);
+    const replay_pending = evaluateCoverage(.partial, 3, 1, 2, 0, true, false);
+    try std.testing.expect(!replay_pending.complete);
+    try std.testing.expect(!replay_pending.healthy);
+
+    const best_effort = evaluateCoverage(.best_effort, 3, 1, 1, 1, true, true);
     try std.testing.expect(best_effort.complete);
     try std.testing.expect(!best_effort.healthy);
     try std.testing.expect(best_effort.degraded);
 
-    const incomplete_observation = evaluateCoverage(.partial, 3, 1, 2, 0, false);
+    const incomplete_observation = evaluateCoverage(.partial, 3, 1, 2, 0, false, true);
     try std.testing.expectEqual(@as(?u64, null), incomplete_observation.pending);
     try std.testing.expect(!incomplete_observation.complete);
     try std.testing.expect(!incomplete_observation.healthy);
 
-    const external_partial = evaluateCoverage(.external, 3, 1, 0, 0, true);
+    const excess_outcomes = evaluateCoverage(.partial, 2, 2, 1, 0, true, true);
+    try std.testing.expectEqual(@as(u64, 3), excess_outcomes.covered);
+    try std.testing.expectEqual(@as(?u64, null), excess_outcomes.pending);
+    try std.testing.expect(!excess_outcomes.counters_valid);
+    try std.testing.expect(!excess_outcomes.complete);
+
+    const external_partial = evaluateCoverage(.external, 3, 1, 0, 0, true, true);
     try std.testing.expectEqual(@as(u64, 1), external_partial.covered);
     try std.testing.expectEqual(@as(?u64, 2), external_partial.pending);
     try std.testing.expect(!external_partial.complete);
 
-    const external_complete = evaluateCoverage(.external, 3, 3, 0, 0, true);
+    const external_complete = evaluateCoverage(.external, 3, 3, 0, 0, true, true);
     try std.testing.expect(external_complete.complete);
     try std.testing.expect(external_complete.healthy);
 }
@@ -1632,7 +1660,7 @@ test "derived coverage aggregation rejects mixed config observations" {
 
     var reasons = std.ArrayListUnmanaged(u8).empty;
     defer reasons.deinit(std.testing.allocator);
-    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 41, true, null);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 41, true, null, 2);
     try std.testing.expectEqualStrings("[\"config_mismatch\"]", reasons.items);
 
     var missing_status = std.ArrayListUnmanaged(u8).empty;
@@ -1733,10 +1761,13 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         .replay_target_sequence = item.replay_target_sequence,
         .replay_catch_up_required = item.replay_catch_up_required,
     };
-    const coverage_incomplete = !runtime_present or aggregateRuntimeCoverageIncomplete(item, coverage_config_hash);
     const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
     const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
     const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+    const replay_current = coverageReplayCurrent(view.replay_applied_sequence, view.replay_target_sequence, view.replay_catch_up_required);
+    const coverage_incomplete = !runtime_present or
+        aggregateRuntimeCoverageIncomplete(item, coverage_config_hash) or
+        !coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
     const coverage = evaluateCoverage(
         coverage_policy,
         table_doc_count,
@@ -1744,6 +1775,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         skipped_count,
         terminal_failed_count,
         !coverage_incomplete,
+        replay_current,
     );
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
     const source_coverage_visible = coverage.source_visible;
@@ -1833,6 +1865,7 @@ fn appendCoverageIncompleteReasons(
     expected_config_hash: u64,
     runtime_present: bool,
     metadata: ?runtime_status.RuntimeStatusMetadata,
+    source_total: u64,
 ) !void {
     const Item = @TypeOf(item);
     const observation_current = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
@@ -1865,7 +1898,26 @@ fn appendCoverageIncompleteReasons(
     const config_mismatch = (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) or
         (observation_current and @hasField(Item, "coverage_config_hash") and item.coverage_config_hash != expected_config_hash);
     if (config_mismatch) try ReasonWriter.append(alloc, out, &emitted, "config_mismatch");
+    const summary_ready = if (@hasField(Item, "coverage_summary_ready")) item.coverage_summary_ready else false;
+    const produced = if (@hasField(Item, "coverage_produced_count")) item.coverage_produced_count else 0;
+    const skipped = if (@hasField(Item, "coverage_skipped_count")) item.coverage_skipped_count else 0;
+    const terminal_failed = if (@hasField(Item, "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+    if (observation_current and !config_mismatch and summary_ready and !coverageCountersValid(source_total, produced, skipped, terminal_failed))
+        try ReasonWriter.append(alloc, out, &emitted, "counter_mismatch");
     try out.append(alloc, ']');
+}
+
+test "derived coverage reasons expose counter mismatch" {
+    const aggregate = AggregatedIndexStatus{
+        .coverage_config_hash = 41,
+        .coverage_produced_count = 2,
+        .coverage_skipped_count = 1,
+        .coverage_summary_ready = true,
+    };
+    var reasons = std.ArrayListUnmanaged(u8).empty;
+    defer reasons.deinit(std.testing.allocator);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 41, true, null, 2);
+    try std.testing.expectEqualStrings("[\"counter_mismatch\"]", reasons.items);
 }
 
 fn appendCoverageFingerprint(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), fingerprint: u64) !void {
@@ -2105,7 +2157,11 @@ fn appendSingleIndexRuntimeStatus(
         const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
         const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
         const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
-        const observation_complete = coverage_runtime_present and !aggregateRuntimeCoverageIncomplete(item, coverage_config_hash);
+        const counters_valid = coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
+        const replay_current = coverageReplayCurrent(replay_applied_sequence, replay_target_sequence, replay_catch_up_required);
+        const observation_complete = coverage_runtime_present and
+            !aggregateRuntimeCoverageIncomplete(item, coverage_config_hash) and
+            counters_valid;
         const coverage = evaluateCoverage(
             embeddings_coverage_policy,
             table_doc_count,
@@ -2113,6 +2169,7 @@ fn appendSingleIndexRuntimeStatus(
             skipped_count,
             terminal_failed_count,
             observation_complete,
+            replay_current,
         );
         const coverage_complete = coverage.complete;
         const artifact_publish_pending = replay_target_sequence > 0 and
@@ -2141,7 +2198,7 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"observation_complete\":");
         try out.appendSlice(alloc, if (observation_complete) "true" else "false");
         try out.appendSlice(alloc, ",\"observation_incomplete_reasons\":");
-        try appendCoverageIncompleteReasons(alloc, out, item, coverage_config_hash, runtime_present, metadata);
+        try appendCoverageIncompleteReasons(alloc, out, item, coverage_config_hash, runtime_present, metadata, table_doc_count);
         try out.appendSlice(alloc, ",\"config_fingerprint\":");
         try appendCoverageFingerprint(alloc, out, coverage_config_hash);
         try out.appendSlice(alloc, ",\"summary_ready\":");

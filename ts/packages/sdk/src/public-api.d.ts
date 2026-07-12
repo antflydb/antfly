@@ -8828,10 +8828,10 @@ export interface components {
          * @description A structured reason why the coverage projection cannot be treated as globally complete.
          * @enum {string}
          */
-        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "unknown_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch";
+        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "unknown_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch" | "counter_mismatch";
         DerivedCoverageStatus: {
             policy: components["schemas"]["DerivedCoverageStatusPolicy"];
-            /** @description Whether every expected shard contributed a fresh runtime observation to this projection. */
+            /** @description Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality. */
             observation_complete: boolean;
             /** @description Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete. */
             observation_incomplete_reasons: components["schemas"]["DerivedCoverageObservationIncompleteReason"][];
@@ -8866,7 +8866,7 @@ export interface components {
             terminal_failed: number;
             /**
              * Format: uint64
-             * @description Terminal source outcomes counted by the configured policy.
+             * @description Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
              */
             covered: number;
             /**
@@ -8874,7 +8874,7 @@ export interface components {
              * @description Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
              */
             pending: number | null;
-            /** @description Whether observations are complete and every observed source has an outcome accepted by the policy. */
+            /** @description Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy. */
             complete: boolean;
             /** @description Whether coverage is complete without terminal failures. */
             healthy: boolean;

@@ -973,6 +973,10 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .coverage_produced_count = item.coverage_produced_count,
             .coverage_skipped_count = item.coverage_skipped_count,
             .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
+            .coverage_config_hash = item.coverage_config_hash,
+            .coverage_summary_ready = item.coverage_summary_ready,
+            .coverage_generation = item.coverage_generation,
+            .coverage_identity_ready = item.coverage_identity_ready,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
             .enrichment_failed = item.enrichment_failed,
@@ -1125,6 +1129,10 @@ test "table runtime snapshot cache clones stored status" {
         .coverage_produced_count = 5,
         .coverage_skipped_count = 6,
         .coverage_terminal_failed_count = 7,
+        .coverage_config_hash = 0x1234,
+        .coverage_summary_ready = false,
+        .coverage_generation = 0x5678,
+        .coverage_identity_ready = true,
         .backfill_active = true,
         .backfill_progress = 0.5,
         .enrichment_failed = true,
@@ -1249,6 +1257,10 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.indexes[0].coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 6), cloned.items[0].stats.indexes[0].coverage_skipped_count);
     try std.testing.expectEqual(@as(u64, 7), cloned.items[0].stats.indexes[0].coverage_terminal_failed_count);
+    try std.testing.expectEqual(@as(u64, 0x1234), cloned.items[0].stats.indexes[0].coverage_config_hash);
+    try std.testing.expect(!cloned.items[0].stats.indexes[0].coverage_summary_ready);
+    try std.testing.expectEqual(@as(u64, 0x5678), cloned.items[0].stats.indexes[0].coverage_generation);
+    try std.testing.expect(cloned.items[0].stats.indexes[0].coverage_identity_ready);
     try std.testing.expect(cloned.items[0].stats.indexes[0].backfill_active);
     try std.testing.expectEqual(@as(f64, 0.5), cloned.items[0].stats.indexes[0].backfill_progress);
     try std.testing.expect(cloned.items[0].stats.indexes[0].enrichment_failed);
