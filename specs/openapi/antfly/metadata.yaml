@@ -4510,29 +4510,40 @@ components:
     RestoreRequest:
       allOf: # Identical to BackupRequest
         - $ref: "#/components/schemas/BackupRequest"
+    RestoreTriggeredResponse:
+      type: object
+      additionalProperties: false
+      required: [restore]
+      description: Asynchronous restore work has been accepted and started.
+      properties:
+        restore:
+          type: string
+          enum: [triggered]
+    RestoreCommittedPendingResponse:
+      type: object
+      additionalProperties: false
+      required: [restore, durability]
+      description: The restored generation is published but its durability barrier remains pending.
+      properties:
+        restore:
+          type: string
+          enum: [committed]
+        durability:
+          type: string
+          enum: [pending]
     RestoreAcceptedResponse:
       description: |
         An accepted restore. `triggered` means asynchronous restoration has
         started. `committed` means the new generation is published but its
         durability barrier has not yet been confirmed.
+      discriminator:
+        propertyName: restore
+        mapping:
+          triggered: "#/components/schemas/RestoreTriggeredResponse"
+          committed: "#/components/schemas/RestoreCommittedPendingResponse"
       oneOf:
-        - type: object
-          additionalProperties: false
-          required: [restore]
-          properties:
-            restore:
-              type: string
-              enum: [triggered]
-        - type: object
-          additionalProperties: false
-          required: [restore, durability]
-          properties:
-            restore:
-              type: string
-              enum: [committed]
-            durability:
-              type: string
-              enum: [pending]
+        - $ref: "#/components/schemas/RestoreTriggeredResponse"
+        - $ref: "#/components/schemas/RestoreCommittedPendingResponse"
     RestoreCommittedDurableResponse:
       type: object
       additionalProperties: false

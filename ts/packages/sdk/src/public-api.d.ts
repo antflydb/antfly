@@ -4619,20 +4619,30 @@ export interface components {
             format?: "native" | "portable";
         };
         RestoreRequest: components["schemas"]["BackupRequest"];
+        /** @description Asynchronous restore work has been accepted and started. */
+        RestoreTriggeredResponse: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            restore: "triggered";
+        };
+        /** @description The restored generation is published but its durability barrier remains pending. */
+        RestoreCommittedPendingResponse: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            restore: "committed";
+            /** @enum {string} */
+            durability: "pending";
+        };
         /**
          * @description An accepted restore. `triggered` means asynchronous restoration has
          *     started. `committed` means the new generation is published but its
          *     durability barrier has not yet been confirmed.
          */
-        RestoreAcceptedResponse: {
-            /** @enum {string} */
-            restore: "triggered";
-        } | {
-            /** @enum {string} */
-            restore: "committed";
-            /** @enum {string} */
-            durability: "pending";
-        };
+        RestoreAcceptedResponse: components["schemas"]["RestoreTriggeredResponse"] | components["schemas"]["RestoreCommittedPendingResponse"];
         RestoreCommittedDurableResponse: {
             /** @enum {string} */
             restore: "committed";

@@ -22,6 +22,7 @@ const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig"
 const shard_mod = @import("../../storage/shard.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const shard_state_store = @import("shard_state_store.zig");
+const batch_shard_count: usize = 64;
 
 pub const AppliedDataBatch = struct {
     commit_index: u64,
@@ -56,10 +57,13 @@ pub const RaftApplyStore = struct {
     path: []u8,
     backend: lsm_backend.BackendHandle,
     store: docstore.DocStore,
-    batches_mutex: std.Io.Mutex = .init,
-    batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
+    batch_shards: [batch_shard_count]BatchShard = [_]BatchShard{.{}} ** batch_shard_count,
 
     const OwnedBatch = AppliedDataBatch;
+    const BatchShard = struct {
+        mutex: std.Io.Mutex = .init,
+        batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
+    };
 
     pub fn init(alloc: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
         var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -98,7 +102,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
-        self.batches.deinit(self.alloc);
+        for (&self.batch_shards) |*shard| shard.batches.deinit(self.alloc);
         self.store.close();
         self.backend.close();
         self.alloc.free(self.path);
@@ -119,9 +123,10 @@ pub const RaftApplyStore = struct {
 
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
         const io = self.io_impl.io();
-        self.batches_mutex.lockUncancelable(io);
-        defer self.batches_mutex.unlock(io);
-        const batch = (try self.ensureLoaded(group_id)) orelse return null;
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        const batch = (try self.ensureLoaded(shard, group_id)) orelse return null;
         return batch.*;
     }
 
@@ -215,9 +220,10 @@ pub const RaftApplyStore = struct {
             self.alloc.free(metadata.operations);
         }
         const io = self.io_impl.io();
-        self.batches_mutex.lockUncancelable(io);
-        defer self.batches_mutex.unlock(io);
-        const existing_batch = try self.ensureLoaded(group_id);
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        const existing_batch = try self.ensureLoaded(shard, group_id);
         if (existing_batch) |existing| {
             if (commit_index < existing.commit_index) return error.OutOfOrderDataApplyBatch;
             if (commit_index == existing.commit_index) {
@@ -227,7 +233,7 @@ pub const RaftApplyStore = struct {
         } else {
             // Reserve before the durable write so cache publication cannot fail
             // after storage has advanced.
-            try self.batches.ensureUnusedCapacity(self.alloc, 1);
+            try shard.batches.ensureUnusedCapacity(self.alloc, 1);
         }
         var writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
         defer shard_state_store.freeOwnedWrites(self.alloc, &writes);
@@ -267,11 +273,11 @@ pub const RaftApplyStore = struct {
             .last_entry_term = metadata.last_entry_term,
             .last_entry_index = metadata.last_entry_index,
         };
-        if (self.batches.getPtr(group_id)) |existing| {
+        if (shard.batches.getPtr(group_id)) |existing| {
             existing.* = summary;
             return;
         }
-        self.batches.putAssumeCapacity(group_id, summary);
+        shard.batches.putAssumeCapacity(group_id, summary);
     }
 
     fn verifyPersistedBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
@@ -290,8 +296,12 @@ pub const RaftApplyStore = struct {
         }
     }
 
-    fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?*OwnedBatch {
-        if (self.batches.getPtr(group_id)) |batch| return batch;
+    fn batchShard(self: *RaftApplyStore, group_id: u64) *BatchShard {
+        return &self.batch_shards[@as(usize, @intCast(group_id % batch_shard_count))];
+    }
+
+    fn ensureLoaded(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) !?*OwnedBatch {
+        if (shard.batches.getPtr(group_id)) |batch| return batch;
 
         var key_buf: [128]u8 = undefined;
         const key = try keyForGroup(&key_buf, group_id);
@@ -305,8 +315,8 @@ pub const RaftApplyStore = struct {
         const commit_index = std.mem.readInt(u64, encoded[0..8], .little);
         var summary = try summarizeEntries(self.alloc, encoded[8..]);
         summary.commit_index = commit_index;
-        try self.batches.put(self.alloc, group_id, summary);
-        return self.batches.getPtr(group_id);
+        try shard.batches.put(self.alloc, group_id, summary);
+        return shard.batches.getPtr(group_id);
     }
 
     fn summarizeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8) !AppliedDataBatch {
@@ -666,6 +676,56 @@ test "data raft apply store applies delete operations into group state" {
     try std.testing.expectEqual(@as(usize, 1), group_state.len);
     try std.testing.expectEqualStrings("z", group_state[0].key);
     try std.testing.expectEqualStrings("9", group_state[0].value);
+}
+
+test "data raft apply store orders independent groups through separate shards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-concurrent-groups", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.heap.page_allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expect(store.batchShard(1) != store.batchShard(2));
+    try std.testing.expect(store.batchShard(1) == store.batchShard(1 + batch_shard_count));
+
+    const Worker = struct {
+        store: *RaftApplyStore,
+        group_id: u64,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const entry = raft_state_machine.encodeCommittedEntries(std.heap.page_allocator, &.{.{
+                .term = 1,
+                .index = 1,
+                .entry_type = .normal,
+                .data = @constCast("put:k=1"),
+            }}) catch |err| {
+                self.result = err;
+                return;
+            };
+            defer std.heap.page_allocator.free(entry);
+            self.store.snapshotBuilder().applyBatch(.{
+                .group_id = self.group_id,
+                .commit_index = 1,
+                .entries_bytes = entry,
+            }) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+
+    var first = Worker{ .store = &store, .group_id = 1 };
+    var second = Worker{ .store = &store, .group_id = 2 };
+    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+    first_thread.join();
+    second_thread.join();
+    if (first.result) |err| return err;
+    if (second.result) |err| return err;
+    try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(1)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(2)).?.commit_index);
 }
 
 test "data raft apply store persists and enforces group range" {

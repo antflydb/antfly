@@ -526,14 +526,14 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
-from .restore_accepted_response_type_0 import RestoreAcceptedResponseType0
-from .restore_accepted_response_type_0_restore import RestoreAcceptedResponseType0Restore
-from .restore_accepted_response_type_1 import RestoreAcceptedResponseType1
-from .restore_accepted_response_type_1_durability import RestoreAcceptedResponseType1Durability
-from .restore_accepted_response_type_1_restore import RestoreAcceptedResponseType1Restore
 from .restore_committed_durable_response import RestoreCommittedDurableResponse
 from .restore_committed_durable_response_durability import RestoreCommittedDurableResponseDurability
 from .restore_committed_durable_response_restore import RestoreCommittedDurableResponseRestore
+from .restore_committed_pending_response import RestoreCommittedPendingResponse
+from .restore_committed_pending_response_durability import RestoreCommittedPendingResponseDurability
+from .restore_committed_pending_response_restore import RestoreCommittedPendingResponseRestore
+from .restore_triggered_response import RestoreTriggeredResponse
+from .restore_triggered_response_restore import RestoreTriggeredResponseRestore
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
@@ -1180,14 +1180,14 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
-    "RestoreAcceptedResponseType0",
-    "RestoreAcceptedResponseType0Restore",
-    "RestoreAcceptedResponseType1",
-    "RestoreAcceptedResponseType1Durability",
-    "RestoreAcceptedResponseType1Restore",
     "RestoreCommittedDurableResponse",
     "RestoreCommittedDurableResponseDurability",
     "RestoreCommittedDurableResponseRestore",
+    "RestoreCommittedPendingResponse",
+    "RestoreCommittedPendingResponseDurability",
+    "RestoreCommittedPendingResponseRestore",
+    "RestoreTriggeredResponse",
+    "RestoreTriggeredResponseRestore",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",

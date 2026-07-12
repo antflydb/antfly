@@ -38,23 +38,23 @@ func TestParseRestoreTableAcceptedResponses(t *testing.T) {
 				t.Fatal("accepted restore response was not decoded")
 			}
 			if test.committed {
-				accepted, err := response.JSON202.AsRestoreAcceptedResponse1()
+				accepted, err := response.JSON202.AsRestoreCommittedPendingResponse()
 				if err != nil {
 					t.Fatalf("decode committed accepted restore: %v", err)
 				}
-				if accepted.Restore != RestoreAcceptedResponse1RestoreCommitted {
+				if accepted.Restore != RestoreCommittedPendingResponseRestoreCommitted {
 					t.Fatalf("restore = %q, want committed", accepted.Restore)
 				}
-				if accepted.Durability != RestoreAcceptedResponse1DurabilityPending {
+				if accepted.Durability != RestoreCommittedPendingResponseDurabilityPending {
 					t.Fatalf("durability = %q, want pending", accepted.Durability)
 				}
 				return
 			}
-			accepted, err := response.JSON202.AsRestoreAcceptedResponse0()
+			accepted, err := response.JSON202.AsRestoreTriggeredResponse()
 			if err != nil {
 				t.Fatalf("decode triggered accepted restore: %v", err)
 			}
-			if accepted.Restore != RestoreAcceptedResponse0RestoreTriggered {
+			if accepted.Restore != RestoreTriggeredResponseRestoreTriggered {
 				t.Fatalf("restore = %q, want triggered", accepted.Restore)
 			}
 		})

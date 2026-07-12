@@ -4292,6 +4292,7 @@ pub const ProvisionedTableWriteSource = struct {
     dirty_write_all_tables: std.atomic.Value(bool) = .init(false),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
+    startup_catch_up_backoff_epoch: std.atomic.Value(u64) = .init(1),
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     dirty_write_table_hashes: [max_cached_write_tables]u64 = [_]u64{0} ** max_cached_write_tables,
     dirty_write_table_hashes_len: usize = 0,
@@ -6380,6 +6381,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_write_owner) |owner| {
             return try owner.catchUpTableGroupBestEffortWithMetadata(alloc, group_id, table_name, metadata);
         }
+        const backoff_epoch = self.startup_catch_up_backoff_epoch.load(.acquire);
         const now_ms = startupCatchUpMonotonicMs();
         if (self.startupCatchUpRetryAt(group_id, now_ms)) |retry_at_ms| {
             return .{
@@ -6413,7 +6415,7 @@ pub const ProvisionedTableWriteSource = struct {
         var preserve_startup_cache = false;
         errdefer {
             var failed_result = StartupCatchUpResult{ .had_debt = true };
-            self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), &failed_result);
+            self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &failed_result);
         }
         defer {
             lockAtomic(&self.local_db_mutex);
@@ -6551,7 +6553,7 @@ pub const ProvisionedTableWriteSource = struct {
         );
         var result = try catchUpManagedDb(self, alloc, group_id, table_name, db);
         try publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db);
-        self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), &result);
+        self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = result.had_debt and !result.cleared_debt and
             !result.terminal_degraded and !result.busy and !result.made_progress;
         return result;
@@ -6568,6 +6570,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn clearStartupCatchUpBackoffs(self: *ProvisionedTableWriteSource) void {
         lockAtomic(&self.startup_catch_up_backoff_mutex);
         defer self.startup_catch_up_backoff_mutex.unlock();
+        _ = self.startup_catch_up_backoff_epoch.fetchAdd(1, .release);
         self.startup_catch_up_backoffs.deinit(std.heap.page_allocator);
         self.startup_catch_up_backoffs = .empty;
     }
@@ -6576,10 +6579,12 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         group_id: u64,
         now_ms: u64,
+        expected_epoch: u64,
         result: *StartupCatchUpResult,
     ) void {
         lockAtomic(&self.startup_catch_up_backoff_mutex);
         defer self.startup_catch_up_backoff_mutex.unlock();
+        if (self.startup_catch_up_backoff_epoch.load(.acquire) != expected_epoch) return;
         if (result.busy) return;
         if (!result.had_debt or result.cleared_debt or result.made_progress) {
             _ = self.startup_catch_up_backoffs.remove(group_id);
@@ -26743,17 +26748,18 @@ test "managed startup catch-up open disables optional runtimes and workers" {
 test "managed startup catch-up quarantines repeated zero progress with bounded backoff" {
     var source = ProvisionedTableWriteSource.init("/tmp/unused-startup-catch-up-backoff", table_catalog.emptyCatalogSource());
     defer source.deinit();
+    const epoch = source.startup_catch_up_backoff_epoch.load(.acquire);
 
     var first = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
-    source.updateStartupCatchUpBackoff(7001, 1_000, &first);
+    source.updateStartupCatchUpBackoff(7001, 1_000, epoch, &first);
     try std.testing.expect(!first.quarantined);
 
     var second = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
-    source.updateStartupCatchUpBackoff(7001, 1_001, &second);
+    source.updateStartupCatchUpBackoff(7001, 1_001, epoch, &second);
     try std.testing.expect(!second.quarantined);
 
     var third = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
-    source.updateStartupCatchUpBackoff(7001, 1_002, &third);
+    source.updateStartupCatchUpBackoff(7001, 1_002, epoch, &third);
     try std.testing.expect(third.quarantined);
     try std.testing.expect(third.quarantine_retry_scheduled);
     try std.testing.expectEqual(@as(u64, 31_002), third.retry_at_ms);
@@ -26761,26 +26767,30 @@ test "managed startup catch-up quarantines repeated zero progress with bounded b
     try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7001, 31_002));
 
     var fourth = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
-    source.updateStartupCatchUpBackoff(7001, 31_002, &fourth);
+    source.updateStartupCatchUpBackoff(7001, 31_002, epoch, &fourth);
     try std.testing.expectEqual(@as(u64, 91_002), fourth.retry_at_ms);
 
     var busy = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .busy = true };
-    source.updateStartupCatchUpBackoff(7001, 40_000, &busy);
+    source.updateStartupCatchUpBackoff(7001, 40_000, epoch, &busy);
     try std.testing.expectEqual(@as(?u64, 91_002), source.startupCatchUpRetryAt(7001, 40_000));
 
     var progress = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .made_progress = true };
-    source.updateStartupCatchUpBackoff(7001, 40_001, &progress);
+    source.updateStartupCatchUpBackoff(7001, 40_001, epoch, &progress);
     try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7001, 40_001));
 
     var terminal_attempt: usize = 0;
     while (terminal_attempt < startup_catch_up_no_progress_threshold) : (terminal_attempt += 1) {
         var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .terminal_degraded = true };
-        source.updateStartupCatchUpBackoff(7002, 50_000 + terminal_attempt, &terminal);
+        source.updateStartupCatchUpBackoff(7002, 50_000 + terminal_attempt, epoch, &terminal);
         try std.testing.expectEqual(terminal_attempt + 1 == startup_catch_up_no_progress_threshold, terminal.quarantined);
     }
 
     source.clearStartupCatchUpBackoffs();
     try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7002, 50_003));
+
+    var stale = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7003, 60_000, epoch, &stale);
+    try std.testing.expectEqual(@as(usize, 0), source.startup_catch_up_backoffs.count());
 }
 
 test "managed startup catch-up uses provided indexes json without catalog fetch" {

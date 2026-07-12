@@ -2129,6 +2129,7 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_last_quarantined_groups: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_last_duration_ns: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_last_run_at_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_startup_catch_up_epoch: std.atomic.Value(u64) = .init(1),
     provisioned_startup_catch_up_not_before_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_dirty: std.atomic.Value(bool) = .init(true),
     runtime_status_last_refresh_at_ms: std.atomic.Value(u64) = .init(0),
@@ -2225,6 +2226,24 @@ pub const DataServer = struct {
     fn startupCatchUpNotBeforeMs(stats: ProvisionedStartupCatchUpStats, inspection_complete: bool) u64 {
         if (!inspection_complete or !stats.debt_remaining or stats.unparked_debt_remaining) return 0;
         return stats.earliest_retry_at_ms;
+    }
+
+    const StartupCatchUpCompletion = struct {
+        dirty: bool,
+        not_before_ms: u64,
+    };
+
+    fn startupCatchUpCompletion(
+        stats: ProvisionedStartupCatchUpStats,
+        inspection_complete: bool,
+        started_epoch: u64,
+        current_epoch: u64,
+    ) StartupCatchUpCompletion {
+        if (started_epoch != current_epoch) return .{ .dirty = true, .not_before_ms = 0 };
+        return .{
+            .dirty = if (inspection_complete) stats.debt_remaining else true,
+            .not_before_ms = startupCatchUpNotBeforeMs(stats, inspection_complete),
+        };
     }
 
     const StartupCatchUpGroupDisposition = enum {
@@ -5741,6 +5760,7 @@ pub const DataServer = struct {
     }
 
     fn runProvisionedStartupCatchUp(self: *DataServer) ProvisionedStartupCatchUpStats {
+        const started_epoch = self.provisioned_startup_catch_up_epoch.load(.acquire);
         const started_ns = platform_time.monotonicNs();
         const started_at_ms: u64 = @intCast(@divTrunc(started_ns, std.time.ns_per_ms));
         self.provisioned_startup_catch_up_last_run_at_ms.store(started_at_ms, .monotonic);
@@ -5754,14 +5774,18 @@ pub const DataServer = struct {
         defer self.provisioned_startup_catch_up_last_quarantined_groups.store(stats.quarantined_groups, .monotonic);
         defer self.provisioned_startup_catch_up_last_duration_ns.store(stats.duration_ns, .monotonic);
         defer stats.duration_ns = platform_time.monotonicNs() - started_ns;
-        defer self.provisioned_startup_catch_up_not_before_ms.store(
-            startupCatchUpNotBeforeMs(stats, inspection_complete),
-            .release,
-        );
-        defer self.provisioned_startup_catch_up_dirty.store(
-            if (inspection_complete) stats.debt_remaining else true,
-            .release,
-        );
+        defer {
+            const completion = startupCatchUpCompletion(
+                stats,
+                inspection_complete,
+                started_epoch,
+                self.provisioned_startup_catch_up_epoch.load(.acquire),
+            );
+            // Publish the deadline before dirty; the release store makes both
+            // fields visible as one scheduler decision.
+            self.provisioned_startup_catch_up_not_before_ms.store(completion.not_before_ms, .monotonic);
+            self.provisioned_startup_catch_up_dirty.store(completion.dirty, .release);
+        }
         defer _ = self.provisioned_startup_catch_up_completed.fetchAdd(1, .monotonic);
 
         const registration = self.store_registration orelse {
@@ -6110,6 +6134,7 @@ pub const DataServer = struct {
     }
 
     fn clearProvisionedStartupCatchUpBackoffs(self: *DataServer) void {
+        _ = self.provisioned_startup_catch_up_epoch.fetchAdd(1, .release);
         self.provisioned_startup_catch_up_not_before_ms.store(0, .release);
         const source = self.liveRuntimeWriteSource();
         source.clearStartupCatchUpBackoffs();
@@ -13326,6 +13351,17 @@ test "data runtime startup catch-up parks scheduler when only quarantined debt r
         .unparked_debt_remaining = true,
         .earliest_retry_at_ms = retry_at_ms,
     }, true));
+
+    const current = DataServer.startupCatchUpCompletion(.{
+        .debt_remaining = true,
+        .earliest_retry_at_ms = retry_at_ms,
+    }, true, 7, 7);
+    try std.testing.expect(current.dirty);
+    try std.testing.expectEqual(retry_at_ms, current.not_before_ms);
+
+    const stale = DataServer.startupCatchUpCompletion(.{}, true, 7, 8);
+    try std.testing.expect(stale.dirty);
+    try std.testing.expectEqual(@as(u64, 0), stale.not_before_ms);
 }
 
 test "data runtime provisioned startup catch-up clears replay debt for local groups" {

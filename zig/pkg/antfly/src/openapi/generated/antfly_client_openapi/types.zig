@@ -6887,32 +6887,45 @@ pub const ResourceType = enum {
 
 /// An accepted restore. `triggered` means asynchronous restoration has started. `committed` means the new generation is published but its durability barrier has not yet been confirmed.
 pub const RestoreAcceptedResponse = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
+    restore_triggered_response: RestoreTriggeredResponse,
+    restore_committed_pending_response: RestoreCommittedPendingResponse,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("restore") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "triggered")) {
+            return .{ .restore_triggered_response = try std.json.parseFromValueLeaky(RestoreTriggeredResponse, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "committed")) {
+            return .{ .restore_committed_pending_response = try std.json.parseFromValueLeaky(RestoreCommittedPendingResponse, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .restore_triggered_response => |v| try jw.write(v),
+            .restore_committed_pending_response => |v| try jw.write(v),
+        }
+    }
 };
 
 pub const RestoreCommittedDurableResponse = struct {
+    restore: []const u8,
+    durability: []const u8,
+};
+
+/// The restored generation is published but its durability barrier remains pending.
+pub const RestoreCommittedPendingResponse = struct {
     restore: []const u8,
     durability: []const u8,
 };
@@ -6924,6 +6937,11 @@ pub const RestoreRequest = struct {
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
+};
+
+/// Asynchronous restore work has been accepted and started.
+pub const RestoreTriggeredResponse = struct {
+    restore: []const u8,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.

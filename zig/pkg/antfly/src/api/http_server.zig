@@ -1479,7 +1479,7 @@ pub const ApiHttpServer = struct {
                     read_statuses_present = true;
                     errdefer owned.deinit(self.alloc);
                     read_needs_refresh = runtimeStatusesNeedWriterRefresh(owned.items);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned);
                 }
             }
         }
@@ -1500,7 +1500,7 @@ pub const ApiHttpServer = struct {
             if (write_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, if (read_needs_refresh) .replace_existing else .append);
+                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned);
             }
         }
         if (items.items.len == 0) {
@@ -1541,18 +1541,12 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
-    const LocalRuntimeAppendMode = enum {
-        append,
-        replace_existing,
-    };
-
     fn appendLocalRuntimeStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
         owned: *runtime_status.LocalTableRuntimeStatuses,
-        mode: LocalRuntimeAppendMode,
     ) !void {
         try items.ensureUnusedCapacity(self.alloc, owned.items.len);
         for (owned.items) |item| {
@@ -1561,27 +1555,11 @@ pub const ApiHttpServer = struct {
                 discard.deinit(self.alloc);
                 continue;
             }
-            if (localRuntimeStatusGroupIndex(items.items, item.group_id)) |existing_index| {
-                switch (mode) {
-                    .append => {},
-                    .replace_existing => {
-                        items.items[existing_index].deinit(self.alloc);
-                        items.items[existing_index] = item;
-                        continue;
-                    },
-                }
-            }
-            items.appendAssumeCapacity(item);
+            var candidate = item;
+            try upsertRuntimeStatus(self.alloc, items, &candidate);
         }
         if (owned.items.len > 0) self.alloc.free(owned.items);
         owned.items = &.{};
-    }
-
-    fn localRuntimeStatusGroupIndex(items: []const runtime_status.LocalTableRuntimeStatus, group_id: u64) ?usize {
-        for (items, 0..) |item, i| {
-            if (item.group_id == group_id) return i;
-        }
-        return null;
     }
 
     fn statusAdminSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
@@ -1605,26 +1583,20 @@ pub const ApiHttpServer = struct {
                 var status = try localRuntimeStatusFromRemoteReport(self.alloc, remote);
                 var consumed = false;
                 errdefer if (!consumed) status.deinit(self.alloc);
-                try upsertRemoteRuntimeStatus(self.alloc, items, &status);
+                try upsertRuntimeStatus(self.alloc, items, &status);
                 consumed = true;
             }
         }
     }
 
-    fn upsertRemoteRuntimeStatus(
+    fn upsertRuntimeStatus(
         alloc: std.mem.Allocator,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
         status: *runtime_status.LocalTableRuntimeStatus,
     ) !void {
         for (items.items) |*existing| {
             if (existing.group_id != status.group_id) continue;
-            if (existing.metadata.source != .remote_store) {
-                existing.deinit(alloc);
-                existing.* = status.*;
-                status.* = undefined;
-                return;
-            }
-            if (existing.metadata.updated_at_ns >= status.metadata.updated_at_ns) {
+            if (!runtimeStatusPreferred(status.*, existing.*)) {
                 status.deinit(alloc);
                 return;
             }
@@ -1635,6 +1607,53 @@ pub const ApiHttpServer = struct {
         }
         try items.append(alloc, status.*);
         status.* = undefined;
+    }
+
+    fn runtimeStatusPreferred(candidate: runtime_status.LocalTableRuntimeStatus, existing: runtime_status.LocalTableRuntimeStatus) bool {
+        const candidate_meta = candidate.metadata;
+        const existing_meta = existing.metadata;
+        if (candidate_meta.topology_generation != 0 and existing_meta.topology_generation != 0 and
+            candidate_meta.topology_generation != existing_meta.topology_generation)
+            return candidate_meta.topology_generation > existing_meta.topology_generation;
+        if (candidate_meta.lsm_root_generation != 0 and existing_meta.lsm_root_generation != 0 and
+            candidate_meta.lsm_root_generation != existing_meta.lsm_root_generation)
+            return candidate_meta.lsm_root_generation > existing_meta.lsm_root_generation;
+        const candidate_freshness = runtimeStatusFreshnessRank(candidate_meta.freshness);
+        const existing_freshness = runtimeStatusFreshnessRank(existing_meta.freshness);
+        if (candidate_freshness != existing_freshness) return candidate_freshness > existing_freshness;
+        const candidate_source = runtimeStatusSourceRank(candidate_meta.source);
+        const existing_source = runtimeStatusSourceRank(existing_meta.source);
+        if (candidate_source != existing_source) return candidate_source > existing_source;
+        const same_producer = candidate_meta.store_id != 0 and candidate_meta.store_id == existing_meta.store_id and
+            candidate_meta.node_id != 0 and candidate_meta.node_id == existing_meta.node_id;
+        if (same_producer and candidate_meta.status_generation != existing_meta.status_generation)
+            return candidate_meta.status_generation > existing_meta.status_generation;
+        return candidate_meta.updated_at_ns > existing_meta.updated_at_ns;
+    }
+
+    fn runtimeStatusFreshnessRank(freshness: runtime_status.RuntimeStatusFreshness) u8 {
+        return switch (freshness) {
+            .fresh => 80,
+            .catching_up => 70,
+            .opening => 60,
+            .stale => 50,
+            .remote_unknown => 40,
+            .unknown => 30,
+            .failed => 20,
+            .missing => 10,
+        };
+    }
+
+    fn runtimeStatusSourceRank(source: runtime_status.RuntimeStatusSource) u8 {
+        return switch (source) {
+            .live_writer_publish => 70,
+            .startup_catch_up => 60,
+            .background_refresh => 50,
+            .remote_store => 40,
+            .cached_snapshot => 30,
+            .synthetic_config => 20,
+            .unknown => 10,
+        };
     }
 
     fn localRuntimeStatusAllowedBySnapshot(
@@ -21879,6 +21898,62 @@ test "api http server create table with local writes waits for projected presenc
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
 }
 
+test "api runtime status upsert keeps one authoritative observation per group" {
+    const alloc = std.testing.allocator;
+    var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
+    defer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+
+    var remote = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .remote_store,
+            .freshness = .fresh,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .status_generation = 3,
+            .updated_at_ns = 100,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &remote);
+    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+
+    var stale_writer = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .topology_generation = 3,
+            .lsm_root_generation = 10,
+            .status_generation = 10,
+            .updated_at_ns = 200,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &stale_writer);
+    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.remote_store, items.items[0].metadata.source);
+
+    var current_writer = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .status_generation = 3,
+            .updated_at_ns = 50,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &current_writer);
+    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, items.items[0].metadata.source);
+}
+
 test "api index status uses read runtime status without consulting write source" {
     const alloc = std.testing.allocator;
 
@@ -22000,6 +22075,7 @@ test "api index status uses read runtime status without consulting write source"
             }
             items[0] = .{
                 .group_id = 10,
+                .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
                 .stats = .{
                     .doc_count = 9,
                     .index_count = 1,
@@ -22087,9 +22163,9 @@ test "api index status uses read runtime status without consulting write source"
     const shard_status = parsed.value.shard_status.?;
     const shard_10 = shard_status.@"10".?;
     try std.testing.expectEqual(@as(?u64, 9), shard_10.doc_count);
-    try std.testing.expectEqual(@as(?u64, 7), shard_10.replay_applied_sequence);
+    try std.testing.expectEqual(@as(?u64, 3), shard_10.replay_applied_sequence);
     try std.testing.expectEqual(@as(?u64, 7), shard_10.replay_target_sequence);
-    try std.testing.expectEqual(@as(?bool, false), shard_10.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?bool, true), shard_10.replay_catch_up_required);
 }
 
 test "api index status refreshes synthetic configured index status from write source" {
