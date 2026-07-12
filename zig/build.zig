@@ -2859,6 +2859,9 @@ pub fn build(b: *std.Build) void {
     const lib_unit_default_filters = [_][]const u8{
         ".test_0",
         "module compiles",
+        "cache budget atomically enforces its hard limit",
+        "query embedding cache owns results and coalesces misses",
+        "query embedding cache keys isolate security domains",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",

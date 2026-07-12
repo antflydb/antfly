@@ -690,6 +690,38 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntry(alloc, entry, text, entry.dimensions);
     }
 
+    /// Digest the effective dense-text embedding operation. Table and index
+    /// names are intentionally excluded so equivalent configurations share
+    /// results; the server-derived scope prevents cross-principal reuse.
+    pub fn queryCacheKey(
+        self: *const ManagedEmbedder,
+        index_name: []const u8,
+        security_domain: QueryCacheSecurityDomain,
+        security_scope: []const u8,
+        text: []const u8,
+    ) ![32]u8 {
+        const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.sparse or entry.multimodal) return error.QueryEmbeddingNotCacheable;
+
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hashQueryCacheField(&hasher, "antfly-query-embedding-v1");
+        hashQueryCacheField(&hasher, @tagName(security_domain));
+        hashQueryCacheField(&hasher, security_scope);
+        hashQueryCacheField(&hasher, @tagName(entry.provider));
+        hashQueryCacheField(&hasher, entry.base_url);
+        hashQueryCacheField(&hasher, entry.model);
+        hashQueryCacheField(&hasher, entry.region);
+        hashQueryCacheField(&hasher, entry.input_type);
+        hashQueryCacheField(&hasher, entry.truncate);
+        hashQueryCacheU64(&hasher, entry.dimensions);
+        hashQueryCacheU64(&hasher, managedEmbeddingApiKeyIdentityHash(entry));
+        hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generation() else 0);
+        hashQueryCacheField(&hasher, text);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+
     pub fn embedQueryWithTemplate(
         self: *const ManagedEmbedder,
         alloc: std.mem.Allocator,
@@ -784,6 +816,22 @@ pub const ManagedEmbedder = struct {
         owner_alloc.destroy(self);
     }
 };
+
+pub const QueryCacheSecurityDomain = enum {
+    anonymous,
+    principal,
+    internal,
+};
+
+fn hashQueryCacheField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    hashQueryCacheU64(hasher, value.len);
+    hasher.update(value);
+}
+
+fn hashQueryCacheU64(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    var encoded = std.mem.nativeToLittle(u64, @intCast(value));
+    hasher.update(std.mem.asBytes(&encoded));
+}
 
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) void {
     const pacer = entry.pacer orelse return;
@@ -2336,6 +2384,32 @@ test "managed embedder parses local antfly and antfly entries from indexes metad
     try std.testing.expectEqualStrings("", managed.entries[0].base_url);
     try std.testing.expectEqual(ProviderKind.antfly, managed.entries[1].provider);
     try std.testing.expectEqualStrings("", managed.entries[1].base_url);
+}
+
+pub fn testQueryEmbeddingCacheKeys() !void {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "first":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "second":{"type":"embeddings","field":"title","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\}
+    , local.provider());
+    defer managed.deinit();
+
+    const first = try managed.queryCacheKey("first", .principal, "alice", "exact input");
+    const equivalent = try managed.queryCacheKey("second", .principal, "alice", "exact input");
+    const other_principal = try managed.queryCacheKey("second", .principal, "bob", "exact input");
+    const anonymous = try managed.queryCacheKey("second", .anonymous, "alice", "exact input");
+    const changed_text = try managed.queryCacheKey("second", .principal, "alice", "exact input ");
+
+    try std.testing.expectEqual(first, equivalent);
+    try std.testing.expect(!std.mem.eql(u8, &first, &other_principal));
+    try std.testing.expect(!std.mem.eql(u8, &first, &anonymous));
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed_text));
+}
+
+test "query embedding cache keys share equivalent indexes and isolate security domains" {
+    try testQueryEmbeddingCacheKeys();
 }
 
 test "managed embedder rejects legacy antfly api path" {

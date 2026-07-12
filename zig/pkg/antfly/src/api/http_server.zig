@@ -78,6 +78,8 @@ const schema_openapi = @import("antfly_schema_openapi");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
+const cache_budget = @import("../common/cache_budget.zig");
 const connections_api = @import("connections.zig");
 const common_config = @import("../common/config.zig");
 const generating_runtime = @import("../generating/mod.zig");
@@ -164,13 +166,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
     ) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var semantic_resolver = SemanticStatusResolver{
-            .source = self.server.source,
-            .antfly_provider = self.server.antfly_provider,
-            .remote_content = self.server.cfg.remote_content,
-            .inference_api_url = self.server.configuredInferenceAPIURL(),
-            .inference_api_key = self.server.cfg.inference_api_key,
-        };
+        var semantic_resolver = self.server.semanticStatusResolver(.internal, "query-builder");
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -200,13 +196,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
-        var semantic_resolver = SemanticStatusResolver{
-            .source = self.server.source,
-            .antfly_provider = self.server.antfly_provider,
-            .remote_content = self.server.cfg.remote_content,
-            .inference_api_url = self.server.configuredInferenceAPIURL(),
-            .inference_api_key = self.server.cfg.inference_api_key,
-        };
+        var semantic_resolver = self.server.semanticStatusResolver(.internal, "query-builder");
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -301,6 +291,8 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
+    query_embedding_cache: query_embedding_cache.Config = .{},
+    inference_cache_budget: ?*cache_budget.CacheBudget = null,
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -316,6 +308,10 @@ pub const SemanticStatusResolver = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
+    query_embedding_budget: ?*cache_budget.CacheBudget = null,
+    query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
+    query_embedding_security_scope: []const u8 = "internal",
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -344,6 +340,10 @@ pub const SemanticStatusResolver = struct {
             .remote_content = self.remote_content,
             .inference_api_url = self.inference_api_url,
             .inference_api_key = self.inference_api_key,
+            .query_embedding_cache = self.query_embedding_cache,
+            .query_embedding_budget = self.query_embedding_budget,
+            .query_embedding_security_domain = self.query_embedding_security_domain,
+            .query_embedding_security_scope = self.query_embedding_security_scope,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
 };
@@ -1071,11 +1071,20 @@ pub const ApiHttpServer = struct {
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
+    local_inference_cache_budget: cache_budget.CacheBudget,
+    shared_inference_cache_budget: ?*cache_budget.CacheBudget,
+    query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
 
     pub const RequestStats = struct {
         request_count: u64 = 0,
         first_request_started_at_ns: u64 = 0,
         first_request_elapsed_ms: u64 = 0,
+        query_embedding_cache: query_embedding_cache.Stats = .{},
+        inference_cache_budget: cache_budget.CacheBudget.Stats = .{
+            .max_bytes = 0,
+            .used_bytes = 0,
+            .rejected_reservations = 0,
+        },
     };
 
     pub fn init(
@@ -1117,12 +1126,15 @@ pub const ApiHttpServer = struct {
             }),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(alloc),
+            .local_inference_cache_budget = cache_budget.CacheBudget.init(cfg.query_embedding_cache.max_bytes),
+            .shared_inference_cache_budget = cfg.inference_cache_budget,
+            .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, cfg.query_embedding_cache),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
         };
     }
 
-    pub fn requestStats(self: *const ApiHttpServer) RequestStats {
+    pub fn requestStats(self: *ApiHttpServer) RequestStats {
         const request_count = self.request_count.load(.monotonic);
         const first_request_started_at_ns = self.first_request_started_at_ns.load(.monotonic);
         return .{
@@ -1132,6 +1144,8 @@ pub const ApiHttpServer = struct {
                 0
             else
                 @intCast(@divTrunc(first_request_started_at_ns - self.created_at_ns, std.time.ns_per_ms)),
+            .query_embedding_cache = self.query_embedding_cache.stats(),
+            .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
     }
 
@@ -1243,7 +1257,34 @@ pub const ApiHttpServer = struct {
             self.alloc.destroy(registry);
         }
         self.connections_cache.deinit();
+        self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.* = undefined;
+    }
+
+    pub fn queryEmbeddingCacheStats(self: *ApiHttpServer) query_embedding_cache.Stats {
+        return self.query_embedding_cache.stats();
+    }
+
+    fn inferenceCacheBudget(self: *ApiHttpServer) *cache_budget.CacheBudget {
+        return self.shared_inference_cache_budget orelse &self.local_inference_cache_budget;
+    }
+
+    pub fn semanticStatusResolver(
+        self: *ApiHttpServer,
+        security_domain: managed_embedder.QueryCacheSecurityDomain,
+        security_scope: []const u8,
+    ) SemanticStatusResolver {
+        return .{
+            .source = self.source,
+            .antfly_provider = self.antfly_provider,
+            .remote_content = self.cfg.remote_content,
+            .inference_api_url = self.configuredInferenceAPIURL(),
+            .inference_api_key = self.cfg.inference_api_key,
+            .query_embedding_cache = &self.query_embedding_cache,
+            .query_embedding_budget = self.inferenceCacheBudget(),
+            .query_embedding_security_domain = security_domain,
+            .query_embedding_security_scope = security_scope,
+        };
     }
 
     /// Build the GET /connections response body. Shared by the legacy
@@ -1325,7 +1366,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null);
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, .{ .domain = .internal, .value = "join" });
     }
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror![]u8 {
@@ -2434,6 +2475,16 @@ pub const ApiHttpServer = struct {
     fn authenticatedIdentityIsAdmin(authenticated_identity: ?AuthenticatedIdentity) bool {
         const identity = authenticated_identity orelse return false;
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
+    }
+
+    const QueryEmbeddingSecurityScope = struct {
+        domain: managed_embedder.QueryCacheSecurityDomain,
+        value: []const u8,
+    };
+
+    fn queryEmbeddingSecurityScope(authenticated_identity: ?AuthenticatedIdentity) QueryEmbeddingSecurityScope {
+        if (authenticated_identity) |identity| return .{ .domain = .principal, .value = identity.username };
+        return .{ .domain = .anonymous, .value = "" };
     }
 
     fn ardOpenApiSpec(name: []const u8) ?ArdOpenApiSpec {
@@ -3665,13 +3716,7 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = SemanticStatusResolver{
-                    .source = runner.server.source,
-                    .antfly_provider = runner.server.antfly_provider,
-                    .remote_content = runner.server.cfg.remote_content,
-                    .inference_api_url = runner.server.configuredInferenceAPIURL(),
-                    .inference_api_key = runner.server.cfg.inference_api_key,
-                };
+                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "a2a-retrieval");
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -3848,13 +3893,7 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = SemanticStatusResolver{
-                    .source = runner.server.source,
-                    .antfly_provider = runner.server.antfly_provider,
-                    .remote_content = runner.server.cfg.remote_content,
-                    .inference_api_url = runner.server.configuredInferenceAPIURL(),
-                    .inference_api_key = runner.server.cfg.inference_api_key,
-                };
+                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "retrieval");
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -6016,6 +6055,7 @@ pub const ApiHttpServer = struct {
                 body,
                 row_filter_json,
                 request_deadline_ns,
+                queryEmbeddingSecurityScope(authenticated_identity),
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
@@ -6079,6 +6119,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             request_deadline_ns,
+            queryEmbeddingSecurityScope(authenticated_identity),
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
@@ -6429,14 +6470,9 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         request_deadline_ns: ?u64,
+        query_embedding_security_scope: QueryEmbeddingSecurityScope,
     ) !query_api.QueryResponse {
-        var semantic_resolver = SemanticStatusResolver{
-            .source = self.source,
-            .antfly_provider = self.antfly_provider,
-            .remote_content = self.cfg.remote_content,
-            .inference_api_url = self.configuredInferenceAPIURL(),
-            .inference_api_key = self.cfg.inference_api_key,
-        };
+        var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
             std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
             return error.InvalidQueryRequest;
@@ -6523,13 +6559,7 @@ pub const ApiHttpServer = struct {
     ) !query_api.OwnedQueryRequest {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
-        var semantic_resolver = SemanticStatusResolver{
-            .source = self.source,
-            .antfly_provider = self.antfly_provider,
-            .remote_content = self.cfg.remote_content,
-            .inference_api_url = self.configuredInferenceAPIURL(),
-            .inference_api_key = self.cfg.inference_api_key,
-        };
+        var semantic_resolver = self.semanticStatusResolver(.internal, "owned-query-plan");
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
@@ -11657,6 +11687,7 @@ test "api http plain public query preserves outer absolute request deadline" {
         body,
         null,
         outer_deadline_ns,
+        .{ .domain = .internal, .value = "test" },
     );
     defer response.deinit(alloc);
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);

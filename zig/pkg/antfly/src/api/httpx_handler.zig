@@ -1353,13 +1353,7 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var semantic_resolver = http_server_mod.SemanticStatusResolver{
-                    .source = runner.server.source,
-                    .antfly_provider = runner.server.antfly_provider,
-                    .remote_content = runner.server.cfg.remote_content,
-                    .inference_api_url = runner.server.configuredInferenceAPIURL(),
-                    .inference_api_key = runner.server.cfg.inference_api_key,
-                };
+                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "httpx-retrieval");
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,

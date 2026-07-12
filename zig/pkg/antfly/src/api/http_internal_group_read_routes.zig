@@ -15,6 +15,8 @@
 const std = @import("std");
 const metadata_api = @import("../metadata/api.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
+const cache_budget = @import("../common/cache_budget.zig");
 const scraping = @import("antfly_scraping");
 const db_mod = @import("../storage/db/mod.zig");
 const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
@@ -90,6 +92,10 @@ pub const QueryPlanningContext = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
+    query_embedding_budget: ?*cache_budget.CacheBudget = null,
+    query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
+    query_embedding_security_scope: []const u8 = "internal",
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);
@@ -99,6 +105,40 @@ pub const QueryPlanningContext = struct {
         self.free_admin_snapshot(self.ptr, snapshot);
     }
 };
+
+const DenseQueryComputeContext = struct {
+    runtime: *const managed_embedder.ManagedEmbedder,
+    index_name: []const u8,
+    text: []const u8,
+
+    fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return embedInteractive(self.runtime, alloc, self.index_name, self.text);
+    }
+};
+
+fn embedInteractive(
+    runtime: *const managed_embedder.ManagedEmbedder,
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    text: []const u8,
+) ![]f32 {
+    _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
+    defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
+    return try runtime.embedQuery(alloc, index_name, text);
+}
+
+fn embedTemplateInteractive(
+    runtime: *const managed_embedder.ManagedEmbedder,
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    text: []const u8,
+    embedding_template: []const u8,
+) ![]f32 {
+    _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
+    defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
+    return try runtime.embedQueryWithTemplate(alloc, index_name, text, embedding_template);
+}
 
 pub fn planSemanticQuery(
     planning: QueryPlanningContext,
@@ -121,17 +161,25 @@ pub fn planSemanticQuery(
     });
     defer runtime.deinit();
 
-    // Signal background enrichment to yield the embedder while this
-    // query-time embed runs (see enrichment_types.interactive_embed_inflight).
-    // Scoped to the embed call only: BM25-only queries never set it, so
-    // steady full-text traffic does not stall enrichment throughput.
-    _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
-    defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
     return .{
         .vector = if (embedding_template) |value|
-            try runtime.embedQueryWithTemplate(alloc, index_name, semantic_search, value)
-        else
-            try runtime.embedQuery(alloc, index_name, semantic_search),
+            try embedTemplateInteractive(&runtime, alloc, index_name, semantic_search, value)
+        else blk: {
+            const cache = planning.query_embedding_cache orelse
+                break :blk try embedInteractive(&runtime, alloc, index_name, semantic_search);
+            const budget = planning.query_embedding_budget orelse
+                break :blk try embedInteractive(&runtime, alloc, index_name, semantic_search);
+            const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
+                error.QueryEmbeddingNotCacheable => break :blk try embedInteractive(&runtime, alloc, index_name, semantic_search),
+                else => return err,
+            };
+            var compute_context = DenseQueryComputeContext{
+                .runtime = &runtime,
+                .index_name = index_name,
+                .text = semantic_search,
+            };
+            break :blk try cache.getOrCompute(budget, alloc, key, &compute_context, DenseQueryComputeContext.run);
+        },
         .k = limit,
     };
 }
