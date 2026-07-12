@@ -14,11 +14,14 @@
 
 const std = @import("std");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_table_manager = @import("../metadata/table_manager.zig");
+const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const cache_budget = @import("../common/cache_budget.zig");
 const scraping = @import("antfly_scraping");
 const db_mod = @import("../storage/db/mod.zig");
+const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const distributed_graph = @import("distributed_graph.zig");
@@ -28,6 +31,7 @@ const query_contract = @import("query_contract.zig");
 const table_reads = @import("table_reads.zig");
 const tables_api = @import("tables.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const raft_reconciler = @import("../raft/reconciler.zig");
 const routes = @import("http_routes.zig");
 
 const QueryPreflightRequestWire = struct {
@@ -202,6 +206,89 @@ pub fn resolveDenseQuery(
         embedding_template,
         limit,
     );
+}
+
+test "semantic query planning reuses equivalent embeddings across tables and isolates principals" {
+    const alloc = std.testing.allocator;
+    const FakeCatalog = struct {
+        const indexes_json =
+            \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test-embedder"}}}
+        ;
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 1, .name = "docs_a", .schema_json = "{}", .indexes_json = indexes_json, .placement_role = "data" },
+                    .{ .table_id = 2, .name = "docs_b", .schema_json = "{}", .indexes_json = indexes_json, .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const FakeProvider = struct {
+        calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+            };
+        }
+
+        fn embedDense(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vectors = try inner_alloc.alloc([]f32, texts.len);
+            errdefer inner_alloc.free(vectors);
+            var initialized: usize = 0;
+            errdefer for (vectors[0..initialized]) |vector| inner_alloc.free(vector);
+            for (vectors) |*vector| {
+                vector.* = try inner_alloc.dupe(f32, &.{ 1, 2, 3 });
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn embedSparse(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try inner_alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, .{});
+    defer cache.deinit(&budget);
+    var provider = FakeProvider{};
+    const base: QueryPlanningContext = .{
+        .ptr = undefined,
+        .admin_snapshot = FakeCatalog.adminSnapshot,
+        .free_admin_snapshot = FakeCatalog.freeAdminSnapshot,
+        .antfly_provider = provider.provider(),
+        .query_embedding_cache = &cache,
+        .query_embedding_budget = &budget,
+        .query_embedding_security_domain = .principal,
+        .query_embedding_security_scope = "alice",
+    };
+
+    const first = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", null, 5);
+    defer alloc.free(first.vector);
+    const equivalent = try planSemanticQuery(base, alloc, "docs_b", "semantic_idx", "same query", null, 5);
+    defer alloc.free(equivalent.vector);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqualSlices(f32, first.vector, equivalent.vector);
+
+    var other_principal = base;
+    other_principal.query_embedding_security_scope = "bob";
+    const isolated = try planSemanticQuery(other_principal, alloc, "docs_b", "semantic_idx", "same query", null, 5);
+    defer alloc.free(isolated.vector);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
 }
 
 const SemanticStatusResolver = struct {

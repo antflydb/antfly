@@ -714,7 +714,7 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
-        hashQueryCacheU64(&hasher, managedEmbeddingApiKeyIdentityHash(entry));
+        hashQueryCacheSecretIdentity(&hasher, entry.api_key);
         hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generation() else 0);
         hashQueryCacheField(&hasher, text);
         var digest: [32]u8 = undefined;
@@ -831,6 +831,27 @@ fn hashQueryCacheField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) 
 fn hashQueryCacheU64(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void {
     var encoded = std.mem.nativeToLittle(u64, @intCast(value));
     hasher.update(std.mem.asBytes(&encoded));
+}
+
+fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secret: ?common_secrets.SecretValue) void {
+    const secret = maybe_secret orelse {
+        hashQueryCacheField(hasher, "none");
+        return;
+    };
+    switch (secret) {
+        .literal => |value| {
+            hashQueryCacheField(hasher, "literal");
+            hashQueryCacheField(hasher, value);
+        },
+        .secret_ref => |value| {
+            hashQueryCacheField(hasher, "secret_ref");
+            hashQueryCacheField(hasher, value);
+        },
+        .env_var => |value| {
+            hashQueryCacheField(hasher, "env_var");
+            hashQueryCacheField(hasher, value);
+        },
+    }
 }
 
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) void {
@@ -2402,10 +2423,22 @@ pub fn testQueryEmbeddingCacheKeys() !void {
     const anonymous = try managed.queryCacheKey("second", .anonymous, "alice", "exact input");
     const changed_text = try managed.queryCacheKey("second", .principal, "alice", "exact input ");
 
+    var first_credentials = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"credential-a"}}}
+    );
+    defer first_credentials.deinit();
+    var second_credentials = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"credential-b"}}}
+    );
+    defer second_credentials.deinit();
+    const credential_a = try first_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
+    const credential_b = try second_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
+
     try std.testing.expectEqual(first, equivalent);
     try std.testing.expect(!std.mem.eql(u8, &first, &other_principal));
     try std.testing.expect(!std.mem.eql(u8, &first, &anonymous));
     try std.testing.expect(!std.mem.eql(u8, &first, &changed_text));
+    try std.testing.expect(!std.mem.eql(u8, &credential_a, &credential_b));
 }
 
 test "query embedding cache keys share equivalent indexes and isolate security domains" {

@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const common_openapi = @import("antfly_common_openapi");
+const inference_config_openapi = @import("antfly_inference_config_openapi");
 const logging_openapi = @import("antfly_logging_openapi");
 const middleware_openapi = @import("antfly_middleware_openapi");
 const scraping = @import("antfly_scraping");
@@ -97,6 +98,12 @@ pub const Config = struct {
     };
 
     pub const InferenceConfig = struct {
+        pub const QueryEmbeddingCacheConfig = struct {
+            enabled: bool = true,
+            max_bytes_mb: usize = 64,
+            ttl_ms: u64 = 300_000,
+        };
+
         pub const WarmModelConfig = struct {
             kind: []u8,
             name: []u8,
@@ -121,6 +128,7 @@ pub const Config = struct {
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
+        query_embedding_cache: QueryEmbeddingCacheConfig = .{},
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -380,6 +388,10 @@ pub const Config = struct {
         errdefer text_to_speech.deinit();
 
         const swarm_mode = try optionalBoolField(root, "swarm_mode") orelse false;
+        const query_embedding_cache = if (validated.value.inference) |inference|
+            try queryEmbeddingCacheFromOpenApi(inference.query_embedding_cache)
+        else
+            Config.InferenceConfig.QueryEmbeddingCacheConfig{};
         return .{
             .registry = registry,
             .transcribers = transcribers,
@@ -412,6 +424,7 @@ pub const Config = struct {
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
+                .query_embedding_cache = query_embedding_cache,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -999,6 +1012,20 @@ fn optionalStringArrayField(alloc: std.mem.Allocator, object: std.json.ObjectMap
     return out;
 }
 
+fn queryEmbeddingCacheFromOpenApi(
+    value: ?inference_config_openapi.QueryEmbeddingCacheConfig,
+) !Config.InferenceConfig.QueryEmbeddingCacheConfig {
+    const config = value orelse return .{};
+    const max_bytes_mb = std.math.cast(usize, config.max_bytes_mb orelse 64) orelse return error.InvalidConfig;
+    const ttl_ms = std.math.cast(u64, config.ttl_ms orelse 300_000) orelse return error.InvalidConfig;
+    if (max_bytes_mb > 1_048_576 or ttl_ms > 86_400_000) return error.InvalidConfig;
+    return .{
+        .enabled = config.enabled orelse true,
+        .max_bytes_mb = max_bytes_mb,
+        .ttl_ms = ttl_ms,
+    };
+}
+
 fn parseInferencePreloadModels(
     alloc: std.mem.Allocator,
     raw_inference: ?std.json.Value,
@@ -1209,6 +1236,11 @@ test "common config extracts antfly settings" {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
+        \\    "query_embedding_cache": {
+        \\      "enabled": false,
+        \\      "max_bytes_mb": 128,
+        \\      "ttl_ms": 45000
+        \\    },
         \\    "preload": [
         \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\    ],
@@ -1234,6 +1266,9 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expect(!cfg.inference.query_embedding_cache.enabled);
+    try std.testing.expectEqual(@as(usize, 128), cfg.inference.query_embedding_cache.max_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 45_000), cfg.inference.query_embedding_cache.ttl_ms);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
@@ -1272,6 +1307,26 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
     try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
+}
+
+test "common config rejects out of range query embedding cache policy" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8090",
+        \\    "query_embedding_cache": { "max_bytes_mb": -1 }
+        \\  }
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8090",
+        \\    "query_embedding_cache": { "ttl_ms": 86400001 }
+        \\  }
+        \\}
+    ));
 }
 
 test "common config defaults shard scalar fields" {

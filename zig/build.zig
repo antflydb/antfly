@@ -2862,6 +2862,8 @@ pub fn build(b: *std.Build) void {
         "cache budget atomically enforces its hard limit",
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
+        "api http server applies node query embedding cache policy",
+        "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",

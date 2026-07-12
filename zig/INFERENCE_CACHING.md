@@ -75,8 +75,9 @@ receives an owned copy, so request cleanup cannot invalidate another request's
 result and callers cannot mutate cache contents.
 
 Lookup and flight registration occur under one mutex. A miss installs exactly
-one producer before releasing the mutex. Waiters sleep on a condition variable
-and are always broadcast on success or error. Errors are delivered to current
+one producer before releasing the mutex. Waiters sleep on that flight's
+condition variable and are always broadcast on success or error. Completion of
+one key never wakes waiters for unrelated keys. Errors are delivered to current
 waiters but are never cached. Producer computation runs without the cache lock.
 
 Shutdown requires request handling to stop before `ApiHttpServer.deinit`, which
@@ -92,6 +93,20 @@ and recency. The default policy is:
 - 64 MiB logical and shared hard limit;
 - no error caching;
 - reject a result larger than the cache limit.
+
+Operators can override the policy in the normal inference configuration:
+
+```yaml
+inference:
+  api_url: http://127.0.0.1:8082
+  query_embedding_cache:
+    enabled: true
+    max_bytes_mb: 64
+    ttl_ms: 300000
+```
+
+`max_bytes_mb: 0` disables result retention while preserving singleflight.
+`enabled: false` bypasses both caching and singleflight.
 
 Each entry charge includes the vector, entry object, key/value storage, and a
 conservative allowance for hash-table occupancy. The cache reserves its charge
@@ -109,8 +124,11 @@ or reject admission; resource-pressure observation alone is not enforcement.
 
 The data-server metrics endpoint exports query-cache hits, misses, coalesced
 waiters, producers, evictions, expirations, rejected admissions, entries, live
-bytes, and aggregate budget use/rejections. These distinguish useful reuse from
-high churn, insufficient capacity, or ineffective request affinity.
+bytes, aggregate producer compute time, and aggregate budget use/rejections.
+Metrics snapshots also expire a bounded batch from an idle LRU tail, so a quiet
+node converges without allowing one scrape to monopolize the cache lock. These
+signals distinguish useful reuse from high churn, insufficient capacity, an
+inherently slow provider, or ineffective request affinity.
 
 Do not include cache keys, query text, principal names, credentials, or vector
 contents in logs or metric labels.

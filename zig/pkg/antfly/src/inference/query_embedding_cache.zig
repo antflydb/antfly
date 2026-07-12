@@ -23,6 +23,7 @@ pub const Stats = struct {
     misses: u64 = 0,
     coalesced_waiters: u64 = 0,
     producer_computations: u64 = 0,
+    producer_compute_ns_total: u64 = 0,
     evictions: u64 = 0,
     expirations: u64 = 0,
     rejected_admissions: u64 = 0,
@@ -47,16 +48,19 @@ const Flight = struct {
     done: bool = false,
     result: ?[]f32 = null,
     err: ?anyerror = null,
+    ready: std.Io.Condition = .init,
 };
 
 /// Thread-safe byte-bounded LRU with per-key in-flight request coalescing.
 /// Returned vectors are always owned by the caller.
 pub const QueryEmbeddingCache = struct {
+    const admission_expire_batch: usize = 64;
+    const metrics_expire_batch: usize = 256;
+
     alloc: std.mem.Allocator,
     config: Config,
     threaded: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
-    ready: std.Io.Condition = .init,
     entries: std.AutoHashMapUnmanaged(Key, *Entry) = .empty,
     flights: std.AutoHashMapUnmanaged(Key, *Flight) = .empty,
     newest: ?*Entry = null,
@@ -92,7 +96,7 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
-        if (!self.config.enabled or self.config.max_bytes == 0) return compute(context, caller_alloc);
+        if (!self.config.enabled) return compute(context, caller_alloc);
 
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
@@ -114,7 +118,7 @@ pub const QueryEmbeddingCache = struct {
         if (self.flights.get(key)) |flight| {
             flight.refs += 1;
             self.counters.coalesced_waiters += 1;
-            while (!flight.done) self.ready.waitUncancelable(io, &self.mutex);
+            while (!flight.done) flight.ready.waitUncancelable(io, &self.mutex);
             const result = self.copyFlightResultLocked(caller_alloc, flight) catch |err| {
                 self.releaseFlightLocked(key, flight);
                 self.mutex.unlock(io);
@@ -141,23 +145,26 @@ pub const QueryEmbeddingCache = struct {
         self.counters.producer_computations += 1;
         self.mutex.unlock(io);
 
+        const compute_started_ns = platform_time.monotonicNs();
         const computed = compute(context, self.alloc) catch |err| {
             self.mutex.lockUncancelable(io);
+            self.recordProducerDurationLocked(compute_started_ns);
             flight.err = err;
             flight.done = true;
-            self.ready.broadcast(io);
+            flight.ready.broadcast(io);
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
             return err;
         };
 
         self.mutex.lockUncancelable(io);
+        self.recordProducerDurationLocked(compute_started_ns);
         flight.result = computed;
         flight.done = true;
         self.admitLocked(key, computed, budget) catch {
             self.counters.rejected_admissions += 1;
         };
-        self.ready.broadcast(io);
+        flight.ready.broadcast(io);
         const result = self.copyFlightResultLocked(caller_alloc, flight) catch |err| {
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
@@ -168,15 +175,21 @@ pub const QueryEmbeddingCache = struct {
         return result;
     }
 
-    pub fn stats(self: *QueryEmbeddingCache) Stats {
+    pub fn stats(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) Stats {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.expireOldestLocked(platform_time.monotonicNs(), budget, metrics_expire_batch);
         var result = self.counters;
         result.entries = self.entries.count();
         result.live_bytes = self.live_bytes;
         result.inflight = self.flights.count();
         return result;
+    }
+
+    fn recordProducerDurationLocked(self: *QueryEmbeddingCache, started_ns: u64) void {
+        const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+        self.counters.producer_compute_ns_total +|= elapsed_ns;
     }
 
     fn copyFlightResultLocked(self: *QueryEmbeddingCache, alloc: std.mem.Allocator, flight: *Flight) ![]f32 {
@@ -201,7 +214,7 @@ pub const QueryEmbeddingCache = struct {
             self.counters.rejected_admissions += 1;
             return;
         }
-        self.expireOldestLocked(platform_time.monotonicNs(), budget);
+        self.expireOldestLocked(platform_time.monotonicNs(), budget, admission_expire_batch);
         while (self.live_bytes > self.config.max_bytes - charge) {
             const victim = self.oldest orelse break;
             self.removeEntryLocked(victim, budget, false);
@@ -258,8 +271,10 @@ pub const QueryEmbeddingCache = struct {
         entry.older = null;
     }
 
-    fn expireOldestLocked(self: *QueryEmbeddingCache, now_ns: u64, budget: *cache_budget.CacheBudget) void {
-        while (self.oldest) |entry| {
+    fn expireOldestLocked(self: *QueryEmbeddingCache, now_ns: u64, budget: *cache_budget.CacheBudget, max_entries: usize) void {
+        var expired: usize = 0;
+        while (expired < max_entries) : (expired += 1) {
+            const entry = self.oldest orelse return;
             if (now_ns < entry.expires_at_ns) return;
             self.removeEntryLocked(entry, budget, true);
         }
@@ -305,7 +320,7 @@ pub fn testOwnedValuesAndHits() !void {
 
     try std.testing.expectEqual(@as(f32, 4), second[0]);
     try std.testing.expectEqual(@as(u64, 1), compute.calls.load(.monotonic));
-    const current = cache.stats();
+    const current = cache.stats(&budget);
     try std.testing.expectEqual(@as(u64, 1), current.hits);
     try std.testing.expectEqual(@as(u64, 1), current.misses);
 }
@@ -342,8 +357,8 @@ pub fn testConcurrentCoalescing() !void {
         }
     };
 
-    var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(std.heap.page_allocator, .{});
+    var budget = cache_budget.CacheBudget.init(0);
+    var cache = QueryEmbeddingCache.init(std.heap.page_allocator, .{ .max_bytes = 0 });
     defer cache.deinit(&budget);
     var compute_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer compute_io.deinit();
@@ -365,7 +380,11 @@ pub fn testConcurrentCoalescing() !void {
     try std.testing.expectEqual(@as(u64, 1), compute.calls.load(.monotonic));
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, first.result.?);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, second.result.?);
-    try std.testing.expectEqual(@as(u64, 1), cache.stats().coalesced_waiters);
+    const current = cache.stats(&budget);
+    try std.testing.expectEqual(@as(u64, 1), current.coalesced_waiters);
+    try std.testing.expect(current.producer_compute_ns_total > 0);
+    try std.testing.expectEqual(@as(usize, 0), current.entries);
+    try std.testing.expectEqual(@as(u64, 1), current.rejected_admissions);
 }
 
 test "query embedding cache coalesces concurrent misses" {
@@ -390,7 +409,7 @@ pub fn testByteBudgetEviction() !void {
     const first_again = try cache.getOrCompute(&budget, std.testing.allocator, first_key, &compute, TestCompute.run);
     std.testing.allocator.free(first_again);
 
-    const current = cache.stats();
+    const current = cache.stats(&budget);
     try std.testing.expectEqual(@as(usize, 1), current.entries);
     try std.testing.expectEqual(one_entry_bytes, current.live_bytes);
     try std.testing.expectEqual(@as(u64, 2), current.evictions);
@@ -400,4 +419,55 @@ pub fn testByteBudgetEviction() !void {
 
 test "query embedding cache enforces byte budget with LRU eviction" {
     try testByteBudgetEviction();
+}
+
+pub fn testStatsExpireIdleEntries() !void {
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, .{ .ttl_ns = 0 });
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 3 };
+    const key: Key = [_]u8{3} ** 32;
+
+    const result = try cache.getOrCompute(&budget, std.testing.allocator, key, &compute, TestCompute.run);
+    std.testing.allocator.free(result);
+    const current = cache.stats(&budget);
+    try std.testing.expectEqual(@as(usize, 0), current.entries);
+    try std.testing.expectEqual(@as(usize, 0), current.live_bytes);
+    try std.testing.expectEqual(@as(u64, 1), current.expirations);
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().used_bytes);
+}
+
+test "query embedding cache stats expire idle entries" {
+    try testStatsExpireIdleEntries();
+}
+
+pub fn testStatsBoundExpirationWork() !void {
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, .{});
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 3 };
+
+    for (0..300) |i| {
+        var key: Key = [_]u8{0} ** 32;
+        key[0] = @intCast(i & 0xff);
+        key[1] = @intCast(i >> 8);
+        const result = try cache.getOrCompute(&budget, std.testing.allocator, key, &compute, TestCompute.run);
+        std.testing.allocator.free(result);
+    }
+    var cursor = cache.oldest;
+    while (cursor) |entry| {
+        entry.expires_at_ns = 0;
+        cursor = entry.newer;
+    }
+
+    const first = cache.stats(&budget);
+    try std.testing.expectEqual(@as(usize, 44), first.entries);
+    try std.testing.expectEqual(@as(u64, 256), first.expirations);
+    const second = cache.stats(&budget);
+    try std.testing.expectEqual(@as(usize, 0), second.entries);
+    try std.testing.expectEqual(@as(u64, 300), second.expirations);
+}
+
+test "query embedding cache bounds metrics expiration work" {
+    try testStatsBoundExpirationWork();
 }

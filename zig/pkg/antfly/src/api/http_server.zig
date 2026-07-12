@@ -166,7 +166,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
     ) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var semantic_resolver = self.server.semanticStatusResolver(.internal, "query-builder");
+        var semantic_resolver = self.server.semanticStatusResolver(.internal, "");
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -196,7 +196,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
-        var semantic_resolver = self.server.semanticStatusResolver(.internal, "query-builder");
+        var semantic_resolver = self.server.semanticStatusResolver(.internal, "");
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -291,7 +291,10 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
-    query_embedding_cache: query_embedding_cache.Config = .{},
+    /// Explicit override for query embedding caching. When null, values come
+    /// from node_config.inference.query_embedding_cache or built-in defaults.
+    query_embedding_cache: ?query_embedding_cache.Config = null,
+    /// Optional node-wide coordinator. The owner must outlive ApiHttpServer.
     inference_cache_budget: ?*cache_budget.CacheBudget = null,
 };
 
@@ -1094,6 +1097,7 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
+        const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -1126,11 +1130,22 @@ pub const ApiHttpServer = struct {
             }),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(alloc),
-            .local_inference_cache_budget = cache_budget.CacheBudget.init(cfg.query_embedding_cache.max_bytes),
+            .local_inference_cache_budget = cache_budget.CacheBudget.init(effective_query_embedding_cache.max_bytes),
             .shared_inference_cache_budget = cfg.inference_cache_budget,
-            .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, cfg.query_embedding_cache),
+            .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, effective_query_embedding_cache),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
+        };
+    }
+
+    fn effectiveQueryEmbeddingCacheConfig(cfg: ApiHttpServerConfig) query_embedding_cache.Config {
+        if (cfg.query_embedding_cache) |explicit| return explicit;
+        const node_config = cfg.node_config orelse return .{};
+        const configured = node_config.inference.query_embedding_cache;
+        return .{
+            .enabled = configured.enabled,
+            .max_bytes = std.math.mul(usize, configured.max_bytes_mb, 1024 * 1024) catch std.math.maxInt(usize),
+            .ttl_ns = configured.ttl_ms * std.time.ns_per_ms,
         };
     }
 
@@ -1144,7 +1159,7 @@ pub const ApiHttpServer = struct {
                 0
             else
                 @intCast(@divTrunc(first_request_started_at_ns - self.created_at_ns, std.time.ns_per_ms)),
-            .query_embedding_cache = self.query_embedding_cache.stats(),
+            .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
     }
@@ -1262,7 +1277,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn queryEmbeddingCacheStats(self: *ApiHttpServer) query_embedding_cache.Stats {
-        return self.query_embedding_cache.stats();
+        return self.query_embedding_cache.stats(self.inferenceCacheBudget());
     }
 
     fn inferenceCacheBudget(self: *ApiHttpServer) *cache_budget.CacheBudget {
@@ -1366,7 +1381,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, .{ .domain = .internal, .value = "join" });
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, .{ .domain = .internal, .value = "" });
     }
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror![]u8 {
@@ -3716,7 +3731,7 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "a2a-retrieval");
+                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "");
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -3893,7 +3908,7 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "retrieval");
+                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "");
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -6559,7 +6574,7 @@ pub const ApiHttpServer = struct {
     ) !query_api.OwnedQueryRequest {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
-        var semantic_resolver = self.semanticStatusResolver(.internal, "owned-query-plan");
+        var semantic_resolver = self.semanticStatusResolver(.internal, "");
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
@@ -11691,6 +11706,36 @@ test "api http plain public query preserves outer absolute request deadline" {
     );
     defer response.deinit(alloc);
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
+}
+
+test "api http server applies node query embedding cache policy and explicit override" {
+    const alloc = std.testing.allocator;
+    var node_config = try common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8082",
+        \\    "query_embedding_cache": {
+        \\      "enabled": false,
+        \\      "max_bytes_mb": 7,
+        \\      "ttl_ms": 1234
+        \\    }
+        \\  }
+        \\}
+    );
+    defer node_config.deinit();
+
+    const configured = ApiHttpServer.effectiveQueryEmbeddingCacheConfig(.{ .node_config = &node_config });
+    try std.testing.expect(!configured.enabled);
+    try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024), configured.max_bytes);
+    try std.testing.expectEqual(@as(u64, 1234 * std.time.ns_per_ms), configured.ttl_ns);
+
+    const explicit = ApiHttpServer.effectiveQueryEmbeddingCacheConfig(.{
+        .node_config = &node_config,
+        .query_embedding_cache = .{ .enabled = true, .max_bytes = 99, .ttl_ns = 77 },
+    });
+    try std.testing.expect(explicit.enabled);
+    try std.testing.expectEqual(@as(usize, 99), explicit.max_bytes);
+    try std.testing.expectEqual(@as(u64, 77), explicit.ttl_ns);
 }
 
 test "api http public table dispatch preserves unsupported sorted query as exact sort" {
