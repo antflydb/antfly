@@ -12475,7 +12475,8 @@ pub const DB = struct {
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                     }
                     if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
-                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, item);
+                        const config_hash = self.core.index_manager.coverageConfigHashForIndex(item.name) orelse 0;
+                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, config_hash, item);
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
@@ -12489,7 +12490,8 @@ pub const DB = struct {
                         item.term_count = sparse_stats.term_count;
                     }
                     if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
-                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, item);
+                        const config_hash = self.core.index_manager.coverageConfigHashForIndex(item.name) orelse 0;
+                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, config_hash, item);
                     }
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
@@ -12801,7 +12803,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
@@ -12824,7 +12826,7 @@ pub const DB = struct {
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
@@ -12978,7 +12980,7 @@ pub const DB = struct {
                             }
                         }
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
                         item.backfill_progress = @min(
                             1.0,
@@ -13008,7 +13010,7 @@ pub const DB = struct {
                             item.backfill_progress = progress;
                         }
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0) {
                         item.backfill_progress = @min(
                             1.0,
@@ -13141,7 +13143,7 @@ pub const DB = struct {
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
-                self.populateDerivedCoverageCountsBestEffort(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), &item);
+                self.populateDerivedCoverageCountsBestEffort(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
             }
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
@@ -13468,19 +13470,31 @@ pub const DB = struct {
         return doc_count;
     }
 
-    fn countDerivedCoverageOutcome(self: *DB, index_name: []const u8, generation: u64, outcome: []const u8) !u64 {
-        if (try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, outcome)) |count| return count;
-        return try scanDerivedCoverageOutcomeFromStore(self.core.alloc, self.core.store, index_name, generation, outcome);
+    fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
+        item.coverage_config_hash = config_hash;
+        const produced = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "produced");
+        const skipped = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "skipped");
+        const terminal_failed = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "terminal_failed");
+
+        const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
+            @as(u2, @intFromBool(skipped != null)) +
+            @as(u2, @intFromBool(terminal_failed != null));
+        // Counter creation and marker mutation share one atomic batch. No
+        // counters means a new generation; a partial tuple means corruption or
+        // an interrupted legacy write and must not be reported as complete.
+        item.coverage_summary_ready = present_count == 0 or present_count == 3;
+        item.coverage_produced_count = produced orelse 0;
+        item.coverage_skipped_count = skipped orelse 0;
+        item.coverage_terminal_failed_count = terminal_failed orelse 0;
+        if (!item.coverage_summary_ready) item.repair_degraded = true;
     }
 
-    fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, item: *types.DBIndexStats) !void {
-        item.coverage_produced_count = try self.countDerivedCoverageOutcome(index_name, generation, "produced");
-        item.coverage_skipped_count = try self.countDerivedCoverageOutcome(index_name, generation, "skipped");
-        item.coverage_terminal_failed_count = try self.countDerivedCoverageOutcome(index_name, generation, "terminal_failed");
-    }
-
-    fn populateDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, generation: u64, item: *types.DBIndexStats) void {
-        self.populateDerivedCoverageCounts(index_name, generation, item) catch {};
+    fn populateDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) void {
+        self.populateDerivedCoverageCounts(index_name, generation, config_hash, item) catch {
+            item.coverage_config_hash = config_hash;
+            item.coverage_summary_ready = false;
+            item.repair_degraded = true;
+        };
     }
 
     fn deleteDerivedCoverageForIndex(self: *DB, index_name: []const u8) !void {
@@ -24541,15 +24555,13 @@ fn setDerivedCoverageOutcomes(
     try store.putBatch(writes.items, &.{});
 }
 
-fn accountDirectDenseCoverage(
+fn accountDenseCoverage(
     ctx: *const AsyncContext,
     index_name: []const u8,
     batch: derived_types.DerivedBatch,
     writes: []const mapper.DenseEmbeddingWrite,
 ) !void {
-    const managed_direct = ctx.index_manager.denseIndexUsesManagedDirectField(index_name);
     const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_name);
-    if (!managed_direct and !external) return;
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
@@ -24557,7 +24569,7 @@ fn accountDirectDenseCoverage(
     }
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
     defer outcomes.deinit(ctx.alloc);
-    if (managed_direct) {
+    if (!external) {
         for (batch.documents) |doc| {
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
@@ -24575,13 +24587,13 @@ fn accountDirectDenseCoverage(
     try setDerivedCoverageOutcomes(ctx.alloc, ctx.store, ctx.index_manager, index_name, outcomes.items);
 }
 
-fn accountDirectSparseCoverage(
+fn accountSparseCoverage(
     ctx: *const AsyncContext,
     index_name: []const u8,
     batch: derived_types.DerivedBatch,
     writes: []const mapper.SparseEmbeddingWrite,
 ) !void {
-    if (!ctx.index_manager.sparseIndexUsesManagedDirectField(index_name)) return;
+    const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_name);
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
@@ -24589,12 +24601,20 @@ fn accountDirectSparseCoverage(
     }
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
     defer outcomes.deinit(ctx.alloc);
-    for (batch.documents) |doc| {
-        if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
-        try outcomes.append(ctx.alloc, .{
-            .doc_key = doc.key,
-            .outcome = if (produced.contains(doc.key)) .produced else .skipped,
-        });
+    if (!external) {
+        for (batch.documents) |doc| {
+            if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
+            try outcomes.append(ctx.alloc, .{
+                .doc_key = doc.key,
+                .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+            });
+        }
+    } else {
+        var iter = produced.keyIterator();
+        while (iter.next()) |doc_key| {
+            if (internal_keys.isInternalUserKey(doc_key.*) or !ctx.index_manager.byte_range.contains(doc_key.*)) continue;
+            try outcomes.append(ctx.alloc, .{ .doc_key = doc_key.*, .outcome = .produced });
+        }
     }
     try setDerivedCoverageOutcomes(ctx.alloc, ctx.store, ctx.index_manager, index_name, outcomes.items);
 }
@@ -25276,7 +25296,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
 
             const dense_embedding_start_ns = monotonicTimeNs();
             try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, dense_embeddings.writes, batch_options);
-            try accountDirectDenseCoverage(ctx, index_ref.name, batch, dense_embeddings.writes);
+            try accountDenseCoverage(ctx, index_ref.name, batch, dense_embeddings.writes);
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.dense_embedding_apply_ns, dense_embedding_start_ns);
                 if (before_hbc_profile) |before| {
@@ -25349,7 +25369,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
 
             const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
-            try accountDirectSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
+            try accountSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
             if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
             if (before_sparse_profile) |before| {
                 if (ctx.index_manager.sparseWriteProfileByName(index_ref.name)) |after| {
@@ -44645,6 +44665,80 @@ test "db leased enrichment worker persists chunk storage when full text consumes
     try std.testing.expect(chunk_count > 0);
 }
 
+test "db managed conditional embeddings persist exact mixed corpus coverage across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const config_json =
+        "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"image_url\",\"source_template\":\"{{#if image_url}}{{image_url}}{{/if}}\"}}";
+    const expected_config_hash = internal_keys.derivedCoverageGeneration(config_json);
+
+    const ExpectCoverage = struct {
+        fn run(db_value: *DB, config_hash: u64, produced: u64, skipped: u64) !void {
+            const stats = try db_value.stats(std.testing.allocator);
+            defer types.freeDBStats(std.testing.allocator, stats);
+            try std.testing.expectEqual(@as(u64, 2), stats.source_doc_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "visual")) continue;
+                try std.testing.expect(index_stats.coverage_summary_ready);
+                try std.testing.expectEqual(config_hash, index_stats.coverage_config_hash);
+                try std.testing.expectEqual(produced, index_stats.coverage_produced_count);
+                try std.testing.expectEqual(skipped, index_stats.coverage_skipped_count);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+                try std.testing.expectEqual(produced, index_stats.doc_count);
+                return;
+            }
+            return error.IndexNotFound;
+        }
+    };
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer db.close();
+        try db.addIndex(.{ .name = "visual", .kind = .dense_vector, .config_json = config_json });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:image", .value = "{\"image_url\":\"https://example.invalid/image.png\"}" },
+                .{ .key = "doc:text", .value = "{\"body\":\"not embeddable by this index\"}" },
+            },
+            .sync_level = .full_index,
+        });
+        try ExpectCoverage.run(&db, expected_config_hash, 1, 1);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:text", .value = "{\"image_url\":\"https://example.invalid/second.png\"}" }},
+            .sync_level = .full_index,
+        });
+        try ExpectCoverage.run(&db, expected_config_hash, 2, 0);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:text", .value = "{\"body\":\"not embeddable again\"}" }},
+            .sync_level = .full_index,
+        });
+        try ExpectCoverage.run(&db, expected_config_hash, 1, 1);
+    }
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-b",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer reopened.close();
+        try ExpectCoverage.run(&reopened, expected_config_hash, 1, 1);
+    }
+}
+
 test "db leased enrichment worker persists chunk storage when chunker enables full text indexing" {
     const alloc = std.testing.allocator;
 
@@ -52201,6 +52295,37 @@ test "db external dense coverage tracks exact writes deletes and reopen" {
         try reopened.batch(.{ .deletes = &.{"doc:pending"}, .sync_level = .full_index });
         try ExpectCoverage.run(&reopened, 1, 0);
     }
+}
+
+test "db coverage status reports partial counter tuples without scanning markers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+    const generation = db.core.index_manager.coverageGenerationForIndex("external_v1") orelse return error.TestUnexpectedResult;
+    const counter_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, "external_v1", generation, "produced");
+    defer alloc.free(counter_key);
+    var encoded_count: [8]u8 = undefined;
+    try db.core.store.put(counter_key, internal_keys.encodeDerivedCoverageOutcomeCount(&encoded_count, 7));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "external_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 7), index_stats.coverage_produced_count);
+        try std.testing.expect(!index_stats.coverage_summary_ready);
+        try std.testing.expect(index_stats.repair_degraded);
+        return;
+    }
+    return error.IndexNotFound;
 }
 
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {

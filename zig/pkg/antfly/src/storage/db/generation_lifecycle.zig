@@ -56,36 +56,40 @@ fn canonicalPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-
-    const existing: ?[:0]u8 = realPathAlloc(alloc, io, path) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => null,
+    const absolute = if (std.fs.path.isAbsolute(path))
+        try std.fs.path.resolve(alloc, &.{path})
+    else blk: {
+        const cwd = try realPathAlloc(alloc, io, ".");
+        defer alloc.free(cwd);
+        break :blk try std.fs.path.resolve(alloc, &.{ cwd, path });
     };
-    if (existing) |canonical| {
-        defer alloc.free(canonical);
-        return try alloc.dupe(u8, canonical);
-    }
+    errdefer alloc.free(absolute);
 
-    const parent = std.fs.path.dirname(path) orelse ".";
-    const canonical_parent: ?[:0]u8 = realPathAlloc(alloc, io, parent) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => null,
-    };
-    if (canonical_parent) |canonical| {
-        defer alloc.free(canonical);
-        return try std.fs.path.join(alloc, &.{ canonical, std.fs.path.basename(path) });
+    // Resolve the deepest existing ancestor, then append the still-missing
+    // suffix. This keeps a path's identity stable before and after creation
+    // (notably /tmp -> /private/tmp on macOS).
+    var probe: []const u8 = absolute;
+    while (true) {
+        const canonical: ?[:0]u8 = realPathAlloc(alloc, io, probe) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        if (canonical) |existing| {
+            defer alloc.free(existing);
+            const suffix = std.mem.trimStart(u8, absolute[probe.len..], &.{std.fs.path.sep});
+            if (suffix.len == 0) {
+                alloc.free(absolute);
+                return try alloc.dupe(u8, existing);
+            }
+            const result = try std.fs.path.join(alloc, &.{ existing, suffix });
+            alloc.free(absolute);
+            return result;
+        }
+        const parent = std.fs.path.dirname(probe) orelse break;
+        if (std.mem.eql(u8, parent, probe)) break;
+        probe = parent;
     }
-
-    if (std.fs.path.isAbsolute(path)) return try std.fs.path.resolve(alloc, &.{path});
-    const cwd: ?[:0]u8 = realPathAlloc(alloc, io, ".") catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => null,
-    };
-    if (cwd) |canonical| {
-        defer alloc.free(canonical);
-        return try std.fs.path.resolve(alloc, &.{ canonical, path });
-    }
-    return try std.fs.path.resolve(alloc, &.{path});
+    return absolute;
 }
 
 pub const PublicationOutcome = enum {

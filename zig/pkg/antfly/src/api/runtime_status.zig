@@ -532,7 +532,8 @@ fn indexHasArtifactVisibilityFacts(index: db_mod.types.DBIndexStats) bool {
         index.term_count > 0 or
         index.edge_count > 0 or
         index.node_count > 0 or
-        index.root_node > 0;
+        index.root_node > 0 or
+        index.coverage_config_hash != 0;
 }
 
 fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_mod.types.DBIndexStats) void {
@@ -1807,6 +1808,22 @@ test "synthetic status with preserved visibility counters is a runtime fact" {
         },
     };
 
+    try std.testing.expect(statusHasRuntimeFacts(status));
+}
+
+test "cached all-skipped coverage observation is a runtime fact" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_skipped_count = 2,
+        .coverage_config_hash = 0x1234,
+        .coverage_summary_ready = true,
+    }};
+    const status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{ .source_doc_count = 2, .index_count = 1, .indexes = indexes[0..] },
+    };
     try std.testing.expect(statusHasRuntimeFacts(status));
 }
 

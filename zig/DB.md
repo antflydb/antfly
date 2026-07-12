@@ -333,8 +333,11 @@ does not depend on query-visible index entries. This distinction is required for
 chunked projections, where one source document may produce many physical vector
 entries. Distributed projections sum cardinality and outcomes only from fresh
 shard observations; `observation_complete` is false if any expected shard is
-missing, stale, or remotely unknown, and an incomplete observation can never
-report complete or healthy coverage.
+missing, stale, remotely unknown, reports an incomplete counter summary, or
+reports a stored-config fingerprint different from the requested index config.
+An incomplete observation can never report complete or healthy coverage. The
+fingerprint is stable across shard-local marker generations, preventing rolling
+reconfiguration from combining outcomes that describe different indexes.
 
 ### Coverage Policy
 
@@ -354,18 +357,15 @@ The policy should be explicit in index and enrichment config, for example:
 {
   "type": "embeddings",
   "coverage_policy": "partial",
-  "applies_when": {
-    "exists": "image_url"
-  },
-  "template": "{{remoteMedia url=image_url}}"
+  "template": "{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}"
 }
 ```
 
-`applies_when` is preferred over syntax sniffing because it gives the planner,
-repair jobs, and operators a stable eligibility predicate. Templates may still
-produce `skipped` outcomes when rendering produces no input, but empty-template
-detection is an execution outcome, not the primary declaration of index
-coverage.
+Today eligibility is an execution outcome: a managed template that renders no
+input records a durable `skipped` result. A future declarative eligibility
+predicate must be implemented consistently by planning, execution, repair, and
+status before it becomes public. Unknown `applies_when` configuration is
+rejected rather than silently ignored.
 
 ### Readiness And Repair
 
@@ -410,8 +410,11 @@ the number of distinct source units rather than quadratic in batch size.
 Each source uses one marker key whose value is the outcome enum. Transitions
 therefore require one point read and one marker write rather than probing one key
 per possible outcome. Aggregate counters remain separate and atomically updated;
-if counters require repair, a bounded maintenance scan reconstructs them from
-marker values. External embedding writes participate in the same accounting:
+status loads the three counters with O(1) point reads and never scans source
+markers. A partial counter tuple is reported as degraded and incomplete. If
+counters require repair, a bounded maintenance scan reconstructs them from
+marker values outside the status path. External embedding writes participate in
+the same accounting:
 only a durably applied `_embeddings` value is `produced`, and a source without an
 external vector remains pending rather than being assumed covered.
 
@@ -422,8 +425,10 @@ entries and complete early under that approximation.
 
 ### Scope
 
-The coverage model should be shared by all derived artifact producers and
-artifact-backed indexes:
+The current durable marker, counter, and public readiness implementation applies
+to managed dense and sparse embeddings indexes. The common outcome model is the
+required contract for extending coverage accounting to other derived artifact
+producers and artifact-backed indexes:
 
 - embeddings
 - chunks

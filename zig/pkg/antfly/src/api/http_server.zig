@@ -1669,6 +1669,8 @@ pub const ApiHttpServer = struct {
                 .coverage_produced_count = index.coverage_produced_count,
                 .coverage_skipped_count = index.coverage_skipped_count,
                 .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
+                .coverage_config_hash = index.coverage_config_hash,
+                .coverage_summary_ready = index.coverage_summary_ready,
                 .backfill_active = index.backfill_active,
                 .backfill_progress = @as(f64, @floatFromInt(index.backfill_progress_millis)) / 1000.0,
                 .replay_applied_sequence = index.replay_applied_sequence,
@@ -22339,6 +22341,8 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .coverage_produced_count = 31,
             .coverage_skipped_count = 7,
             .coverage_terminal_failed_count = 2,
+            .coverage_config_hash = 0x1234,
+            .coverage_summary_ready = true,
             .replay_applied_sequence = 225,
             .replay_target_sequence = 300,
             .replay_catch_up_required = true,
@@ -22359,6 +22363,8 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 31), index.coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 7), index.coverage_skipped_count);
     try std.testing.expectEqual(@as(u64, 2), index.coverage_terminal_failed_count);
+    try std.testing.expectEqual(@as(u64, 0x1234), index.coverage_config_hash);
+    try std.testing.expect(index.coverage_summary_ready);
     try std.testing.expectEqual(@as(u64, 40), status.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_identity.namespace_table_id);
     try std.testing.expectEqual(@as(u64, 10), status.stats.doc_identity.namespace_shard_id);

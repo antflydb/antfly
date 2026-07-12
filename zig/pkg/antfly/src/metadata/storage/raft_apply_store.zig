@@ -1859,7 +1859,7 @@ pub const RaftApplyStore = struct {
 };
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 5;
+const runtime_status_record_version: u16 = 6;
 const group_status_record_version: u16 = 1;
 
 const TransitionTag = enum(u8) {
@@ -2638,7 +2638,7 @@ fn readRuntimeGroupStatusRecord(
     pos: *usize,
 ) !metadata.RuntimeGroupStatusReport {
     const version = try readInt(encoded, pos, u16);
-    if (version != 1 and version != 2 and version != 3 and version != 4 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const table_id = try readInt(encoded, pos, u64);
     const table_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(table_name);
@@ -2856,6 +2856,8 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.coverage_produced_count);
     try appendInt(alloc, out, u64, record.coverage_skipped_count);
     try appendInt(alloc, out, u64, record.coverage_terminal_failed_count);
+    try appendInt(alloc, out, u64, record.coverage_config_hash);
+    try out.append(alloc, if (record.coverage_summary_ready) 1 else 0);
     try out.append(alloc, if (record.backfill_active) 1 else 0);
     try appendInt(alloc, out, u16, record.backfill_progress_millis);
     try appendInt(alloc, out, u64, record.replay_applied_sequence);
@@ -2881,6 +2883,13 @@ fn readRuntimeIndexStatusRecord(
     const coverage_produced_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
     const coverage_skipped_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
     const coverage_terminal_failed_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
+    const coverage_config_hash = if (version >= 6) try readInt(encoded, pos, u64) else 0;
+    const coverage_summary_ready = if (version >= 6) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const ready = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk ready;
+    } else false;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const backfill_active = encoded[pos.*] != 0;
     pos.* += 1;
@@ -2901,6 +2910,8 @@ fn readRuntimeIndexStatusRecord(
         .coverage_produced_count = coverage_produced_count,
         .coverage_skipped_count = coverage_skipped_count,
         .coverage_terminal_failed_count = coverage_terminal_failed_count,
+        .coverage_config_hash = coverage_config_hash,
+        .coverage_summary_ready = coverage_summary_ready,
         .backfill_active = backfill_active,
         .backfill_progress_millis = backfill_progress_millis,
         .replay_applied_sequence = replay_applied_sequence,
@@ -5619,6 +5630,8 @@ test "metadata raft apply store runtime status codec preserves document identity
             .coverage_produced_count = 31,
             .coverage_skipped_count = 7,
             .coverage_terminal_failed_count = 2,
+            .coverage_config_hash = 0x1234,
+            .coverage_summary_ready = true,
         }})[0..]),
     }};
 
@@ -5650,6 +5663,8 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 31), status.indexes[0].coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 7), status.indexes[0].coverage_skipped_count);
     try std.testing.expectEqual(@as(u64, 2), status.indexes[0].coverage_terminal_failed_count);
+    try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
+    try std.testing.expect(status.indexes[0].coverage_summary_ready);
 }
 
 test "metadata apply store replay is idempotent when applied watermark lags WAL state" {

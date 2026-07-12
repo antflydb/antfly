@@ -1238,6 +1238,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         field_name: []u8,
+        external: bool = false,
         managed_direct_field: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
@@ -5597,6 +5598,21 @@ pub const IndexManager = struct {
         return null;
     }
 
+    pub fn coverageConfigHashForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
+        for (self.dense_indexes.items) |entry| {
+            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageGeneration(entry.config.config_json);
+        }
+        for (self.sparse_indexes.items) |entry| {
+            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageGeneration(entry.config.config_json);
+        }
+        for (self.status_only_index_configs) |cfg| {
+            if (std.mem.eql(u8, cfg.name, index_name) and (cfg.kind == .dense_vector or cfg.kind == .sparse_vector)) {
+                return internal_keys.derivedCoverageGeneration(cfg.config_json);
+            }
+        }
+        return null;
+    }
+
     pub fn denseIndexUsesManagedDirectField(self: *const IndexManager, index_name: []const u8) bool {
         for (self.dense_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
@@ -5617,6 +5633,14 @@ pub const IndexManager = struct {
         for (self.sparse_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
             return entry.managed_direct_field;
+        }
+        return false;
+    }
+
+    pub fn sparseIndexUsesExternalCoverage(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.sparse_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.external;
         }
         return false;
     }
@@ -7588,7 +7612,8 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
-                    .managed_direct_field = sparse_generator == null and referenced_embedding == null,
+                    .external = sparse_cfg.external,
+                    .managed_direct_field = !sparse_cfg.external and sparse_generator == null and referenced_embedding == null,
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
@@ -13365,6 +13390,7 @@ const GeneratorConfig = struct {
 
 const SparseConfig = struct {
     field_name: []u8,
+    external: bool = false,
 
     fn deinit(self: *const SparseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
@@ -13984,6 +14010,10 @@ fn parseSparseConfig(alloc: Allocator, raw: []const u8) !SparseConfig {
     const field = root.object.get("field") orelse return error.InvalidIndexConfig;
     return .{
         .field_name = try alloc.dupe(u8, field.string),
+        .external = if (root.object.get("external")) |value|
+            if (value == .bool) value.bool else return error.InvalidIndexConfig
+        else
+            false,
     };
 }
 
@@ -16555,6 +16585,13 @@ test "parseDenseConfig accepts external embedding indexes" {
     try std.testing.expectEqual(@as(u32, 384), cfg.dims);
     try std.testing.expectEqual(vector_mod.DistanceMetric.cosine, cfg.metric);
     try std.testing.expectEqualStrings("semantic_idx", cfg.embedding_name.?);
+    try std.testing.expect(cfg.external);
+}
+
+test "parseSparseConfig accepts external embedding indexes" {
+    const cfg = try parseSparseConfig(std.testing.allocator, "{\"field\":\"sparse\",\"external\":true}");
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("sparse", cfg.field_name);
     try std.testing.expect(cfg.external);
 }
 

@@ -2127,6 +2127,9 @@ pub const DBIndexStats = struct {
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    // Stable across shard-local marker generations for the same stored config.
+    coverage_config_hash: u64 = 0,
+    coverage_summary_ready: bool = true,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,

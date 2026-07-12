@@ -23,7 +23,7 @@ pub fn parse(value: std.json.Value) !Policy {
 pub fn validateIndexConfig(value: std.json.Value) !void {
     if (value != .object) return error.InvalidIndexConfig;
     // These experimental spellings were never part of the public schema.
-    if (value.object.get("coverage") != null or value.object.get("partial") != null) {
+    if (value.object.get("coverage") != null or value.object.get("partial") != null or value.object.get("applies_when") != null) {
         return error.InvalidCoveragePolicy;
     }
 
@@ -55,4 +55,8 @@ test "coverage policy accepts only the public embeddings contract" {
     var wrong_kind = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"full_text\",\"coverage_policy\":\"partial\"}", .{});
     defer wrong_kind.deinit();
     try std.testing.expectError(error.InvalidCoveragePolicy, validateIndexConfig(wrong_kind.value));
+
+    var unsupported_eligibility = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"applies_when\":{\"exists\":\"image_url\"}}", .{});
+    defer unsupported_eligibility.deinit();
+    try std.testing.expectError(error.InvalidCoveragePolicy, validateIndexConfig(unsupported_eligibility.value));
 }

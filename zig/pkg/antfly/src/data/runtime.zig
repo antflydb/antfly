@@ -7969,6 +7969,8 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .coverage_produced_count = index.coverage_produced_count,
         .coverage_skipped_count = index.coverage_skipped_count,
         .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
+        .coverage_config_hash = index.coverage_config_hash,
+        .coverage_summary_ready = index.coverage_summary_ready,
         .backfill_active = index.backfill_active,
         .backfill_progress_millis = progressMillis(index.backfill_progress),
         .replay_applied_sequence = index.replay_applied_sequence,

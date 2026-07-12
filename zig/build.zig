@@ -4258,6 +4258,7 @@ pub fn build(b: *std.Build) void {
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
             "provisioned storage inspection uses table read admission",
+            "provisioned distributed aggregations collect path terms nested cardinality",
             "parseRemoteSearchResult preserves fused index scores",
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
@@ -4317,6 +4318,31 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_api_docid_tests = b.addRunArtifact(lib_api_docid_tests);
+    const api_derived_coverage_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_derived_coverage_test_mod, true, true);
+    const lib_api_derived_coverage_tests = b.addTest(.{
+        .root_module = api_derived_coverage_test_mod,
+        .filters = &.{
+            "coverage policy accepts only the public embeddings contract",
+            "derived coverage evaluation is policy exact and observation gated",
+            "derived coverage aggregation rejects mixed config observations",
+            "cached all-skipped coverage observation is a runtime fact",
+            "partial coverage embeddings readiness counts skipped source units",
+            "partial coverage embeddings readiness does not mask pending enrichment",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_derived_coverage_tests = b.addRunArtifact(lib_api_derived_coverage_tests);
+    run_lib_api_derived_coverage_tests.step.dependOn(&openapi_root_check.step);
+    const lib_api_derived_coverage_test_step = b.step("lib-api-derived-coverage-test", "Run focused public derived coverage tests");
+    lib_api_derived_coverage_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
     const run_lib_serverless_docid_tests = b.addRunArtifact(lib_serverless_docid_tests);
     const run_api_transactions_docid_tests = b.addRunArtifact(api_transactions_docid_tests);
     const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
