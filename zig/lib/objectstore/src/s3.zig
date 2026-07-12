@@ -20,6 +20,11 @@ const test_support = @import("test_support.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
+const multipart_upload_threshold: u64 = 64 * 1024 * 1024;
+const multipart_upload_min_part_bytes: u64 = 16 * 1024 * 1024;
+const multipart_upload_max_part_bytes: u64 = 512 * 1024 * 1024;
+const multipart_upload_part_alignment: u64 = 1024 * 1024;
+const max_multipart_parts: u64 = 10_000;
 
 pub const Scheme = s3_compat.Scheme;
 pub const AddressingStyle = s3_compat.AddressingStyle;
@@ -100,6 +105,7 @@ pub const HeaderPair = [2][]const u8;
 
 pub const HttpMethod = enum {
     GET,
+    POST,
     PUT,
     DELETE,
     HEAD,
@@ -107,6 +113,7 @@ pub const HttpMethod = enum {
     fn toHttpx(self: HttpMethod) httpx.Method {
         return switch (self) {
             .GET => .GET,
+            .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
             .HEAD => .HEAD,
@@ -116,6 +123,7 @@ pub const HttpMethod = enum {
     fn asBytes(self: HttpMethod) []const u8 {
         return switch (self) {
             .GET => "GET",
+            .POST => "POST",
             .PUT => "PUT",
             .DELETE => "DELETE",
             .HEAD => "HEAD",
@@ -345,6 +353,113 @@ pub const Client = struct {
         };
     }
 
+    fn putFile(
+        self: *Client,
+        alloc: Allocator,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        src_path: []const u8,
+        opts: types.PutOptions,
+    ) !types.PutResult {
+        const source = try openFilePath(io, src_path);
+        defer source.close(io);
+        const stat = try source.stat(io);
+        if (stat.size <= multipart_upload_threshold) {
+            const body = try alloc.alloc(u8, @intCast(stat.size));
+            defer alloc.free(body);
+            if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+            var extra: [1]u8 = undefined;
+            if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
+            return try self.putObject(alloc, bucket, key, body, opts);
+        }
+        if (opts.if_match_etag != null or opts.if_none_match) return error.ConditionalMultipartUnsupported;
+        const required_part_bytes = ((stat.size - 1) / max_multipart_parts) + 1;
+        const aligned_part_bytes = std.mem.alignForward(u64, required_part_bytes, multipart_upload_part_alignment);
+        const part_bytes = @max(multipart_upload_min_part_bytes, aligned_part_bytes);
+        if (part_bytes > multipart_upload_max_part_bytes) return error.ObjectTooLarge;
+        const part_count = ((stat.size - 1) / part_bytes) + 1;
+        if (part_count > max_multipart_parts) return error.ObjectTooLarge;
+
+        var initiate_query = std.ArrayListUnmanaged(QueryPair).empty;
+        defer freeQueryPairs(alloc, initiate_query.items);
+        try appendQueryPair(alloc, &initiate_query, "uploads", "");
+        var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_query.items);
+        defer initiate_target.deinit(alloc);
+        var initiated = try self.perform(.POST, initiate_target, &.{}, null, opts.content_type);
+        defer initiated.deinit(alloc);
+        if (initiated.status != 200) return unexpectedStatusError(initiated.status);
+        const upload_id = try requiredTagAlloc(alloc, initiated.body, "UploadId");
+        defer alloc.free(upload_id);
+
+        var completed = false;
+        defer if (!completed) self.abortMultipartUpload(bucket, key, upload_id) catch {};
+        var etags = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (etags.items) |etag| alloc.free(etag);
+            etags.deinit(alloc);
+        }
+        const buffer = try alloc.alloc(u8, @intCast(part_bytes));
+        defer alloc.free(buffer);
+        var offset: u64 = 0;
+        var part_number: u32 = 1;
+        while (offset < stat.size) : (part_number += 1) {
+            const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
+            if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
+            const part_number_text = try std.fmt.allocPrint(alloc, "{d}", .{part_number});
+            defer alloc.free(part_number_text);
+            var query = std.ArrayListUnmanaged(QueryPair).empty;
+            defer freeQueryPairs(alloc, query.items);
+            try appendQueryPair(alloc, &query, "partNumber", part_number_text);
+            try appendQueryPair(alloc, &query, "uploadId", upload_id);
+            var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query.items);
+            defer target.deinit(alloc);
+            var response = try self.perform(.PUT, target, &.{}, buffer[0..wanted], null);
+            defer response.deinit(alloc);
+            if (response.status != 200) return unexpectedStatusError(response.status);
+            const etag = response.etag orelse return error.MissingMultipartEtag;
+            try etags.append(alloc, try alloc.dupe(u8, etag));
+            offset += wanted;
+        }
+        var extra: [1]u8 = undefined;
+        if (try source.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
+
+        const completion_xml = try completeMultipartXmlAlloc(alloc, etags.items);
+        defer alloc.free(completion_xml);
+        var complete_query = std.ArrayListUnmanaged(QueryPair).empty;
+        defer freeQueryPairs(alloc, complete_query.items);
+        try appendQueryPair(alloc, &complete_query, "uploadId", upload_id);
+        var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_query.items);
+        defer complete_target.deinit(alloc);
+        var response = try self.perform(.POST, complete_target, &.{}, completion_xml, "application/xml");
+        defer response.deinit(alloc);
+        if (response.status != 200) return unexpectedStatusError(response.status);
+        if (findBlock(response.body, "Error", 0) != null) return error.MultipartCompletionFailed;
+        completed = true;
+        const result_etag = if (response.etag) |value|
+            try alloc.dupe(u8, stripQuotes(value))
+        else if (try optionalTagAlloc(alloc, response.body, "ETag")) |value| blk: {
+            defer alloc.free(value);
+            break :blk try alloc.dupe(u8, stripQuotes(value));
+        } else null;
+        return .{
+            .etag = result_etag,
+            .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
+        };
+    }
+
+    fn abortMultipartUpload(self: *Client, bucket: []const u8, key: []const u8, upload_id: []const u8) !void {
+        var query = std.ArrayListUnmanaged(QueryPair).empty;
+        defer freeQueryPairs(self.alloc, query.items);
+        try appendQueryPair(self.alloc, &query, "uploadId", upload_id);
+        var target = try objectTargetAllocWithQuery(self.alloc, self.cfg, bucket, key, query.items);
+        defer target.deinit(self.alloc);
+        var response = try self.perform(.DELETE, target, &.{}, null, null);
+        defer response.deinit(self.alloc);
+        if (response.status != 200 and response.status != 204 and response.status != 404)
+            return unexpectedStatusError(response.status);
+    }
+
     fn getObject(
         self: *Client,
         alloc: Allocator,
@@ -533,6 +648,7 @@ pub const Client = struct {
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
         .put_object = erasedPutObject,
+        .put_file = erasedPutFile,
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
@@ -558,6 +674,11 @@ pub const Client = struct {
     fn erasedPutObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return try self.putObject(alloc, bucket, key, body, opts);
+    }
+
+    fn erasedPutFile(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return try self.putFile(alloc, io, bucket, key, src_path, opts);
     }
 
     fn erasedGetObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
@@ -1241,6 +1362,41 @@ fn optionalTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
     return try alloc.dupe(u8, block.inner);
 }
 
+fn completeMultipartXmlAlloc(alloc: Allocator, etags: []const []u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "<CompleteMultipartUpload>");
+    for (etags, 1..) |etag, part_number| {
+        try out.appendSlice(alloc, "<Part><PartNumber>");
+        var number_buf: [16]u8 = undefined;
+        const number = try std.fmt.bufPrint(&number_buf, "{d}", .{part_number});
+        try out.appendSlice(alloc, number);
+        try out.appendSlice(alloc, "</PartNumber><ETag>");
+        try appendXmlEscaped(alloc, &out, etag);
+        try out.appendSlice(alloc, "</ETag></Part>");
+    }
+    try out.appendSlice(alloc, "</CompleteMultipartUpload>");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '&' => try out.appendSlice(alloc, "&amp;"),
+        '<' => try out.appendSlice(alloc, "&lt;"),
+        '>' => try out.appendSlice(alloc, "&gt;"),
+        '"' => try out.appendSlice(alloc, "&quot;"),
+        '\'' => try out.appendSlice(alloc, "&apos;"),
+        else => try out.append(alloc, byte),
+    };
+}
+
+fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+}
+
 fn decodeXmlAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) ![]u8 {
     const raw = try requiredTagAlloc(alloc, xml, tag);
     defer alloc.free(raw);
@@ -1367,6 +1523,17 @@ test "s3 object query includes version and part selectors" {
     const rendered = try canonicalQueryStringAlloc(alloc, query);
     defer alloc.free(rendered);
     try std.testing.expectEqualStrings("partNumber=7&versionId=v123", rendered);
+}
+
+test "s3 multipart completion preserves ordered quoted etags" {
+    const alloc = std.testing.allocator;
+    const etags = [_][]u8{ @constCast("\"etag-one\""), @constCast("\"etag-two\"") };
+    const xml = try completeMultipartXmlAlloc(alloc, &etags);
+    defer alloc.free(xml);
+    try std.testing.expectEqualStrings(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;etag-one&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;etag-two&quot;</ETag></Part></CompleteMultipartUpload>",
+        xml,
+    );
 }
 
 test "s3 client signs and issues object operations through request fn" {

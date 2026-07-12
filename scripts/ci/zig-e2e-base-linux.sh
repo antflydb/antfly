@@ -70,10 +70,17 @@ else
   run_inference="${RUN_INFERENCE_E2E:-1}"
 fi
 
-UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q -x "${antfly_args[@]}"
+e2e_status=0
+UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q --continue-on-collection-errors "${antfly_args[@]}" || e2e_status=$?
 
 if [[ "$run_inference" == "1" ]]; then
-  UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q -x \
+  inference_status=0
+  UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q --continue-on-collection-errors \
     -m "not slow and not multimodal and not model_integration and not browser_integration" \
-    e2e/inference
+    e2e/inference || inference_status=$?
+  if (( inference_status != 0 )); then
+    e2e_status=$inference_status
+  fi
 fi
+
+exit "$e2e_status"

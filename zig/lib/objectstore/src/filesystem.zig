@@ -116,6 +116,38 @@ pub const FilesystemClient = struct {
         };
     }
 
+    fn putFile(self: *FilesystemClient, alloc: Allocator, source_io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        try self.makeBucket(bucket);
+        const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
+        defer alloc.free(object_path);
+        var object_lock = try lockObject(self.io, alloc, self.root_dir, bucket, key);
+        defer object_lock.deinit();
+        if (fileExists(self.io, object_path)) {
+            var current = try self.statObject(alloc, bucket, key);
+            defer current.deinit(alloc);
+            if (opts.if_none_match) return error.PreconditionFailed;
+            if (opts.if_match_etag) |expected| {
+                if (current.etag == null or !std.mem.eql(u8, current.etag.?, expected)) return error.PreconditionFailed;
+            }
+        } else if (opts.if_match_etag != null) {
+            return error.PreconditionFailed;
+        }
+
+        try ensureParentDir(self.io, object_path);
+        const staging_path = try stagingPathAlloc(alloc, self.root_dir, bucket);
+        defer alloc.free(staging_path);
+        const etag = try writeObjectFileAtomically(
+            alloc,
+            self.io,
+            source_io,
+            object_path,
+            staging_path,
+            src_path,
+            opts.content_type orelse "",
+        );
+        return .{ .etag = etag };
+    }
+
     fn getObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
         if (opts.version_id != null) return error.VersioningUnsupported;
         if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
@@ -235,69 +267,71 @@ pub const FilesystemClient = struct {
             prefixes.deinit(alloc);
         }
 
-        var keys = std.ArrayListUnmanaged([]u8).empty;
+        const candidate_limit: usize = @as(usize, opts.max_keys) + 1;
+        var candidates = std.PriorityQueue(ListCandidate, void, candidateMaxOrder).initContext({});
         defer {
-            for (keys.items) |key| alloc.free(key);
-            keys.deinit(alloc);
+            for (candidates.items) |candidate| alloc.free(candidate.name);
+            candidates.deinit(alloc);
         }
+        var retained = std.StringHashMapUnmanaged(void).empty;
+        defer retained.deinit(alloc);
+        const continuation = opts.continuation_token orelse opts.start_after;
         while (try walker.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.startsWith(u8, entry.path, opts.prefix)) continue;
-            try keys.append(alloc, try alloc.dupe(u8, entry.path));
-        }
-        std.mem.sort([]u8, keys.items, {}, lessPrefix);
-
-        const continuation = opts.continuation_token orelse opts.start_after;
-        var count: u32 = 0;
-        var last_cursor_key: ?[]const u8 = null;
-        var truncated = false;
-        for (keys.items) |key| {
-            if (continuation) |token| {
-                if (std.mem.order(u8, key, token) != .gt) continue;
-            }
-
-            if (!opts.recursive and opts.delimiter.len > 0 and key.len > opts.prefix.len) {
-                if (std.mem.indexOf(u8, key[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
+            var candidate_name: []const u8 = entry.path;
+            var is_prefix = false;
+            if (!opts.recursive and opts.delimiter.len > 0 and entry.path.len > opts.prefix.len) {
+                if (std.mem.indexOf(u8, entry.path[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
                     const prefix_end = opts.prefix.len + delimiter_offset + opts.delimiter.len;
-                    const common_prefix = key[0..prefix_end];
-                    if (containsPrefix(prefixes.items, common_prefix)) {
-                        last_cursor_key = key;
-                        continue;
-                    }
-                    if (count >= opts.max_keys) {
-                        truncated = true;
-                        break;
-                    }
-                    try prefixes.append(alloc, try alloc.dupe(u8, common_prefix));
-                    count += 1;
-                    last_cursor_key = key;
-                    continue;
+                    candidate_name = entry.path[0..prefix_end];
+                    is_prefix = true;
                 }
             }
-
-            if (count >= opts.max_keys) {
-                truncated = true;
-                break;
+            if (continuation) |token| {
+                if (std.mem.order(u8, candidate_name, token) != .gt) continue;
             }
-            var meta = try self.statObject(alloc, bucket, key);
+            if (retained.contains(candidate_name)) continue;
+            if (candidates.items.len >= candidate_limit) {
+                const largest = candidates.peek().?;
+                if (std.mem.order(u8, candidate_name, largest.name) != .lt) continue;
+                const evicted = candidates.pop().?;
+                _ = retained.remove(evicted.name);
+                alloc.free(evicted.name);
+            }
+            const owned_name = try alloc.dupe(u8, candidate_name);
+            retained.put(alloc, owned_name, {}) catch |err| {
+                alloc.free(owned_name);
+                return err;
+            };
+            candidates.push(alloc, .{ .name = owned_name, .is_prefix = is_prefix }) catch |err| {
+                _ = retained.remove(owned_name);
+                alloc.free(owned_name);
+                return err;
+            };
+        }
+        std.mem.sort(ListCandidate, candidates.items, {}, candidateLessThan);
+        const result_count = @min(@as(usize, opts.max_keys), candidates.items.len);
+        for (candidates.items[0..result_count]) |candidate| {
+            if (candidate.is_prefix) {
+                try prefixes.append(alloc, try alloc.dupe(u8, candidate.name));
+                continue;
+            }
+            var meta = try self.statObject(alloc, bucket, candidate.name);
             defer meta.deinit(alloc);
             try entries.append(alloc, .{
-                .key = try alloc.dupe(u8, key),
+                .key = try alloc.dupe(u8, candidate.name),
                 .etag = if (meta.etag) |value| try alloc.dupe(u8, value) else null,
                 .size = meta.content_length,
                 .last_modified_unix_ms = meta.last_modified_unix_ms,
             });
-            count += 1;
-            last_cursor_key = key;
         }
 
-        std.mem.sort(types.ListEntry, entries.items, {}, lessEntry);
-        std.mem.sort([]u8, prefixes.items, {}, lessPrefix);
         return .{
             .entries = try entries.toOwnedSlice(alloc),
             .common_prefixes = try prefixes.toOwnedSlice(alloc),
-            .next_continuation_token = if (truncated and last_cursor_key != null)
-                try alloc.dupe(u8, last_cursor_key.?)
+            .next_continuation_token = if (candidates.items.len > result_count and result_count > 0)
+                try alloc.dupe(u8, candidates.items[result_count - 1].name)
             else
                 null,
         };
@@ -308,6 +342,7 @@ pub const FilesystemClient = struct {
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
         .put_object = erasedPutObject,
+        .put_file = erasedPutFile,
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
@@ -333,6 +368,11 @@ pub const FilesystemClient = struct {
     fn erasedPutObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         return try self.putObject(alloc, bucket, key, body, opts);
+    }
+
+    fn erasedPutFile(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
+        return try self.putFile(alloc, io, bucket, key, src_path, opts);
     }
 
     fn erasedGetObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
@@ -478,10 +518,7 @@ fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, bod
         defer file.close(io);
 
         var fixed: [object_header_len]u8 = undefined;
-        @memcpy(fixed[0..object_magic.len], object_magic);
-        std.mem.writeInt(u64, fixed[object_magic.len..][0..8], @intCast(body.len), .little);
-        std.mem.writeInt(u32, fixed[object_magic.len + 8 ..][0..4], @intCast(content_type.len), .little);
-        @memcpy(fixed[object_magic.len + 12 ..], etag);
+        encodeObjectHeader(&fixed, @intCast(body.len), content_type.len, etag);
 
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
@@ -496,6 +533,78 @@ fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, bod
         try std.Io.Dir.renameAbsolute(tmp_path, path, io)
     else
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+}
+
+fn writeObjectFileAtomically(
+    alloc: Allocator,
+    io: std.Io,
+    source_io: std.Io,
+    path: []const u8,
+    tmp_path: []const u8,
+    src_path: []const u8,
+    content_type: []const u8,
+) ![]u8 {
+    if (content_type.len > max_content_type_bytes) return error.InvalidObjectMetadata;
+    const source = try openFilePath(source_io, src_path);
+    defer source.close(source_io);
+    const source_stat = try source.stat(source_io);
+
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var output = if (std.fs.path.isAbsolute(tmp_path))
+        try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+    else
+        try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    var output_open = true;
+    defer if (output_open) output.close(io);
+
+    var placeholder: [object_header_len]u8 = @splat(0);
+    var writer_buf: [64 * 1024]u8 = undefined;
+    var writer = output.writer(io, &writer_buf);
+    try writer.interface.writeAll(&placeholder);
+    try writer.interface.writeAll(content_type);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var read_buf: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < source_stat.size) {
+        const wanted: usize = @intCast(@min(source_stat.size - offset, read_buf.len));
+        const n = try source.readPositionalAll(source_io, read_buf[0..wanted], offset);
+        if (n != wanted) return error.SourceFileChanged;
+        hasher.update(read_buf[0..n]);
+        try writer.interface.writeAll(read_buf[0..n]);
+        offset += n;
+    }
+    var extra: [1]u8 = undefined;
+    if (try source.readPositionalAll(source_io, &extra, offset) != 0) return error.SourceFileChanged;
+    try writer.end();
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const etag = try digestHexAlloc(alloc, &digest);
+    errdefer alloc.free(etag);
+    encodeObjectHeader(&placeholder, source_stat.size, content_type.len, etag);
+    try output.writePositionalAll(io, &placeholder, 0);
+    try output.sync(io);
+    output.close(io);
+    output_open = false;
+
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    return etag;
+}
+
+fn encodeObjectHeader(out: *[object_header_len]u8, content_length: u64, content_type_len: usize, etag: []const u8) void {
+    std.debug.assert(etag.len == 64);
+    @memcpy(out[0..object_magic.len], object_magic);
+    std.mem.writeInt(u64, out[object_magic.len..][0..8], content_length, .little);
+    std.mem.writeInt(u32, out[object_magic.len + 8 ..][0..4], @intCast(content_type_len), .little);
+    @memcpy(out[object_magic.len + 12 ..], etag);
 }
 
 fn readObjectHeader(alloc: Allocator, io: std.Io, file: std.Io.File, file_size: u64) !ObjectHeader {
@@ -569,6 +678,10 @@ fn partCount(content_length: u64) usize {
 fn sha256HexAlloc(alloc: Allocator, body: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    return try digestHexAlloc(alloc, &digest);
+}
+
+fn digestHexAlloc(alloc: Allocator, digest: *const [32]u8) ![]u8 {
     const out = try alloc.alloc(u8, 64);
     for (digest, 0..) |byte, idx| {
         out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
@@ -640,19 +753,17 @@ fn validateKey(key: []const u8) !void {
     }
 }
 
-fn lessEntry(_: void, lhs: types.ListEntry, rhs: types.ListEntry) bool {
-    return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+const ListCandidate = struct {
+    name: []u8,
+    is_prefix: bool,
+};
+
+fn candidateMaxOrder(_: void, lhs: ListCandidate, rhs: ListCandidate) std.math.Order {
+    return std.mem.order(u8, rhs.name, lhs.name);
 }
 
-fn lessPrefix(_: void, lhs: []u8, rhs: []u8) bool {
-    return std.mem.order(u8, lhs, rhs) == .lt;
-}
-
-fn containsPrefix(prefixes: []const []u8, needle: []const u8) bool {
-    for (prefixes) |prefix| {
-        if (std.mem.eql(u8, prefix, needle)) return true;
-    }
-    return false;
+fn candidateLessThan(_: void, lhs: ListCandidate, rhs: ListCandidate) bool {
+    return std.mem.order(u8, lhs.name, rhs.name) == .lt;
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
@@ -754,4 +865,48 @@ test "filesystem client rejects paths that escape its root" {
         .start_after = "a",
         .continuation_token = "b",
     }));
+}
+
+test "filesystem pagination retains only the requested ordered window" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "bounded-pagination");
+    defer cleanupTmp(path);
+
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+    const keys = [_][]const u8{ "logs/c/2", "logs/a/2", "logs/b/1", "logs/a/1", "logs/c/1" };
+    for (keys) |key| {
+        var result = try client.putObject("bucket", key, key, .{});
+        result.deinit(alloc);
+    }
+
+    var first = try client.listObjects("bucket", .{ .prefix = "logs/", .max_keys = 2 });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), first.entries.len);
+    try std.testing.expectEqualStrings("logs/a/1", first.entries[0].key);
+    try std.testing.expectEqualStrings("logs/a/2", first.entries[1].key);
+    try std.testing.expectEqualStrings("logs/a/2", first.next_continuation_token.?);
+
+    var second = try client.listObjects("bucket", .{
+        .prefix = "logs/",
+        .max_keys = 2,
+        .continuation_token = first.next_continuation_token,
+    });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), second.entries.len);
+    try std.testing.expectEqualStrings("logs/b/1", second.entries[0].key);
+    try std.testing.expectEqualStrings("logs/c/1", second.entries[1].key);
+
+    var collapsed = try client.listObjects("bucket", .{
+        .prefix = "logs/",
+        .recursive = false,
+        .max_keys = 2,
+    });
+    defer collapsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), collapsed.common_prefixes.len);
+    try std.testing.expectEqualStrings("logs/a/", collapsed.common_prefixes[0]);
+    try std.testing.expectEqualStrings("logs/b/", collapsed.common_prefixes[1]);
+    try std.testing.expectEqualStrings("logs/b/", collapsed.next_continuation_token.?);
 }

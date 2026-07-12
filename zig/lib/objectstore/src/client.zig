@@ -16,6 +16,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const file_transfer_chunk_bytes: u64 = 8 * 1024 * 1024;
+const fallback_upload_limit_bytes: u64 = 64 * 1024 * 1024;
+const max_list_page_keys: u32 = 10_000;
 
 pub const Client = struct {
     allocator: Allocator,
@@ -27,6 +29,7 @@ pub const Client = struct {
         bucket_exists: *const fn (*anyopaque, []const u8) anyerror!bool,
         make_bucket: *const fn (*anyopaque, []const u8) anyerror!void,
         put_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult,
+        put_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult = null,
         get_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, types.GetOptions) anyerror!types.GetResult,
         get_object_attributes: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectAttributes,
         stat_object: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectMetadata,
@@ -58,8 +61,16 @@ pub const Client = struct {
     }
 
     pub fn putFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
-        const body = try readFileAlloc(self.allocator, io, src_path);
+        if (self.vtable.put_file) |put_file| return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
+        const file = try openFilePath(io, src_path);
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.size > fallback_upload_limit_bytes) return error.StreamingUploadUnsupported;
+        const body = try self.allocator.alloc(u8, @intCast(stat.size));
         defer self.allocator.free(body);
+        if (try file.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+        var extra: [1]u8 = undefined;
+        if (try file.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
         return try self.putObject(bucket, key, body, opts);
     }
 
@@ -127,6 +138,7 @@ pub const Client = struct {
 
     pub fn listObjects(self: *Client, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         if (opts.max_keys == 0) return error.InvalidPageSize;
+        if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
         if (opts.start_after != null and opts.continuation_token != null) return error.AmbiguousContinuation;
         return try self.vtable.list_objects(self.ptr, self.allocator, bucket, opts);
     }
@@ -136,13 +148,16 @@ fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
-fn readFileAlloc(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
-    return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(std.math.maxInt(usize)));
-}
-
 fn ensureParentDir(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
     try std.Io.Dir.cwd().createDirPath(io, parent);
+}
+
+fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
 fn writeFileAtomically(io: std.Io, path: []const u8, contents: []const u8) !void {

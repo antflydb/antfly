@@ -171,6 +171,17 @@ support fail closed rather than weakening conditional writes. Upload staging
 lives outside the enumerable key namespace, so concurrent pagination cannot
 observe partial objects or internal temporary keys.
 
+Backup uploads are bounded as well. Filesystem connections stream directly
+into their staged object envelope; S3 multipart parts and GCS resumable chunks
+start at 16 MiB and grow for very large objects to keep request counts bounded.
+Failed sessions are aborted or cancelled, source-file
+growth and truncation are detected, and providers without a streaming upload
+capability reject files above 64 MiB instead of attempting an unbounded heap
+allocation. Filesystem listing retains only the smallest requested page plus
+one continuation candidate, so page memory is bounded by the requested page
+size even when the archive contains many more objects. Page sizes are capped at
+10,000 keys to keep caller-controlled memory and sorting work predictable.
+
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the
 `s3://` location continues to identify the artifact:
