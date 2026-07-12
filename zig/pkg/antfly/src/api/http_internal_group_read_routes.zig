@@ -126,6 +126,18 @@ const DenseQueryComputeContext = struct {
     }
 };
 
+const TemplateQueryComputeContext = struct {
+    runtime: *const managed_embedder.ManagedEmbedder,
+    index_name: []const u8,
+    text: []const u8,
+    embedding_template: []const u8,
+
+    fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return embedTemplateInteractive(self.runtime, alloc, self.index_name, self.text, self.embedding_template);
+    }
+};
+
 fn embedInteractive(
     runtime: *const managed_embedder.ManagedEmbedder,
     alloc: std.mem.Allocator,
@@ -178,21 +190,29 @@ pub fn planSemanticQuery(
     defer runtime.deinit();
 
     return .{
-        .vector = if (embedding_template) |value|
-            try embedTemplateInteractive(&runtime, alloc, index_name, semantic_search, value)
-        else blk: {
-            const cache = planning.query_embedding_cache orelse
-                break :blk try embedInteractive(&runtime, alloc, index_name, semantic_search);
-            const budget = planning.query_embedding_budget orelse
-                break :blk try embedInteractive(&runtime, alloc, index_name, semantic_search);
-            const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
-                error.QueryEmbeddingNotCacheable => break :blk try embedInteractive(&runtime, alloc, index_name, semantic_search),
-                else => return err,
+        .vector = if (embedding_template) |value| blk: {
+            var compute_context = TemplateQueryComputeContext{
+                .runtime = &runtime,
+                .index_name = index_name,
+                .text = semantic_search,
+                .embedding_template = value,
             };
+            const cache = planning.query_embedding_cache orelse
+                break :blk try TemplateQueryComputeContext.run(&compute_context, alloc);
+            break :blk try cache.computeUncached(alloc, planning.query_embedding_deadline_ns, &compute_context, TemplateQueryComputeContext.run);
+        } else blk: {
             var compute_context = DenseQueryComputeContext{
                 .runtime = &runtime,
                 .index_name = index_name,
                 .text = semantic_search,
+            };
+            const cache = planning.query_embedding_cache orelse
+                break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
+            const budget = planning.query_embedding_budget orelse
+                break :blk try cache.computeUncached(alloc, planning.query_embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+            const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
+                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, planning.query_embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
+                else => return err,
             };
             break :blk try cache.getOrCompute(budget, alloc, key, planning.query_embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
         },
@@ -302,6 +322,13 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     defer alloc.free(isolated.vector);
     try std.testing.expectEqual(@as(usize, 2), provider.calls);
 
+    const templated = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", "{{this}}", 5);
+    defer alloc.free(templated.vector);
+    const templated_again = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", "{{this}}", 5);
+    defer alloc.free(templated_again.vector);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).uncached_computations);
+
     const oversized = try alloc.alloc(u8, max_query_embedding_input_bytes + 1);
     defer alloc.free(oversized);
     @memset(oversized, 'x');
@@ -309,7 +336,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.QueryEmbeddingInputTooLarge,
         planSemanticQuery(base, alloc, "docs_a", "semantic_idx", oversized, null, 5),
     );
-    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
 
     const oversized_template = try alloc.alloc(u8, max_query_embedding_template_bytes + 1);
     defer alloc.free(oversized_template);
@@ -318,7 +345,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         error.QueryEmbeddingInputTooLarge,
         planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", oversized_template, 5),
     );
-    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
 }
 
 const SemanticStatusResolver = struct {

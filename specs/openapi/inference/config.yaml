@@ -1439,12 +1439,13 @@ components:
         Process-local cache for dense query embeddings. Cache lookup and
         singleflight happen before provider pacing and local inference queueing.
         Entries are isolated by the server-derived security domain and effective
-        embedding operation. Templated and multimodal queries bypass this cache.
+        embedding operation. Templated and multimodal queries bypass retention
+        and singleflight but share the max_inflight provider admission bound.
       properties:
         enabled:
           type: boolean
           default: true
-          description: Enable query embedding result caching and concurrent miss coalescing.
+          description: Enable query embedding result caching, concurrent miss coalescing, and provider admission control. When false, max_inflight is not enforced.
         max_bytes_mb:
           type: integer
           minimum: 0
@@ -1462,7 +1463,7 @@ components:
           minimum: 1
           maximum: 65536
           default: 1024
-          description: Maximum distinct query embedding computations in flight. Existing-key waiters continue to coalesce when this limit is reached.
+          description: Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached.
 
     Config:
       type: object

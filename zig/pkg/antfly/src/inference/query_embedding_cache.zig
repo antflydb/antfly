@@ -24,6 +24,7 @@ pub const Stats = struct {
     misses: u64 = 0,
     coalesced_waiters: u64 = 0,
     producer_computations: u64 = 0,
+    uncached_computations: u64 = 0,
     producer_compute_ns_total: u64 = 0,
     inflight_rejections: u64 = 0,
     waiter_timeouts: u64 = 0,
@@ -73,6 +74,7 @@ pub const QueryEmbeddingCache = struct {
     oldest: ?*Entry = null,
     live_bytes: usize = 0,
     active_pins: usize = 0,
+    uncached_inflight: usize = 0,
     counters: Stats = .{},
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, config: Config) QueryEmbeddingCache {
@@ -86,6 +88,7 @@ pub const QueryEmbeddingCache = struct {
     pub fn deinit(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) void {
         self.mutex.lockUncancelable(self.io);
         std.debug.assert(self.flights.count() == 0);
+        std.debug.assert(self.uncached_inflight == 0);
         std.debug.assert(self.active_pins == 0);
         while (self.oldest) |entry| self.removeEntryLocked(entry, budget, false);
         self.entries.deinit(self.alloc);
@@ -157,23 +160,23 @@ pub const QueryEmbeddingCache = struct {
             return error.Timeout;
         }
 
-        if (self.flights.count() >= self.config.max_inflight) {
+        if (self.totalInflightLocked() >= self.config.max_inflight) {
             self.counters.inflight_rejections +|= 1;
             self.mutex.unlock(io);
             return error.QueryEmbeddingOverloaded;
         }
 
-        const flight = self.alloc.create(Flight) catch {
-            self.counters.rejected_admissions += 1;
+        const flight = self.alloc.create(Flight) catch |err| {
+            self.counters.rejected_admissions +|= 1;
             self.mutex.unlock(io);
-            return compute(context, caller_alloc);
+            return err;
         };
         flight.* = .{};
-        self.flights.put(self.alloc, key, flight) catch {
+        self.flights.put(self.alloc, key, flight) catch |err| {
             self.alloc.destroy(flight);
-            self.counters.rejected_admissions += 1;
+            self.counters.rejected_admissions +|= 1;
             self.mutex.unlock(io);
-            return compute(context, caller_alloc);
+            return err;
         };
         self.counters.misses += 1;
         self.counters.producer_computations += 1;
@@ -213,6 +216,42 @@ pub const QueryEmbeddingCache = struct {
         return result;
     }
 
+    /// Run a query embedding that is unsafe to retain or coalesce while still
+    /// sharing the provider admission bound with cacheable producers.
+    pub fn computeUncached(
+        self: *QueryEmbeddingCache,
+        caller_alloc: std.mem.Allocator,
+        deadline_ns: ?u64,
+        context: *anyopaque,
+        compute: ComputeFn,
+    ) ![]f32 {
+        if (!self.config.enabled) return compute(context, caller_alloc);
+
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        if (deadlineExpired(deadline_ns)) {
+            self.mutex.unlock(io);
+            return error.Timeout;
+        }
+        if (self.totalInflightLocked() >= self.config.max_inflight) {
+            self.counters.inflight_rejections +|= 1;
+            self.mutex.unlock(io);
+            return error.QueryEmbeddingOverloaded;
+        }
+        self.uncached_inflight += 1;
+        self.counters.producer_computations +|= 1;
+        self.counters.uncached_computations +|= 1;
+        self.mutex.unlock(io);
+
+        const compute_started_ns = platform_time.monotonicNs();
+        const result = compute(context, caller_alloc) catch |err| {
+            self.finishUncachedCompute(compute_started_ns);
+            return err;
+        };
+        self.finishUncachedCompute(compute_started_ns);
+        return result;
+    }
+
     pub fn stats(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) Stats {
         const io = self.io;
         self.mutex.lockUncancelable(io);
@@ -221,7 +260,7 @@ pub const QueryEmbeddingCache = struct {
         var result = self.counters;
         result.entries = self.entries.count();
         result.live_bytes = self.live_bytes;
-        result.inflight = self.flights.count();
+        result.inflight = self.totalInflightLocked();
         result.max_inflight = self.config.max_inflight;
         return result;
     }
@@ -229,6 +268,19 @@ pub const QueryEmbeddingCache = struct {
     fn recordProducerDurationLocked(self: *QueryEmbeddingCache, started_ns: u64) void {
         const elapsed_ns = platform_time.monotonicNs() -| started_ns;
         self.counters.producer_compute_ns_total +|= elapsed_ns;
+    }
+
+    fn totalInflightLocked(self: *const QueryEmbeddingCache) usize {
+        return self.flights.count() + self.uncached_inflight;
+    }
+
+    fn finishUncachedCompute(self: *QueryEmbeddingCache, started_ns: u64) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        std.debug.assert(self.uncached_inflight > 0);
+        self.uncached_inflight -= 1;
+        self.recordProducerDurationLocked(started_ns);
+        self.mutex.unlock(io);
     }
 
     fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64) !void {
@@ -539,8 +591,12 @@ pub fn testInflightAdmissionBound() !void {
         error.QueryEmbeddingOverloaded,
         cache.getOrCompute(&budget, std.testing.allocator, rejected_key, null, &compute, BlockingCompute.run),
     );
+    try std.testing.expectError(
+        error.QueryEmbeddingOverloaded,
+        cache.computeUncached(std.testing.allocator, null, &compute, BlockingCompute.run),
+    );
     const current = cache.stats(&budget);
-    try std.testing.expectEqual(@as(u64, 1), current.inflight_rejections);
+    try std.testing.expectEqual(@as(u64, 2), current.inflight_rejections);
     try std.testing.expectEqual(@as(u64, 1), current.waiter_timeouts);
     try std.testing.expectEqual(@as(u64, 1), current.coalesced_waiters);
     try std.testing.expectEqual(@as(usize, 1), current.inflight);
@@ -551,10 +607,37 @@ pub fn testInflightAdmissionBound() !void {
     producer_thread.join();
     defer if (producer.result) |result| std.heap.page_allocator.free(result);
     try std.testing.expectEqual(@as(?anyerror, null), producer.err);
+
+    const uncached = try cache.computeUncached(std.testing.allocator, null, &compute, BlockingCompute.run);
+    defer std.testing.allocator.free(uncached);
+    const completed = cache.stats(&budget);
+    try std.testing.expectEqual(@as(u64, 1), completed.uncached_computations);
+    try std.testing.expectEqual(@as(usize, 0), completed.inflight);
+    try std.testing.expectEqual(@as(u64, 2), compute.calls.load(.monotonic));
 }
 
 test "query embedding cache bounds distinct in-flight misses" {
     try testInflightAdmissionBound();
+}
+
+pub fn testFlightBookkeepingOOMFailsClosed() !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(failing.allocator(), std.Io.Threaded.global_single_threaded.io(), .{});
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 1 };
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        cache.getOrCompute(&budget, std.testing.allocator, [_]u8{8} ** 32, null, &compute, TestCompute.run),
+    );
+    try std.testing.expectEqual(@as(u64, 0), compute.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), cache.stats(&budget).rejected_admissions);
+}
+
+test "query embedding cache fails closed when flight bookkeeping allocation fails" {
+    try testFlightBookkeepingOOMFailsClosed();
 }
 
 pub fn testByteBudgetEviction() !void {

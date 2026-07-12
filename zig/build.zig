@@ -3253,6 +3253,7 @@ pub fn build(b: *std.Build) void {
     serverless_test_step.dependOn(&run_serverless_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget reuses cached group status instead of opening db",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",

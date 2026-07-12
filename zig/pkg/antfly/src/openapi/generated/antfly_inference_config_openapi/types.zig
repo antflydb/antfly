@@ -657,15 +657,15 @@ pub const ModelsResponse = struct {
     transcribers: std.json.ArrayHashMap(ModelInfo),
 };
 
-/// Process-local cache for dense query embeddings. Cache lookup and singleflight happen before provider pacing and local inference queueing. Entries are isolated by the server-derived security domain and effective embedding operation. Templated and multimodal queries bypass this cache.
+/// Process-local cache for dense query embeddings. Cache lookup and singleflight happen before provider pacing and local inference queueing. Entries are isolated by the server-derived security domain and effective embedding operation. Templated and multimodal queries bypass retention and singleflight but share the max_inflight provider admission bound.
 pub const QueryEmbeddingCacheConfig = struct {
-    /// Enable query embedding result caching and concurrent miss coalescing.
+    /// Enable query embedding result caching, concurrent miss coalescing, and provider admission control. When false, max_inflight is not enforced.
     enabled: ?bool = null,
     /// Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
     max_bytes_mb: ?i64 = null,
     /// Idle expiration in milliseconds. Cache hits refresh the expiry time.
     ttl_ms: ?i64 = null,
-    /// Maximum distinct query embedding computations in flight. Existing-key waiters continue to coalesce when this limit is reached.
+    /// Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached.
     max_inflight: ?i64 = null,
 };
 

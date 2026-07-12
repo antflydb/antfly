@@ -138,13 +138,15 @@ inference:
 `max_bytes_mb: 0` disables result retention while preserving singleflight.
 `enabled: false` bypasses both caching and singleflight.
 
-`max_inflight` bounds distinct producer keys before provider pacing and local
-inference queueing. Requests for a key already in flight still coalesce when
-the limit is reached; new unique misses receive an overload response. This
-prevents high-cardinality traffic from turning the singleflight map into an
-unbounded upstream queue. Public overload, provider rate-limit, and transient
-provider responses include a short `Retry-After` hint so clients can back off
-instead of immediately amplifying pressure.
+`max_inflight` bounds all query embedding provider computations before provider
+pacing and local inference queueing. Requests for a cacheable key already in
+flight still coalesce when the limit is reached; new unique misses receive an
+overload response. Templated and otherwise non-cacheable queries do not retain
+or coalesce results, but they consume the same admission pool so callers cannot
+bypass provider protection by selecting an uncached request shape. Public
+overload, provider rate-limit, and transient provider responses include a short
+`Retry-After` hint so clients can back off instead of immediately amplifying
+pressure.
 
 Plain and templated semantic query text is limited to 1 MiB of UTF-8 input, and
 user-supplied embedding templates are limited to 64 KiB. Both limits are checked
@@ -167,8 +169,9 @@ or reject admission; resource-pressure observation alone is not enforcement.
 ## Metrics
 
 The data-server metrics endpoint exports query-cache hits, misses, coalesced
-waiters, producers, evictions, expirations, rejected admissions, entries, live
-bytes, aggregate producer compute time, and aggregate budget use/rejections.
+waiters, producers, uncached computations, evictions, expirations, rejected
+admissions, entries, live bytes, aggregate producer compute time, and aggregate
+budget use/rejections.
 The endpoint also reports in-flight admission rejections and waiter timeouts so
 operators can distinguish upstream saturation from cache-capacity churn.
 Metrics snapshots also expire a bounded batch from an idle LRU tail, so a quiet
