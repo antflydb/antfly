@@ -1312,10 +1312,10 @@ test "table provisioner replaces embedding index when metadata incarnation chang
     defer db.close();
 
     const first =
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:1"},"_antfly_coverage_incarnation":41}}
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:1"},"_coverage_incarnation":41}}
     ;
     const second =
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:1"},"_antfly_coverage_incarnation":42}}
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:1"},"_coverage_incarnation":42}}
     ;
     const initial = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, first, .{});
     try std.testing.expectEqual(@as(usize, 1), initial.indexes_added);

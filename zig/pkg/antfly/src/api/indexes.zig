@@ -53,7 +53,7 @@ pub fn addIndexToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
-    const stored_config = coverage_policy_mod.withFreshIncarnationAlloc(alloc, config.value) catch return error.InvalidCreateIndexRequest;
+    const stored_config = coverage_policy_mod.withIncarnationIfMissingAlloc(alloc, config.value) catch return error.InvalidCreateIndexRequest;
     defer alloc.free(stored_config);
 
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -2899,6 +2899,19 @@ test "index config map encoder injects canonical name and type" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384}") != null);
 }
 
+test "public index config encoders redact coverage incarnation" {
+    const indexes_json =
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"_coverage_incarnation":42}}
+    ;
+    const encoded_map = try encodeIndexConfigMap(std.testing.allocator, indexes_json);
+    defer std.testing.allocator.free(encoded_map);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_map, coverage_policy_mod.incarnation_field) == null);
+
+    const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
+    defer std.testing.allocator.free(encoded_single);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_single, coverage_policy_mod.incarnation_field) == null);
+}
+
 test "index status encoder projects inline enrichment configs as names" {
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
@@ -4443,7 +4456,7 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
 }
 
 test "partial coverage embeddings readiness counts skipped source units" {
-    const config_json = "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_antfly_coverage_incarnation\":42}";
+    const config_json = "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
     var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
     defer parsed_config.deinit();
     const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "visual_idx", parsed_config.value);
@@ -4518,7 +4531,7 @@ test "partial coverage embeddings readiness counts skipped source units" {
 }
 
 test "partial coverage embeddings readiness does not mask pending enrichment" {
-    const config_json = "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_antfly_coverage_incarnation\":42}";
+    const config_json = "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
     var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
     defer parsed_config.deinit();
     const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "visual_idx", parsed_config.value);

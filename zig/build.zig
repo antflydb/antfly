@@ -4329,6 +4329,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "coverage policy accepts only the public embeddings contract",
             "coverage policy assigns persistent private incarnations only to embeddings",
+            "public index config encoders redact coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage aggregation rejects stale index incarnations",
@@ -4338,6 +4339,7 @@ pub fn build(b: *std.Build) void {
             "table runtime snapshot cache clones stored status",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
+            "api http server create index waits for exact target config projection",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4358,7 +4360,11 @@ pub fn build(b: *std.Build) void {
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_writes_restore_repeat_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{"provisioned native backup restore repeats through shared read and write owners"},
+        .filters = &.{
+            "provisioned native backup restore repeats through shared read and write owners",
+            "provisioned table restore preparation blocks writes and competing structural mutation",
+            "provisioned table restore preparation blocks writes while allowing reads",
+        },
     });
     const run_api_table_writes_restore_repeat_tests = b.addRunArtifact(api_table_writes_restore_repeat_tests);
     const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");

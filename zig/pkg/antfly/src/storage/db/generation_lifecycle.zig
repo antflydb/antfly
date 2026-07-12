@@ -16,15 +16,18 @@ const Allocator = std.mem.Allocator;
 const publication_marker_name = ".antfly-generation-publication-v1";
 const publication_marker_data = "antfly_generation_publication_v1\n";
 const publication_lock_suffix = ".antfly-generation.lock";
+const preparation_lock_suffix = ".antfly-generation-prepare.lock";
 const max_reconciled_paths = 8192;
 
 fn publicationLockPathAlloc(alloc: Allocator, canonical_path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ canonical_path, publication_lock_suffix });
 }
 
-fn openPublicationLock(alloc: Allocator, canonical_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
-    const lock_path = try publicationLockPathAlloc(alloc, canonical_path);
-    defer alloc.free(lock_path);
+fn preparationLockPathAlloc(alloc: Allocator, canonical_path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ canonical_path, preparation_lock_suffix });
+}
+
+fn openPathLock(lock_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     if (std.fs.path.dirname(lock_path)) |parent| try fs_paths.createDirPathPortable(io_impl.io(), parent);
@@ -40,13 +43,25 @@ fn openPublicationLock(alloc: Allocator, canonical_path: []const u8, lock: std.I
     };
 }
 
+fn openPublicationLock(alloc: Allocator, canonical_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
+    const lock_path = try publicationLockPathAlloc(alloc, canonical_path);
+    defer alloc.free(lock_path);
+    return try openPathLock(lock_path, lock);
+}
+
+fn openPreparationLock(alloc: Allocator, canonical_path: []const u8) !std.Io.File {
+    const lock_path = try preparationLockPathAlloc(alloc, canonical_path);
+    defer alloc.free(lock_path);
+    return try openPathLock(lock_path, .exclusive);
+}
+
 fn closePublicationLock(file: std.Io.File) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     file.close(io_impl.io());
 }
 
-const LeaseKind = enum { exclusive, reconciliation, read };
+const LeaseKind = enum { preparation, exclusive, reconciliation, read };
 
 fn realPathAlloc(alloc: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
     if (std.fs.path.isAbsolute(path)) return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, alloc);
@@ -141,11 +156,12 @@ const ActiveTransition = struct {
 
 const PathState = struct {
     readers: usize = 0,
+    preparation: bool = false,
     reconciliation: bool = false,
     exclusive: bool = false,
 
     fn isEmpty(self: PathState) bool {
-        return self.readers == 0 and !self.reconciliation and !self.exclusive;
+        return self.readers == 0 and !self.preparation and !self.reconciliation and !self.exclusive;
     }
 };
 
@@ -187,6 +203,8 @@ const Manager = struct {
         // Filesystem lock acquisition can block or fail. Keep it outside the
         // manager mutex so rollback never has to re-enter the mutex through an
         // ExclusiveTransition destructor.
+        const preparation_lock = try openPreparationLock(self.allocator, path_key);
+        errdefer closePublicationLock(preparation_lock);
         const publication_lock = try openPublicationLock(self.allocator, path_key, .exclusive);
         errdefer closePublicationLock(publication_lock);
 
@@ -214,8 +232,47 @@ const Manager = struct {
             .path = owned_path,
             .id = id,
             .publication_lock = publication_lock,
+            .preparation_lock = preparation_lock,
         };
         return transition;
+    }
+
+    pub fn beginPreparation(self: *Manager, path: []const u8, cleanup_scheduler: ?CleanupScheduler) !PreparationTransition {
+        const path_key = try canonicalPathAlloc(self.allocator, path);
+        errdefer self.allocator.free(path_key);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+
+        const preparation_lock = try openPreparationLock(self.allocator, path_key);
+        errdefer closePublicationLock(preparation_lock);
+        const publication_lock = try openPublicationLock(self.allocator, path_key, .shared);
+        errdefer closePublicationLock(publication_lock);
+
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.path_states.get(path_key)) |state| {
+            if (state.preparation or state.exclusive or state.reconciliation) return error.GenerationTransitionActive;
+        }
+
+        const id = self.next_id;
+        self.next_id +%= 1;
+        if (self.next_id == 0) self.next_id = 1;
+        const state = try self.getOrPutPathStateLocked(path_key);
+        state.preparation = true;
+        errdefer {
+            state.preparation = false;
+            self.removeEmptyPathStateLocked(path_key);
+        }
+        try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = path_key, .id = id, .kind = .preparation });
+        return .{
+            .manager = self,
+            .alloc = self.allocator,
+            .path = owned_path,
+            .id = id,
+            .cleanup_scheduler = cleanup_scheduler,
+            .publication_lock = publication_lock,
+            .preparation_lock = preparation_lock,
+        };
     }
 
     fn beginReconciliation(self: *Manager, path: []const u8) !?ReconciliationLease {
@@ -306,6 +363,40 @@ const Manager = struct {
         const entry = self.active.get(id) orelse return error.InvalidGenerationTransition;
         if (entry.kind == .exclusive and std.mem.eql(u8, entry.path, path)) return;
         return error.InvalidGenerationTransition;
+    }
+
+    fn validateStaging(self: *Manager, id: u64, path: []const u8) !void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = self.active.get(id) orelse return error.InvalidGenerationTransition;
+        if ((entry.kind == .preparation or entry.kind == .exclusive) and std.mem.eql(u8, entry.path, path)) return;
+        return error.InvalidGenerationTransition;
+    }
+
+    fn finishPreparation(self: *Manager, path: []const u8, id: u64) void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const removed = self.active.fetchRemove(id) orelse unreachable;
+        std.debug.assert(removed.value.kind == .preparation and std.mem.eql(u8, removed.value.path, path));
+        const state = self.path_states.getPtr(removed.value.path_key) orelse unreachable;
+        std.debug.assert(state.preparation);
+        state.preparation = false;
+        self.removeEmptyPathStateLocked(removed.value.path_key);
+        self.allocator.free(removed.value.path);
+        self.allocator.free(removed.value.path_key);
+    }
+
+    fn promotePreparation(self: *Manager, path: []const u8, id: u64) !void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const active = self.active.getPtr(id) orelse return error.InvalidGenerationTransition;
+        if (active.kind != .preparation or !std.mem.eql(u8, active.path, path)) return error.InvalidGenerationTransition;
+        const state = self.path_states.getPtr(active.path_key) orelse unreachable;
+        if (state.readers != 0 or state.exclusive or state.reconciliation or !state.preparation) return error.GenerationTransitionActive;
+        state.preparation = false;
+        state.exclusive = true;
+        active.kind = .exclusive;
+        self.removeReconciledPathLocked(active.path_key);
     }
 
     fn removeReconciledPathLocked(self: *Manager, path: []const u8) void {
@@ -445,12 +536,83 @@ pub const ReadLease = struct {
     }
 };
 
+pub const PreparationTransition = struct {
+    manager: *Manager,
+    alloc: Allocator,
+    path: []const u8,
+    id: u64,
+    cleanup_scheduler: ?CleanupScheduler = null,
+    publication_lock: ?std.Io.File,
+    preparation_lock: ?std.Io.File,
+    active: bool = true,
+
+    pub fn beginStaging(self: *PreparationTransition) !StagedGeneration {
+        if (!self.active) return error.InvalidGenerationTransition;
+        try self.manager.validateStaging(self.id, self.path);
+        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, false);
+    }
+
+    pub fn promote(self: *PreparationTransition) !ExclusiveTransition {
+        if (!self.active) return error.InvalidGenerationTransition;
+        const path_key = try canonicalPathAlloc(self.alloc, self.path);
+        defer self.alloc.free(path_key);
+        if (self.publication_lock) |file| closePublicationLock(file);
+        self.publication_lock = null;
+        const publication_lock = openPublicationLock(self.alloc, path_key, .exclusive) catch |promotion_err| {
+            self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
+                std.log.err("generation preparation failed to restore publication read lock path={s} promotion_err={s} reacquire_err={s}", .{
+                    self.path,
+                    @errorName(promotion_err),
+                    @errorName(reacquire_err),
+                });
+                return reacquire_err;
+            };
+            return promotion_err;
+        };
+        self.manager.promotePreparation(self.path, self.id) catch |promotion_err| {
+            closePublicationLock(publication_lock);
+            self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
+                std.log.err("generation preparation failed to restore publication read lock path={s} promotion_err={s} reacquire_err={s}", .{
+                    self.path,
+                    @errorName(promotion_err),
+                    @errorName(reacquire_err),
+                });
+                return reacquire_err;
+            };
+            return promotion_err;
+        };
+        self.active = false;
+        const preparation_lock = self.preparation_lock.?;
+        self.preparation_lock = null;
+        return .{
+            .manager = self.manager,
+            .alloc = self.alloc,
+            .path = self.path,
+            .id = self.id,
+            .publication_lock = publication_lock,
+            .preparation_lock = preparation_lock,
+            .cleanup_scheduler = self.cleanup_scheduler,
+        };
+    }
+
+    pub fn deinit(self: *PreparationTransition) void {
+        if (!self.active) return;
+        if (self.publication_lock) |file| closePublicationLock(file);
+        self.publication_lock = null;
+        if (self.preparation_lock) |file| closePublicationLock(file);
+        self.preparation_lock = null;
+        self.manager.finishPreparation(self.path, self.id);
+        self.active = false;
+    }
+};
+
 pub const ExclusiveTransition = struct {
     manager: *Manager,
     alloc: Allocator,
     path: []const u8,
     id: u64,
     publication_lock: ?std.Io.File = null,
+    preparation_lock: ?std.Io.File = null,
     cleanup_scheduler: ?CleanupScheduler = null,
     active: bool = true,
 
@@ -462,6 +624,8 @@ pub const ExclusiveTransition = struct {
         if (!self.active) return;
         if (self.publication_lock) |file| closePublicationLock(file);
         self.publication_lock = null;
+        if (self.preparation_lock) |file| closePublicationLock(file);
+        self.preparation_lock = null;
         self.manager.finishExclusive(self.path, self.id);
         self.active = false;
     }
@@ -475,30 +639,41 @@ pub const ExclusiveTransition = struct {
 
     pub fn beginStaging(self: *ExclusiveTransition) !StagedGeneration {
         try self.validate(self.path);
-        const live_path = try self.alloc.dupe(u8, self.path);
-        errdefer self.alloc.free(live_path);
-        const nonce = platform.time.monotonicNs();
-        const staging_path = try std.fmt.allocPrint(self.alloc, "{s}.restore-stage-{x}-{x}", .{ self.path, self.id, nonce });
-        errdefer self.alloc.free(staging_path);
-
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        _ = try reconcilePublishedGeneration(self.alloc, io, self.path, self.cleanup_scheduler);
-        if (pathExists(io, staging_path)) return error.GenerationStagingCollision;
-        try fs_paths.createDirPathPortable(io, staging_path);
-        errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
-        try writePublicationMarker(self.alloc, io, staging_path);
-        return .{
-            .alloc = self.alloc,
-            .manager = self.manager,
-            .transition_id = self.id,
-            .live_path = live_path,
-            .staging_path = staging_path,
-            .cleanup_scheduler = self.cleanup_scheduler,
-        };
+        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, true);
     }
 };
+
+fn beginStagingGeneration(
+    alloc: Allocator,
+    manager: *Manager,
+    path: []const u8,
+    transition_id: u64,
+    cleanup_scheduler: ?CleanupScheduler,
+    reconcile: bool,
+) !StagedGeneration {
+    const live_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(live_path);
+    const nonce = platform.time.monotonicNs();
+    const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-{x}-{x}", .{ path, transition_id, nonce });
+    errdefer alloc.free(staging_path);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    if (reconcile) _ = try reconcilePublishedGeneration(alloc, io, path, cleanup_scheduler);
+    if (pathExists(io, staging_path)) return error.GenerationStagingCollision;
+    try fs_paths.createDirPathPortable(io, staging_path);
+    errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
+    try writePublicationMarker(alloc, io, staging_path);
+    return .{
+        .alloc = alloc,
+        .manager = manager,
+        .transition_id = transition_id,
+        .live_path = live_path,
+        .staging_path = staging_path,
+        .cleanup_scheduler = cleanup_scheduler,
+    };
+}
 
 pub const StagedGeneration = struct {
     alloc: Allocator,
@@ -507,6 +682,7 @@ pub const StagedGeneration = struct {
     live_path: []u8,
     staging_path: []u8,
     published: bool = false,
+    sealed: bool = false,
     preserve_retired: bool = false,
     cleanup_scheduler: ?CleanupScheduler = null,
     closed: bool = false,
@@ -517,12 +693,28 @@ pub const StagedGeneration = struct {
 
     pub fn validatePath(self: *const StagedGeneration, path_value: []const u8) !void {
         if (self.closed or !std.mem.eql(u8, self.staging_path, path_value)) return error.InvalidGenerationTransition;
-        try self.manager.validateExclusive(self.transition_id, self.live_path);
+        try self.manager.validateStaging(self.transition_id, self.live_path);
     }
 
     pub fn validateLivePath(self: *const StagedGeneration, path_value: []const u8) !void {
         if (self.closed or !std.mem.eql(u8, self.live_path, path_value)) return error.InvalidGenerationTransition;
-        try self.manager.validateExclusive(self.transition_id, self.live_path);
+        try self.manager.validateStaging(self.transition_id, self.live_path);
+    }
+
+    /// Makes every staged file durable before serving admission is quiesced.
+    /// Further writes to the candidate after sealing violate the transition
+    /// contract and require another seal before publication.
+    pub fn seal(self: *StagedGeneration) !void {
+        if (self.closed or self.published) return error.InvalidGenerationTransition;
+        try self.manager.validateStaging(self.transition_id, self.live_path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        if (!pathExists(io, self.staging_path)) return error.GenerationStagingMissing;
+        try syncTreePortable(self.alloc, io, self.staging_path);
+        const parent = std.fs.path.dirname(self.staging_path) orelse if (std.fs.path.isAbsolute(self.staging_path)) "/" else ".";
+        try fs_paths.syncDirPortable(io, parent);
+        self.sealed = true;
     }
 
     /// Errors are returned only before the live namespace changes. Once the
@@ -532,11 +724,12 @@ pub const StagedGeneration = struct {
         if (self.closed or self.published) return error.InvalidGenerationTransition;
         try self.manager.validateExclusive(self.transition_id, self.live_path);
 
+        if (!self.sealed) try self.seal();
+
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         if (!pathExists(io, self.staging_path)) return error.GenerationStagingMissing;
-        try syncTreePortable(self.alloc, io, self.staging_path);
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
         try fs_paths.syncDirPortable(io, parent);
 
@@ -889,6 +1082,10 @@ pub fn beginProcessExclusiveWithRuntime(path: []const u8, runtime: ?*background_
     return transition;
 }
 
+pub fn beginProcessPreparationWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !PreparationTransition {
+    return try process_manager.beginPreparation(path, CleanupScheduler.fromRuntime(runtime));
+}
+
 pub fn hasPublishedGenerationRead(path: []const u8) !bool {
     return try process_manager.hasReaders(path);
 }
@@ -907,6 +1104,43 @@ test "generation lifecycle serializes the same root and validates capability tar
 
     var other = try manager.beginExclusive("/tmp/table-b");
     other.deinit();
+}
+
+test "generation preparation overlaps reads but promotion requires reader drain" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    var preparation = try manager.beginPreparation(path, null);
+    defer preparation.deinit();
+    var read = try manager.beginRead(path);
+    try std.testing.expectError(error.GenerationTransitionActive, preparation.promote());
+    read.deinit();
+
+    var exclusive = try preparation.promote();
+    defer exclusive.deinit();
+    try exclusive.validate(path);
+    try std.testing.expectError(error.GenerationTransitionActive, manager.beginRead(path));
+}
+
+test "generation preparation excludes cross-manager publishers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-cross-manager", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var first = Manager.init(alloc);
+    defer first.deinit();
+    var second = Manager.init(alloc);
+    defer second.deinit();
+    var preparation = try first.beginPreparation(path, null);
+    defer preparation.deinit();
+    try std.testing.expectError(error.GenerationTransitionActive, second.beginExclusive(path));
 }
 
 test "generation lifecycle returns cross-manager filesystem lock contention" {
@@ -1036,6 +1270,50 @@ test "staged generation preserves live root until publication" {
 
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
     const after = try std.Io.Dir.cwd().readFileAlloc(io, live_value_path, alloc, .limited(16));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("new", after);
+}
+
+test "staged generation seals while readers remain admitted before atomic publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-live", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(live_value_path);
+
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "old" });
+
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    var preparation = try manager.beginPreparation(live_path, null);
+    defer preparation.deinit();
+    var reader = try manager.beginRead(live_path);
+    var reader_active = true;
+    defer if (reader_active) reader.deinit();
+    var staged = try preparation.beginStaging();
+    defer staged.deinit();
+
+    const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
+    defer alloc.free(staged_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "new" });
+
+    try staged.seal();
+    try std.testing.expect(staged.sealed);
+    try std.testing.expectError(error.GenerationTransitionActive, preparation.promote());
+    const before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    defer alloc.free(before);
+    try std.testing.expectEqualStrings("old", before);
+
+    reader.deinit();
+    reader_active = false;
+    var transition = try preparation.promote();
+    defer transition.deinit();
+    try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
+    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(after);
     try std.testing.expectEqualStrings("new", after);
 }

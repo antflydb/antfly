@@ -610,6 +610,7 @@ const AsyncContext = struct {
     repair_sequence: u64 = 0,
     allow_graph_materialization: bool = true,
     require_graph_resolution_contract: bool = false,
+    query_visibility_hook_mutex: std.atomic.Mutex = .unlocked,
     query_visibility_hook: ?QueryVisibilityHook = null,
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
@@ -3280,7 +3281,9 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
+        lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
+        self.async_context.query_visibility_hook_mutex.unlock();
         if (self.enrichment_runtime) |runtime| {
             runtime.setStatusHook(if (hook == null) null else .{
                 .ptr = self.async_context,
@@ -3291,7 +3294,17 @@ pub const DB = struct {
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        if (ctx.query_visibility_hook) |hook| hook.notify(.status);
+        notifyQueryVisibilityHook(ctx, .status);
+    }
+
+    fn queryVisibilityHook(ctx: *AsyncContext) ?QueryVisibilityHook {
+        lockAtomic(&ctx.query_visibility_hook_mutex);
+        defer ctx.query_visibility_hook_mutex.unlock();
+        return ctx.query_visibility_hook;
+    }
+
+    fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
+        if (queryVisibilityHook(ctx)) |hook| hook.notify(change);
     }
 
     const DetachedEnrichmentRuntime = struct {
@@ -3403,7 +3416,7 @@ pub const DB = struct {
         var cfg_owned = true;
         errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
 
-        const query_visibility_hook = self.async_context.query_visibility_hook;
+        const query_visibility_hook = queryVisibilityHook(self.async_context);
         var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
         cfg_owned = false;
         errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
@@ -3872,7 +3885,7 @@ pub const DB = struct {
             self.executor,
             self.core.nextDerivedSequence(),
         );
-        if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
+        notifyQueryVisibilityHook(self.async_context, .publish);
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
@@ -3918,7 +3931,7 @@ pub const DB = struct {
             self.executor,
             self.core.nextDerivedSequence(),
         );
-        if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
+        notifyQueryVisibilityHook(self.async_context, .publish);
     }
 
     pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
@@ -3965,7 +3978,7 @@ pub const DB = struct {
                 self.core.nextDerivedSequence(),
             );
         }
-        if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
+        notifyQueryVisibilityHook(self.async_context, .publish);
     }
 
     pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
@@ -9050,18 +9063,14 @@ pub const DB = struct {
         return try self.executeGraphQueriesWithSets(alloc, snapshot_req, graph_queries, named_sets);
     }
 
-    pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
-        if (restart_enrichment) self.enrichment_runtime.?.stop();
-        defer if (restart_enrichment) {
-            self.enrichment_runtime.?.start() catch |err| {
-                std.log.err("failed to restart enrichment runtime after index creation index={s} err={s}", .{ cfg.name, @errorName(err) });
-            };
-        };
+    const InstalledIndex = struct {
+        applied: u64,
+        needs_enrichment_replay: bool,
+    };
+
+    fn installIndexWhileEnrichmentQuiesced(self: *DB, cfg: types.IndexConfig) !InstalledIndex {
         lockApply(self);
-        var apply_locked = true;
-        errdefer if (apply_locked) self.core.unlockApply();
+        defer self.core.unlockApply();
         const applied = try self.core.addIndex(cfg);
         try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
             .index_name = cfg.name,
@@ -9071,8 +9080,31 @@ pub const DB = struct {
             self.hydrateAlgebraicObservationStatusForIndexBestEffort(cfg.name);
         }
         const needs_enrichment_replay = try self.core.indexRequiresEnrichmentReplay(cfg.name);
-        self.core.unlockApply();
-        apply_locked = false;
+        return .{ .applied = applied, .needs_enrichment_replay = needs_enrichment_replay };
+    }
+
+    fn restartEnrichmentAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) !void {
+        const runtime = self.enrichment_runtime orelse return;
+        runtime.start() catch |err| {
+            std.log.err("failed to restart enrichment runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            return err;
+        };
+    }
+
+    pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
+        if (restart_enrichment) self.enrichment_runtime.?.stop();
+        const installed = self.installIndexWhileEnrichmentQuiesced(cfg) catch |install_err| {
+            if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("failed index creation", cfg.name);
+            return install_err;
+        };
+        // Keep the global pause bounded to catalog/worker mutation. Corpus scans
+        // below are target-specific and may be arbitrarily large.
+        if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("index creation", cfg.name);
+
+        const needs_enrichment_replay = installed.needs_enrichment_replay;
+        const applied = installed.applied;
         var worker_applied = applied;
         if (needs_enrichment_replay) {
             // A newly admitted managed index owns a fresh coverage generation.
@@ -10122,20 +10154,24 @@ pub const DB = struct {
         };
     }
 
-    pub fn deleteIndex(self: *DB, name: []const u8) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
-        if (restart_enrichment) self.enrichment_runtime.?.stop();
-        defer if (restart_enrichment) {
-            self.enrichment_runtime.?.start() catch |err| {
-                std.log.err("failed to restart enrichment runtime after index deletion index={s} err={s}", .{ name, @errorName(err) });
-            };
-        };
+    fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !bool {
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
         const removed = try self.core.deleteIndex(name);
         if (removed) try self.deleteDerivedCoverageForIndex(name);
+        return removed;
+    }
+
+    pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
+        if (restart_enrichment) self.enrichment_runtime.?.stop();
+        const removed = self.deleteIndexWhileEnrichmentQuiesced(name) catch |delete_err| {
+            if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("failed index deletion", name);
+            return delete_err;
+        };
+        if (restart_enrichment) try self.restartEnrichmentAfterStructuralMutation("index deletion", name);
         return removed;
     }
 
@@ -29369,7 +29405,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
     finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     catch_up_tracked = false;
-    if (ctx.query_visibility_hook) |hook| {
+    if (DB.queryVisibilityHook(ctx)) |hook| {
         if (!published_visibility) hook.notify(.publish_consistent);
         hook.notify(.publish_blocking);
     }
@@ -29968,7 +30004,7 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-    if (ctx.query_visibility_hook) |hook| hook.notify(.status);
+    DB.notifyQueryVisibilityHook(ctx, .status);
     return true;
 }
 
@@ -30014,7 +30050,7 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
-    if (ctx.query_visibility_hook) |hook| hook.notify(.status);
+    DB.notifyQueryVisibilityHook(ctx, .status);
     return true;
 }
 

@@ -31,22 +31,28 @@ same path duplicate index/cache/runtime state and make restore, drop, and schema
 mutation correctness depend on every caller remembering the same invalidation
 sequence.
 
-Restore, drop, and schema mutation are generation transitions. A transition
-lease:
+Restore preparation and generation publication use separate capabilities.
+Preparation allows existing and new readers to continue against the live
+generation while Antfly imports, repairs, validates, and syncs an isolated
+sibling. It blocks new writes for the restore's full lifetime so acknowledged
+writes cannot be discarded when the prepared backup is published. Publication,
+drop, and in-place schema mutation use an exclusive
+transition lease that:
 
 - blocks new table reads and writes
 - drains existing read, write, and pending-open leases
 - invalidates read, write, startup-write, runtime-status, and shared
   path-scoped storage caches for the affected generation
-- performs the file/catalog mutation and any foreground repair under the
-  exclusive lease
+- performs only the live file/catalog mutation and unavoidable live-generation
+  repair under the exclusive lease
 - publishes the new visible generation only after repair/invalidation complete
 
 Restore never reconstructs the live root in place. It acquires a process-wide
-exclusive capability for the exact shard root, creates a unique sibling staging
-generation, imports and validates the primary store there, runs foreground
-derived/runtime repair against that staged path, closes and recursively syncs
-the staged generation, and only then publishes it. A prepare or repair failure
+preparation capability for the exact shard root, creates a unique sibling
+staging generation, imports and validates the primary store there, runs
+foreground derived/runtime repair against that staged path, closes and
+recursively syncs and seals the staged generation, and only then drains serving leases and
+promotes preparation to the exclusive publication capability. A prepare or repair failure
 destroys staging and leaves the live generation untouched. macOS and Linux use
 atomic directory exchange when a live generation exists. Platforms or
 filesystems without atomic exchange reject replacement before mutating the live
@@ -109,9 +115,10 @@ name until reconciliation confirms the new namespace is durable and submits it
 for asynchronous cleanup.
 
 The current root layout is path-relative and may lazily open run files after a
-transaction starts. Consequently, serving transitions stop admission and drain
-the old read/write owners before staging and publication. Refcounts make close
-ordering safe, but they do not make a path swap safe beneath an old reader. A
+transaction starts. Preparation may overlap reads because it only touches the
+sibling root, but serving transitions still stop admission and drain old
+read/write owners before publication. Refcounts make close ordering safe, but
+they do not make a path swap safe beneath an old reader. A
 future zero-downtime transition must place each generation under an immutable
 versioned root and atomically publish a separate current-generation pointer;
 only then may generation N readers overlap preparation and publication of N+1.

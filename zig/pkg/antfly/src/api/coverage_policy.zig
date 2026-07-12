@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-pub const incarnation_field = "_antfly_coverage_incarnation";
+pub const incarnation_field = "_coverage_incarnation";
 
 pub const Policy = enum {
     strict,
@@ -23,22 +23,38 @@ pub fn parse(value: std.json.Value) !Policy {
 }
 
 pub fn validateIndexConfig(value: std.json.Value) !void {
+    return try validateIndexConfigWithPrivateFields(value, false);
+}
+
+fn validateStoredIndexConfig(value: std.json.Value) !void {
+    return try validateIndexConfigWithPrivateFields(value, true);
+}
+
+fn validateIndexConfigWithPrivateFields(value: std.json.Value, allow_incarnation: bool) !void {
     if (value != .object) return error.InvalidIndexConfig;
-    if (value.object.get(incarnation_field) != null) return error.InvalidIndexConfig;
+    const stored_incarnation = value.object.get(incarnation_field);
+    if (stored_incarnation != null and !allow_incarnation) return error.InvalidIndexConfig;
+    if (stored_incarnation) |raw| {
+        if (raw != .integer or raw.integer <= 0) return error.InvalidIndexConfig;
+    }
     // These experimental spellings were never part of the public schema.
     if (value.object.get("coverage") != null or value.object.get("partial") != null or value.object.get("applies_when") != null) {
         return error.InvalidCoveragePolicy;
     }
 
-    const configured = value.object.get("coverage_policy") orelse return;
-    const index_type = value.object.get("type") orelse return error.InvalidCoveragePolicy;
+    const configured = value.object.get("coverage_policy");
+    const index_type = value.object.get("type") orelse {
+        if (configured != null or stored_incarnation != null) return error.InvalidCoveragePolicy;
+        return;
+    };
     if (index_type != .string) return error.InvalidIndexConfig;
     const embeddings = std.mem.eql(u8, index_type.string, "embeddings");
-    if (!embeddings) return error.InvalidCoveragePolicy;
+    if ((configured != null or stored_incarnation != null) and !embeddings) return error.InvalidCoveragePolicy;
+    if (configured == null) return;
     if (value.object.get("external")) |external| {
         if (external == .bool and external.bool) return error.InvalidCoveragePolicy;
     }
-    _ = try parse(configured);
+    _ = try parse(configured.?);
 }
 
 fn newIncarnation(io: std.Io) !i64 {
@@ -72,6 +88,19 @@ pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value
     defer io_impl.deinit();
     try cloned.value.object.put(arena, incarnation_field, .{ .integer = try newIncarnation(io_impl.io()) });
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
+}
+
+/// Canonicalizes trusted catalog input while preserving an incarnation already
+/// assigned by the authoritative metadata mutation. Public request validation
+/// must call validateIndexConfig before this internal replay path.
+pub fn withIncarnationIfMissingAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    if (value != .object) return error.InvalidIndexConfig;
+    try validateStoredIndexConfig(value);
+    if (value.object.get(incarnation_field)) |raw| {
+        _ = raw;
+        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    }
+    return try withFreshIncarnationAlloc(alloc, value);
 }
 
 pub fn incarnation(value: std.json.Value) ?u64 {
@@ -124,7 +153,7 @@ test "coverage policy accepts only the public embeddings contract" {
     defer unsupported_eligibility.deinit();
     try std.testing.expectError(error.InvalidCoveragePolicy, validateIndexConfig(unsupported_eligibility.value));
 
-    var reserved = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"embeddings\",\"_antfly_coverage_incarnation\":42}", .{});
+    var reserved = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"embeddings\",\"_coverage_incarnation\":42}", .{});
     defer reserved.deinit();
     try std.testing.expectError(error.InvalidIndexConfig, validateIndexConfig(reserved.value));
 }
@@ -153,4 +182,14 @@ test "coverage policy assigns persistent private incarnations only to embeddings
     defer parsed_indexes.deinit();
     try std.testing.expect(incarnation(parsed_indexes.value.object.get("visual").?) != null);
     try std.testing.expect(incarnation(parsed_indexes.value.object.get("title").?) == null);
+
+    const replayed_json = try withIncarnationIfMissingAlloc(alloc, first.value);
+    defer alloc.free(replayed_json);
+    var replayed = try std.json.parseFromSlice(std.json.Value, alloc, replayed_json, .{});
+    defer replayed.deinit();
+    try std.testing.expectEqual(first_incarnation, incarnation(replayed.value).?);
+
+    var invalid_stored = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"full_text\",\"_coverage_incarnation\":42}", .{});
+    defer invalid_stored.deinit();
+    try std.testing.expectError(error.InvalidCoveragePolicy, withIncarnationIfMissingAlloc(alloc, invalid_stored.value));
 }

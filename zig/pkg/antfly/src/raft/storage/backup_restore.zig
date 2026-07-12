@@ -114,6 +114,20 @@ pub fn prepareRestoreSnapshotToPathWithExclusiveTransition(
     return try prepareRestoreSnapshotIfNeeded(transition, alloc, path, group_id, restore, options);
 }
 
+/// Prepares a sibling generation while the current generation remains
+/// readable. The caller must drain serving leases and promote `preparation`
+/// before publishing the returned generation.
+pub fn prepareRestoreSnapshotToPathWithPreparation(
+    preparation: *db_mod.generation_lifecycle.PreparationTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !?db_mod.generation_lifecycle.StagedGeneration {
+    return try prepareRestoreSnapshotIfNeeded(preparation, alloc, path, group_id, restore, options);
+}
+
 pub fn publishPreparedRestore(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -212,7 +226,7 @@ pub fn applyBackupRestoreFromRecord(
 }
 
 fn prepareRestoreSnapshotIfNeeded(
-    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    transition: anytype,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
@@ -240,7 +254,7 @@ fn prepareRestoreSnapshotIfNeeded(
 }
 
 fn prepareRestoreSnapshot(
-    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    transition: anytype,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,

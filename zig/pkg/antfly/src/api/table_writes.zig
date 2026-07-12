@@ -4262,7 +4262,7 @@ pub const ProvisionedTableWriteSource = struct {
         read_request_active: usize = 0,
         operation_active: bool = false,
         structural_active: bool = false,
-        restore_reservations: usize = 0,
+        restore_preparations: usize = 0,
     };
 
     const WriteCoalesceQueue = struct {
@@ -4583,7 +4583,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn pruneTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) void {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
-        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.structural_active or entry.restore_reservations > 0) return;
+        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.structural_active or entry.restore_preparations > 0) return;
         const removed = self.active_table_activities.swapRemove(index);
         std.heap.page_allocator.free(removed.table_name);
         if (self.active_table_activities.items.len == 0) {
@@ -4606,7 +4606,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.restore_reservations > 0) {
+                if (entry.structural_active or entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4620,7 +4620,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.restore_reservations > 0) {
+                if (entry.structural_active or entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4651,7 +4651,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.restore_reservations > 0) {
+                if (entry.structural_active) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4686,7 +4686,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.restore_reservations > 0 or entry.read_request_active > 0) {
+                if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4707,7 +4707,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn tryBeginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.restore_reservations > 0 or entry.read_request_active > 0) return false;
+            if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0) return false;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
@@ -4730,7 +4730,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn tryBeginStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.table_request_active > 0 or entry.read_request_active > 0) return false;
+            if (entry.structural_active or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) return false;
         }
         if (self.hasAnyActiveGroupOperationLocked(table_name)) return false;
         const entry = self.activityEntryLocked(table_name, null);
@@ -4743,7 +4743,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.table_request_active > 0 or entry.read_request_active > 0) {
+                if (entry.structural_active or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4771,7 +4771,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.table_request_active > 0 or entry.read_request_active > 0) {
+                if (entry.structural_active or entry.restore_preparations > 0 or entry.table_request_active > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4781,7 +4781,7 @@ pub const ProvisionedTableWriteSource = struct {
                 continue;
             }
             const entry = self.activityEntryLocked(table_name, null);
-            entry.restore_reservations += 1;
+            entry.restore_preparations += 1;
             return;
         }
     }
@@ -4792,8 +4792,8 @@ pub const ProvisionedTableWriteSource = struct {
             self.table_activity_ready.broadcast(io);
             return;
         };
-        if (self.active_table_activities.items[index].restore_reservations > 0) {
-            self.active_table_activities.items[index].restore_reservations -= 1;
+        if (self.active_table_activities.items[index].restore_preparations > 0) {
+            self.active_table_activities.items[index].restore_preparations -= 1;
         }
         self.pruneTableActivityLocked(table_name, null);
         self.table_activity_ready.broadcast(io);
@@ -4825,7 +4825,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.table_request_active > 0 or entry.restore_reservations > 0) {
+                if (entry.structural_active or entry.table_request_active > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5095,6 +5095,48 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer {
             if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         }
+
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
+
+        return .{
+            .source = self,
+            .table_name = table_name,
+            .read_cache_exclusive = read_cache_exclusive,
+        };
+    }
+
+    fn beginLocalTableGenerationTransitionFromPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) !LocalTableGenerationTransition {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        if (self.findTableActivityLocked(table_name, null)) |index| {
+            const entry = &self.active_table_activities.items[index];
+            if (entry.restore_preparations > 0) {
+                entry.restore_preparations -= 1;
+                std.debug.assert(!entry.structural_active and entry.table_request_active == 0);
+                entry.structural_active = true;
+                while (true) {
+                    const current_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
+                    if (self.active_table_activities.items[current_index].read_request_active == 0 and !self.hasAnyActiveGroupOperationLocked(table_name)) break;
+                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                }
+                self.table_activity_mutex.unlock(io);
+            } else {
+                self.table_activity_mutex.unlock(io);
+                self.beginStructuralTableActivity(table_name);
+            }
+        } else {
+            self.table_activity_mutex.unlock(io);
+            self.beginStructuralTableActivity(table_name);
+        }
+        errdefer self.endStructuralTableActivity(table_name);
+
+        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
 
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
@@ -6845,7 +6887,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.restore_reservations > 0) return true;
+            if (entry.structural_active or entry.restore_preparations > 0) return true;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             if (self.active_table_activities.items[index].operation_active) return true;
@@ -6859,7 +6901,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.table_request_active > 0 or entry.read_request_active > 0 or entry.restore_reservations > 0) return true;
+            if (entry.structural_active or entry.table_request_active > 0 or entry.read_request_active > 0) return true;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             if (self.active_table_activities.items[index].operation_active) return true;
@@ -6884,7 +6926,7 @@ pub const ProvisionedTableWriteSource = struct {
         var request_busy = false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.restore_reservations > 0) structural_busy = true;
+            if (entry.structural_active or entry.restore_preparations > 0) structural_busy = true;
             if (entry.table_request_active > 0 or entry.read_request_active > 0) request_busy = true;
         }
 
@@ -7905,20 +7947,20 @@ pub const ProvisionedTableWriteSource = struct {
         self.structural_reconcile_tables = .empty;
     }
 
-    fn enqueueTableStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        self.enqueueTableStructuralReconcileTarget(table_name, null);
+    fn enqueueTableStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8) !void {
+        try self.enqueueTableStructuralReconcileTarget(table_name, null);
     }
 
-    fn enqueueTableIndexStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8, index_name: []const u8) void {
-        self.enqueueTableStructuralReconcileTarget(table_name, index_name);
+    fn enqueueTableIndexStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8, index_name: []const u8) !void {
+        try self.enqueueTableStructuralReconcileTarget(table_name, index_name);
     }
 
     fn enqueueTableStructuralReconcileTarget(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         index_name: ?[]const u8,
-    ) void {
-        if (self.restore_repair_shutdown.load(.acquire)) return;
+    ) !void {
+        if (self.restore_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
         const alloc = std.heap.page_allocator;
         const io = self.table_activity_threaded.io();
 
@@ -7941,32 +7983,21 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
 
-        const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
-            std.log.warn("structural reconcile table name allocation failed table={s} err={}", .{ table_name, err });
-            return;
-        };
-        const owned_index_name = if (index_name) |name| alloc.dupe(u8, name) catch |err| {
-            alloc.free(owned_table_name);
-            std.log.warn("structural reconcile index name allocation failed table={s} index={s} err={}", .{ table_name, name, err });
-            return;
-        } else null;
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        errdefer alloc.free(owned_table_name);
+        const owned_index_name = if (index_name) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (owned_index_name) |name| alloc.free(name);
         const appended_index = self.structural_reconcile_tables.items.len;
-        self.structural_reconcile_tables.append(alloc, .{
+        try self.structural_reconcile_tables.append(alloc, .{
             .table_name = owned_table_name,
             .index_name = owned_index_name,
-        }) catch |err| {
-            alloc.free(owned_table_name);
-            if (owned_index_name) |name| alloc.free(name);
-            std.log.warn("structural reconcile queue append failed table={s} err={}", .{ table_name, err });
-            return;
-        };
+        });
 
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.restore_repair_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
-            var removed = self.structural_reconcile_tables.orderedRemove(appended_index);
-            removed.deinit(alloc);
+            _ = self.structural_reconcile_tables.orderedRemove(appended_index);
             self.structural_reconcile_scheduled.store(false, .release);
-            std.log.warn("structural reconcile submit failed table={s} err={}", .{ table_name, err });
+            return err;
         };
     }
 
@@ -8234,7 +8265,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.requestTableStructuralReconcile(std.heap.page_allocator, table_name);
-        self.enqueueTableStructuralReconcile(table_name);
+        try self.enqueueTableStructuralReconcile(table_name);
         return {};
     }
 
@@ -8246,7 +8277,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.requestTableIndexStructuralReconcile(std.heap.page_allocator, table_name, index_name);
-        self.enqueueTableIndexStructuralReconcile(table_name, index_name);
+        try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
         return {};
     }
 
@@ -9276,44 +9307,37 @@ pub const ProvisionedTableWriteSource = struct {
         if (all_groups_already_admitted) return;
         if (plan.reconcile_only and admitted_identity_mismatch) return error.RestoreIdentityMismatch;
 
-        var transition = try self.beginLocalTableGenerationTransition(table_name);
-        errdefer transition.abort();
-        defer transition.deinit();
         var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer restore_io_impl.deinit();
-        var publication_outcome: db_mod.generation_lifecycle.PublicationOutcome = .durable;
+        const shard = plan.manifest.shards[0];
+        const group_id = shard.group_id;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        const restore_source: backup_restore.RestoreSource = .{
+            .backup_id = plan.manifest.backup_id,
+            .location = local_location,
+            .identity_location = plan.source_location,
+            .snapshot_path = shard.snapshot_path,
+            .manifest = plan.manifest,
+        };
 
-        for (plan.manifest.shards) |shard| {
-            const group_id = shard.group_id;
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-            defer alloc.free(path);
-            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (true) {
+            if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
+            if (platform_time.monotonicNs() >= ready_deadline_ns) break;
+            sleepNs(50 * std.time.ns_per_ms);
+        }
+        runTestBeforeRestoreWorkHook();
 
-            const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-            while (true) {
-                if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
-                if (platform_time.monotonicNs() >= ready_deadline_ns) break;
-                sleepNs(50 * std.time.ns_per_ms);
-            }
+        var preparation: ?db_mod.generation_lifecycle.PreparationTransition = null;
+        defer if (preparation) |*value| value.deinit();
+        var prepared_generation: ?db_mod.generation_lifecycle.StagedGeneration = null;
+        defer if (prepared_generation) |*generation| generation.deinit();
 
-            runTestBeforeRestoreWorkHook();
-            self.invalidateSharedPathCaches(path);
-            var shard_transition = try transition.beginShardStorageTransition(path);
-            errdefer shard_transition.deinit();
-            const restore_source: backup_restore.RestoreSource = .{
-                .backup_id = plan.manifest.backup_id,
-                .location = local_location,
-                .identity_location = plan.source_location,
-                .snapshot_path = shard.snapshot_path,
-                .manifest = plan.manifest,
-            };
-            if (plan.reconcile_only) {
-                try backup_restore.reconcileCommittedRestoreWithExclusiveTransition(&shard_transition, alloc, path, group_id, restore_source);
-                self.invalidateSharedPathCaches(path);
-                shard_transition.deinit();
-                continue;
-            }
-            var prepared_generation = backup_restore.prepareRestoreSnapshotToPathWithExclusiveTransition(&shard_transition, alloc, path, group_id, restore_source, .{
+        if (!plan.reconcile_only) {
+            preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, self.backend_runtime);
+            prepared_generation = backup_restore.prepareRestoreSnapshotToPathWithPreparation(&preparation.?, alloc, path, group_id, restore_source, .{
                 .expected_table_name = table_name,
                 .expected_identity_namespace = identity_namespace,
             }) catch |err| {
@@ -9336,27 +9360,54 @@ pub const ProvisionedTableWriteSource = struct {
                 }
                 return err;
             };
-            defer if (prepared_generation) |*generation| generation.deinit();
-
-            const repair_path = if (prepared_generation) |*generation| generation.path() else path;
-            try self.repairRestoredTableRuntimeStateBlocking(
+            // Import, derived rebuild, and validation run against the isolated
+            // sibling while the current generation remains admitted.
+            if (prepared_generation) |*generation| try self.repairRestoredTableRuntimeStateBlocking(
                 alloc,
-                repair_path,
+                generation.path(),
                 group_id,
                 table_name,
-                if (prepared_generation) |*generation| generation else null,
+                generation,
             );
-            if (prepared_generation) |*generation| {
-                const outcome = try backup_restore.publishPreparedRestore(alloc, path, generation);
-                publication_outcome = outcome;
-                if (outcome == .durability_uncertain) {
-                    std.log.err("restore generation published with uncertain durability table={s} group_id={d} path={s}", .{ table_name, group_id, path });
-                }
+            if (prepared_generation) |*generation| try generation.seal();
+            if (prepared_generation == null) {
+                preparation.?.deinit();
+                preparation = null;
             }
-            self.invalidateSharedPathCaches(path);
-            shard_transition.deinit();
         }
 
+        var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
+        errdefer transition.abort();
+        defer transition.deinit();
+        self.invalidateSharedPathCaches(path);
+        var publication_outcome: db_mod.generation_lifecycle.PublicationOutcome = .durable;
+
+        if (plan.reconcile_only) {
+            var shard_transition = try transition.beginShardStorageTransition(path);
+            defer shard_transition.deinit();
+            try backup_restore.reconcileCommittedRestoreWithExclusiveTransition(&shard_transition, alloc, path, group_id, restore_source);
+        } else if (prepared_generation) |*generation| {
+            var shard_transition = try preparation.?.promote();
+            defer shard_transition.deinit();
+            publication_outcome = try backup_restore.publishPreparedRestore(alloc, path, generation);
+            if (publication_outcome == .durability_uncertain) {
+                std.log.err("restore generation published with uncertain durability table={s} group_id={d} path={s}", .{ table_name, group_id, path });
+            }
+        } else {
+            // An idempotent retry may only owe runtime repair on the already
+            // published generation. Keep that maintenance under exclusivity.
+            var shard_transition = try transition.beginShardStorageTransition(path);
+            defer shard_transition.deinit();
+            try self.repairRestoredTableRuntimeStateBlocking(
+                alloc,
+                path,
+                group_id,
+                table_name,
+                null,
+            );
+        }
+
+        self.invalidateSharedPathCaches(path);
         transition.finishMutation();
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
@@ -21446,7 +21497,7 @@ test "provisioned create index updates cached writer in place" {
     const original_entry = cached.entry.?;
     try std.testing.expect(cached.db.core.index_manager.denseIndex("semantic_idx") == null);
 
-    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"_antfly_coverage_incarnation\":42}}";
+    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"_coverage_incarnation\":42}}";
     _ = try source.source().createIndex(alloc, "docs", "semantic_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
@@ -21462,7 +21513,7 @@ test "provisioned create index updates cached writer in place" {
     _ = outer_source.withLocalWriteOwner(&source);
 
     Catalog.indexes_json_buf =
-        \\{"semantic_idx":{"type":"embeddings","dimension":3,"external":true,"_antfly_coverage_incarnation":42},"owner_forwarded_idx":{"type":"embeddings","dimension":3,"external":true,"_antfly_coverage_incarnation":43}}
+        \\{"semantic_idx":{"type":"embeddings","dimension":3,"external":true,"_coverage_incarnation":42},"owner_forwarded_idx":{"type":"embeddings","dimension":3,"external":true,"_coverage_incarnation":43}}
     ;
     _ = try outer_source.source().createIndex(alloc, "docs", "owner_forwarded_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
 
@@ -21472,7 +21523,7 @@ test "provisioned create index updates cached writer in place" {
     try std.testing.expect(cached.db.core.index_manager.denseIndex("owner_forwarded_idx") != null);
     try std.testing.expectEqual(@as(?u64, 43), cached.db.core.index_manager.coverageGenerationForIndex("owner_forwarded_idx"));
 
-    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"_antfly_coverage_incarnation\":42}}";
+    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"_coverage_incarnation\":42}}";
     _ = try source.source().dropIndex(alloc, "docs", "owner_forwarded_idx");
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
@@ -22509,7 +22560,7 @@ test "provisioned table write source serializes same-table same-group operations
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
 }
 
-test "provisioned table restore lifecycle blocks group operations but allows foreground structural mutation" {
+test "provisioned table restore preparation blocks writes and competing structural mutation" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -22532,15 +22583,14 @@ test "provisioned table restore lifecycle blocks group operations but allows for
     source.beginRestoreLifecycleActivity("docs");
 
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
-    try std.testing.expect(source.tryBeginStructuralTableActivity("docs"));
-    source.endStructuralTableActivity("docs");
+    try std.testing.expect(!source.tryBeginStructuralTableActivity("docs"));
 
     source.endRestoreLifecycleActivity("docs");
     try std.testing.expect(source.tryBeginGroupOperation("docs", 7001));
     source.endGroupOperation("docs", 7001);
 }
 
-test "provisioned table restore lifecycle blocks request admission without blocking foreground structural mutation" {
+test "provisioned table restore preparation blocks writes while allowing reads" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -22570,6 +22620,17 @@ test "provisioned table restore lifecycle blocks request admission without block
         }
     };
 
+    const ReadWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.beginReadRequest("docs");
+            self.entered.store(true, .release);
+            self.source.endReadRequest("docs");
+        }
+    };
+
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-restore-lifecycle-request-admission", NoCatalog.iface());
     source.beginRestoreLifecycleActivity("docs");
     var restore_lifecycle_active = true;
@@ -22577,14 +22638,15 @@ test "provisioned table restore lifecycle blocks request admission without block
 
     var worker = RequestWorker{ .source = &source };
     const thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&worker});
+    var read_worker = ReadWorker{ .source = &source };
+    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!worker.entered.load(.acquire));
-
-    try std.testing.expect(source.tryBeginStructuralTableActivity("docs"));
-    source.endStructuralTableActivity("docs");
+    try std.testing.expect(read_worker.entered.load(.acquire));
+    read_thread.join();
 
     source.endRestoreLifecycleActivity("docs");
     restore_lifecycle_active = false;

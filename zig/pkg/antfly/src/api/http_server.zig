@@ -5352,6 +5352,30 @@ pub const ApiHttpServer = struct {
         try self.waitForTableMetadata(table_name, expected_schema_json, expected_indexes_json);
     }
 
+    fn waitForIndexMetadataProjection(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        index_name: []const u8,
+        expected_index_json: []const u8,
+    ) !void {
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            const table = try self.loadOwnedTableRecord(self.alloc, table_name);
+            if (table) |record| {
+                defer metadata_table_manager.freeTable(self.alloc, record);
+                const projected = try indexes_api.storedIndexConfigJsonAlloc(self.alloc, record.indexes_json, index_name);
+                if (projected) |config_json| {
+                    defer self.alloc.free(config_json);
+                    if (try jsonDocumentsEqual(self.alloc, config_json, expected_index_json)) return;
+                }
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            sleepNs(poll_interval_ns);
+        }
+    }
+
     fn hasLocalTableRuntime(self: *ApiHttpServer, table_name: []const u8) bool {
         const source = self.table_writes orelse return false;
         const maybe_statuses = source.localRuntimeStatuses(self.alloc, table_name) catch return false;
@@ -6777,7 +6801,18 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
 
-        self.source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
+        // Materialize catalog-owned fields once. The same exact config is sent
+        // through consensus and used as the projection expectation, making the
+        // operation idempotent across retries and leadership changes.
+        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, normalized_index_json) catch |err| switch (err) {
+            error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
+            else => return error.InternalFailure,
+        };
+        defer alloc.free(expected_indexes_json);
+        const stored_index_json = (indexes_api.storedIndexConfigJsonAlloc(alloc, expected_indexes_json, index_name) catch return error.InternalFailure) orelse return error.InternalFailure;
+        defer alloc.free(stored_index_json);
+
+        self.source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
@@ -6788,31 +6823,29 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, normalized_index_json) catch |err| switch (err) {
-            error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
-            else => return error.InternalFailure,
-        };
-        defer alloc.free(expected_indexes_json);
-        self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
+        self.waitForIndexMetadataProjection(table_name, index_name, stored_index_json) catch |err| {
             if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
             std.log.err("public create index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
-            const table_after = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
-            defer metadata_table_manager.freeTable(alloc, table_after);
-            const stored_index_json = (indexes_api.storedIndexConfigJsonAlloc(alloc, table_after.indexes_json, index_name) catch return error.InternalFailure) orelse return error.InternalFailure;
-            defer alloc.free(stored_index_json);
-            _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
-                error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
-                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-                else => {
-                    std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                    _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
-                        std.log.warn("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
-                    };
-                },
+            const scheduled = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| {
+                std.log.err("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
             };
+            // Embedded/direct DB sources have no serving reconciliation queue.
+            // Preserve their synchronous contract while provisioned serving
+            // performs potentially corpus-sized backfill in the background.
+            if (scheduled == null) {
+                _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
+                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+                    error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                    else => {
+                        std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                        return error.InternalFailure;
+                    },
+                };
+            }
         }
     }
 
@@ -20833,7 +20866,7 @@ test "api http server serves local index runtime backfill status" {
     try std.testing.expectEqual(@as(?u64, 1), local_shard.doc_count);
 }
 
-test "api http server create index relies on metadata projection without local index polling" {
+test "api http server create index waits for exact target config projection" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -20897,7 +20930,12 @@ test "api http server create index relies on metadata projection without local i
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
-            self.replaceIndexesJson(allocator, next, true);
+            defer allocator.free(next);
+            // An unrelated metadata mutation may commit before this projection
+            // is observed; target convergence must not require whole-document
+            // equality with the pre-proposal snapshot.
+            const concurrent = try indexes_api.addIndexToTableIndexesJson(allocator, next, "concurrent_text", "{\"type\":\"full_text\"}");
+            self.replaceIndexesJson(allocator, concurrent, true);
         }
 
         fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !void {
@@ -20905,6 +20943,7 @@ test "api http server create index relies on metadata projection without local i
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(schema_json == null);
             try std.testing.expect(indexes_json != null);
+            try std.testing.expectEqualStrings(self.indexes_json, indexes_json.?);
             _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
         }
     };
@@ -20948,7 +20987,7 @@ test "api http server create index relies on metadata projection without local i
     });
     defer create_index_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
-    try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
 }
 
 test "api http server create index expands schema-derived algebraic config" {
