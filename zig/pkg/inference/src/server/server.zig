@@ -140,6 +140,8 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
+const default_read_max_tokens: usize = 256;
+const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 
 const GenerateBackendSelection = struct {
@@ -1021,9 +1023,11 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
-        try self.request_queue.acquire();
+        const max_tokens = try validateReadMaxTokens(request.max_tokens);
+        const queue_units = estimateReadQueueUnits(request.images.len, max_tokens);
+        try self.request_queue.acquireUnits(queue_units);
         self.updateQueueMetrics();
-        defer self.releaseSlot();
+        defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
@@ -1063,7 +1067,7 @@ pub const Node = struct {
 
         const results = try reader.readBatch(image_datas, .{
             .prompt = request.prompt,
-            .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
+            .max_tokens = max_tokens,
         });
         defer {
             for (results) |result| {
@@ -1136,7 +1140,8 @@ pub const Node = struct {
     ) !extracting_api.Response {
         try self.request_queue.acquire();
         self.updateQueueMetrics();
-        defer self.releaseSlot();
+        var queue_units: usize = 1;
+        defer if (queue_units > 0) self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("extract.local");
         defer self.metrics.decActive();
 
@@ -1162,6 +1167,20 @@ pub const Node = struct {
 
         var parsed_inputs = try parseDirectExtractionInputs(self, allocator, request.inputs, options.prompt, options.max_tokens);
         defer parsed_inputs.deinit();
+        const required_units = if (parsed_inputs.images.items.len > 0) blk: {
+            if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
+            const max_tokens = parsed_inputs.max_tokens orelse default_read_max_tokens;
+            if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
+            parsed_inputs.max_tokens = max_tokens;
+            break :blk estimateReadQueueUnits(parsed_inputs.images.items.len, max_tokens);
+        } else 1;
+        if (required_units > queue_units) {
+            self.releaseSlotUnits(queue_units);
+            queue_units = 0;
+            try self.request_queue.acquireUnits(required_units);
+            queue_units = required_units;
+            self.updateQueueMetrics();
+        }
 
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
@@ -4691,11 +4710,6 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
-        self.metrics.incRequest("read");
-        defer self.metrics.decActive();
-
         if (body.images.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'images' must not be empty" });
         }
@@ -4705,6 +4719,16 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = validateReadMaxTokens(body.max_tokens) catch
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' must be between 1 and 1024",
+            });
+        const queue_units = estimateReadQueueUnits(body.images.len, max_tokens);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("read");
+        defer self.metrics.decActive();
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -4784,9 +4808,14 @@ pub const Node = struct {
 
         const results = reader.readBatch(image_datas, .{
             .prompt = body.prompt,
-            .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
-        }) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            .max_tokens = max_tokens,
+        }) catch |err| switch (err) {
+            error.InvalidMaxTokens => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' exceeds the selected model's context limit",
+            }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+        };
         defer {
             for (results) |result| {
                 var tmp = result;
@@ -4994,11 +5023,6 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
-        self.metrics.incRequest("extract");
-        defer self.metrics.decActive();
-
         if (body.model.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
         }
@@ -5022,6 +5046,22 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = if (has_images)
+            validateReadMaxTokens(body.max_tokens) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "'max_tokens' must be between 1 and 1024",
+                })
+        else
+            null;
+        const queue_units = if (has_images)
+            estimateReadQueueUnits(images.len, max_tokens.?)
+        else
+            1;
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("extract");
+        defer self.metrics.decActive();
         const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch |err| {
             const message = try std.fmt.allocPrint(ctx.allocator, "invalid schema: {s}", .{@errorName(err)});
             defer ctx.allocator.free(message);
@@ -5060,9 +5100,13 @@ pub const Node = struct {
             }
             break :blk extractor.extractImages(extractor_ctx, schemas, config, image_datas, .{
                 .prompt = body.prompt,
-                .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
+                .max_tokens = max_tokens,
             });
         }) catch |err| switch (err) {
+            error.InvalidMaxTokens => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' exceeds the selected model's context limit",
+            }),
             error.UnsupportedInput => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
                 .message = if (has_images)
@@ -6446,6 +6490,23 @@ test "read batch downloaded byte accounting enforces aggregate cap" {
     };
     try std.testing.expectEqual(@as(usize, 14), try addReadBatchDownloadedBytes(0, item, 14));
     try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
+}
+
+test "read max tokens applies default and rejects unsafe signed values" {
+    try std.testing.expectEqual(default_read_max_tokens, try validateReadMaxTokens(null));
+    try std.testing.expectEqual(@as(usize, 1), try validateReadMaxTokens(1));
+    try std.testing.expectEqual(max_read_tokens, try validateReadMaxTokens(@intCast(max_read_tokens)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(-1));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(0));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(@intCast(max_read_tokens + 1)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(std.math.maxInt(i64)));
+}
+
+test "read queue units scale with image batch and decode length" {
+    try std.testing.expectEqual(@as(usize, 1), estimateReadQueueUnits(1, default_read_max_tokens));
+    try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, default_read_max_tokens));
+    try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_max_tokens + 1));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {
@@ -8426,6 +8487,17 @@ fn downloadReadBatchContent(
 
 fn readBatchMaxBytes() usize {
     return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_BYTES") orelse default_max_read_batch_bytes);
+}
+
+fn validateReadMaxTokens(value: ?i64) !usize {
+    const requested = value orelse default_read_max_tokens;
+    if (requested < 1 or requested > @as(i64, @intCast(max_read_tokens))) return error.InvalidMaxTokens;
+    return @intCast(requested);
+}
+
+fn estimateReadQueueUnits(image_count: usize, max_tokens: usize) usize {
+    const token_units = 1 + ((@max(max_tokens, 1) - 1) / default_read_max_tokens);
+    return std.math.mul(usize, @max(image_count, 1), token_units) catch std.math.maxInt(usize);
 }
 
 fn addReadBatchDownloadedBytes(current: usize, item: scraping.DownloadedContent, max_bytes: usize) !usize {

@@ -955,10 +955,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         {"doc:old-primary": {"title": "must not commit"}},
     )
     assert rejected.status_code >= 400, rejected.text
-    with pytest.raises(requests.HTTPError) as missing_old_primary_doc:
-        ha_cluster.primary.lookup_key(table_name, "doc:old-primary")
-    assert missing_old_primary_doc.value.response is not None
-    assert missing_old_primary_doc.value.response.status_code == 404
+    with pytest.raises(requests.HTTPError) as missing_promoted_primary_doc:
+        ha_cluster.standby.lookup_key(table_name, "doc:old-primary")
+    assert missing_promoted_primary_doc.value.response is not None
+    assert missing_promoted_primary_doc.value.response.status_code == 404
 
 
 def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):
