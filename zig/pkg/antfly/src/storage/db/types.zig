@@ -152,6 +152,9 @@ pub const IndexConfig = struct {
     kind: IndexKind,
     config_json: []const u8,
     coverage_generation: u64 = 0,
+    // Internal semantic identity, validated and computed once when the config
+    // enters the catalog. It is derived metadata and is not serialized.
+    coverage_config_fingerprint: ?u64 = null,
 
     pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
         return .{
@@ -159,6 +162,7 @@ pub const IndexConfig = struct {
             .kind = cfg.kind,
             .config_json = try alloc.dupe(u8, cfg.config_json),
             .coverage_generation = cfg.coverage_generation,
+            .coverage_config_fingerprint = cfg.coverage_config_fingerprint,
         };
     }
 
@@ -2130,6 +2134,10 @@ pub const DBIndexStats = struct {
     // Stable across shard-local marker generations for the same stored config.
     coverage_config_hash: u64 = 0,
     coverage_summary_ready: bool = true,
+    // Internal identity used while collecting stats. These fields are not part
+    // of the public status contract.
+    coverage_generation: u64 = 0,
+    coverage_identity_ready: bool = false,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,

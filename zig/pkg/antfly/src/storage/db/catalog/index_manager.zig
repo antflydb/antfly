@@ -5584,33 +5584,32 @@ pub const IndexManager = struct {
     }
 
     pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
-        for (self.dense_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return coverageGenerationForConfig(entry.config);
-        }
-        for (self.sparse_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return coverageGenerationForConfig(entry.config);
-        }
-        for (self.status_only_index_configs) |cfg| {
-            if (std.mem.eql(u8, cfg.name, index_name) and (cfg.kind == .dense_vector or cfg.kind == .sparse_vector)) {
-                return coverageGenerationForConfig(cfg);
-            }
-        }
-        return null;
+        const cfg = self.get(index_name) orelse return null;
+        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return null;
+        return coverageGenerationForConfig(cfg.*);
     }
 
-    pub fn coverageConfigHashForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
+    pub const CoverageIdentity = struct {
+        generation: u64,
+        config_fingerprint: ?u64,
+    };
+
+    pub fn coverageIdentityMapAlloc(self: *const IndexManager, alloc: Allocator) !std.StringHashMapUnmanaged(CoverageIdentity) {
+        var identities = std.StringHashMapUnmanaged(CoverageIdentity).empty;
+        errdefer identities.deinit(alloc);
+        const vector_count = self.dense_indexes.items.len + self.sparse_indexes.items.len + self.status_only_index_configs.len;
+        try identities.ensureTotalCapacity(alloc, @intCast(vector_count));
         for (self.dense_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageConfigFingerprint(self.alloc, entry.config.config_json) catch null;
+            identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
         }
         for (self.sparse_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return internal_keys.derivedCoverageConfigFingerprint(self.alloc, entry.config.config_json) catch null;
+            identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
         }
         for (self.status_only_index_configs) |cfg| {
-            if (std.mem.eql(u8, cfg.name, index_name) and (cfg.kind == .dense_vector or cfg.kind == .sparse_vector)) {
-                return internal_keys.derivedCoverageConfigFingerprint(self.alloc, cfg.config_json) catch null;
-            }
+            if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) continue;
+            identities.putAssumeCapacity(cfg.name, coverageIdentityForConfig(cfg));
         }
-        return null;
+        return identities;
     }
 
     pub fn denseIndexUsesManagedDirectField(self: *const IndexManager, index_name: []const u8) bool {
@@ -7304,8 +7303,10 @@ pub const IndexManager = struct {
         try self.appendOpenedIndex(opened);
     }
 
-    fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
+    fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg_input: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
         if (test_inject_index_open_error) |err| return err;
+        var cfg = cfg_input;
+        try populateCoverageConfigFingerprint(self.alloc, &cfg);
         try self.ensureConfiguredIndexDir(cfg);
         switch (cfg.kind) {
             .full_text => {
@@ -13110,6 +13111,8 @@ fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !
     var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
     errdefer stored_cfg.deinit(alloc);
     if (stored_cfg.coverage_generation == 0) stored_cfg.coverage_generation = try newCoverageGeneration();
+    stored_cfg.coverage_config_fingerprint = null;
+    try populateCoverageConfigFingerprint(alloc, &stored_cfg);
     return stored_cfg;
 }
 
@@ -13119,11 +13122,30 @@ fn indexConfigWithFreshCoverageGeneration(alloc: Allocator, cfg: types.IndexConf
     while (stored_cfg.coverage_generation == cfg.coverage_generation) {
         stored_cfg.coverage_generation = try newCoverageGeneration();
     }
+    stored_cfg.coverage_config_fingerprint = null;
+    try populateCoverageConfigFingerprint(alloc, &stored_cfg);
     return stored_cfg;
+}
+
+fn populateCoverageConfigFingerprint(alloc: Allocator, cfg: *types.IndexConfig) !void {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) {
+        cfg.coverage_config_fingerprint = null;
+        return;
+    }
+    if (cfg.coverage_config_fingerprint == null) {
+        cfg.coverage_config_fingerprint = try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json);
+    }
 }
 
 fn coverageGenerationForConfig(cfg: types.IndexConfig) u64 {
     return internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json);
+}
+
+fn coverageIdentityForConfig(cfg: types.IndexConfig) IndexManager.CoverageIdentity {
+    return .{
+        .generation = coverageGenerationForConfig(cfg),
+        .config_fingerprint = cfg.coverage_config_fingerprint,
+    };
 }
 
 fn appendCatalogConfig(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, cfg: types.IndexConfig) !void {
@@ -13210,6 +13232,12 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
             .config_json = config_json,
             .coverage_generation = coverage_generation,
         };
+        populateCoverageConfigFingerprint(alloc, &configs[i]) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // Preserve malformed persisted configs so the regular open path
+            // can quarantine only that index instead of taking down the table.
+            else => {},
+        };
         initialized += 1;
     }
 
@@ -13276,6 +13304,10 @@ test "index catalog preserves coverage generation and migrates legacy generation
     defer types.freeIndexConfigs(alloc, decoded);
     try std.testing.expectEqual(@as(usize, 1), decoded.len);
     try std.testing.expectEqual(generation, decoded[0].coverage_generation);
+    try std.testing.expectEqual(
+        try internal_keys.derivedCoverageConfigFingerprint(alloc, config_json),
+        decoded[0].coverage_config_fingerprint orelse return error.TestUnexpectedResult,
+    );
 
     var legacy = std.ArrayListUnmanaged(u8).empty;
     defer legacy.deinit(alloc);
@@ -13290,6 +13322,7 @@ test "index catalog preserves coverage generation and migrates legacy generation
     defer types.freeIndexConfigs(alloc, legacy_decoded);
     try std.testing.expectEqual(@as(usize, 1), legacy_decoded.len);
     try std.testing.expectEqual(internal_keys.derivedCoverageGeneration(config_json), legacy_decoded[0].coverage_generation);
+    try std.testing.expect(legacy_decoded[0].coverage_config_fingerprint != null);
 }
 
 test "index create ignores caller supplied coverage generation" {
@@ -13322,6 +13355,25 @@ test "index create ignores caller supplied coverage generation" {
     const stored_generation = configs[0].coverage_generation;
     try std.testing.expect(stored_generation != 0);
     try std.testing.expect(stored_generation != caller_generation);
+}
+
+test "index catalog preserves malformed vector config for quarantine" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, "AIDX");
+    try appendU32(&encoded, alloc, 2);
+    try appendU32(&encoded, alloc, 1);
+    try appendStr(&encoded, alloc, "bad_dense");
+    try encoded.append(alloc, @intFromEnum(types.IndexKind.dense_vector));
+    try appendStr(&encoded, alloc, "{");
+    try appendU64(&encoded, alloc, 42);
+
+    const decoded = try deserializeCatalog(alloc, encoded.items);
+    defer types.freeIndexConfigs(alloc, decoded);
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqual(@as(u64, 42), decoded[0].coverage_generation);
+    try std.testing.expectEqual(@as(?u64, null), decoded[0].coverage_config_fingerprint);
 }
 
 const DenseConfig = struct {

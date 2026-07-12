@@ -12454,6 +12454,7 @@ pub const DB = struct {
     }
 
     fn overlayRuntimeStatusIndexesLocked(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
+        self.hydrateDerivedCoverageIdentitiesBestEffort(stats_alloc, runtime_stats.indexes);
         var visible_doc_count = runtime_stats.doc_count;
         for (runtime_stats.indexes) |*item| {
             switch (item.kind) {
@@ -12474,10 +12475,7 @@ pub const DB = struct {
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                     }
-                    if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
-                        const config_hash = self.core.index_manager.coverageConfigHashForIndex(item.name) orelse 0;
-                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, config_hash, item);
-                    }
+                    self.populateConfiguredDerivedCoverageCountsBestEffort(item.name, item);
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .sparse_vector => {
@@ -12489,10 +12487,7 @@ pub const DB = struct {
                             sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
                     }
-                    if (self.core.index_manager.coverageGenerationForIndex(item.name)) |generation| {
-                        const config_hash = self.core.index_manager.coverageConfigHashForIndex(item.name) orelse 0;
-                        self.populateDerivedCoverageCountsBestEffort(item.name, generation, config_hash, item);
-                    }
+                    self.populateConfiguredDerivedCoverageCountsBestEffort(item.name, item);
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .graph => {
@@ -12760,6 +12755,7 @@ pub const DB = struct {
                 .catch_up_target_sequence = target_sequence,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            initializeDerivedCoverageIdentity(cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             if (target_sequence > 0) {
                 item.backfill_progress = @min(
@@ -12803,7 +12799,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
+                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
@@ -12826,7 +12822,7 @@ pub const DB = struct {
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
+                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
@@ -12917,6 +12913,7 @@ pub const DB = struct {
                 .kind = cfg.kind,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            initializeDerivedCoverageIdentity(cfg, &item);
             if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
                 item.load_error = try alloc.dupe(u8, load_error);
                 applyTerminalLoadFailureStatus(&item);
@@ -12980,7 +12977,7 @@ pub const DB = struct {
                             }
                         }
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
+                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
                         item.backfill_progress = @min(
                             1.0,
@@ -13010,7 +13007,7 @@ pub const DB = struct {
                             item.backfill_progress = progress;
                         }
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
+                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0) {
                         item.backfill_progress = @min(
                             1.0,
@@ -13123,6 +13120,7 @@ pub const DB = struct {
                 .catch_up_target_sequence = target_sequence,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            initializeDerivedCoverageIdentity(cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             if (target_sequence > 0) {
                 item.backfill_progress = @min(
@@ -13143,8 +13141,7 @@ pub const DB = struct {
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
-                const config_fingerprint = internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json) catch 0;
-                self.populateDerivedCoverageCountsBestEffort(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), config_fingerprint, &item);
+                self.populateConfiguredDerivedCoverageCountsBestEffort(cfg.name, &item);
             }
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
@@ -13471,6 +13468,63 @@ pub const DB = struct {
         return doc_count;
     }
 
+    fn initializeDerivedCoverageIdentity(cfg: types.IndexConfig, item: *types.DBIndexStats) void {
+        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return;
+        item.coverage_generation = internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json);
+        if (cfg.coverage_config_fingerprint) |fingerprint| {
+            item.coverage_config_hash = fingerprint;
+            item.coverage_identity_ready = true;
+        } else {
+            // Catalog admission should make this state unreachable. Keep status
+            // available and expose the missing identity as degraded coverage.
+            item.coverage_summary_ready = false;
+            item.repair_degraded = true;
+        }
+    }
+
+    fn hydrateDerivedCoverageIdentitiesBestEffort(self: *DB, alloc: Allocator, items: []types.DBIndexStats) void {
+        var needs_hydration = false;
+        for (items) |item| {
+            if ((item.kind == .dense_vector or item.kind == .sparse_vector) and !item.coverage_identity_ready) {
+                needs_hydration = true;
+                break;
+            }
+        }
+        if (!needs_hydration) return;
+
+        var identities = self.core.index_manager.coverageIdentityMapAlloc(alloc) catch {
+            markMissingDerivedCoverageIdentities(items);
+            return;
+        };
+        defer identities.deinit(alloc);
+        for (items) |*item| {
+            if (item.kind != .dense_vector and item.kind != .sparse_vector) continue;
+            const identity = identities.get(item.name) orelse {
+                markMissingDerivedCoverageIdentity(item);
+                continue;
+            };
+            item.coverage_generation = identity.generation;
+            if (identity.config_fingerprint) |fingerprint| {
+                item.coverage_config_hash = fingerprint;
+                item.coverage_identity_ready = true;
+            } else {
+                markMissingDerivedCoverageIdentity(item);
+            }
+        }
+    }
+
+    fn markMissingDerivedCoverageIdentities(items: []types.DBIndexStats) void {
+        for (items) |*item| {
+            if (item.kind == .dense_vector or item.kind == .sparse_vector) markMissingDerivedCoverageIdentity(item);
+        }
+    }
+
+    fn markMissingDerivedCoverageIdentity(item: *types.DBIndexStats) void {
+        item.coverage_identity_ready = false;
+        item.coverage_summary_ready = false;
+        item.repair_degraded = true;
+    }
+
     fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
         item.coverage_config_hash = config_hash;
         const produced = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "produced");
@@ -13490,9 +13544,17 @@ pub const DB = struct {
         if (!item.coverage_summary_ready) item.repair_degraded = true;
     }
 
-    fn populateDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) void {
-        self.populateDerivedCoverageCounts(index_name, generation, config_hash, item) catch {
-            item.coverage_config_hash = config_hash;
+    fn populateConfiguredDerivedCoverageCounts(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
+        if (!item.coverage_identity_ready) {
+            item.coverage_summary_ready = false;
+            item.repair_degraded = true;
+            return;
+        }
+        try self.populateDerivedCoverageCounts(index_name, item.coverage_generation, item.coverage_config_hash, item);
+    }
+
+    fn populateConfiguredDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, item: *types.DBIndexStats) void {
+        self.populateConfiguredDerivedCoverageCounts(index_name, item) catch {
             item.coverage_summary_ready = false;
             item.repair_degraded = true;
         };
@@ -52327,6 +52389,71 @@ test "db coverage status reports partial counter tuples without scanning markers
         return;
     }
     return error.IndexNotFound;
+}
+
+test "derived coverage stats require validated config identity" {
+    var unavailable = types.DBIndexStats{
+        .name = "dense_v1",
+        .kind = .dense_vector,
+    };
+    DB.initializeDerivedCoverageIdentity(.{
+        .name = "dense_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+        .coverage_generation = 42,
+    }, &unavailable);
+    try std.testing.expect(!unavailable.coverage_identity_ready);
+    try std.testing.expect(!unavailable.coverage_summary_ready);
+    try std.testing.expect(unavailable.repair_degraded);
+
+    var ready = types.DBIndexStats{
+        .name = "dense_v1",
+        .kind = .dense_vector,
+    };
+    DB.initializeDerivedCoverageIdentity(.{
+        .name = "dense_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+        .coverage_generation = 42,
+        .coverage_config_fingerprint = 0,
+    }, &ready);
+    try std.testing.expect(ready.coverage_identity_ready);
+    try std.testing.expect(ready.coverage_summary_ready);
+    try std.testing.expectEqual(@as(u64, 42), ready.coverage_generation);
+    try std.testing.expectEqual(@as(u64, 0), ready.coverage_config_hash);
+}
+
+test "runtime status overlay hydrates cached derived coverage identity" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}";
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = config_json,
+    });
+
+    var indexes = [_]types.DBIndexStats{.{
+        .name = "external_v1",
+        .kind = .dense_vector,
+    }};
+    var cached_stats = types.DBStats{
+        .index_count = 1,
+        .indexes = &indexes,
+    };
+    db.overlayRuntimeStatusConsistent(alloc, &cached_stats);
+
+    try std.testing.expect(indexes[0].coverage_identity_ready);
+    try std.testing.expect(indexes[0].coverage_summary_ready);
+    try std.testing.expectEqual(
+        try internal_keys.derivedCoverageConfigFingerprint(alloc, config_json),
+        indexes[0].coverage_config_hash,
+    );
 }
 
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {
