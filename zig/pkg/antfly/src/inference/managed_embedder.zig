@@ -898,6 +898,29 @@ pub fn testEmbeddingProviderDeadlines() !void {
     try std.testing.expect(config.timeouts.request_ms <= 5_000);
 }
 
+pub fn testEmbeddingProviderResultValidation() !void {
+    const valid_vector = [_]f32{ 0.25, -0.5 };
+    const valid_batch = [_][]const f32{&valid_vector};
+    try validateDenseBatch(&valid_batch, 1, 2);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateDenseBatch(&valid_batch, 2, 2));
+    try std.testing.expectError(error.InvalidEmbeddingDimensions, validateDenseBatch(&valid_batch, 1, 3));
+
+    const invalid_vector = [_]f32{ std.math.nan(f32), std.math.inf(f32) };
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateDenseVector(&invalid_vector, 2));
+
+    var sparse_indices = [_]u32{ 1, 3 };
+    var sparse_values = [_]f32{ 0.5, std.math.inf(f32) };
+    const sparse_batch = [_]db_embedder.SparseEmbedding{.{
+        .indices = &sparse_indices,
+        .values = &sparse_values,
+    }};
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateSparseBatch(&sparse_batch, 1));
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateSparseBatch(&sparse_batch, 2));
+    sparse_values[1] = 0.25;
+    sparse_indices[1] = 1;
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateSparseBatch(&sparse_batch, 1));
+}
+
 pub fn translateEmbeddingsIndexConfigJson(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -1747,6 +1770,32 @@ fn flattenContentPartsToText(
     return try out.toOwnedSlice(alloc);
 }
 
+fn validateDenseVector(vector: []const f32, dims: u32) !void {
+    if (vector.len == 0) return error.InvalidEmbeddingResponse;
+    if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
+    for (vector) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+    }
+}
+
+fn validateDenseBatch(vectors: []const []const f32, expected_count: usize, dims: u32) !void {
+    if (vectors.len == 0) return error.EmptyEmbeddingResponse;
+    if (vectors.len != expected_count) return error.InvalidEmbeddingResponse;
+    for (vectors) |vector| try validateDenseVector(vector, dims);
+}
+
+fn validateSparseBatch(embeddings: []const db_embedder.SparseEmbedding, expected_count: usize) !void {
+    if (embeddings.len == 0) return error.EmptyEmbeddingResponse;
+    if (embeddings.len != expected_count) return error.InvalidEmbeddingResponse;
+    for (embeddings) |embedding| {
+        if (embedding.indices.len != embedding.values.len) return error.InvalidEmbeddingResponse;
+        for (embedding.indices, embedding.values, 0..) |index, value, i| {
+            if (i > 0 and embedding.indices[i - 1] >= index) return error.InvalidEmbeddingResponse;
+            if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+        }
+    }
+}
+
 fn embedWithEntryParts(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
@@ -1770,7 +1819,8 @@ fn embedWithEntryParts(
         var result = try provider.embedParts(alloc, entry.model, parts);
         defer result.deinit();
         if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
-        if (dims > 0 and result.vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+        if (result.vectors.len != 1) return error.InvalidEmbeddingResponse;
+        try validateDenseVector(result.vectors[0], dims);
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
@@ -1781,7 +1831,8 @@ fn embedWithEntryParts(
                 const vectors = try embed_parts(local.ptr, alloc, entry.model, parts);
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 if (vectors.len == 0) return error.EmptyEmbeddingResponse;
-                if (dims > 0 and vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+                if (vectors.len != 1) return error.InvalidEmbeddingResponse;
+                try validateDenseVector(vectors[0], dims);
                 return try alloc.dupe(f32, vectors[0]);
             }
             return error.UnsupportedEmbeddingProvider;
@@ -1802,7 +1853,8 @@ fn embedWithEntryParts(
         var result = try provider.embedParts(alloc, entry.model, parts);
         defer result.deinit();
         if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
-        if (dims > 0 and result.vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+        if (result.vectors.len != 1) return error.InvalidEmbeddingResponse;
+        try validateDenseVector(result.vectors[0], dims);
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
@@ -1838,7 +1890,8 @@ fn embedSparseBatchWithEntry(
             if (entry.antfly_provider) |local| {
                 try waitForEntryPacer(entry);
                 const embeddings = try local.embed_sparse_texts(local.ptr, alloc, entry.model, texts);
-                if (embeddings.len == 0) return error.EmptyEmbeddingResponse;
+                errdefer db_embedder.freeSparseEmbeddingBatch(alloc, embeddings);
+                try validateSparseBatch(embeddings, texts.len);
                 return embeddings;
             }
             try waitForEntryPacer(entry);
@@ -1857,6 +1910,7 @@ fn embedSparseBatchWithEntry(
             var result = try provider.embedSparse(alloc, entry.model, texts);
             defer result.deinit();
             if (result.indices.len == 0) return error.EmptyEmbeddingResponse;
+            if (result.indices.len != texts.len or result.values.len != texts.len) return error.InvalidEmbeddingResponse;
 
             const embeddings = try alloc.alloc(db_embedder.SparseEmbedding, result.indices.len);
             var initialized: usize = 0;
@@ -1866,6 +1920,10 @@ fn embedSparseBatchWithEntry(
             }
 
             for (result.indices, result.values, 0..) |src_indices, src_values, i| {
+                if (src_indices.len != src_values.len) return error.InvalidEmbeddingResponse;
+                for (src_values) |value| {
+                    if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+                }
                 const indices = try alloc.alloc(u32, src_indices.len);
                 errdefer alloc.free(indices);
                 for (src_indices, 0..) |value, j| {
@@ -1878,6 +1936,7 @@ fn embedSparseBatchWithEntry(
                 };
                 initialized += 1;
             }
+            try validateSparseBatch(embeddings, texts.len);
             return embeddings;
         },
         .openai, .ollama, .bedrock => return error.UnsupportedEmbeddingProvider,
@@ -2036,10 +2095,7 @@ fn embedBatchWithEntry(
                 try waitForEntryPacer(entry);
                 const vectors = try local.embed_dense_texts(local.ptr, alloc, entry.model, texts);
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-                if (vectors.len == 0) return error.EmptyEmbeddingResponse;
-                for (vectors) |vector| {
-                    if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
-                }
+                try validateDenseBatch(vectors, texts.len, dims);
                 return vectors;
             }
             try waitForEntryPacer(entry);
@@ -2057,10 +2113,7 @@ fn embedBatchWithEntry(
 
             var result = try provider.embedder().embed(alloc, entry.model, texts);
             errdefer result.deinit();
-            if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
-            for (result.vectors) |vector| {
-                if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
-            }
+            try validateDenseBatch(result.vectors, texts.len, dims);
             return try adoptDenseBatchResult(alloc, &result);
         },
     }
@@ -2114,10 +2167,7 @@ fn embedBatchWithBedrockRequest(
     try waitForEntryPacer(entry);
     var result = try provider.embedText(alloc, entry.model, texts);
     errdefer result.deinit();
-    if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
-    for (result.vectors) |vector| {
-        if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
-    }
+    try validateDenseBatch(result.vectors, texts.len, dims);
     return try adoptDenseBatchResult(alloc, &result);
 }
 
@@ -2203,6 +2253,7 @@ fn embedBatchWithOpenAiCompatible(
     defer parsed.deinit();
 
     if (parsed.value.data.len == 0) return error.EmptyEmbeddingResponse;
+    if (parsed.value.data.len != texts.len) return error.InvalidEmbeddingResponse;
 
     const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
     var initialized: usize = 0;
@@ -2211,7 +2262,7 @@ fn embedBatchWithOpenAiCompatible(
         alloc.free(vectors);
     }
     for (parsed.value.data, 0..) |item, i| {
-        if (dims > 0 and item.embedding.len != dims) return error.InvalidEmbeddingDimensions;
+        try validateDenseVector(item.embedding, dims);
         vectors[i] = try alloc.dupe(f32, item.embedding);
         initialized += 1;
     }

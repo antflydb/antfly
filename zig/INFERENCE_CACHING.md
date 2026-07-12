@@ -84,6 +84,13 @@ Cached vectors and in-flight producer results are cache-owned. Every caller
 receives an owned copy, so request cleanup cannot invalidate another request's
 result and callers cannot mutate cache contents.
 
+Provider results cross a strict validation boundary before they can enter the
+cache or search/index code. Dense and sparse batches must match the requested
+cardinality, dense dimensions must match configuration, sparse index/value
+shapes must agree, sparse indices must be strictly increasing, and every
+numeric value must be finite. Malformed upstream or embedded-runtime output is
+rejected and never cached.
+
 Lookup and flight registration occur under one mutex. A miss installs exactly
 one producer before releasing the mutex. Waiters sleep on that flight's
 completion event and are always released on success or error. Public-query

@@ -82,6 +82,10 @@ test "managed embedder deadlines bound provider pacing and transport" {
     try managed_embedder.testEmbeddingProviderDeadlines();
 }
 
+test "managed embedder rejects malformed provider vectors" {
+    try managed_embedder.testEmbeddingProviderResultValidation();
+}
+
 test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }
