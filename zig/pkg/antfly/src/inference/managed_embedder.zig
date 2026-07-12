@@ -162,24 +162,6 @@ fn monotonicNowNs() u64 {
     }
 }
 
-fn sleepNs(duration_ns: u64) void {
-    if (comptime builtin.os.tag == .freestanding) return;
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(duration_ns);
-        return;
-    }
-
-    var req = std.posix.timespec{
-        .sec = @intCast(duration_ns / std.time.ns_per_s),
-        .nsec = @intCast(duration_ns % std.time.ns_per_s),
-    };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
-}
-
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
@@ -210,10 +192,21 @@ const RequestPacer = struct {
         };
     }
 
-    fn acquire(self: *RequestPacer, deadline_ns: ?u64) !void {
+    fn acquire(self: *RequestPacer, io: std.Io, deadline_ns: ?u64) !void {
         if (self.capacity <= 1.0) {
-            try self.beginSerialRequest(deadline_ns);
-            self.endSerialRequest();
+            lockAtomic(&self.mutex);
+            const now_ns = monotonicNowNs();
+            const send_at_ns = @max(now_ns, self.next_send_ns);
+            const wait_ns = send_at_ns - now_ns;
+            if (deadline_ns) |deadline| {
+                if (now_ns >= deadline or wait_ns >= deadline - now_ns) {
+                    self.mutex.unlock();
+                    return error.Timeout;
+                }
+            }
+            self.next_send_ns = send_at_ns +| self.interval_ns +| pacing_safety_margin_ns;
+            self.mutex.unlock();
+            if (wait_ns > 0) try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
             return;
         }
 
@@ -237,31 +230,8 @@ const RequestPacer = struct {
             if (deadline_ns) |deadline| {
                 if (now_ns >= deadline or wait_ns >= deadline - now_ns) return error.Timeout;
             }
-            sleepNs(wait_ns);
+            try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
         }
-    }
-
-    fn beginSerialRequest(self: *RequestPacer, deadline_ns: ?u64) !void {
-        lockAtomic(&self.mutex);
-        while (true) {
-            const now_ns = monotonicNowNs();
-            if (now_ns >= self.next_send_ns) return;
-            const wait_ns = self.next_send_ns - now_ns;
-            if (deadline_ns) |deadline| {
-                if (now_ns >= deadline or wait_ns >= deadline - now_ns) {
-                    self.mutex.unlock();
-                    return error.Timeout;
-                }
-            }
-            self.mutex.unlock();
-            sleepNs(wait_ns);
-            lockAtomic(&self.mutex);
-        }
-    }
-
-    fn endSerialRequest(self: *RequestPacer) void {
-        self.next_send_ns = monotonicNowNs() +| self.interval_ns +| pacing_safety_margin_ns;
-        self.mutex.unlock();
     }
 };
 
@@ -871,26 +841,12 @@ fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secr
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
     try ensureEntryDeadline(entry);
     const pacer = entry.pacer orelse return;
-    try pacer.acquire(entry.deadline_ns);
+    try pacer.acquire(embeddingIo(entry), entry.deadline_ns);
     try ensureEntryDeadline(entry);
 }
 
 fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
     return entry.io orelse std.Io.Threaded.global_single_threaded.io();
-}
-
-fn beginEntryPacedRequest(entry: *const ManagedEmbeddingEntry) !?*RequestPacer {
-    try ensureEntryDeadline(entry);
-    const pacer = entry.pacer orelse return null;
-    if (pacer.capacity <= 1.0) {
-        try pacer.beginSerialRequest(entry.deadline_ns);
-        errdefer pacer.mutex.unlock();
-        try ensureEntryDeadline(entry);
-        return pacer;
-    }
-    try pacer.acquire(entry.deadline_ns);
-    try ensureEntryDeadline(entry);
-    return null;
 }
 
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
@@ -917,10 +873,12 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
 }
 
 pub fn testEmbeddingProviderDeadlines() !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
     var pacer = RequestPacer.init(60, 1);
-    try pacer.beginSerialRequest(null);
-    pacer.endSerialRequest();
-    try std.testing.expectError(error.Timeout, pacer.beginSerialRequest(monotonicNowNs() + std.time.ns_per_ms));
+    try pacer.acquire(io, null);
+    try std.testing.expect(pacer.mutex.tryLock());
+    pacer.mutex.unlock();
+    try std.testing.expectError(error.Timeout, pacer.acquire(io, monotonicNowNs() + std.time.ns_per_ms));
 
     const indexes_json =
         \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
@@ -938,11 +896,6 @@ pub fn testEmbeddingProviderDeadlines() !void {
     try std.testing.expectEqual(@as(usize, 4 << 20), config.max_response_size);
     try std.testing.expect(config.timeouts.request_ms > 0);
     try std.testing.expect(config.timeouts.request_ms <= 5_000);
-}
-
-fn endEntryPacedRequest(serial_pacer: ?*RequestPacer) void {
-    const pacer = serial_pacer orelse return;
-    pacer.endSerialRequest();
 }
 
 pub fn translateEmbeddingsIndexConfigJson(
@@ -2236,8 +2189,7 @@ fn embedBatchWithOpenAiCompatible(
         headers_buf[1] = .{ "authorization", value };
     }
 
-    const serial_pacer = try beginEntryPacedRequest(entry);
-    defer endEntryPacedRequest(serial_pacer);
+    try waitForEntryPacer(entry);
 
     var response = try client.post(url, .{
         .json = json_body,

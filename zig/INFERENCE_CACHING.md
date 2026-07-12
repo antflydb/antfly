@@ -40,9 +40,12 @@ capacity or local inference queue slots.
 The cache and `ManagedEmbedder` provider clients borrow the API lane's `std.Io`
 from `BackendRuntime`; neither creates or owns an executor per request. This
 keeps synchronization, network I/O, shutdown, and runtime resource ownership
-under the server lifecycle. Test or embedded construction without a backend
-runtime uses Zig's explicit global single-threaded I/O fallback and does not
-create a private thread pool.
+under the server lifecycle. Provider pacing also sleeps through that runtime
+and reserves request start slots without holding its mutex across network I/O,
+so throttled providers do not pin worker threads or serialize unrelated runtime
+work. Test or embedded construction without a backend runtime uses Zig's
+explicit global single-threaded I/O fallback and does not create a private
+thread pool.
 
 Cache contents remain process-local. They do not belong in metadata Raft and do
 not require distributed invalidation. Multiple API replicas may each perform
@@ -127,7 +130,9 @@ inference:
 inference queueing. Requests for a key already in flight still coalesce when
 the limit is reached; new unique misses receive an overload response. This
 prevents high-cardinality traffic from turning the singleflight map into an
-unbounded upstream queue.
+unbounded upstream queue. Public overload, provider rate-limit, and transient
+provider responses include a short `Retry-After` hint so clients can back off
+instead of immediately amplifying pressure.
 
 Each entry charge includes the vector, entry object, key/value storage, and a
 conservative allowance for hash-table occupancy. The cache reserves its charge

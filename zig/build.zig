@@ -2863,6 +2863,7 @@ pub fn build(b: *std.Build) void {
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
+        "api http retryable embedding failures provide retry guidance",
         "api http server applies node query embedding cache policy",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",

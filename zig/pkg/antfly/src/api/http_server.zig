@@ -7365,9 +7365,9 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
             error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
             error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
-            error.QueryEmbeddingOverloaded => return try textResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => return try textResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => return try textResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
             error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
             error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -7434,9 +7434,9 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
                 error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
                 error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
-                error.QueryEmbeddingOverloaded => return try textResponse(self.alloc, 429, "query embedding overloaded"),
-                error.EmbedRateLimited => return try textResponse(self.alloc, 429, "query embedding rate limited"),
-                error.EmbedTransientFailure => return try textResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+                error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+                error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+                error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
                 error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
                 error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -11189,6 +11189,29 @@ fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_c
     };
 }
 
+fn retryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
+    const headers = try alloc.alloc(http_common.Header, 1);
+    errdefer alloc.free(headers);
+    headers[0] = .{
+        .name = try alloc.dupe(u8, "Retry-After"),
+        .value = alloc.dupe(u8, "1") catch |err| {
+            alloc.free(headers[0].name);
+            return err;
+        },
+    };
+    errdefer headers[0].deinit(alloc);
+
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
+    const owned_body = try alloc.dupe(u8, body);
+    return .{
+        .status = status,
+        .content_type = content_type,
+        .headers = headers,
+        .body = owned_body,
+    };
+}
+
 fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     const headers = try alloc.alloc(http_common.Header, 2);
     var initialized_headers: usize = 0;
@@ -11830,6 +11853,16 @@ test "api http query parsing preserves operational embedding failures" {
     try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.ConnectionRefused));
     try std.testing.expectEqual(error.EmbedUpstreamFailure, normalizePublicQueryParseError(error.InvalidEmbeddingResponse));
     try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicQueryParseError(error.InvalidCharacter));
+}
+
+test "api http retryable embedding failures provide retry guidance" {
+    var response = try retryableTextResponse(std.testing.allocator, 429, "query embedding overloaded");
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 429), response.status);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqualStrings("Retry-After", response.headers[0].name);
+    try std.testing.expectEqualStrings("1", response.headers[0].value);
 }
 
 test "api http public table dispatch preserves unsupported sorted query as exact sort" {
