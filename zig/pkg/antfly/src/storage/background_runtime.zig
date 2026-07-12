@@ -465,14 +465,14 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.entries.items.len == 0) return null;
-        return self.entries.orderedRemove(0);
+        return self.entries.swapRemove(0);
     }
 
     fn popOwner(self: *ThreadedDurableJobLane, owner_id: u64) ?*Entry {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (self.entries.items, 0..) |entry, idx| {
-            if (entry.job.owner_id == owner_id) return self.entries.orderedRemove(idx);
+            if (entry.job.owner_id == owner_id) return self.entries.swapRemove(idx);
         }
         return null;
     }
@@ -481,7 +481,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (self.entries.items, 0..) |entry, idx| {
-            if (entry.completed.load(.acquire)) return self.entries.orderedRemove(idx);
+            if (entry.completed.load(.acquire)) return self.entries.swapRemove(idx);
         }
         return null;
     }

@@ -10553,6 +10553,7 @@ components:
         table_names:
           type: array
           maxItems: 256
+          uniqueItems: true
           items:
             type: string
             minLength: 1
@@ -10637,6 +10638,7 @@ components:
         table_names:
           type: array
           maxItems: 256
+          uniqueItems: true
           items:
             type: string
             minLength: 1

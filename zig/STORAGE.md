@@ -289,9 +289,11 @@ the existing `/db/v1`, SQL, transaction, indexing, and inference code paths are
 reused unchanged. Each checkpoint pins both the append-only document history
 and a copy-on-write, disk-resident ordered B+ tree whose leaves map full logical
 keys to their newest document pages. Point reads and cursor seeks are
-`O(log N)` page lookups; forward and reverse cursors retain only the current key
-and value, skip indexed tombstones, and never materialize a table-sized key
-array. Prefix bounds prevent cross-table scans. Initial imports and vacuum use
+`O(log N)` page lookups. Forward and reverse cursors retain one decoded
+root-to-leaf path, making sequential next/previous traversal amortized `O(1)`
+per key while retaining memory proportional only to tree height; they skip
+indexed tombstones and never materialize a table-sized key array. Prefix bounds
+prevent cross-table scans. Initial imports and vacuum use
 a streaming packed-tree builder, retaining one leaf plus one separator per
 output page rather than all live keys. Normal commits copy only the affected
 tree path, and the shared bounded page cache serves index and document pages.
@@ -303,11 +305,12 @@ cannot reclaim their pages. A `std.Io.RwLock` permits normal append-only commits
 while readers pin roots and makes vacuum/rewrite wait before reclaiming pages.
 A checkpointed namespace-head directory and per-namespace document links retain
 efficient table-history maintenance independently of the global ordered index.
-Recreating an existing Lite
-artifact publishes a complete new inode by atomic rename, so readers pinned to
+Recreating an existing Lite artifact publishes a complete new inode by atomic
+rename, so readers pinned to
 the prior generation are never exposed to truncation. Missing namespace
-metadata fails closed as file corruption. Cached namespace runtimes avoid allocations and storage
-reinitialization on repeated reader/writer opens. The standalone metadata
+metadata fails closed as file corruption. Hash-indexed namespace runtimes give
+expected `O(1)` reuse without storage reinitialization on repeated reader/writer
+opens. The standalone metadata
 catalog and durable HTTP transaction sessions are stored in reserved system
 namespaces in the same file. Metadata is published in memory only with a
 durable catalog commit; staged multi-request transactions are reloaded from the

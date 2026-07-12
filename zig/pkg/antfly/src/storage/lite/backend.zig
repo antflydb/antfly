@@ -151,7 +151,7 @@ pub const Handle = struct {
     native_index_storage: ?*index_storage.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
     namespace_mutex: std.atomic.Mutex = .unlocked,
-    namespace_runtimes: std.ArrayListUnmanaged(NamespaceRuntime) = .empty,
+    namespace_runtimes: std.StringHashMapUnmanaged(NamespaceRuntime) = .empty,
     root_namespace_alias: ?[]u8 = null,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
@@ -206,7 +206,8 @@ pub const Handle = struct {
                 }
             },
             .native_single_file => {
-                for (self.namespace_runtimes.items) |*runtime| runtime.deinit(self.allocator);
+                var runtimes = self.namespace_runtimes.valueIterator();
+                while (runtimes.next()) |runtime| runtime.deinit(self.allocator);
                 self.namespace_runtimes.deinit(self.allocator);
                 if (self.root_namespace_alias) |alias| self.allocator.free(alias);
                 if (self.native_index_storage) |storage| {
@@ -283,13 +284,7 @@ pub const Handle = struct {
         const canonical_namespace = try canonicalDbNamespaceAlloc(self.allocator, namespace);
         defer self.allocator.free(canonical_namespace);
 
-        var selected: ?*NamespaceRuntime = null;
-        for (self.namespace_runtimes.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, canonical_namespace)) {
-                selected = entry;
-                break;
-            }
-        }
+        var selected = self.namespace_runtimes.getPtr(canonical_namespace);
         if (selected == null) {
             const name = try self.allocator.dupe(u8, canonical_namespace);
             errdefer self.allocator.free(name);
@@ -311,13 +306,13 @@ pub const Handle = struct {
             errdefer self.allocator.destroy(runtime_store);
             runtime_store.* = try self.native_docstore.?.runtimeStoreWithPrefix(self.allocator, key_prefix);
             errdefer runtime_store.deinit();
-            try self.namespace_runtimes.append(self.allocator, .{
+            try self.namespace_runtimes.putNoClobber(self.allocator, name, .{
                 .name = name,
                 .key_prefix = key_prefix,
                 .index_base_path = index_base_path,
                 .runtime_store = runtime_store,
             });
-            selected = &self.namespace_runtimes.items[self.namespace_runtimes.items.len - 1];
+            selected = self.namespace_runtimes.getPtr(name).?;
         }
 
         const runtime = selected.?;
@@ -356,6 +351,12 @@ pub const Handle = struct {
             if (!std.mem.eql(u8, existing, canonical)) return error.LiteRootNamespaceAlreadyAdopted;
             self.allocator.free(canonical);
             return;
+        }
+        // Changing the namespace mapping after a DB has opened would leave
+        // that caller bound to the old prefixed runtime. Fail closed instead
+        // of publishing an alias that only future opens observe.
+        if (self.namespace_runtimes.get(canonical)) |runtime| {
+            if (runtime.key_prefix.len != 0) return error.LiteNamespaceAlreadyOpened;
         }
         try self.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
         self.root_namespace_alias = canonical;
@@ -424,10 +425,7 @@ pub const Handle = struct {
         defer self.allocator.free(canonical_namespace);
         platform_sync.lockYielding(&self.namespace_mutex);
         defer self.namespace_mutex.unlock();
-        for (self.namespace_runtimes.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, canonical_namespace)) return entry.runtime_store;
-        }
-        unreachable;
+        return self.namespace_runtimes.getPtr(canonical_namespace).?.runtime_store;
     }
 
     pub fn storageStatus(self: *Handle) StorageStatus {
@@ -532,7 +530,8 @@ pub const Handle = struct {
             .compact => blk: {
                 platform_sync.lockYielding(&self.namespace_mutex);
                 defer self.namespace_mutex.unlock();
-                for (self.namespace_runtimes.items) |*runtime| {
+                var runtimes = self.namespace_runtimes.valueIterator();
+                while (runtimes.next()) |runtime| {
                     try cancel.check();
                     try runtime.runtime_store.sync(true);
                 }
@@ -1336,6 +1335,9 @@ test "lite backend namespaced db options isolate tables in one file" {
     var opts_b = opts_a;
     try handle.configureDbOpenOptionsForNamespace(&opts_a, "table/a");
     try handle.configureDbOpenOptionsForNamespace(&opts_b, "table/b");
+    const runtime_a = try handle.runtimeStoreForNamespace("table/a");
+    try std.testing.expect(runtime_a == try handle.runtimeStoreForNamespace("table/a"));
+    try std.testing.expectEqual(@as(usize, 2), handle.namespace_runtimes.count());
     var db_a = try db_mod.DB.open(allocator, "table/a", opts_a);
     defer db_a.close();
     var db_b = try db_mod.DB.open(allocator, "table/b", opts_b);
@@ -1402,6 +1404,21 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         defer allocator.free(value);
         try std.testing.expectEqualStrings("{\"source\":\"embedded\"}", value);
     }
+}
+
+test "lite backend rejects root adoption after the target namespace opens" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "embedded-adoption-open.aflite");
+    defer allocator.free(path);
+
+    var handle = try Handle.create(allocator, path, true);
+    defer handle.deinit();
+    var opts = db_mod.OpenOptions{};
+    try handle.configureDbOpenOptionsForNamespace(&opts, "docs");
+    try std.testing.expectError(error.LiteNamespaceAlreadyOpened, handle.adoptEmbeddedRootAsNamespace("docs"));
+    try std.testing.expect(!handle.hasStandaloneRootAdoption());
 }
 
 test "lite backend fails closed on unknown artifact profile and invalid root alias" {

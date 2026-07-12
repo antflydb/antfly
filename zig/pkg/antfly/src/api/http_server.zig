@@ -8617,6 +8617,7 @@ fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_c
         error.AsyncRestoreUnavailable => try textResponse(alloc, 503, "asynchronous restore worker unavailable"),
         error.RestoreJobCapacityExceeded => try textResponse(alloc, 503, "restore job history is at capacity"),
         error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try textResponse(alloc, 400, "restore request is too large"),
+        error.DuplicateRestoreTableName => try textResponse(alloc, 400, "restore request contains duplicate table names"),
         else => try textResponse(alloc, 500, "failed to create restore job"),
     };
 }

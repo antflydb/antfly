@@ -853,7 +853,12 @@ fn validateStartRequest(req: StartRequest) !void {
         return error.RestoreJobRecordTooLarge;
     if (req.table_names) |names| {
         if (names.len > max_tables_per_job) return error.TooManyRestoreTables;
-        for (names) |name| if (name.len == 0 or name.len > max_restore_string_bytes) return error.RestoreJobRecordTooLarge;
+        for (names, 0..) |name, i| {
+            if (name.len == 0 or name.len > max_restore_string_bytes) return error.RestoreJobRecordTooLarge;
+            for (names[0..i]) |previous| {
+                if (std.mem.eql(u8, previous, name)) return error.DuplicateRestoreTableName;
+            }
+        }
     }
 }
 
@@ -1167,5 +1172,12 @@ test "restore job store rejects oversized request state" {
         .backup_id = "daily",
         .location = oversized,
         .connection = "archive-reader",
+    }));
+    try std.testing.expectError(error.DuplicateRestoreTableName, store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/backups",
+        .connection = "archive-reader",
+        .table_names = &.{ "docs", "docs" },
     }));
 }

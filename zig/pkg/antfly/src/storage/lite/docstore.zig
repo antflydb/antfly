@@ -661,7 +661,11 @@ pub const Txn = struct {
     }
 
     pub fn openCursor(self: *Txn) !Cursor {
-        return .{ .txn = self };
+        const store = self.store orelse return error.InvalidTransactionState;
+        return .{
+            .txn = self,
+            .index_cursor = native.DocumentIndexCursor.init(&store.file, self.checkpoint),
+        };
     }
 
     fn freePending(self: *Txn) void {
@@ -705,11 +709,13 @@ fn validatePrefix(prefix: []const u8) !void {
 
 pub const Cursor = struct {
     txn: *Txn,
+    index_cursor: native.DocumentIndexCursor,
     current_key: ?[]u8 = null,
     upper_bound: ?[]const u8 = null,
     owned_value: ?[]u8 = null,
 
     pub fn close(self: *Cursor) void {
+        self.index_cursor.deinit();
         if (self.current_key) |key| self.txn.allocator.free(key);
         if (self.owned_value) |value| self.txn.allocator.free(value);
         self.current_key = null;
@@ -717,50 +723,44 @@ pub const Cursor = struct {
     }
 
     pub fn first(self: *Cursor) !backend_adapter.Entry {
-        const store = self.txn.store orelse return error.InvalidTransactionState;
         const candidate = if (self.txn.prefix.len == 0)
-            try store.file.firstDocumentIndexEntry(self.txn.checkpoint)
+            try self.index_cursor.first()
         else
-            try store.file.seekDocumentIndexAtOrAfter(self.txn.checkpoint, self.txn.prefix, false);
+            try self.index_cursor.seekAtOrAfter(self.txn.prefix, false);
         return try self.resolveCandidate(candidate, .forward);
     }
 
     pub fn last(self: *Cursor) !backend_adapter.Entry {
-        const store = self.txn.store orelse return error.InvalidTransactionState;
         const candidate = if (self.txn.prefix.len == 0)
-            try store.file.lastDocumentIndexEntry(self.txn.checkpoint)
+            try self.index_cursor.last()
         else blk: {
             const upper = try self.namespaceUpperBound();
             defer self.txn.allocator.free(upper);
-            break :blk try store.file.seekDocumentIndexAtOrBefore(self.txn.checkpoint, upper, true);
+            break :blk try self.index_cursor.seekAtOrBefore(upper, true);
         };
         return try self.resolveCandidate(candidate, .backward);
     }
 
     pub fn next(self: *Cursor) !backend_adapter.Entry {
-        const current = self.current_key orelse return error.NotFound;
-        const store = self.txn.store orelse return error.InvalidTransactionState;
-        return try self.resolveCandidate(try store.file.seekDocumentIndexAtOrAfter(self.txn.checkpoint, current, true), .forward);
+        if (self.current_key == null) return error.NotFound;
+        return try self.resolveCandidate(try self.index_cursor.next(), .forward);
     }
 
     pub fn prev(self: *Cursor) !backend_adapter.Entry {
-        const current = self.current_key orelse return error.NotFound;
-        const store = self.txn.store orelse return error.InvalidTransactionState;
-        return try self.resolveCandidate(try store.file.seekDocumentIndexAtOrBefore(self.txn.checkpoint, current, true), .backward);
+        if (self.current_key == null) return error.NotFound;
+        return try self.resolveCandidate(try self.index_cursor.prev(), .backward);
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
-        const store = self.txn.store orelse return error.InvalidTransactionState;
-        return try self.resolveCandidate(try store.file.seekDocumentIndexAtOrAfter(self.txn.checkpoint, lookup_key, false), .forward);
+        return try self.resolveCandidate(try self.index_cursor.seekAtOrAfter(lookup_key, false), .forward);
     }
 
     pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !backend_adapter.Entry {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
-        const store = self.txn.store orelse return error.InvalidTransactionState;
-        return try self.resolveCandidate(try store.file.seekDocumentIndexAtOrBefore(self.txn.checkpoint, lookup_key, false), .backward);
+        return try self.resolveCandidate(try self.index_cursor.seekAtOrBefore(lookup_key, false), .backward);
     }
 
     pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
@@ -795,8 +795,8 @@ pub const Cursor = struct {
                 return .{ .key = self.current_key.?[self.txn.prefix.len..], .value = owned_value };
             }
             candidate = switch (direction) {
-                .forward => try store.file.seekDocumentIndexAtOrAfter(self.txn.checkpoint, full_key, true),
-                .backward => try store.file.seekDocumentIndexAtOrBefore(self.txn.checkpoint, full_key, true),
+                .forward => try self.index_cursor.next(),
+                .backward => try self.index_cursor.prev(),
             };
             owned_indexed.deinit(self.txn.allocator);
         }
@@ -1508,6 +1508,15 @@ test "lite native docstore cold writes and large disk-index cursors stay bounded
         }
         try std.testing.expectEqual(bounded_cursor_test_documents, count);
         try std.testing.expectEqualStrings("doc:00511", (try cursor.last()).key);
+        var reverse_count: usize = 1;
+        while (true) {
+            _ = cursor.prev() catch |err| switch (err) {
+                error.NotFound => break,
+                else => return err,
+            };
+            reverse_count += 1;
+        }
+        try std.testing.expectEqual(bounded_cursor_test_documents, reverse_count);
         try std.testing.expectEqualStrings("doc:00256", (try cursor.seekAtOrAfter("doc:00256")).key);
     }
 

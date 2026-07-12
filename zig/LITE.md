@@ -71,16 +71,19 @@ The implementation now consists of:
   path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
   logical document key to its newest document page. Initial loads and vacuum
   build packed trees as bounded streaming operations. Integrity checks validate
-  every tree page, separator range, document pointer, and checkpoint/free-map
-  reachability. Missing directory, namespace-link, or ordered-index metadata is
-  treated as corruption.
+  every tree page, separator range, and checkpoint/free-map reachability, then
+  prove that the index contains exactly the newest document page for every key
+  in history. Missing, stale, duplicate, or cross-key document pointers and
+  missing directory or namespace-link metadata are treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Point reads
   and ordered seeks traverse the checkpoint's disk-resident B+ tree in
-  `O(log N)` pages. A cursor owns only its current key and value, so cold scans
-  remain bounded by the page cache rather than live-key count or document
-  payload volume. Tombstones remain indexed until vacuum and are skipped during
-  iteration. Pinned reads use concurrent positional I/O. A
+  `O(log N)` pages. A cursor retains one decoded root-to-leaf path, its current
+  key, and its current value, so sequential next/previous traversal is
+  amortized `O(1)` and cold-scan memory remains bounded by tree height and the
+  page cache rather than live-key count or document payload volume. Tombstones
+  remain indexed until vacuum and are skipped during iteration. Pinned reads
+  use concurrent positional I/O. A
   `std.Io.RwLock` allows normal append-only commits while readers pin roots and
   blocks vacuum before it can reclaim those roots.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the

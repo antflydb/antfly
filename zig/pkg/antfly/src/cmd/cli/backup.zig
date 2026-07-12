@@ -23,6 +23,7 @@ const portable_backup = antfly.portable_backup;
 
 const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
 const restore_poll_interval_ms: u64 = 1000;
+const max_restore_tables: usize = 256;
 
 const BackupArgs = struct {
     help: bool = false,
@@ -110,13 +111,11 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
 
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    defer names.deinit(allocator);
     var table_names: ?[]const []const u8 = null;
     if (opts.tables_str) |ts| {
-        var names = std.ArrayListUnmanaged([]const u8).empty;
-        var it = std.mem.splitScalar(u8, ts, ',');
-        while (it.next()) |name| {
-            try names.append(allocator, std.mem.trim(u8, name, " "));
-        }
+        parseTableNames(allocator, &names, ts) catch |err| tableListFatal(err);
         table_names = names.items;
     }
 
@@ -178,13 +177,11 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         return;
     }
 
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    defer names.deinit(allocator);
     var table_names: ?[]const []const u8 = null;
     if (opts.tables_str) |ts| {
-        var names = std.ArrayListUnmanaged([]const u8).empty;
-        var it = std.mem.splitScalar(u8, ts, ',');
-        while (it.next()) |name| {
-            try names.append(allocator, std.mem.trim(u8, name, " "));
-        }
+        parseTableNames(allocator, &names, ts) catch |err| tableListFatal(err);
         table_names = names.items;
     }
 
@@ -386,6 +383,27 @@ fn restoreInputLocationAlloc(allocator: std.mem.Allocator, input_path: []const u
     _ = input_path;
     if (!opts.location_explicit) return error.RestoreInputLocationRequired;
     return try allocator.dupe(u8, opts.location);
+}
+
+fn parseTableNames(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), raw: []const u8) !void {
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |candidate| {
+        const name = std.mem.trim(u8, candidate, " \t\r\n");
+        if (name.len == 0) return error.InvalidTableName;
+        if (out.items.len >= max_restore_tables) return error.TooManyRestoreTables;
+        for (out.items) |existing| if (std.mem.eql(u8, existing, name)) return error.DuplicateTableName;
+        try out.append(allocator, name);
+    }
+    if (out.items.len == 0) return error.InvalidTableName;
+}
+
+fn tableListFatal(err: anyerror) noreturn {
+    switch (err) {
+        error.InvalidTableName => cli.fatal("--tables contains an empty table name", .{}),
+        error.DuplicateTableName => cli.fatal("--tables contains a duplicate table name", .{}),
+        error.TooManyRestoreTables => cli.fatal("--tables supports at most {d} table names", .{max_restore_tables}),
+        else => cli.fatal("invalid --tables value: {s}", .{@errorName(err)}),
+    }
 }
 
 fn printBackupUsage() void {
@@ -673,4 +691,18 @@ test "restore cli parser rejects unknown arguments" {
     var argv = [_][*:0]const u8{ "--input", "app.aflite", "--table", "docs", "--bogus" };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&iter));
+}
+
+test "restore table list trims names and rejects ambiguous input" {
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    defer names.deinit(std.testing.allocator);
+    try parseTableNames(std.testing.allocator, &names, " alpha, beta ");
+    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    try std.testing.expectEqualStrings("alpha", names.items[0]);
+    try std.testing.expectEqualStrings("beta", names.items[1]);
+
+    names.clearRetainingCapacity();
+    try std.testing.expectError(error.InvalidTableName, parseTableNames(std.testing.allocator, &names, "alpha,,beta"));
+    names.clearRetainingCapacity();
+    try std.testing.expectError(error.DuplicateTableName, parseTableNames(std.testing.allocator, &names, "alpha,alpha"));
 }

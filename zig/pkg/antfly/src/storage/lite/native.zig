@@ -104,6 +104,175 @@ pub const DocumentIndexEntry = struct {
     }
 };
 
+/// Cursor over one checkpoint's copy-on-write document index. The cursor owns
+/// one decoded root-to-leaf path, so sequential scans read each index page once
+/// instead of repeating a root seek for every key. Memory is bounded by tree
+/// height times page size.
+pub const DocumentIndexCursor = struct {
+    const Frame = struct {
+        node: DocumentIndexNode,
+        position: usize,
+    };
+
+    file: *NativeFile,
+    checkpoint: CheckpointSlot,
+    frames: std.ArrayListUnmanaged(Frame) = .empty,
+
+    pub fn init(file: *NativeFile, checkpoint: CheckpointSlot) DocumentIndexCursor {
+        return .{ .file = file, .checkpoint = checkpoint };
+    }
+
+    pub fn deinit(self: *DocumentIndexCursor) void {
+        self.clear();
+        self.frames.deinit(self.file.allocator);
+        self.* = undefined;
+    }
+
+    pub fn first(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+        self.clear();
+        if (self.checkpoint.document_index_root_page == 0) return null;
+        try self.descendExtreme(self.checkpoint.document_index_root_page, true);
+        return try self.currentEntry();
+    }
+
+    pub fn last(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+        self.clear();
+        if (self.checkpoint.document_index_root_page == 0) return null;
+        try self.descendExtreme(self.checkpoint.document_index_root_page, false);
+        return try self.currentEntry();
+    }
+
+    pub fn seekAtOrAfter(self: *DocumentIndexCursor, key: []const u8, strict: bool) !?DocumentIndexEntry {
+        self.clear();
+        var page_id = self.checkpoint.document_index_root_page;
+        while (page_id != 0) {
+            var node = try self.file.readDocumentIndexNode(page_id, self.checkpoint);
+            if (node.kind == .leaf) {
+                const position = if (strict) upperBoundIndexKeys(node.keys, key) else lowerBoundIndexKeys(node.keys, key);
+                self.frames.append(self.file.allocator, .{ .node = node, .position = position }) catch |err| {
+                    node.deinit(self.file.allocator);
+                    return err;
+                };
+                if (position < node.keys.len) return try self.currentEntry();
+                return try self.next();
+            }
+            const position = upperBoundIndexKeys(node.keys, key);
+            page_id = node.pointers[position];
+            self.frames.append(self.file.allocator, .{ .node = node, .position = position }) catch |err| {
+                node.deinit(self.file.allocator);
+                return err;
+            };
+        }
+        return null;
+    }
+
+    pub fn seekAtOrBefore(self: *DocumentIndexCursor, key: []const u8, strict: bool) !?DocumentIndexEntry {
+        self.clear();
+        var page_id = self.checkpoint.document_index_root_page;
+        while (page_id != 0) {
+            var node = try self.file.readDocumentIndexNode(page_id, self.checkpoint);
+            if (node.kind == .leaf) {
+                const bound = if (strict) lowerBoundIndexKeys(node.keys, key) else upperBoundIndexKeys(node.keys, key);
+                self.frames.append(self.file.allocator, .{ .node = node, .position = if (bound == 0) 0 else bound - 1 }) catch |err| {
+                    node.deinit(self.file.allocator);
+                    return err;
+                };
+                if (bound > 0) return try self.currentEntry();
+                return try self.prev();
+            }
+            const position = upperBoundIndexKeys(node.keys, key);
+            page_id = node.pointers[position];
+            self.frames.append(self.file.allocator, .{ .node = node, .position = position }) catch |err| {
+                node.deinit(self.file.allocator);
+                return err;
+            };
+        }
+        return null;
+    }
+
+    pub fn next(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+        if (self.frames.items.len == 0) return null;
+        const leaf = &self.frames.items[self.frames.items.len - 1];
+        if (leaf.node.kind != .leaf) return error.InvalidDocumentIndex;
+        if (leaf.position + 1 < leaf.node.keys.len) {
+            leaf.position += 1;
+            return try self.currentEntry();
+        }
+        self.popFrame();
+        while (self.frames.items.len > 0) {
+            const parent = &self.frames.items[self.frames.items.len - 1];
+            if (parent.node.kind != .internal) return error.InvalidDocumentIndex;
+            if (parent.position + 1 < parent.node.pointers.len) {
+                parent.position += 1;
+                const child = parent.node.pointers[parent.position];
+                try self.descendExtreme(child, true);
+                return try self.currentEntry();
+            }
+            self.popFrame();
+        }
+        return null;
+    }
+
+    pub fn prev(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+        if (self.frames.items.len == 0) return null;
+        const leaf = &self.frames.items[self.frames.items.len - 1];
+        if (leaf.node.kind != .leaf) return error.InvalidDocumentIndex;
+        if (leaf.position > 0 and leaf.position <= leaf.node.keys.len) {
+            leaf.position -= 1;
+            return try self.currentEntry();
+        }
+        self.popFrame();
+        while (self.frames.items.len > 0) {
+            const parent = &self.frames.items[self.frames.items.len - 1];
+            if (parent.node.kind != .internal) return error.InvalidDocumentIndex;
+            if (parent.position > 0) {
+                parent.position -= 1;
+                const child = parent.node.pointers[parent.position];
+                try self.descendExtreme(child, false);
+                return try self.currentEntry();
+            }
+            self.popFrame();
+        }
+        return null;
+    }
+
+    fn descendExtreme(self: *DocumentIndexCursor, root_page_id: u64, toward_first: bool) !void {
+        var page_id = root_page_id;
+        while (page_id != 0) {
+            var node = try self.file.readDocumentIndexNode(page_id, self.checkpoint);
+            const position = switch (node.kind) {
+                .leaf => if (toward_first) 0 else node.keys.len - 1,
+                .internal => if (toward_first) 0 else node.pointers.len - 1,
+            };
+            const next_page = if (node.kind == .internal) node.pointers[position] else 0;
+            self.frames.append(self.file.allocator, .{ .node = node, .position = position }) catch |err| {
+                node.deinit(self.file.allocator);
+                return err;
+            };
+            page_id = next_page;
+        }
+    }
+
+    fn currentEntry(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+        if (self.frames.items.len == 0) return null;
+        const frame = &self.frames.items[self.frames.items.len - 1];
+        if (frame.node.kind != .leaf or frame.position >= frame.node.keys.len) return null;
+        return .{
+            .key = try self.file.allocator.dupe(u8, frame.node.keys[frame.position]),
+            .document_page_id = frame.node.pointers[frame.position],
+        };
+    }
+
+    fn popFrame(self: *DocumentIndexCursor) void {
+        var frame = self.frames.pop().?;
+        frame.node.deinit(self.file.allocator);
+    }
+
+    fn clear(self: *DocumentIndexCursor) void {
+        while (self.frames.items.len > 0) self.popFrame();
+    }
+};
+
 const DocumentIndexSplit = struct {
     separator: []u8,
     right_page_id: u64,
@@ -819,6 +988,9 @@ pub const NativeFile = struct {
         if ((checkpoint.document_root_page == 0) != (checkpoint.document_index_root_page == 0))
             return invalidCheck(report, "invalid_document_index");
         const document_index_pages = self.collectDocumentIndexPages(checkpoint, &reachable_pages, true, cancel) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        self.validateDocumentIndexCoverage(checkpoint, cancel) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         if (cancel) |token| try token.check();
@@ -2134,83 +2306,6 @@ pub const NativeFile = struct {
         return null;
     }
 
-    fn documentIndexExtreme(self: *NativeFile, checkpoint: CheckpointSlot, root_page_id: u64, first: bool) !?DocumentIndexEntry {
-        var page_id = root_page_id;
-        while (page_id != 0) {
-            var node = try self.readDocumentIndexNode(page_id, checkpoint);
-            defer node.deinit(self.allocator);
-            if (node.kind == .leaf) {
-                if (node.keys.len == 0) return error.InvalidDocumentIndex;
-                const index: usize = if (first) 0 else node.keys.len - 1;
-                return .{
-                    .key = try self.allocator.dupe(u8, node.keys[index]),
-                    .document_page_id = node.pointers[index],
-                };
-            }
-            page_id = if (first) node.pointers[0] else node.pointers[node.pointers.len - 1];
-        }
-        return null;
-    }
-
-    pub fn firstDocumentIndexEntry(self: *NativeFile, checkpoint: CheckpointSlot) !?DocumentIndexEntry {
-        return try self.documentIndexExtreme(checkpoint, checkpoint.document_index_root_page, true);
-    }
-
-    pub fn lastDocumentIndexEntry(self: *NativeFile, checkpoint: CheckpointSlot) !?DocumentIndexEntry {
-        return try self.documentIndexExtreme(checkpoint, checkpoint.document_index_root_page, false);
-    }
-
-    pub fn seekDocumentIndexAtOrAfter(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8, strict: bool) !?DocumentIndexEntry {
-        var page_id = checkpoint.document_index_root_page;
-        var candidate_subtree: ?u64 = null;
-        while (page_id != 0) {
-            var node = try self.readDocumentIndexNode(page_id, checkpoint);
-            defer node.deinit(self.allocator);
-            if (node.kind == .leaf) {
-                const index = if (strict) upperBoundIndexKeys(node.keys, key) else lowerBoundIndexKeys(node.keys, key);
-                if (index < node.keys.len) return .{
-                    .key = try self.allocator.dupe(u8, node.keys[index]),
-                    .document_page_id = node.pointers[index],
-                };
-                return if (candidate_subtree) |candidate|
-                    try self.documentIndexExtreme(checkpoint, candidate, true)
-                else
-                    null;
-            }
-            const child_index = upperBoundIndexKeys(node.keys, key);
-            if (child_index + 1 < node.pointers.len) candidate_subtree = node.pointers[child_index + 1];
-            page_id = node.pointers[child_index];
-        }
-        return null;
-    }
-
-    pub fn seekDocumentIndexAtOrBefore(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8, strict: bool) !?DocumentIndexEntry {
-        var page_id = checkpoint.document_index_root_page;
-        var candidate_subtree: ?u64 = null;
-        while (page_id != 0) {
-            var node = try self.readDocumentIndexNode(page_id, checkpoint);
-            defer node.deinit(self.allocator);
-            if (node.kind == .leaf) {
-                const bound = if (strict) lowerBoundIndexKeys(node.keys, key) else upperBoundIndexKeys(node.keys, key);
-                if (bound > 0) {
-                    const index = bound - 1;
-                    return .{
-                        .key = try self.allocator.dupe(u8, node.keys[index]),
-                        .document_page_id = node.pointers[index],
-                    };
-                }
-                return if (candidate_subtree) |candidate|
-                    try self.documentIndexExtreme(checkpoint, candidate, false)
-                else
-                    null;
-            }
-            const child_index = upperBoundIndexKeys(node.keys, key);
-            if (child_index > 0) candidate_subtree = node.pointers[child_index - 1];
-            page_id = node.pointers[child_index];
-        }
-        return null;
-    }
-
     pub fn documentValueAtIndexEntryAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !?[]u8 {
         const payload = try self.readPagePayloadByKindAllocForCheckpoint(allocator, indexed.document_page_id, .document, checkpoint);
         defer allocator.free(payload);
@@ -3100,6 +3195,45 @@ pub const NativeFile = struct {
         }
     }
 
+    /// Proves that the ordered index contains exactly the newest page for every
+    /// key in document history. The unresolved set stores only page IDs, not
+    /// keys or values, keeping integrity-check memory proportional to eight
+    /// bytes plus hash overhead per live key.
+    fn validateDocumentIndexCoverage(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken) !void {
+        var unresolved = std.AutoHashMapUnmanaged(u64, void){};
+        defer unresolved.deinit(self.allocator);
+
+        var cursor = DocumentIndexCursor.init(self, checkpoint);
+        defer cursor.deinit();
+        var indexed = try cursor.first();
+        while (indexed) |entry| {
+            var owned = entry;
+            defer owned.deinit(self.allocator);
+            if (cancel) |token| try token.check();
+            const inserted = try unresolved.getOrPut(self.allocator, owned.document_page_id);
+            if (inserted.found_existing) return error.InvalidDocumentIndex;
+            indexed = try cursor.next();
+        }
+
+        var page_id = checkpoint.document_root_page;
+        var walked: u64 = 0;
+        while (page_id != 0) {
+            if (cancel) |token| try token.check();
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .document, checkpoint);
+            defer self.allocator.free(payload);
+            const entry = try decodeDocumentEntry(payload);
+            const indexed_page = (try self.lookupDocumentIndexPage(checkpoint, entry.key)) orelse return error.InvalidDocumentIndex;
+            if (unresolved.contains(indexed_page)) {
+                if (indexed_page != page_id) return error.InvalidDocumentIndex;
+                _ = unresolved.remove(indexed_page);
+            }
+            page_id = entry.previous_page;
+            walked += 1;
+            if (walked > checkpoint.page_count) return error.InvalidNativePageChain;
+        }
+        if (unresolved.count() != 0) return error.InvalidDocumentIndex;
+    }
+
     fn collectAllValidCheckpointReachablePages(self: *NativeFile, out: *ReachablePageSet) !void {
         const file_size = (try self.file.stat(self.io_impl.io())).size;
         for (self.header.checkpoints) |slot| {
@@ -3297,7 +3431,9 @@ pub const NativeFile = struct {
         }
 
         const checkpoint = self.activeCheckpoint();
-        var maybe_document = try self.firstDocumentIndexEntry(checkpoint);
+        var index_cursor = DocumentIndexCursor.init(self, checkpoint);
+        defer index_cursor.deinit();
+        var maybe_document = try index_cursor.first();
         while (maybe_document) |indexed| {
             var owned_indexed = indexed;
             defer owned_indexed.deinit(self.allocator);
@@ -3311,7 +3447,7 @@ pub const NativeFile = struct {
                     compact_pages += self.valuePageCount(owned_value.len);
                 }
             }
-            maybe_document = try self.seekDocumentIndexAtOrAfter(checkpoint, owned_indexed.key, true);
+            maybe_document = try index_cursor.next();
         }
         if (document_count > 0) {
             var directory = (try self.loadNamespaceDirectoryAlloc(self.allocator)) orelse return error.InvalidNamespaceDirectory;
@@ -6217,6 +6353,43 @@ test "lite native check reports corrupted committed document index page" {
     const report = try reopened.check();
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native check rejects a structurally valid stale document index pointer" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-document-index-stale.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+    try file.putDocument("doc:1", "old");
+    try file.putDocument("doc:1", "new");
+
+    const checkpoint = file.activeCheckpoint();
+    const newest_payload = try file.readPagePayloadByKindAllocForCheckpoint(allocator, checkpoint.document_root_page, .document, checkpoint);
+    defer allocator.free(newest_payload);
+    const newest = try decodeDocumentEntry(newest_payload);
+    try std.testing.expect(newest.previous_page != 0);
+
+    var index_node = try file.readDocumentIndexNode(checkpoint.document_index_root_page, checkpoint);
+    defer index_node.deinit(allocator);
+    try std.testing.expectEqual(DocumentIndexNodeKind.leaf, index_node.kind);
+    try std.testing.expectEqual(@as(usize, 1), index_node.pointers.len);
+    index_node.pointers[0] = newest.previous_page;
+    const encoded = try encodeDocumentIndexNode(allocator, index_node);
+    defer allocator.free(encoded);
+    var page: [default_page_size]u8 = undefined;
+    encodePage(&page, .document_index, encoded);
+    try file.file.writePositionalAll(file.io_impl.io(), &page, checkpoint.document_index_root_page * default_page_size);
+    file.page_cache.clear(allocator);
+
+    const report = try file.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_document_index", report.issue.?);
 }
 
 test "lite native check reports corrupted committed index catalog page" {

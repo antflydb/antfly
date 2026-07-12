@@ -760,6 +760,7 @@ pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !Cl
     errdefer alloc.free(location);
     const connection = try alloc.dupe(u8, parsed.value.connection);
     errdefer alloc.free(connection);
+    try validateSelectedTableNames(parsed.value.table_names);
     const table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names);
     errdefer if (table_names) |values| freeStringSlice(alloc, values);
     return .{
@@ -791,6 +792,16 @@ test "cluster backup format defaults portable and preserves explicit native" {
     try std.testing.expectEqual(BackupFormat.native, native_req.format);
 }
 
+test "cluster backup and restore reject duplicate table selectors" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.DuplicateBackupTableName, parseClusterBackupRequest(alloc,
+        \\{"backup_id":"daily","location":"s3://archive/backups","connection":"archive-writer","table_names":["docs","docs"]}
+    ));
+    try std.testing.expectError(error.DuplicateBackupTableName, parseClusterRestoreRequest(alloc,
+        \\{"backup_id":"daily","location":"s3://archive/backups","connection":"archive-reader","table_names":["docs","docs"]}
+    ));
+}
+
 pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterRestoreRequest {
     var parsed = try metadata_openapi.server.parseRestoreBody(alloc, body);
     defer parsed.deinit();
@@ -801,6 +812,7 @@ pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !C
     errdefer alloc.free(location);
     const connection = try alloc.dupe(u8, parsed.value.connection);
     errdefer alloc.free(connection);
+    try validateSelectedTableNames(parsed.value.table_names);
     const table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names);
     errdefer if (table_names) |values| freeStringSlice(alloc, values);
     const restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null;
@@ -2046,6 +2058,17 @@ fn cloneOptionalStringSlice(alloc: std.mem.Allocator, values: ?[]const []const u
         initialized += 1;
     }
     return result;
+}
+
+fn validateSelectedTableNames(values: ?[]const []const u8) !void {
+    const names = values orelse return;
+    if (names.len > 256) return error.TooManyBackupTables;
+    for (names, 0..) |name, i| {
+        if (name.len == 0 or name.len > 4096) return error.InvalidBackupTableName;
+        for (names[0..i]) |previous| {
+            if (std.mem.eql(u8, previous, name)) return error.DuplicateBackupTableName;
+        }
+    }
 }
 
 pub fn freeClusterBackupRequest(alloc: std.mem.Allocator, req: *ClusterBackupRequest) void {
