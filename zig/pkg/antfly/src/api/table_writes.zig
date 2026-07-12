@@ -26607,15 +26607,15 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
     try std.testing.expect(!status.stats.async_indexing.startup.active);
     try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.idle, status.stats.async_indexing.startup.phase);
     try std.testing.expect(status.stats.repair_degraded);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, status.metadata.source);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, status.metadata.freshness);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.startup_catch_up, status.metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, status.metadata.freshness);
     try std.testing.expectEqual(@as(usize, 1), status.stats.indexes.len);
     try std.testing.expect(status.stats.indexes[0].repair_degraded);
     try std.testing.expect(status.stats.indexes[0].load_error != null);
-    try std.testing.expectEqualStrings("FileNotFound", status.stats.indexes[0].load_error.?);
+    try std.testing.expectEqualStrings("startup catch-up open failed: FileNotFound", status.stats.indexes[0].load_error.?);
 }
 
-test "managed startup catch-up finishes restore repair before terminal index load degradation" {
+test "managed startup catch-up preserves restore repair debt while index load is terminal" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -26683,43 +26683,16 @@ test "managed startup catch-up finishes restore repair before terminal index loa
     index_manager_mod.test_inject_index_open_error = error.FileNotFound;
     defer index_manager_mod.test_inject_index_open_error = null;
 
-    var repair_passes: usize = 0;
-    var terminal_seen = false;
-    while (try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path)) : (repair_passes += 1) {
-        if (repair_passes > 16) return error.TestUnexpectedResult;
-        const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-            .indexes_json = indexes_json,
-            .schema_json = "",
-            .identity_namespace = identity_namespace,
-        });
-        try std.testing.expect(!result.busy);
-        try std.testing.expect(result.had_debt);
-        try std.testing.expect(!result.cleared_debt);
-
-        const repair_still_needed = try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path);
-        // The final repair pass may also observe terminal index-load degradation
-        // after repair debt is cleared, so only pre-terminal passes require it
-        // to remain unset.
-        if (repair_still_needed) {
-            try std.testing.expect(!result.terminal_degraded);
-        } else {
-            try std.testing.expect(result.terminal_degraded);
-            terminal_seen = true;
-        }
-    }
-    try std.testing.expect(repair_passes > 0);
-
-    if (!terminal_seen) {
-        const terminal = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-            .indexes_json = indexes_json,
-            .schema_json = "",
-            .identity_namespace = identity_namespace,
-        });
-        try std.testing.expect(!terminal.busy);
-        try std.testing.expect(terminal.had_debt);
-        try std.testing.expect(terminal.terminal_degraded);
-        try std.testing.expect(!terminal.cleared_debt);
-    }
+    const terminal = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        .indexes_json = indexes_json,
+        .schema_json = "",
+        .identity_namespace = identity_namespace,
+    });
+    try std.testing.expect(!terminal.busy);
+    try std.testing.expect(terminal.had_debt);
+    try std.testing.expect(terminal.terminal_degraded);
+    try std.testing.expect(!terminal.cleared_debt);
+    try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path));
     try std.testing.expectEqual(@as(usize, 0), catalog.calls);
 }
 

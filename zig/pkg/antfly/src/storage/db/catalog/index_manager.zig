@@ -13135,7 +13135,7 @@ fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !
 fn indexConfigWithFreshCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
     var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
     errdefer stored_cfg.deinit(alloc);
-    if (stored_cfg.coverage_generation == 0) stored_cfg.coverage_generation = try newCoverageGeneration();
+    stored_cfg.coverage_generation = try newCoverageGeneration();
     stored_cfg.coverage_config_fingerprint = null;
     try populateCoverageConfigFingerprint(alloc, &stored_cfg);
     return stored_cfg;

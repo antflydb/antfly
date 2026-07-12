@@ -69,6 +69,11 @@ acquires and releases the table-level restore reservation itself, so direct
 callers cannot omit write fencing. Cluster restore, which must hold that
 reservation across metadata replacement and remote snapshot staging, uses the
 explicit `restoreTableReserved()` operation while retaining the same reservation.
+For overwrite mode, cluster restore first performs the old table's exclusive
+drop transition and acquires the restore reservation only after the table is
+absent. The drop drains admission while it runs, and the absent table cannot
+accept traffic before restore recreates it, so this ordering preserves the
+write fence without making drop wait on its own restore-preparation reservation.
 This includes the embedded
 `BoundTableWriteSource`: it closes its current owner, restores into a sibling
 generation, publishes atomically, and reopens either the unchanged live

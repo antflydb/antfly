@@ -13129,9 +13129,18 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
     defer alloc.free(replica_root_dir);
     const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
     defer alloc.free(db_path);
-    const indexes_json = "{\"dv_v1\":{\"type\":\"embeddings\",\"field\":\"embedding\",\"dims\":2}}";
+    const public_index_json = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}";
+    var parsed_public_index = try std.json.parseFromSlice(std.json.Value, alloc, public_index_json, .{});
+    defer parsed_public_index.deinit();
+    const stored_index_json = try antfly.inference.managed_embedder.translateEmbeddingsIndexConfigJson(
+        alloc,
+        "dv_v1",
+        parsed_public_index.value,
+    );
+    defer alloc.free(stored_index_json);
 
     var appended_sequence: u64 = 0;
+    var coverage_incarnation: u64 = 0;
     {
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .start_index_workers = false,
@@ -13143,8 +13152,13 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         try db.addIndex(.{
             .name = "dv_v1",
             .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+            .config_json = stored_index_json,
         });
+        const configs = try db.listIndexes(alloc);
+        defer antfly.db.types.freeIndexConfigs(alloc, configs);
+        try std.testing.expectEqual(@as(usize, 1), configs.len);
+        coverage_incarnation = configs[0].coverage_generation;
+        try std.testing.expect(coverage_incarnation != 0);
 
         const stored_key = try antfly.db.internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -13178,10 +13192,19 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         try db.core.store.appendReplayOpaque(alloc, appended_sequence, encoded);
     }
 
+    const indexes_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"dv_v1\":{{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"_coverage_incarnation\":{d}}}}}",
+        .{coverage_incarnation},
+    );
+    defer alloc.free(indexes_json);
+
     const FakeStatus = struct {
-        fn iface() antfly.public_api.http_server.StatusSource {
+        tables: [1]antfly.metadata.table_manager.TableRecord,
+
+        fn iface(self: *@This()) antfly.public_api.http_server.StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
@@ -13194,15 +13217,11 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
 
-        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = indexes_json,
-                }})[0..]),
+                .tables = self.tables[0..],
                 .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
                     .group_id = 77,
                     .table_id = 7,
@@ -13230,9 +13249,11 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        status_source: *FakeStatus,
+
+        fn iface(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -13240,8 +13261,9 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
-            return try FakeStatus.adminSnapshot(undefined);
+        fn adminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try FakeStatus.adminSnapshot(self.status_source);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
@@ -13277,6 +13299,14 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         }
     };
 
+    var fake_status = FakeStatus{ .tables = .{.{
+        .table_id = 7,
+        .name = "docs",
+        .placement_role = "data",
+        .indexes_json = indexes_json,
+    }} };
+    var fake_catalog = FakeCatalog{ .status_source = &fake_status };
+
     var server: DataServer = .{
         .alloc = alloc,
         .store_registration = .{
@@ -13289,14 +13319,14 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
-            FakeCatalog.iface(),
+            fake_catalog.iface(),
             antfly.raft.read_gate.noopReadableLeaseRequester(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            FakeCatalog.iface(),
+            fake_catalog.iface(),
         ),
-        .status_source = FakeStatus.iface(),
+        .status_source = fake_status.iface(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
@@ -13345,7 +13375,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
     defer alloc.free(replica_root_dir);
     const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
     defer alloc.free(db_path);
-    const indexes_json = "{\"dv_v1\":{\"type\":\"embeddings\",\"field\":\"embedding\",\"dims\":2}}";
+    const indexes_json = "{\"dv_v1\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"_coverage_incarnation\":42}}";
     const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 77, .range_id = 77 };
 
     {
@@ -13498,7 +13528,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
     try std.testing.expect(statuses.items[0].stats.indexes[0].repair_degraded);
     try std.testing.expect(statuses.items[0].stats.indexes[0].load_error != null);
-    try std.testing.expectEqualStrings("FileNotFound", statuses.items[0].stats.indexes[0].load_error.?);
+    try std.testing.expectEqualStrings("startup catch-up open failed: FileNotFound", statuses.items[0].stats.indexes[0].load_error.?);
 }
 
 test "data runtime startup catch-up clears no-debt busy writer groups" {

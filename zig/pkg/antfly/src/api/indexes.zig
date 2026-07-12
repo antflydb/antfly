@@ -1398,11 +1398,23 @@ fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
 fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
     const kind = aggregate.kind orelse return;
     if (kind != .dense_vector and kind != .sparse_vector) return;
-    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.stale_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.reported_group_count == 0 or
+        aggregate.missing_group_count > 0 or
+        aggregate.stale_group_count > 0 or
+        aggregate.unknown_group_count > 0 or
+        aggregate.remote_unknown_group_count > 0 or
+        aggregate.expected_group_count != aggregate.fresh_group_count) return;
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
-    if (aggregate.catch_up_active or aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence) return;
+    const complete_dense_coverage = aggregate.coverage_identity_ready and
+        aggregate.coverage_summary_ready and
+        aggregate.coverage_config_mismatch_count == 0 and
+        aggregate.coverage_produced_count == aggregate.table_doc_count and
+        aggregate.coverage_skipped_count == 0 and
+        aggregate.coverage_terminal_failed_count == 0;
+    if (aggregate.catch_up_active or
+        (aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence and !complete_dense_coverage)) return;
     if (!embeddingsArtifactPublishComplete(aggregate.*, kind == .sparse_vector, aggregate.table_doc_count)) return;
     if (aggregate.table_doc_count > 0 and aggregate.doc_count < aggregate.table_doc_count) return;
 
@@ -4388,6 +4400,10 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
 }
 
 test "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4396,6 +4412,10 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
         .doc_count = 3,
         .node_count = 1,
         .root_node = 1,
+        .coverage_produced_count = 3,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 4,
         .replay_target_sequence = 8,
         .replay_catch_up_required = true,
@@ -4412,7 +4432,9 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
+            .source_doc_count = 3,
             .doc_count = 3,
             .index_count = 1,
             .indexes = indexes,
@@ -4431,7 +4453,7 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),

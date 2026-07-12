@@ -3813,7 +3813,7 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
         "managed startup catch-up marks FileNotFound index open terminal degraded",
-        "managed startup catch-up finishes restore repair before terminal index load degradation",
+        "managed startup catch-up preserves restore repair debt while index load is terminal",
         "idle startup runtime status preserves live empty cached status",
         "api http server serves table batch transforms",
         "api http server updates local table schema through bound write source",
@@ -3841,6 +3841,7 @@ pub fn build(b: *std.Build) void {
         "api http server lists cluster backups through public route",
         "api http server returns retryable not leader through public cluster adapter mutation",
         "api http server backs up and restores a table through public routes",
+        "api http server cluster overwrite restore tolerates already absent metadata drop",
         "api http server durability-pending restore preserves committed metadata",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "api http server retries stale metadata table-exists restore race",
@@ -4340,6 +4341,7 @@ pub fn build(b: *std.Build) void {
             "table runtime snapshot cache clones stored status",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
+            "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
             "api http server create index waits for exact target config projection",
         },
         .test_runner = .{
@@ -4366,6 +4368,8 @@ pub fn build(b: *std.Build) void {
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
+            "managed startup catch-up marks FileNotFound index open terminal degraded",
+            "managed startup catch-up preserves restore repair debt while index load is terminal",
         },
     });
     const run_api_table_writes_restore_repeat_tests = b.addRunArtifact(api_table_writes_restore_repeat_tests);

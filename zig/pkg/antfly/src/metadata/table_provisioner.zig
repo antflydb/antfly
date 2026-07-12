@@ -2445,6 +2445,17 @@ test "table provisioner reconcile does not replay pending derived batches" {
     defer std.testing.allocator.free(db_path);
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
+    const public_index_json = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}";
+    var parsed_public_index = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, public_index_json, .{});
+    defer parsed_public_index.deinit();
+    const stored_index_json = try managed_embedder.translateEmbeddingsIndexConfigJson(
+        std.testing.allocator,
+        "embed_idx",
+        parsed_public_index.value,
+    );
+    defer std.testing.allocator.free(stored_index_json);
+
+    var coverage_incarnation: u64 = 0;
     {
         var db = try db_mod.DB.open(std.testing.allocator, db_path, .{
             .start_index_workers = false,
@@ -2453,8 +2464,13 @@ test "table provisioner reconcile does not replay pending derived batches" {
         try db.addIndex(.{
             .name = "embed_idx",
             .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+            .config_json = stored_index_json,
         });
+        const configs = try db.listIndexes(std.testing.allocator);
+        defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+        try std.testing.expectEqual(@as(usize, 1), configs.len);
+        coverage_incarnation = configs[0].coverage_generation;
+        try std.testing.expect(coverage_incarnation != 0);
         const stored_key = try db_mod.internal_keys.documentKeyAlloc(std.testing.allocator, "doc:a");
         defer std.testing.allocator.free(stored_key);
         try db.core.store.putBatch(&.{
@@ -2489,6 +2505,13 @@ test "table provisioner reconcile does not replay pending derived batches" {
         try db.core.store.appendReplayOpaque(std.testing.allocator, sequence, encoded);
     }
 
+    const indexes_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"embed_idx\":{{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"_coverage_incarnation\":{d}}}}}",
+        .{coverage_incarnation},
+    );
+    defer std.testing.allocator.free(indexes_json);
+
     const summary = try reconcileReplicaRoot(
         std.testing.allocator,
         path,
@@ -2497,7 +2520,7 @@ test "table provisioner reconcile does not replay pending derived batches" {
         &.{.{
             .table_id = 11,
             .name = "docs",
-            .indexes_json = "{\"embed_idx\":{\"type\":\"embeddings\",\"field\":\"embedding\",\"dims\":2}}",
+            .indexes_json = indexes_json,
         }},
         &.{.{
             .group_id = 2006,

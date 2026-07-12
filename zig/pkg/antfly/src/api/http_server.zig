@@ -7249,20 +7249,6 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        if (self.table_writes) |write_source| {
-            for (table_names, 0..) |table_name, i| {
-                if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
-                const active = write_source.beginRestoreLifecycle(table_name) catch |err| {
-                    statuses[i].@"error" = switch (err) {
-                        error.UnsupportedOperation => "method not allowed",
-                        else => "restore failed",
-                    };
-                    continue;
-                };
-                restore_lifecycle_active[i] = active;
-            }
-        }
-
         if (std.mem.eql(u8, restore_mode, "overwrite")) {
             for (table_names, 0..) |table_name, i| {
                 if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
@@ -7301,6 +7287,23 @@ pub const ApiHttpServer = struct {
                     statuses[i].@"error" = "failed to remove existing table";
                     continue;
                 };
+            }
+        }
+
+        // Overwrite drop is already an exclusive structural transition. Take
+        // the longer restore reservation only after drop completes; acquiring
+        // it first would make the drop wait on its own preparation fence.
+        if (self.table_writes) |write_source| {
+            for (table_names, 0..) |table_name, i| {
+                if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
+                const active = write_source.beginRestoreLifecycle(table_name) catch |err| {
+                    statuses[i].@"error" = switch (err) {
+                        error.UnsupportedOperation => "method not allowed",
+                        else => "restore failed",
+                    };
+                    continue;
+                };
+                restore_lifecycle_active[i] = active;
             }
         }
 
@@ -21634,7 +21637,7 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqual(@as(u16, 201), drop_index_resp.status);
     try std.testing.expectEqualStrings("application/json", drop_index_resp.content_type.?);
     try std.testing.expectEqualStrings("{}", drop_index_resp.body);
-    try std.testing.expectEqual(@as(u32, 2), source.projection_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
 }
 
 test "api http server table visibility helper prefers metadata lifecycle wait" {
@@ -23985,6 +23988,8 @@ test "api http server cluster overwrite restore tolerates already absent metadat
         present: bool = true,
         restored: bool = false,
         local_drop_used_manifest_group: bool = false,
+        restore_lifecycle_active: bool = false,
+        restore_lifecycle_finished: bool = false,
     };
 
     const FakeSource = struct {
@@ -24088,6 +24093,8 @@ test "api http server cluster overwrite restore tolerates already absent metadat
                     .batch = batch,
                     .drop_table = dropTable,
                     .restore_table = restoreTable,
+                    .begin_restore_lifecycle = beginRestoreLifecycle,
+                    .finish_restore_lifecycle = finishRestoreLifecycle,
                 },
             };
         }
@@ -24104,10 +24111,28 @@ test "api http server cluster overwrite restore tolerates already absent metadat
             self.state.local_drop_used_manifest_group = true;
         }
 
+        fn beginRestoreLifecycle(ptr: *anyopaque, table_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(self.state.local_drop_used_manifest_group);
+            try std.testing.expect(!self.state.present);
+            try std.testing.expect(!self.state.restore_lifecycle_active);
+            self.state.restore_lifecycle_active = true;
+        }
+
+        fn finishRestoreLifecycle(ptr: *anyopaque, table_name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(std.mem.eql(u8, "docs", table_name));
+            std.debug.assert(self.state.restore_lifecycle_active);
+            self.state.restore_lifecycle_active = false;
+            self.state.restore_lifecycle_finished = true;
+        }
+
         fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("docs-snap-cluster", plan.manifest.backup_id);
+            try std.testing.expect(self.state.restore_lifecycle_active);
             self.state.restored = true;
         }
     };
@@ -24135,6 +24160,8 @@ test "api http server cluster overwrite restore tolerates already absent metadat
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     try std.testing.expect(state.local_drop_used_manifest_group);
     try std.testing.expect(state.restored);
+    try std.testing.expect(!state.restore_lifecycle_active);
+    try std.testing.expect(state.restore_lifecycle_finished);
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"status\":\"triggered\"") != null);
 }
 
