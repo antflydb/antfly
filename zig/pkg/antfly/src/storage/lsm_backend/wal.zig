@@ -55,6 +55,12 @@ pub const AppendOptions = struct {
     segment_bytes: u64 = default_wal_segment_bytes,
 };
 
+pub const AppendResult = struct {
+    bytes: usize = 0,
+    segment: u64 = 0,
+    segment_became_nonempty: bool = false,
+};
+
 pub const ReplayStats = struct {
     records: u64 = 0,
     entries: u64 = 0,
@@ -176,7 +182,18 @@ pub fn appendStateWithOptions(
     sync: bool,
     options: AppendOptions,
 ) !usize {
-    if (state.entries.items.len == 0) return 0;
+    return (try appendStateWithOptionsResult(storage, allocator, root_dir, state, sync, options)).bytes;
+}
+
+pub fn appendStateWithOptionsResult(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    root_dir: []const u8,
+    state: anytype,
+    sync: bool,
+    options: AppendOptions,
+) !AppendResult {
+    if (state.entries.items.len == 0) return .{};
 
     const payload_len = encodedPayloadLen(state);
     var record = try allocator.alloc(u8, record_header_len + payload_len);
@@ -216,6 +233,7 @@ pub fn appendStateWithOptions(
         segment_path = try segmentPathAlloc(allocator, root_dir, segment);
         segment_path_owned = true;
     }
+    const segment_became_nonempty = current_size == 0;
     storage.appendFileAbsolute(allocator, segment_path, record, sync) catch |err| switch (err) {
         error.FileNotFound => {
             try storage.createDirPath(wal_dir);
@@ -229,7 +247,11 @@ pub fn appendStateWithOptions(
     }
     allocator.free(segment_path);
     segment_path_owned = false;
-    return record.len;
+    return .{
+        .bytes = record.len,
+        .segment = segment,
+        .segment_became_nonempty = segment_became_nonempty,
+    };
 }
 
 pub fn encodedStateRecordLen(state: anytype) usize {

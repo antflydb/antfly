@@ -51,6 +51,7 @@ const ha_effects_mod = @import("../ha/effects.zig");
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
 const ha_fencing_mod = @import("../ha/fencing.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
+const ha_public_gate_state_mod = @import("../ha/public_gate_state.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
@@ -444,10 +445,48 @@ fn haSyncPolicyIncludesStandby(policy: ha_primary_mod.SyncPolicy, slot_name: []c
 pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
 pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
 
+pub const SharedHAWriteGate = struct {
+    state: *const ha_public_gate_state_mod.State,
+    /// Sources track the live role. DB instances pin the generation they opened
+    /// with so a promotion cannot pair old runtime hooks with the new primary.
+    generation: ?u64 = null,
+};
+
 pub const HAWriteGate = union(enum) {
     primary: *ha_primary_mod.Primary,
     fenced_primary: ha_write_gate_mod.FencedPrimary,
     standby: *ha_standby_mod.Standby,
+    shared: SharedHAWriteGate,
+
+    pub fn check(self: HAWriteGate) !void {
+        switch (self) {
+            .shared => |shared| return try shared.state.checkWrite(shared.generation),
+            else => {},
+        }
+
+        const decision = switch (self) {
+            .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+            .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
+            .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
+            .shared => unreachable,
+        };
+        switch (decision.action) {
+            .allow_write => {},
+            .reject_read_only_standby => return error.HAReadOnlyStandby,
+            .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+            .reject_fenced_primary => return error.HAFencedPrimary,
+        }
+    }
+
+    pub fn pinned(self: HAWriteGate) HAWriteGate {
+        return switch (self) {
+            .shared => |shared| .{ .shared = .{
+                .state = shared.state,
+                .generation = shared.generation orelse shared.state.currentGeneration(),
+            } },
+            else => self,
+        };
+    }
 };
 
 fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
@@ -456,6 +495,7 @@ fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
         .primary => false,
         .fenced_primary => false,
         .standby => true,
+        .shared => |shared| shared.state.isStandbyRole(),
     };
 }
 
@@ -664,6 +704,45 @@ const DocSetPlanningRuntimeStats = struct {
             .bitmap_promotion_count = self.bitmap_promotion_count.load(.monotonic),
             .unsupported_filter_shape_count = self.unsupported_filter_shape_count.load(.monotonic),
             .stale_identity_generation_rejection_count = self.stale_identity_generation_rejection_count.load(.monotonic),
+        };
+    }
+};
+
+const VisibilityRuntimeStats = struct {
+    cache_hits_total: AtomicU64 = AtomicU64.init(0),
+    cache_misses_total: AtomicU64 = AtomicU64.init(0),
+    mask_build_ns_total: AtomicU64 = AtomicU64.init(0),
+    mask_builds_total: AtomicU64 = AtomicU64.init(0),
+    full_scan_fallbacks_total: AtomicU64 = AtomicU64.init(0),
+    overflow_total: AtomicU64 = AtomicU64.init(0),
+
+    fn recordCacheHit(self: *@This()) void {
+        _ = self.cache_hits_total.fetchAdd(1, .monotonic);
+    }
+
+    fn recordCacheMiss(self: *@This()) void {
+        _ = self.cache_misses_total.fetchAdd(1, .monotonic);
+    }
+
+    fn recordBuild(self: *@This(), duration_ns: u64) void {
+        _ = self.mask_builds_total.fetchAdd(1, .monotonic);
+        _ = self.mask_build_ns_total.fetchAdd(duration_ns, .monotonic);
+    }
+
+    fn recordOverflow(self: *@This()) void {
+        _ = self.overflow_total.fetchAdd(1, .monotonic);
+        _ = self.full_scan_fallbacks_total.fetchAdd(1, .monotonic);
+    }
+
+    fn snapshot(self: *@This(), cache_entries: u64) types.VisibilityStats {
+        return .{
+            .cache_entries = cache_entries,
+            .cache_hits_total = self.cache_hits_total.load(.monotonic),
+            .cache_misses_total = self.cache_misses_total.load(.monotonic),
+            .mask_build_ns_total = self.mask_build_ns_total.load(.monotonic),
+            .mask_builds_total = self.mask_builds_total.load(.monotonic),
+            .full_scan_fallbacks_total = self.full_scan_fallbacks_total.load(.monotonic),
+            .overflow_total = self.overflow_total.load(.monotonic),
         };
     }
 };
@@ -2767,8 +2846,14 @@ pub const DB = struct {
     live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
     live_doc_set_cache_generation: ?u64 = null,
     live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    nonvisible_doc_set_cache_generation: ?u64 = null,
+    nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set_cache_overflow: bool = false,
+    nonvisible_doc_set_cache_entries: AtomicU64 = AtomicU64.init(0),
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
+    visibility_runtime_stats: VisibilityRuntimeStats = .{},
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
@@ -2884,6 +2969,7 @@ pub const DB = struct {
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return blk: {
             const open_started_ns = monotonicTimeNs();
+            const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
             var profile = OpenProfile{};
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_async_context: ?*AsyncContext = null;
@@ -2985,7 +3071,7 @@ pub const DB = struct {
                 .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                 .lmdb, .mem => {},
             }
-            const ha_standby_role = haWriteGateIsStandby(opts.ha_write_gate);
+            const ha_standby_role = haWriteGateIsStandby(ha_write_gate);
             const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !ha_standby_role;
 
             var db = DB{
@@ -3014,7 +3100,7 @@ pub const DB = struct {
                 .ha_async_effect_mirror = opts.ha_async_effect_mirror,
                 .ha_async_batch_mirror = opts.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = opts.ha_async_metadata_mirror,
-                .ha_write_gate = opts.ha_write_gate,
+                .ha_write_gate = ha_write_gate,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -3613,6 +3699,16 @@ pub const DB = struct {
         self.live_doc_set_cache_generation = null;
     }
 
+    fn clearNonVisibleDocSetCache(self: *DB) void {
+        lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+        defer self.nonvisible_doc_set_cache_mutex.unlock();
+        if (self.nonvisible_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
+        self.nonvisible_doc_set_cache_set = null;
+        self.nonvisible_doc_set_cache_generation = null;
+        self.nonvisible_doc_set_cache_overflow = false;
+        self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+    }
+
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
@@ -3623,7 +3719,10 @@ pub const DB = struct {
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
         self.clearLiveDocSetCache();
+        self.clearNonVisibleDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
+        self.bulk_ingest_identity_state.deinit(self.alloc);
+        self.bulk_ingest_identity_all_new = false;
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
@@ -4822,6 +4921,11 @@ pub const DB = struct {
             }
             identity_writes.deinit(self.alloc);
         }
+        var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (identity_visibility_deletes.items) |key| self.alloc.free(key);
+            identity_visibility_deletes.deinit(self.alloc);
+        }
 
         const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else currentTimeNs();
 
@@ -5127,23 +5231,25 @@ pub const DB = struct {
             identity_upsert_keys.items.len > 0 and
             (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
         {
-            used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
+            used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForNamespaceAlloc(
                 self.alloc,
                 self.core.identity_namespace,
                 sequence,
                 &identity_writes,
+                &identity_visibility_deletes,
                 identity_upsert_keys.items,
                 &self.bulk_ingest_identity_state,
             );
             if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
         }
         if (!used_trusted_identity_path) {
-            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+            try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
                 self.alloc,
                 self.core.store,
                 self.core.identity_namespace,
                 sequence,
                 &identity_writes,
+                &identity_visibility_deletes,
                 identity_upsert_keys.items,
                 effective_req.deletes,
             );
@@ -5223,6 +5329,7 @@ pub const DB = struct {
             &owned_store_keys,
             &owned_store_values,
         );
+        try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
         const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
             null
         else
@@ -5244,6 +5351,7 @@ pub const DB = struct {
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
             self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
         }
         if (profile) |active_profile| {
             recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
@@ -5371,13 +5479,14 @@ pub const DB = struct {
             self.bulk_ingest_identity_state = state;
             self.identity_visibility_summary_cache = state.visibility_summary;
             self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
             self.bulk_ingest_identity_all_new = true;
         }
     }
 
     fn clearBulkIngestIdentityAllNewLocked(self: *DB) void {
         self.bulk_ingest_identity_all_new = false;
-        self.bulk_ingest_identity_state = .{};
+        self.bulk_ingest_identity_state.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
     }
 
@@ -8513,6 +8622,11 @@ pub const DB = struct {
             }
             identity_writes.deinit(self.alloc);
         }
+        var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (identity_visibility_deletes.items) |key| self.alloc.free(key);
+            identity_visibility_deletes.deinit(self.alloc);
+        }
 
         if (status == .committed) {
             try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
@@ -8522,12 +8636,13 @@ pub const DB = struct {
             for (raw_identity_deletes.items) |key| {
                 if (!isMetadataKey(key)) try identity_deletes.append(self.alloc, key);
             }
-            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+            try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
                 self.alloc,
                 self.core.store,
                 self.core.identity_namespace,
                 self.core.nextDerivedSequence(),
                 &identity_writes,
+                &identity_visibility_deletes,
                 identity_upserts.items,
                 identity_deletes.items,
             );
@@ -8536,10 +8651,12 @@ pub const DB = struct {
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
         try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
             .writes = identity_writes.items,
+            .deletes = identity_visibility_deletes.items,
         });
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
             self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
         }
     }
 
@@ -12345,6 +12462,7 @@ pub const DB = struct {
             return .{
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
+                .visibility = self.snapshotVisibilityStats(),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
                 .resolution = self.resolutionStageStats(),
                 .promotion = self.promotionStageStats(),
@@ -12406,6 +12524,11 @@ pub const DB = struct {
             .state_rows = raw.state_rows,
             .live_ordinals = raw.live_ordinals,
             .tombstone_ordinals = raw.tombstone_ordinals,
+            .visibility_chunk_size = doc_identity.visibility_chunk_size,
+            .visibility_chunks = raw.visibility_chunks,
+            .visibility_deleted_ordinals = raw.visibility_deleted_ordinals,
+            .visibility_mask_bytes = raw.visibility_mask_bytes,
+            .visibility_repair_count = raw.visibility_repair_count,
             .min_created_generation = raw.min_created_generation,
             .max_created_generation = raw.max_created_generation,
             .min_deleted_generation = raw.min_deleted_generation,
@@ -12450,6 +12573,10 @@ pub const DB = struct {
 
     fn snapshotDocSetPlanningStats(self: *DB) types.DocSetPlanningStats {
         return self.doc_set_planning_stats.snapshot();
+    }
+
+    fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
+        return self.visibility_runtime_stats.snapshot(self.nonvisible_doc_set_cache_entries.load(.monotonic));
     }
 
     const DocIdentityCoverage = struct {
@@ -12612,6 +12739,7 @@ pub const DB = struct {
             .repair_issue_count_estimated = !repair_summary.ready,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .visibility = self.snapshotVisibilityStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
@@ -12809,6 +12937,7 @@ pub const DB = struct {
             .repair_issue_count_estimated = !repair_summary.ready,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .visibility = self.snapshotVisibilityStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
@@ -12926,6 +13055,7 @@ pub const DB = struct {
             .repair_issue_count_estimated = !repair_summary.ready,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .visibility = self.snapshotVisibilityStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
@@ -13611,6 +13741,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
         });
@@ -13628,6 +13759,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
@@ -13682,6 +13814,7 @@ pub const DB = struct {
             .live_filter_doc_set = liveFilterDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
             .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
         db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
@@ -14126,6 +14259,82 @@ pub const DB = struct {
         return computed;
     }
 
+    fn nonVisibleDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        // The complement cache contains identity visibility only. TTL is a
+        // time-varying visibility constraint applied by liveFilterDocSetCallback,
+        // so using the complement would bypass it and let an expired vector
+        // consume a top-k slot before postprocessing. Fall back to the existing
+        // TTL-aware positive live set for those tables.
+        if (ttlDurationNs(self) != 0) return null;
+        return try self.nonVisibleDocSetCachedAlloc(alloc, generation);
+    }
+
+    fn nonVisibleDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !?doc_set.ResolvedDocSet {
+        const gen = generation orelse {
+            return try doc_identity.nonVisibleDocSetFromStoreAlloc(
+                alloc,
+                self.core.store,
+                generation,
+                doc_identity.default_max_nonvisible_doc_set_entries,
+            );
+        };
+        {
+            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+            defer self.nonvisible_doc_set_cache_mutex.unlock();
+            if (self.nonvisible_doc_set_cache_generation == gen) {
+                if (self.nonvisible_doc_set_cache_overflow) {
+                    self.visibility_runtime_stats.recordCacheHit();
+                    return null;
+                }
+                if (self.nonvisible_doc_set_cache_set) |*cached| {
+                    self.visibility_runtime_stats.recordCacheHit();
+                    return try doc_set.cloneAlloc(alloc, cached);
+                }
+            }
+        }
+        self.visibility_runtime_stats.recordCacheMiss();
+        const build_start_ns = platform_time.monotonicNs();
+        var computed = (try doc_identity.nonVisibleDocSetFromStoreAlloc(
+            alloc,
+            self.core.store,
+            generation,
+            doc_identity.default_max_nonvisible_doc_set_entries,
+        )) orelse {
+            self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
+            self.visibility_runtime_stats.recordOverflow();
+            // Overflow (more non-visible docs than the budget) is also worth
+            // remembering, so each query does not rescan before falling back
+            // to the include-set path.
+            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+            defer self.nonvisible_doc_set_cache_mutex.unlock();
+            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.nonvisible_doc_set_cache_set = null;
+            self.nonvisible_doc_set_cache_generation = gen;
+            self.nonvisible_doc_set_cache_overflow = true;
+            self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+            return null;
+        };
+        self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
+        errdefer computed.deinit(alloc);
+        if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
+            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
+            defer self.nonvisible_doc_set_cache_mutex.unlock();
+            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.nonvisible_doc_set_cache_set = cloned;
+            self.nonvisible_doc_set_cache_generation = gen;
+            self.nonvisible_doc_set_cache_overflow = false;
+            self.nonvisible_doc_set_cache_entries.store(1, .monotonic);
+        } else |_| {
+            // Caching is best-effort; the computed set is still returned.
+        }
+        return computed;
+    }
+
     fn allDocsVisibleCallback(
         ctx: ?*anyopaque,
         generation: ?u64,
@@ -14278,6 +14487,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -14326,6 +14536,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -14382,6 +14593,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
@@ -14597,6 +14809,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
         })) orelse return null;
@@ -15104,6 +15317,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
+            .nonvisible_doc_set = nonVisibleDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -22405,6 +22619,11 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         }
         identity_writes.deinit(ctx.alloc);
     }
+    var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (identity_visibility_deletes.items) |key| ctx.alloc.free(key);
+        identity_visibility_deletes.deinit(ctx.alloc);
+    }
     var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer delete_keys.deinit(ctx.alloc);
     var timestamp_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -22448,12 +22667,13 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
-    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         ctx.alloc,
         ctx.store,
         ctx.identity_namespace,
         sequence,
         &identity_writes,
+        &identity_visibility_deletes,
         &.{},
         keys,
     );
@@ -22467,6 +22687,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         &owned_store_values,
         &owned_delete_keys,
     );
+    try delete_keys.appendSlice(ctx.alloc, identity_visibility_deletes.items);
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -22565,17 +22786,7 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
 
 fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
     const configured = gate orelse return;
-    const decision = switch (configured) {
-        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
-        .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
-        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
-    };
-    switch (decision.action) {
-        .allow_write => return,
-        .reject_read_only_standby => return error.HAReadOnlyStandby,
-        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
-        .reject_fenced_primary => return error.HAFencedPrimary,
-    }
+    try configured.check();
 }
 
 fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
@@ -57888,6 +58099,60 @@ test "db search filters expired documents when ttl schema is configured" {
     defer text.deinit();
     try std.testing.expectEqual(@as(u32, 1), text.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", text.hits[0].id);
+}
+
+test "db dense broad visibility filtering does not bypass ttl" {
+    const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"embedding\":[1,0]}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:fresh", .value = "{\"embedding\":[0,1]}" },
+            .{ .key = "doc:deleted", .value = "{\"embedding\":[0.5,0.5]}" },
+        },
+        .timestamp_ns = now_ns,
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    // Force broad identity visibility to have a cheap complement. TTL is a
+    // second visibility dimension and must still select the positive live set.
+    try db.batch(.{
+        .deletes = &.{"doc:deleted"},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:fresh", result.hits[0].id);
 }
 
 test "db ttl falls back to write timestamp when ttl field is missing" {

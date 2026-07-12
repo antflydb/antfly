@@ -174,6 +174,14 @@ pub fn evaluateStandbyWrite(
     return try write_gate.evaluateStandby(standby, request);
 }
 
+pub fn evaluatePromotedPrimaryWrite(
+    primary: *const primary_mod.Primary,
+    handoff: standby_mod.PromotionHandoff,
+    request: write_gate.Request,
+) !write_gate.Decision {
+    return try write_gate.evaluatePromotedPrimary(primary, handoff, request);
+}
+
 pub fn evaluatePrimaryOwnerJob(
     primary: *const primary_mod.Primary,
     request: owner_job_gate.Request,
@@ -186,6 +194,14 @@ pub fn evaluateStandbyOwnerJob(
     request: owner_job_gate.Request,
 ) !owner_job_gate.Decision {
     return try owner_job_gate.evaluateStandby(standby, request);
+}
+
+pub fn evaluatePromotedPrimaryOwnerJob(
+    primary: *const primary_mod.Primary,
+    handoff: standby_mod.PromotionHandoff,
+    request: owner_job_gate.Request,
+) !owner_job_gate.Decision {
+    return try owner_job_gate.evaluatePromotedPrimary(primary, handoff, request);
 }
 
 pub fn assessPromotion(

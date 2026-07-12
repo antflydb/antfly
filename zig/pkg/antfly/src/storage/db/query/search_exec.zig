@@ -170,6 +170,11 @@ pub const SearchTextQueryExecutor = struct {
         ctx: ?*anyopaque,
         generation: ?u64,
     ) anyerror!bool = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -381,6 +386,11 @@ pub const DenseSearchExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -521,6 +531,11 @@ pub const SparseSearchExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     lookup_doc_nums_for_ordinals: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -638,6 +653,11 @@ pub const MatchAllExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1694,6 +1714,12 @@ const NativeDenseConstraints = struct {
     filter_ids_owned: bool = false,
     exclude_ids: []const u64 = &.{},
     exclude_ids_owned: bool = false,
+    // Vector ids contributed specifically by the broad identity-visibility
+    // complement. Kept separate from arbitrary request exclusions so they can
+    // safely tighten the candidate upper bound when an exhaustive page is
+    // otherwise possible.
+    broad_live_exclude_ids: []const u64 = &.{},
+    broad_live_exclude_ids_owned: bool = false,
     resolved_stored_filters: bool = false,
     filter_query_json_resolved: bool = false,
     exclusion_query_json_resolved: bool = false,
@@ -1701,6 +1727,7 @@ const NativeDenseConstraints = struct {
     fn deinit(self: *NativeDenseConstraints, alloc: Allocator) void {
         if (self.filter_ids_owned and self.filter_ids.len > 0) alloc.free(@constCast(self.filter_ids));
         if (self.exclude_ids_owned and self.exclude_ids.len > 0) alloc.free(@constCast(self.exclude_ids));
+        if (self.broad_live_exclude_ids_owned and self.broad_live_exclude_ids.len > 0) alloc.free(@constCast(self.broad_live_exclude_ids));
         self.* = undefined;
     }
 };
@@ -1711,10 +1738,12 @@ const NativeDocIdConstraints = struct {
     exclude_doc_ids: []const []const u8 = &.{},
     filter_doc_nums: []const u32 = &.{},
     exclude_doc_nums: []const u32 = &.{},
+    broad_live_exclude_doc_nums: []const u32 = &.{},
     filter_doc_ids_owned: bool = false,
     exclude_doc_ids_owned: bool = false,
     filter_doc_nums_owned: bool = false,
     exclude_doc_nums_owned: bool = false,
+    broad_live_exclude_doc_nums_owned: bool = false,
     resolved_stored_filters: bool = false,
     filter_query_json_resolved: bool = false,
     exclusion_query_json_resolved: bool = false,
@@ -1724,6 +1753,7 @@ const NativeDocIdConstraints = struct {
         if (self.exclude_doc_ids_owned) freeDocIdSlice(alloc, self.exclude_doc_ids);
         if (self.filter_doc_nums_owned and self.filter_doc_nums.len > 0) alloc.free(@constCast(self.filter_doc_nums));
         if (self.exclude_doc_nums_owned and self.exclude_doc_nums.len > 0) alloc.free(@constCast(self.exclude_doc_nums));
+        if (self.broad_live_exclude_doc_nums_owned and self.broad_live_exclude_doc_nums.len > 0) alloc.free(@constCast(self.broad_live_exclude_doc_nums));
         self.* = undefined;
     }
 };
@@ -1752,6 +1782,16 @@ pub const StructuredFilterResolverExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    // Complement of the broad live set: the (usually tiny) set of ordinals not
+    // visible at the read generation. When available, the broad live-doc
+    // constraint is expressed as this exclude set instead of materializing an
+    // include set proportional to the table size. Null result = unavailable or
+    // too large; callers fall back to live_filter_doc_set.
+    nonvisible_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     all_docs_visible: ?*const fn (
         ctx: ?*anyopaque,
         generation: ?u64,
@@ -2414,6 +2454,56 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
     out: *NativeDocIdConstraints,
     executor: StructuredFilterResolverExecutor,
 ) !void {
+    // Prefer the complement representation: excluding the handful of
+    // non-visible ordinals is equivalent to including every visible one, but
+    // its cost scales with the tombstone count instead of the table size.
+    //
+    // Only valid when ordinals are used directly. When the include set is
+    // projected to index doc nums (text snapshots, sparse indexes), the
+    // positive filter also implicitly drops stale index rows for re-indexed
+    // docs — their old doc nums map to no live ordinal — and an exclusion of
+    // non-visible ordinals cannot express that.
+    const exclusion_representable = executor.text_snapshot_for_doc_num_projection == null and
+        executor.lookup_doc_nums_for_ordinals == null and
+        !executor.require_doc_num_projection_mapper;
+    if (executor.nonvisible_doc_set != null and exclusion_representable) {
+        const nonvisible = executor.nonvisible_doc_set.?;
+        if (try nonvisible(executor.ctx, alloc, executor.identity_read_generation)) |set| {
+            var owned_set = set;
+            if (owned_set == .none) {
+                owned_set.deinit(alloc);
+                return;
+            }
+            var owned_filter = doc_set.ResolvedDocFilter{
+                .include = .all,
+                .exclude = owned_set,
+            };
+            defer owned_filter.deinit(alloc);
+
+            // The exclude set already encodes visibility; live-filtering it
+            // would strip the very ordinals it exists to exclude.
+            var already_filtered_executor = executor;
+            already_filtered_executor.live_filter_doc_set = null;
+
+            // Preserve the provenance of the broad-live exclusion before it is
+            // unioned with request exclusions. Dense search can use only this
+            // subset to tighten its candidate upper bound; subtracting arbitrary
+            // exclusions would change long-standing lower-bound semantics.
+            if (try docNumsForResolvedDocSetWithExecutorAlloc(alloc, &owned_filter.exclude, already_filtered_executor)) |doc_nums| {
+                if (out.broad_live_exclude_doc_nums_owned and out.broad_live_exclude_doc_nums.len > 0) {
+                    alloc.free(@constCast(out.broad_live_exclude_doc_nums));
+                }
+                out.broad_live_exclude_doc_nums = doc_nums;
+                out.broad_live_exclude_doc_nums_owned = true;
+            }
+
+            const resolved_stored_filters_before = out.resolved_stored_filters;
+            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, already_filtered_executor);
+            out.resolved_stored_filters = resolved_stored_filters_before;
+            return;
+        }
+    }
+
     const live_filter = executor.live_filter_doc_set orelse return;
     const all: doc_set.ResolvedDocSet = .all;
     var live = try live_filter(executor.ctx, alloc, &all, executor.identity_read_generation);
@@ -9970,6 +10060,7 @@ fn deriveNativeDenseConstraintsAlloc(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = apply_broad_live_docs,
     });
@@ -10021,6 +10112,15 @@ fn deriveNativeDenseConstraintsAlloc(
         const mapped_excludes = try denseVectorIdsForDocNumsAlloc(alloc, doc_constraints.exclude_doc_nums, executor, index_name);
         if (bench_profile) exclude_doc_nums_ns += platform_time.monotonicNs() - phase_start_ns;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
+    }
+    if (doc_constraints.broad_live_exclude_doc_nums.len > 0) {
+        out.broad_live_exclude_ids = try denseVectorIdsForDocNumsAlloc(
+            alloc,
+            doc_constraints.broad_live_exclude_doc_nums,
+            executor,
+            index_name,
+        );
+        out.broad_live_exclude_ids_owned = true;
     }
     if (doc_constraints.exclude_doc_ids.len > 0) {
         const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -10727,6 +10827,7 @@ pub fn searchTextQuery(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
         .apply_live_all_docs = can_apply_live_all_docs,
@@ -11934,10 +12035,27 @@ fn searchDenseInternal(
 
     const effective_filter_ids = if (native_constraints.positive_filter) native_constraints.filter_ids else req.filter_ids;
     const effective_exclude_ids = if (native_constraints.exclude_ids.len > 0) native_constraints.exclude_ids else req.exclude_ids;
-    const bounded_full_candidate_count: u32 = if (native_constraints.positive_filter)
+    var bounded_full_candidate_count: u32 = if (native_constraints.positive_filter)
         @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
     else
         @intCast(index_stats.active_count);
+    if (!native_constraints.positive_filter and native_constraints.broad_live_exclude_ids.len > 0) {
+        const coarse_excluded: u32 = @intCast(@min(
+            native_constraints.broad_live_exclude_ids.len,
+            @as(usize, bounded_full_candidate_count),
+        ));
+        // Only pay for active-membership verification when the broad exclusion
+        // could make this candidate window exhaustive. The common large-table
+        // top-k path remains an O(tombstones) mapping plus the normal HBC query.
+        if (effective_k >= bounded_full_candidate_count - coarse_excluded) {
+            const active_excluded = try countActiveDenseVectorIdsAlloc(
+                alloc,
+                entry,
+                native_constraints.broad_live_exclude_ids,
+            );
+            bounded_full_candidate_count -|= active_excluded;
+        }
+    }
     var candidate_window: u32 = if (full_candidate_window)
         initialDenseFullCandidateWindow(bounded_full_candidate_count, paging)
     else
@@ -11947,10 +12065,18 @@ fn searchDenseInternal(
         var score_exactness = SortPlanExactness.approximate;
         var projected_source_profile = ProjectedSourceLoadProfile{};
         const hbc_effective_k: u32 = if (full_candidate_window) candidate_window else effective_k;
+        const exhaustive_broad_live_window = !full_candidate_window and
+            native_constraints.broad_live_exclude_ids.len > 0 and
+            hbc_effective_k >= bounded_full_candidate_count;
         const hbc_req: vectorindex_mod.SearchRequest = .{
             .query = dense.vector,
             .k = hbc_effective_k,
-            .rerank_k = if (full_candidate_window) @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k))) else null,
+            .rerank_k = if (full_candidate_window)
+                @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k)))
+            else if (exhaustive_broad_live_window)
+                @as(usize, @intCast(bounded_full_candidate_count))
+            else
+                null,
             .search_width = resolved_search_width,
             .epsilon = resolved_epsilon,
             .rerank_factor = resolveRerankFactor(effort),
@@ -12052,6 +12178,9 @@ fn searchDenseInternal(
         const raw_hits = results.getHits();
         profile.raw_hit_count = @intCast(raw_hits.len);
         const candidate_window_incomplete = denseCandidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count, raw_hits.len);
+        if (!candidate_window_incomplete and exhaustive_broad_live_window) {
+            score_exactness = .exact;
+        }
         const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
         const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
 
@@ -12270,6 +12399,33 @@ fn exactScoreNativeDenseFilter(
     }
     results.sort();
     return results;
+}
+
+fn countActiveDenseVectorIdsAlloc(
+    alloc: Allocator,
+    entry: *index_manager_mod.IndexManager.DenseIndex,
+    vector_ids: []const u64,
+) !u32 {
+    if (vector_ids.len == 0) return 0;
+
+    var sorted = try alloc.dupe(u64, vector_ids);
+    defer alloc.free(sorted);
+    std.mem.sort(u64, sorted, {}, u64LessThan);
+    const unique = sorted[0..uniqueSortedU64(sorted)];
+
+    const metadata = try alloc.alloc(?[]const u8, unique.len);
+    defer alloc.free(metadata);
+    @memset(metadata, null);
+
+    var txn = try entry.index.beginReadTxn();
+    defer txn.abort();
+    try entry.index.getMetadataManySortedInTxn(&txn, unique, metadata);
+
+    var count: u32 = 0;
+    for (metadata) |maybe_metadata| {
+        if (maybe_metadata != null) count +|= 1;
+    }
+    return count;
 }
 
 fn benchQueryProfileEvery() ?u64 {
@@ -12671,6 +12827,7 @@ pub fn searchSparse(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .lookup_doc_nums_for_ordinals = executor.lookup_doc_nums_for_ordinals,
         .doc_num_index_name = req.index_name orelse entry.config.name,
         .require_doc_num_projection_mapper = true,
@@ -14443,6 +14600,7 @@ pub fn searchMatchAll(
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
+        .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = true,
     });
@@ -25670,6 +25828,85 @@ test "native sparse constraints can apply broad live doc filter" {
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
     try std.testing.expect(!containsDocNum(constraints.filter_doc_nums, 1));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
+}
+
+fn testNonVisibleDocSetCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    _: ?u64,
+) anyerror!?doc_set.ResolvedDocSet {
+    return try doc_set.fromOrdinalsAlloc(alloc, &.{1});
+}
+
+fn testNonVisibleDocSetEmptyCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: ?u64,
+) anyerror!?doc_set.ResolvedDocSet {
+    return .none;
+}
+
+fn testNonVisibleDocSetUnavailableCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: ?u64,
+) anyerror!?doc_set.ResolvedDocSet {
+    return null;
+}
+
+test "broad live doc filter prefers small non-visible exclude set" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveAllDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer constraints.deinit(alloc);
+
+    // The tombstone becomes a one-entry exclusion; no include set of every
+    // live ordinal is materialized.
+    try std.testing.expect(!constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 1), constraints.exclude_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.exclude_doc_nums, 1));
+}
+
+test "broad live doc filter with empty non-visible set applies no constraint" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveAllDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetEmptyCallback,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(!constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
+    try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
+}
+
+test "broad live doc filter falls back to include set when complement unavailable" {
+    const alloc = std.testing.allocator;
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testLiveAllDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetUnavailableCallback,
+        .project_ordinals_to_doc_ids = false,
+        .apply_live_all_docs = true,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
 }

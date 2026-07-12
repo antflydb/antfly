@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const platform_sync = @import("antfly_platform").sync;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
 const ha_admin = @import("admin.zig");
@@ -81,9 +82,20 @@ pub const Server = struct {
         }
     };
 
+    pub const StateChangedHook = struct {
+        ptr: *anyopaque,
+        run_fn: *const fn (ptr: *anyopaque) void,
+
+        pub fn run(self: StateChangedHook) void {
+            self.run_fn(self.ptr);
+        }
+    };
+
     pub const AuthOptions = struct {
         bearer_token: ?[]const u8 = null,
         standby_status_extras: ?StandbyStatusExtras = null,
+        state_mutex: ?*std.atomic.Mutex = null,
+        state_changed: ?StateChangedHook = null,
     };
 
     pub fn init(alloc: Allocator, ctx: admin_exec.Context) Server {
@@ -116,11 +128,16 @@ pub const Server = struct {
         if (isAdminAuthRequired(path) and !self.authorized(req)) {
             return try textResponse(self.alloc, 401, "unauthorized");
         }
+        if (req.method == .GET and std.mem.eql(u8, path, Routes.health)) {
+            return try textResponse(self.alloc, 200, "ok");
+        }
+        if (self.auth.state_mutex) |mutex| {
+            platform_sync.lockYielding(mutex);
+            defer mutex.unlock();
+        }
+        defer if (self.auth.state_changed) |hook| hook.run();
         switch (req.method) {
             .GET => {
-                if (std.mem.eql(u8, path, Routes.health)) {
-                    return try textResponse(self.alloc, 200, "ok");
-                }
                 if (std.mem.eql(u8, path, Routes.ready)) {
                     if (self.ready()) return try textResponse(self.alloc, 200, "ready");
                     return try textResponse(self.alloc, 503, "not ready");
@@ -485,8 +502,16 @@ pub const Server = struct {
                 };
             },
             .standby => blk: {
-                const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
-                break :blk ha_admin.evaluateStandbyWrite(standby, request.request) catch |err| {
+                const evaluated = if (self.ctx.standby) |standby|
+                    ha_admin.evaluateStandbyWrite(standby, request.request)
+                else if (self.ctx.primary) |primary|
+                    if (self.ctx.promoted_standby_handoff) |handoff|
+                        ha_admin.evaluatePromotedPrimaryWrite(primary, handoff, request.request)
+                    else
+                        return try textResponse(self.alloc, 409, "StandbyUnavailable")
+                else
+                    return try textResponse(self.alloc, 409, "StandbyUnavailable");
+                break :blk evaluated catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
             },
@@ -515,8 +540,16 @@ pub const Server = struct {
                 };
             },
             .standby => blk: {
-                const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
-                break :blk ha_admin.evaluateStandbyOwnerJob(standby, request.request) catch |err| {
+                const evaluated = if (self.ctx.standby) |standby|
+                    ha_admin.evaluateStandbyOwnerJob(standby, request.request)
+                else if (self.ctx.primary) |primary|
+                    if (self.ctx.promoted_standby_handoff) |handoff|
+                        ha_admin.evaluatePromotedPrimaryOwnerJob(primary, handoff, request.request)
+                    else
+                        return try textResponse(self.alloc, 409, "StandbyUnavailable")
+                else
+                    return try textResponse(self.alloc, 409, "StandbyUnavailable");
+                break :blk evaluated catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
             },
