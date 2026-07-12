@@ -162,6 +162,7 @@ pub fn planSemanticQuery(
     var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, table.indexes_json, .{
         .antfly_provider = planning.antfly_provider,
         .io = planning.io,
+        .deadline_ns = planning.query_embedding_deadline_ns,
         .remote_content = planning.remote_content,
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,

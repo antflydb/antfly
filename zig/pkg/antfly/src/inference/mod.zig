@@ -78,6 +78,10 @@ test "managed embedder configured inference api url precedence" {
     try managed_embedder.testConfiguredInferenceAPIURLPrecedence();
 }
 
+test "managed embedder deadlines bound provider pacing and transport" {
+    try managed_embedder.testEmbeddingProviderDeadlines();
+}
+
 test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }

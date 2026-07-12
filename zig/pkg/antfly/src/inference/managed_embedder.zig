@@ -132,6 +132,7 @@ pub const AntflyProvider = struct {
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -150,6 +151,7 @@ pub const QueryTemplateError = error{
 
 const default_pacing_burst: u32 = 1;
 const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
+const max_embedding_request_timeout_ms: u64 = 30_000;
 const dimension_probe_text = "antfly embedding dimension probe";
 
 fn monotonicNowNs() u64 {
@@ -208,9 +210,9 @@ const RequestPacer = struct {
         };
     }
 
-    fn acquire(self: *RequestPacer) void {
+    fn acquire(self: *RequestPacer, deadline_ns: ?u64) !void {
         if (self.capacity <= 1.0) {
-            self.beginSerialRequest();
+            try self.beginSerialRequest(deadline_ns);
             self.endSerialRequest();
             return;
         }
@@ -232,16 +234,25 @@ const RequestPacer = struct {
             const deficit = 1.0 - self.tokens;
             const wait_ns = @max(@as(u64, 1), @as(u64, @intFromFloat(@ceil(deficit / self.refill_per_ns)))) + pacing_safety_margin_ns;
             self.mutex.unlock();
+            if (deadline_ns) |deadline| {
+                if (now_ns >= deadline or wait_ns >= deadline - now_ns) return error.Timeout;
+            }
             sleepNs(wait_ns);
         }
     }
 
-    fn beginSerialRequest(self: *RequestPacer) void {
+    fn beginSerialRequest(self: *RequestPacer, deadline_ns: ?u64) !void {
         lockAtomic(&self.mutex);
         while (true) {
             const now_ns = monotonicNowNs();
             if (now_ns >= self.next_send_ns) return;
             const wait_ns = self.next_send_ns - now_ns;
+            if (deadline_ns) |deadline| {
+                if (now_ns >= deadline or wait_ns >= deadline - now_ns) {
+                    self.mutex.unlock();
+                    return error.Timeout;
+                }
+            }
             self.mutex.unlock();
             sleepNs(wait_ns);
             lockAtomic(&self.mutex);
@@ -361,6 +372,7 @@ fn releaseSharedRequestPacer(scope_key: []const u8) void {
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     provider: ProviderKind,
@@ -856,23 +868,76 @@ fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secr
     }
 }
 
-fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) void {
+fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
+    try ensureEntryDeadline(entry);
     const pacer = entry.pacer orelse return;
-    pacer.acquire();
+    try pacer.acquire(entry.deadline_ns);
+    try ensureEntryDeadline(entry);
 }
 
 fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
     return entry.io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-fn beginEntryPacedRequest(entry: *const ManagedEmbeddingEntry) ?*RequestPacer {
+fn beginEntryPacedRequest(entry: *const ManagedEmbeddingEntry) !?*RequestPacer {
+    try ensureEntryDeadline(entry);
     const pacer = entry.pacer orelse return null;
     if (pacer.capacity <= 1.0) {
-        pacer.beginSerialRequest();
+        try pacer.beginSerialRequest(entry.deadline_ns);
+        errdefer pacer.mutex.unlock();
+        try ensureEntryDeadline(entry);
         return pacer;
     }
-    pacer.acquire();
+    try pacer.acquire(entry.deadline_ns);
+    try ensureEntryDeadline(entry);
     return null;
+}
+
+fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
+    const deadline = entry.deadline_ns orelse return;
+    if (monotonicNowNs() >= deadline) return error.Timeout;
+}
+
+fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientConfig {
+    var config = httpx.ClientConfig{
+        .keep_alive = false,
+        .max_response_size = 4 << 20,
+    };
+    const deadline = entry.deadline_ns orelse return config;
+    const now_ns = monotonicNowNs();
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    const timeout_ms = @min(
+        max_embedding_request_timeout_ms,
+        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
+    );
+    config.timeouts = httpx.Timeouts.uniform(timeout_ms);
+    config.timeouts.request_ms = timeout_ms;
+    return config;
+}
+
+pub fn testEmbeddingProviderDeadlines() !void {
+    var pacer = RequestPacer.init(60, 1);
+    try pacer.beginSerialRequest(null);
+    pacer.endSerialRequest();
+    try std.testing.expectError(error.Timeout, pacer.beginSerialRequest(monotonicNowNs() + std.time.ns_per_ms));
+
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
+    ;
+    const expired_deadline = monotonicNowNs();
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator, indexes_json, .{
+        .deadline_ns = expired_deadline,
+    });
+    defer managed.deinit();
+    try std.testing.expectEqual(expired_deadline, managed.entries[0].deadline_ns.?);
+    try std.testing.expectError(error.Timeout, embeddingHttpClientConfig(&managed.entries[0]));
+
+    managed.entries[0].deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s;
+    const config = try embeddingHttpClientConfig(&managed.entries[0]);
+    try std.testing.expectEqual(@as(usize, 4 << 20), config.max_response_size);
+    try std.testing.expect(config.timeouts.request_ms > 0);
+    try std.testing.expect(config.timeouts.request_ms <= 5_000);
 }
 
 fn endEntryPacedRequest(serial_pacer: ?*RequestPacer) void {
@@ -1236,6 +1301,7 @@ fn buildManagedEmbeddingEntry(
     return .{
         .alloc = alloc,
         .io = options.io,
+        .deadline_ns = options.deadline_ns,
         .index_name = owned_index_name,
         .embedding_name = owned_embedding_name,
         .provider = provider,
@@ -1735,8 +1801,8 @@ fn embedWithEntryParts(
     dims: u32,
 ) ![]f32 {
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
-        waitForEntryPacer(entry);
-        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
+        try waitForEntryPacer(entry);
+        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
         defer http.deinit();
 
         var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
@@ -1758,7 +1824,7 @@ fn embedWithEntryParts(
     if (isAntflyProvider(entry.provider) and (entry.multimodal or partsContainMedia(parts))) {
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
-                waitForEntryPacer(entry);
+                try waitForEntryPacer(entry);
                 const vectors = try embed_parts(local.ptr, alloc, entry.model, parts);
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 if (vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -1767,8 +1833,8 @@ fn embedWithEntryParts(
             }
             return error.UnsupportedEmbeddingProvider;
         }
-        waitForEntryPacer(entry);
-        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
+        try waitForEntryPacer(entry);
+        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
         defer http.deinit();
 
         var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -1817,13 +1883,13 @@ fn embedSparseBatchWithEntry(
     switch (entry.provider) {
         .antfly => {
             if (entry.antfly_provider) |local| {
-                waitForEntryPacer(entry);
+                try waitForEntryPacer(entry);
                 const embeddings = try local.embed_sparse_texts(local.ptr, alloc, entry.model, texts);
                 if (embeddings.len == 0) return error.EmptyEmbeddingResponse;
                 return embeddings;
             }
-            waitForEntryPacer(entry);
-            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
+            try waitForEntryPacer(entry);
+            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
             defer http.deinit();
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -2014,7 +2080,7 @@ fn embedBatchWithEntry(
         },
         .antfly => {
             if (entry.antfly_provider) |local| {
-                waitForEntryPacer(entry);
+                try waitForEntryPacer(entry);
                 const vectors = try local.embed_dense_texts(local.ptr, alloc, entry.model, texts);
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 if (vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -2023,8 +2089,8 @@ fn embedBatchWithEntry(
                 }
                 return vectors;
             }
-            waitForEntryPacer(entry);
-            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
+            try waitForEntryPacer(entry);
+            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
             defer http.deinit();
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -2060,7 +2126,7 @@ fn embedBatchWithBedrock(
         out.deinit(alloc);
     }
 
-    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
+    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer http.deinit();
 
     var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
@@ -2092,7 +2158,7 @@ fn embedBatchWithBedrockRequest(
     texts: []const []const u8,
     dims: u32,
 ) ![]const []const f32 {
-    waitForEntryPacer(entry);
+    try waitForEntryPacer(entry);
     var result = try provider.embedText(alloc, entry.model, texts);
     errdefer result.deinit();
     if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -2141,10 +2207,7 @@ fn embedBatchWithOpenAiCompatible(
         },
     };
 
-    var client = std.http.Client{
-        .allocator = alloc,
-        .io = embeddingIo(entry),
-    };
+    var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer client.deinit();
 
     var input_array = std.json.Array.init(alloc);
@@ -2153,8 +2216,6 @@ fn embedBatchWithOpenAiCompatible(
 
     const url = try std.fmt.allocPrint(alloc, "{s}/embeddings", .{entry.base_url});
     defer alloc.free(url);
-    const uri = std.Uri.parse(url) catch |err| return err;
-
     const json_body = try httpx.json.Json.stringify(alloc, Request{
         .model = .{ .string = entry.model },
         .input = .{ .array = input_array },
@@ -2168,33 +2229,23 @@ fn embedBatchWithOpenAiCompatible(
         null;
     defer if (auth_header) |value| alloc.free(value);
 
-    var headers_buf: [2]std.http.Header = undefined;
-    headers_buf[0] = .{ .name = "content-type", .value = "application/json" };
+    var headers_buf: [2][2][]const u8 = undefined;
+    headers_buf[0] = .{ "content-type", "application/json" };
     const header_count: usize = if (auth_header != null) 2 else 1;
     if (auth_header) |value| {
-        headers_buf[1] = .{ .name = "authorization", .value = value };
+        headers_buf[1] = .{ "authorization", value };
     }
 
-    const serial_pacer = beginEntryPacedRequest(entry);
+    const serial_pacer = try beginEntryPacedRequest(entry);
     defer endEntryPacedRequest(serial_pacer);
 
-    var request = std.http.Client.request(&client, .POST, uri, .{
-        .extra_headers = headers_buf[0..header_count],
-    }) catch |err| return err;
-    defer request.deinit();
-
-    request.transfer_encoding = .{ .content_length = json_body.len };
-    var body_writer = try request.sendBodyUnflushed(&.{});
-    try body_writer.writer.writeAll(json_body);
-    try body_writer.end();
-    try request.connection.?.flush();
-
-    var response = request.receiveHead(&.{}) catch |err| return err;
-    if (response.head.status.class() != .success) return mapEmbedStatus(response.head.status);
-
-    var transfer_buffer: [512]u8 = undefined;
-    const response_body = response.reader(&transfer_buffer).allocRemaining(alloc, .limited(4 << 20)) catch |err| return err;
-    defer alloc.free(response_body);
+    var response = try client.post(url, .{
+        .json = json_body,
+        .headers = headers_buf[0..header_count],
+    });
+    defer response.deinit();
+    if (!response.ok()) return mapEmbedStatus(response.status.code);
+    const response_body = response.body orelse return error.EmptyEmbeddingResponse;
 
     var parsed = std.json.parseFromSlice(Response, alloc, response_body, .{ .ignore_unknown_fields = true }) catch |err| return err;
     defer parsed.deinit();
@@ -2229,15 +2280,15 @@ fn optionalBearerAuthHeaderOwned(
     };
 }
 
-fn mapEmbedStatus(status: std.http.Status) anyerror {
+fn mapEmbedStatus(status: u16) anyerror {
     return switch (status) {
-        .too_many_requests => error.EmbedRateLimited,
-        .request_timeout,
-        .bad_gateway,
-        .service_unavailable,
-        .gateway_timeout,
+        429 => error.EmbedRateLimited,
+        408,
+        502,
+        503,
+        504,
         => error.EmbedTransientFailure,
-        else => if (status.class() == .server_error) error.EmbedTransientFailure else error.EmbedRequestFailed,
+        else => if (status >= 500 and status < 600) error.EmbedTransientFailure else error.EmbedRequestFailed,
     };
 }
 

@@ -85,9 +85,14 @@ Lookup and flight registration occur under one mutex. A miss installs exactly
 one producer before releasing the mutex. Waiters sleep on that flight's
 completion event and are always released on success or error. Public-query
 waiters stop waiting at their request deadline without canceling a producer
-that may still serve other callers. Completion of
-one key never wakes waiters for unrelated keys. Errors are delivered to current
-waiters but are never cached. Producer computation runs without the cache lock.
+that may still serve other callers. The producer receives the same absolute
+deadline: provider pacing refuses slots that cannot be reached in time, and
+remote connect, read, write, and whole-request limits are capped by the
+remaining budget. An embedded model call that has already started follows the
+embedded runtime's cancellation contract, but its result is never allowed to
+extend a waiter's deadline. Completion of one key never wakes waiters for
+unrelated keys. Errors are delivered to current waiters but are never cached.
+Producer computation runs without the cache lock.
 
 Shutdown requires request handling to stop before `ApiHttpServer.deinit`, which
 asserts that no flights remain before freeing cache state.
