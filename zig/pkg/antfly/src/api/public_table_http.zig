@@ -78,6 +78,7 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        QueryEmbeddingInputTooLarge,
         QueryEmbeddingOverloaded,
         EmbedRateLimited,
         EmbedTransientFailure,
@@ -614,6 +615,9 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+            },
+            error.QueryEmbeddingInputTooLarge => {
+                return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
             },
             error.QueryEmbeddingOverloaded => {
                 return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding overloaded") };
@@ -1658,6 +1662,7 @@ test "public table query handler preserves embedding failure status" {
         body: []const u8,
     };
     const cases = [_]Case{
+        .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "query embedding input too large" },
         .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "query embedding overloaded" },
         .{ .err = error.EmbedRateLimited, .status = 429, .body = "query embedding rate limited" },
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },

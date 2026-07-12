@@ -146,6 +146,12 @@ unbounded upstream queue. Public overload, provider rate-limit, and transient
 provider responses include a short `Retry-After` hint so clients can back off
 instead of immediately amplifying pressure.
 
+Plain and templated semantic query text is limited to 1 MiB of UTF-8 input, and
+user-supplied embedding templates are limited to 64 KiB. Both limits are checked
+before metadata lookup, hashing, template rendering, provider serialization, or
+cache access. Oversized public requests receive HTTP 413 rather than consuming
+provider and cache admission capacity.
+
 Each entry charge includes the vector, entry object, key/value storage, and a
 conservative allowance for hash-table occupancy. The cache reserves its charge
 from `CacheBudget` before publishing the entry and releases it on expiration,

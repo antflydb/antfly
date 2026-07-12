@@ -6008,6 +6008,7 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.QueryEmbeddingInputTooLarge => return error.QueryEmbeddingInputTooLarge,
             error.QueryEmbeddingOverloaded => return error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
@@ -6100,6 +6101,7 @@ pub const ApiHttpServer = struct {
                 error.TableNotFound => return error.TableNotFound,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+                error.QueryEmbeddingInputTooLarge,
                 error.QueryEmbeddingOverloaded,
                 error.EmbedRateLimited,
                 error.EmbedTransientFailure,
@@ -6127,6 +6129,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.QueryEmbeddingInputTooLarge,
             error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited,
             error.EmbedTransientFailure,
@@ -7365,6 +7368,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
             error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
             error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
+            error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
             error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
             error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
             error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
@@ -7434,6 +7438,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
                 error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
                 error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
+                error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
                 error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
                 error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
                 error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
@@ -9974,6 +9979,7 @@ fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.Http
 
 fn normalizePublicQueryParseError(err: anyerror) anyerror {
     return switch (err) {
+        error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
@@ -11848,6 +11854,7 @@ test "api http server applies node query embedding cache policy and explicit ove
 }
 
 test "api http query parsing preserves operational embedding failures" {
+    try std.testing.expectEqual(error.QueryEmbeddingInputTooLarge, normalizePublicQueryParseError(error.QueryEmbeddingInputTooLarge));
     try std.testing.expectEqual(error.QueryEmbeddingOverloaded, normalizePublicQueryParseError(error.QueryEmbeddingOverloaded));
     try std.testing.expectEqual(error.EmbedRateLimited, normalizePublicQueryParseError(error.EmbedRateLimited));
     try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.ConnectionRefused));

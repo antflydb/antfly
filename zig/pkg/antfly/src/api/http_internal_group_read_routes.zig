@@ -21,6 +21,9 @@ const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const cache_budget = @import("../common/cache_budget.zig");
 const scraping = @import("antfly_scraping");
 const db_mod = @import("../storage/db/mod.zig");
+
+pub const max_query_embedding_input_bytes: usize = 1024 * 1024;
+pub const max_query_embedding_template_bytes: usize = 64 * 1024;
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -155,6 +158,11 @@ pub fn planSemanticQuery(
     embedding_template: ?[]const u8,
     limit: u32,
 ) !db_mod.types.DenseKnnQuery {
+    if (semantic_search.len > max_query_embedding_input_bytes) return error.QueryEmbeddingInputTooLarge;
+    if (embedding_template) |value| {
+        if (value.len > max_query_embedding_template_bytes) return error.QueryEmbeddingInputTooLarge;
+    }
+
     var snapshot = try planning.adminSnapshot();
     defer planning.freeAdminSnapshot(&snapshot);
 
@@ -292,6 +300,24 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     other_principal.query_embedding_security_scope = "bob";
     const isolated = try planSemanticQuery(other_principal, alloc, "docs_b", "semantic_idx", "same query", null, 5);
     defer alloc.free(isolated.vector);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+
+    const oversized = try alloc.alloc(u8, max_query_embedding_input_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    try std.testing.expectError(
+        error.QueryEmbeddingInputTooLarge,
+        planSemanticQuery(base, alloc, "docs_a", "semantic_idx", oversized, null, 5),
+    );
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+
+    const oversized_template = try alloc.alloc(u8, max_query_embedding_template_bytes + 1);
+    defer alloc.free(oversized_template);
+    @memset(oversized_template, 'x');
+    try std.testing.expectError(
+        error.QueryEmbeddingInputTooLarge,
+        planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", oversized_template, 5),
+    );
     try std.testing.expectEqual(@as(usize, 2), provider.calls);
 }
 
