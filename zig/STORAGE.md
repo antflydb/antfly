@@ -286,23 +286,24 @@ renewing leases, encoding, or waiting for durable I/O.
 Lite installs a scoped DB-open provider on the standalone backend runtime.
 Logical group paths become cached key and index namespaces inside the file, so
 the existing `/db/v1`, SQL, transaction, indexing, and inference code paths are
-reused unchanged. Prefix-bounded cursors prevent cross-table scans. Read
-snapshots cache only ordered live keys; values are resolved lazily from a
-pinned append-only document root, and cursors retain only their current value.
-Point reads walk the pinned per-namespace chain directly and never build the
-key index; only ordered cursor operations materialize it. Pinned point and
-cursor-value reads use concurrent positional I/O rather than holding the
-store-wide mutation mutex, and key snapshots use one compact ownership array
-instead of a heap allocation per key. Index segment reads use the same pinned
-checkpoint and generation fence, so concurrent queries do not serialize on the
-mutation mutex and vacuum cannot reclaim their pages.
-Cache-budget exhaustion falls back to a transaction-owned key index instead of
-making valid data unreadable. A `std.Io.RwLock` permits normal append-only
-commits while readers pin roots and makes vacuum/rewrite wait before reclaiming
-pages. Cold write-only transactions do not materialize a table, and commits
-invalidate hot key indexes in constant time. A checkpointed namespace-head
-directory and per-namespace document links make key-index construction
-proportional to the selected namespace's history. Recreating an existing Lite
+reused unchanged. Each checkpoint pins both the append-only document history
+and a copy-on-write, disk-resident ordered B+ tree whose leaves map full logical
+keys to their newest document pages. Point reads and cursor seeks are
+`O(log N)` page lookups; forward and reverse cursors retain only the current key
+and value, skip indexed tombstones, and never materialize a table-sized key
+array. Prefix bounds prevent cross-table scans. Initial imports and vacuum use
+a streaming packed-tree builder, retaining one leaf plus one separator per
+output page rather than all live keys. Normal commits copy only the affected
+tree path, and the shared bounded page cache serves index and document pages.
+
+Pinned reads use concurrent positional I/O rather than holding the store-wide
+mutation mutex. Index segment reads use the same checkpoint and generation
+fence, so concurrent queries do not serialize on the mutation mutex and vacuum
+cannot reclaim their pages. A `std.Io.RwLock` permits normal append-only commits
+while readers pin roots and makes vacuum/rewrite wait before reclaiming pages.
+A checkpointed namespace-head directory and per-namespace document links retain
+efficient table-history maintenance independently of the global ordered index.
+Recreating an existing Lite
 artifact publishes a complete new inode by atomic rename, so readers pinned to
 the prior generation are never exposed to truncation. Missing namespace
 metadata fails closed as file corruption. Cached namespace runtimes avoid allocations and storage

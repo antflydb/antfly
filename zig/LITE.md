@@ -27,7 +27,7 @@ The server topology remains Antfly Standalone.
 - Make upgrade to normal Antfly explicit and reliable through portable backup
   and restore.
 - Keep the embedded API stable enough for language bindings.
-- Make `.aflite` the public v1 database format, backed by a Lite-native
+- Make `.aflite` the public database format, backed by a Lite-native
   single-file engine instead of exposing a temporary directory-backed user
   format.
 
@@ -41,7 +41,7 @@ The server topology remains Antfly Standalone.
   backup, and restore contracts; it does not duplicate them under a Lite API.
 - Antfly Lite should not silently emulate distributed behavior in ways that make
   later promotion surprising.
-- Antfly Lite v1 should not include legacy fallback code for pre-release
+- Antfly Lite should not include legacy fallback code for pre-release
   `.aflite`, directory-backed, or LSM-container experiments. Unknown versions
   and invalid headers should fail explicitly.
 
@@ -56,7 +56,7 @@ The implementation now consists of:
   `runUntilIdle`.
 - `storage/db/db.zig` already supports open modes such as writer,
   query-readonly, and status-only.
-- `storage/lite/native.zig` owns the v1 header, alternating checkpoint roots,
+- `storage/lite/native.zig` owns the native revision-2 header, alternating checkpoint roots,
   page allocation, free map, crash recovery, integrity checks, stable snapshots,
   and atomic vacuum replacement. Document commits publish a namespace-head
   directory and per-namespace page links in the same checkpoint, so a cold
@@ -68,19 +68,19 @@ The implementation now consists of:
   bounding cold-open replay. The checkpoint links the directory delta and
   document pages atomically. Normal commits remain append-only; explicit vacuum
   reclaims superseded pages without putting a reachability walk on the write
-  path. Missing directory or namespace-link metadata is treated as corruption.
+  path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
+  logical document key to its newest document page. Initial loads and vacuum
+  build packed trees as bounded streaming operations. Integrity checks validate
+  every tree page, separator range, document pointer, and checkpoint/free-map
+  reachability. Missing directory, namespace-link, or ordered-index metadata is
+  treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
-  snapshots, replay lanes, and prefix-bounded logical namespaces. Snapshot
-  caches retain ordered live keys only and are charged to the shared resource
-  governor; values are loaded lazily from a pinned append-only document root,
-  and a cursor owns only its current value. Point reads walk the pinned
-  per-namespace chain without building the ordered key index; only cursor
-  operations materialize it. Cold write-only transactions do not
-  materialize live documents, and commits invalidate hot key indexes in
-  constant time. Pinned point and cursor-value reads use concurrent positional
-  I/O, and key snapshots use one compact ownership array rather than a heap
-  object per key. Cache-budget exhaustion uses a transaction-owned key index
-  rather than rejecting reads based on document payload volume. A
+  snapshots, replay lanes, and prefix-bounded logical namespaces. Point reads
+  and ordered seeks traverse the checkpoint's disk-resident B+ tree in
+  `O(log N)` pages. A cursor owns only its current key and value, so cold scans
+  remain bounded by the page cache rather than live-key count or document
+  payload volume. Tombstones remain indexed until vacuum and are skipped during
+  iteration. Pinned reads use concurrent positional I/O. A
   `std.Io.RwLock` allows normal append-only commits while readers pin roots and
   blocks vacuum before it can reclaim those roots.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
@@ -143,7 +143,7 @@ into another.
 
 `antfly lite status` should include a storage block that identifies the live
 file format, the selected engine, the primary, replay, and index layouts, the
-v1 format version, page size, and active checkpoint sequence. That makes the
+native format revision, page size, and active checkpoint sequence. That makes the
 public native `.aflite` path observable and keeps internal bridge profiles from
 being mistaken for the v1 contract.
 
@@ -352,7 +352,7 @@ invalid `.aflite` files without first opening a handle.
 
 ### File Format
 
-Antfly Lite v1 should use `.aflite` as the live database format. Users should
+Antfly Lite uses `.aflite` as the live database format. Users should
 not need to understand a temporary directory-backed layout.
 
 The single-file database should be implemented as a Lite-native backend, not as
@@ -383,20 +383,20 @@ same way. Neither should be the public Lite v1 contract.
 
 ### Compatibility Policy
 
-Because this is new, unreleased code, v1 should not carry a legacy fallback,
+Because this is new, unreleased code, native revision 2 does not carry a legacy fallback,
 pre-release importer, v0 directory reader, silent LSM-container upgrade path, or
 prototype-to-v1 auto-migrator. Prototype files can be recreated from tests or
 explicit exports while the format is still pre-release. `.aflite` readers should
-accept the documented v1 format and reject unknown versions loudly. Recovery
-from an older complete checkpoint root inside the same v1 file is crash
-recovery, not legacy compatibility; a file with no complete v1 checkpoint should
+accept the documented revision-2 format and reject unknown versions loudly. Recovery
+from an older complete checkpoint root inside the same file is crash
+recovery, not legacy compatibility; a file with no complete checkpoint should
 fail with an explicit integrity error. Compatibility branches should only be
 added after a format has shipped and users can reasonably have files that need
 preservation.
 
 The implementation consequence is that the production Lite open path should be
-small and direct: parse the v1 header, validate the v1 checkpoint, recover within
-the v1 format if needed, and otherwise return an explicit error. It should not
+small and direct: parse the current header, validate its checkpoint and ordered
+index root, recover within the same format if needed, and otherwise return an explicit error. It should not
 carry readers for discarded prototype layouts, and tests should assert rejection
 of invalid headers, unsupported versions, and bridge-profile files opened through
 the default `.aflite` path.
@@ -424,6 +424,7 @@ for embedded Antfly data:
 - checkpoint roots
 - catalog pages
 - document key/value pages or segments
+- copy-on-write ordered document-index pages
 - text index files
 - dense vector/HBC posting files
 - sparse posting files
@@ -817,7 +818,8 @@ query-visible results should match within documented index rebuild semantics.
 
 - Implemented a Lite-native storage backend for embedded and standalone Antfly.
 - Add database header, catalog roots, page or segment allocator, free-space map,
-  commit/checkpoint publish, crash recovery, integrity checks, and vacuum.
+  copy-on-write ordered document index, commit/checkpoint publish, crash
+  recovery, integrity checks, and streaming vacuum rebuild.
 - Preserve Antfly's document ordering, range scans, index definitions,
   enrichment state, vector/HBC artifacts, sparse artifacts, graph artifacts,
   backup, and restore semantics.
@@ -902,7 +904,7 @@ query-visible results should match within documented index rebuild semantics.
 
 ## Recommendation
 
-Ship Antfly Lite v1 as `.aflite`, not as a public directory-backed format. This
+Ship Antfly Lite as `.aflite`, not as a public directory-backed format. This
 keeps the product mental model simple: a Lite database is a file, and a portable
 backup is an `.afb` archive.
 
