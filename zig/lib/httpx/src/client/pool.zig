@@ -98,8 +98,7 @@ pub const Connection = struct {
         const host_owned = try allocator.dupe(u8, host);
         errdefer allocator.free(host_owned);
 
-        const addr = try resolveAddress(io, host, port);
-        var socket = try Socket.connect(addr, io);
+        var socket = try Socket.connectHost(host, port, io);
         errdefer socket.close();
         socket.setKeepAlive(true) catch {};
 
@@ -168,8 +167,7 @@ pub const TlsConnection = struct {
         errdefer allocator.destroy(entry);
 
         // Resolve and connect the TCP socket.
-        const addr = try resolveAddress(io, host, port);
-        entry.socket = try Socket.connect(addr, io);
+        entry.socket = try Socket.connectHost(host, port, io);
         errdefer entry.socket.close();
 
         // Initialize the TLS session.  The session stores internal pointers to

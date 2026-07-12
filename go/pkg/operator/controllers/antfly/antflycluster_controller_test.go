@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -38,7 +39,65 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+type conflictOnceStatusClient struct {
+	client.Client
+	updates   int
+	persisted *antflyv1.AntflyCluster
+}
+
+func (c *conflictOnceStatusClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if c.persisted != nil && key.Name == c.persisted.Name && key.Namespace == c.persisted.Namespace {
+		cluster, ok := obj.(*antflyv1.AntflyCluster)
+		if !ok {
+			return fmt.Errorf("unexpected persisted status target %T", obj)
+		}
+		*cluster = *c.persisted.DeepCopy()
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *conflictOnceStatusClient) Status() client.SubResourceWriter {
+	return &conflictOnceStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type conflictOnceStatusWriter struct {
+	client.SubResourceWriter
+	client *conflictOnceStatusClient
+}
+
+func (w *conflictOnceStatusWriter) Update(_ context.Context, obj client.Object, _ ...client.SubResourceUpdateOption) error {
+	w.client.updates++
+	if w.client.updates == 1 {
+		w.client.persisted.Status.Phase = "concurrent-status-update"
+		return errors.NewConflict(
+			antflyv1.GroupVersion.WithResource("antflyclusters").GroupResource(),
+			obj.GetName(),
+			fmt.Errorf("injected status resource-version conflict"),
+		)
+	}
+	cluster, ok := obj.(*antflyv1.AntflyCluster)
+	if !ok {
+		return fmt.Errorf("unexpected status update target %T", obj)
+	}
+	if cluster.ResourceVersion != w.client.persisted.ResourceVersion {
+		return errors.NewConflict(
+			antflyv1.GroupVersion.WithResource("antflyclusters").GroupResource(),
+			obj.GetName(),
+			fmt.Errorf("stale status resource version %q, current %q", cluster.ResourceVersion, w.client.persisted.ResourceVersion),
+		)
+	}
+	w.client.persisted = cluster.DeepCopy()
+	w.client.persisted.ResourceVersion = "persisted-promotion-receipt"
+	cluster.ResourceVersion = w.client.persisted.ResourceVersion
+	return nil
+}
+
 func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64, token string) string {
+	return haFenceResponseJSONAtBoundary(oldPrimaryID, promotedNodeID, promotedNodeID, generation, token, 12)
+}
+
+func haFenceResponseJSONAtBoundary(oldPrimaryID, promotedNodeID, nodeID string, generation uint64, token string, boundary uint64) string {
 	body, err := json.Marshal(map[string]any{
 		"schema_version": 1,
 		"action": map[string]any{
@@ -46,7 +105,7 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 			"action_kind": "fence_acquire",
 			"target":      promotedNodeID,
 			"state":       "applied",
-			"node_id":     promotedNodeID,
+			"node_id":     nodeID,
 		},
 		"receipt": map[string]any{
 			"identity": map[string]any{
@@ -62,8 +121,8 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 			"parent_epoch":       6,
 			"new_timeline_id":    5,
 			"new_epoch":          7,
-			"required_lsn":       12,
-			"observed_lsn":       12,
+			"required_lsn":       boundary,
+			"observed_lsn":       boundary,
 			"generation":         generation,
 			"forced":             false,
 			"token":              token,
@@ -521,7 +580,6 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 			}, nil
 		})},
 	}
-
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/replication-slots"}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
@@ -2088,8 +2146,12 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		},
 	}
 	var observed []string
+	statusClient := &conflictOnceStatusClient{
+		Client:    fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		persisted: cluster.DeepCopy(),
+	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: statusClient,
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
@@ -2137,6 +2199,12 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		})},
 	}
 
+	var before antflyv1.AntflyCluster
+	g.Expect(reconciler.Get(
+		context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+		&before,
+	)).To(Succeed())
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/fence",
@@ -2194,6 +2262,171 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(promotion.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(promotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
+
+	var persisted antflyv1.AntflyCluster
+	g.Expect(reconciler.Get(
+		context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+		&persisted,
+	)).To(Succeed())
+	g.Expect(persisted.Status.HAStatus).NotTo(BeNil())
+	g.Expect(persisted.Status.HAStatus.LastPromotion).NotTo(BeNil())
+	g.Expect(persisted.Status.HAStatus.LastPromotion.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(persisted.Status.Phase).To(Equal("concurrent-status-update"))
+	g.Expect(statusClient.updates).To(Equal(2))
+
+	// The receipt write advances the stored resource version. The rest of this
+	// reconcile still holds a stale, full status object, so its eventual update
+	// must conflict instead of overwriting the concurrent status field.
+	err := reconciler.Status().Update(context.Background(), cluster)
+	g.Expect(errors.IsConflict(err)).To(BeTrue())
+	g.Expect(statusClient.updates).To(Equal(3))
+	g.Expect(reconciler.Get(
+		context.Background(),
+		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+		&persisted,
+	)).To(Succeed())
+	g.Expect(persisted.Status.Phase).To(Equal("concurrent-status-update"))
+	g.Expect(persisted.Status.HAStatus.LastPromotion.FenceToken).To(Equal("ha-fence-token"))
+}
+
+func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAssessment(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionFenceFormerPrimary),
+					StandbyName:     "primary-a",
+					TargetLSN:       12,
+					RouteFrom:       "primary-a",
+					RouteTo:         "standby-a",
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					AdminURL:        "http://primary-ha.default.svc:8081",
+					AdminNodeID:     "primary-a",
+					AdminMethod:     http.MethodPost,
+					AdminPath:       "/admin/v1/ha/fence",
+				}, {
+					Kind:            string(haActionAcquireFence),
+					DependsOn:       string(haActionFenceFormerPrimary),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
+					AdminMethod:     http.MethodPost,
+					AdminPath:       "/admin/v1/ha/fence",
+				}, {
+					Kind:            string(haActionAssessPromotion),
+					DependsOn:       string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
+					AdminMethod:     http.MethodPost,
+					AdminPath:       "/admin/v1/ha/promotion/assess",
+				}},
+			},
+		},
+	}
+
+	var observed []string
+	assessmentCalls := 0
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			observed = append(observed, req.URL.Host+" "+req.Method+" "+req.URL.Path)
+			var payload map[string]any
+			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+			switch {
+			case req.URL.Host == "primary-ha.default.svc:8081" && req.URL.Path == "/admin/v1/ha/fence":
+				g.Expect(payload["required_lsn"]).To(Equal(float64(12)))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(haFenceResponseJSONAtBoundary(
+						"primary-a", "standby-a", "primary-a", 3, "tail-17-token", 17,
+					))),
+				}, nil
+			case req.URL.Host == "standby-a-ha.default.svc:8081" && req.URL.Path == "/admin/v1/ha/fence":
+				g.Expect(payload["required_lsn"]).To(Equal(float64(17)))
+				g.Expect(payload["observed_lsn"]).To(Equal(float64(17)))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(haFenceResponseJSONAtBoundary(
+						"primary-a", "standby-a", "standby-a", 3, "tail-17-token", 17,
+					))),
+				}, nil
+			case req.URL.Host == "standby-a-ha.default.svc:8081" && req.URL.Path == "/admin/v1/ha/promotion/assess":
+				g.Expect(payload["required_lsn"]).To(Equal(float64(17)))
+				assessmentCalls++
+				if assessmentCalls == 1 {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":17,"received_lsn":16,"applied_lsn":16,"has_required_lsn":false,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"blocked","data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":true,"can_promote":false}}`)),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":17,"received_lsn":17,"applied_lsn":17,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`)),
+				}, nil
+			default:
+				t.Fatalf("unexpected HA admin request: %s %s", req.URL.Host, req.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminError).To(ContainSubstring("has not applied the frozen former-primary boundary"))
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(observed).To(Equal([]string{
+		"primary-ha.default.svc:8081 POST /admin/v1/ha/fence",
+		"standby-a-ha.default.svc:8081 POST /admin/v1/ha/fence",
+		"standby-a-ha.default.svc:8081 POST /admin/v1/ha/promotion/assess",
+		"standby-a-ha.default.svc:8081 POST /admin/v1/ha/promotion/assess",
+	}))
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		g.Expect(cluster.Status.HAStatus.PlannedActions[i].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	}
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceRequiredLSN).To(Equal(uint64(17)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].TargetLSN).To(Equal(uint64(17)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceToken).To(Equal("tail-17-token"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].TargetLSN).To(Equal(uint64(17)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.PromotionAppliedLSN).To(Equal(uint64(17)))
 }
 
 func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
@@ -2386,6 +2619,110 @@ func TestReconcileHAAdminJobsRejectsMismatchedDirectFenceReceipt(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).To(BeNil())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseWaitingDependency))
 	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
+}
+
+func TestReconcileHAAdminJobsDurablyFencesFormerPrimaryFromPromotionReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	promotion := &antflyv1.HAPromotionStatus{
+		ClusterID:         100,
+		ShardID:           10,
+		TableID:           20,
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  4,
+		ParentEpoch:       6,
+		NewTimelineID:     5,
+		NewEpoch:          7,
+		RequiredLSN:       11,
+		ObservedLSN:       12,
+		SwitchLSN:         13,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration:   3,
+		FenceReason:       "LeaseAcquired",
+		FenceToken:        "ha-fence-token",
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Mode: antflyv1.HAModeHotStandby,
+			Admin: &antflyv1.HAAdminSpec{
+				PrimaryURL:            "http://primary-ha.default.svc:8081",
+				ExecutePlannedActions: true,
+			},
+			Identity: &antflyv1.HAReplicationIdentitySpec{
+				ClusterID:        100,
+				ShardID:          10,
+				TableID:          20,
+				TimelineID:       4,
+				Epoch:            6,
+				CurrentPrimaryID: "primary-a",
+			},
+		}},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{
+			LastPromotion: promotion,
+			PlannedActions: []antflyv1.HAPlannedActionStatus{{
+				Kind:            string(haActionFenceFormerPrimary),
+				Phase:           string(haActionPhaseFence),
+				Executor:        string(haActionExecutorAdminAPI),
+				StandbyName:     "primary-a",
+				RouteFrom:       "primary-a",
+				RouteTo:         "standby-a",
+				TargetLSN:       12,
+				FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+				FenceHolder:     "standby-a",
+				FenceGeneration: 3,
+				FenceReason:     "LeaseAcquired",
+				AdminCommand:    []string{"fence", "acquire"},
+				AdminURL:        "http://primary-ha.default.svc:8081",
+				AdminNodeID:     "primary-a",
+				AdminMethod:     http.MethodPost,
+				AdminPath:       "/admin/v1/ha/fence",
+			}},
+		}},
+	}
+	var request adminsdk.FenceAcquireRequest
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodPost))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/fence"))
+			g.Expect(json.NewDecoder(req.Body).Decode(&request)).To(Succeed())
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(strings.Replace(
+					strings.Replace(
+						haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token"),
+						`"node_id":"standby-a"`, `"node_id":"primary-a"`, 1,
+					),
+					`"required_lsn":12`, `"required_lsn":11`, 1,
+				))),
+			}, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(request.Identity).To(Equal(adminsdk.HAIdentity{ClusterId: 100, ShardId: 10, TableId: 20, TimelineId: 4, Epoch: 6}))
+	g.Expect(string(request.OldPrimaryId)).To(Equal("primary-a"))
+	g.Expect(string(request.PromotedNodeId)).To(Equal("standby-a"))
+	g.Expect(request.NewTimelineId).To(Equal(uint64(5)))
+	g.Expect(request.NewEpoch).To(Equal(uint64(7)))
+	g.Expect(request.RequiredLsn).To(Equal(uint64(11)))
+	g.Expect(request.ObservedLsn).To(Equal(uint64(12)))
+	g.Expect(request.Force).To(BeFalse())
+	action := cluster.Status.HAStatus.PlannedActions[0]
+	g.Expect(action.AdminJobName).To(Equal(haAdminDirectAPIName))
+	if action.AdminJobPhase != haAdminJobPhaseSucceeded {
+		t.Fatalf("expected former-primary fence action to succeed, got phase=%q error=%q result=%#v", action.AdminJobPhase, action.AdminError, action.AdminResult)
+	}
+	g.Expect(action.AdminResult).NotTo(BeNil())
+	g.Expect(action.AdminResult.FenceToken).To(Equal(promotion.FenceToken))
+	g.Expect(action.AdminResult.ActionNodeID).To(Equal("primary-a"), "fence receipt must identify the node that durably recorded it")
 }
 
 func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) {
@@ -2583,7 +2920,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 				PlannedActions: []antflyv1.HAPlannedActionStatus{{
 					Kind:            string(haActionRewindFormerPrimary),
 					StandbyName:     "primary-a",
-					TargetLSN:       12,
+					TargetLSN:       13,
 					ObservedLSN:     13,
 					RetainedFromLSN: 8,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
@@ -2623,7 +2960,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":4,"parent_epoch":6,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":4,"parent_epoch":6,"fork_lsn":13,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":false},"rewind":{"node_id":"primary-a","fork_lsn":13,"previous_last_lsn":13,"current_last_lsn":14,"next_lsn":15,"discarded_lsn_count":0,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":false}}`)),
 			}, nil
 		})},
 	}
@@ -2641,25 +2978,25 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FormerNodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.TargetTimelineID).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.TargetEpoch).To(Equal(uint64(7)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ForkLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ForkLSN).To(Equal(uint64(13)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FormerLastLSN).To(Equal(uint64(13)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RetainedFromLSN).To(Equal(uint64(8)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.DataLossDiscarded).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.DataLossDiscarded).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindExecuted).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindPreviousLastLSN).To(Equal(uint64(13)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindCurrentLastLSN).To(Equal(uint64(12)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindNextLSN).To(Equal(uint64(13)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindCurrentLastLSN).To(Equal(uint64(14)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindNextLSN).To(Equal(uint64(15)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindDiscardedLSNCount).To(BeZero())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Fenced).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.RewindPossible).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.TargetTimelineID).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.TargetEpoch).To(Equal(uint64(7)))
-	g.Expect(cluster.Status.HAStatus.FormerPrimary.ForkLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.ForkLSN).To(Equal(uint64(13)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.FormerLastLSN).To(Equal(uint64(13)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.RetainedFromLSN).To(Equal(uint64(8)))
-	g.Expect(cluster.Status.HAStatus.FormerPrimary.DataLossDiscarded).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.DataLossDiscarded).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.AssessedAction).To(Equal("rewind"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.AssessedReason).To(Equal("parent_timeline_retained"))
 
@@ -2821,7 +3158,7 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 			ParentEpoch:       6,
 			NewTimelineID:     5,
 			NewEpoch:          7,
-			SwitchLSN:         12,
+			SwitchLSN:         14,
 			RequiredLSN:       12,
 			ObservedLSN:       13,
 			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
@@ -2832,8 +3169,8 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	action := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionRewindFormerPrimary),
 		StandbyName:     "primary-a",
-		TargetLSN:       12,
-		ObservedLSN:     13,
+		TargetLSN:       13,
+		ObservedLSN:     12,
 		RetainedFromLSN: 8,
 		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceGeneration: 3,
@@ -2848,7 +3185,7 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		ParentTableID:    20,
 		ParentTimelineID: 4,
 		ParentEpoch:      6,
-		ForkLSN:          12,
+		ForkLSN:          13,
 		FormerLastLSN:    13,
 		RetainedFromLSN:  8,
 	}
@@ -2862,9 +3199,9 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	result.Action = "rewind"
 	result.RewindExecuted = true
 	result.RewindPreviousLastLSN = 13
-	result.RewindCurrentLastLSN = 12
-	result.RewindNextLSN = 13
-	result.RewindDiscardedLSNCount = 1
+	result.RewindCurrentLastLSN = 14
+	result.RewindNextLSN = 15
+	result.RewindDiscardedLSNCount = 0
 	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
 
 	status.LastPromotion.FenceAuthority = ""
@@ -2886,8 +3223,8 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		ParentTableID:    20,
 		ParentTimelineID: 4,
 		ParentEpoch:      6,
-		ForkLSN:          12,
-		FormerLastLSN:    13,
+		ForkLSN:          13,
+		FormerLastLSN:    15,
 		RetainedFromLSN:  8,
 	}
 	action.Kind = string(haActionReseedFormerPrimary)
@@ -2959,13 +3296,13 @@ func TestHAFormerPrimaryActionRequiresPromotionReceiptEvidence(t *testing.T) {
 			TargetTimelineID:        5,
 			TargetEpoch:             7,
 			ForkLSN:                 12,
-			FormerLastLSN:           13,
+			FormerLastLSN:           12,
 			RetainedFromLSN:         8,
 			RewindExecuted:          true,
-			RewindPreviousLastLSN:   13,
-			RewindCurrentLastLSN:    12,
-			RewindNextLSN:           13,
-			RewindDiscardedLSNCount: 1,
+			RewindPreviousLastLSN:   12,
+			RewindCurrentLastLSN:    13,
+			RewindNextLSN:           14,
+			RewindDiscardedLSNCount: 0,
 		},
 	}
 
@@ -3381,16 +3718,16 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 		TargetTimelineID: 5,
 		TargetEpoch:      7,
 		ForkLSN:          12,
-		FormerLastLSN:    13,
+		FormerLastLSN:    12,
 		RetainedFromLSN:  8,
 	}
 	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeFalse())
 
 	rejoinActions[0].AdminResult.RewindExecuted = true
-	rejoinActions[0].AdminResult.RewindPreviousLastLSN = 13
-	rejoinActions[0].AdminResult.RewindCurrentLastLSN = 12
-	rejoinActions[0].AdminResult.RewindNextLSN = 13
-	rejoinActions[0].AdminResult.RewindDiscardedLSNCount = 1
+	rejoinActions[0].AdminResult.RewindPreviousLastLSN = 12
+	rejoinActions[0].AdminResult.RewindCurrentLastLSN = 13
+	rejoinActions[0].AdminResult.RewindNextLSN = 14
+	rejoinActions[0].AdminResult.RewindDiscardedLSNCount = 0
 	rejoinActions[0].AdminResult.ActionID = "rejoin_rewind:primary-a"
 	rejoinActions[0].AdminResult.ActionKind = "rejoin_rewind"
 	rejoinActions[0].AdminResult.ActionTarget = "primary-a"
@@ -5084,20 +5421,20 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 			ParentTimelineId:  4,
 			ParentEpoch:       6,
 			ForkLsn:           12,
-			FormerLastLsn:     13,
+			FormerLastLsn:     12,
 			RetainedFromLsn:   8,
-			DataLossDiscarded: true,
+			DataLossDiscarded: false,
 		},
 		Rewind: adminsdk.HARejoinRewindResult{
 			NodeId:            "primary-a",
 			ForkLsn:           12,
-			PreviousLastLsn:   13,
-			CurrentLastLsn:    12,
-			NextLsn:           13,
-			DiscardedLsnCount: 1,
+			PreviousLastLsn:   12,
+			CurrentLastLsn:    13,
+			NextLsn:           14,
+			DiscardedLsnCount: 0,
 			TargetTimelineId:  5,
 			TargetEpoch:       7,
-			DataLossDiscarded: true,
+			DataLossDiscarded: false,
 		},
 	}
 
@@ -5116,7 +5453,8 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 	staleObservedResponse.Assessment.FormerLastLsn = 12
 	staleObservedResponse.Assessment.DataLossDiscarded = false
 	staleObservedResponse.Rewind.PreviousLastLsn = 12
-	staleObservedResponse.Rewind.CurrentLastLsn = 12
+	staleObservedResponse.Rewind.CurrentLastLsn = 13
+	staleObservedResponse.Rewind.NextLsn = 14
 	staleObservedResponse.Rewind.DiscardedLsnCount = 0
 	staleObservedResponse.Rewind.DataLossDiscarded = false
 	staleObservedCluster := newRejoinCluster()
@@ -5442,9 +5780,9 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"parent_timeline_id=4",
 		"parent_epoch=6",
 		"fork_lsn=12",
-		"former_last_lsn=13",
+		"former_last_lsn=12",
 		"retained_from_lsn=8",
-		"data_loss_discarded=true",
+		"data_loss_discarded=false",
 		"",
 	}, "\n"))
 	g.Expect(ok).To(BeTrue())
@@ -5459,9 +5797,9 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(rejoin.TargetTimelineID).To(Equal(uint64(5)))
 	g.Expect(rejoin.TargetEpoch).To(Equal(uint64(7)))
 	g.Expect(rejoin.ForkLSN).To(Equal(uint64(12)))
-	g.Expect(rejoin.FormerLastLSN).To(Equal(uint64(13)))
+	g.Expect(rejoin.FormerLastLSN).To(Equal(uint64(12)))
 	g.Expect(rejoin.RetainedFromLSN).To(Equal(uint64(8)))
-	g.Expect(rejoin.DataLossDiscarded).To(BeTrue())
+	g.Expect(rejoin.DataLossDiscarded).To(BeFalse())
 }
 
 func TestCompletedSlotAdminJobResultSatisfiesReceiptEvidence(t *testing.T) {
@@ -5505,9 +5843,9 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"parent_timeline_id=4",
 		"parent_epoch=6",
 		"fork_lsn=12",
-		"former_last_lsn=13",
+		"former_last_lsn=12",
 		"retained_from_lsn=8",
-		"data_loss_discarded=true",
+		"data_loss_discarded=false",
 		"",
 	}, "\n"))
 
@@ -5523,9 +5861,9 @@ func TestParseHARejoinJobResult(t *testing.T) {
 	g.Expect(result.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(result.ParentEpoch).To(Equal(uint64(6)))
 	g.Expect(result.ForkLSN).To(Equal(uint64(12)))
-	g.Expect(result.FormerLastLSN).To(Equal(uint64(13)))
+	g.Expect(result.FormerLastLSN).To(Equal(uint64(12)))
 	g.Expect(result.RetainedFromLSN).To(Equal(uint64(8)))
-	g.Expect(result.DataLossDiscarded).To(BeTrue())
+	g.Expect(result.DataLossDiscarded).To(BeFalse())
 
 	rewindExecuted, ok := parseHARejoinJobResult(strings.Join([]string{
 		"result=rejoin_rewind",
@@ -5540,27 +5878,27 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.parent_timeline_id=4",
 		"assessment.parent_epoch=6",
 		"assessment.fork_lsn=12",
-		"assessment.former_last_lsn=13",
+		"assessment.former_last_lsn=12",
 		"assessment.retained_from_lsn=8",
-		"assessment.data_loss_discarded=true",
+		"assessment.data_loss_discarded=false",
 		"rewind.node_id=primary-a",
 		"rewind.fork_lsn=12",
-		"rewind.previous_last_lsn=13",
-		"rewind.current_last_lsn=12",
-		"rewind.next_lsn=13",
-		"rewind.discarded_lsn_count=1",
+		"rewind.previous_last_lsn=12",
+		"rewind.current_last_lsn=13",
+		"rewind.next_lsn=14",
+		"rewind.discarded_lsn_count=0",
 		"rewind.target_timeline_id=5",
 		"rewind.target_epoch=7",
-		"rewind.data_loss_discarded=true",
+		"rewind.data_loss_discarded=false",
 		"",
 	}, "\n"))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(rewindExecuted.Action).To(Equal("rewind"))
 	g.Expect(rewindExecuted.RewindExecuted).To(BeTrue())
-	g.Expect(rewindExecuted.RewindPreviousLastLSN).To(Equal(uint64(13)))
-	g.Expect(rewindExecuted.RewindCurrentLastLSN).To(Equal(uint64(12)))
-	g.Expect(rewindExecuted.RewindNextLSN).To(Equal(uint64(13)))
-	g.Expect(rewindExecuted.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+	g.Expect(rewindExecuted.RewindPreviousLastLSN).To(Equal(uint64(12)))
+	g.Expect(rewindExecuted.RewindCurrentLastLSN).To(Equal(uint64(13)))
+	g.Expect(rewindExecuted.RewindNextLSN).To(Equal(uint64(14)))
+	g.Expect(rewindExecuted.RewindDiscardedLSNCount).To(BeZero())
 
 	adminResult, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=rejoin_rewind",
@@ -5575,24 +5913,24 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.parent_timeline_id=4",
 		"assessment.parent_epoch=6",
 		"assessment.fork_lsn=12",
-		"assessment.former_last_lsn=13",
+		"assessment.former_last_lsn=12",
 		"assessment.retained_from_lsn=8",
-		"assessment.data_loss_discarded=true",
+		"assessment.data_loss_discarded=false",
 		"rewind.node_id=primary-a",
 		"rewind.fork_lsn=12",
-		"rewind.previous_last_lsn=13",
-		"rewind.current_last_lsn=12",
-		"rewind.next_lsn=13",
-		"rewind.discarded_lsn_count=1",
+		"rewind.previous_last_lsn=12",
+		"rewind.current_last_lsn=13",
+		"rewind.next_lsn=14",
+		"rewind.discarded_lsn_count=0",
 		"rewind.target_timeline_id=5",
 		"rewind.target_epoch=7",
-		"rewind.data_loss_discarded=true",
+		"rewind.data_loss_discarded=false",
 		"",
 	}, "\n"))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(adminResult.RejoinAction).To(Equal("rewind"))
 	g.Expect(adminResult.RewindExecuted).To(BeTrue())
-	g.Expect(adminResult.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+	g.Expect(adminResult.RewindDiscardedLSNCount).To(BeZero())
 
 	_, ok = parseHARejoinJobResult(strings.Join([]string{
 		"result=rejoin_rewind",
@@ -5661,10 +5999,10 @@ func TestParseHARejoinJobResult(t *testing.T) {
 	g.Expect(former.TargetTimelineID).To(Equal(uint64(5)))
 	g.Expect(former.TargetEpoch).To(Equal(uint64(7)))
 	g.Expect(former.ForkLSN).To(Equal(uint64(12)))
-	g.Expect(former.FormerLastLSN).To(Equal(uint64(13)))
-	g.Expect(former.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(former.FormerLastLSN).To(Equal(uint64(12)))
+	g.Expect(former.ObservedLSN).To(Equal(uint64(12)))
 	g.Expect(former.RetainedFromLSN).To(Equal(uint64(8)))
-	g.Expect(former.DataLossDiscarded).To(BeTrue())
+	g.Expect(former.DataLossDiscarded).To(BeFalse())
 
 	result.Action = "reseed"
 	result.Reason = "parent_timeline_wal_expired"
@@ -5796,7 +6134,7 @@ func TestParseHARejoinJobResult(t *testing.T) {
 func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g := NewWithT(t)
 
-	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":4,"parent_epoch":6,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":4,"parent_epoch":6,"fork_lsn":12,"former_last_lsn":12,"retained_from_lsn":8,"data_loss_discarded":false},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":12,"current_last_lsn":13,"next_lsn":14,"discarded_lsn_count":0,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":false}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(result.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(result.ActionID).To(Equal("rejoin_rewind:primary-a"))
@@ -5810,11 +6148,11 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g.Expect(result.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(result.ParentEpoch).To(Equal(uint64(6)))
 	g.Expect(result.RewindExecuted).To(BeTrue())
-	g.Expect(result.RewindPreviousLastLSN).To(Equal(uint64(13)))
-	g.Expect(result.RewindCurrentLastLSN).To(Equal(uint64(12)))
-	g.Expect(result.RewindNextLSN).To(Equal(uint64(13)))
-	g.Expect(result.RewindDiscardedLSNCount).To(Equal(uint64(1)))
-	g.Expect(result.DataLossDiscarded).To(BeTrue())
+	g.Expect(result.RewindPreviousLastLSN).To(Equal(uint64(12)))
+	g.Expect(result.RewindCurrentLastLSN).To(Equal(uint64(13)))
+	g.Expect(result.RewindNextLSN).To(Equal(uint64(14)))
+	g.Expect(result.RewindDiscardedLSNCount).To(BeZero())
+	g.Expect(result.DataLossDiscarded).To(BeFalse())
 
 	status := haRejoinAdminActionResult(result)
 	g.Expect(status.SchemaVersion).To(Equal(uint32(1)))
@@ -5823,17 +6161,17 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g.Expect(status.ActionTarget).To(Equal("primary-a"))
 	g.Expect(status.ActionState).To(Equal("applied"))
 	g.Expect(status.RewindExecuted).To(BeTrue())
-	g.Expect(status.RewindPreviousLastLSN).To(Equal(uint64(13)))
-	g.Expect(status.RewindCurrentLastLSN).To(Equal(uint64(12)))
-	g.Expect(status.RewindNextLSN).To(Equal(uint64(13)))
-	g.Expect(status.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+	g.Expect(status.RewindPreviousLastLSN).To(Equal(uint64(12)))
+	g.Expect(status.RewindCurrentLastLSN).To(Equal(uint64(13)))
+	g.Expect(status.RewindNextLSN).To(Equal(uint64(14)))
+	g.Expect(status.RewindDiscardedLSNCount).To(BeZero())
 
 	roundTripped, ok := haRejoinJobResultFromAdminResult(status)
 	g.Expect(ok).To(BeTrue())
 	g.Expect(roundTripped.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(roundTripped.ActionID).To(Equal("rejoin_rewind:primary-a"))
 	g.Expect(roundTripped.RewindExecuted).To(BeTrue())
-	g.Expect(roundTripped.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+	g.Expect(roundTripped.RewindDiscardedLSNCount).To(BeZero())
 
 	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"promote","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":4,"parent_epoch":6,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":false}}`))
 	g.Expect(ok).To(BeFalse())
@@ -8121,7 +8459,7 @@ func TestBuildHTTPStartupProbeUsesDefaultsAndOverrides(t *testing.T) {
 	g.Expect(defaultProbe.HTTPGet.Port.IntValue()).To(Equal(4200))
 	g.Expect(defaultProbe.InitialDelaySeconds).To(Equal(int32(30)))
 	g.Expect(defaultProbe.PeriodSeconds).To(Equal(int32(10)))
-	g.Expect(defaultProbe.TimeoutSeconds).To(Equal(int32(1)))
+	g.Expect(defaultProbe.TimeoutSeconds).To(Equal(int32(10)))
 	g.Expect(defaultProbe.FailureThreshold).To(Equal(int32(30)))
 
 	failureThreshold := int32(180)
@@ -9764,6 +10102,10 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			},
 		},
 	}))
+	container := sts.Spec.Template.Spec.Containers[0]
+	g.Expect(container.StartupProbe.TimeoutSeconds).To(Equal(int32(10)))
+	g.Expect(container.LivenessProbe.TimeoutSeconds).To(Equal(int32(10)))
+	g.Expect(container.ReadinessProbe.TimeoutSeconds).To(Equal(int32(10)))
 
 	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
 		Role:                 antflyv1.HARuntimeRoleStandby,
@@ -9796,6 +10138,12 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(standbyArgs).NotTo(ContainSubstring(`--ha-retention-max-retained-age-ns`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-upstream-url 'http://primary.default.svc:8080'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-slot 'standby-a'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-sync-mode 'remote-apply'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-sync-selection 'first'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-sync-required 2`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-sync-standby 'standby-a'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-sync-standby 'standby-b'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-sync-failure 'fail-closed'`))
 	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
 		Name: "CUSTOM_HA_ADMIN_TOKEN",
 		ValueFrom: &corev1.EnvVarSource{

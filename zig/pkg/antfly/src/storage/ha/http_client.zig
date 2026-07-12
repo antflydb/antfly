@@ -1071,7 +1071,9 @@ fn validateRejoinResponse(
     if (!std.mem.eql(u8, assessment.former_node_id, request.node_id)) {
         return error.AdminRejoinResponseMismatch;
     }
-    if (assessment.former_last_lsn != request.last_lsn) return error.AdminRejoinResponseMismatch;
+    // last_lsn in the request is a controller observation, not authority. A
+    // former primary with local log access replaces it with its durable tail so
+    // writes racing the promotion boundary cannot be hidden by stale status.
     if (assessment.retained_from_lsn != request.retained_from_lsn) return error.AdminRejoinResponseMismatch;
 
     switch (expected) {
@@ -1854,7 +1856,7 @@ test "storage.ha http client round trips typed safety operations" {
         .receipt = fence.parsed.value.receipt,
     });
     defer rejoin.deinit(alloc);
-    try std.testing.expectEqualStrings("rewind", rejoin.parsed.value.assessment.action);
+    try std.testing.expectEqualStrings("reseed", rejoin.parsed.value.assessment.action);
     try std.testing.expectEqual(@as(i64, 2), rejoin.parsed.value.assessment.target_timeline_id);
     try std.testing.expectEqual(@as(i64, 100), rejoin.parsed.value.assessment.parent_cluster_id);
     try std.testing.expectEqual(@as(i64, 10), rejoin.parsed.value.assessment.parent_shard_id);
@@ -1862,23 +1864,7 @@ test "storage.ha http client round trips typed safety operations" {
     try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_timeline_id);
     try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_epoch);
 
-    var rewind = try client.rewindRejoin("http://ha-admin.test", .{
-        .node_id = "primary-a",
-        .identity = testAdminIdentity(),
-        .last_lsn = 2,
-        .retained_from_lsn = 0,
-        .allow_rewind_after_forced_promotion = false,
-        .receipt = fence.parsed.value.receipt,
-    });
-    defer rewind.deinit(alloc);
-    try std.testing.expectEqualStrings("rewind", rewind.parsed.value.assessment.action);
-    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.assessment.parent_timeline_id);
-    try std.testing.expect(rewind.parsed.value.rewind != null);
-    try std.testing.expectEqual(@as(i64, 2), rewind.parsed.value.rewind.?.previous_last_lsn);
-    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.rewind.?.current_last_lsn);
-    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.rewind.?.discarded_lsn_count);
-
-    try std.testing.expectError(error.HaCommandConflict, client.reseedRejoin("http://ha-admin.test", .{
+    try std.testing.expectError(error.HaCommandConflict, client.rewindRejoin("http://ha-admin.test", .{
         .node_id = "primary-a",
         .identity = testAdminIdentity(),
         .last_lsn = 2,
@@ -1886,6 +1872,21 @@ test "storage.ha http client round trips typed safety operations" {
         .allow_rewind_after_forced_promotion = false,
         .receipt = fence.parsed.value.receipt,
     }));
+
+    var reseed = try client.reseedRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 2,
+        .retained_from_lsn = 0,
+        .allow_rewind_after_forced_promotion = false,
+        .receipt = fence.parsed.value.receipt,
+    });
+    defer reseed.deinit(alloc);
+    try std.testing.expectEqualStrings("reseed", reseed.parsed.value.assessment.action);
+    try std.testing.expectEqual(@as(i64, 1), reseed.parsed.value.assessment.parent_timeline_id);
+    try std.testing.expect(reseed.parsed.value.reseed != null);
+    try std.testing.expect(reseed.parsed.value.reseed.?.reseed_required);
+    try std.testing.expect(reseed.parsed.value.reseed.?.base_backup_required);
 }
 
 test "storage.ha http client rejects mismatched rejoin admin responses" {

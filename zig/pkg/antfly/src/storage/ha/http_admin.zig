@@ -95,6 +95,7 @@ pub const Server = struct {
         bearer_token: ?[]const u8 = null,
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
+        primary_fence_started: ?StateChangedHook = null,
         state_changed: ?StateChangedHook = null,
     };
 
@@ -714,15 +715,38 @@ pub const Server = struct {
 
     fn handleAdminAcquireFence(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
-        const fence = self.parseAcquireFenceRequest(req) catch {
+        var fence = self.parseAcquireFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA fence request");
         };
+        if (self.ctx.primary) |primary| {
+            const primary_node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
+            if (std.mem.eql(u8, primary_node_id, fence.old_primary_id) and
+                primary.identity.cluster_id == fence.identity.cluster_id and
+                primary.identity.shard_id == fence.identity.shard_id and
+                primary.identity.table_id == fence.identity.table_id and
+                primary.identity.timeline_id == fence.identity.timeline_id and
+                primary.identity.epoch == fence.identity.epoch)
+            {
+                // The caller-provided LSN is only the last control-plane
+                // observation. Freeze the live writer under the same mutex used
+                // by final HA WAL append/ack, then bind the receipt to the
+                // former primary's actual durable tail.
+                if (self.auth.primary_fence_started) |hook| hook.run();
+                const durable_tail = primary.lastLsn();
+                if (durable_tail < fence.required_lsn) {
+                    return try textResponse(self.alloc, 409, "FormerPrimaryBehindFenceBoundary");
+                }
+                fence.required_lsn = durable_tail;
+                fence.observed_lsn = durable_tail;
+            }
+        }
         var result = ha_admin.acquirePromotionFence(self.alloc, fence_store, fence) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
         const action_id = try std.fmt.allocPrint(self.alloc, "fence_acquire:{s}", .{result.receipt.promoted_node_id});
         defer self.alloc.free(action_id);
+        const action_node_id = self.primaryNodeID() orelse self.standbyNodeID() orelse result.receipt.promoted_node_id;
         return try self.handleTypedJson(admin_api.HAFenceResponse{
             .schema_version = 1,
             .action = .{
@@ -730,7 +754,7 @@ pub const Server = struct {
                 .action_kind = "fence_acquire",
                 .target = result.receipt.promoted_node_id,
                 .state = "applied",
-                .node_id = result.receipt.promoted_node_id,
+                .node_id = action_node_id,
             },
             .receipt = try adminFenceReceipt(result.receipt),
         });
@@ -851,10 +875,10 @@ pub const Server = struct {
         else
             null;
 
-        if (expected_action != null and expected_action.? == .rewind and self.ctx.former_primary_log == null) {
-            const log = self.rejoinRewindLog() orelse
-                return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
+        if (self.localFormerPrimaryLog(parsed.value.node_id)) |log| {
             last_lsn = log.lastLsn();
+        } else if (expected_action != null and expected_action.? == .rewind) {
+            return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
         }
 
         if (expected_action != null) {
@@ -972,6 +996,12 @@ pub const Server = struct {
         if (self.ctx.former_primary_log) |log| return log;
         if (self.ctx.primary) |primary| return &primary.log;
         return null;
+    }
+
+    fn localFormerPrimaryLog(self: *Server, node_id: []const u8) ?*replication_log.ReplicationLog {
+        const local_node_id = self.ctx.primary_node_id orelse return null;
+        if (!std.mem.eql(u8, local_node_id, node_id)) return null;
+        return self.rejoinRewindLog();
     }
 
     fn parseAcquireFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
@@ -2122,7 +2152,6 @@ test "storage.ha http admin executes typed former primary log rewind when config
     defer former_log.close();
     _ = try former_log.append(alloc, baseRecord(identity, 1, "one"));
     _ = try former_log.append(alloc, baseRecord(identity, 2, "two"));
-    _ = try former_log.append(alloc, baseRecord(identity, 3, "diverged"));
 
     var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
     defer fence_store.close();
@@ -2135,7 +2164,7 @@ test "storage.ha http admin executes typed former primary log rewind when config
     defer server.deinit();
 
     const body =
-        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
+        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
     var rewind = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
@@ -2151,8 +2180,10 @@ test "storage.ha http admin executes typed former primary log rewind when config
     try expectContains(rewind.body, "\"assessment\"");
     try expectContains(rewind.body, "\"rewind\"");
     try expectContains(rewind.body, "\"node_id\":\"primary-a\"");
-    try expectContains(rewind.body, "\"discarded_lsn_count\":1");
-    try std.testing.expectEqual(@as(u64, 2), former_log.lastLsn());
+    try expectContains(rewind.body, "\"discarded_lsn_count\":0");
+    try expectContains(rewind.body, "\"current_last_lsn\":3");
+    try expectContains(rewind.body, "\"next_lsn\":4");
+    try std.testing.expectEqual(@as(u64, 3), former_log.lastLsn());
     const current_receipt = (try fence_store.current(alloc)) orelse return error.TestExpectedEqual;
     defer fencing.freeReceipt(alloc, current_receipt);
     try std.testing.expectEqualStrings("primary-a", current_receipt.old_primary_id);
@@ -2166,7 +2197,7 @@ test "storage.ha http admin executes typed former primary log rewind when config
     });
     defer stale.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), stale.status);
-    try expectContains(stale.body, "RejoinAssessmentStale");
+    try std.testing.expectEqual(@as(u64, 3), former_log.lastLsn());
 }
 
 test "storage.ha http admin rejects typed former primary rewind on node without local log" {
@@ -2178,7 +2209,7 @@ test "storage.ha http admin rejects typed former primary rewind on node without 
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), response.status);
@@ -2202,13 +2233,47 @@ test "storage.ha http admin does not persist rejoin assess receipts" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_assess,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try expectContains(response.body, "\"action_kind\":\"rejoin_assess\"");
     try expectContains(response.body, "\"action\":\"rewind\"");
     try std.testing.expect((try fence_store.current(alloc)) == null);
+}
+
+test "storage.ha http admin assesses the local former primary durable tail" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-assess-local-tail");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var former_log = try replication_log.ReplicationLog.open(paths.primary_log.ptr, .{});
+    defer former_log.close();
+    _ = try former_log.append(alloc, baseRecord(identity, 1, "one"));
+    _ = try former_log.append(alloc, baseRecord(identity, 2, "two"));
+    _ = try former_log.append(alloc, baseRecord(identity, 3, "divergent-local-write"));
+
+    var server = Server.init(alloc, .{
+        .primary_node_id = "primary-a",
+        .former_primary_log = &former_log,
+    });
+    defer server.deinit();
+
+    // The controller's last_lsn=2 was captured at promotion time and is stale.
+    // The old node must assess its own durable LSN=3 or it can misclassify an
+    // applied divergent write as safe to rewind.
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_assess,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try expectContains(response.body, "\"action\":\"reseed\"");
+    try expectContains(response.body, "\"former_last_lsn\":3");
 }
 
 test "storage.ha http admin rejects unbound rejoin receipts before persisting" {
@@ -2627,6 +2692,16 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(identity.shard_id, appended_entry.record.shard_id);
     try std.testing.expectEqual(identity.table_id, appended_entry.record.table_id);
 
+    var final_boundary_catchup = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"--table\",\"stream\",\"once\",\"--slot\",\"standby-a\"]}",
+    });
+    defer final_boundary_catchup.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), final_boundary_catchup.status);
+    try expectContains(final_boundary_catchup.body, "applied_lsn=2\n");
+
     var unfenced_promote = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_promotion_current_fence,
@@ -2649,7 +2724,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_fence.body, "\"schema_version\":1");
     try expectContains(typed_fence.body, "\"action_kind\":\"fence_acquire\"");
     try expectContains(typed_fence.body, "\"action_id\":\"fence_acquire:standby-a\"");
-    try expectContains(typed_fence.body, "\"node_id\":\"standby-a\"");
+    try expectContains(typed_fence.body, "\"node_id\":\"primary-a\"");
     try expectContains(typed_fence.body, "\"receipt\"");
     try expectContains(typed_fence.body, "\"promoted_node_id\":\"standby-a\"");
 
@@ -2690,7 +2765,7 @@ test "storage.ha http admin serves health and command endpoint" {
 
     const typed_rejoin_fenced_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"node_id\":\"primary-a\",\"identity\":{{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1}},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{s}}}",
+        "{{\"node_id\":\"primary-a\",\"identity\":{{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1}},\"last_lsn\":2,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{s}}}",
         .{typed_fence_receipt_json},
     );
     defer alloc.free(typed_rejoin_fenced_body);
@@ -2705,7 +2780,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_fenced.status);
     try std.testing.expectEqualStrings("application/json", typed_rejoin_fenced.content_type.?);
     try expectContains(typed_rejoin_fenced.body, "\"assessment\"");
-    try expectContains(typed_rejoin_fenced.body, "\"action\":\"rewind\"");
+    try expectContains(typed_rejoin_fenced.body, "\"action\":\"reseed\"");
     try expectContains(typed_rejoin_fenced.body, "\"target_timeline_id\":2");
 
     var typed_rejoin_rewind = try server.handle(.{
@@ -2715,9 +2790,8 @@ test "storage.ha http admin serves health and command endpoint" {
         .body = typed_rejoin_fenced_body,
     });
     defer typed_rejoin_rewind.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_rewind.status);
-    try expectContains(typed_rejoin_rewind.body, "\"action_kind\":\"rejoin_rewind\"");
-    try expectContains(typed_rejoin_rewind.body, "\"state\":\"applied\"");
+    try std.testing.expectEqual(@as(u16, 409), typed_rejoin_rewind.status);
+    try expectContains(typed_rejoin_rewind.body, "does not allow rewind");
 
     var typed_rejoin_reseed_mismatch = try server.handle(.{
         .method = .POST,
@@ -2726,8 +2800,9 @@ test "storage.ha http admin serves health and command endpoint" {
         .body = typed_rejoin_fenced_body,
     });
     defer typed_rejoin_reseed_mismatch.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 409), typed_rejoin_reseed_mismatch.status);
-    try expectContains(typed_rejoin_reseed_mismatch.body, "does not allow reseed");
+    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_reseed_mismatch.status);
+    try expectContains(typed_rejoin_reseed_mismatch.body, "\"action_kind\":\"rejoin_reseed\"");
+    try expectContains(typed_rejoin_reseed_mismatch.body, "\"state\":\"applied\"");
 
     var typed_promote_assess = try server.handle(.{
         .method = .POST,

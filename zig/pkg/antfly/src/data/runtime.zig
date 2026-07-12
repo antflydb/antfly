@@ -1537,6 +1537,7 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     ConnectionRefused,
     BrokenPipe,
     EndOfStream,
+    NoAddressReturned,
     UnexpectedHttpStatus,
     NotListening,
     UnsupportedReplicationFormat,
@@ -1576,6 +1577,7 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.ConnectionRefused => .ConnectionRefused,
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
+        error.NoAddressReturned => .NoAddressReturned,
         error.UnexpectedHttpStatus => .UnexpectedHttpStatus,
         error.NotListening => .NotListening,
         error.UnsupportedReplicationFormat => .UnsupportedReplicationFormat,
@@ -1617,6 +1619,7 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .ConnectionRefused => "ConnectionRefused",
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
+        .NoAddressReturned => "NoAddressReturned",
         .UnexpectedHttpStatus => "UnexpectedHttpStatus",
         .NotListening => "NotListening",
         .UnsupportedReplicationFormat => "UnsupportedReplicationFormat",
@@ -1647,58 +1650,6 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .HeaderCrcMismatch => "HeaderCrcMismatch",
         .PayloadCrcMismatch => "PayloadCrcMismatch",
         .Other => "Other",
-    };
-}
-
-fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
-    return switch (err) {
-        error.HttpConnectionClosing,
-        error.ConnectionResetByPeer,
-        error.ConnectionRefused,
-        error.BrokenPipe,
-        error.EndOfStream,
-        error.UnexpectedHttpStatus,
-        error.NotListening,
-        error.UnsupportedReplicationFormat,
-        error.InternalReplicationDidNotAdvance,
-        error.ReplicationResponseLsnMismatch,
-        error.ReplicationResponseEndOfWalMismatch,
-        error.ReplicationFrameLsnMismatch,
-        error.UnexpectedRecordLsn,
-        error.UnexpectedPreviousLsn,
-        error.RecordAlreadyReceived,
-        error.ConflictingReceivedRecord,
-        error.MissingReceivedRecord,
-        error.WrongCluster,
-        error.WrongShard,
-        error.WrongTable,
-        error.WrongTimeline,
-        error.WrongEpoch,
-        error.NonMonotonicTimeline,
-        error.InvalidTimelineSwitch,
-        error.TimelineSwitchRequiresAppliedProgress,
-        error.HAReplicationRecordMissingTableId,
-        error.HAReplicationRecordMissingShardId,
-        error.HAReplicationRecordUnknownTable,
-        error.HAReplicationRecordUnknownShard,
-        error.HAReplicationRecordApplyUnsupported,
-        error.NotBatchMutationRecord,
-        error.UnsupportedBatchMutationCodec,
-        error.UnsupportedBatchMutationPayloadVersion,
-        error.NotMetadataMutationRecord,
-        error.UnsupportedMetadataMutationCodec,
-        error.UnsupportedMetadataMutationPayloadVersion,
-        error.UnsupportedMetadataMutationKind,
-        error.UnsupportedRecordKind,
-        error.UnsupportedPayloadCodec,
-        error.UnsupportedVersion,
-        error.UnsupportedHeaderLength,
-        error.InvalidMagic,
-        error.HeaderCrcMismatch,
-        error.PayloadCrcMismatch,
-        error.TrailingBytes,
-        => true,
-        else => false,
     };
 }
 
@@ -2148,6 +2099,7 @@ pub const DataServer = struct {
     ha_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HAStandbyReplicationErrorCode.none)),
     ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -2181,6 +2133,15 @@ pub const DataServer = struct {
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
     const ha_replication_default_max_records_per_apply = 256;
     const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
+    const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
+    const ha_standby_replication_retry_interval_ns = 1 * std.time.ns_per_s;
+
+    fn haStandbyReplicationHTTPExecutorConfig() antfly.common.http.StdHttpExecutorConfig {
+        return .{
+            .max_response_bytes = ha_replication_default_max_response_bytes,
+            .resolve_before_connect = true,
+        };
+    }
 
     const ProvisionedWarmupStats = struct {
         warmed_group_count: u64 = 0,
@@ -2631,20 +2592,18 @@ pub const DataServer = struct {
             error.StandbyNotPromoted, error.PromotionNotApplied => return false,
             else => return err,
         };
-        const log_path = cfg.standby_log_path orelse return error.HAPromotedPrimaryLogMissing;
+        if (cfg.standby_log_path == null) return error.HAPromotedPrimaryLogMissing;
         const progress_path = cfg.standby_progress_path orelse return error.HAPromotedPrimarySlotsMissing;
         try self.validateHAStandbyPromotionOwner(standby);
 
-        const log_path_z = try self.alloc.dupeZ(u8, log_path);
-        defer self.alloc.free(log_path_z);
         const slots_path_buf = try std.fmt.allocPrint(self.alloc, "{s}.promoted-primary-slots", .{progress_path});
         defer self.alloc.free(slots_path_buf);
         const slots_path = try self.alloc.dupeZ(u8, slots_path_buf);
         defer self.alloc.free(slots_path);
 
-        var promoted_primary = try antfly.ha.primary.Primary.openPromotedFromStandby(
+        var promoted_primary = try antfly.ha.primary.Primary.takePromotedStandby(
             self.alloc,
-            log_path_z.ptr,
+            standby,
             slots_path.ptr,
             handoff,
             .{},
@@ -2652,7 +2611,7 @@ pub const DataServer = struct {
         errdefer promoted_primary.close();
 
         self.ha_public_gate_state.beginPromotion();
-        try self.consumeHAStandbyForPromotion(standby);
+        self.ha_cfg.standby_owner.?.* = null;
         self.ha_cfg.admin_context.?.standby = null;
         if (self.ha_admin_server) |*server| {
             server.ctx.standby = null;
@@ -2699,17 +2658,6 @@ pub const DataServer = struct {
         return error.HAStandbyOwnershipRequired;
     }
 
-    fn consumeHAStandbyForPromotion(self: *DataServer, standby: *antfly.ha.standby.Standby) !void {
-        const owner = self.ha_cfg.standby_owner orelse return error.HAStandbyOwnershipRequired;
-        if (owner.*) |*owned| {
-            if (owned != standby) return error.HAStandbyOwnerMismatch;
-            owned.close();
-            owner.* = null;
-            return;
-        }
-        return error.HAStandbyOwnershipRequired;
-    }
-
     fn rewireHAPromotionMirrors(self: *DataServer) void {
         const ha_primary_mirror = self.haPrimaryMirror();
         _ = self.write_source.withHAMirror(ha_primary_mirror);
@@ -2724,7 +2672,10 @@ pub const DataServer = struct {
     ) !antfly.common.http.RequestExecutor {
         if (cfg.executor) |executor| return executor;
         if (self.ha_standby_replication_http_executor == null) {
-            self.ha_standby_replication_http_executor = antfly.common.http.StdHttpExecutor.init(self.alloc, .{});
+            self.ha_standby_replication_http_executor = antfly.common.http.StdHttpExecutor.init(
+                self.alloc,
+                haStandbyReplicationHTTPExecutorConfig(),
+            );
         }
         return self.ha_standby_replication_http_executor.?.executor();
     }
@@ -2778,6 +2729,14 @@ pub const DataServer = struct {
         self.refreshHAPublicGateState();
     }
 
+    fn haPrimaryFenceStartedCallback(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        // Called while ha_state_mutex is held. HA WAL mirror/ack paths take
+        // the same mutex, so publishing the fence here establishes a strict
+        // linearization point before the durable primary tail is sampled.
+        self.ha_public_gate_state.publishPrimaryFence(true);
+    }
+
     fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby != null or ctx.primary != null) return .{ .shared = .{
@@ -2798,6 +2757,7 @@ pub const DataServer = struct {
     fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.ha.primary.Primary) antfly.db.HAAsyncEffectMirror {
         var mirror = antfly.db.HAAsyncEffectMirror{
             .primary = primary,
+            .transition_mutex = &self.ha_state_mutex,
             .last_lsn = &self.ha_primary_mirror_last_lsn,
             .failure_count = &self.ha_primary_mirror_failure_count,
             .sync_policy = self.ha_cfg.primary_sync_policy,
@@ -2834,6 +2794,10 @@ pub const DataServer = struct {
                 self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(self.alloc, ctx, .{
                     .bearer_token = self.ha_cfg.admin_bearer_token,
                     .state_mutex = if (ctx.primary != null or ctx.standby != null) &self.ha_state_mutex else null,
+                    .primary_fence_started = .{
+                        .ptr = self,
+                        .run_fn = DataServer.haPrimaryFenceStartedCallback,
+                    },
                     .state_changed = .{
                         .ptr = self,
                         .run_fn = DataServer.haPublicGateStateChangedCallback,
@@ -2988,17 +2952,21 @@ pub const DataServer = struct {
     }
 
     pub fn runRound(self: *DataServer) !void {
-        const ha_standby_replication_ok = blk: {
+        const now_ns = platform_time.monotonicNs();
+        if (self.haStandbyReplicationRetryDue(now_ns)) replication: {
             self.runHAStandbyReplicationRound() catch |err| {
                 _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
                 self.recordHAStandbyReplicationError(err);
-                if (!isNonFatalHAStandbyReplicationError(err)) return err;
+                self.deferHAStandbyReplicationRetry(now_ns);
+                // Replication is a fail-closed maintenance loop. Keep the runtime
+                // and HA admin surface alive so the operator can observe and
+                // repair transport, compatibility, or durable-state failures.
                 std.log.warn("HA standby replication round skipped err={}", .{err});
-                break :blk false;
+                break :replication;
             };
-            break :blk true;
-        };
-        if (ha_standby_replication_ok) self.clearHAStandbyReplicationError();
+            self.clearHAStandbyReplicationRetry();
+            self.clearHAStandbyReplicationError();
+        }
         if (self.data_raft) |raft| {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
@@ -3206,6 +3174,22 @@ pub const DataServer = struct {
 
     fn clearHAStandbyReplicationError(self: *DataServer) void {
         self.ha_standby_replication_last_error.store(@intFromEnum(HAStandbyReplicationErrorCode.none), .release);
+    }
+
+    fn haStandbyReplicationRetryDue(self: *DataServer, now_ns: u64) bool {
+        const next_attempt_ns = self.ha_standby_replication_next_attempt_ns.load(.acquire);
+        return next_attempt_ns == 0 or now_ns >= next_attempt_ns;
+    }
+
+    fn deferHAStandbyReplicationRetry(self: *DataServer, now_ns: u64) void {
+        self.ha_standby_replication_next_attempt_ns.store(
+            now_ns +| ha_standby_replication_retry_interval_ns,
+            .release,
+        );
+    }
+
+    fn clearHAStandbyReplicationRetry(self: *DataServer) void {
+        self.ha_standby_replication_next_attempt_ns.store(0, .release);
     }
 
     fn recordHAStandbyReplicationAttempt(self: *DataServer) void {
@@ -16397,6 +16381,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
     defer primary.close();
     _ = try primary.append(.{ .payload = "before-fence" });
+    _ = try primary.append(.{ .payload = "after-controller-observation" });
 
     var fence_store = try antfly.ha.fencing.Store.open(alloc, fence_path.ptr, .{});
     defer fence_store.close();
@@ -16432,6 +16417,9 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     });
     defer fence_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), fence_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"node_id\":\"primary-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"required_lsn\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"observed_lsn\":2") != null);
     try std.testing.expectError(error.HAFencedPrimary, source_gate.check());
     try std.testing.expectError(
         error.HAReadRequiresPrimary,
@@ -17185,6 +17173,10 @@ test "data server promotion open failure preserves retryable standby" {
     defer alloc.free(wrong_log_raw);
     const wrong_log = try alloc.dupeZ(u8, wrong_log_raw);
     defer alloc.free(wrong_log);
+    const promoted_slots_raw = try std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress});
+    defer alloc.free(promoted_slots_raw);
+    const promoted_slots = try alloc.dupeZ(u8, promoted_slots_raw);
+    defer alloc.free(promoted_slots);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -17192,17 +17184,12 @@ test "data server promotion open failure preserves retryable standby" {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), promoted_slots) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
-    defer {
-        const promoted_slots = std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress}) catch null;
-        if (promoted_slots) |path| {
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-            alloc.free(path);
-        }
-    }
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), promoted_slots) catch {};
 
     var standby: ?antfly.ha.standby.Standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
         .cluster_id = 100,
@@ -17231,7 +17218,7 @@ test "data server promotion open failure preserves retryable standby" {
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
-                .standby_log_path = wrong_log,
+                .standby_log_path = standby_log,
                 .standby_progress_path = standby_progress,
             },
         },
@@ -17244,13 +17231,23 @@ test "data server promotion open failure preserves retryable standby" {
     try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate.check(.stale));
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate.check());
 
-    try std.testing.expectError(error.PromotedLogMismatch, server.runHAStandbyReplicationRound());
+    var slot_blocker: ?antfly.ha.primary.Primary = try antfly.ha.primary.Primary.open(alloc, wrong_log.ptr, promoted_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 2,
+        .epoch = 2,
+    }, .{});
+    defer if (slot_blocker) |*handle| handle.close();
+
+    try std.testing.expectError(error.LsmRootWriterAlreadyOpen, server.runHAStandbyReplicationRound());
     try std.testing.expect(standby != null);
     try std.testing.expect(server.ha_promoted_primary == null);
     try std.testing.expect(server.ha_cfg.admin_context.?.standby != null);
     try std.testing.expect(server.ha_cfg.admin_context.?.primary == null);
 
-    server.ha_cfg.standby_replication.?.standby_log_path = standby_log;
+    if (slot_blocker) |*handle| handle.close();
+    slot_blocker = null;
     try server.runHAStandbyReplicationRound();
     try std.testing.expect(standby == null);
     try std.testing.expect(server.ha_promoted_primary != null);
@@ -17487,7 +17484,7 @@ test "data server resumes HA standby replication from durable progress after res
     }
 }
 
-test "data runtime records HA standby replication round failures" {
+test "data runtime records and backs off HA standby replication round failures" {
     const alloc = std.testing.allocator;
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -17547,7 +17544,7 @@ test "data runtime records HA standby replication round failures" {
         }
 
         fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
-            return error.ConnectionRefused;
+            return error.NoAddressReturned;
         }
     };
 
@@ -17604,6 +17601,10 @@ test "data runtime records HA standby replication round failures" {
     try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
     try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
     try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_last_success_ns.load(.acquire));
+    const next_attempt_ns = server.ha_standby_replication_next_attempt_ns.load(.acquire);
+    try std.testing.expect(next_attempt_ns > 0);
+    try std.testing.expect(!server.haStandbyReplicationRetryDue(next_attempt_ns - 1));
+    try std.testing.expect(server.haStandbyReplicationRetryDue(next_attempt_ns));
 
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
@@ -17611,7 +17612,7 @@ test "data runtime records HA standby replication round failures" {
     });
     defer admin_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);
-    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"ConnectionRefused\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"NoAddressReturned\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":1") != null);
 
@@ -17624,6 +17625,15 @@ test "data runtime records HA standby replication round failures" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_failures_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_attempt_ns ") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_success_ns 0\n") != null);
+}
+
+test "data runtime HA replication HTTP budget covers base64 apply envelope" {
+    const cfg = DataServer.haStandbyReplicationHTTPExecutorConfig();
+    const encoded_batch_bytes = std.base64.standard.Encoder.calcSize(
+        DataServer.ha_replication_default_max_encoded_bytes_per_apply,
+    );
+    try std.testing.expect(cfg.max_response_bytes >= encoded_batch_bytes + 64 * 1024);
+    try std.testing.expect(cfg.resolve_before_connect);
 }
 
 test "data runtime records HA standby apply failures without stopping run round" {

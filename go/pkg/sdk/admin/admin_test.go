@@ -2039,6 +2039,11 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	if err := ValidateHAFenceResponse(response); err != nil {
 		t.Fatalf("ValidateHAFenceResponse returned error: %v", err)
 	}
+	formerPrimaryCopy := response
+	formerPrimaryCopy.Action.NodeId = "primary-a"
+	if err := ValidateHAFenceResponse(formerPrimaryCopy); err != nil {
+		t.Fatalf("ValidateHAFenceResponse rejected former-primary receipt copy: %v", err)
+	}
 	emptyReason := response
 	emptyReason.Receipt.Reason = ""
 	if err := ValidateHAFenceResponse(emptyReason); err != nil {

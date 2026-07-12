@@ -1090,6 +1090,7 @@ pub fn runFromIterator(
     const bind_port = public_listener.bind_port;
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
+    var unified_server_control = UnifiedServerControl{};
     const thread = std.Thread.spawn(.{}, serveUnified, .{
         alloc,
         bind_host,
@@ -1098,11 +1099,17 @@ pub fn runFromIterator(
         &antfly_node,
         api_server,
         &unified_api_ready,
+        &unified_server_control,
     }) catch |err| {
         std.log.err("swarm startup failed step=spawn_unified_http err={}", .{err});
         return err;
     };
-    _ = thread; // detach happens on process exit
+    // The HTTP server holds pointers into data_server. Stop accepting requests
+    // and join all in-flight handlers before those backing objects are deinit'd.
+    defer {
+        unified_server_control.stop();
+        thread.join();
+    }
 
     // Print bound address. The thread will print it after bind().
     std.debug.print("swarm local metadata enabled (raft disabled)\n", .{});
@@ -1529,6 +1536,34 @@ fn decodeLocalGenerateDataUri(
 // Unified server thread
 // ---------------------------------------------------------------
 
+const UnifiedServerControl = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    server: ?*httpx.Server = null,
+    stop_requested: bool = false,
+
+    fn publish(self: *@This(), server: *httpx.Server) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.stop_requested) return false;
+        std.debug.assert(self.server == null);
+        self.server = server;
+        return true;
+    }
+
+    fn clear(self: *@This(), server: *httpx.Server) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.server == server) self.server = null;
+    }
+
+    fn stop(self: *@This()) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.stop_requested = true;
+        if (self.server) |server| server.stop();
+    }
+};
+
 fn serveUnified(
     alloc: std.mem.Allocator,
     bind_host: []const u8,
@@ -1537,8 +1572,9 @@ fn serveUnified(
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
+    control: *UnifiedServerControl,
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready) catch |err| {
+    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready, control) catch |err| {
         unified_api_ready.store(false, .release);
         std.debug.print("unified server error: {}\n", .{err});
     };
@@ -1552,6 +1588,7 @@ fn serveUnifiedInner(
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
+    control: *UnifiedServerControl,
 ) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1581,6 +1618,7 @@ fn serveUnifiedInner(
     // Internal group routes are still served by the legacy ApiHttpServer
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
+    defer active_api_server = null;
     try registerHAAdminRoutes(&server);
     try registerHAInternalRoutes(&server);
     try registerMcpRoutes(&server);
@@ -1589,6 +1627,8 @@ fn serveUnifiedInner(
     try registerAntfarmRoutes(&server);
 
     try server.bind();
+    if (!control.publish(&server)) return;
+    defer control.clear(&server);
     unified_api_ready.store(true, .release);
 
     if (server.boundAddress()) |addr| {
@@ -2604,7 +2644,11 @@ fn validateHARole(cli: CliConfig) !void {
     if (primary_requested) try validateHAPrimaryRoleComplete(cli);
     if (standby_requested) try validateHAStandbyRoleComplete(cli);
     if (haRetentionPolicyRequested(cli) and !primary_requested) return error.HARetentionPolicyRequiresPrimary;
-    if (haSyncPolicyRequested(cli) and !primary_requested) return error.HASyncPolicyRequiresPrimary;
+    // A standby must preload the policy it will enforce if promotion opens a
+    // primary in place. The mirror remains inactive while the standby owns the
+    // runtime; it becomes authoritative only after the promoted-primary
+    // handoff. Sync flags without any HA role are still invalid.
+    if (haSyncPolicyRequested(cli) and !primary_requested and !standby_requested) return error.HASyncPolicyRequiresPrimary;
 }
 
 fn validateHAIdentity(cli: CliConfig) !void {
@@ -2699,7 +2743,7 @@ const OwnedHASyncPolicy = struct {
 
 fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPolicy {
     if (!haSyncPolicyRequested(cli)) return .{};
-    if (!haPrimaryRequested(cli)) return error.HASyncPolicyRequiresPrimary;
+    if (!haPrimaryRequested(cli) and !haStandbyRequested(cli)) return error.HASyncPolicyRequiresPrimary;
 
     const names = try alloc.alloc([]const u8, cli.ha_sync_standby_names.items.len);
     errdefer alloc.free(names);
@@ -3968,6 +4012,28 @@ test "swarm HA runtime rejects ambiguous role flags" {
     try std.testing.expectError(error.HASyncPolicyRequiresPrimary, validateHARole(.{
         .ha_sync_mode = .remote_write,
     }));
+
+    var promoted_policy_cli = CliConfig{
+        .ha_standby_log = "/tmp/standby.log",
+        .ha_standby_progress = "/tmp/progress.wal",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+        .ha_sync_mode = .remote_apply,
+        .ha_sync_required = 1,
+        .ha_sync_failure_policy = .block,
+    };
+    defer promoted_policy_cli.deinit(std.testing.allocator);
+    try promoted_policy_cli.ha_sync_standby_names.append(std.testing.allocator, "primary-a");
+    try validateHARole(promoted_policy_cli);
+    var promoted_policy = try haSyncPolicyFromCli(std.testing.allocator, promoted_policy_cli);
+    defer promoted_policy.deinit(std.testing.allocator);
+    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, promoted_policy.policy.mode);
+    try std.testing.expectEqual(@as(usize, 1), promoted_policy.policy.required);
+    try std.testing.expectEqualStrings("primary-a", promoted_policy.policy.standby_names[0]);
+    try std.testing.expectEqual(antfly.ha.primary.FailurePolicy.block, promoted_policy.policy.failure_policy);
     try std.testing.expectError(error.InvalidHASyncPolicy, haSyncPolicyFromCli(std.testing.allocator, .{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
@@ -4159,6 +4225,24 @@ test "swarm readiness follows api initialization and unified listener" {
     try std.testing.expect(!swarmReadyFromState(false, true));
     try std.testing.expect(!swarmReadyFromState(true, false));
     try std.testing.expect(swarmReadyFromState(true, true));
+}
+
+test "swarm unified server control stops publication and live listeners" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var server = httpx.Server.init(std.testing.allocator, io_impl.io());
+    defer server.deinit();
+
+    var live = UnifiedServerControl{};
+    try std.testing.expect(live.publish(&server));
+    server.running = true;
+    live.stop();
+    try std.testing.expect(!server.running);
+    live.clear(&server);
+
+    var stopped = UnifiedServerControl{};
+    stopped.stop();
+    try std.testing.expect(!stopped.publish(&server));
 }
 
 test "parse cli accepts inference budget overrides" {

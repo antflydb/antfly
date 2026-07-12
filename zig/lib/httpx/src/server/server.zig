@@ -665,6 +665,7 @@ pub const Server = struct {
     global_handler: ?Handler = null,
     listener: ?TcpListener = null,
     running: bool = false,
+    stop_requested: std.atomic.Value(bool) = .init(false),
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
 
@@ -793,8 +794,17 @@ pub const Server = struct {
     /// the Io backend supports it (Kqueue on macOS, io_uring on Linux).
     /// Falls back to synchronous handling if concurrency is unavailable.
     pub fn listen(self: *Self) !void {
+        // A server is single-use once stopped. In particular, do not let a
+        // startup/shutdown race re-bind a listener after its owner has begun
+        // tearing down the handler state referenced by this server.
+        if (self.stop_requested.load(.acquire)) return;
         if (self.listener == null) try self.bind();
+        if (self.stop_requested.load(.acquire)) return;
         self.running = true;
+        if (self.stop_requested.load(.acquire)) {
+            self.running = false;
+            return;
+        }
 
         if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
@@ -829,6 +839,7 @@ pub const Server = struct {
 
     /// Stops the server immediately, cancelling all in-flight connections.
     pub fn stop(self: *Self) void {
+        self.stop_requested.store(true, .release);
         self.running = false;
         self.connections.cancel(self.io);
         if (self.listener) |*l| {
@@ -845,6 +856,7 @@ pub const Server = struct {
     /// dedicated shutdown fiber) because it calls `io.sleep`. For signal-safe
     /// stopping without a fiber, use `stop()` instead.
     pub fn shutdown(self: *Self, timeout_ms: u64) void {
+        self.stop_requested.store(true, .release);
         self.running = false;
         if (self.listener) |*l| {
             l.deinit();
@@ -2542,6 +2554,12 @@ test "stop cancels connections immediately" {
 
     server.running = true;
     server.stop();
+    try std.testing.expect(!server.running);
+    try std.testing.expect(server.listener == null);
+
+    // A concurrent owner may call stop before the listener thread reaches
+    // listen(). That late listen must not resurrect the server.
+    try server.listen();
     try std.testing.expect(!server.running);
     try std.testing.expect(server.listener == null);
 }

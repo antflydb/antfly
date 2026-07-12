@@ -140,6 +140,45 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	}
 }
 
+func TestPlanHAPromotedNodeNeverBecomesItsOwnStandby(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name:     "standby-a",
+		SlotName: "standby-a",
+		AdminURL: "http://standby-a-ha.default.svc:8081",
+	}}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 21,
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			ParentEpoch:       1,
+			NewTimelineID:     2,
+			NewEpoch:          2,
+			RequiredLSN:       20,
+			ObservedLSN:       20,
+			SwitchLSN:         21,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   1,
+			FenceToken:        "token",
+		},
+	}
+
+	plan := planHA(cluster)
+	if plan.DesiredStandbyCount != 0 {
+		t.Fatalf("promoted node must be removed from the desired standby count, got %d", plan.DesiredStandbyCount)
+	}
+	for _, action := range plan.Actions {
+		switch action.Kind {
+		case haActionCreateSlot, haActionSeedStandby, haActionResumeSlot, haActionMarkReseed:
+			if action.StandbyName == "standby-a" || action.SlotName == "standby-a" {
+				t.Fatalf("promoted node must not be planned as its own standby: %#v", action)
+			}
+		}
+	}
+}
+
 func TestPlanHAWaitsForPrimaryLSNBeforeMissingStandbySeed(t *testing.T) {
 	cluster := haCluster()
 	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 0}
@@ -371,7 +410,7 @@ func TestHAPlannedActionStatusesDropFormerPrimarySuccessWithoutPromotionReceipt(
 		Kind:            haActionRewindFormerPrimary,
 		StandbyName:     "old-primary",
 		TargetLSN:       12,
-		ObservedLSN:     13,
+		ObservedLSN:     12,
 		RetainedFromLSN: 8,
 		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceHolder:     "standby-a",
@@ -414,13 +453,13 @@ func TestHAPlannedActionStatusesDropFormerPrimarySuccessWithoutPromotionReceipt(
 		TargetTimelineID:        5,
 		TargetEpoch:             7,
 		ForkLSN:                 12,
-		FormerLastLSN:           13,
+		FormerLastLSN:           12,
 		RetainedFromLSN:         8,
 		RewindExecuted:          true,
-		RewindPreviousLastLSN:   13,
-		RewindCurrentLastLSN:    12,
-		RewindNextLSN:           13,
-		RewindDiscardedLSNCount: 1,
+		RewindPreviousLastLSN:   12,
+		RewindCurrentLastLSN:    13,
+		RewindNextLSN:           14,
+		RewindDiscardedLSNCount: 0,
 	}
 	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
 
@@ -438,6 +477,208 @@ func TestHAPlannedActionStatusesDropFormerPrimarySuccessWithoutPromotionReceipt(
 		notPreserved[0].AdminJobPhase != "" ||
 		notPreserved[0].AdminResult != nil {
 		t.Fatalf("expected former-primary execution state without promotion receipt to be dropped, got %#v", notPreserved[0])
+	}
+}
+
+func TestHAPlannedActionStatusesRetainSuccessfulFormerPrimaryAssessmentUntilDisposition(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+		}},
+	}
+	previous := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		Phase:           string(haActionPhaseRejoin),
+		Executor:        string(haActionExecutorAdminAPI),
+		DependsOn:       string(haActionPromoteStandby),
+		StandbyName:     "old-primary",
+		TargetLSN:       10,
+		ObservedLSN:     10,
+		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 4,
+		AdminURL:        "http://old-primary-ha.default.svc:8081",
+		AdminNodeID:     "old-primary",
+		AdminMethod:     "POST",
+		AdminPath:       haAdminRejoinAssessPath,
+		Reason:          "PromotionPlanned",
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:    1,
+			ActionID:         "rejoin_assess:old-primary",
+			ActionKind:       "rejoin_assess",
+			ActionTarget:     "old-primary",
+			ActionState:      "assessed",
+			ActionNodeID:     "old-primary",
+			RejoinAction:     "reseed",
+			FormerNodeID:     "old-primary",
+			TargetTimelineID: 2,
+			TargetEpoch:      2,
+			ForkLSN:          10,
+			FormerLastLSN:    11,
+			RetainedFromLSN:  8,
+		},
+	}
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "old-primary",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			ParentEpoch:       1,
+			NewTimelineID:     2,
+			NewEpoch:          2,
+			RequiredLSN:       10,
+			ObservedLSN:       10,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   4,
+			FenceToken:        "ha-fence-token",
+		},
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:          "old-primary",
+			Fenced:          true,
+			FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:     "standby-a",
+			FenceGeneration: 4,
+			AssessedAction:  "reseed",
+		},
+		PlannedActions: []antflyv1.HAPlannedActionStatus{previous},
+	}
+	if !haFormerPrimaryDemotePreserveAllowed(status, previous) {
+		t.Fatalf("expected former-primary assessment to remain bound to the recorded durable fence: %#v", status)
+	}
+	if !haAdminActionSucceededWithStatusEvidence(status, previous) {
+		t.Fatalf("expected valid typed former-primary assessment evidence: %#v", previous)
+	}
+
+	actions := haPlannedActionStatuses([]haPlannedAction{{
+		Kind:            haActionReseedFormerPrimary,
+		DependsOn:       haActionFenceFormerPrimary,
+		StandbyName:     "old-primary",
+		TargetLSN:       10,
+		ObservedLSN:     11,
+		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 4,
+		Reason:          "parent_timeline_wal_expired",
+	}}, ha, status)
+
+	assessment, ok := haPlannedActionByKind(actions, haActionDemoteFormerPrimary)
+	if !ok || assessment.AdminJobPhase != haAdminJobPhaseSucceeded || assessment.AdminResult == nil {
+		t.Fatalf("expected successful typed assessment evidence to survive the disposition replan, got %#v", actions)
+	}
+	if _, ok := haPlannedActionByKind(actions, haActionReseedFormerPrimary); !ok {
+		t.Fatalf("expected current reseed disposition alongside assessment evidence, got %#v", actions)
+	}
+}
+
+func TestHACompletedFormerPrimaryRewindRemainsIdempotentAcrossRetentionMovement(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+		}},
+	}
+	rewind := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionRewindFormerPrimary),
+		Phase:           string(haActionPhaseRejoin),
+		Executor:        string(haActionExecutorAdminAPI),
+		DependsOn:       string(haActionFenceFormerPrimary),
+		StandbyName:     "old-primary",
+		TargetLSN:       10,
+		ObservedLSN:     10,
+		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 4,
+		AdminURL:        "http://old-primary-ha.default.svc:8081",
+		AdminNodeID:     "old-primary",
+		AdminMethod:     "POST",
+		AdminPath:       haAdminRejoinRewindPath,
+		Reason:          "parent_timeline_retained",
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:           1,
+			ActionID:                "rejoin_rewind:old-primary",
+			ActionKind:              "rejoin_rewind",
+			ActionTarget:            "old-primary",
+			ActionState:             "applied",
+			ActionNodeID:            "old-primary",
+			RejoinAction:            "rewind",
+			RejoinReason:            "parent_timeline_retained",
+			FormerNodeID:            "old-primary",
+			TargetTimelineID:        2,
+			TargetEpoch:             2,
+			ForkLSN:                 10,
+			FormerLastLSN:           10,
+			RetainedFromLSN:         8,
+			RewindExecuted:          true,
+			RewindPreviousLastLSN:   10,
+			RewindCurrentLastLSN:    11,
+			RewindNextLSN:           12,
+			RewindDiscardedLSNCount: 0,
+		},
+	}
+	assessment := *rewind.DeepCopy()
+	assessment.Kind = string(haActionDemoteFormerPrimary)
+	assessment.AdminPath = haAdminRejoinAssessPath
+	assessment.AdminResult.ActionID = "rejoin_assess:old-primary"
+	assessment.AdminResult.ActionKind = "rejoin_assess"
+	assessment.AdminResult.ActionState = "assessed"
+	assessment.AdminResult.RewindExecuted = false
+	assessment.AdminResult.RewindPreviousLastLSN = 0
+	assessment.AdminResult.RewindCurrentLastLSN = 0
+	assessment.AdminResult.RewindNextLSN = 0
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "old-primary",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			ParentEpoch:       1,
+			NewTimelineID:     2,
+			NewEpoch:          2,
+			RequiredLSN:       10,
+			ObservedLSN:       10,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   4,
+			FenceToken:        "ha-fence-token",
+		},
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:           "old-primary",
+			Fenced:           true,
+			FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:      "standby-a",
+			FenceGeneration:  4,
+			TargetTimelineID: 2,
+			TargetEpoch:      2,
+			ForkLSN:          10,
+			FormerLastLSN:    10,
+			RetainedFromLSN:  8,
+			AssessedAction:   "rewind",
+			AssessedReason:   "parent_timeline_retained",
+			RejoinRequired:   true,
+			RewindPossible:   true,
+		},
+		PlannedActions: []antflyv1.HAPlannedActionStatus{assessment, rewind},
+	}
+
+	evaluation := haEvaluateFormerPrimary(status)
+	if evaluation.RejoinRequired || evaluation.Action != "None" || evaluation.Reason != "FormerPrimaryRewindApplied" {
+		t.Fatalf("expected a safely applied timeline switch to make rewind idempotently complete, got %#v", evaluation)
+	}
+	retained := haPlannedActionStatuses(nil, ha, status)
+	completed, ok := haPlannedActionByKind(retained, haActionRewindFormerPrimary)
+	if !ok || completed.AdminJobPhase != haAdminJobPhaseSucceeded || completed.AdminResult == nil {
+		t.Fatalf("expected successful rewind receipt to remain auditable after the current plan empties, got %#v", retained)
+	}
+	if assessed, ok := haPlannedActionByKind(retained, haActionDemoteFormerPrimary); !ok || assessed.AdminJobPhase != haAdminJobPhaseSucceeded || assessed.AdminResult == nil {
+		t.Fatalf("expected the typed assessment receipt to remain alongside the completed rewind, got %#v", retained)
 	}
 }
 
@@ -1495,6 +1736,141 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 				t.Fatalf("expected %q, got %q", tt.want, got)
 			}
 		})
+	}
+}
+
+func TestHAFormerPrimaryPlannedActionKeepsOriginalPrimaryAdminRoute(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "standby-a",
+			AdminURL: "http://standby-a-ha.default.svc:8081",
+		}},
+	}
+	promotion := haCompletePromotionReceipt("primary-a", "standby-a")
+	promotion.RequiredLSN = 11
+	promotion.ObservedLSN = 12
+	promotion.SwitchLSN = 13
+	status := &antflyv1.HAStatus{LastPromotion: promotion}
+	action := haFormerPrimaryPlannedAction(haFormerPrimaryEvaluation{
+		Present:          true,
+		NodeID:           "primary-a",
+		RejoinRequired:   true,
+		ParentTimelineID: 1,
+		NewTimelineID:    2,
+		SwitchLSN:        13,
+		FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:      "standby-a",
+		FenceGeneration:  3,
+		Action:           string(haActionDemoteFormerPrimary),
+		Reason:           "FormerPrimaryNotObserved",
+	}, status)
+	planned := haPlannedActionStatuses([]haPlannedAction{action}, ha, status)
+
+	if action.RouteFrom != "primary-a" ||
+		action.TargetLSN != 12 ||
+		len(planned) != 1 ||
+		planned[0].AdminURL != "http://primary-ha.default.svc:8081" ||
+		planned[0].AdminNodeID != "primary-a" {
+		t.Fatalf("expected former-primary action to retain its original primary admin route, got action=%#v planned=%#v", action, planned)
+	}
+}
+
+func TestHAFormerPrimaryFencePrecedesRejoinAndTargetsOldPrimary(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       4,
+			Epoch:            6,
+			CurrentPrimaryID: "primary-a",
+		},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "standby-a",
+			AdminURL: "http://standby-a-ha.default.svc:8081",
+		}},
+	}
+	promotion := haCompletePromotionReceipt("primary-a", "standby-a")
+	promotion.RequiredLSN = 11
+	promotion.ObservedLSN = 12
+	promotion.SwitchLSN = 13
+	status := &antflyv1.HAStatus{LastPromotion: promotion}
+	fence := haFormerPrimaryFencePlannedAction(status)
+	rejoin := haFormerPrimaryPlannedAction(haFormerPrimaryEvaluation{
+		Present:          true,
+		NodeID:           "primary-a",
+		RejoinRequired:   true,
+		ParentTimelineID: 4,
+		NewTimelineID:    5,
+		SwitchLSN:        13,
+		FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:      "standby-a",
+		FenceGeneration:  5,
+		Action:           string(haActionDemoteFormerPrimary),
+		Reason:           "FormerPrimaryNotObserved",
+	}, status)
+	rejoin.DependsOn = haActionFenceFormerPrimary
+	planned := haPlannedActionStatuses([]haPlannedAction{fence, rejoin}, ha, status)
+
+	if len(planned) != 2 {
+		t.Fatalf("expected durable fence followed by rejoin, got %#v", planned)
+	}
+	if planned[0].Kind != string(haActionFenceFormerPrimary) ||
+		planned[0].StandbyName != "primary-a" ||
+		planned[0].RouteTo != "standby-a" ||
+		planned[0].TargetLSN != 12 ||
+		planned[0].AdminURL != "http://primary-ha.default.svc:8081" ||
+		planned[0].AdminNodeID != "primary-a" ||
+		planned[0].AdminMethod != http.MethodPost ||
+		planned[0].AdminPath != "/admin/v1/ha/fence" {
+		t.Fatalf("expected fence action to execute against the original primary with promotion evidence, got %#v", planned[0])
+	}
+	if planned[1].DependsOn != string(haActionFenceFormerPrimary) {
+		t.Fatalf("expected rejoin to wait for former-primary durable fencing, got %#v", planned[1])
+	}
+}
+
+func TestHAFormerPrimaryFenceRequiresOldNodeDurableObservation(t *testing.T) {
+	promotion := &antflyv1.HAPromotionStatus{
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  1,
+		ParentEpoch:       1,
+		NewTimelineID:     2,
+		NewEpoch:          2,
+		RequiredLSN:       10,
+		ObservedLSN:       10,
+		SwitchLSN:         11,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration:   3,
+		FenceToken:        "token",
+	}
+	status := &antflyv1.HAStatus{
+		LastPromotion: promotion,
+		Fencing: antflyv1.HAFencingStatus{
+			Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			Ready:      true,
+			Holder:     "standby-a",
+			Generation: 3,
+		},
+	}
+
+	if haFormerPrimaryFenced(status, promotion) {
+		t.Fatal("promotion and Lease receipts must not impersonate a durable fence on the old node")
+	}
+	status.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
+		NodeID:           "primary-a",
+		Fenced:           true,
+		FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:      "standby-a",
+		FenceGeneration:  3,
+		TargetTimelineID: 2,
+		TargetEpoch:      2,
+	}
+	if !haFormerPrimaryFenced(status, promotion) {
+		t.Fatal("matching durable old-node fence observation should permit rejoin")
 	}
 }
 
@@ -2573,20 +2949,24 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		t.Fatalf("expected failover-ready condition, got %#v", failover)
 	}
 	plan := planHA(cluster)
-	if len(plan.Actions) != 5 {
+	if len(plan.Actions) != 6 {
 		t.Fatalf("expected fenced promotion action chain, got %#v", plan.Actions)
 	}
 	if plan.PromotionStandbyName != "standby-a" {
 		t.Fatalf("expected promotion standby standby-a, got %q", plan.PromotionStandbyName)
 	}
-	if plan.Actions[0].Kind != haActionAcquireFence ||
-		plan.Actions[1].Kind != haActionAssessPromotion ||
-		plan.Actions[2].Kind != haActionPromoteStandby {
+	if plan.Actions[0].Kind != haActionFenceFormerPrimary ||
+		plan.Actions[1].Kind != haActionAcquireFence ||
+		plan.Actions[2].Kind != haActionAssessPromotion ||
+		plan.Actions[3].Kind != haActionPromoteStandby {
 		t.Fatalf("unexpected promotion actions: %#v", plan.Actions)
 	}
-	if plan.Actions[1].StandbyName != "standby-a" ||
+	if plan.Actions[0].StandbyName != "primary-a" ||
+		plan.Actions[0].RouteTo != "standby-a" ||
+		plan.Actions[1].StandbyName != "standby-a" ||
 		plan.Actions[2].StandbyName != "standby-a" ||
-		plan.Actions[3].RouteTo != "standby-a" {
+		plan.Actions[3].StandbyName != "standby-a" ||
+		plan.Actions[4].RouteTo != "standby-a" {
 		t.Fatalf("expected promotion and route actions to target standby-a, got %#v", plan.Actions)
 	}
 
@@ -2604,31 +2984,36 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	cluster.Status.HAStatus.Standbys[0].LastError = ""
 	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = true
 	reconciler.updateHAStatusAndConditions(cluster)
-	if len(cluster.Status.HAStatus.PlannedActions) != 5 {
+	if len(cluster.Status.HAStatus.PlannedActions) != 6 {
 		t.Fatalf("expected fenced promotion action chain in status, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
-	if cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionAcquireFence) ||
-		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionAssessPromotion) ||
-		cluster.Status.HAStatus.PlannedActions[2].Kind != string(haActionPromoteStandby) {
+	if cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionFenceFormerPrimary) ||
+		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionAcquireFence) ||
+		cluster.Status.HAStatus.PlannedActions[2].Kind != string(haActionAssessPromotion) ||
+		cluster.Status.HAStatus.PlannedActions[3].Kind != string(haActionPromoteStandby) {
 		t.Fatalf("unexpected promotion action status: %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].Phase != string(haActionPhaseFence) ||
-		cluster.Status.HAStatus.PlannedActions[1].Phase != string(haActionPhasePromote) ||
+		cluster.Status.HAStatus.PlannedActions[1].Phase != string(haActionPhaseFence) ||
 		cluster.Status.HAStatus.PlannedActions[2].Phase != string(haActionPhasePromote) ||
-		cluster.Status.HAStatus.PlannedActions[3].Phase != string(haActionPhaseRoute) ||
-		cluster.Status.HAStatus.PlannedActions[4].Phase != string(haActionPhaseRejoin) ||
+		cluster.Status.HAStatus.PlannedActions[3].Phase != string(haActionPhasePromote) ||
+		cluster.Status.HAStatus.PlannedActions[4].Phase != string(haActionPhaseRoute) ||
+		cluster.Status.HAStatus.PlannedActions[5].Phase != string(haActionPhaseRejoin) ||
 		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminAPI) ||
-		cluster.Status.HAStatus.PlannedActions[3].Executor != string(haActionExecutorControllerAction) {
+		cluster.Status.HAStatus.PlannedActions[4].Executor != string(haActionExecutorControllerAction) {
 		t.Fatalf("expected promotion action status to publish phase/executor metadata, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
-	if cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
-		cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionAcquireFence) ||
-		cluster.Status.HAStatus.PlannedActions[2].DependsOn != string(haActionAssessPromotion) ||
-		cluster.Status.HAStatus.PlannedActions[3].DependsOn != string(haActionPromoteStandby) ||
+	if cluster.Status.HAStatus.PlannedActions[0].StandbyName != "primary-a" ||
+		cluster.Status.HAStatus.PlannedActions[0].RouteTo != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionFenceFormerPrimary) ||
+		cluster.Status.HAStatus.PlannedActions[2].DependsOn != string(haActionAcquireFence) ||
+		cluster.Status.HAStatus.PlannedActions[3].DependsOn != string(haActionAssessPromotion) ||
 		cluster.Status.HAStatus.PlannedActions[4].DependsOn != string(haActionPromoteStandby) ||
-		cluster.Status.HAStatus.PlannedActions[3].RouteFrom != "primary" ||
-		cluster.Status.HAStatus.PlannedActions[3].RouteTo != "standby-a" ||
-		cluster.Status.HAStatus.PlannedActions[4].RouteFrom != "primary-a" {
+		cluster.Status.HAStatus.PlannedActions[5].DependsOn != string(haActionPromoteStandby) ||
+		cluster.Status.HAStatus.PlannedActions[4].RouteFrom != "primary" ||
+		cluster.Status.HAStatus.PlannedActions[4].RouteTo != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[5].RouteFrom != "primary-a" {
 		t.Fatalf("expected planned action status to publish route target, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	expectedAcquireCommand := []string{
@@ -2646,32 +3031,39 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		"--observed-lsn", "12",
 		"--reason", "AutomaticFailoverReady",
 	}
-	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, expectedAcquireCommand) {
-		t.Fatalf("unexpected acquire-fence admin command: %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+	expectedFormerFenceCommand := append([]string(nil), expectedAcquireCommand...)
+	expectedFormerFenceCommand[len(expectedFormerFenceCommand)-1] = "LeaseHeld"
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, expectedFormerFenceCommand) {
+		t.Fatalf("unexpected former-primary fence admin command: %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
 	}
-	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"promote", "assess", "--current-fence"}) {
-		t.Fatalf("unexpected promotion-assessment admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, expectedAcquireCommand) {
+		t.Fatalf("unexpected acquire-fence admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
 	}
-	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[2].AdminCommand, []string{"promote", "--current-fence"}) {
-		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[2].AdminCommand)
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[2].AdminCommand, []string{"promote", "assess", "--current-fence"}) {
+		t.Fatalf("unexpected promotion-assessment admin command: %#v", cluster.Status.HAStatus.PlannedActions[2].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://standby-a-ha.default.svc:8081" {
-		t.Fatalf("expected acquire-fence action to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[3].AdminCommand, []string{"promote", "--current-fence"}) {
+		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[3].AdminCommand)
+	}
+	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
+		cluster.Status.HAStatus.PlannedActions[0].AdminNodeID != "primary-a" {
+		t.Fatalf("expected former-primary fence to target the old writer, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
 	if cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://standby-a-ha.default.svc:8081" ||
-		cluster.Status.HAStatus.PlannedActions[2].AdminURL != "http://standby-a-ha.default.svc:8081" {
-		t.Fatalf("expected promotion actions to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[1:3])
+		cluster.Status.HAStatus.PlannedActions[2].AdminURL != "http://standby-a-ha.default.svc:8081" ||
+		cluster.Status.HAStatus.PlannedActions[3].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		t.Fatalf("expected fence/promotion actions to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[1:4])
 	}
-	if cluster.Status.HAStatus.PlannedActions[0].AdminNodeID != "standby-a" ||
-		cluster.Status.HAStatus.PlannedActions[1].AdminNodeID != "standby-a" ||
-		cluster.Status.HAStatus.PlannedActions[2].AdminNodeID != "standby-a" {
-		t.Fatalf("expected fence/promotion actions to require standby node receipts, got %#v", cluster.Status.HAStatus.PlannedActions[:3])
+	if cluster.Status.HAStatus.PlannedActions[1].AdminNodeID != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[2].AdminNodeID != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[3].AdminNodeID != "standby-a" {
+		t.Fatalf("expected candidate fence/promotion actions to require standby node receipts, got %#v", cluster.Status.HAStatus.PlannedActions[1:4])
 	}
-	if cluster.Status.HAStatus.PlannedActions[3].AdminCommand != nil {
-		t.Fatalf("route action should not publish an HA admin command without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[3].AdminCommand)
+	if cluster.Status.HAStatus.PlannedActions[4].AdminCommand != nil {
+		t.Fatalf("route action should not publish an HA admin command without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[4].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[3].AdminURL != "" {
-		t.Fatalf("route action should not publish an HA admin URL without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[3].AdminURL)
+	if cluster.Status.HAStatus.PlannedActions[4].AdminURL != "" {
+		t.Fatalf("route action should not publish an HA admin URL without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[4].AdminURL)
 	}
 	expectedDemoteCommand := []string{
 		"rejoin", "assess",
@@ -2684,14 +3076,14 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		"--last-lsn", "12",
 		"--retained-from-lsn", "0",
 	}
-	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[4].AdminCommand, expectedDemoteCommand) {
-		t.Fatalf("unexpected former-primary demote admin command: %#v", cluster.Status.HAStatus.PlannedActions[4].AdminCommand)
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[5].AdminCommand, expectedDemoteCommand) {
+		t.Fatalf("unexpected former-primary demote admin command: %#v", cluster.Status.HAStatus.PlannedActions[5].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[4].AdminURL != "http://primary-ha.default.svc:8081" {
-		t.Fatalf("expected former-primary demote to target old primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[4])
+	if cluster.Status.HAStatus.PlannedActions[5].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("expected former-primary demote to target old primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[5])
 	}
-	if cluster.Status.HAStatus.PlannedActions[4].AdminNodeID != "primary-a" {
-		t.Fatalf("expected former-primary demote to require old primary node receipt, got %#v", cluster.Status.HAStatus.PlannedActions[4])
+	if cluster.Status.HAStatus.PlannedActions[5].AdminNodeID != "primary-a" {
+		t.Fatalf("expected former-primary demote to require old primary node receipt, got %#v", cluster.Status.HAStatus.PlannedActions[5])
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||
@@ -2815,6 +3207,94 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWithoutRouteSelector(t *testing.T
 		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionAssessPromotion) || action.Kind == string(haActionPromoteStandby) {
 			t.Fatalf("expected no automatic promotion actions without route selector, got %#v", cluster.Status.HAStatus.PlannedActions)
 		}
+	}
+}
+
+func TestPlanHAContinuesCommittedFenceTransactionWhenPrimaryAdminRecovers(t *testing.T) {
+	cluster := haCluster()
+	ha := cluster.Spec.HighAvailability
+	ha.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
+	ha.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
+	ha.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
+	ha.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
+	ha.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:         antflyv1.HADurabilityModeRemoteApply,
+		Required:     1,
+		StandbyNames: []string{"standby-a"},
+	}
+	ha.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
+		Enabled:          true,
+		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.PrimaryAdminLastError = ""
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{{
+		Kind:            string(haActionFenceFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		RouteFrom:       "primary-a",
+		RouteTo:         "standby-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 1,
+		FenceReason:     "LeaseHeld",
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhasePending,
+		AdminError:      "connection refused",
+	}}
+
+	plan := planHA(cluster)
+	if !plan.AutomaticPromotionAllowed || plan.PromotionStandbyName != "standby-a" {
+		t.Fatalf("expected committed fence transaction to continue after admin recovery, got %#v", plan)
+	}
+	if len(plan.Actions) != 6 || plan.Actions[0].Kind != haActionFenceFormerPrimary {
+		t.Fatalf("expected full pre-fence promotion chain, got %#v", plan.Actions)
+	}
+	if holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus); holder != "standby-a" {
+		t.Fatalf("expected committed Lease holder to be renewed, got %q", holder)
+	}
+
+	// The old writer can advance after its admin transport recovers but before
+	// the pending node-local fence call succeeds. That transient lag must not
+	// erase the committed transaction: fencing freezes the actual durable tail,
+	// and the downstream assessment waits for the candidate to apply it.
+	cluster.Status.HAStatus.PrimaryLSN = 13
+	cluster.Status.HAStatus.Standbys[0].ApplyLagLSN = 1
+	plan = planHA(cluster)
+	if !plan.AutomaticPromotionAllowed || plan.PromotionStandbyName != "standby-a" {
+		t.Fatalf("expected committed transaction to survive a moving old-primary tail, got %#v", plan)
+	}
+	if len(plan.Actions) != 6 || plan.Actions[0].Kind != haActionFenceFormerPrimary {
+		t.Fatalf("expected full pre-fence chain while the candidate catches up, got %#v", plan.Actions)
+	}
+	if plan.Actions[0].TargetLSN != 12 {
+		t.Fatalf("expected the pending transaction to preserve its original lower-bound LSN, got %#v", plan.Actions[0])
+	}
+
+	// A delayed admin call may cross the 30-second Lease deadline between
+	// reconciles. The recorded in-flight fence transaction must remain the
+	// renewal candidate so the controller can make the Lease ready again rather
+	// than silently abandoning an ownership transfer it already started.
+	cluster.Status.HAStatus.Fencing.Ready = false
+	cluster.Status.HAStatus.Fencing.Reason = "LeaseExpired"
+	plan = planHA(cluster)
+	if plan.AutomaticPromotionAllowed || plan.PromotionStandbyName != "" {
+		t.Fatalf("expected promotion execution to pause until the expired Lease is renewed, got %#v", plan)
+	}
+	if holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus); holder != "standby-a" {
+		t.Fatalf("expected expired committed Lease holder to remain the renewal candidate, got %q", holder)
 	}
 }
 
@@ -3143,6 +3623,13 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 			FenceGeneration:   4,
 		},
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:          "old-primary",
+			Fenced:          true,
+			FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:     "standby-a",
+			FenceGeneration: 4,
+		},
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:        "old-primary",
 			SlotName:    "old-primary",
@@ -3189,7 +3676,7 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		rewindAction.FenceHolder != "standby-a" {
 		t.Fatalf("expected rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
-	cluster.Status.HAStatus.Fencing.Authority = antflyv1.HAFencingAuthorityStorageFence
+	cluster.Status.HAStatus.FormerPrimary.FenceAuthority = antflyv1.HAFencingAuthorityStorageFence
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	former = cluster.Status.HAStatus.FormerPrimary
@@ -3200,7 +3687,7 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		t.Fatalf("expected authority-mismatched fence to block former-primary rejoin, got %#v", former)
 	}
 
-	cluster.Status.HAStatus.Fencing.Authority = antflyv1.HAFencingAuthorityKubernetesLease
+	cluster.Status.HAStatus.FormerPrimary.Fenced = true
 	cluster.Status.HAStatus.Standbys[0].ReceivedLSN = 11
 	reconciler.updateHAStatusAndConditions(cluster)
 
@@ -3224,6 +3711,7 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	}
 	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
 		NodeID:            "old-primary",
+		Fenced:            true,
 		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceHolder:       "standby-a",
 		FenceGeneration:   4,
@@ -3240,19 +3728,20 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 
 	former = cluster.Status.HAStatus.FormerPrimary
 	if former == nil ||
-		!former.RewindPossible ||
-		former.ReseedRequired ||
-		former.Action != string(haActionRewindFormerPrimary) ||
-		former.Reason != "parent_timeline_retained" ||
+		former.RewindPossible ||
+		!former.ReseedRequired ||
+		!former.Diverged ||
+		former.Action != string(haActionReseedFormerPrimary) ||
+		former.Reason != "FormerPrimaryRequiresReseed" ||
 		former.SwitchLSN != 10 ||
 		former.ObservedLSN != 11 {
-		t.Fatalf("expected recorded rejoin assessment to preserve rewind disposition, got %#v", former)
+		t.Fatalf("expected unsafe recorded rewind assessment to fail closed to reseed, got %#v", former)
 	}
-	rewindAction, ok = haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionRewindFormerPrimary)
+	reseedAction, ok = haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionReseedFormerPrimary)
 	if !ok ||
-		rewindAction.TargetLSN != 10 ||
-		rewindAction.ObservedLSN != 11 {
-		t.Fatalf("expected assessed rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
+		reseedAction.TargetLSN != 10 ||
+		reseedAction.ObservedLSN != 11 {
+		t.Fatalf("expected assessed reseed planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 
 	cluster.Status.HAStatus.Standbys = []antflyv1.HAStandbyStatus{{
@@ -3266,15 +3755,16 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	}}
 	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
 		NodeID:            "old-primary",
+		Fenced:            true,
 		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceHolder:       "standby-a",
 		FenceGeneration:   4,
 		TargetTimelineID:  2,
 		TargetEpoch:       2,
 		ForkLSN:           10,
-		FormerLastLSN:     11,
+		FormerLastLSN:     10,
 		RetainedFromLSN:   8,
-		DataLossDiscarded: true,
+		DataLossDiscarded: false,
 		AssessedAction:    "rewind",
 		AssessedReason:    "parent_timeline_retained",
 	}
@@ -3285,13 +3775,13 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		former.Action != string(haActionRewindFormerPrimary) ||
 		former.Reason != "parent_timeline_retained" ||
 		former.SwitchLSN != 10 ||
-		former.ObservedLSN != 11 {
+		former.ObservedLSN != 10 {
 		t.Fatalf("expected recorded rejoin assessment to drive rewind without standby observation, got %#v", former)
 	}
 	rewindAction, ok = haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionRewindFormerPrimary)
 	if !ok ||
 		rewindAction.TargetLSN != 10 ||
-		rewindAction.ObservedLSN != 11 {
+		rewindAction.ObservedLSN != 10 {
 		t.Fatalf("expected assessment-only rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 
@@ -3316,25 +3806,24 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 
 	former = cluster.Status.HAStatus.FormerPrimary
 	if former == nil ||
-		!former.ReseedRequired ||
-		!former.Diverged ||
-		former.RewindPossible ||
-		former.Action != string(haActionReseedFormerPrimary) ||
-		former.Reason != "FormerPrimaryRequiresReseed" {
-		t.Fatalf("expected stale assessed fence generation to be ignored, got %#v", former)
+		former.Fenced ||
+		former.Action != string(haActionDemoteFormerPrimary) ||
+		former.Reason != "FormerPrimaryFenceNotObserved" {
+		t.Fatalf("expected stale assessed fence generation to block rejoin, got %#v", former)
 	}
 
 	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
 		NodeID:            "old-primary",
+		Fenced:            true,
 		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceHolder:       "standby-a",
 		FenceGeneration:   4,
 		TargetTimelineID:  2,
 		TargetEpoch:       2,
 		ForkLSN:           10,
-		FormerLastLSN:     11,
+		FormerLastLSN:     10,
 		RetainedFromLSN:   8,
-		DataLossDiscarded: true,
+		DataLossDiscarded: false,
 		AssessedAction:    "rewind",
 		AssessedReason:    "parent_timeline_retained",
 	}
@@ -3358,7 +3847,7 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	}
 }
 
-func TestUpdateHAStatusUsesPromotionReceiptForFormerPrimaryRejoinAfterFenceExpires(t *testing.T) {
+func TestUpdateHAStatusUsesDurableFormerPrimaryFenceAfterLeaseExpires(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
@@ -3407,6 +3896,13 @@ func TestUpdateHAStatusUsesPromotionReceiptForFormerPrimaryRejoinAfterFenceExpir
 			FenceReason:       "operator-approved",
 			FenceToken:        "token",
 		},
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:          "old-primary",
+			Fenced:          true,
+			FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:     "standby-a",
+			FenceGeneration: 4,
+		},
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:        "old-primary",
 			SlotName:    "old-primary",
@@ -3436,17 +3932,18 @@ func TestUpdateHAStatusUsesPromotionReceiptForFormerPrimaryRejoinAfterFenceExpir
 		former.ReseedRequired ||
 		former.Action != string(haActionRewindFormerPrimary) ||
 		former.Reason != "FormerPrimaryNeedsRewind" {
-		t.Fatalf("expected promotion receipt to permit rewind after live fence expiry, got %#v", former)
+		t.Fatalf("expected durable former-primary fence to permit rewind after live lease expiry, got %#v", former)
 	}
-	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
-		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionRewindFormerPrimary) ||
-		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://old-primary-ha.default.svc:8081" {
+	rewindAction, ok := haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionRewindFormerPrimary)
+	if !ok ||
+		rewindAction.DependsOn != string(haActionFenceFormerPrimary) ||
+		rewindAction.AdminURL != "http://old-primary-ha.default.svc:8081" {
 		t.Fatalf("expected executable former-primary rewind, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
-	command := strings.Join(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, " ")
+	command := strings.Join(rewindAction.AdminCommand, " ")
 	if !strings.Contains(command, "--fence-token token") ||
 		!strings.Contains(command, "--fence-generation 4") {
-		t.Fatalf("expected rejoin command to carry durable fence receipt, got %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+		t.Fatalf("expected rejoin command to carry durable fence receipt, got %#v", rewindAction.AdminCommand)
 	}
 }
 
@@ -3499,6 +3996,13 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 			FenceGeneration:   4,
 			FenceReason:       "operator-approved",
+		},
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:          "old-primary",
+			Fenced:          true,
+			FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:     "standby-a",
+			FenceGeneration: 4,
 		},
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:        "old-primary",
@@ -3564,18 +4068,19 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 	cluster.Status.HAStatus.LastPromotion.DataLossPossible = true
 	reconciler.updateHAStatusAndConditions(cluster)
 
-	if len(cluster.Status.HAStatus.PlannedActions) != 2 ||
-		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionReseedFormerPrimary) ||
-		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://standby-a-ha.default.svc:8081" ||
-		cluster.Status.HAStatus.PlannedActions[0].AdminNodeID != "standby-a" {
+	reseedAction, ok := haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionReseedFormerPrimary)
+	if !ok ||
+		reseedAction.DependsOn != string(haActionFenceFormerPrimary) ||
+		reseedAction.AdminURL != "http://standby-a-ha.default.svc:8081" ||
+		reseedAction.AdminNodeID != "standby-a" {
 		t.Fatalf("expected forced promotion to require former-primary reseed, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
-	forcedCommand := strings.Join(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, " ")
+	forcedCommand := strings.Join(reseedAction.AdminCommand, " ")
 	if !strings.Contains(forcedCommand, "--fence-forced") {
-		t.Fatalf("expected forced rejoin command to carry forced fence evidence, got %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+		t.Fatalf("expected forced rejoin command to carry forced fence evidence, got %#v", reseedAction.AdminCommand)
 	}
 	if strings.Contains(forcedCommand, "allow-rewind-after-forced-promotion") {
-		t.Fatalf("forced promotion must not opt into former-primary rewind automatically, got %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+		t.Fatalf("forced promotion must not opt into former-primary rewind automatically, got %#v", reseedAction.AdminCommand)
 	}
 }
 
@@ -3895,6 +4400,59 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 	}
 }
 
+func TestReconcileHAFencingLeaseRenewsExpiredCommittedTransfer(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.PrimaryAdminLastError = ""
+	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		Ready:      false,
+		Holder:     "standby-a",
+		Generation: 2,
+		Reason:     "LeaseExpired",
+	}
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{{
+		Kind:            string(haActionFenceFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		RouteFrom:       "primary-a",
+		RouteTo:         "standby-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 2,
+		FenceReason:     "LeaseHeld",
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhasePending,
+		AdminError:      "connection refused",
+	}}
+	durationSeconds := int32(30)
+	lease := haFenceLease(cluster, time.Now().Add(-2*time.Minute), durationSeconds, 2, "standby-a")
+	reconciler := testHAReconciler(t, cluster, lease)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("renew committed fencing lease: %v", err)
+	}
+
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, observed); err != nil {
+		t.Fatalf("get renewed fencing lease: %v", err)
+	}
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.After(lease.Spec.RenewTime.Time) {
+		t.Fatalf("expected expired committed Lease renew time to advance, old=%#v new=%#v", lease.Spec.RenewTime, observed.Spec.RenewTime)
+	}
+	if !cluster.Status.HAStatus.Fencing.Ready ||
+		cluster.Status.HAStatus.Fencing.Holder != "standby-a" ||
+		cluster.Status.HAStatus.Fencing.Generation != 2 ||
+		cluster.Status.HAStatus.Fencing.Reason != "LeaseHeld" {
+		t.Fatalf("expected successful renewal to publish ready in-memory fencing status, got %#v", cluster.Status.HAStatus.Fencing)
+	}
+	plan := planHA(cluster)
+	if !plan.AutomaticPromotionAllowed || plan.PromotionStandbyName != "standby-a" {
+		t.Fatalf("expected the renewed committed transfer to continue, got %#v", plan)
+	}
+}
+
 func TestReconcileHAFencingLeaseAllowsRemoteWriteCandidate(t *testing.T) {
 	remoteApply := false
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
@@ -4211,6 +4769,121 @@ func TestObserveHAFencingStatusRejectsStalePromotionBoundaryLeaseScope(t *testin
 	}
 	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
 		t.Fatal("expected stale promotion-boundary lease scope to block automatic promotion")
+	}
+}
+
+func TestObserveHAFencingStatusPreservesCommittedBoundaryWhileOldPrimaryTailMoves(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{{
+		Kind:            string(haActionFenceFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		RouteFrom:       "primary-a",
+		RouteTo:         "standby-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 3,
+		FenceReason:     "LeaseHeld",
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhasePending,
+		AdminError:      "connection refused",
+	}}
+	lease := haFenceLease(cluster, time.Now(), 30, 3, "standby-a")
+
+	// The Lease and action committed LSN 12 while the old-primary admin
+	// transport was isolated. Once transport heals, the still-unfenced writer
+	// may report a newer tail before the pending fence call linearizes.
+	cluster.Status.HAStatus.PrimaryLSN = 13
+	cluster.Status.HAStatus.Standbys[0].ApplyLagLSN = 1
+	reconciler := testHAReconciler(t, lease)
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe committed fencing status: %v", err)
+	}
+	fencing := cluster.Status.HAStatus.Fencing
+	if !fencing.Ready || fencing.Reason != "LeaseHeld" || fencing.Holder != "standby-a" || fencing.Generation != 3 {
+		t.Fatalf("expected the exact committed lower-bound Lease to remain ready, got %#v", fencing)
+	}
+	plan := planHA(cluster)
+	if !plan.AutomaticPromotionAllowed || plan.PromotionStandbyName != "standby-a" {
+		t.Fatalf("expected the committed transaction to survive the moving tail, got %#v", plan)
+	}
+
+	// The successful node-local fence freezes the newer tail, but observation
+	// runs before Lease renewal in the next reconcile. The still-valid Lease can
+	// therefore carry the original lower bound for exactly this transition.
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	cluster.Status.HAStatus.PlannedActions[0].AdminError = ""
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		FencePromotedNodeID: "standby-a",
+		FenceRequiredLSN:    13,
+		FenceObservedLSN:    13,
+		FenceGeneration:     3,
+	}
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe successful fence transition: %v", err)
+	}
+	fencing = cluster.Status.HAStatus.Fencing
+	if !fencing.Ready || fencing.Reason != "LeaseHeld" {
+		t.Fatalf("expected original lower-bound Lease to remain ready until renewal publishes the frozen tail, got %#v", fencing)
+	}
+}
+
+func TestReconcileHAFencingLeaseKeepsCommittedLowerBoundWhileOldPrimaryTailMoves(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.Fencing.Generation = 3
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{{
+		Kind:            string(haActionFenceFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		RouteFrom:       "primary-a",
+		RouteTo:         "standby-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 3,
+		FenceReason:     "LeaseHeld",
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhasePending,
+		AdminError:      "connection refused",
+	}}
+	lease := haFenceLease(cluster, time.Now().Add(-time.Second), 30, 3, "standby-a")
+	cluster.Status.HAStatus.PrimaryLSN = 13
+	reconciler := testHAReconciler(t, cluster, lease)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("renew committed fencing lease: %v", err)
+	}
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, observed); err != nil {
+		t.Fatalf("get renewed fencing lease: %v", err)
+	}
+	if got := observed.Annotations[haFencingLeaseAnnotationPrimaryLSN]; got != "12" {
+		t.Fatalf("expected renewal to preserve committed lower-bound LSN 12, got %q", got)
+	}
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.After(lease.Spec.RenewTime.Time) {
+		t.Fatalf("expected committed lease renewal time to advance, old=%#v new=%#v", lease.Spec.RenewTime, observed.Spec.RenewTime)
+	}
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		FencePromotedNodeID: "standby-a",
+		FenceRequiredLSN:    13,
+		FenceObservedLSN:    13,
+		FenceGeneration:     3,
+	}
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("advance committed fencing lease to frozen tail: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, observed); err != nil {
+		t.Fatalf("get advanced fencing lease: %v", err)
+	}
+	if got := observed.Annotations[haFencingLeaseAnnotationPrimaryLSN]; got != "13" {
+		t.Fatalf("expected renewal to advance from the lower bound to frozen tail 13, got %q", got)
 	}
 }
 

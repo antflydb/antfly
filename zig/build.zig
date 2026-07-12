@@ -2369,6 +2369,22 @@ pub fn build(b: *std.Build) void {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    const common_http_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/common_http_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    common_http_test_mod.addImport("raft_engine", raft_engine_mod);
+    common_http_test_mod.addImport("antfly_platform", platform_mod);
+    common_http_test_mod.addImport("httpx", httpx_mod);
+    const common_http_tests = b.addTest(.{
+        .root_module = common_http_test_mod,
+    });
+    common_http_tests.root_module.link_libc = true;
+    const run_common_http_tests = b.addRunArtifact(common_http_tests);
+    const common_http_test_step = b.step("common-http-test", "Run common HTTP listener and client tests");
+    common_http_test_step.dependOn(&run_common_http_tests.step);
+
     const api_json_helpers_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/json_helpers.zig"),
         .target = target,
@@ -3279,8 +3295,11 @@ pub fn build(b: *std.Build) void {
         "storage.ha data server rejects writes and owner jobs after primary promotion fence",
         "data server applies routed HA replication records through standby write gate",
         "data server pulls and applies HA standby replication through internal HTTP client",
+        "data server promotion rewires live HTTP internal HA executor",
+        "data server promotion open failure preserves retryable standby",
         "data server resumes HA standby replication from durable progress after restart",
-        "data runtime records HA standby replication round failures",
+        "data runtime records and backs off HA standby replication round failures",
+        "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data runtime records HA standby apply failures without stopping run round",
     };
     const lib_data_runtime_tests = b.addTest(.{
@@ -4182,6 +4201,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
+            "provisioned table write source backs up and restores a local table",
             "provisioned table write source backs up a portable local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned table restore retry skips exact incomplete restore state with active writer",
@@ -4248,6 +4268,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
+            "public table batch handler exposes pending HA durability without claiming rollback",
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",
@@ -4707,6 +4728,7 @@ pub fn build(b: *std.Build) void {
             "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
             "swarm runtime registers internal group routes explicitly",
             "swarm runtime registers mcp routes before antfarm catch-all",
+            "swarm unified server control stops publication and live listeners",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -5266,6 +5288,7 @@ pub fn build(b: *std.Build) void {
         &run_lib_onnx_tests.step,
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,
+        &run_common_http_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
         &run_lib_unit_tests.step,

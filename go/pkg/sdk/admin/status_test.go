@@ -305,6 +305,42 @@ func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T
 	}
 }
 
+func TestHAClientPrimaryStatusParsedResponseOmitsEmptyAsyncSyncQuery(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAPrimaryStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
+		}
+		query := r.URL.Query()
+		if got := query.Get("max_lag_lsn"); got != "1000000" {
+			t.Fatalf("max_lag_lsn = %q, want 1000000", got)
+		}
+		for _, key := range []string{"sync_mode", "sync_selection", "sync_required", "sync_standby", "sync_failure"} {
+			if values, ok := query[key]; ok {
+				t.Fatalf("query includes %s = %q, want omitted for async policy", key, values)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haLegacyPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.PrimaryStatusParsedResponse(context.Background(), &HAPrimaryStatusParams{
+		MaxLagLsn: 1000000,
+	})
+	if err != nil {
+		t.Fatalf("PrimaryStatusParsedResponse returned error: %v", err)
+	}
+}
+
 func TestHAClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
 	t.Parallel()
 

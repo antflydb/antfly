@@ -145,20 +145,44 @@ pub const Primary = struct {
         handoff: standby_mod.PromotionHandoff,
         options: OpenOptions,
     ) !Primary {
-        if (handoff.switch_lsn == 0) return error.InvalidPromotionHandoff;
-        if (handoff.next_lsn != handoff.switch_lsn + 1) return error.InvalidPromotionHandoff;
-
         var primary = try Primary.open(alloc, log_path, slot_store_path, handoff.identity, options);
         errdefer primary.close();
 
-        if (primary.lastLsn() != handoff.switch_lsn) return error.PromotedLogMismatch;
-        var switch_entry = (try primary.log.entryAt(alloc, handoff.switch_lsn)) orelse return error.MissingPromotionSwitch;
-        defer switch_entry.deinit(alloc);
-        if (switch_entry.record.kind != .timeline_switch) return error.MissingPromotionSwitch;
-        try validateRecordIdentity(handoff.identity, switch_entry.record);
-        if (primary.nextLsn() != handoff.next_lsn) return error.PromotedLogMismatch;
+        try validatePromotedLog(alloc, &primary.log, handoff);
 
         return primary;
+    }
+
+    /// Convert a live promoted standby into a primary without reopening its
+    /// receive log. The receive log has an exclusive writer lock, so attempting
+    /// to open the same path while the standby still owns it can never succeed.
+    /// All fallible validation and slot-store setup happens before ownership is
+    /// transferred; a failure therefore leaves the standby intact and retryable.
+    pub fn takePromotedStandby(
+        alloc: Allocator,
+        standby: *standby_mod.Standby,
+        slot_store_path: [*:0]const u8,
+        handoff: standby_mod.PromotionHandoff,
+        options: OpenOptions,
+    ) !Primary {
+        const current_handoff = try standby.promotedPrimaryHandoff();
+        if (!std.meta.eql(current_handoff, handoff)) return error.PromotedLogMismatch;
+        try validatePromotedLog(alloc, &standby.receive_log, handoff);
+
+        var slots = try slot_store.SlotStore.open(alloc, slot_store_path, options.slot_store_options);
+        errdefer slots.close();
+
+        // Nothing below this point can fail. Close the standby-only progress
+        // WAL and move the still-open receive log into the new primary.
+        standby.progress_wal.close();
+        const log = standby.receive_log;
+        standby.* = undefined;
+        return .{
+            .alloc = alloc,
+            .identity = handoff.identity,
+            .log = log,
+            .slots = slots,
+        };
     }
 
     pub fn close(self: *Primary) void {
@@ -596,6 +620,21 @@ fn validateRecordIdentity(expected: Identity, actual: replication_record.RecordV
     if (actual.table_id != expected.table_id) return error.WrongTable;
     if (actual.timeline_id != expected.timeline_id) return error.WrongTimeline;
     if (actual.epoch != expected.epoch) return error.WrongEpoch;
+}
+
+fn validatePromotedLog(
+    alloc: Allocator,
+    log: *replication_log.ReplicationLog,
+    handoff: standby_mod.PromotionHandoff,
+) !void {
+    if (handoff.switch_lsn == 0) return error.InvalidPromotionHandoff;
+    if (handoff.next_lsn != handoff.switch_lsn + 1) return error.InvalidPromotionHandoff;
+    if (log.lastLsn() != handoff.switch_lsn) return error.PromotedLogMismatch;
+    var switch_entry = (try log.entryAt(alloc, handoff.switch_lsn)) orelse return error.MissingPromotionSwitch;
+    defer switch_entry.deinit(alloc);
+    if (switch_entry.record.kind != .timeline_switch) return error.MissingPromotionSwitch;
+    try validateRecordIdentity(handoff.identity, switch_entry.record);
+    if (log.nextLsn() != handoff.next_lsn) return error.PromotedLogMismatch;
 }
 
 fn backupStartPayload(
