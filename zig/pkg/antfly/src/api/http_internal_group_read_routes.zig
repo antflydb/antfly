@@ -93,6 +93,7 @@ pub const QueryPlanningContext = struct {
     admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
     free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    io: ?std.Io = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
@@ -100,6 +101,7 @@ pub const QueryPlanningContext = struct {
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
+    query_embedding_deadline_ns: ?u64 = null,
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);
@@ -159,6 +161,7 @@ pub fn planSemanticQuery(
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, table.indexes_json, .{
         .antfly_provider = planning.antfly_provider,
+        .io = planning.io,
         .remote_content = planning.remote_content,
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,
@@ -182,7 +185,7 @@ pub fn planSemanticQuery(
                 .index_name = index_name,
                 .text = semantic_search,
             };
-            break :blk try cache.getOrCompute(budget, alloc, key, &compute_context, DenseQueryComputeContext.run);
+            break :blk try cache.getOrCompute(budget, alloc, key, planning.query_embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
         },
         .k = limit,
     };

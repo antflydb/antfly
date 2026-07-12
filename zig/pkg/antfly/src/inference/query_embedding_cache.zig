@@ -26,6 +26,7 @@ pub const Stats = struct {
     producer_computations: u64 = 0,
     producer_compute_ns_total: u64 = 0,
     inflight_rejections: u64 = 0,
+    waiter_timeouts: u64 = 0,
     evictions: u64 = 0,
     expirations: u64 = 0,
     rejected_admissions: u64 = 0,
@@ -51,7 +52,7 @@ const Flight = struct {
     done: bool = false,
     result: ?[]f32 = null,
     err: ?anyerror = null,
-    ready: std.Io.Condition = .init,
+    ready: std.Io.Event = .unset,
 };
 
 /// Thread-safe byte-bounded LRU with per-key in-flight request coalescing.
@@ -94,6 +95,7 @@ pub const QueryEmbeddingCache = struct {
         budget: *cache_budget.CacheBudget,
         caller_alloc: std.mem.Allocator,
         key: Key,
+        deadline_ns: ?u64,
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
@@ -119,7 +121,15 @@ pub const QueryEmbeddingCache = struct {
         if (self.flights.get(key)) |flight| {
             flight.refs += 1;
             self.counters.coalesced_waiters += 1;
-            while (!flight.done) flight.ready.waitUncancelable(io, &self.mutex);
+            self.mutex.unlock(io);
+            self.waitForFlight(flight, deadline_ns) catch |err| {
+                self.mutex.lockUncancelable(io);
+                if (err == error.Timeout) self.counters.waiter_timeouts +|= 1;
+                self.releaseFlightLocked(key, flight);
+                self.mutex.unlock(io);
+                return err;
+            };
+            self.mutex.lockUncancelable(io);
             const result = self.copyFlightResultLocked(caller_alloc, flight) catch |err| {
                 self.releaseFlightLocked(key, flight);
                 self.mutex.unlock(io);
@@ -128,6 +138,11 @@ pub const QueryEmbeddingCache = struct {
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
             return result;
+        }
+
+        if (deadlineExpired(deadline_ns)) {
+            self.mutex.unlock(io);
+            return error.Timeout;
         }
 
         if (self.flights.count() >= self.config.max_inflight) {
@@ -158,7 +173,7 @@ pub const QueryEmbeddingCache = struct {
             self.recordProducerDurationLocked(compute_started_ns);
             flight.err = err;
             flight.done = true;
-            flight.ready.broadcast(io);
+            flight.ready.set(io);
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
             return err;
@@ -171,7 +186,7 @@ pub const QueryEmbeddingCache = struct {
         self.admitLocked(key, computed, budget) catch {
             self.counters.rejected_admissions += 1;
         };
-        flight.ready.broadcast(io);
+        flight.ready.set(io);
         const result = self.copyFlightResultLocked(caller_alloc, flight) catch |err| {
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
@@ -198,6 +213,26 @@ pub const QueryEmbeddingCache = struct {
     fn recordProducerDurationLocked(self: *QueryEmbeddingCache, started_ns: u64) void {
         const elapsed_ns = platform_time.monotonicNs() -| started_ns;
         self.counters.producer_compute_ns_total +|= elapsed_ns;
+    }
+
+    fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64) !void {
+        const deadline = deadline_ns orelse {
+            flight.ready.waitUncancelable(self.io);
+            return;
+        };
+        while (!flight.ready.isSet()) {
+            const now = platform_time.monotonicNs();
+            if (now >= deadline) return error.Timeout;
+            flight.ready.waitTimeout(self.io, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(@intCast(deadline - now)),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return error.Canceled,
+            };
+        }
     }
 
     fn copyFlightResultLocked(self: *QueryEmbeddingCache, alloc: std.mem.Allocator, flight: *Flight) ![]f32 {
@@ -299,6 +334,11 @@ pub const QueryEmbeddingCache = struct {
     }
 };
 
+fn deadlineExpired(deadline_ns: ?u64) bool {
+    const deadline = deadline_ns orelse return false;
+    return platform_time.monotonicNs() >= deadline;
+}
+
 const TestCompute = struct {
     calls: std.atomic.Value(u64) = .init(0),
     value: f32,
@@ -320,10 +360,10 @@ pub fn testOwnedValuesAndHits() !void {
     var compute = TestCompute{ .value = 4 };
     const key: Key = [_]u8{7} ** 32;
 
-    const first = try cache.getOrCompute(&budget, std.testing.allocator, key, &compute, TestCompute.run);
+    const first = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
     defer std.testing.allocator.free(first);
     first[0] = 99;
-    const second = try cache.getOrCompute(&budget, std.testing.allocator, key, &compute, TestCompute.run);
+    const second = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
     defer std.testing.allocator.free(second);
 
     try std.testing.expectEqual(@as(f32, 4), second[0]);
@@ -358,7 +398,7 @@ pub fn testConcurrentCoalescing() !void {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.result = self.cache.getOrCompute(self.budget, std.heap.page_allocator, self.key, self.compute, SlowCompute.run) catch |err| {
+            self.result = self.cache.getOrCompute(self.budget, std.heap.page_allocator, self.key, null, self.compute, SlowCompute.run) catch |err| {
                 self.err = err;
                 return;
             };
@@ -420,7 +460,7 @@ pub fn testInflightAdmissionBound() !void {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.result = self.cache.getOrCompute(self.budget, std.heap.page_allocator, self.key, self.compute, BlockingCompute.run) catch |err| {
+            self.result = self.cache.getOrCompute(self.budget, std.heap.page_allocator, self.key, null, self.compute, BlockingCompute.run) catch |err| {
                 self.err = err;
                 return;
             };
@@ -444,13 +484,27 @@ pub fn testInflightAdmissionBound() !void {
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
     const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&compute});
 
+    const producer_key: Key = [_]u8{1} ** 32;
+    try std.testing.expectError(
+        error.Timeout,
+        cache.getOrCompute(
+            &budget,
+            std.testing.allocator,
+            producer_key,
+            platform_time.monotonicNs() +| std.time.ns_per_ms,
+            &compute,
+            BlockingCompute.run,
+        ),
+    );
     const rejected_key: Key = [_]u8{2} ** 32;
     try std.testing.expectError(
         error.QueryEmbeddingOverloaded,
-        cache.getOrCompute(&budget, std.testing.allocator, rejected_key, &compute, BlockingCompute.run),
+        cache.getOrCompute(&budget, std.testing.allocator, rejected_key, null, &compute, BlockingCompute.run),
     );
     const current = cache.stats(&budget);
     try std.testing.expectEqual(@as(u64, 1), current.inflight_rejections);
+    try std.testing.expectEqual(@as(u64, 1), current.waiter_timeouts);
+    try std.testing.expectEqual(@as(u64, 1), current.coalesced_waiters);
     try std.testing.expectEqual(@as(usize, 1), current.inflight);
     try std.testing.expectEqual(@as(u64, 1), compute.calls.load(.monotonic));
 
@@ -474,13 +528,13 @@ pub fn testByteBudgetEviction() !void {
     const first_key: Key = [_]u8{1} ** 32;
     const second_key: Key = [_]u8{2} ** 32;
 
-    const first = try cache.getOrCompute(&budget, std.testing.allocator, first_key, &compute, TestCompute.run);
+    const first = try cache.getOrCompute(&budget, std.testing.allocator, first_key, null, &compute, TestCompute.run);
     std.testing.allocator.free(first);
-    const second = try cache.getOrCompute(&budget, std.testing.allocator, second_key, &compute, TestCompute.run);
+    const second = try cache.getOrCompute(&budget, std.testing.allocator, second_key, null, &compute, TestCompute.run);
     std.testing.allocator.free(second);
-    const second_hit = try cache.getOrCompute(&budget, std.testing.allocator, second_key, &compute, TestCompute.run);
+    const second_hit = try cache.getOrCompute(&budget, std.testing.allocator, second_key, null, &compute, TestCompute.run);
     std.testing.allocator.free(second_hit);
-    const first_again = try cache.getOrCompute(&budget, std.testing.allocator, first_key, &compute, TestCompute.run);
+    const first_again = try cache.getOrCompute(&budget, std.testing.allocator, first_key, null, &compute, TestCompute.run);
     std.testing.allocator.free(first_again);
 
     const current = cache.stats(&budget);
@@ -502,7 +556,7 @@ pub fn testStatsExpireIdleEntries() !void {
     var compute = TestCompute{ .value = 3 };
     const key: Key = [_]u8{3} ** 32;
 
-    const result = try cache.getOrCompute(&budget, std.testing.allocator, key, &compute, TestCompute.run);
+    const result = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
     std.testing.allocator.free(result);
     const current = cache.stats(&budget);
     try std.testing.expectEqual(@as(usize, 0), current.entries);
@@ -525,7 +579,7 @@ pub fn testStatsBoundExpirationWork() !void {
         var key: Key = [_]u8{0} ** 32;
         key[0] = @intCast(i & 0xff);
         key[1] = @intCast(i >> 8);
-        const result = try cache.getOrCompute(&budget, std.testing.allocator, key, &compute, TestCompute.run);
+        const result = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
         std.testing.allocator.free(result);
     }
     var cursor = cache.oldest;

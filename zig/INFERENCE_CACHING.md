@@ -37,11 +37,12 @@ local fallback budget. The stack-local `SemanticStatusResolver` and
 `ManagedEmbedder.embedQuery`, so waiters do not consume provider rate-limit
 capacity or local inference queue slots.
 
-The cache borrows the API lane's `std.Io` from `BackendRuntime`; it does not
-create or own an executor. This keeps synchronization, shutdown, and runtime
-resource ownership under the server lifecycle. Test or embedded construction
-without a backend runtime uses Zig's explicit global single-threaded I/O
-fallback and does not create a cache-private thread pool.
+The cache and `ManagedEmbedder` provider clients borrow the API lane's `std.Io`
+from `BackendRuntime`; neither creates or owns an executor per request. This
+keeps synchronization, network I/O, shutdown, and runtime resource ownership
+under the server lifecycle. Test or embedded construction without a backend
+runtime uses Zig's explicit global single-threaded I/O fallback and does not
+create a private thread pool.
 
 Cache contents remain process-local. They do not belong in metadata Raft and do
 not require distributed invalidation. Multiple API replicas may each perform
@@ -82,7 +83,9 @@ result and callers cannot mutate cache contents.
 
 Lookup and flight registration occur under one mutex. A miss installs exactly
 one producer before releasing the mutex. Waiters sleep on that flight's
-condition variable and are always broadcast on success or error. Completion of
+completion event and are always released on success or error. Public-query
+waiters stop waiting at their request deadline without canceling a producer
+that may still serve other callers. Completion of
 one key never wakes waiters for unrelated keys. Errors are delivered to current
 waiters but are never cached. Producer computation runs without the cache lock.
 
@@ -138,8 +141,8 @@ or reject admission; resource-pressure observation alone is not enforcement.
 The data-server metrics endpoint exports query-cache hits, misses, coalesced
 waiters, producers, evictions, expirations, rejected admissions, entries, live
 bytes, aggregate producer compute time, and aggregate budget use/rejections.
-The endpoint also reports in-flight admission rejections so operators can
-distinguish upstream saturation from cache-capacity churn.
+The endpoint also reports in-flight admission rejections and waiter timeouts so
+operators can distinguish upstream saturation from cache-capacity churn.
 Metrics snapshots also expire a bounded batch from an idle LRU tail, so a quiet
 node converges without allowing one scrape to monopolize the cache lock. These
 signals distinguish useful reuse from high churn, insufficient capacity, an

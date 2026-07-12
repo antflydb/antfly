@@ -1539,6 +1539,7 @@ pub const AntflyApiHandler = struct {
             create_req.indexes_json orelse tables_api.default_indexes_json,
             .{
                 .antfly_provider = self.api_server.antfly_provider,
+                .io = self.api_server.inferenceIo(),
                 .secret_store = self.api_server.cfg.secret_store,
                 .remote_content = self.api_server.cfg.remote_content,
                 .inference_api_url = self.api_server.configuredInferenceAPIURL(),

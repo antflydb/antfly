@@ -131,6 +131,7 @@ pub const AntflyProvider = struct {
 
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
+    io: ?std.Io = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -359,6 +360,7 @@ fn releaseSharedRequestPacer(scope_key: []const u8) void {
 
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
+    io: ?std.Io = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     provider: ProviderKind,
@@ -859,6 +861,10 @@ fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) void {
     pacer.acquire();
 }
 
+fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
+    return entry.io orelse std.Io.Threaded.global_single_threaded.io();
+}
+
 fn beginEntryPacedRequest(entry: *const ManagedEmbeddingEntry) ?*RequestPacer {
     const pacer = entry.pacer orelse return null;
     if (pacer.capacity <= 1.0) {
@@ -1229,6 +1235,7 @@ fn buildManagedEmbeddingEntry(
 
     return .{
         .alloc = alloc,
+        .io = options.io,
         .index_name = owned_index_name,
         .embedding_name = owned_embedding_name,
         .provider = provider,
@@ -1729,10 +1736,7 @@ fn embedWithEntryParts(
 ) ![]f32 {
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
         waitForEntryPacer(entry);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-
-        var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
         defer http.deinit();
 
         var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
@@ -1764,10 +1768,7 @@ fn embedWithEntryParts(
             return error.UnsupportedEmbeddingProvider;
         }
         waitForEntryPacer(entry);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-
-        var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
         defer http.deinit();
 
         var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -1822,10 +1823,7 @@ fn embedSparseBatchWithEntry(
                 return embeddings;
             }
             waitForEntryPacer(entry);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-
-            var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
             defer http.deinit();
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -2026,10 +2024,7 @@ fn embedBatchWithEntry(
                 return vectors;
             }
             waitForEntryPacer(entry);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-
-            var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
             defer http.deinit();
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -2065,10 +2060,7 @@ fn embedBatchWithBedrock(
         out.deinit(alloc);
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
-    var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), .{ .keep_alive = false });
     defer http.deinit();
 
     var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
@@ -2149,12 +2141,9 @@ fn embedBatchWithOpenAiCompatible(
         },
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     var client = std.http.Client{
         .allocator = alloc,
-        .io = io_impl.io(),
+        .io = embeddingIo(entry),
     };
     defer client.deinit();
 
@@ -2409,13 +2398,17 @@ test "managed embedder parses local antfly and antfly entries from indexes metad
 
 pub fn testQueryEmbeddingCacheKeys() !void {
     var local = TestLocalDenseProvider{ .dimensions = 3 };
-    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+    const test_io = std.Io.Threaded.global_single_threaded.io();
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
         \\{
         \\  "first":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
         \\  "second":{"type":"embeddings","field":"title","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
         \\}
-    , local.provider());
+    , .{ .antfly_provider = local.provider(), .io = test_io });
     defer managed.deinit();
+
+    try std.testing.expect(managed.entries[0].io.?.userdata == test_io.userdata);
+    try std.testing.expect(managed.entries[0].io.?.vtable == test_io.vtable);
 
     const first = try managed.queryCacheKey("first", .principal, "alice", "exact input");
     const equivalent = try managed.queryCacheKey("second", .principal, "alice", "exact input");

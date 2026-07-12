@@ -403,6 +403,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_producers_total", "counter", "Query embedding producer computations", api_request_stats.query_embedding_cache.producer_computations);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_producer_compute_ns_total", "counter", "Nanoseconds spent computing query embedding cache producer results", api_request_stats.query_embedding_cache.producer_compute_ns_total);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight_rejections_total", "counter", "Distinct query embedding misses rejected by the in-flight admission limit", api_request_stats.query_embedding_cache.inflight_rejections);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_waiter_timeouts_total", "counter", "Coalesced query embedding waiters that reached their request deadline", api_request_stats.query_embedding_cache.waiter_timeouts);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight", "gauge", "Distinct query embedding computations currently in flight", api_request_stats.query_embedding_cache.inflight);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight_limit", "gauge", "Maximum distinct query embedding computations allowed in flight", api_request_stats.query_embedding_cache.max_inflight);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_evictions_total", "counter", "Query embedding cache LRU evictions", api_request_stats.query_embedding_cache.evictions);
@@ -15532,6 +15533,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_producer_compute_ns_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_rejections_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_waiter_timeouts_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
