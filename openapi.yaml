@@ -20625,11 +20625,13 @@ components:
         max_bytes_mb:
           type: integer
           description: >
-            Node-wide prompt KV cache budget. Split evenly across loaded generator
+            Node-wide target for live prompt-cache entries. The runtime divides it
 
-            models that hold an active cache, so loading more models does not
+            across participating model caches and evicts using estimated metadata
 
-            multiply retained KV memory.
+            and logical host/device KV bytes. Backend allocators may retain reusable
+
+            capacity, so this is not a hard cap on process or accelerator memory.
           default: 512
         min_tokens:
           type: integer

@@ -109,17 +109,16 @@ pub const PromptCacheConfig = struct {
     min_tokens: usize = 64,
     ttl_ms: u64 = 300_000,
 
-    /// max_bytes_mb is a node-wide budget: each cache gets an even share of it,
-    /// so loading more generator models cannot multiply retained KV memory.
+    /// max_bytes_mb is a node-wide accounting target. ModelManager divides it
+    /// across active caches and reconfigures them together.
     pub fn runtimeConfig(
         self: @This(),
         resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver,
-        active_cache_count: usize,
     ) runtime.kv.prompt_cache.Config {
         return .{
             .enabled = self.enabled,
             .mode = self.mode,
-            .max_bytes = (self.max_bytes_mb * 1024 * 1024) / @max(active_cache_count, 1),
+            .max_bytes = self.max_bytes_mb * 1024 * 1024,
             .min_tokens = self.min_tokens,
             .ttl_ms = self.ttl_ms,
             .resource_usage_observer = resource_usage_observer,
@@ -127,12 +126,55 @@ pub const PromptCacheConfig = struct {
     }
 };
 
-test "prompt cache config splits node budget across active caches" {
+test "prompt cache config reports node target in bytes" {
     const cfg = PromptCacheConfig{ .enabled = true, .max_bytes_mb = 512 };
-    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null, 1).max_bytes);
-    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.runtimeConfig(null, 2).max_bytes);
-    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), cfg.runtimeConfig(null, 4).max_bytes);
-    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null, 0).max_bytes);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null).max_bytes);
+}
+
+test "model manager rebalances every active prompt cache" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
+
+    var first: model_manager_mod.LoadedModel = undefined;
+    first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer first.prompt_prefix_cache.deinit();
+    var second: model_manager_mod.LoadedModel = undefined;
+    second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer second.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "first", &first);
+    try manager.loaded.put(allocator, "second", &second);
+
+    first.prompt_prefix_cache.configure(.{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+    });
+    const first_pool_id = (try first.prompt_prefix_cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const first_sequence_id = try first.prompt_prefix_cache.manager.attachSequence(first_pool_id);
+    try first.prompt_prefix_cache.manager.appendTokens(first_sequence_id, 2);
+    try first.prompt_prefix_cache.storeFromSequence("", &.{ 1, 2 }, first_sequence_id);
+    try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.stats().live_entries);
+
+    manager.rebalancePromptCaches(&second, .{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 2,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), second.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 0), first.prompt_prefix_cache.stats().live_entries);
 }
 
 pub const NodeConfig = struct {
@@ -2644,8 +2686,10 @@ pub const Node = struct {
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
         {
-            const active_cache_count = self.model_manager.activePromptCacheCount(model);
-            model.prompt_prefix_cache.configure(self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer, active_cache_count));
+            self.model_manager.rebalancePromptCaches(
+                model,
+                self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer),
+            );
             const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
                 const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -6272,7 +6316,7 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
     try appendPromMetric(writer, "antfly_inference_prompt_cache_evictions_total", "counter", "Total prompt prefix cache evictions", evictions);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_cached_tokens", "gauge", "Prompt prefix cache retained prompt tokens", cached_tokens);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_live_entries", "gauge", "Prompt prefix cache live entries", live_entries);
-    try appendPromMetric(writer, "antfly_inference_prompt_cache_live_bytes", "gauge", "Prompt prefix cache estimated retained bytes", live_bytes);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_live_bytes", "gauge", "Prompt prefix cache estimated logical bytes", live_bytes);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_hits_total", "counter", "Total block-hash prompt cache hits", block_hash_hits);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_misses_total", "counter", "Total block-hash prompt cache misses", block_hash_misses);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_evictions_total", "counter", "Total block-hash prompt cache evictions", block_hash_evictions);

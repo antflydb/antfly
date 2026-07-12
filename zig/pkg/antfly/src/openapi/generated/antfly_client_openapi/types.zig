@@ -4885,7 +4885,7 @@ pub const InferencePromptCacheConfig = struct {
     enabled: ?bool = null,
     /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
-    /// Node-wide prompt KV cache budget. Split evenly across loaded generator models that hold an active cache, so loading more models does not multiply retained KV memory.
+    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
     max_bytes_mb: ?i64 = null,
     /// Minimum prompt length eligible for prompt KV caching.
     min_tokens: ?i64 = null,

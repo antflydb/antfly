@@ -32,6 +32,7 @@ pub const Mode = enum {
 pub const Config = struct {
     enabled: bool = false,
     mode: Mode = .block_hash,
+    /// Eviction target for estimated logical cache bytes, not an allocator/RSS cap.
     max_bytes: usize = 512 * 1024 * 1024,
     min_tokens: usize = 64,
     ttl_ms: u64 = 300_000,
@@ -552,8 +553,28 @@ pub const PromptPrefixCache = struct {
             namespace_len +
             token_count * @sizeOf(i64) +
             (block_count + storage_block_count) * @sizeOf(block.KvBlockId);
-        const cfg = self.pool_config orelse return metadata_bytes;
-        return metadata_bytes + token_count * cfg.num_layers_packed * cfg.bytesPerTokenPair();
+        const pool_id = self.pool_id orelse return metadata_bytes;
+        const manager_pool = self.manager.getPool(pool_id) orelse return metadata_bytes;
+        var kv_bytes: usize = if (manager_pool.config.store_cpu_bytes)
+            block_count * manager_pool.bytesPerBlock()
+        else
+            0;
+        if (self.storage) |*storage| {
+            const storage_pool = &storage.storage;
+            if (storage_pool.config.store_cpu_bytes) {
+                kv_bytes += storage_block_count * storage_pool.bytesPerBlock();
+            }
+            if (storage.device_write_hook != null) {
+                // Device formats and allocator capacity vary by backend. Use
+                // f32 K+V per logical block as the accounting estimate.
+                kv_bytes += storage_block_count *
+                    @as(usize, storage_pool.config.num_layers_packed) *
+                    @as(usize, storage_pool.config.page_size_tokens) *
+                    (storage_pool.config.keyValuesPerToken() + storage_pool.config.valueValuesPerToken()) *
+                    @sizeOf(f32);
+            }
+        }
+        return metadata_bytes + kv_bytes;
     }
 
     fn expireOld(self: *PromptPrefixCache) void {
@@ -917,6 +938,61 @@ test "prompt cache attaches longest retained prefix with storage runtime" {
 
     try cache.manager.releaseSequence(hit.sequence_id);
     try storage.releaseSequence(hit.sequence_id);
+}
+
+test "prompt cache estimates GPU host and device KV copies" {
+    const TestHook = struct {
+        fn write(
+            _: *anyopaque,
+            _: storage_runtime_mod.KvSuffixWrite,
+            _: storage_runtime_mod.DeviceKvRef,
+            _: storage_runtime_mod.DeviceKvRef,
+        ) anyerror!void {}
+
+        fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+
+        const vtable: storage_runtime_mod.DeviceWriteHook.VTable = .{
+            .writeLayerKvSuffix = write,
+            .deinit = deinit,
+        };
+    };
+
+    const allocator = std.testing.allocator;
+    const pool_config = pool_mod.KvPoolConfig{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+    var cache = PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2, .max_bytes = 1 << 20 });
+
+    const storage = (try cache.ensureStorage(pool_config)).?.storage;
+    var hook_context: u8 = 0;
+    storage.setDeviceWriteHook(.{ .ctx = &hook_context, .vtable = &TestHook.vtable });
+    const pool_id = cache.pool_id.?;
+    const sequence_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(sequence_id, 2);
+    const storage_sequence_id = try storage.attachSequence(storage.poolId());
+    try std.testing.expectEqual(sequence_id, storage_sequence_id);
+    try storage.appendTokens(storage_sequence_id, 2);
+    try cache.storeFromSequence("gpu", &.{ 1, 2 }, sequence_id);
+
+    const metadata_bytes = @sizeOf(Entry) + "gpu".len + 2 * @sizeOf(i64) + 2 * @sizeOf(block.KvBlockId);
+    const block_bytes = @as(usize, pool_config.num_layers_packed) *
+        @as(usize, pool_config.page_size_tokens) *
+        pool_config.bytesPerTokenPair();
+    const expected_bytes = metadata_bytes + 3 * block_bytes;
+    try std.testing.expectEqual(expected_bytes, cache.stats().live_bytes);
+
+    var tighter = cache.config;
+    tighter.max_bytes = metadata_bytes + 2 * block_bytes;
+    cache.configure(tighter);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_bytes);
 }
 
 test "prompt cache block hash isolates namespaces" {
