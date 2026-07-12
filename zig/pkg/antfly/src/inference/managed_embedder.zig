@@ -57,6 +57,16 @@ pub const ProviderKind = enum {
     antfly,
 };
 
+pub const EmbeddingRequestContext = struct {
+    io: std.Io,
+    deadline_ns: ?u64,
+
+    pub fn check(self: EmbeddingRequestContext) !void {
+        const deadline = self.deadline_ns orelse return;
+        if (monotonicNowNs() >= deadline) return error.Timeout;
+    }
+};
+
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
     embed_dense_texts: *const fn (
@@ -65,6 +75,13 @@ pub const AntflyProvider = struct {
         model: []const u8,
         texts: []const []const u8,
     ) anyerror![][]f32,
+    embed_dense_texts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        context: EmbeddingRequestContext,
+    ) anyerror![][]f32 = null,
     embed_sparse_texts: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -76,6 +93,13 @@ pub const AntflyProvider = struct {
         alloc: std.mem.Allocator,
         model: []const u8,
         parts: []const template_mod.ContentPart,
+    ) anyerror![][]f32 = null,
+    embed_dense_parts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        parts: []const template_mod.ContentPart,
+        context: EmbeddingRequestContext,
     ) anyerror![][]f32 = null,
     rerank_texts: ?*const fn (
         ptr: *anyopaque,
@@ -686,6 +710,7 @@ pub const ManagedEmbedder = struct {
     ) ![32]u8 {
         const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse or entry.multimodal) return error.QueryEmbeddingNotCacheable;
+        if (entry.secret_store) |store| _ = try store.refreshIfChanged();
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hashQueryCacheField(&hasher, "antfly-query-embedding-v1");
@@ -849,6 +874,10 @@ fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
     return entry.io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
+fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequestContext {
+    return .{ .io = embeddingIo(entry), .deadline_ns = entry.deadline_ns };
+}
+
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
     const deadline = entry.deadline_ns orelse return;
     if (monotonicNowNs() >= deadline) return error.Timeout;
@@ -896,6 +925,50 @@ pub fn testEmbeddingProviderDeadlines() !void {
     try std.testing.expectEqual(@as(usize, 4 << 20), config.max_response_size);
     try std.testing.expect(config.timeouts.request_ms > 0);
     try std.testing.expect(config.timeouts.request_ms <= 5_000);
+
+    const Local = struct {
+        context_calls: usize = 0,
+
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn denseWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expect(context.deadline_ns != null);
+            self.context_calls += 1;
+            const vectors = try alloc.alloc([]f32, texts.len);
+            errdefer alloc.free(vectors);
+            var initialized: usize = 0;
+            errdefer for (vectors[0..initialized]) |vector| alloc.free(vector);
+            for (vectors) |*vector| {
+                vector.* = try alloc.dupe(f32, &.{ 1, 2, 3 });
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var local = Local{};
+    var deadline_aware = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"}}}
+    , .{
+        .antfly_provider = .{
+            .ptr = &local,
+            .embed_dense_texts = Local.dense,
+            .embed_dense_texts_with_context = Local.denseWithContext,
+            .embed_sparse_texts = Local.sparse,
+        },
+        .deadline_ns = monotonicNowNs() + std.time.ns_per_s,
+    });
+    defer deadline_aware.deinit();
+    const local_vector = try deadline_aware.embedQuery(std.testing.allocator, "semantic_idx", "deadline aware");
+    defer std.testing.allocator.free(local_vector);
+    try std.testing.expectEqual(@as(usize, 1), local.context_calls);
 }
 
 pub fn testEmbeddingProviderResultValidation() !void {
@@ -1828,8 +1901,14 @@ fn embedWithEntryParts(
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
                 try waitForEntryPacer(entry);
-                const vectors = try embed_parts(local.ptr, alloc, entry.model, parts);
+                const context = embeddingRequestContext(entry);
+                try context.check();
+                const vectors = if (local.embed_dense_parts_with_context) |embed_parts_with_context|
+                    try embed_parts_with_context(local.ptr, alloc, entry.model, parts, context)
+                else
+                    try embed_parts(local.ptr, alloc, entry.model, parts);
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+                try context.check();
                 if (vectors.len == 0) return error.EmptyEmbeddingResponse;
                 if (vectors.len != 1) return error.InvalidEmbeddingResponse;
                 try validateDenseVector(vectors[0], dims);
@@ -2093,8 +2172,17 @@ fn embedBatchWithEntry(
         .antfly => {
             if (entry.antfly_provider) |local| {
                 try waitForEntryPacer(entry);
-                const vectors = try local.embed_dense_texts(local.ptr, alloc, entry.model, texts);
+                const context = embeddingRequestContext(entry);
+                try context.check();
+                const vectors = if (local.embed_dense_texts_with_context) |embed_with_context|
+                    try embed_with_context(local.ptr, alloc, entry.model, texts, context)
+                else
+                    try local.embed_dense_texts(local.ptr, alloc, entry.model, texts);
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+                context.check() catch |err| {
+                    db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+                    return err;
+                };
                 try validateDenseBatch(vectors, texts.len, dims);
                 return vectors;
             }
@@ -2132,22 +2220,10 @@ fn embedBatchWithBedrock(
         out.deinit(alloc);
     }
 
-    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
-    defer http.deinit();
-
-    var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
-        .region = entry.region,
-        .endpoint = entry.base_url,
-        .input_type = entry.input_type,
-        .truncate = entry.truncate,
-        .dimension = dims,
-    }, &@constCast(entry).bedrock_credentials);
-    defer provider.deinit();
-
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = @min(texts.len, offset + max_batch);
-        const vectors = try embedBatchWithBedrockRequest(alloc, entry, &provider, texts[offset..end], dims);
+        const vectors = try embedBatchWithBedrockRequest(alloc, entry, texts[offset..end], dims);
         errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
         try out.ensureUnusedCapacity(alloc, vectors.len);
         for (vectors) |vector| out.appendAssumeCapacity(vector);
@@ -2160,11 +2236,20 @@ fn embedBatchWithBedrock(
 fn embedBatchWithBedrockRequest(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
-    provider: *bedrock_provider.Provider,
     texts: []const []const u8,
     dims: u32,
 ) ![]const []const f32 {
     try waitForEntryPacer(entry);
+    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer http.deinit();
+    var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
+        .region = entry.region,
+        .endpoint = entry.base_url,
+        .input_type = entry.input_type,
+        .truncate = entry.truncate,
+        .dimension = dims,
+    }, &@constCast(entry).bedrock_credentials);
+    defer provider.deinit();
     var result = try provider.embedText(alloc, entry.model, texts);
     errdefer result.deinit();
     try validateDenseBatch(result.vectors, texts.len, dims);
@@ -2210,9 +2295,6 @@ fn embedBatchWithOpenAiCompatible(
         },
     };
 
-    var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
-    defer client.deinit();
-
     var input_array = std.json.Array.init(alloc);
     defer input_array.deinit();
     for (texts) |text| try input_array.append(.{ .string = text });
@@ -2240,6 +2322,9 @@ fn embedBatchWithOpenAiCompatible(
     }
 
     try waitForEntryPacer(entry);
+
+    var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer client.deinit();
 
     var response = try client.post(url, .{
         .json = json_body,
@@ -2873,8 +2958,12 @@ pub fn testFileBackedApiKeyRotation() !void {
     , .{base_uri});
     defer alloc.free(indexes_json);
 
-    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{ .secret_store = &secret_store });
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{
+        .secret_store = &secret_store,
+        .deadline_ns = monotonicNowNs() + 30 * std.time.ns_per_s,
+    });
     defer managed.deinit();
+    const first_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
 
     const first = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
     defer alloc.free(first);
@@ -2884,6 +2973,9 @@ pub fn testFileBackedApiKeyRotation() !void {
         .sub_path = store_path,
         .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"second-key-longer\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
     });
+
+    const rotated_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+    try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &rotated_cache_key));
 
     const second = try managed.embedQuery(alloc, "semantic_idx", "beta concept");
     defer alloc.free(second);

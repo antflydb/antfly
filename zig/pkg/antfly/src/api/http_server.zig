@@ -149,6 +149,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
     server: *ApiHttpServer,
     source: table_reads.TableReadSource,
     table_name: []const u8,
+    query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope = .{ .domain = .internal, .value = "" },
 
     pub fn iface(self: *@This()) query_builder_agent.QueryBuilderRuntimeQueryRequestValidator {
         return .{
@@ -166,7 +167,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
     ) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var semantic_resolver = self.server.semanticStatusResolver(.internal, "");
+        var semantic_resolver = self.server.semanticStatusResolver(self.query_embedding_security_scope.domain, self.query_embedding_security_scope.value);
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -196,7 +197,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
-        var semantic_resolver = self.server.semanticStatusResolver(.internal, "");
+        var semantic_resolver = self.server.semanticStatusResolver(self.query_embedding_security_scope.domain, self.query_embedding_security_scope.value);
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -312,6 +313,7 @@ pub const SemanticStatusResolver = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    secret_store: ?*common_secrets.FileStore = null,
     query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
@@ -346,6 +348,7 @@ pub const SemanticStatusResolver = struct {
             .remote_content = self.remote_content,
             .inference_api_url = self.inference_api_url,
             .inference_api_key = self.inference_api_key,
+            .secret_store = self.secret_store,
             .query_embedding_cache = self.query_embedding_cache,
             .query_embedding_budget = self.query_embedding_budget,
             .query_embedding_security_domain = self.query_embedding_security_domain,
@@ -1312,6 +1315,7 @@ pub const ApiHttpServer = struct {
             .remote_content = self.cfg.remote_content,
             .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
+            .secret_store = self.cfg.secret_store,
             .query_embedding_cache = &self.query_embedding_cache,
             .query_embedding_budget = self.inferenceCacheBudget(),
             .query_embedding_security_domain = security_domain,
@@ -2255,10 +2259,10 @@ pub const ApiHttpServer = struct {
             return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) {
-            return try protocol_adapters.handleA2aRequest(self, req);
+            return try protocol_adapters.handleA2aRequest(self, req, queryEmbeddingSecurityScope(authenticated_identity));
         }
         if (req.method == .GET and (std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card_legacy) or std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card))) {
-            return try protocol_adapters.handleA2aCard(self);
+            return try protocol_adapters.handleA2aCard(self, queryEmbeddingSecurityScope(null));
         }
         return null;
     }
@@ -2509,12 +2513,12 @@ pub const ApiHttpServer = struct {
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
     }
 
-    const QueryEmbeddingSecurityScope = struct {
+    pub const QueryEmbeddingSecurityScope = struct {
         domain: managed_embedder.QueryCacheSecurityDomain,
         value: []const u8,
     };
 
-    fn queryEmbeddingSecurityScope(authenticated_identity: ?AuthenticatedIdentity) QueryEmbeddingSecurityScope {
+    pub fn queryEmbeddingSecurityScope(authenticated_identity: ?AuthenticatedIdentity) QueryEmbeddingSecurityScope {
         if (authenticated_identity) |identity| return .{ .domain = .principal, .value = identity.username };
         return .{ .domain = .anonymous, .value = "" };
     }
@@ -3200,6 +3204,7 @@ pub const ApiHttpServer = struct {
                         .server = self,
                         .source = reads,
                         .table_name = table_name,
+                        .query_embedding_security_scope = queryEmbeddingSecurityScope(authenticated_identity),
                     };
                     table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
                 }
@@ -3671,6 +3676,24 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    fn internalQueryPlanningContext(self: *ApiHttpServer) ?http_internal_group_read_routes.QueryPlanningContext {
+        return .{
+            .ptr = self.source.ptr,
+            .admin_snapshot = self.source.vtable.admin_snapshot orelse return null,
+            .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return null,
+            .antfly_provider = self.antfly_provider,
+            .io = self.inferenceIo(),
+            .remote_content = self.cfg.remote_content,
+            .inference_api_url = self.configuredInferenceAPIURL(),
+            .inference_api_key = self.cfg.inference_api_key,
+            .secret_store = self.cfg.secret_store,
+            .query_embedding_cache = &self.query_embedding_cache,
+            .query_embedding_budget = self.inferenceCacheBudget(),
+            .query_embedding_security_domain = .internal,
+            .query_embedding_security_scope = "",
+        };
+    }
+
     fn internalRoutesContext(self: *ApiHttpServer, uri_parts: UriParts) http_internal_routes.Context {
         return .{
             .alloc = self.alloc,
@@ -3688,6 +3711,7 @@ pub const ApiHttpServer = struct {
                     .ptr = self,
                     .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
                 },
+                .query_planning = self.internalQueryPlanningContext(),
             },
             .join_ctx = self.joinContext(),
             .join_job_store = &self.join_job_store,
@@ -3721,6 +3745,7 @@ pub const ApiHttpServer = struct {
         task_id: []const u8,
         context_id: []const u8,
         queue: *a2a.EventQueue,
+        query_embedding_security_scope: QueryEmbeddingSecurityScope,
     ) !void {
         const source = self.table_reads orelse {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
@@ -3730,6 +3755,7 @@ pub const ApiHttpServer = struct {
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
+            query_embedding_security_scope: QueryEmbeddingSecurityScope,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -3748,7 +3774,10 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "");
+                var semantic_resolver = runner.server.semanticStatusResolver(
+                    runner.query_embedding_security_scope.domain,
+                    runner.query_embedding_security_scope.value,
+                );
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -3807,6 +3836,7 @@ pub const ApiHttpServer = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
+            io: std.Io,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -3822,18 +3852,22 @@ pub const ApiHttpServer = struct {
                 messages: []const generating_runtime.ChatMessage,
             ) !generating_runtime.GenerateResult {
                 const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                var client = httpx.Client.initWithConfig(inner_alloc, io_impl.io(), .{ .keep_alive = false });
+                var client = httpx.Client.initWithConfig(inner_alloc, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
+        var generation_runner = RetrievalGenerationRunner{
+            .antfly_provider = self.antfly_provider,
+            .secret_store = self.cfg.secret_store,
+            .inference_api_key = self.cfg.inference_api_key,
+            .io = self.inferenceIo(),
+        };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
             .source = source,
+            .query_embedding_security_scope = query_embedding_security_scope,
         };
 
         const RetrievalA2aSink = struct {
@@ -5920,7 +5954,12 @@ pub const ApiHttpServer = struct {
         }
 
         self.recordHandledRequest();
-        return try protocol_adapters.handleA2aStreamingRequest(self, req, writer);
+        return try protocol_adapters.handleA2aStreamingRequest(
+            self,
+            req,
+            writer,
+            queryEmbeddingSecurityScope(authenticated_identity),
+        );
     }
 
     pub fn tableApi(self: *ApiHttpServer) public_table_http.TableApi {
@@ -6177,6 +6216,12 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.QueryEmbeddingInputTooLarge,
+            error.QueryEmbeddingOverloaded,
+            error.EmbedRateLimited,
+            error.EmbedTransientFailure,
+            error.EmbedUpstreamFailure,
+            => return err,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -6194,6 +6239,7 @@ pub const ApiHttpServer = struct {
         if (std.mem.indexOf(u8, body, "\"join\"") == null and
             std.mem.indexOf(u8, body, "\"foreign_sources\"") == null and
             (std.mem.indexOf(u8, body, "\"full_text_search\"") != null or
+                std.mem.indexOf(u8, body, "\"semantic_search\"") != null or
                 std.mem.indexOf(u8, body, "\"embeddings\"") != null or
                 std.mem.indexOf(u8, body, "\"filter_query\"") != null or
                 std.mem.indexOf(u8, body, "\"exclusion_query\"") != null))
@@ -6211,6 +6257,7 @@ pub const ApiHttpServer = struct {
         if (jsonObjectHasNonNullField(object, "foreign_sources")) return false;
         return public_search_request.looksLikePublicSearchRequest(parsed.value) or
             jsonObjectHasNonNullField(object, "full_text_search") or
+            jsonObjectHasNonNullField(object, "semantic_search") or
             jsonObjectHasNonNullField(object, "embeddings") or
             jsonObjectHasNonNullField(object, "filter_query") or
             jsonObjectHasNonNullField(object, "exclusion_query");
@@ -11863,6 +11910,11 @@ test "api http query parsing preserves operational embedding failures" {
 }
 
 test "api http retryable embedding failures provide retry guidance" {
+    try std.testing.expect(try ApiHttpServer.shouldDispatchPlainPublicSearch(
+        std.testing.allocator,
+        "{\"semantic_search\":\"bounded failure mapping\",\"indexes\":[\"semantic_idx\"]}",
+    ));
+
     var response = try retryableTextResponse(std.testing.allocator, 429, "query embedding overloaded");
     defer response.deinit(std.testing.allocator);
 

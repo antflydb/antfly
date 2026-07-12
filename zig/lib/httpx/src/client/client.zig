@@ -511,6 +511,63 @@ pub const Client = struct {
 
     /// Executes the actual HTTP request.
     fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
+        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
+        if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms);
+
+        const RequestResult = anyerror!Response;
+        const TimeoutResult = anyerror!void;
+        const SelectResult = union(enum) {
+            request: RequestResult,
+            timeout: TimeoutResult,
+        };
+        const Task = struct {
+            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64) RequestResult {
+                return client.executeRequestWithRetries(request_value, socket_timeout_ms);
+            }
+
+            fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
+                return timeout.sleep(io);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .request => |request_result| {
+                        if (request_result) |response_value| {
+                            var response = response_value;
+                            response.deinit();
+                        } else |_| {}
+                    },
+                    .timeout => {},
+                }
+            }
+        };
+
+        var select_buffer: [2]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms });
+        select.async(.timeout, Task.timeoutTask, .{
+            self.io,
+            Io.Timeout{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+                .clock = .awake,
+            } },
+        });
+
+        const first = try select.await();
+        switch (first) {
+            .request => |request_result| {
+                select.cancelDiscard();
+                return try request_result;
+            },
+            .timeout => |timeout_result| {
+                try timeout_result;
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                return error.Timeout;
+            },
+        }
+    }
+
+    fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
@@ -1137,7 +1194,12 @@ pub const Client = struct {
         }
 
         const h2_headers = try H2Connection.buildRequestHeaders(
-            method_str, path, scheme, authority, extra.items, self.allocator,
+            method_str,
+            path,
+            scheme,
+            authority,
+            extra.items,
+            self.allocator,
         );
         defer self.allocator.free(h2_headers);
 
@@ -1367,7 +1429,12 @@ pub const Client = struct {
         }
 
         const h2_headers = try H2Connection.buildRequestHeaders(
-            method_str, path, scheme, authority, extra.items, self.allocator,
+            method_str,
+            path,
+            scheme,
+            authority,
+            extra.items,
+            self.allocator,
         );
         defer self.allocator.free(h2_headers);
 
@@ -2152,7 +2219,6 @@ pub const Client = struct {
     }
 };
 
-
 test "Client initialization" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator, std.testing.io);
@@ -2754,7 +2820,6 @@ test "HTTPS client round trip via local TLS server" {
     try std.testing.expect(std.mem.indexOf(u8, request, expected_host) != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "Connection: close\r\n") != null);
 }
-
 
 test "HTTPS client handles chunked gzip body via local TLS server" {
     const allocator = std.testing.allocator;

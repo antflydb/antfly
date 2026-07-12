@@ -63,6 +63,7 @@ The key is a SHA-256 digest of the effective operation:
 - output dimensions;
 - input type and truncation behavior;
 - provider credential identity;
+- refreshed file-backed secret-store generation when applicable;
 - exact input bytes.
 
 Table and index names are omitted, allowing equivalent embedding
@@ -72,6 +73,11 @@ full-text clauses are also omitted because they do not affect the vector.
 Authenticated requests use a principal scope. Anonymous and internal work use
 different domain tags, so a username cannot collide with either namespace.
 Callers never supply the complete cache namespace.
+
+File-backed stores are refreshed before reading their generation for a cache
+key. A rotated credential therefore changes the key before a hot sliding-TTL
+entry can be reused; the previous entry ages out normally without exposing
+secret material.
 
 Text is not trimmed, lowercased, or whitespace-normalized. Those changes can
 alter tokenizer output. Templated and multimodal queries currently bypass the
@@ -108,6 +114,13 @@ embedded runtime's cancellation contract, but its result is never allowed to
 extend a waiter's deadline. Completion of one key never wakes waiters for
 unrelated keys. Errors are delivered to current waiters but are never cached.
 Producer computation runs without the cache lock.
+
+Remote HTTP `request_ms` is enforced as an absolute operation timer around
+retries and response-body reads, in addition to socket inactivity timeouts.
+Paced multi-request batches recompute transport timeouts after each pacing wait
+from the remaining absolute deadline. Embedded providers receive an explicit
+deadline-aware request context, and the production adapter checks it before
+and after local execution.
 
 When a query does not provide `timeout_ms`, query embedding planning, provider
 pacing, and provider transport receive a 30-second default deadline. Explicit
@@ -152,6 +165,16 @@ bypass provider protection by selecting an uncached request shape. Public
 overload, provider rate-limit, and transient provider responses include a short
 `Retry-After` hint so clients can back off instead of immediately amplifying
 pressure.
+
+Internal group query and preflight routes use the same server-owned planning
+context as public queries: backend-runtime I/O, cache and singleflight,
+`max_inflight`, provider and remote-content configuration, secret refresh, and
+the default provider deadline all apply. Internal callers share a dedicated
+internal security domain rather than any public principal namespace.
+
+Authenticated query-builder validation and retrieval-agent execution derive
+their cache namespace from the authenticated principal. Anonymous, principal,
+and trusted internal work cannot share cache entries or in-flight results.
 
 Plain and templated semantic query text is limited to 1 MiB of UTF-8 input, and
 user-supplied embedding templates are limited to 64 KiB. Both limits are checked

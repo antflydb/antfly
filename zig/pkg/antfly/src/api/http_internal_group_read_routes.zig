@@ -19,6 +19,7 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const cache_budget = @import("../common/cache_budget.zig");
+const common_secrets = @import("../common/secrets.zig");
 const platform_time = @import("../platform/time.zig");
 const scraping = @import("antfly_scraping");
 const db_mod = @import("../storage/db/mod.zig");
@@ -91,6 +92,16 @@ pub const Context = struct {
     reads: ?table_reads.TableReadSource,
     catalog: CatalogSource,
     query_router: QueryRouter,
+    query_planning: ?QueryPlanningContext = null,
+
+    fn queryPlanning(self: Context) ?QueryPlanningContext {
+        if (self.query_planning) |planning| return planning;
+        return .{
+            .ptr = self.catalog.ptr,
+            .admin_snapshot = self.catalog.admin_snapshot orelse return null,
+            .free_admin_snapshot = self.catalog.free_admin_snapshot orelse return null,
+        };
+    }
 };
 
 pub const QueryPlanningContext = struct {
@@ -102,6 +113,7 @@ pub const QueryPlanningContext = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    secret_store: ?*common_secrets.FileStore = null,
     query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
@@ -195,6 +207,7 @@ pub fn planSemanticQuery(
         .remote_content = planning.remote_content,
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,
+        .secret_store = planning.secret_store,
     });
     defer runtime.deinit();
 
@@ -368,7 +381,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
 }
 
 const SemanticStatusResolver = struct {
-    catalog: CatalogSource,
+    planning: QueryPlanningContext,
 
     fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -389,12 +402,7 @@ const SemanticStatusResolver = struct {
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
-        return try planSemanticQuery(.{
-            .ptr = self.catalog.ptr,
-            .admin_snapshot = self.catalog.admin_snapshot orelse return error.UnsupportedQueryRequest,
-            .free_admin_snapshot = self.catalog.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
-            .antfly_provider = null,
-        }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        return try planSemanticQuery(self.planning, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
 };
 
@@ -666,7 +674,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
         }
         if (routes.Routes.matchGroupQuery(path)) |query_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var semantic_resolver = SemanticStatusResolver{ .catalog = ctx.catalog };
+            var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() orelse return try http_route_helpers.textResponse(alloc, 400, "UnsupportedQueryRequest") };
             var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), query_route.table_name, req.body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 else => return err,
@@ -741,7 +749,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             const preflight_req = try parseQueryPreflightRequest(alloc, req.body);
             defer alloc.free(preflight_req.query_request_body);
-            var semantic_resolver = SemanticStatusResolver{ .catalog = ctx.catalog };
+            var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() orelse return try http_route_helpers.textResponse(alloc, 400, "UnsupportedQueryRequest") };
             var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), query_route.table_name, preflight_req.query_request_body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 else => return err,
