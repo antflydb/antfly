@@ -64,7 +64,12 @@ the admission-critical publication path.
 capability and rejects a path that is not the capability's staging root. Raw
 path possession is therefore insufficient to mutate a serving root. Startup,
 provisioning, and API restore entry points all acquire their capability through
-the same process generation-lifecycle manager. This includes the embedded
+the same process generation-lifecycle manager. `TableWriteSource.restoreTable()`
+acquires and releases the table-level restore reservation itself, so direct
+callers cannot omit write fencing. Cluster restore, which must hold that
+reservation across metadata replacement and remote snapshot staging, uses the
+explicit `restoreTableReserved()` operation while retaining the same reservation.
+This includes the embedded
 `BoundTableWriteSource`: it closes its current owner, restores into a sibling
 generation, publishes atomically, and reopens either the unchanged live
 generation after a pre-commit failure or the newly published generation after

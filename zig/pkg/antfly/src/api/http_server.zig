@@ -5593,7 +5593,7 @@ pub const ApiHttpServer = struct {
         while (restore_attempt < 3) : (restore_attempt += 1) {
             const start_ns = platform_time.monotonicNs();
             while (true) {
-                if ((table_writes_source.restoreTable(self.alloc, table_name, .{
+                if ((table_writes_source.restoreTableReserved(self.alloc, table_name, .{
                     .backup_root = local_backup_root,
                     .manifest = &manifest,
                     .source_location = source_location,

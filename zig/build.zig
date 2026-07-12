@@ -4329,6 +4329,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "coverage policy accepts only the public embeddings contract",
             "coverage policy assigns persistent private incarnations only to embeddings",
+            "restore manifest preserves trusted coverage incarnation metadata",
             "public index config encoders redact coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "derived coverage aggregation rejects mixed config observations",
@@ -4361,6 +4362,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_restore_repeat_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",

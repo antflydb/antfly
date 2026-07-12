@@ -3182,6 +3182,21 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         plan: backups_api.TableRestorePlan,
     ) !?void {
+        const lifecycle_active = try self.beginRestoreLifecycle(table_name);
+        defer if (lifecycle_active) self.finishRestoreLifecycle(table_name);
+        return try self.restoreTableReserved(alloc, table_name, plan);
+    }
+
+    /// Executes restore work under a lifecycle reservation already held by the
+    /// caller. Coordinators use this when the reservation must span metadata
+    /// replacement or remote snapshot staging; ordinary callers should use
+    /// restoreTable so write fencing cannot be omitted.
+    pub fn restoreTableReserved(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
         const fn_ptr = self.vtable.restore_table orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, plan);
     }
@@ -9268,7 +9283,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableRestorePlan,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.restoreTable(alloc, table_name, plan);
+        if (self.localWriteOwnerSource()) |owner| return try owner.restoreTableReserved(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         try backups_api.validateRestorableManifestLayout(plan.manifest);
 
@@ -22558,6 +22573,86 @@ test "provisioned table write source serializes same-table same-group operations
     defer source.endGroupOperation("docs", 7001);
 
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+}
+
+test "table write source restore acquires lifecycle unless caller reserves it" {
+    const Context = struct {
+        lifecycle_active: bool = false,
+        begin_count: usize = 0,
+        finish_count: usize = 0,
+        restore_count: usize = 0,
+
+        fn source(self: *@This()) TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .restore_table = restoreTable,
+                    .begin_restore_lifecycle = beginRestore,
+                    .finish_restore_lifecycle = finishRestore,
+                    .batch = batch,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedBatch;
+        }
+
+        fn beginRestore(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!self.lifecycle_active);
+            self.lifecycle_active = true;
+            self.begin_count += 1;
+        }
+
+        fn finishRestore(ptr: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.lifecycle_active);
+            self.lifecycle_active = false;
+            self.finish_count += 1;
+        }
+
+        fn restoreTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: backups_api.TableRestorePlan,
+        ) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.lifecycle_active);
+            self.restore_count += 1;
+        }
+    };
+
+    const manifest = backups_api.TableBackupManifest{
+        .backup_id = "backup",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "{}",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = &.{},
+    };
+    const plan = backups_api.TableRestorePlan{
+        .backup_root = "/tmp/unused-antfly-automatic-restore-lifecycle",
+        .manifest = &manifest,
+    };
+
+    var context = Context{};
+    const source = context.source();
+    _ = try source.restoreTable(std.testing.allocator, "docs", plan);
+    try std.testing.expect(!context.lifecycle_active);
+    try std.testing.expectEqual(@as(usize, 1), context.begin_count);
+    try std.testing.expectEqual(@as(usize, 1), context.finish_count);
+    try std.testing.expectEqual(@as(usize, 1), context.restore_count);
+
+    try std.testing.expect(try source.beginRestoreLifecycle("docs"));
+    _ = try source.restoreTableReserved(std.testing.allocator, "docs", plan);
+    source.finishRestoreLifecycle("docs");
+    try std.testing.expectEqual(@as(usize, 2), context.begin_count);
+    try std.testing.expectEqual(@as(usize, 2), context.finish_count);
+    try std.testing.expectEqual(@as(usize, 2), context.restore_count);
 }
 
 test "provisioned table restore preparation blocks writes and competing structural mutation" {

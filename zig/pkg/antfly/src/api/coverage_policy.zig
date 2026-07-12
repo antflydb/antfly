@@ -26,7 +26,7 @@ pub fn validateIndexConfig(value: std.json.Value) !void {
     return try validateIndexConfigWithPrivateFields(value, false);
 }
 
-fn validateStoredIndexConfig(value: std.json.Value) !void {
+pub fn validateStoredIndexConfig(value: std.json.Value) !void {
     return try validateIndexConfigWithPrivateFields(value, true);
 }
 

@@ -1172,7 +1172,7 @@ pub fn findClusterTable(
 
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-    try tables_api.validateIndexesJson(alloc, manifest.indexes_json);
+    try tables_api.validateStoredIndexesJson(alloc, manifest.indexes_json);
     return .{
         .description = if (manifest.description.len > 0) try alloc.dupe(u8, manifest.description) else null,
         .indexes_json = try alloc.dupe(u8, manifest.indexes_json),
@@ -1976,4 +1976,28 @@ test "derive restore table record returns owned table metadata" {
     try std.testing.expectEqualStrings("{\"default_type\":\"doc\"}", table.schema_json);
     try std.testing.expectEqualStrings("{\"full_text_index_v0\":{\"type\":\"full_text\"}}", table.indexes_json);
     try std.testing.expectEqual(@as(u32, 1), table.min_ranges);
+}
+
+test "restore manifest preserves trusted coverage incarnation metadata" {
+    const manifest = TableBackupManifest{
+        .backup_id = "snap",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "{}",
+        .read_schema_json = "",
+        .indexes_json = "{\"semantic\":{\"type\":\"embeddings\",\"dimension\":3,\"_coverage_incarnation\":42}}",
+        .replication_sources_json = "[]",
+        .shards = &.{},
+    };
+
+    var request = try createTableRequestFromManifest(std.testing.allocator, &manifest);
+    defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(manifest.indexes_json, request.indexes_json.?);
+
+    var invalid = manifest;
+    invalid.indexes_json = "{\"full_text\":{\"type\":\"full_text\",\"_coverage_incarnation\":42}}";
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        createTableRequestFromManifest(std.testing.allocator, &invalid),
+    );
 }
