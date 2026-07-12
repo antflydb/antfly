@@ -721,10 +721,7 @@ pub fn handleTableBackup(
 }
 
 fn parseBackupFormat(value: ?[]const u8) !backups_api.BackupFormat {
-    const format = value orelse return .native;
-    if (std.mem.eql(u8, format, "native")) return .native;
-    if (std.mem.eql(u8, format, "portable")) return .portable;
-    return error.UnsupportedBackupFormat;
+    return backups_api.parseBackupFormat(value);
 }
 
 pub fn handleTableRestore(

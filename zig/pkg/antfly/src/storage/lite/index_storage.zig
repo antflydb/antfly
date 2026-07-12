@@ -80,6 +80,12 @@ fn lockStore(store: *docstore.Store) void {
     platform_sync.lockYielding(&store.mutex);
 }
 
+fn pinCheckpoint(store: *docstore.Store) native.CheckpointSlot {
+    lockStore(store);
+    defer store.mutex.unlock();
+    return store.file.activeCheckpoint();
+}
+
 fn pathContains(prefix: []const u8, path: []const u8) bool {
     if (prefix.len == 0) return true;
     if (!std.mem.startsWith(u8, path, prefix)) return false;
@@ -104,10 +110,12 @@ fn validateIndexPath(self: *const Store, path: []const u8) !void {
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
+    const io = self.docs.file.io_impl.io();
+    self.docs.generation_lock.lockSharedUncancelable(io);
+    defer self.docs.generation_lock.unlockShared(io);
+    const checkpoint = pinCheckpoint(self.docs);
 
-    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(allocator, path)) orelse return error.FileNotFound;
+    const stored = (try self.docs.file.getIndexCatalogRecordAtCheckpointAlloc(allocator, path, checkpoint)) orelse return error.FileNotFound;
     errdefer allocator.free(stored);
     if (stored.len > max_bytes) return error.FileTooBig;
     return stored;
@@ -116,31 +124,37 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
+    const io = self.docs.file.io_impl.io();
+    self.docs.generation_lock.lockSharedUncancelable(io);
+    defer self.docs.generation_lock.unlockShared(io);
+    const checkpoint = pinCheckpoint(self.docs);
 
-    return (try self.docs.file.getIndexCatalogRecordRangeAlloc(allocator, path, offset, len)) orelse return error.FileNotFound;
+    return (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, offset, len, checkpoint)) orelse return error.FileNotFound;
 }
 
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
+    const io = self.docs.file.io_impl.io();
+    self.docs.generation_lock.lockSharedUncancelable(io);
+    defer self.docs.generation_lock.unlockShared(io);
+    const checkpoint = pinCheckpoint(self.docs);
 
-    const size = (try self.docs.file.getIndexCatalogRecordSize(path)) orelse return error.FileNotFound;
+    const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     return @intCast(size);
 }
 
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
+    const io = self.docs.file.io_impl.io();
+    self.docs.generation_lock.lockSharedUncancelable(io);
+    defer self.docs.generation_lock.unlockShared(io);
+    const checkpoint = pinCheckpoint(self.docs);
 
-    const size = (try self.docs.file.getIndexCatalogRecordSize(path)) orelse return error.FileNotFound;
+    const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     if (size < len) return error.EndOfStream;
-    return (try self.docs.file.getIndexCatalogRecordRangeAlloc(allocator, path, @intCast(size - len), len)) orelse return error.FileNotFound;
+    return (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, @intCast(size - len), len, checkpoint)) orelse return error.FileNotFound;
 }
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -341,6 +355,29 @@ test "lite native index storage persists logical files across reopen" {
         defer allocator.free(range);
         try std.testing.expectEqualStrings("cdef", range);
     }
+}
+
+test "lite native index reads remain pinned while newer checkpoints publish" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/index-pinned-checkpoint.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var docs = try docstore.Store.create(allocator, path, true);
+    defer docs.close();
+    var indexes = Store.init(allocator, &docs);
+    try writeFileAbsolute(&indexes, "segments/current", "generation-one");
+    const pinned = docs.file.activeCheckpoint();
+    try writeFileAbsolute(&indexes, "segments/current", "generation-two");
+
+    const old = (try docs.file.getIndexCatalogRecordAtCheckpointAlloc(allocator, "segments/current", pinned)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(old);
+    try std.testing.expectEqualStrings("generation-one", old);
+
+    const current = try readFileAlloc(&indexes, allocator, "segments/current", 1024);
+    defer allocator.free(current);
+    try std.testing.expectEqualStrings("generation-two", current);
 }
 
 test "lite native index storage can be scoped to the Lite index namespace" {

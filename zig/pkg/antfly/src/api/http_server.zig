@@ -1145,7 +1145,7 @@ pub const ApiHttpServer = struct {
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
             }),
-            .restore_job_store = restore_jobs.Store.init(alloc),
+            .restore_job_store = restore_jobs.Store.initWithIo(alloc, if (cfg.backend_runtime) |runtime| runtime.io() else null),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .restore_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .session_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
@@ -7217,7 +7217,7 @@ pub const ApiHttpServer = struct {
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
             const table_backup_id = backups_api.clusterTableBackupId(alloc, req.backup_id, table_name) catch return error.InternalFailure;
-            self.backupOwnedTable(table_name, location, req.location, table_backup_id, .native) catch |err| {
+            self.backupOwnedTable(table_name, location, req.location, table_backup_id, req.format) catch |err| {
                 if (isRetryableMetadataLeadershipError(err)) {
                     alloc.free(table_backup_id);
                     return error.NotLeader;

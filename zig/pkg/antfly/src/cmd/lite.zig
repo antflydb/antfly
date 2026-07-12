@@ -728,14 +728,21 @@ const PromoteOptions = struct {
     }
 };
 
-const PromoteRestoreFn = *const fn (ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) anyerror!i64;
+const PromoteRestoreAcceptance = struct {
+    job_id: i64,
+    encoded: []u8,
+};
+
+const PromoteRestoreFn = *const fn (ctx: *anyopaque, allocator: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) anyerror!PromoteRestoreAcceptance;
 
 const PromoteSubmission = struct {
     staged: lite_restore_staging.StagedRestore,
     restore_job_id: i64,
+    accepted_json: []u8,
 
     fn deinit(self: *PromoteSubmission, allocator: Allocator) void {
         self.staged.deinit(allocator);
+        allocator.free(self.accepted_json);
         self.* = undefined;
     }
 };
@@ -766,17 +773,16 @@ fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     var submission = try promoteWithRestore(allocator, path, opts, &client, promoteRestoreWithClient);
     defer submission.deinit(allocator);
 
-    var response = if (opts.wait)
-        try cli.backup.waitForRestoreJob(&client, io, submission.restore_job_id, opts.wait_timeout_ms)
-    else blk: {
-        var job_id_buf: [32]u8 = undefined;
-        const job_id = try std.fmt.bufPrint(&job_id_buf, "{d}", .{submission.restore_job_id});
-        break :blk try client.getRestoreJob(job_id);
-    };
+    if (!opts.wait) {
+        writeJsonLine(io, submission.accepted_json);
+        return;
+    }
+
+    var response = try cli.backup.waitForRestoreJob(&client, io, submission.restore_job_id, opts.wait_timeout_ms);
     defer response.deinit();
     const job = if (response.data) |*data| data.value else return error.InvalidRestoreResponse;
     try cli.writeJson(allocator, io, job);
-    if (opts.wait) try cli.backup.restorePhaseResult(job.phase);
+    try cli.backup.restorePhaseResult(job.phase);
 }
 
 fn promoteWithRestore(
@@ -789,21 +795,26 @@ fn promoteWithRestore(
     var staged = try lite_restore_staging.stageAfliteRestoreBackup(allocator, path, opts.table, opts.backup_id, opts.location);
     errdefer staged.deinit(allocator);
 
-    const restore_job_id = try restore_fn(restore_ctx, opts.table, .{
+    const accepted = try restore_fn(restore_ctx, allocator, opts.table, .{
         .backup_id = staged.backup_id,
         .location = staged.location,
         .connection = opts.connection,
         .format = "portable",
     }, opts.idempotency_key);
+    errdefer allocator.free(accepted.encoded);
 
-    return .{ .staged = staged, .restore_job_id = restore_job_id };
+    return .{ .staged = staged, .restore_job_id = accepted.job_id, .accepted_json = accepted.encoded };
 }
 
-fn promoteRestoreWithClient(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) !i64 {
+fn promoteRestoreWithClient(ctx: *anyopaque, allocator: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) !PromoteRestoreAcceptance {
     const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ctx));
     var resp = try client.restoreTableWithOptions(table, request, .{ .idempotency_key = idempotency_key });
     defer resp.deinit();
-    return if (resp.data) |*data| data.value.job_id else error.InvalidRestoreResponse;
+    const job = if (resp.data) |*data| data.value else return error.InvalidRestoreResponse;
+    return .{
+        .job_id = job.job_id,
+        .encoded = try std.json.Stringify.valueAlloc(allocator, job, .{}),
+    };
 }
 
 fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.process.Args.Iterator) !PromoteOptions {
@@ -2888,7 +2899,7 @@ test "lite promote helper stages backup then submits normal restore request" {
         format: []const u8 = "",
         connection: []const u8 = "",
 
-        fn restore(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest, _: ?[]const u8) !i64 {
+        fn restore(ctx: *anyopaque, allocator_inner: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, _: ?[]const u8) !PromoteRestoreAcceptance {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.called = true;
             self.table = table;
@@ -2896,7 +2907,10 @@ test "lite promote helper stages backup then submits normal restore request" {
             self.location = request.location;
             self.format = request.format orelse "";
             self.connection = request.connection;
-            return 42;
+            return .{
+                .job_id = 42,
+                .encoded = try allocator_inner.dupe(u8, "{\"job_id\":42,\"phase\":\"queued\"}"),
+            };
         }
     };
 
@@ -2907,6 +2921,7 @@ test "lite promote helper stages backup then submits normal restore request" {
 
     try std.testing.expect(capture.called);
     try std.testing.expectEqual(@as(i64, 42), submission.restore_job_id);
+    try std.testing.expectEqualStrings("{\"job_id\":42,\"phase\":\"queued\"}", submission.accepted_json);
     try std.testing.expectEqualStrings("docs", capture.table);
     try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
     try std.testing.expectEqualStrings(staged.location, capture.location);

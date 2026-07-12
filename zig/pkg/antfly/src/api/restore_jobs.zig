@@ -15,6 +15,7 @@ const max_retained_restore_jobs: usize = 10_000;
 const max_restore_job_record_bytes: usize = 64 * 1024;
 const max_retained_restore_job_bytes: usize = 64 * 1024 * 1024;
 const restore_job_prune_interval_ms: u64 = 60 * 1000;
+const restore_job_prune_batch_size: usize = 1024;
 pub const max_tables_per_job: usize = 256;
 const max_restore_string_bytes: usize = 4096;
 
@@ -89,6 +90,7 @@ pub const ReplicatedPersistence = struct {
         get: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) anyerror!?[]u8,
         put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
         delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
+        delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8) anyerror!void,
     };
 
     pub fn freeRows(alloc: std.mem.Allocator, rows: []OwnedRow) void {
@@ -107,6 +109,7 @@ pub const Store = struct {
     };
 
     alloc: std.mem.Allocator,
+    io: ?std.Io = null,
     mutex: std.atomic.Mutex = .unlocked,
     jobs: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     idempotency: std.StringHashMapUnmanaged(u64) = .empty,
@@ -121,6 +124,10 @@ pub const Store = struct {
 
     pub fn init(alloc: std.mem.Allocator) Store {
         return .{ .alloc = alloc };
+    }
+
+    pub fn initWithIo(alloc: std.mem.Allocator, io: ?std.Io) Store {
+        return .{ .alloc = alloc, .io = io };
     }
 
     pub fn deinit(self: *Store) void {
@@ -295,14 +302,23 @@ pub const Store = struct {
         self.clearInMemoryLocked();
         const rows = try persistence.vtable.load(persistence.ptr, self.alloc);
         defer ReplicatedPersistence.freeRows(self.alloc, rows);
+        var expired_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer expired_keys.deinit(self.alloc);
         for (rows) |row| {
             if (try replicatedRowExpired(self.alloc, row.value)) {
-                // Only the elected leader performs catalog cleanup. Followers
-                // may attach the same projection read-only during startup.
-                try persistence.vtable.delete(persistence.ptr, row.key);
+                try expired_keys.append(self.alloc, row.key);
                 continue;
             }
             try self.attachReplicatedRowLocked(row.key, row.value);
+        }
+        // Expiry cleanup is a bounded number of Raft entries rather than one
+        // consensus round per retained job. This keeps leadership acquisition
+        // responsive after a large cohort reaches its retention boundary.
+        var expired_offset: usize = 0;
+        while (expired_offset < expired_keys.items.len) {
+            const end = @min(expired_offset + restore_job_prune_batch_size, expired_keys.items.len);
+            try persistence.vtable.delete_many(persistence.ptr, expired_keys.items[expired_offset..end]);
+            expired_offset = end;
         }
         self.sortPendingLocked();
 
@@ -411,17 +427,21 @@ pub const Store = struct {
             if (provided.len == 0 or provided.len > 256) return error.InvalidIdempotencyKey;
             break :blk provided;
         } else null;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
         var entropy: [16]u8 = undefined;
-        try io_impl.io().randomSecure(&entropy);
+        var fallback_io: ?std.Io.Threaded = null;
+        defer if (fallback_io) |*io_impl| io_impl.deinit();
+        const io = self.io orelse blk: {
+            fallback_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            break :blk fallback_io.?.io();
+        };
+        try io.randomSecure(&entropy);
 
         self.lock();
         defer self.mutex.unlock();
         const now_for_prune = nowMillis();
         if (now_for_prune >= self.next_prune_at_ms) {
-            try self.pruneExpiredLocked(now_for_prune);
-            self.next_prune_at_ms = now_for_prune +| restore_job_prune_interval_ms;
+            const more_expired = try self.pruneExpiredLocked(now_for_prune, restore_job_prune_batch_size);
+            self.next_prune_at_ms = if (more_expired) now_for_prune else now_for_prune +| restore_job_prune_interval_ms;
         }
         if (explicit_idempotency_key) |key| {
             if (self.idempotency.get(key)) |job_id| {
@@ -437,7 +457,7 @@ pub const Store = struct {
         const now = nowMillis();
         var job_id = std.mem.readInt(u64, entropy[0..8], .little) & std.math.maxInt(i64);
         while (job_id == 0 or self.jobs.contains(job_id)) {
-            try io_impl.io().randomSecure(entropy[0..8]);
+            try io.randomSecure(entropy[0..8]);
             job_id = std.mem.readInt(u64, entropy[0..8], .little) & std.math.maxInt(i64);
         }
         const auto_nonce = std.mem.readInt(u64, entropy[8..16], .little);
@@ -704,29 +724,43 @@ pub const Store = struct {
         self.retained_bytes = next_bytes;
     }
 
-    fn pruneExpiredLocked(self: *Store, now_ms: u64) !void {
+    fn pruneExpiredLocked(self: *Store, now_ms: u64, limit: usize) !bool {
         var expired = std.ArrayListUnmanaged(u64).empty;
         defer expired.deinit(self.alloc);
+        var more_expired = false;
         var it = self.jobs.iterator();
         while (it.next()) |entry| {
             var parsed = std.json.parseFromSlice(JobState, self.alloc, entry.value_ptr.*, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
             defer parsed.deinit();
-            if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= now_ms) try expired.append(self.alloc, entry.key_ptr.*);
+            if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= now_ms) {
+                if (expired.items.len < limit) {
+                    try expired.append(self.alloc, entry.key_ptr.*);
+                } else {
+                    more_expired = true;
+                }
+            }
         }
+        const keys = try self.alloc.alloc([]u8, expired.items.len);
+        var keys_initialized: usize = 0;
+        defer {
+            for (keys[0..keys_initialized]) |key| self.alloc.free(key);
+            self.alloc.free(keys);
+        }
+        for (expired.items, 0..) |job_id, i| {
+            keys[i] = try jobKey(self.alloc, job_id);
+            keys_initialized += 1;
+        }
+        if (keys.len > 0) try self.persistDeleteManyLocked(keys);
         for (expired.items) |job_id| {
             const current = self.jobs.get(job_id) orelse continue;
             var parsed = std.json.parseFromSlice(JobState, self.alloc, current, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
             defer parsed.deinit();
-            const key = try jobKey(self.alloc, job_id);
-            defer self.alloc.free(key);
-            // Delete durable state first. If persistence fails, the in-memory
-            // record and idempotency fence remain intact and can be retried.
-            try self.persistDeleteLocked(key);
             const removed = self.jobs.fetchRemove(job_id) orelse return error.CorruptRestoreJobStore;
             if (self.idempotency.fetchRemove(parsed.value.idempotency_key)) |key_entry| self.alloc.free(key_entry.key);
             self.retained_bytes -= removed.value.len;
             self.alloc.free(removed.value);
         }
+        return more_expired;
     }
 
     fn validateRowKeyLocked(self: *Store, key: []const u8, job_id: u64) !void {
@@ -781,6 +815,29 @@ pub const Store = struct {
             return txn.commit();
         }
         if (self.replicated) |replicated| return replicated.vtable.delete(replicated.ptr, key);
+    }
+
+    fn persistDeleteManyLocked(self: *Store, keys: []const []const u8) !void {
+        if (keys.len == 0) return;
+        if (self.opened) |opened| {
+            var batch = try opened.docstore.beginWriteBatch();
+            errdefer batch.abort();
+            for (keys) |key| batch.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            return batch.commit();
+        }
+        if (self.runtime) |runtime| {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            for (keys) |key| txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            return txn.commit();
+        }
+        if (self.replicated) |replicated| return replicated.vtable.delete_many(replicated.ptr, keys);
     }
 
     fn lock(self: *Store) void {
@@ -861,6 +918,7 @@ const TestReplicatedPersistence = struct {
             .get = get,
             .put = put,
             .delete = delete,
+            .delete_many = deleteMany,
         } };
     }
 
@@ -911,6 +969,10 @@ const TestReplicatedPersistence = struct {
             self.alloc.free(removed.key);
             self.alloc.free(removed.value);
         }
+    }
+
+    fn deleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+        for (keys) |key| try delete(ptr, key);
     }
 };
 

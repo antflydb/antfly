@@ -21,7 +21,6 @@ const platform_time = antfly.platform_time;
 const lite_restore_staging = antfly.lite.restore_staging;
 const portable_backup = antfly.portable_backup;
 
-const default_backup_location = "file:///tmp/antfly_backups";
 const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
 const restore_poll_interval_ms: u64 = 1000;
 
@@ -30,11 +29,12 @@ const BackupArgs = struct {
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
-    location: []const u8 = default_backup_location,
+    location: []const u8 = "",
     format: ?[]const u8 = null,
     url: ?[]const u8 = null,
     output: ?[]const u8 = null,
     connection: ?[]const u8 = null,
+    location_explicit: bool = false,
     list_backups: bool = false,
 };
 
@@ -43,7 +43,7 @@ const RestoreArgs = struct {
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
-    location: []const u8 = default_backup_location,
+    location: []const u8 = "",
     location_explicit: bool = false,
     format: ?[]const u8 = null,
     restore_mode: ?[]const u8 = null,
@@ -76,6 +76,10 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         return;
     }
     const connection = opts.connection orelse cli.fatal("--connection is required", .{});
+    validateBackupArgs(opts) catch |err| switch (err) {
+        error.BackupLocationRequired => cli.fatal("--location is required", .{}),
+        else => cli.fatal("invalid backup arguments", .{}),
+    };
 
     if (opts.url) |value| try client.setBaseUrl(value);
 
@@ -94,7 +98,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     }
 
     if (opts.table_name) |tbl| {
-        const selected_format = opts.format orelse "native";
+        const selected_format = opts.format orelse "portable";
         if (!std.mem.eql(u8, selected_format, "native") and !std.mem.eql(u8, selected_format, "portable")) {
             cli.fatal("unsupported backup format: {s}", .{selected_format});
         }
@@ -120,6 +124,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         .backup_id = bid,
         .location = opts.location,
         .connection = connection,
+        .format = opts.format orelse "portable",
         .table_names = table_names,
     });
     defer resp.deinit();
@@ -138,6 +143,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     const connection = opts.connection orelse cli.fatal("--connection is required", .{});
 
     validateRestoreArgs(opts) catch |err| switch (err) {
+        error.RestoreLocationRequired => cli.fatal("--location is required", .{}),
         error.RestoreInputModeUnsupported => cli.fatal("--input restore targets one table; omit --mode", .{}),
         else => cli.fatal("invalid restore arguments", .{}),
     };
@@ -295,6 +301,7 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
             out.backup_id = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--location")) {
             out.location = try nextRequired(args);
+            out.location_explicit = true;
         } else if (std.mem.eql(u8, arg, "--connection")) {
             out.connection = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--format")) {
@@ -351,10 +358,24 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
     return out;
 }
 
+fn validateBackupArgs(opts: BackupArgs) !void {
+    if (!opts.location_explicit) return error.BackupLocationRequired;
+    if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
+    if (opts.list_backups and (opts.table_name != null or opts.tables_str != null or opts.backup_id != null or opts.format != null))
+        return error.ConflictingBackupListArguments;
+    if (opts.format) |format| {
+        if (!std.mem.eql(u8, format, "native") and !std.mem.eql(u8, format, "portable")) return error.UnsupportedBackupFormat;
+    }
+}
+
 fn validateRestoreArgs(opts: RestoreArgs) !void {
-    if (opts.input_path == null) return;
-    if (opts.restore_mode != null) return error.RestoreInputModeUnsupported;
-    if (!isPortableRestoreInputPath(opts.input_path.?)) return error.InvalidRestoreInputPath;
+    if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
+    if (opts.input_path) |input| {
+        if (opts.tables_str != null or opts.table_name == null) return error.InvalidRestoreInputTarget;
+        if (opts.restore_mode != null) return error.RestoreInputModeUnsupported;
+        if (!isPortableRestoreInputPath(input)) return error.InvalidRestoreInputPath;
+    }
+    if (!opts.location_explicit) return error.RestoreLocationRequired;
 }
 
 fn isPortableRestoreInputPath(path: []const u8) bool {
@@ -370,12 +391,13 @@ fn restoreInputLocationAlloc(allocator: std.mem.Allocator, input_path: []const u
 fn printBackupUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly backup --table <name> --backup-id <id> --connection <id> [--location <uri>] [--format native|portable] [--url <url>]
-        \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> [--location <uri>] [--url <url>]
-        \\  antfly backup --list --connection <id> [--location <uri>] [--output json] [--url <url>]
+        \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
+        \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
+        \\  antfly backup --list --connection <id> --location <uri> [--output json] [--url <url>]
         \\
         \\notes:
         \\  Network backups are written by the server through the named connection.
+        \\  Table and cluster backups default to the portable format.
         \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local AFB artifact.
         \\
     , .{});
@@ -384,8 +406,8 @@ fn printBackupUsage() void {
 fn printRestoreUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly restore --table <name> --backup-id <id> --connection <id> [--location <uri>] [--format native|portable] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> [--location <uri>] [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\
         \\notes:
@@ -425,6 +447,20 @@ test "backup cli parser rejects local out path" {
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
+}
+
+test "network backup requires explicit location" {
+    var argv = [_][*:0]const u8{ "--backup-id", "daily", "--connection", "archive-writer" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseBackupArgs(&iter);
+    try std.testing.expectError(error.BackupLocationRequired, validateBackupArgs(opts));
+}
+
+test "backup rejects conflicting table selectors" {
+    var argv = [_][*:0]const u8{ "--table", "one", "--tables", "two,three", "--location", "s3://archive/backups" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseBackupArgs(&iter);
+    try std.testing.expectError(error.ConflictingTableSelection, validateBackupArgs(opts));
 }
 
 test "restore cli parser accepts aflite input shape" {
@@ -576,6 +612,20 @@ test "restore cli parser accepts help flag" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(opts.help);
+}
+
+test "network restore requires explicit location" {
+    var argv = [_][*:0]const u8{ "--backup-id", "daily", "--connection", "archive-reader" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectError(error.RestoreLocationRequired, validateRestoreArgs(opts));
+}
+
+test "restore rejects conflicting table selectors" {
+    var argv = [_][*:0]const u8{ "--table", "one", "--tables", "two,three", "--location", "s3://archive/backups" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectError(error.ConflictingTableSelection, validateRestoreArgs(opts));
 }
 
 test "restore cli parser keeps mode visible for input validation" {

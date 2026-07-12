@@ -4015,6 +4015,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table backup and restore require named connections",
             "cluster backup APIs require named connections",
+            "cluster backup format defaults portable and preserves explicit native",
             "api http server lists cluster backups through public route",
         },
         .test_runner = .{

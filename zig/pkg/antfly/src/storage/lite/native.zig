@@ -1070,8 +1070,16 @@ pub const NativeFile = struct {
         return try self.getCatalogRecordFromRootAlloc(allocator, .index, key);
     }
 
+    pub fn getIndexCatalogRecordAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, key: []const u8, checkpoint: CheckpointSlot) !?[]u8 {
+        return try self.getCatalogRecordFromRootAtCheckpointAlloc(allocator, .index, key, checkpoint);
+    }
+
     pub fn getIndexCatalogRecordSize(self: *NativeFile, key: []const u8) !?usize {
         return try self.getCatalogRecordSizeFromRoot(.index, key);
+    }
+
+    pub fn getIndexCatalogRecordSizeAtCheckpoint(self: *NativeFile, key: []const u8, checkpoint: CheckpointSlot) !?usize {
+        return try self.getCatalogRecordSizeFromRootAtCheckpoint(.index, key, checkpoint);
     }
 
     pub fn getIndexCatalogRecordRangeAlloc(
@@ -1084,15 +1092,36 @@ pub const NativeFile = struct {
         return try self.getCatalogRecordRangeFromRootAlloc(allocator, .index, key, offset, len);
     }
 
+    pub fn getIndexCatalogRecordRangeAtCheckpointAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        key: []const u8,
+        offset: u64,
+        len: usize,
+        checkpoint: CheckpointSlot,
+    ) !?[]u8 {
+        return try self.getCatalogRecordRangeFromRootAtCheckpointAlloc(allocator, .index, key, offset, len, checkpoint);
+    }
+
     fn getCatalogRecordFromRootAlloc(
         self: *NativeFile,
         allocator: Allocator,
         root: CatalogRoot,
         key: []const u8,
     ) !?[]u8 {
-        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        return try self.getCatalogRecordFromRootAtCheckpointAlloc(allocator, root, key, self.activeCheckpoint());
+    }
+
+    fn getCatalogRecordFromRootAtCheckpointAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+        checkpoint: CheckpointSlot,
+    ) !?[]u8 {
+        var page_id = catalogRootPage(checkpoint, root);
         while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(allocator, page_id, .catalog, checkpoint);
             defer allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
             if (std.mem.eql(u8, entry.key, key)) {
@@ -1109,9 +1138,18 @@ pub const NativeFile = struct {
         root: CatalogRoot,
         key: []const u8,
     ) !?usize {
-        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        return try self.getCatalogRecordSizeFromRootAtCheckpoint(root, key, self.activeCheckpoint());
+    }
+
+    fn getCatalogRecordSizeFromRootAtCheckpoint(
+        self: *NativeFile,
+        root: CatalogRoot,
+        key: []const u8,
+        checkpoint: CheckpointSlot,
+    ) !?usize {
+        var page_id = catalogRootPage(checkpoint, root);
         while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .catalog, checkpoint);
             defer self.allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
             if (std.mem.eql(u8, entry.key, key)) {
@@ -1131,9 +1169,21 @@ pub const NativeFile = struct {
         offset: u64,
         len: usize,
     ) !?[]u8 {
-        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        return try self.getCatalogRecordRangeFromRootAtCheckpointAlloc(allocator, root, key, offset, len, self.activeCheckpoint());
+    }
+
+    fn getCatalogRecordRangeFromRootAtCheckpointAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+        offset: u64,
+        len: usize,
+        checkpoint: CheckpointSlot,
+    ) !?[]u8 {
+        var page_id = catalogRootPage(checkpoint, root);
         while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .catalog, checkpoint);
             defer self.allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
             if (std.mem.eql(u8, entry.key, key)) {

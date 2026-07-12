@@ -462,6 +462,7 @@ fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs
         .get = metadataRestoreJobGet,
         .put = metadataRestoreJobPut,
         .delete = metadataRestoreJobDelete,
+        .delete_many = metadataRestoreJobDeleteMany,
     } };
 }
 
@@ -515,6 +516,20 @@ fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8) !void {
     if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
         svc.alloc.free(committed);
         return error.RestoreJobCommitNotApplied;
+    }
+}
+
+fn metadataRestoreJobDeleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+    if (keys.len == 0) return;
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.proposeTransitionCommand(.{ .remove_restore_jobs = .{ .keys = keys } });
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    for (keys) |key| {
+        if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
+            svc.alloc.free(committed);
+            return error.RestoreJobCommitNotApplied;
+        }
     }
 }
 

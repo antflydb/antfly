@@ -544,6 +544,10 @@ and exits nonzero on failure. `--no-wait` returns the accepted job instead. It
 should not invent a separate migration protocol until backup/restore proves too
 slow for large databases.
 
+The no-wait path prints the response returned by the successful submission; it
+does not issue an immediate second GET that could turn a transient routing
+failure into an ambiguous CLI error after the job was already accepted.
+
 `promote` and network `restore --input` require an explicit `--location`.
 Client-local defaults are unsafe because a remote server resolves filesystem
 connections in its own namespace. The location must be writable by the CLI and
@@ -849,7 +853,8 @@ query-visible results should match within documented index rebuild semantics.
   CLI shape should be:
 
   ```sh
-  antfly restore --input app.aflite --table docs
+  antfly restore --input app.aflite --table docs \
+    --location s3://migration-staging/app --connection migration-reader
   ```
 
 - Extend portable backup coverage for schema, index definitions, enrichment

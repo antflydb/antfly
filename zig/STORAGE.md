@@ -134,6 +134,13 @@ antfly backup --backup-id daily --location s3://archive/prod/daily --connection 
 antfly restore --backup-id daily --location s3://archive/prod/daily --connection archive-reader
 ```
 
+Network backup and restore commands require both `--connection` and
+`--location`; there is no client-local filesystem default because a connection
+may authorize several buckets or a server-scoped filesystem root. Backup
+format defaults to `portable` for both table and cluster backups. Use
+`--format native` explicitly when same-engine physical restore speed is more
+important than cross-engine portability.
+
 The server requires `backup.write` or `restore.read` respectively and verifies
 the object-store bucket and segment-bounded prefix, or resolves a logical
 `file:///...` path beneath an administrator-controlled filesystem root. This
@@ -202,7 +209,10 @@ higher attempt ID. Mutations are acknowledged only after a Raft read barrier
 confirms the proposed value is committed and applied. At most two restore jobs
 execute across the control-plane leader. The runnable deque is rebuilt once on
 leadership acquisition and consumed incrementally, so completing a job does
-not rescan retained terminal history.
+not rescan retained terminal history. Expired history is removed in bounded
+batches of up to 1,024 keys per metadata-Raft transition rather than one
+consensus round per job, avoiding retention cliffs during failover and new-job
+admission.
 Table restore jobs are visible to administrators of that table; cluster restore
 jobs require cluster administration. Cancellation is observed at table-publication
 boundaries.
@@ -283,7 +293,9 @@ Point reads walk the pinned per-namespace chain directly and never build the
 key index; only ordered cursor operations materialize it. Pinned point and
 cursor-value reads use concurrent positional I/O rather than holding the
 store-wide mutation mutex, and key snapshots use one compact ownership array
-instead of a heap allocation per key.
+instead of a heap allocation per key. Index segment reads use the same pinned
+checkpoint and generation fence, so concurrent queries do not serialize on the
+mutation mutex and vacuum cannot reclaim their pages.
 Cache-budget exhaustion falls back to a transaction-owned key index instead of
 making valid data unreadable. A `std.Io.RwLock` permits normal append-only
 commits while readers pin roots and makes vacuum/rewrite wait before reclaiming

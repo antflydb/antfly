@@ -33,6 +33,7 @@ pub const ClusterBackupRequest = struct {
     backup_id: []const u8,
     location: []const u8,
     connection: ?[]const u8 = null,
+    format: BackupFormat = .portable,
     table_names: ?[]const []const u8 = null,
 };
 pub const ClusterRestoreRequest = struct {
@@ -752,24 +753,64 @@ pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !Cl
     var parsed = try metadata_openapi.server.parseBackupBody(alloc, body);
     defer parsed.deinit();
     try validateBackupId(parsed.value.backup_id);
+    const format = try parseBackupFormat(parsed.value.format);
+    const backup_id = try alloc.dupe(u8, parsed.value.backup_id);
+    errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, parsed.value.location);
+    errdefer alloc.free(location);
+    const connection = try alloc.dupe(u8, parsed.value.connection);
+    errdefer alloc.free(connection);
+    const table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names);
+    errdefer if (table_names) |values| freeStringSlice(alloc, values);
     return .{
-        .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
-        .location = try alloc.dupe(u8, parsed.value.location),
-        .connection = try alloc.dupe(u8, parsed.value.connection),
-        .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
+        .backup_id = backup_id,
+        .location = location,
+        .connection = connection,
+        .format = format,
+        .table_names = table_names,
     };
+}
+
+pub fn parseBackupFormat(value: ?[]const u8) !BackupFormat {
+    const format = value orelse return .portable;
+    return std.meta.stringToEnum(BackupFormat, format) orelse error.UnsupportedBackupFormat;
+}
+
+test "cluster backup format defaults portable and preserves explicit native" {
+    const alloc = std.testing.allocator;
+    var default_req = try parseClusterBackupRequest(alloc,
+        \\{"backup_id":"daily","location":"s3://archive/backups","connection":"archive-writer"}
+    );
+    defer freeClusterBackupRequest(alloc, &default_req);
+    try std.testing.expectEqual(BackupFormat.portable, default_req.format);
+
+    var native_req = try parseClusterBackupRequest(alloc,
+        \\{"backup_id":"daily-native","location":"s3://archive/backups","connection":"archive-writer","format":"native"}
+    );
+    defer freeClusterBackupRequest(alloc, &native_req);
+    try std.testing.expectEqual(BackupFormat.native, native_req.format);
 }
 
 pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterRestoreRequest {
     var parsed = try metadata_openapi.server.parseRestoreBody(alloc, body);
     defer parsed.deinit();
     try validateBackupId(parsed.value.backup_id);
+    const backup_id = try alloc.dupe(u8, parsed.value.backup_id);
+    errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, parsed.value.location);
+    errdefer alloc.free(location);
+    const connection = try alloc.dupe(u8, parsed.value.connection);
+    errdefer alloc.free(connection);
+    const table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names);
+    errdefer if (table_names) |values| freeStringSlice(alloc, values);
+    const restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (restore_mode) |value| alloc.free(value);
     return .{
-        .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
-        .location = try alloc.dupe(u8, parsed.value.location),
-        .connection = try alloc.dupe(u8, parsed.value.connection),
-        .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
-        .restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null,
+        .backup_id = backup_id,
+        .location = location,
+        .connection = connection,
+        .table_names = table_names,
+        .restore_mode = restore_mode,
     };
 }
 

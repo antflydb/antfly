@@ -124,6 +124,9 @@ pub const TransitionCommand = union(enum) {
     remove_restore_job: struct {
         key: []const u8,
     },
+    remove_restore_jobs: struct {
+        keys: []const []const u8,
+    },
     upsert_reallocation_request: metadata.ReallocationRequestRecord,
     remove_reallocation_request: struct {},
     upsert_extension_package: extension_domain.PackageManifest,
@@ -207,6 +210,10 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.value);
             },
             .remove_restore_job => |record| alloc.free(record.key),
+            .remove_restore_jobs => |record| {
+                for (record.keys) |key| alloc.free(key);
+                alloc.free(record.keys);
+            },
             .apply_extension_lifecycle => |*delta| freeExtensionLifecycleDelta(alloc, delta.*),
             else => {},
         }
@@ -236,6 +243,10 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
         },
         .remove_restore_job => |record| try validateRestoreJobLogicalKey(record.key),
+        .remove_restore_jobs => |record| {
+            if (record.keys.len == 0 or record.keys.len > 4096) return error.InvalidRestoreJobRecord;
+            for (record.keys) |key| try validateRestoreJobLogicalKey(key);
+        },
         else => {},
     }
 }
@@ -265,7 +276,7 @@ test "transition command validation rejects metadata group ids in data group fie
     }
 }
 
-test "restore job transition encoding is append-only compatible" {
+test "metadata raft apply store restore job transition encoding is append-only compatible" {
     const encoded = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_restore_job = .{
             .key = "\x00\x00__api_restore_jobs__:000000000000002a",
@@ -278,6 +289,21 @@ test "restore job transition encoding is append-only compatible" {
     try std.testing.expect(decoded == .upsert_restore_job);
     try std.testing.expectEqualStrings("\x00\x00__api_restore_jobs__:000000000000002a", decoded.upsert_restore_job.key);
     try std.testing.expectEqualStrings("{\"job_id\":42}", decoded.upsert_restore_job.value);
+
+    const keys = [_][]const u8{
+        "\x00\x00__api_restore_jobs__:000000000000002a",
+        "\x00\x00__api_restore_jobs__:000000000000002b",
+    };
+    const batch_encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_restore_jobs = .{ .keys = &keys },
+    });
+    defer std.testing.allocator.free(batch_encoded);
+    var batch_decoded = (try decodeTransitionCommand(std.testing.allocator, batch_encoded)).?;
+    defer batch_decoded.deinit(std.testing.allocator);
+    try std.testing.expect(batch_decoded == .remove_restore_jobs);
+    try std.testing.expectEqual(@as(usize, 2), batch_decoded.remove_restore_jobs.keys.len);
+    try std.testing.expectEqualStrings(keys[0], batch_decoded.remove_restore_jobs.keys[0]);
+    try std.testing.expectEqualStrings(keys[1], batch_decoded.remove_restore_jobs.keys[1]);
 }
 
 test "metadata raft apply store replicates restore job records" {
@@ -1600,6 +1626,21 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
+            .remove_restore_jobs => |record| {
+                for (record.keys) |logical_key| {
+                    var key_buf: [256]u8 = undefined;
+                    const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+                    txn.delete(key) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                    self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                }
+                self.notifyProjectionListeners(.{
+                    .kind = .restore_job,
+                    .metadata_group_id = group_id,
+                });
+            },
             .upsert_reallocation_request => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
@@ -2065,6 +2106,7 @@ const TransitionTag = enum(u8) {
     apply_extension_lifecycle = 40,
     upsert_restore_job = 41,
     remove_restore_job = 42,
+    remove_restore_jobs = 43,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -2250,6 +2292,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job));
             try appendRequiredString(alloc, &out, record.key);
         },
+        .remove_restore_jobs => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_jobs));
+            try appendInt(alloc, &out, u32, @intCast(record.keys.len));
+            for (record.keys) |key| try appendRequiredString(alloc, &out, key);
+        },
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -2427,6 +2474,9 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .remove_restore_job => .{
             .remove_restore_job = .{ .key = try readRequiredString(alloc, encoded, &pos) },
+        },
+        .remove_restore_jobs => .{
+            .remove_restore_jobs = .{ .keys = try readRequiredStrings(alloc, encoded, &pos, 4096) },
         },
     };
 }
@@ -3593,6 +3643,27 @@ fn readRequiredString(
     const value = try alloc.dupe(u8, encoded[pos.* .. pos.* + value_len]);
     pos.* += value_len;
     return value;
+}
+
+fn readRequiredStrings(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+    max_count: usize,
+) ![]const []const u8 {
+    const count = try readInt(encoded, pos, u32);
+    if (count == 0 or count > max_count) return error.InvalidMetadataTransitionEncoding;
+    const values = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |value| alloc.free(value);
+        alloc.free(values);
+    }
+    for (values) |*value| {
+        value.* = try readRequiredString(alloc, encoded, pos);
+        initialized += 1;
+    }
+    return values;
 }
 
 fn readJsonRecord(comptime T: type, alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !T {
