@@ -153,6 +153,17 @@ reuse one immutable cached token instead of racing refresh and reclamation. A
 failed proactive refresh continues serving the still-valid token until its
 actual expiry, then fails closed.
 
+Remote artifact traversal is segment-scoped and paginated. Restore lists at
+most 1,000 objects at a time, validates every returned key as a strict
+descendant of the requested artifact directory, and requires continuation
+tokens to advance. There is no 10,000-object restore ceiling, sibling prefixes
+cannot bleed into a restore, and page memory remains bounded independently of
+backup size. Local file transfer reuses the same `std.Io` runtime instead of
+constructing a scheduler for every artifact. Full-object downloads use bounded
+8 MiB range reads into an atomic temporary file and fence every range with the
+object's initial ETag, preventing both whole-object heap growth and mixed-version
+files when an archive is modified concurrently.
+
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the
 `s3://` location continues to identify the artifact:

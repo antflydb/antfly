@@ -546,10 +546,6 @@ const RemoteBackupStore = struct {
         });
     }
 
-    fn listObjects(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) !object_storage.ListResult {
-        return try self.listObjectsPage(alloc, suffix, true, 10_000, null);
-    }
-
     fn listTopLevelObjectsPage(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
@@ -581,7 +577,7 @@ const RemoteBackupStore = struct {
             defer alloc.free(key_suffix);
             const key = try self.keyAlloc(alloc, key_suffix);
             defer alloc.free(key);
-            var result = try self.client.putFile(self.bucket, key, local_path, .{
+            var result = try self.client.putFileWithIo(io, self.bucket, key, local_path, .{
                 .content_type = "application/octet-stream",
             });
             defer result.deinit(alloc);
@@ -589,21 +585,54 @@ const RemoteBackupStore = struct {
     }
 
     fn downloadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8) !void {
-        const key_prefix = try self.keyAlloc(alloc, src_suffix);
+        return try self.downloadDirectoryRecursiveWithPageSize(alloc, src_suffix, dest_path, 1000);
+    }
+
+    fn downloadDirectoryRecursiveWithPageSize(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8, page_size: u32) !void {
+        if (page_size == 0) return error.InvalidPageSize;
+        if (!(try self.client.bucketExists(self.bucket))) return error.FileNotFound;
+        const base_key = try self.keyAlloc(alloc, src_suffix);
+        defer alloc.free(base_key);
+        const key_prefix = if (base_key.len == 0)
+            try alloc.alloc(u8, 0)
+        else
+            try std.fmt.allocPrint(alloc, "{s}/", .{base_key});
         defer alloc.free(key_prefix);
 
-        var listed = try self.listObjects(alloc, src_suffix);
-        defer listed.deinit(alloc);
-        if (listed.entries.len == 0) return error.FileNotFound;
+        var found = false;
+        var continuation_token: ?[]u8 = null;
+        defer if (continuation_token) |token| alloc.free(token);
+        while (true) {
+            var listed = try self.client.listObjects(self.bucket, .{
+                .prefix = key_prefix,
+                .recursive = true,
+                .max_keys = page_size,
+                .continuation_token = continuation_token,
+            });
+            defer listed.deinit(alloc);
+            var next_token = if (listed.next_continuation_token) |token| try alloc.dupe(u8, token) else null;
+            errdefer if (next_token) |token| alloc.free(token);
 
-        for (listed.entries) |entry| {
-            const rel = trimLeftSlash(entry.key[key_prefix.len..]);
-            if (rel.len == 0) continue;
-            try validateArtifactRelativePath(rel);
-            const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
-            defer alloc.free(dest_file);
-            try self.client.getFile(self.bucket, entry.key, dest_file, .{});
+            for (listed.entries) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, key_prefix)) return error.InvalidBackupArtifactPath;
+                const rel = entry.key[key_prefix.len..];
+                if (rel.len == 0) continue;
+                try validateArtifactRelativePath(rel);
+                const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
+                defer alloc.free(dest_file);
+                try self.client.getFileWithIo(self.io, self.bucket, entry.key, dest_file, .{});
+                found = true;
+            }
+
+            if (continuation_token != null and next_token != null and std.mem.eql(u8, continuation_token.?, next_token.?)) {
+                return error.InvalidContinuationToken;
+            }
+            if (continuation_token) |token| alloc.free(token);
+            continuation_token = next_token;
+            next_token = null;
+            if (continuation_token == null) break;
         }
+        if (!found) return error.FileNotFound;
     }
 };
 
@@ -2396,6 +2425,48 @@ test "backup manifest round trips through remote objectstore location" {
     try std.testing.expectEqualStrings("docs", loaded.table_name);
     try std.testing.expectEqual(@as(usize, 1), loaded.shards.len);
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
+}
+
+test "remote backup directory download paginates and enforces segment prefix" {
+    const alloc = std.testing.allocator;
+    const dest_root = ".zig-cache/test-paginated-backup-download";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    std.Io.Dir.cwd().deleteTree(io, dest_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dest_root) catch {};
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var raw_client = memory.client();
+    inline for (&.{
+        .{ "backups/prod/snap/a/one", "one" },
+        .{ "backups/prod/snap/a/nested/two", "two" },
+        .{ "backups/prod/snap/a/three", "three" },
+        .{ "backups/prod/snap/ab/evil", "evil" },
+    }) |entry| {
+        var put = try raw_client.putObject("bucket", entry[0], entry[1], .{});
+        put.deinit(alloc);
+    }
+
+    var store = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups/prod");
+    defer store.deinit();
+    try store.downloadDirectoryRecursiveWithPageSize(alloc, "snap/a", dest_root, 2);
+
+    inline for (&.{
+        .{ "one", "one" },
+        .{ "nested/two", "two" },
+        .{ "three", "three" },
+    }) |expected| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_root, expected[0] });
+        defer alloc.free(path);
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16));
+        defer alloc.free(body);
+        try std.testing.expectEqualStrings(expected[1], body);
+    }
+    const escaped_path = try std.fmt.allocPrint(alloc, "{s}/b/evil", .{dest_root});
+    defer alloc.free(escaped_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(io, escaped_path, alloc, .limited(16)));
 }
 
 test "cluster backup list uses top-level remote manifests without recursing into payloads" {

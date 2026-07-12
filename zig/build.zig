@@ -3279,6 +3279,21 @@ pub fn build(b: *std.Build) void {
     const serverless_test_step = b.step("serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
 
+    const serverless_manifest_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, serverless_manifest_test_mod, true, true);
+    const serverless_manifest_tests = b.addTest(.{
+        .root_module = serverless_manifest_test_mod,
+        .filters = &.{"objectstore-backed manifest store supports publish and list"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_serverless_manifest_tests = b.addRunArtifact(serverless_manifest_tests);
+    const serverless_manifest_test_step = b.step("lib-serverless-manifest-test", "Run focused serverless manifest object-store tests");
+    serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
+
     const lib_data_runtime_default_filters = [_][]const u8{
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget reuses cached group status instead of opening db",
@@ -4021,6 +4036,7 @@ pub fn build(b: *std.Build) void {
             "cluster backup APIs require named connections",
             "cluster backup format defaults portable and preserves explicit native",
             "cluster backup and restore reject duplicate table selectors",
+            "remote backup directory download paginates and enforces segment prefix",
             "api http server lists cluster backups through public route",
         },
         .test_runner = .{

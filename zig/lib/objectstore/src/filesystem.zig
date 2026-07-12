@@ -223,12 +223,23 @@ pub const FilesystemClient = struct {
             prefixes.deinit(alloc);
         }
 
-        const continuation = opts.continuation_token orelse opts.start_after;
-        var count: u32 = 0;
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (keys.items) |key| alloc.free(key);
+            keys.deinit(alloc);
+        }
         while (try walker.next(io_impl.io())) |entry| {
             if (entry.kind != .file) continue;
-            const key = entry.path;
-            if (!std.mem.startsWith(u8, key, opts.prefix)) continue;
+            if (!std.mem.startsWith(u8, entry.path, opts.prefix)) continue;
+            try keys.append(alloc, try alloc.dupe(u8, entry.path));
+        }
+        std.mem.sort([]u8, keys.items, {}, lessPrefix);
+
+        const continuation = opts.continuation_token orelse opts.start_after;
+        var count: u32 = 0;
+        var last_cursor_key: ?[]const u8 = null;
+        var truncated = false;
+        for (keys.items) |key| {
             if (continuation) |token| {
                 if (std.mem.order(u8, key, token) != .gt) continue;
             }
@@ -237,16 +248,25 @@ pub const FilesystemClient = struct {
                 if (std.mem.indexOf(u8, key[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
                     const prefix_end = opts.prefix.len + delimiter_offset + opts.delimiter.len;
                     const common_prefix = key[0..prefix_end];
-                    if (!containsPrefix(prefixes.items, common_prefix)) {
-                        if (count >= opts.max_keys) break;
-                        try prefixes.append(alloc, try alloc.dupe(u8, common_prefix));
-                        count += 1;
+                    if (containsPrefix(prefixes.items, common_prefix)) {
+                        last_cursor_key = key;
+                        continue;
                     }
+                    if (count >= opts.max_keys) {
+                        truncated = true;
+                        break;
+                    }
+                    try prefixes.append(alloc, try alloc.dupe(u8, common_prefix));
+                    count += 1;
+                    last_cursor_key = key;
                     continue;
                 }
             }
 
-            if (count >= opts.max_keys) break;
+            if (count >= opts.max_keys) {
+                truncated = true;
+                break;
+            }
             var meta = try self.statObject(alloc, bucket, key);
             defer meta.deinit(alloc);
             try entries.append(alloc, .{
@@ -256,6 +276,7 @@ pub const FilesystemClient = struct {
                 .last_modified_unix_ms = meta.last_modified_unix_ms,
             });
             count += 1;
+            last_cursor_key = key;
         }
 
         std.mem.sort(types.ListEntry, entries.items, {}, lessEntry);
@@ -263,6 +284,10 @@ pub const FilesystemClient = struct {
         return .{
             .entries = try entries.toOwnedSlice(alloc),
             .common_prefixes = try prefixes.toOwnedSlice(alloc),
+            .next_continuation_token = if (truncated and last_cursor_key != null)
+                try alloc.dupe(u8, last_cursor_key.?)
+            else
+                null,
         };
     }
 
