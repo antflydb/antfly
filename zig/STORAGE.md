@@ -188,9 +188,10 @@ their connection root through absolute paths, traversal components, or existing
 symlink ancestors.
 
 Restore is a durable asynchronous job. `POST /db/v1/restore` and table restore
-verify that the shared asynchronous backend-runtime lane is available, then
-persist the job before returning `202`; otherwise admission fails with `503`
-and creates no durable job. Clients poll or cancel
+verify that both the shared asynchronous backend-runtime lane and a durable
+engine, filesystem, or replicated-metadata job store are available, then persist
+the job before returning `202`; otherwise admission fails with `503` and creates
+no job. Clients poll or cancel
 `/db/v1/restore/jobs/{job_id}`. `Idempotency-Key` safely coalesces retries,
 while requests without a key create independent jobs. Completed table boundaries
 are durably checkpointed and are not repeated after restart. An ambiguous

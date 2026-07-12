@@ -175,8 +175,9 @@ credentials because they run with the invoking user's filesystem authority.
 
 Restore through `/db/v1` is a durable asynchronous job, not request-duration
 work. Admission requires the standalone process's shared asynchronous
-backend-runtime lane; an unavailable worker returns `503` before any job is
-persisted. The accepted response contains a job ID; status and cooperative
+backend-runtime lane and its engine-owned durable job store; an unavailable
+worker or store returns `503` before any job is created. The accepted response
+contains a job ID; status and cooperative
 cancellation use `/db/v1/restore/jobs/{job_id}`. Idempotency keys make retries
 safe; requests without a key create independent jobs. Restore state lives inside
 the `.aflite` file, and completed table boundaries are durably checkpointed and

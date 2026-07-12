@@ -2869,9 +2869,9 @@ paths:
 
         The restore is a durable asynchronous job. The request returns after the
 
-        job record is persisted and an asynchronous worker is available. Poll
+        job record is persisted and both a durable job store and asynchronous
 
-        the restore job resource for progress.
+        worker are available. Poll the restore job resource for progress.
 
         Completed table boundaries are durably checkpointed and are not repeated
 

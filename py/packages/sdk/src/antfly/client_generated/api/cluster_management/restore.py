@@ -89,8 +89,8 @@ def sync_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted and an asynchronous worker is available. Poll
-    the restore job resource for progress.
+    job record is persisted and both a durable job store and asynchronous
+    worker are available. Poll the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection
@@ -136,8 +136,8 @@ def sync(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted and an asynchronous worker is available. Poll
-    the restore job resource for progress.
+    job record is persisted and both a durable job store and asynchronous
+    worker are available. Poll the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection
@@ -178,8 +178,8 @@ async def asyncio_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted and an asynchronous worker is available. Poll
-    the restore job resource for progress.
+    job record is persisted and both a durable job store and asynchronous
+    worker are available. Poll the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection
@@ -223,8 +223,8 @@ async def asyncio(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted and an asynchronous worker is available. Poll
-    the restore job resource for progress.
+    job record is persisted and both a durable job store and asynchronous
+    worker are available. Poll the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection

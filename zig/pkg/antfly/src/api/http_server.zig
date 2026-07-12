@@ -8399,10 +8399,11 @@ pub const ApiHttpServer = struct {
         try self.schedulePendingRestoreJobs();
     }
 
-    fn ensureAsyncRestoreWorker(self: *const ApiHttpServer) !void {
+    fn ensureAsyncRestoreWorker(self: *ApiHttpServer) !void {
         if (self.restore_jobs_closing.load(.acquire)) return error.AsyncRestoreUnavailable;
         const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
         if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return error.AsyncRestoreUnavailable;
+        if (!self.restore_job_store.hasPersistence()) return error.RestoreJobPersistenceUnavailable;
     }
 
     fn schedulePendingRestoreJobs(self: *ApiHttpServer) !void {
@@ -8626,6 +8627,7 @@ fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_c
         error.InvalidIdempotencyKey => try jsonErrorResponse(alloc, 400, "invalid idempotency key"),
         error.IdempotencyConflict => try jsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
         error.AsyncRestoreUnavailable => try jsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
+        error.RestoreJobPersistenceUnavailable => try jsonErrorResponse(alloc, 503, "durable restore store unavailable"),
         error.RestoreJobCapacityExceeded => try jsonErrorResponse(alloc, 503, "restore job history is at capacity"),
         error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try jsonErrorResponse(alloc, 400, "restore request is too large"),
         error.DuplicateRestoreTableName => try jsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
@@ -8650,6 +8652,12 @@ fn testBackupNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
         \\  }
         \\}
     );
+}
+
+fn attachTestRestoreJobStore(alloc: std.mem.Allocator, server: *ApiHttpServer, tmp_sub_path: []const u8, name: []const u8) !void {
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp_sub_path, name });
+    defer alloc.free(path);
+    try server.attachRestoreJobStorePath(path);
 }
 
 fn waitForTerminalRestoreJobAlloc(alloc: std.mem.Allocator, server: *ApiHttpServer, response_body: []const u8) ![]u8 {
@@ -23941,6 +23949,23 @@ test "api http server rejects restore before persistence without an asynchronous
     try std.testing.expectEqualStrings("application/json", response.content_type.?);
     try std.testing.expectEqualStrings("{\"error\":\"asynchronous restore worker unavailable\"}", response.body);
     try std.testing.expectEqual(@as(usize, 0), server.restore_job_store.jobs.count());
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var storeless_server = ApiHttpServer.init(std.testing.allocator, .{
+        .node_config = &node_config,
+        .backend_runtime = backend_runtime.ptr(),
+    }, source.iface(), null, null);
+    defer storeless_server.deinit();
+    var storeless_response = try storeless_server.handlePublicTableRestore(
+        "docs",
+        "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\"}",
+        "restore-without-store",
+    );
+    defer storeless_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), storeless_response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"durable restore store unavailable\"}", storeless_response.body);
+    try std.testing.expectEqual(@as(usize, 0), storeless_server.restore_job_store.jobs.count());
 }
 
 test "api http server backs up and restores a table through public routes" {
@@ -23955,6 +23980,8 @@ test "api http server backs up and restores a table through public routes" {
     defer alloc.free(path);
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-out", .{tmp.sub_path});
     defer alloc.free(backup_root);
+    const restore_job_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-jobs", .{tmp.sub_path});
+    defer alloc.free(restore_job_path);
 
     var db = try db_mod.DB.open(alloc, path, .{});
     defer db.close();
@@ -24040,6 +24067,7 @@ test "api http server backs up and restores a table through public routes" {
     defer backend_runtime.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), read_source.source(), write_source.source());
     defer server.deinit();
+    try server.attachRestoreJobStorePath(restore_job_path);
 
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
@@ -24263,6 +24291,7 @@ test "api http server table restore is triggered when read path is still empty" 
     defer backend_runtime.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), read_source.source(), write_source.source());
     defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
 
     const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}", .{location_uri});
     defer alloc.free(restore_body);
@@ -24603,6 +24632,7 @@ test "api http server cluster restore rejects missing extension package digest" 
     defer backend_runtime.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), null, write_source.source());
     defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
 
     const restore_body = try std.fmt.allocPrint(
         alloc,
@@ -24755,6 +24785,7 @@ test "api http server cluster restore rehydrates extension metadata" {
     defer backend_runtime.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), null, null);
     defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
 
     const restore_body = try std.fmt.allocPrint(
         alloc,
@@ -24781,6 +24812,8 @@ test "api http server cluster restore rehydrates extension metadata" {
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     const RestoreSource = struct {
         restored: bool = false,
@@ -24879,6 +24912,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
     defer backend_runtime.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, restore_source.iface(), null, FailingWrites.source());
     defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
     var restore_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/restore",
@@ -24895,6 +24929,8 @@ test "api http server prefers metadata-owned restore over inline write-source re
 
 test "api http server retries stale metadata table-exists restore race" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     const RestoreSource = struct {
         attempts: usize = 0,
@@ -24932,6 +24968,7 @@ test "api http server retries stale metadata table-exists restore race" {
     defer backend_runtime.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, restore_source.iface(), null, null);
     defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
     var restore_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/restore",

@@ -145,6 +145,12 @@ pub const Store = struct {
         self.* = undefined;
     }
 
+    pub fn hasPersistence(self: *Store) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.opened != null or self.runtime != null or self.replicated != null;
+    }
+
     pub fn attach(self: *Store, opened: *OpenedStore) !void {
         self.lock();
         defer self.mutex.unlock();
@@ -796,6 +802,7 @@ pub const Store = struct {
             return txn.commit();
         }
         if (self.replicated) |replicated| return replicated.vtable.put(replicated.ptr, key, value);
+        return error.RestoreJobPersistenceUnavailable;
     }
 
     fn persistDeleteLocked(self: *Store, key: []const u8) !void {
@@ -810,6 +817,7 @@ pub const Store = struct {
             return txn.commit();
         }
         if (self.replicated) |replicated| return replicated.vtable.delete(replicated.ptr, key);
+        return error.RestoreJobPersistenceUnavailable;
     }
 
     fn persistDeleteManyLocked(self: *Store, keys: []const []const u8) !void {
@@ -833,6 +841,7 @@ pub const Store = struct {
             return txn.commit();
         }
         if (self.replicated) |replicated| return replicated.vtable.delete_many(replicated.ptr, keys);
+        return error.RestoreJobPersistenceUnavailable;
     }
 
     fn lock(self: *Store) void {
@@ -977,8 +986,11 @@ const TestReplicatedPersistence = struct {
 };
 
 test "restore job store is idempotent and fenced" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
     var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
     const req: StartRequest = .{
         .scope = .cluster,
         .backup_id = "daily",
@@ -1005,8 +1017,11 @@ test "restore job store is idempotent and fenced" {
 }
 
 test "restore job runnable queue drains incrementally and preserves insertion order" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
     var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
     var created: [3]u64 = undefined;
     for (&created, 0..) |*job_id, i| {
         const encoded = try store.start(std.testing.allocator, .{
@@ -1090,8 +1105,11 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
 }
 
 test "restore requests without idempotency keys create independent opaque jobs" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
     var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
     const req: StartRequest = .{
         .scope = .table,
         .table_name = "docs",
@@ -1157,7 +1175,7 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
 }
 
 test "restore job store rejects oversized request state" {
-    var store = Store.init(std.testing.allocator);
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
     const oversized = try std.testing.allocator.alloc(u8, max_restore_string_bytes + 1);
     defer std.testing.allocator.free(oversized);
@@ -1175,7 +1193,16 @@ test "restore job store rejects oversized request state" {
         .connection = "archive-reader",
         .table_names = &.{ "docs", "docs" },
     }));
-    try std.testing.expectError(error.AsyncRestoreUnavailable, store.start(std.testing.allocator, .{
+    try std.testing.expectError(error.RestoreJobPersistenceUnavailable, store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/backups",
+        .connection = "archive-reader",
+    }));
+
+    var no_io_store = Store.init(std.testing.allocator);
+    defer no_io_store.deinit();
+    try std.testing.expectError(error.AsyncRestoreUnavailable, no_io_store.start(std.testing.allocator, .{
         .scope = .cluster,
         .backup_id = "daily",
         .location = "s3://archive/backups",
