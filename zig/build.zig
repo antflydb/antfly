@@ -2862,6 +2862,8 @@ pub fn build(b: *std.Build) void {
         "lsm backend compaction chaos campaign",
     };
     const lib_unit_default_filters = [_][]const u8{
+        "restore job store is idempotent and fenced",
+        "restore requests without idempotency keys create independent opaque jobs",
         ".test_0",
         "module compiles",
         "batch parser preserves oversized value errors",
@@ -3958,7 +3960,7 @@ pub fn build(b: *std.Build) void {
     const lib_api_connections_tests = b.addTest(.{
         .root_module = api_connections_test_mod,
         .filters = &.{
-            "S3 probe cache identity covers every bucket and credential source",
+            "object probe cache identity covers every bucket and credential source",
             "build response reports mock connected and types filter",
             "build response reports configured external io connections",
             "build response reports configured web search connections",
@@ -3983,8 +3985,8 @@ pub fn build(b: *std.Build) void {
     const lib_api_storage_authority_tests = b.addTest(.{
         .root_module = api_storage_authority_test_mod,
         .filters = &.{
-            "public table backup and restore require named connections for remote locations",
-            "cluster backup APIs require named connections for remote locations",
+            "public table backup and restore require named connections",
+            "cluster backup APIs require named connections",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

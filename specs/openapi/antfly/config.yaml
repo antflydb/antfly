@@ -554,70 +554,110 @@ components:
             type: string
           description: Exclude results from these domains when provider supports it.
     ExternalIoConnectionConfig:
+      oneOf:
+        - $ref: "#/components/schemas/S3ExternalIoConfig"
+        - $ref: "#/components/schemas/GcsExternalIoConfig"
+        - $ref: "#/components/schemas/FilesystemExternalIoConfig"
+        - $ref: "#/components/schemas/HttpExternalIoConfig"
+      discriminator:
+        propertyName: protocol
+        mapping:
+          s3: "#/components/schemas/S3ExternalIoConfig"
+          gcs: "#/components/schemas/GcsExternalIoConfig"
+          filesystem: "#/components/schemas/FilesystemExternalIoConfig"
+          http: "#/components/schemas/HttpExternalIoConfig"
+    S3ExternalIoConfig:
       type: object
       additionalProperties: false
-      required:
-        - protocol
-      oneOf:
-        - title: S3 external IO
-          required: [protocol, buckets]
-          properties:
-            protocol: { type: string, enum: [s3] }
-        - title: Non-S3 external IO
-          properties:
-            protocol: { type: string, enum: [gcs, filesystem, http] }
+      required: [protocol, buckets]
       properties:
-        protocol:
-          $ref: "#/components/schemas/ExternalIoProtocol"
-        endpoint:
-          type: string
-          description: Custom endpoint URL when configured.
-        region:
-          type: string
-          description: Object-store signing region when configured.
+        protocol: { type: string, enum: [s3] }
+        endpoint: { type: string, description: S3-compatible endpoint override. }
+        region: { type: string }
         addressing_style:
           type: string
           enum: [path, virtual_hosted]
           default: virtual_hosted
-          description: S3 request addressing style.
         bucket_provisioning:
           type: string
           enum: [require_existing, create_if_missing]
           default: require_existing
-          description: >-
-            Whether runtime startup may create missing buckets. Production
-            connections should require infrastructure-provisioned buckets.
         buckets:
           type: array
           minItems: 1
           maxItems: 64
           uniqueItems: true
-          items:
-            type: string
-            minLength: 3
-            maxLength: 63
-          description: >-
-            Explicit bucket allowlist for this connection. S3 connections must
-            configure at least one bucket; omission never means unrestricted
-            access.
-        prefix:
+          items: { type: string, minLength: 3, maxLength: 63 }
+        prefix: { type: string }
+        credentials: { $ref: "#/components/schemas/AwsCredentialConfig" }
+        use_ssl: { type: boolean }
+    GcsExternalIoConfig:
+      type: object
+      additionalProperties: false
+      required: [protocol, buckets]
+      properties:
+        protocol: { type: string, enum: [gcs] }
+        endpoint: { type: string, description: GCS JSON API endpoint override. }
+        upload_endpoint: { type: string, description: GCS JSON upload endpoint override. }
+        project_id: { type: string }
+        bucket_provisioning:
           type: string
-          description: Key-prefix boundary enforced for every use of this connection.
+          enum: [require_existing, create_if_missing]
+          default: require_existing
+        buckets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 3, maxLength: 63 }
+        prefix: { type: string }
+        credentials: { $ref: "#/components/schemas/GcsCredentialConfig" }
+    FilesystemExternalIoConfig:
+      type: object
+      additionalProperties: false
+      required: [protocol, root]
+      properties:
+        protocol: { type: string, enum: [filesystem] }
+        root:
+          type: string
+          description: Absolute administrator-controlled root. URI paths are resolved beneath this root.
+    HttpExternalIoConfig:
+      type: object
+      additionalProperties: false
+      required: [protocol]
+      properties:
+        protocol: { type: string, enum: [http] }
         hosts:
           type: array
-          items:
-            type: string
-          description: Hosts or base URLs this connection applies to.
+          items: { type: string }
         headers:
           type: object
-          additionalProperties:
-            type: string
+          additionalProperties: { type: string }
           description: HTTP headers or secret references. Never returned by inventory APIs.
-        credentials:
-          $ref: "#/components/schemas/AwsCredentialConfig"
-        use_ssl:
-          type: boolean
-          description: Whether S3-compatible endpoints should use TLS.
+    GcsCredentialConfig:
+      type: object
+      additionalProperties: false
+      required: [source]
+      oneOf:
+        - title: Application default credentials
+          properties:
+            source: { type: string, enum: [default] }
+        - title: Bearer token
+          required: [bearer_token]
+          properties:
+            source: { type: string, enum: [bearer_token] }
+        - title: Service account
+          properties:
+            source: { type: string, enum: [service_account] }
+          oneOf:
+            - required: [service_account_json]
+            - required: [credentials_path]
+      properties:
+        source: { type: string, enum: [default, bearer_token, service_account] }
+        bearer_token: { type: string, description: Token or secret reference. }
+        service_account_json: { type: string, description: Service-account JSON or secret reference. }
+        credentials_path: { type: string }
+        scope: { type: string }
     AwsCredentialConfig:
       type: object
       additionalProperties: false

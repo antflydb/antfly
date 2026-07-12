@@ -39,6 +39,7 @@ pub const ClusterApi = struct {
         InvalidRequest,
         TableAlreadyExists,
         MethodNotAllowed,
+        Cancelled,
         InternalFailure,
     };
 
@@ -111,8 +112,8 @@ pub fn handleClusterBackupList(
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
 ) !OwnedResponse {
-    if (isRemoteLocation(location_uri) and connection == null) {
-        return .{ .status = 400, .body = try alloc.dupe(u8, "remote backup listing requires a named connection") };
+    if (connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "backup listing requires a named external_io connection") };
     }
     var location = backups_api.openBackupLocationWithOptions(alloc, location_uri, .{
         .secret_store = secret_store,
@@ -144,8 +145,8 @@ pub fn handleClusterBackup(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     };
     defer backups_api.freeClusterBackupRequest(alloc, &req);
-    if (isRemoteLocation(req.location) and req.connection == null) {
-        return .{ .status = 400, .body = try alloc.dupe(u8, "remote backup requires a named connection") };
+    if (req.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "backup requires a named external_io connection") };
     }
 
     var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
@@ -180,8 +181,8 @@ pub fn handleClusterRestore(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
     defer backups_api.freeClusterRestoreRequest(alloc, &req);
-    if (isRemoteLocation(req.location) and req.connection == null) {
-        return .{ .status = 400, .body = try alloc.dupe(u8, "remote restore requires a named connection") };
+    if (req.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "restore requires a named external_io connection") };
     }
 
     var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
@@ -206,18 +207,13 @@ pub fn handleClusterRestore(
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.Cancelled => return .{ .status = 409, .body = try alloc.dupe(u8, "restore cancelled") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
     return .{ .status = 202, .body = response_body };
 }
 
-fn isRemoteLocation(location: []const u8) bool {
-    return std.mem.startsWith(u8, location, "s3://") or
-        std.mem.startsWith(u8, location, "gs://") or
-        std.mem.startsWith(u8, location, "gcs://");
-}
-
-test "cluster backup APIs require named connections for remote locations" {
+test "cluster backup APIs require named connections" {
     var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null);
     defer list.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), list.status);
@@ -231,7 +227,7 @@ test "cluster backup APIs require named connections for remote locations" {
     );
     defer backup.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), backup.status);
-    try std.testing.expectEqualStrings("remote backup requires a named connection", backup.body);
+    try std.testing.expectEqualStrings("invalid backup request", backup.body);
 
     var restore = try handleClusterRestore(
         std.testing.allocator,
@@ -242,5 +238,5 @@ test "cluster backup APIs require named connections for remote locations" {
     );
     defer restore.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), restore.status);
-    try std.testing.expectEqualStrings("remote restore requires a named connection", restore.body);
+    try std.testing.expectEqualStrings("invalid restore request", restore.body);
 }

@@ -6,16 +6,19 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.cluster_restore_request import ClusterRestoreRequest
-from ...models.cluster_restore_response import ClusterRestoreResponse
 from ...models.error import Error
-from ...types import Response
+from ...models.restore_job import RestoreJob
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     *,
     body: ClusterRestoreRequest,
+    idempotency_key: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(idempotency_key, Unset):
+        headers["Idempotency-Key"] = idempotency_key
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -30,11 +33,9 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(
-    *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ClusterRestoreResponse | Error | None:
+def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | RestoreJob | None:
     if response.status_code == 202:
-        response_202 = ClusterRestoreResponse.from_dict(response.json())
+        response_202 = RestoreJob.from_dict(response.json())
 
         return response_202
 
@@ -54,9 +55,7 @@ def _parse_response(
         return None
 
 
-def _build_response(
-    *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ClusterRestoreResponse | Error]:
+def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Error | RestoreJob]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -69,7 +68,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: ClusterRestoreRequest,
-) -> Response[ClusterRestoreResponse | Error]:
+    idempotency_key: str | Unset = UNSET,
+) -> Response[Error | RestoreJob]:
     """Restore multiple tables from a backup
 
      Restores tables from a cluster backup. Can restore all tables or a subset.
@@ -79,11 +79,13 @@ def sync_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The restore is a durable asynchronous job. The request returns after the
+    job record is persisted. Poll the restore job resource for progress.
+    Interrupted running jobs are resumed after restart. Cancellation is
+    cooperative between table and artifact publication boundaries.
 
     Args:
+        idempotency_key (str | Unset):
         body (ClusterRestoreRequest):
 
     Raises:
@@ -91,11 +93,12 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ClusterRestoreResponse | Error]
+        Response[Error | RestoreJob]
     """
 
     kwargs = _get_kwargs(
         body=body,
+        idempotency_key=idempotency_key,
     )
 
     response = client.get_httpx_client().request(
@@ -109,7 +112,8 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: ClusterRestoreRequest,
-) -> ClusterRestoreResponse | Error | None:
+    idempotency_key: str | Unset = UNSET,
+) -> Error | RestoreJob | None:
     """Restore multiple tables from a backup
 
      Restores tables from a cluster backup. Can restore all tables or a subset.
@@ -119,11 +123,13 @@ def sync(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The restore is a durable asynchronous job. The request returns after the
+    job record is persisted. Poll the restore job resource for progress.
+    Interrupted running jobs are resumed after restart. Cancellation is
+    cooperative between table and artifact publication boundaries.
 
     Args:
+        idempotency_key (str | Unset):
         body (ClusterRestoreRequest):
 
     Raises:
@@ -131,12 +137,13 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ClusterRestoreResponse | Error
+        Error | RestoreJob
     """
 
     return sync_detailed(
         client=client,
         body=body,
+        idempotency_key=idempotency_key,
     ).parsed
 
 
@@ -144,7 +151,8 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: ClusterRestoreRequest,
-) -> Response[ClusterRestoreResponse | Error]:
+    idempotency_key: str | Unset = UNSET,
+) -> Response[Error | RestoreJob]:
     """Restore multiple tables from a backup
 
      Restores tables from a cluster backup. Can restore all tables or a subset.
@@ -154,11 +162,13 @@ async def asyncio_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The restore is a durable asynchronous job. The request returns after the
+    job record is persisted. Poll the restore job resource for progress.
+    Interrupted running jobs are resumed after restart. Cancellation is
+    cooperative between table and artifact publication boundaries.
 
     Args:
+        idempotency_key (str | Unset):
         body (ClusterRestoreRequest):
 
     Raises:
@@ -166,11 +176,12 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ClusterRestoreResponse | Error]
+        Response[Error | RestoreJob]
     """
 
     kwargs = _get_kwargs(
         body=body,
+        idempotency_key=idempotency_key,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -182,7 +193,8 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: ClusterRestoreRequest,
-) -> ClusterRestoreResponse | Error | None:
+    idempotency_key: str | Unset = UNSET,
+) -> Error | RestoreJob | None:
     """Restore multiple tables from a backup
 
      Restores tables from a cluster backup. Can restore all tables or a subset.
@@ -192,11 +204,13 @@ async def asyncio(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The restore is a durable asynchronous job. The request returns after the
+    job record is persisted. Poll the restore job resource for progress.
+    Interrupted running jobs are resumed after restart. Cancellation is
+    cooperative between table and artifact publication boundaries.
 
     Args:
+        idempotency_key (str | Unset):
         body (ClusterRestoreRequest):
 
     Raises:
@@ -204,12 +218,13 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ClusterRestoreResponse | Error
+        Error | RestoreJob
     """
 
     return (
         await asyncio_detailed(
             client=client,
             body=body,
+            idempotency_key=idempotency_key,
         )
     ).parsed

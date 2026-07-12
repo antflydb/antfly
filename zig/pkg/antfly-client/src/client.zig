@@ -306,10 +306,13 @@ pub const AntflyClient = struct {
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
 
-    pub fn restoreTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.RestoreRequest) !void {
+    pub fn restoreTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.RestoreRequest) !openapi.ApiResponse(openapi.types.RestoreJob) {
         var resp = try self.inner.restoreTable(table_name, body);
-        defer resp.deinit();
-        if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
     }
 
     pub fn clusterBackup(self: *AntflyClient, body: openapi.types.ClusterBackupRequest) !openapi.ApiResponse(openapi.types.ClusterBackupResponse) {
@@ -321,8 +324,26 @@ pub const AntflyClient = struct {
         return resp;
     }
 
-    pub fn clusterRestore(self: *AntflyClient, body: openapi.types.ClusterRestoreRequest) !openapi.ApiResponse(openapi.types.ClusterRestoreResponse) {
+    pub fn clusterRestore(self: *AntflyClient, body: openapi.types.ClusterRestoreRequest) !openapi.ApiResponse(openapi.types.RestoreJob) {
         var resp = try self.inner.restore(body);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
+    pub fn getRestoreJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.RestoreJob) {
+        var resp = try self.inner.getRestoreJob(job_id);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
+    pub fn cancelRestoreJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.RestoreJob) {
+        var resp = try self.inner.cancelRestoreJob(job_id);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);

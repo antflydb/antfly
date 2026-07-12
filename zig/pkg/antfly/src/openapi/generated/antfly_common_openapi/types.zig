@@ -236,73 +236,46 @@ pub const ConnectionKind = enum {
     }
 };
 
-pub const ExternalIoConnectionConfig = struct {
-    protocol: ExternalIoProtocol,
-    /// Custom endpoint URL when configured.
-    endpoint: ?[]const u8 = null,
-    /// Object-store signing region when configured.
-    region: ?[]const u8 = null,
-    /// S3 request addressing style.
-    addressing_style: ?[]const u8 = null,
-    /// Whether runtime startup may create missing buckets. Production connections should require infrastructure-provisioned buckets.
-    bucket_provisioning: ?[]const u8 = null,
-    /// Explicit bucket allowlist for this connection. S3 connections must configure at least one bucket; omission never means unrestricted access.
-    buckets: ?[]const []const u8 = null,
-    /// Key-prefix boundary enforced for every use of this connection.
-    prefix: ?[]const u8 = null,
-    /// Hosts or base URLs this connection applies to.
-    hosts: ?[]const []const u8 = null,
-    /// HTTP headers or secret references. Never returned by inventory APIs.
-    headers: ?std.json.ArrayHashMap([]const u8) = null,
-    credentials: ?AwsCredentialConfig = null,
-    /// Whether S3-compatible endpoints should use TLS.
-    use_ssl: ?bool = null,
+pub const ExternalIoConnectionConfig = union(enum) {
+    s3_external_io_config: S3ExternalIoConfig,
+    gcs_external_io_config: GcsExternalIoConfig,
+    filesystem_external_io_config: FilesystemExternalIoConfig,
+    http_external_io_config: HttpExternalIoConfig,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("protocol") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "s3")) {
+            return .{ .s3_external_io_config = try std.json.parseFromValueLeaky(S3ExternalIoConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "gcs")) {
+            return .{ .gcs_external_io_config = try std.json.parseFromValueLeaky(GcsExternalIoConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "filesystem")) {
+            return .{ .filesystem_external_io_config = try std.json.parseFromValueLeaky(FilesystemExternalIoConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "http")) {
+            return .{ .http_external_io_config = try std.json.parseFromValueLeaky(HttpExternalIoConfig, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("protocol");
-        try jw.write(self.protocol);
-        if (self.endpoint) |value| {
-            try jw.objectField("endpoint");
-            try jw.write(value);
+        switch (self) {
+            .s3_external_io_config => |v| try jw.write(v),
+            .gcs_external_io_config => |v| try jw.write(v),
+            .filesystem_external_io_config => |v| try jw.write(v),
+            .http_external_io_config => |v| try jw.write(v),
         }
-        if (self.region) |value| {
-            try jw.objectField("region");
-            try jw.write(value);
-        }
-        if (self.addressing_style) |value| {
-            try jw.objectField("addressing_style");
-            try jw.write(value);
-        }
-        if (self.bucket_provisioning) |value| {
-            try jw.objectField("bucket_provisioning");
-            try jw.write(value);
-        }
-        if (self.buckets) |value| {
-            try jw.objectField("buckets");
-            try jw.write(value);
-        }
-        if (self.prefix) |value| {
-            try jw.objectField("prefix");
-            try jw.write(value);
-        }
-        if (self.hosts) |value| {
-            try jw.objectField("hosts");
-            try jw.write(value);
-        }
-        if (self.headers) |value| {
-            try jw.objectField("headers");
-            try jw.write(value);
-        }
-        if (self.credentials) |value| {
-            try jw.objectField("credentials");
-            try jw.write(value);
-        }
-        if (self.use_ssl) |value| {
-            try jw.objectField("use_ssl");
-            try jw.write(value);
-        }
-        try jw.endObject();
     }
 };
 
@@ -347,6 +320,65 @@ pub const ExternalIoProtocol = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const FilesystemExternalIoConfig = struct {
+    protocol: []const u8,
+    /// Absolute administrator-controlled root. URI paths are resolved beneath this root.
+    root: []const u8,
+};
+
+pub const GcsCredentialConfig = struct {
+    source: []const u8,
+    /// Token or secret reference.
+    bearer_token: ?[]const u8 = null,
+    /// Service-account JSON or secret reference.
+    service_account_json: ?[]const u8 = null,
+    credentials_path: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.bearer_token) |value| {
+            try jw.objectField("bearer_token");
+            try jw.write(value);
+        }
+        if (self.service_account_json) |value| {
+            try jw.objectField("service_account_json");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.scope) |value| {
+            try jw.objectField("scope");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GcsExternalIoConfig = struct {
+    protocol: []const u8,
+    /// GCS JSON API endpoint override.
+    endpoint: ?[]const u8 = null,
+    /// GCS JSON upload endpoint override.
+    upload_endpoint: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    bucket_provisioning: ?[]const u8 = null,
+    buckets: []const []const u8,
+    prefix: ?[]const u8 = null,
+    credentials: ?GcsCredentialConfig = null,
+};
+
+pub const HttpExternalIoConfig = struct {
+    protocol: []const u8,
+    hosts: ?[]const []const u8 = null,
+    /// HTTP headers or secret references. Never returned by inventory APIs.
+    headers: ?std.json.ArrayHashMap([]const u8) = null,
 };
 
 pub const InferenceConnectionConfig = struct {
@@ -432,6 +464,19 @@ pub const ObjectStorageLocation = struct {
     connection: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
+};
+
+pub const S3ExternalIoConfig = struct {
+    protocol: []const u8,
+    /// S3-compatible endpoint override.
+    endpoint: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    addressing_style: ?[]const u8 = null,
+    bucket_provisioning: ?[]const u8 = null,
+    buckets: []const []const u8,
+    prefix: ?[]const u8 = null,
+    credentials: ?AwsCredentialConfig = null,
+    use_ssl: ?bool = null,
 };
 
 /// Tagged storage-engine configuration. Engine is required and exactly the matching engine member must be present.

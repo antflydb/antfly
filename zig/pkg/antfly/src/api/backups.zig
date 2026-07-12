@@ -25,6 +25,7 @@ const common_config = @import("../common/config.zig");
 const bedrock = @import("../inference/bedrock.zig");
 const httpx = @import("httpx");
 const extension_domain = @import("../extensions/mod.zig");
+const google_auth = @import("antfly_google").auth;
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
@@ -171,9 +172,10 @@ const AwsCredentialContext = struct {
     }
 };
 
-fn authorizedS3Connection(
+fn authorizedObjectConnection(
     config: *const common_config.Config,
     connection_id: []const u8,
+    protocol: common_config.Config.ExternalIoProtocol,
     bucket: []const u8,
     raw_prefix: []const u8,
     required_capability: []const u8,
@@ -181,7 +183,7 @@ fn authorizedS3Connection(
     const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
     if (connection.kind != .external_io) return error.ConnectionKindMismatch;
     const external = connection.external_io orelse return error.ConnectionKindMismatch;
-    if (external.protocol != .s3) return error.ConnectionProtocolMismatch;
+    if (external.protocol != protocol) return error.ConnectionProtocolMismatch;
     var capability_allowed = false;
     for (connection.capabilities) |capability| {
         if (std.mem.eql(u8, capability, required_capability)) {
@@ -207,6 +209,21 @@ fn authorizedS3Connection(
         }
     }
     return external;
+}
+
+fn authorizedFilesystemConnection(
+    config: *const common_config.Config,
+    connection_id: []const u8,
+    required_capability: []const u8,
+) !common_config.Config.ExternalIoConnectionConfig {
+    const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .external_io) return error.ConnectionKindMismatch;
+    const external = connection.external_io orelse return error.ConnectionKindMismatch;
+    if (external.protocol != .filesystem or external.root == null) return error.ConnectionProtocolMismatch;
+    for (connection.capabilities) |capability| {
+        if (std.mem.eql(u8, capability, required_capability)) return external;
+    }
+    return error.ConnectionCapabilityDenied;
 }
 
 fn s3ConfigForConnection(
@@ -277,21 +294,34 @@ const RemoteBackupStore = struct {
 
         return switch (parsed) {
             .file => error.UnsupportedBackupLocation,
-            .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix),
+            .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix, options),
             .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix, options),
         };
     }
 
-    fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8) !RemoteBackupStore {
+    fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8, options: OpenOptions) !RemoteBackupStore {
         const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
-        const cfg = try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var create_bucket_if_missing = false;
+        const cfg = if (options.connection) |connection_id| blk: {
+            const external = try authorizedObjectConnection(
+                options.node_config orelse return error.ConnectionConfigUnavailable,
+                connection_id,
+                .gcs,
+                bucket,
+                prefix,
+                options.required_capability,
+            );
+            create_bucket_if_missing = external.bucket_provisioning == .create_if_missing;
+            break :blk try gcsConfigForConnection(alloc, external);
+        } else try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
 
         return .{
             .alloc = alloc,
             .client = gcs.client(),
             .gcs_client = gcs,
+            .create_bucket_if_missing = create_bucket_if_missing,
             .bucket = try alloc.dupe(u8, bucket),
             .prefix = try alloc.dupe(u8, prefix),
         };
@@ -312,7 +342,7 @@ const RemoteBackupStore = struct {
         };
         var create_bucket_if_missing = false;
         const cfg = if (options.connection) |connection_id| blk: {
-            const connection = try authorizedS3Connection(options.node_config orelse return error.ConnectionConfigUnavailable, connection_id, bucket, prefix, options.required_capability);
+            const connection = try authorizedObjectConnection(options.node_config orelse return error.ConnectionConfigUnavailable, connection_id, .s3, bucket, prefix, options.required_capability);
             create_bucket_if_missing = connection.bucket_provisioning == .create_if_missing;
             break :blk try s3ConfigForConnection(alloc, connection, &credential_context);
         } else blk: {
@@ -379,6 +409,7 @@ const RemoteBackupStore = struct {
 
     fn keyAlloc(self: *const RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
         const trimmed_suffix = trimLeftSlash(suffix);
+        if (trimmed_suffix.len > 0) try validateArtifactRelativePath(trimmed_suffix);
         if (self.prefix.len == 0) return try alloc.dupe(u8, trimmed_suffix);
         if (trimmed_suffix.len == 0) return try alloc.dupe(u8, self.prefix);
         return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.prefix, trimmed_suffix });
@@ -484,12 +515,65 @@ const RemoteBackupStore = struct {
         for (listed.entries) |entry| {
             const rel = trimLeftSlash(entry.key[key_prefix.len..]);
             if (rel.len == 0) continue;
+            try validateArtifactRelativePath(rel);
             const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
             defer alloc.free(dest_file);
             try self.client.getFile(self.bucket, entry.key, dest_file, .{});
         }
     }
 };
+
+pub fn gcsConfigForConnection(
+    alloc: std.mem.Allocator,
+    external: common_config.Config.ExternalIoConnectionConfig,
+) !object_storage.Gcs.JsonApiConfig {
+    var cfg = switch (external.gcs_credentials.source) {
+        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc),
+        .bearer_token => try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(
+            alloc,
+            external.gcs_credentials.bearer_token orelse return error.InvalidConnectionCredentials,
+            external.project_id,
+        ),
+        .service_account => blk: {
+            var account = if (external.gcs_credentials.service_account_json) |raw|
+                try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
+            else
+                try google_auth.serviceAccountFromFileAlloc(alloc, external.gcs_credentials.credentials_path orelse return error.InvalidConnectionCredentials);
+            var account_owned = true;
+            errdefer if (account_owned) account.deinit(alloc);
+            const account_project_id = if (account.project_id) |value| try alloc.dupe(u8, value) else null;
+            defer if (account_project_id) |value| alloc.free(value);
+            var auth_cfg = try google_auth.configFromServiceAccountAlloc(
+                alloc,
+                account,
+                external.gcs_credentials.scope orelse google_auth.default_scope,
+            );
+            account_owned = false;
+            errdefer auth_cfg.deinit(alloc);
+            const source = try alloc.create(google_auth.CachedTokenSource);
+            errdefer alloc.destroy(source);
+            source.* = try google_auth.CachedTokenSource.init(alloc, auth_cfg);
+            var value = try object_storage.Gcs.jsonApiClientConfigAlloc(alloc);
+            value.auth = .{ .google_token_source = source };
+            if (external.project_id orelse account_project_id) |project_id| value.project_id = try alloc.dupe(u8, project_id);
+            break :blk value;
+        },
+    };
+    errdefer cfg.deinit(alloc);
+    if (external.endpoint) |endpoint| {
+        alloc.free(cfg.endpoint);
+        cfg.endpoint = try alloc.dupe(u8, endpoint);
+    }
+    if (external.upload_endpoint) |endpoint| {
+        alloc.free(cfg.upload_endpoint);
+        cfg.upload_endpoint = try alloc.dupe(u8, endpoint);
+    }
+    if (external.project_id) |project_id| {
+        if (cfg.project_id) |previous| alloc.free(previous);
+        cfg.project_id = try alloc.dupe(u8, project_id);
+    }
+    return cfg;
+}
 
 const S3SecretOverrides = struct {
     endpoint: ?[]u8 = null,
@@ -619,11 +703,17 @@ pub fn openBackupLocationWithOptions(
     options: OpenOptions,
 ) !BackupLocation {
     if (std.mem.startsWith(u8, location, "file://")) {
-        if (options.connection != null) return error.ConnectionProtocolMismatch;
+        if (options.connection) |connection_id| {
+            const external = try authorizedFilesystemConnection(
+                options.node_config orelse return error.ConnectionConfigUnavailable,
+                connection_id,
+                options.required_capability,
+            );
+            return .{ .file = try resolveFilesystemLocationAlloc(alloc, external.root.?, location) };
+        }
         return .{ .file = try alloc.dupe(u8, try parseFileLocation(location)) };
     }
     if (std.mem.startsWith(u8, location, "s3://") or std.mem.startsWith(u8, location, "gs://") or std.mem.startsWith(u8, location, "gcs://")) {
-        if ((std.mem.startsWith(u8, location, "gs://") or std.mem.startsWith(u8, location, "gcs://")) and options.connection != null) return error.ConnectionProtocolMismatch;
         return .{ .remote = try RemoteBackupStore.initRemoteUri(alloc, location, options) };
     }
     return error.UnsupportedBackupLocation;
@@ -640,7 +730,7 @@ pub fn backupLocationErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingProjectId => "missing GCS project id; set GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT for gs:// backups",
         error.ConnectionConfigUnavailable => "named backup connection is unavailable on this server",
         error.ConnectionNotFound => "backup connection was not found",
-        error.ConnectionKindMismatch, error.ConnectionProtocolMismatch => "backup connection must be an external_io S3 connection",
+        error.ConnectionKindMismatch, error.ConnectionProtocolMismatch => "backup connection protocol does not match the location",
         error.ConnectionCapabilityDenied => "backup connection does not grant the required capability",
         error.ConnectionBucketDenied => "backup location bucket is outside the connection allowlist",
         error.ConnectionPrefixDenied => "backup location prefix is outside the connection scope",
@@ -661,10 +751,11 @@ pub fn parseRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json
 pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterBackupRequest {
     var parsed = try metadata_openapi.server.parseBackupBody(alloc, body);
     defer parsed.deinit();
+    try validateBackupId(parsed.value.backup_id);
     return .{
         .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
         .location = try alloc.dupe(u8, parsed.value.location),
-        .connection = if (parsed.value.connection) |value| try alloc.dupe(u8, value) else null,
+        .connection = try alloc.dupe(u8, parsed.value.connection),
         .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
     };
 }
@@ -672,10 +763,11 @@ pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !Cl
 pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterRestoreRequest {
     var parsed = try metadata_openapi.server.parseRestoreBody(alloc, body);
     defer parsed.deinit();
+    try validateBackupId(parsed.value.backup_id);
     return .{
         .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
         .location = try alloc.dupe(u8, parsed.value.location),
-        .connection = if (parsed.value.connection) |value| try alloc.dupe(u8, value) else null,
+        .connection = try alloc.dupe(u8, parsed.value.connection),
         .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
         .restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null,
     };
@@ -686,6 +778,64 @@ pub fn parseFileLocation(location: []const u8) ![]const u8 {
     const path = location["file://".len..];
     if (path.len == 0 or path[0] != '/') return error.InvalidBackupLocation;
     return path;
+}
+
+pub fn validateBackupId(value: []const u8) !void {
+    if (value.len == 0 or value.len > 128) return error.InvalidBackupId;
+    for (value) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return error.InvalidBackupId;
+    }
+    if (std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return error.InvalidBackupId;
+}
+
+pub fn validateArtifactRelativePath(path: []const u8) !void {
+    if (path.len == 0 or path.len > 4096 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidBackupArtifactPath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidBackupArtifactPath;
+    }
+}
+
+fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []const u8, location: []const u8) ![]u8 {
+    const uri_path = try parseFileLocation(location);
+    const relative = std.mem.trimStart(u8, uri_path, "/");
+    if (relative.len > 0) try validateArtifactRelativePath(relative);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const canonical_root = try std.Io.Dir.realPathFileAbsoluteAlloc(io, configured_root, alloc);
+    defer alloc.free(canonical_root);
+    const candidate = if (relative.len == 0)
+        try alloc.dupe(u8, canonical_root)
+    else
+        try std.fs.path.join(alloc, &.{ canonical_root, relative });
+    errdefer alloc.free(candidate);
+
+    // Resolve the nearest existing ancestor. This rejects pre-existing symlinks
+    // that leave the configured root while still allowing backup directories to
+    // be created below it.
+    var ancestor: []const u8 = candidate;
+    while (true) {
+        const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io, ancestor, alloc) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                ancestor = std.fs.path.dirname(ancestor) orelse return error.InvalidBackupLocation;
+                continue;
+            },
+            else => return err,
+        };
+        defer alloc.free(canonical);
+        if (!pathIsWithin(canonical_root, canonical)) return error.ConnectionPrefixDenied;
+        break;
+    }
+    return candidate;
+}
+
+fn pathIsWithin(root: []const u8, candidate: []const u8) bool {
+    return std.mem.eql(u8, root, candidate) or
+        (candidate.len > root.len and std.mem.startsWith(u8, candidate, root) and candidate[root.len] == std.fs.path.sep);
 }
 
 pub fn createManifest(
@@ -792,10 +942,16 @@ fn parseTableBackupManifestOrPortable(
     if (std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always })) |parsed| {
         defer parsed.deinit();
         if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
+        try validateTableManifest(&parsed.value, backup_id);
         return try cloneTableBackupManifest(alloc, parsed.value);
     } else |_| {
         return try parseGoPortableTableManifest(alloc, body, backup_id);
     }
+}
+
+fn validateTableManifest(manifest: *const TableBackupManifest, requested_backup_id: []const u8) !void {
+    if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
+    for (manifest.shards) |shard| try validateArtifactRelativePath(shard.snapshot_path);
 }
 
 const PortableShard = struct {
@@ -1037,18 +1193,22 @@ fn decodePortableByteRangeBoundary(alloc: std.mem.Allocator, encoded: []const u8
 }
 
 pub fn metadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/{s}-metadata.json", .{ backup_root, backup_id });
 }
 
 pub fn clusterMetadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/{s}-cluster-metadata.json", .{ backup_root, backup_id });
 }
 
 pub fn shardSnapshotPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8, group_id: u64) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/{s}/groups/{d}", .{ backup_root, backup_id, group_id });
 }
 
 pub fn shardSnapshotRelPath(alloc: std.mem.Allocator, backup_id: []const u8, group_id: u64) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/groups/{d}", .{ backup_id, group_id });
 }
 
@@ -1061,7 +1221,30 @@ pub fn encodeRestoreTriggered(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub fn clusterTableBackupId(alloc: std.mem.Allocator, cluster_backup_id: []const u8, table_name: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}-{s}", .{ table_name, cluster_backup_id });
+    try validateBackupId(cluster_backup_id);
+    if (table_name.len == 0) return error.InvalidBackupId;
+    // Table names are user-facing Unicode identifiers and are not safe path
+    // components. A domain-separated digest is fixed-size, portable, and
+    // collision-resistant even when the public backup ID is at its limit.
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-cluster-table-backup-v1\x00");
+    hash.update(cluster_backup_id);
+    hash.update("\x00");
+    hash.update(table_name);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return try std.fmt.allocPrint(alloc, "table-{s}", .{hex});
+}
+
+test "cluster table backup ids are fixed-size safe components" {
+    const first = try clusterTableBackupId(std.testing.allocator, "daily", "documents/日本語");
+    defer std.testing.allocator.free(first);
+    const second = try clusterTableBackupId(std.testing.allocator, "daily", "documents/日本語");
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expectEqual(@as(usize, "table-".len + 64), first.len);
+    try validateBackupId(first);
 }
 
 pub fn createClusterManifest(
@@ -1141,6 +1324,7 @@ pub fn readClusterManifest(
     var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value.format_version != cluster_format_version) return error.UnsupportedBackupFormat;
+    try validateClusterManifest(&parsed.value, backup_id);
     return try cloneClusterBackupManifest(alloc, parsed.value);
 }
 
@@ -1176,9 +1360,15 @@ pub fn readClusterManifestFromLocation(
             var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             if (parsed.value.format_version != cluster_format_version) return error.UnsupportedBackupFormat;
+            try validateClusterManifest(&parsed.value, backup_id);
             return try cloneClusterBackupManifest(alloc, parsed.value);
         },
     }
+}
+
+fn validateClusterManifest(manifest: *const ClusterBackupManifest, requested_backup_id: []const u8) !void {
+    if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
+    for (manifest.tables) |table| try validateBackupId(table.table_backup_id);
 }
 
 pub fn encodeClusterBackupResponse(
@@ -1428,6 +1618,7 @@ pub fn copyDirectoryFromLocation(
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const src_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -1444,6 +1635,7 @@ pub fn copyFileFromLocation(
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const src_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -1465,6 +1657,7 @@ pub fn copyFileToLocation(
     src_path: []const u8,
     content_type: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -1486,6 +1679,7 @@ pub fn writeFileToLocation(
     body: []const u8,
     content_type: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -2141,11 +2335,20 @@ test "backup connections enforce capability bucket and segment bounded prefix" {
     var config = try common_config.Config.parseFromSlice(std.testing.allocator, json);
     defer config.deinit();
 
-    _ = try authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups/daily", "backup.write");
-    _ = try authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups/daily", "restore.read");
-    try std.testing.expectError(error.ConnectionCapabilityDenied, authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups/daily", "objects.delete"));
-    try std.testing.expectError(error.ConnectionBucketDenied, authorizedS3Connection(&config, "archive", "other", "tenant-a/backups/daily", "backup.write"));
-    try std.testing.expectError(error.ConnectionPrefixDenied, authorizedS3Connection(&config, "archive", "prod-archive", "tenant-a/backups-evil", "backup.write"));
+    _ = try authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups/daily", "backup.write");
+    _ = try authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups/daily", "restore.read");
+    try std.testing.expectError(error.ConnectionCapabilityDenied, authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups/daily", "objects.delete"));
+    try std.testing.expectError(error.ConnectionBucketDenied, authorizedObjectConnection(&config, "archive", .s3, "other", "tenant-a/backups/daily", "backup.write"));
+    try std.testing.expectError(error.ConnectionPrefixDenied, authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups-evil", "backup.write"));
+}
+
+test "backup identifiers and artifact paths reject traversal" {
+    try validateBackupId("daily-2026.07.11");
+    try std.testing.expectError(error.InvalidBackupId, validateBackupId("../escape"));
+    try std.testing.expectError(error.InvalidBackupId, validateBackupId("nested/name"));
+    try validateArtifactRelativePath("daily/groups/7/data.bin");
+    try std.testing.expectError(error.InvalidBackupArtifactPath, validateArtifactRelativePath("daily/../secrets"));
+    try std.testing.expectError(error.InvalidBackupArtifactPath, validateArtifactRelativePath("/etc/passwd"));
 }
 
 test "derive restore table record returns owned table metadata" {

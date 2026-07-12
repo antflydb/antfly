@@ -72,6 +72,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         printBackupUsage();
         return;
     }
+    const connection = opts.connection orelse cli.fatal("--connection is required", .{});
 
     if (opts.url) |value| try client.setBaseUrl(value);
 
@@ -81,7 +82,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
                 cli.fatal("only JSON output is supported for backup --list", .{});
             }
         }
-        var resp = try client.listBackups(.{ .location = opts.location });
+        var resp = try client.listBackups(.{ .location = opts.location, .connection = connection });
         defer resp.deinit();
         if (resp.data) |data| {
             try cli.writeJson(allocator, io, data.value);
@@ -105,7 +106,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
             break :blk out_plan.?.backup_id;
         } else opts.backup_id orelse cli.fatal("--backup-id is required", .{});
         const location = if (out_plan) |plan| plan.location else opts.location;
-        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .connection = opts.connection, .format = selected_format });
+        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .connection = connection, .format = selected_format });
         if (out_plan) |plan| {
             validatePortableOutputFile(allocator, io, plan.out_path) catch |err| switch (err) {
                 error.EmptyPortableOutput => cli.fatal("portable backup completed but local --out file is empty: {s}", .{plan.out_path}),
@@ -134,7 +135,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     var resp = try client.clusterBackup(.{
         .backup_id = bid,
         .location = opts.location,
-        .connection = opts.connection,
+        .connection = connection,
         .table_names = table_names,
     });
     defer resp.deinit();
@@ -150,6 +151,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         printRestoreUsage();
         return;
     }
+    const connection = opts.connection orelse cli.fatal("--connection is required", .{});
 
     validateRestoreArgs(opts) catch |err| switch (err) {
         error.RestoreInputModeUnsupported => cli.fatal("--input restore targets one table; omit --mode", .{}),
@@ -169,9 +171,10 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
 
         const location = try restoreInputLocationAlloc(allocator, input, opts);
         defer allocator.free(location);
-        var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location);
+        var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location, connection);
         defer plan.deinit(allocator);
-        try client.restoreTable(plan.tableName(), plan.request);
+        var resp = try client.restoreTable(plan.tableName(), plan.request);
+        defer resp.deinit();
         std.debug.print("Restore command successfully initiated.\n", .{});
         return;
     }
@@ -179,7 +182,8 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
     if (opts.table_name) |tbl| {
-        try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = opts.connection, .format = opts.format });
+        var resp = try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = opts.format });
+        defer resp.deinit();
         std.debug.print("Restore command successfully initiated.\n", .{});
         return;
     }
@@ -197,7 +201,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     var resp = try client.clusterRestore(.{
         .backup_id = bid,
         .location = opts.location,
-        .connection = opts.connection,
+        .connection = connection,
         .table_names = table_names,
         .restore_mode = opts.restore_mode,
     });
@@ -214,6 +218,7 @@ fn prepareInputRestorePlan(
     table_name: []const u8,
     backup_id: ?[]const u8,
     location: []const u8,
+    connection: []const u8,
 ) !InputRestorePlan {
     var owned_backup_id: ?[]u8 = null;
     defer if (owned_backup_id) |value| allocator.free(value);
@@ -233,6 +238,7 @@ fn prepareInputRestorePlan(
         .request = .{
             .backup_id = staged.backup_id,
             .location = staged.location,
+            .connection = connection,
             .format = "portable",
         },
     };
@@ -325,10 +331,10 @@ fn defaultLiteInputRestoreLocationAlloc(allocator: std.mem.Allocator) ![]u8 {
 fn printBackupUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly backup --table <name> --backup-id <id> [--location <uri>] [--connection <id>] [--format native|portable] [--url <url>]
-        \\  antfly backup --table <name> --format portable --out <backup.afb> [--url <url>]
-        \\  antfly backup --tables <a,b> --backup-id <id> [--location <uri>] [--connection <id>] [--url <url>]
-        \\  antfly backup --list [--location <uri>] [--output json] [--url <url>]
+        \\  antfly backup --table <name> --backup-id <id> --connection <id> [--location <uri>] [--format native|portable] [--url <url>]
+        \\  antfly backup --table <name> --format portable --out <backup.afb> --connection <id> [--url <url>]
+        \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> [--location <uri>] [--url <url>]
+        \\  antfly backup --list --connection <id> [--location <uri>] [--output json] [--url <url>]
         \\
         \\notes:
         \\  `--out` writes a single portable AFB file for Lite restore/import.
@@ -339,9 +345,9 @@ fn printBackupUsage() void {
 fn printRestoreUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly restore --table <name> --backup-id <id> [--location <uri>] [--connection <id>] [--format native|portable] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> [--location <uri>] [--connection <id>] [--mode <mode>] [--url <url>]
-        \\  antfly restore --input <db.aflite|backup.afb> --table <name> [--backup-id <id>] [--location <uri>] [--url <url>]
+        \\  antfly restore --table <name> --backup-id <id> --connection <id> [--location <uri>] [--format native|portable] [--url <url>]
+        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> [--location <uri>] [--mode <mode>] [--url <url>]
+        \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> [--backup-id <id>] [--location <uri>] [--url <url>]
         \\
         \\notes:
         \\  `--input db.aflite` stages an Antfly Lite database as a portable backup,
@@ -603,7 +609,7 @@ test "restore input plan stages aflite as portable table restore" {
         try db.runUntilIdle();
     }
 
-    var plan = try prepareInputRestorePlan(allocator, src_path, "docs", null, location);
+    var plan = try prepareInputRestorePlan(allocator, src_path, "docs", null, location, "local-reader");
     defer plan.deinit(allocator);
 
     try std.testing.expectEqualStrings("docs", plan.tableName());

@@ -4511,9 +4511,13 @@ components:
       required:
         - backup_id
         - location
+        - connection
       properties:
         backup_id:
           type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
           description: |
             Unique identifier for this backup. Used to reference the backup for restore operations.
             Choose a meaningful name that includes date/version information.
@@ -4522,18 +4526,18 @@ components:
           type: string
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Local filesystem: `file:///path/to/backup`
+            - Scoped filesystem connection: `file:///logical/path`
             - Amazon S3: `s3://bucket-name/path/to/backup`
+            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
             The backup includes all table data, indexes, and metadata for the specified table.
           example: "s3://mybucket/antfly-backups/users-table/2025-01-15"
         connection:
           type: string
           description: |
-            ID of a configured `external_io` connection. Required for remote
-            backup and restore locations; local `file://` operations omit it.
-            S3 backups require `backup.write`, restores require `restore.read`,
-            and the location bucket and prefix must be allowlisted.
+            ID of a configured `external_io` connection. Required for every
+            network API backup and restore. Object locations enforce bucket and
+            prefix scopes; filesystem URI paths resolve beneath the connection root.
         format:
           type: string
           enum: [native, portable]
@@ -4553,9 +4557,13 @@ components:
       required:
         - backup_id
         - location
+        - connection
       properties:
         backup_id:
           type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
           description: |
             Unique identifier for this backup. Used to reference the backup for restore operations.
             Choose a meaningful name that includes date/version information.
@@ -4564,14 +4572,15 @@ components:
           type: string
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Local filesystem: `file:///path/to/backup`
+            - Scoped filesystem connection: `file:///logical/path`
             - Amazon S3: `s3://bucket-name/path/to/backup`
+            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
             The backup includes all table data, indexes, and metadata.
           example: "s3://mybucket/antfly-backups/cluster/2025-01-15"
         connection:
           type: string
-          description: Optional configured `external_io` connection with the `backup.write` capability.
+          description: Required configured `external_io` connection with the `backup.write` capability.
         format:
           type: string
           enum: [native, portable]
@@ -4634,9 +4643,13 @@ components:
       required:
         - backup_id
         - location
+        - connection
       properties:
         backup_id:
           type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
           description: |
             Unique identifier of the backup to restore from.
           example: "cluster-backup-2025-01-15"
@@ -4647,7 +4660,7 @@ components:
           example: "s3://mybucket/antfly-backups/cluster/2025-01-15"
         connection:
           type: string
-          description: Optional configured `external_io` connection with the `restore.read` capability.
+          description: Required configured `external_io` connection with the `restore.read` capability.
         table_names:
           type: array
           items:
@@ -4665,6 +4678,27 @@ components:
             - `skip_if_exists`: Skip existing tables, restore others
             - `overwrite`: Drop and recreate existing tables
           example: "skip_if_exists"
+    RestoreJob:
+      type: object
+      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, created_at_ms, updated_at_ms, expires_at_ms]
+      properties:
+        job_id: { type: integer, format: int64 }
+        attempt_id: { type: integer, format: int64 }
+        scope: { type: string, enum: [table, cluster] }
+        table_name: { type: string }
+        backup_id: { type: string }
+        phase: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        cancel_requested: { type: boolean }
+        result:
+          type: object
+          additionalProperties: true
+        error: { type: string }
+        created_at_ms: { type: integer, format: int64 }
+        updated_at_ms: { type: integer, format: int64 }
+        expires_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed.
     ClusterRestoreResponse:
       type: object
       required:
@@ -8025,10 +8059,17 @@ paths:
         - `skip_if_exists`: Skip existing tables and restore the rest
         - `overwrite`: Drop existing tables and restore from backup
 
-        The restore is asynchronous - this endpoint triggers the restore process
-        and returns immediately. The actual data restoration happens via the
-        reconciliation loop as shards are started.
+        The restore is a durable asynchronous job. The request returns after the
+        job record is persisted. Poll the restore job resource for progress.
+        Interrupted running jobs are resumed after restart. Cancellation is
+        cooperative between table and artifact publication boundaries.
       operationId: restore
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 256 }
+          description: Stable key used to safely retry creation of this restore job. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -8041,11 +8082,39 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ClusterRestoreResponse"
+                $ref: "#/components/schemas/RestoreJob"
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /restore/jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    get:
+      summary: Get durable restore job status
+      operationId: getRestoreJob
+      tags: [cluster_management]
+      responses:
+        "200":
+          description: Restore job status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreJob" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Request cooperative restore cancellation
+      operationId: cancelRestoreJob
+      tags: [cluster_management]
+      responses:
+        "200":
+          description: Updated restore job status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreJob" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /backups:
     get:
       summary: List available backups
@@ -8717,6 +8786,12 @@ paths:
       tags:
         - data_operations
       operationId: restoreTable
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 256 }
+          description: Stable key used to safely retry creation of this restore job. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -8724,16 +8799,12 @@ paths:
             schema:
               $ref: "#/components/schemas/RestoreRequest"
       responses:
-        "202": # Corrected to 202 as per handler
-          description: Restore process triggered successfully
+        "202":
+          description: Durable restore job accepted
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  restore:
-                    type: string
-                    example: triggered
+                $ref: "#/components/schemas/RestoreJob"
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":

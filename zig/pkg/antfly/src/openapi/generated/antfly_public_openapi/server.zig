@@ -246,6 +246,16 @@ pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.jso
     return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get durable restore job status
+pub const GetRestoreJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// Request cooperative restore cancellation
+pub const CancelRestoreJobPathParams = struct {
+    job_id: []const u8,
+};
+
 /// Store a secret
 pub const PutSecretPathParams = struct {
     /// Secret key name (e.g., openai.api_key)
@@ -725,6 +735,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
+    .{ .method = "GET", .path = "/restore/jobs/{job_id}", .operation_id = "getRestoreJob" },
+    .{ .method = "DELETE", .path = "/restore/jobs/{job_id}", .operation_id = "cancelRestoreJob" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
@@ -813,6 +825,8 @@ pub const routes = [_]Route{
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response

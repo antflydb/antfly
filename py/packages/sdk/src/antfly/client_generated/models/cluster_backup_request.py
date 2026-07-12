@@ -20,12 +20,13 @@ class ClusterBackupRequest:
             Choose a meaningful name that includes date/version information.
              Example: cluster-backup-2025-01-15.
         location (str): Storage location for the backup. Supports multiple backends:
-            - Local filesystem: `file:///path/to/backup`
+            - Scoped filesystem connection: `file:///logical/path`
             - Amazon S3: `s3://bucket-name/path/to/backup`
+            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
             The backup includes all table data, indexes, and metadata.
              Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
-        connection (str | Unset): Optional configured `external_io` connection with the `backup.write` capability.
+        connection (str): Required configured `external_io` connection with the `backup.write` capability.
         format_ (ClusterBackupRequestFormat | Unset): Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
@@ -39,7 +40,7 @@ class ClusterBackupRequest:
 
     backup_id: str
     location: str
-    connection: str | Unset = UNSET
+    connection: str
     format_: ClusterBackupRequestFormat | Unset = ClusterBackupRequestFormat.PORTABLE
     table_names: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -65,10 +66,9 @@ class ClusterBackupRequest:
             {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": connection,
             }
         )
-        if connection is not UNSET:
-            field_dict["connection"] = connection
         if format_ is not UNSET:
             field_dict["format"] = format_
         if table_names is not UNSET:
@@ -83,7 +83,7 @@ class ClusterBackupRequest:
 
         location = d.pop("location")
 
-        connection = d.pop("connection", UNSET)
+        connection = d.pop("connection")
 
         _format_ = d.pop("format", UNSET)
         format_: ClusterBackupRequestFormat | Unset

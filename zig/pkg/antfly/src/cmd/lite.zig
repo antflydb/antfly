@@ -716,6 +716,7 @@ const PromoteOptions = struct {
     table: []const u8,
     backup_id: []const u8,
     location: []const u8,
+    connection: []const u8,
 
     fn deinit(self: *PromoteOptions, allocator: Allocator) void {
         allocator.free(self.backup_id);
@@ -776,6 +777,7 @@ fn promoteWithRestore(
     try restore_fn(restore_ctx, opts.table, .{
         .backup_id = staged.backup_id,
         .location = staged.location,
+        .connection = opts.connection,
         .format = "portable",
     });
 
@@ -784,7 +786,8 @@ fn promoteWithRestore(
 
 fn promoteRestoreWithClient(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
     const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ctx));
-    try client.restoreTable(table, request);
+    var resp = try client.restoreTable(table, request);
+    defer resp.deinit();
 }
 
 fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.process.Args.Iterator) !PromoteOptions {
@@ -792,6 +795,7 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
     var table: ?[]const u8 = null;
     var backup_id: ?[]const u8 = null;
     var location: ?[]const u8 = null;
+    var connection: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "--url")) {
             target = try nextRequiredArg(args);
@@ -801,6 +805,8 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
             backup_id = try nextRequiredArg(args);
         } else if (std.mem.eql(u8, arg, "--location")) {
             location = try nextRequiredArg(args);
+        } else if (std.mem.eql(u8, arg, "--connection")) {
+            connection = try nextRequiredArg(args);
         } else {
             return error.UnknownArgument;
         }
@@ -815,6 +821,7 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
         .table = resolved_table,
         .backup_id = resolved_backup_id,
         .location = resolved_location,
+        .connection = connection orelse return error.MissingArgument,
     };
 }
 
@@ -896,6 +903,11 @@ const ServeOptions = struct {
     path: []const u8,
     addr: []const u8 = "127.0.0.1:8080",
     fsync: bool = true,
+    standalone_args: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *ServeOptions, alloc: std.mem.Allocator) void {
+        self.standalone_args.deinit(alloc);
+    }
 };
 
 const LiteListenAddress = struct {
@@ -904,22 +916,24 @@ const LiteListenAddress = struct {
 };
 
 fn serve(init: std.process.Init, args: *std.process.Args.Iterator) !void {
-    const opts = try parseServeOptions(args);
+    var opts = try parseServeOptions(init.gpa, args);
+    defer opts.deinit(init.gpa);
     return try serveWithOptions(init, opts);
 }
 
 fn serveWithOptions(init: std.process.Init, opts: ServeOptions) !void {
     try requireAflitePath(opts.path);
     const listen = try parseLiteListenAddress(opts.addr);
-    return try antfly.standalone.runtime.runLite(init, opts.path, listen.host, listen.port, opts.fsync);
+    return try antfly.standalone.runtime.runLite(init, opts.path, listen.host, listen.port, opts.fsync, opts.standalone_args.items);
 }
 
-fn parseServeOptions(args: *std.process.Args.Iterator) !ServeOptions {
+fn parseServeOptions(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !ServeOptions {
     const path = args.next() orelse {
         std.debug.print("error: database path is required\n", .{});
         return error.InvalidArguments;
     };
     var opts: ServeOptions = .{ .path = path };
+    errdefer opts.deinit(alloc);
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--addr")) {
             opts.addr = args.next() orelse {
@@ -930,12 +944,21 @@ fn parseServeOptions(args: *std.process.Args.Iterator) !ServeOptions {
             opts.fsync = parseLiteBool(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
         } else if (std.mem.startsWith(u8, arg, "--fsync=")) {
             opts.fsync = parseLiteBool(arg["--fsync=".len..]) orelse return error.InvalidArguments;
-        } else {
-            std.debug.print("error: unknown serve argument: {s}\n", .{arg});
+        } else if (isReservedLiteServeFlag(arg)) {
+            std.debug.print("error: {s} is controlled by antfly lite serve\n", .{arg});
             return error.InvalidArguments;
+        } else {
+            try opts.standalone_args.append(alloc, arg);
         }
     }
     return opts;
+}
+
+fn isReservedLiteServeFlag(arg: []const u8) bool {
+    for ([_][]const u8{ "--storage-engine", "--storage-path", "--host", "--port" }) |flag| {
+        if (std.mem.eql(u8, arg, flag) or (arg.len > flag.len and std.mem.startsWith(u8, arg, flag) and arg[flag.len] == '=')) return true;
+    }
+    return false;
 }
 
 fn parseLiteBool(value: []const u8) ?bool {
@@ -1358,11 +1381,11 @@ fn printUsage(argv0: []const u8) void {
         \\  restore <backup.afb> --out <db.aflite> [--replace]
         \\  restore <source.aflite> --out <db.aflite> [--replace] (stable snapshot copy)
         \\  import <db.aflite> --from <backup.afb|source.aflite> [--replace]
-        \\  promote <db.aflite> --target <url> --table <name> [--backup-id <id>] [--location <uri>]
+        \\  promote <db.aflite> --target <url> --table <name> --connection <name> [--backup-id <id>] [--location <uri>]
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
-        \\  serve <db.aflite> --addr 127.0.0.1:8080 [--fsync <true|false>]
+        \\  serve <db.aflite> --addr 127.0.0.1:8080 [--fsync <true|false>] [standalone options]
         \\
     , .{argv0});
 }
@@ -1389,11 +1412,12 @@ test "lite restore source validation accepts afb and aflite" {
     try std.testing.expectError(error.InvalidArguments, requireRestoreSourcePath("app.db"));
 }
 
-test "lite serve parser preserves optional addr and rejects unknown args" {
+test "lite serve parser preserves convenience flags and forwards standalone options" {
     {
         const argv = [_][*:0]const u8{"app.aflite"};
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        const opts = try parseServeOptions(&args);
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
         try std.testing.expectEqualStrings("127.0.0.1:8080", opts.addr);
         try std.testing.expect(opts.fsync);
@@ -1404,13 +1428,15 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--fsync=false" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        const opts = try parseServeOptions(&args);
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
         try std.testing.expect(!opts.fsync);
     }
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--addr", "127.0.0.1:9090" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        const opts = try parseServeOptions(&args);
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
         try std.testing.expectEqualStrings("127.0.0.1:9090", opts.addr);
         const listen = try parseLiteListenAddress(opts.addr);
@@ -1420,7 +1446,14 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--port", "9090" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        try std.testing.expectError(error.InvalidArguments, parseServeOptions(&args));
+        try std.testing.expectError(error.InvalidArguments, parseServeOptions(std.testing.allocator, &args));
+    }
+    {
+        const argv = [_][*:0]const u8{ "app.aflite", "--config", "production.json", "--admin-api-token", "secret" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices([]const u8, &.{ "--config", "production.json", "--admin-api-token", "secret" }, opts.standalone_args.items);
     }
     try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("127.0.0.1"));
     try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress(":8080"));
@@ -1438,7 +1471,7 @@ test "lite promote parser requires values and derives default backup id" {
     const allocator = std.testing.allocator;
 
     {
-        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--location", "file:///tmp/backups" };
+        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--location", "file:///tmp/backups" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
@@ -1446,10 +1479,11 @@ test "lite promote parser requires values and derives default backup id" {
         try std.testing.expectEqualStrings("docs", opts.table);
         try std.testing.expectEqualStrings("lite-app", opts.backup_id);
         try std.testing.expectEqualStrings("file:///tmp/backups", opts.location);
+        try std.testing.expectEqualStrings("local-reader", opts.connection);
     }
 
     {
-        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--backup-id", "explicit-id" };
+        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--backup-id", "explicit-id" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
@@ -2808,7 +2842,7 @@ test "lite promote helper stages backup then submits normal restore request" {
 
     const location_z = try allocator.dupeZ(u8, location);
     defer allocator.free(location_z);
-    const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
+    const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--connection", "local-reader", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var opts = try parsePromoteOptions(allocator, src_path, &args);
     defer opts.deinit(allocator);
@@ -2819,6 +2853,7 @@ test "lite promote helper stages backup then submits normal restore request" {
         backup_id: []const u8 = "",
         location: []const u8 = "",
         format: []const u8 = "",
+        connection: []const u8 = "",
 
         fn restore(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -2827,6 +2862,7 @@ test "lite promote helper stages backup then submits normal restore request" {
             self.backup_id = request.backup_id;
             self.location = request.location;
             self.format = request.format orelse "";
+            self.connection = request.connection;
         }
     };
 
@@ -2839,6 +2875,7 @@ test "lite promote helper stages backup then submits normal restore request" {
     try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
     try std.testing.expectEqualStrings(staged.location, capture.location);
     try std.testing.expectEqualStrings("portable", capture.format);
+    try std.testing.expectEqualStrings("local-reader", capture.connection);
     try std.testing.expectEqualStrings("lite-promote-command.afb", staged.snapshot_path);
 
     var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);

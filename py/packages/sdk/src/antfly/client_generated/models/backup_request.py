@@ -20,15 +20,15 @@ class BackupRequest:
             Choose a meaningful name that includes date/version information.
              Example: backup-2025-01-15-v2.
         location (str): Storage location for the backup. Supports multiple backends:
-            - Local filesystem: `file:///path/to/backup`
+            - Scoped filesystem connection: `file:///logical/path`
             - Amazon S3: `s3://bucket-name/path/to/backup`
+            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
             The backup includes all table data, indexes, and metadata for the specified table.
              Example: s3://mybucket/antfly-backups/users-table/2025-01-15.
-        connection (str | Unset): ID of a configured `external_io` connection. Required for remote
-            backup and restore locations; local `file://` operations omit it.
-            S3 backups require `backup.write`, restores require `restore.read`,
-            and the location bucket and prefix must be allowlisted.
+        connection (str): ID of a configured `external_io` connection. Required for every
+            network API backup and restore. Object locations enforce bucket and
+            prefix scopes; filesystem URI paths resolve beneath the connection root.
         format_ (BackupRequestFormat | Unset): Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
@@ -40,7 +40,7 @@ class BackupRequest:
 
     backup_id: str
     location: str
-    connection: str | Unset = UNSET
+    connection: str
     format_: BackupRequestFormat | Unset = BackupRequestFormat.PORTABLE
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -61,10 +61,9 @@ class BackupRequest:
             {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": connection,
             }
         )
-        if connection is not UNSET:
-            field_dict["connection"] = connection
         if format_ is not UNSET:
             field_dict["format"] = format_
 
@@ -77,7 +76,7 @@ class BackupRequest:
 
         location = d.pop("location")
 
-        connection = d.pop("connection", UNSET)
+        connection = d.pop("connection")
 
         _format_ = d.pop("format", UNSET)
         format_: BackupRequestFormat | Unset

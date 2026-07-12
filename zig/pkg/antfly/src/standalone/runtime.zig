@@ -1589,6 +1589,7 @@ pub fn runLite(
     host: []const u8,
     port: u16,
     fsync: bool,
+    extra_args: []const []const u8,
 ) !void {
     const path_z = try init.gpa.dupeZ(u8, path);
     defer init.gpa.free(path_z);
@@ -1596,7 +1597,9 @@ pub fn runLite(
     defer init.gpa.free(host_z);
     var port_buf: [16]u8 = undefined;
     const port_z = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
-    const argv = [_][*:0]const u8{
+    var argv = std.ArrayListUnmanaged([*:0]const u8).empty;
+    defer argv.deinit(init.gpa);
+    try argv.appendSlice(init.gpa, &.{
         "--storage-engine",
         "lite",
         "--storage-path",
@@ -1606,8 +1609,19 @@ pub fn runLite(
         "--port",
         port_z.ptr,
         if (fsync) "--fsync=true" else "--fsync=false",
-    };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    });
+    const owned_extra = try init.gpa.alloc([:0]u8, extra_args.len);
+    var owned_extra_count: usize = 0;
+    defer {
+        for (owned_extra[0..owned_extra_count]) |value| init.gpa.free(value);
+        init.gpa.free(owned_extra);
+    }
+    for (extra_args, 0..) |arg, i| {
+        owned_extra[i] = try init.gpa.dupeZ(u8, arg);
+        owned_extra_count += 1;
+        try argv.append(init.gpa, owned_extra[i].ptr);
+    }
+    var args = std.process.Args.Iterator.init(.{ .vector = argv.items });
     try runFromIterator(init, "antfly standalone", &args);
 }
 

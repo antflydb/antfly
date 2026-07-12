@@ -19,6 +19,7 @@ const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
 const backups_api = @import("backups.zig");
+const restore_jobs = @import("restore_jobs.zig");
 const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
@@ -301,6 +302,7 @@ pub const ApiHttpServerConfig = struct {
     artifact_reprocess_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
+    restore_job_store_path: ?[]const u8 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -1075,7 +1077,10 @@ pub const ApiHttpServer = struct {
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    restore_job_store: restore_jobs.Store = .{ .alloc = undefined },
     repair_job_owner_id: u64 = 0,
+    restore_job_owner_id: u64 = 0,
+    restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
     session_maintenance_owner_id: u64 = 0,
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     mcp_sessions: mcp.InMemorySessionStore = .{},
@@ -1127,7 +1132,9 @@ pub const ApiHttpServer = struct {
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
             }),
+            .restore_job_store = restore_jobs.Store.init(alloc),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
+            .restore_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .session_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
@@ -1223,6 +1230,18 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.repair_job_store.attachOpenedStore(opened);
         }
+        if (cfg.restore_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.restore_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.restore_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(restore_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try restore_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.restore_job_store.attach(opened);
+        }
         return server;
     }
 
@@ -1247,6 +1266,7 @@ pub const ApiHttpServer = struct {
     pub fn deinit(self: *ApiHttpServer) void {
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
+            if (self.restore_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.restore_job_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
         }
         self.mcp_sessions.deinit(self.alloc);
@@ -1259,6 +1279,7 @@ pub const ApiHttpServer = struct {
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
         self.repair_job_store.deinit();
+        self.restore_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
             self.alloc.destroy(registry);
@@ -2137,6 +2158,17 @@ pub const ApiHttpServer = struct {
 
         if (try self.dispatchStorageMaintenanceRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
+        try self.resumeRestoreJobsOnce();
+        if (restoreJobIdFromPath(uri_parts.path)) |job_id| {
+            if (authenticated_identity) |identity| {
+                if (!(try self.restoreJobAllowed(self.alloc, identity, job_id))) return try textResponse(self.alloc, 404, "not found");
+            }
+            return switch (req.method) {
+                .GET => try self.handlePublicRestoreJob(job_id, false),
+                .DELETE => try self.handlePublicRestoreJob(job_id, true),
+                else => try textResponse(self.alloc, 405, "method not allowed"),
+            };
+        }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
             const metadata_status = try self.source.status();
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
@@ -4165,7 +4197,7 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
-                return try self.handlePublicClusterRestore(req.body);
+                return try self.handlePublicClusterRestore(req.body, req.header("idempotency-key"));
             }
         }
         if (req.method == .POST) {
@@ -4179,7 +4211,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableRestore(uri_parts.path)) |table_restore| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_restore.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicTableRestore(table_name, req.body);
+                return try self.handlePublicTableRestore(table_name, req.body, req.header("idempotency-key"));
             }
         }
         if (req.method == .POST) {
@@ -7214,7 +7246,22 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
+        return executePublicClusterRestoreWithCancellation(ptr, alloc, req, location, restore_mode, null);
+    }
+
+    const RestoreCancellation = struct { job_id: u64, attempt_id: u64 };
+
+    fn executePublicClusterRestoreWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        req: backups_api.ClusterRestoreRequest,
+        location: *backups_api.BackupLocation,
+        restore_mode: []const u8,
+        cancellation: ?RestoreCancellation,
+    ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+
+        if (self.restoreCancelled(cancellation)) return error.Cancelled;
 
         var manifest = backups_api.readClusterManifestFromLocation(alloc, location, req.backup_id) catch return error.InvalidRequest;
         defer manifest.deinit(alloc);
@@ -7233,6 +7280,7 @@ pub const ApiHttpServer = struct {
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
             for (table_names) |table_name| {
+                if (self.restoreCancelled(cancellation)) return error.Cancelled;
                 if (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)) {
                     return error.TableAlreadyExists;
                 }
@@ -7259,6 +7307,7 @@ pub const ApiHttpServer = struct {
 
         if (std.mem.eql(u8, restore_mode, "overwrite")) {
             for (table_names, 0..) |table_name, i| {
+                if (self.restoreCancelled(cancellation)) return error.Cancelled;
                 if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
                 const exists = self.tableExists(table_name) catch |err| return metadataAccessFailure(err);
                 if (!exists) continue;
@@ -7300,6 +7349,7 @@ pub const ApiHttpServer = struct {
 
         const is_overwrite = std.mem.eql(u8, restore_mode, "overwrite");
         for (table_names, 0..) |table_name, i| {
+            if (self.restoreCancelled(cancellation)) return error.Cancelled;
             if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
 
             const table_backup_id = backups_api.findClusterTable(&manifest, table_name).?.table_backup_id;
@@ -7355,6 +7405,7 @@ pub const ApiHttpServer = struct {
         }
 
         if (owns_table_names and clusterRestoreStatusesHaveNoErrors(statuses)) {
+            if (self.restoreCancelled(cancellation)) return error.Cancelled;
             self.source.restoreExtensions(
                 alloc,
                 manifest.installed_extensions,
@@ -7371,6 +7422,11 @@ pub const ApiHttpServer = struct {
         }
 
         return backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
+    }
+
+    fn restoreCancelled(self: *ApiHttpServer, cancellation: ?RestoreCancellation) bool {
+        const token = cancellation orelse return false;
+        return self.restore_job_store.cancellationRequested(self.alloc, token.job_id, token.attempt_id) catch true;
     }
 
     pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -8245,21 +8301,33 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicTableRestore(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config);
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            202 => blk: {
-                const RestoreTriggered = struct {
-                    restore: []const u8,
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(RestoreTriggered, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 202, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+    pub fn handlePublicTableRestore(self: *ApiHttpServer, table_name: []const u8, body: []const u8, idempotency_key: ?[]const u8) !http_common.HttpResponse {
+        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid restore request");
+        defer parsed.deinit();
+        backups_api.validateBackupId(parsed.value.backup_id) catch return try textResponse(self.alloc, 400, "invalid backup id");
+        const connection = parsed.value.connection;
+        var location = backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{
+            .secret_store = self.cfg.secret_store,
+            .node_config = self.cfg.node_config,
+            .connection = connection,
+            .required_capability = "restore.read",
+        }) catch |err| return try textResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        location.deinit(self.alloc);
+        const encoded = self.restore_job_store.start(self.alloc, .{
+            .scope = .table,
+            .table_name = table_name,
+            .backup_id = parsed.value.backup_id,
+            .location = parsed.value.location,
+            .connection = connection,
+            .idempotency_key = idempotency_key,
+        }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        defer self.alloc.free(encoded);
+        var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer state.deinit();
+        if (!restore_jobs.isTerminal(state.value.phase)) self.submitRestoreJob(state.value.job_id) catch |err| {
+            return try restoreJobStartErrorResponse(self.alloc, err);
         };
+        return try self.restoreJobResponse(202, encoded);
     }
 
     pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8, connection: ?[]const u8) !http_common.HttpResponse {
@@ -8290,20 +8358,190 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicClusterRestore(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config);
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            202 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.ClusterRestoreResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 202, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+    pub fn handlePublicClusterRestore(self: *ApiHttpServer, body: []const u8, idempotency_key: ?[]const u8) !http_common.HttpResponse {
+        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid restore request");
+        defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
+        const connection = req.connection orelse return try textResponse(self.alloc, 400, "restore requires a named external_io connection");
+        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try textResponse(self.alloc, 400, "invalid restore mode");
+        var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
+            .secret_store = self.cfg.secret_store,
+            .node_config = self.cfg.node_config,
+            .connection = connection,
+            .required_capability = "restore.read",
+        }) catch |err| return try textResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        location.deinit(self.alloc);
+        const encoded = self.restore_job_store.start(self.alloc, .{
+            .scope = .cluster,
+            .backup_id = req.backup_id,
+            .location = req.location,
+            .connection = connection,
+            .restore_mode = restore_mode,
+            .table_names = req.table_names,
+            .idempotency_key = idempotency_key,
+        }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        defer self.alloc.free(encoded);
+        var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer state.deinit();
+        if (!restore_jobs.isTerminal(state.value.phase)) self.submitRestoreJob(state.value.job_id) catch |err| {
+            return try restoreJobStartErrorResponse(self.alloc, err);
+        };
+        return try self.restoreJobResponse(202, encoded);
+    }
+
+    fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
+        if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        const ids = self.restore_job_store.pendingIds(self.alloc) catch |err| {
+            self.restore_jobs_resumed.store(false, .release);
+            return err;
+        };
+        defer self.alloc.free(ids);
+        for (ids) |job_id| self.submitRestoreJob(job_id) catch |err| {
+            std.log.err("failed to resume restore job job_id={d} err={s}", .{ job_id, @errorName(err) });
         };
     }
+
+    fn submitRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
+        const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
+        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return error.AsyncRestoreUnavailable;
+        const work = try self.alloc.create(RestoreJobWork);
+        work.* = .{ .server = self, .job_id = job_id };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.restore_job_owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = RestoreJobWork.run,
+            .deinit = RestoreJobWork.deinit,
+        }) catch |err| {
+            self.alloc.destroy(work);
+            return err;
+        };
+    }
+
+    fn runRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
+        const running_encoded = (try self.restore_job_store.begin(self.alloc, job_id)) orelse return;
+        defer self.alloc.free(running_encoded);
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const state = parsed.value;
+        if (state.phase != .running) return;
+        var location = backups_api.openBackupLocationWithOptions(self.alloc, state.location, .{
+            .secret_store = self.cfg.secret_store,
+            .node_config = self.cfg.node_config,
+            .connection = state.connection,
+            .required_capability = "restore.read",
+        }) catch |err| {
+            const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+            self.alloc.free(failed);
+            return;
+        };
+        defer location.deinit(self.alloc);
+        const result = switch (state.scope) {
+            .table => blk: {
+                executePublicTableRestore(self, self.alloc, state.table_name orelse return error.CorruptRestoreJobStore, state.backup_id, state.location, &location) catch |err| {
+                    const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                    self.alloc.free(failed);
+                    return;
+                };
+                break :blk try backups_api.encodeRestoreTriggered(self.alloc);
+            },
+            .cluster => executePublicClusterRestoreWithCancellation(self, self.alloc, .{
+                .backup_id = state.backup_id,
+                .location = state.location,
+                .connection = state.connection,
+                .table_names = state.table_names,
+                .restore_mode = state.restore_mode,
+            }, &location, state.restore_mode, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
+                const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                self.alloc.free(failed);
+                return;
+            },
+        };
+        defer self.alloc.free(result);
+        const finished = try self.restore_job_store.finish(self.alloc, state, result);
+        self.alloc.free(finished);
+    }
+
+    pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !http_common.HttpResponse {
+        const encoded = if (cancel)
+            (try self.restore_job_store.cancel(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found")
+        else
+            (try self.restore_job_store.load(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        return try self.restoreJobResponse(200, encoded);
+    }
+
+    pub fn restoreJobAllowed(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: AuthenticatedIdentity, job_id: u64) !bool {
+        const encoded = (try self.restore_job_store.load(alloc, job_id)) orelse return false;
+        defer alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return switch (parsed.value.scope) {
+            .cluster => permissionsAllow(identity.permissions, .@"*", "*", .admin),
+            .table => permissionsAllow(identity.permissions, .table, parsed.value.table_name orelse return false, .admin),
+        };
+    }
+
+    fn restoreJobResponse(self: *ApiHttpServer, status: u16, encoded: []const u8) !http_common.HttpResponse {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, arena, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const result: ?std.json.Value = if (parsed.value.result_json) |raw| blk: {
+            const value = try std.json.parseFromSlice(std.json.Value, arena, raw, .{});
+            break :blk value.value;
+        } else null;
+        return try jsonResponseWithStatus(self.alloc, status, .{
+            .job_id = parsed.value.job_id,
+            .attempt_id = parsed.value.attempt_id,
+            .scope = parsed.value.scope,
+            .table_name = parsed.value.table_name,
+            .backup_id = parsed.value.backup_id,
+            .phase = parsed.value.phase,
+            .cancel_requested = parsed.value.cancel_requested,
+            .result = result,
+            .@"error" = parsed.value.last_error,
+            .created_at_ms = parsed.value.created_at_ms,
+            .updated_at_ms = parsed.value.updated_at_ms,
+            .expires_at_ms = parsed.value.expires_at_ms,
+        });
+    }
 };
+
+const RestoreJobWork = struct {
+    server: *ApiHttpServer,
+    job_id: u64,
+
+    fn run(ptr: *anyopaque) !void {
+        const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
+        self.server.runRestoreJob(self.job_id) catch |err| {
+            std.log.err("restore job execution failed job_id={d} err={s}", .{ self.job_id, @errorName(err) });
+        };
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
+        self.server.alloc.destroy(self);
+    }
+};
+
+fn restoreJobIdFromPath(path: []const u8) ?u64 {
+    const prefix = routes.Routes.restore ++ "/jobs/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const raw = path[prefix.len..];
+    if (raw.len == 0 or std.mem.indexOfScalar(u8, raw, '/') != null) return null;
+    return std.fmt.parseUnsigned(u64, raw, 10) catch null;
+}
+
+fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    return switch (err) {
+        error.InvalidIdempotencyKey => try textResponse(alloc, 400, "invalid idempotency key"),
+        error.IdempotencyConflict => try textResponse(alloc, 409, "idempotency key reused for a different restore"),
+        error.AsyncRestoreUnavailable => try textResponse(alloc, 503, "asynchronous restore worker unavailable"),
+        error.RestoreJobCapacityExceeded => try textResponse(alloc, 503, "restore job history is at capacity"),
+        else => try textResponse(alloc, 500, "failed to create restore job"),
+    };
+}
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(alloc);
@@ -23904,6 +24142,7 @@ test "api http server cluster overwrite restore tolerates already absent metadat
         present: bool = true,
         restored: bool = false,
         local_drop_used_manifest_group: bool = false,
+        expected_backup_id: []const u8,
     };
 
     const FakeSource = struct {
@@ -24026,12 +24265,12 @@ test "api http server cluster overwrite restore tolerates already absent metadat
         fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("docs-snap-cluster", plan.manifest.backup_id);
+            try std.testing.expectEqualStrings(self.state.expected_backup_id, plan.manifest.backup_id);
             self.state.restored = true;
         }
     };
 
-    var state = State{};
+    var state = State{ .expected_backup_id = table_backup_id };
     var source = FakeSource{ .state = &state };
     var read_source = FakeReads{ .state = &state };
     var write_source = FakeWrites{ .state = &state };

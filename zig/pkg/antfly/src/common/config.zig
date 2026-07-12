@@ -241,6 +241,7 @@ pub const Config = struct {
     pub const S3AddressingStyle = enum { path, virtual_hosted };
     pub const BucketProvisioning = enum { require_existing, create_if_missing };
     pub const AwsCredentialSource = enum { default, static, profile, web_identity };
+    pub const GcsCredentialSource = enum { default, bearer_token, service_account };
 
     pub const AwsCredentialConfig = struct {
         source: AwsCredentialSource = .default,
@@ -264,6 +265,22 @@ pub const Config = struct {
             if (self.token_file) |value| alloc.free(value);
             if (self.session_name) |value| alloc.free(value);
             if (self.sts_endpoint) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    pub const GcsCredentialConfig = struct {
+        source: GcsCredentialSource = .default,
+        bearer_token: ?[]u8 = null,
+        service_account_json: ?[]u8 = null,
+        credentials_path: ?[]u8 = null,
+        scope: ?[]u8 = null,
+
+        fn deinit(self: *GcsCredentialConfig, alloc: std.mem.Allocator) void {
+            if (self.bearer_token) |value| alloc.free(value);
+            if (self.service_account_json) |value| alloc.free(value);
+            if (self.credentials_path) |value| alloc.free(value);
+            if (self.scope) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -362,6 +379,10 @@ pub const Config = struct {
         hosts: []const []u8 = &.{},
         headers: std.StringArrayHashMapUnmanaged([]u8) = .{},
         credentials: AwsCredentialConfig = .{},
+        gcs_credentials: GcsCredentialConfig = .{},
+        project_id: ?[]u8 = null,
+        upload_endpoint: ?[]u8 = null,
+        root: ?[]u8 = null,
         use_ssl: ?bool = null,
 
         fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
@@ -377,6 +398,10 @@ pub const Config = struct {
             }
             self.headers.deinit(alloc);
             self.credentials.deinit(alloc);
+            self.gcs_credentials.deinit(alloc);
+            if (self.project_id) |value| alloc.free(value);
+            if (self.upload_endpoint) |value| alloc.free(value);
+            if (self.root) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -456,10 +481,13 @@ pub const Config = struct {
             else => return error.InvalidConfig,
         };
 
-        var validated = try std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
+        var validated = std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
-        });
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidConfig,
+        };
         defer validated.deinit();
 
         const deployment_mode = try deploymentModeFromObject(root, expected_deployment);
@@ -985,6 +1013,38 @@ test "common config requires an explicit unique S3 bucket allowlist" {
     ));
 }
 
+test "common config keeps GCS and filesystem connection credentials protocol scoped" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "connections": {
+        \\    "reader": { "kind": "external_io", "capabilities": ["restore.read"], "external_io": { "protocol": "gcs", "buckets": ["archive-bucket"], "project_id": "reader-project", "credentials": { "source": "service_account", "credentials_path": "/secrets/gcs-reader.json" } } },
+        \\    "local": { "kind": "external_io", "capabilities": ["backup.write"], "external_io": { "protocol": "filesystem", "root": "/var/lib/antfly/backups" } }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    const reader = cfg.connections.get("reader").?.external_io.?;
+    try std.testing.expectEqual(Config.ExternalIoProtocol.gcs, reader.protocol);
+    try std.testing.expectEqual(Config.GcsCredentialSource.service_account, reader.gcs_credentials.source);
+    try std.testing.expectEqualStrings("/secrets/gcs-reader.json", reader.gcs_credentials.credentials_path.?);
+    try std.testing.expectEqualStrings("/var/lib/antfly/backups", cfg.connections.get("local").?.external_io.?.root.?);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "connections": {
+        \\    "reader": { "kind": "external_io", "capabilities": ["restore.read"], "external_io": { "protocol": "gcs", "buckets": ["archive-bucket"], "region": "us-west-2" } }
+        \\  }
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "connections": {
+        \\    "local": { "kind": "external_io", "capabilities": ["backup.write"], "external_io": { "protocol": "filesystem", "root": "relative/backups" } }
+        \\  }
+        \\}
+    ));
+}
+
 test "common config command deployment context supplies topology and rejects conflicting assertions" {
     var cfg = try Config.parseFromSliceWithSecretsForDeployment(std.testing.allocator,
         \\{
@@ -1431,22 +1491,44 @@ fn parseWebSearchConnectionConfig(alloc: std.mem.Allocator, value: std.json.Valu
 
 fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.ExternalIoConnectionConfig {
     if (value != .object) return error.InvalidConfig;
-    if (!objectContainsOnly(value.object, &.{ "protocol", "endpoint", "region", "addressing_style", "bucket_provisioning", "buckets", "prefix", "hosts", "headers", "credentials", "use_ssl" })) return error.InvalidConfig;
     var cfg = Config.ExternalIoConnectionConfig{
         .protocol = try requiredEnumField(Config.ExternalIoProtocol, value.object, "protocol"),
     };
     errdefer cfg.deinit(alloc);
-    cfg.endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint");
-    cfg.region = try optionalStringFieldDup(alloc, value.object, "region");
-    cfg.addressing_style = try optionalEnumField(Config.S3AddressingStyle, value.object, "addressing_style") orelse .virtual_hosted;
-    cfg.bucket_provisioning = try optionalEnumField(Config.BucketProvisioning, value.object, "bucket_provisioning") orelse .require_existing;
-    cfg.buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{};
-    cfg.prefix = try optionalStringFieldDup(alloc, value.object, "prefix");
-    cfg.hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{};
-    cfg.credentials = try parseAwsCredentialConfig(alloc, value.object.get("credentials"));
-    cfg.use_ssl = try optionalBoolField(value.object, "use_ssl");
+    switch (cfg.protocol) {
+        .s3 => {
+            if (!objectContainsOnly(value.object, &.{ "protocol", "endpoint", "region", "addressing_style", "bucket_provisioning", "buckets", "prefix", "credentials", "use_ssl" })) return error.InvalidConfig;
+            cfg.endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint");
+            cfg.region = try optionalStringFieldDup(alloc, value.object, "region");
+            cfg.addressing_style = try optionalEnumField(Config.S3AddressingStyle, value.object, "addressing_style") orelse .virtual_hosted;
+            cfg.bucket_provisioning = try optionalEnumField(Config.BucketProvisioning, value.object, "bucket_provisioning") orelse .require_existing;
+            cfg.buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{};
+            cfg.prefix = try optionalStringFieldDup(alloc, value.object, "prefix");
+            cfg.credentials = try parseAwsCredentialConfig(alloc, value.object.get("credentials"));
+            cfg.use_ssl = try optionalBoolField(value.object, "use_ssl");
+        },
+        .gcs => {
+            if (!objectContainsOnly(value.object, &.{ "protocol", "endpoint", "upload_endpoint", "project_id", "bucket_provisioning", "buckets", "prefix", "credentials" })) return error.InvalidConfig;
+            cfg.endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint");
+            cfg.upload_endpoint = try optionalStringFieldDup(alloc, value.object, "upload_endpoint");
+            cfg.project_id = try optionalStringFieldDup(alloc, value.object, "project_id");
+            cfg.bucket_provisioning = try optionalEnumField(Config.BucketProvisioning, value.object, "bucket_provisioning") orelse .require_existing;
+            cfg.buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{};
+            cfg.prefix = try optionalStringFieldDup(alloc, value.object, "prefix");
+            cfg.gcs_credentials = try parseGcsCredentialConfig(alloc, value.object.get("credentials"));
+        },
+        .filesystem => {
+            if (!objectContainsOnly(value.object, &.{ "protocol", "root" })) return error.InvalidConfig;
+            cfg.root = try requiredStringFieldDup(alloc, value.object, "root");
+            if (cfg.root.?.len == 0 or !std.fs.path.isAbsolute(cfg.root.?)) return error.InvalidConfig;
+        },
+        .http => {
+            if (!objectContainsOnly(value.object, &.{ "protocol", "hosts", "headers" })) return error.InvalidConfig;
+            cfg.hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{};
+        },
+    }
 
-    if (cfg.protocol == .s3) {
+    if (cfg.protocol == .s3 or cfg.protocol == .gcs) {
         if (cfg.buckets.len == 0 or cfg.buckets.len > 64) return error.InvalidConfig;
         for (cfg.buckets, 0..) |bucket, i| {
             if (bucket.len < 3 or bucket.len > 63 or !std.mem.eql(u8, bucket, std.mem.trim(u8, bucket, " \t\r\n"))) {
@@ -1480,6 +1562,25 @@ fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Val
         }
     }
 
+    return cfg;
+}
+
+fn parseGcsCredentialConfig(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !Config.GcsCredentialConfig {
+    const value = maybe_value orelse return .{};
+    if (value != .object or !objectContainsOnly(value.object, &.{ "source", "bearer_token", "service_account_json", "credentials_path", "scope" })) return error.InvalidConfig;
+    var cfg = Config.GcsCredentialConfig{
+        .source = try requiredEnumField(Config.GcsCredentialSource, value.object, "source"),
+        .bearer_token = try optionalStringFieldDup(alloc, value.object, "bearer_token"),
+        .service_account_json = try optionalStringFieldDup(alloc, value.object, "service_account_json"),
+        .credentials_path = try optionalStringFieldDup(alloc, value.object, "credentials_path"),
+        .scope = try optionalStringFieldDup(alloc, value.object, "scope"),
+    };
+    errdefer cfg.deinit(alloc);
+    switch (cfg.source) {
+        .default => if (cfg.bearer_token != null or cfg.service_account_json != null or cfg.credentials_path != null) return error.InvalidConfig,
+        .bearer_token => if (cfg.bearer_token == null or cfg.service_account_json != null or cfg.credentials_path != null) return error.InvalidConfig,
+        .service_account => if ((cfg.service_account_json == null) == (cfg.credentials_path == null) or cfg.bearer_token != null) return error.InvalidConfig,
+    }
     return cfg;
 }
 

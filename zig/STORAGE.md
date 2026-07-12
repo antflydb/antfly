@@ -126,7 +126,7 @@ Pass `--secret-store-path` (or `ANTFLY_SECRET_STORE_PATH`) when those JSON
 values use `${secret:...}`.
 
 Backup and restore select credentials independently from primary storage and
-remote-content reads. Requests may name an `external_io` connection while the
+remote-content reads. Network requests must name an `external_io` connection while the
 `s3://` location continues to identify the artifact:
 
 ```console
@@ -135,23 +135,75 @@ antfly restore --backup-id daily --location s3://archive/prod/daily --connection
 ```
 
 The server requires `backup.write` or `restore.read` respectively and verifies
-the location bucket and segment-bounded prefix against the connection. This
+the object-store bucket and segment-bounded prefix, or resolves a logical
+`file:///...` path beneath an administrator-controlled filesystem root. This
 supports several buckets, accounts, roles, and read/write trust domains in one
 process without promoting storage credentials to process-global environment
-variables. Remote backup and restore requests require a named connection;
+variables. Every network backup and restore request requires a named connection;
 ambient process credentials are not exposed through the network API. Offline
 Lite tooling may still use environment credentials when explicitly requested.
+
+GCS and filesystem authority are protocol-specific rather than accepting S3
+fields that would be silently ignored:
+
+```json
+{
+  "connections": {
+    "gcs-reader": {
+      "kind": "external_io",
+      "capabilities": ["restore.read"],
+      "external_io": {
+        "protocol": "gcs",
+        "project_id": "prod-search",
+        "buckets": ["antfly-archive"],
+        "prefix": "production",
+        "credentials": {
+          "source": "service_account",
+          "credentials_path": "/var/run/secrets/gcs-reader.json"
+        }
+      }
+    },
+    "local-backups": {
+      "kind": "external_io",
+      "capabilities": ["backup.write", "restore.read"],
+      "external_io": {
+        "protocol": "filesystem",
+        "root": "/var/lib/antfly/backups"
+      }
+    }
+  }
+}
+```
+
+Backup identifiers are bounded portable path components. Manifest artifact
+paths are validated as relative paths, and filesystem locations cannot escape
+their connection root through absolute paths, traversal components, or existing
+symlink ancestors.
+
+Restore is a durable asynchronous job. `POST /db/v1/restore` and table restore
+persist the job before returning `202`; clients poll or cancel
+`/db/v1/restore/jobs/{job_id}`. `Idempotency-Key` safely coalesces retries,
+while requests without a key create independent jobs. Interrupted running jobs
+are re-queued after restart. Terminal job state and explicit idempotency keys
+are retained for seven days; the bounded 10,000-job history rejects new work
+instead of silently evicting an unexpired key. Job IDs are random opaque
+63-bit values, so multiple API processes do not share a sequential allocator.
+Table restore jobs are visible to administrators of that table; cluster restore
+jobs require cluster administration. Cancellation is observed before each
+destructive overwrite and table-publication boundary.
 
 The canonical and convenience forms are equivalent:
 
 ```console
 antfly standalone --storage-engine lite --storage-path ./data.antfly.aflite
-antfly lite serve ./data.antfly.aflite --fsync true
+antfly lite serve ./data.antfly.aflite --fsync true --config production.json
 ```
 
 Both start the normal standalone metadata, data, inference, SQL, and public
 HTTP runtime. `antfly lite serve` is only an artifact-oriented constructor; it
-atomically creates the file when it does not exist and opens it otherwise.
+atomically creates the file when it does not exist and opens it otherwise. All
+other standalone options are forwarded; storage path/engine and listen address
+remain owned by the Lite constructor so conflicting duplicates fail closed.
 There is no storage-specific HTTP namespace. Clients use the same `/db/v1`
 contract regardless of whether standalone storage is `local` or `lite`.
 

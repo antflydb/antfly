@@ -733,13 +733,35 @@ pub const Client = struct {
 
     /// Restore multiple tables from a backup
     /// POST /db/v1/restore
-    pub fn restore(self: *@This(), body: types.ClusterRestoreRequest) !ApiResponse(types.ClusterRestoreResponse) {
+    pub fn restore(self: *@This(), body: types.ClusterRestoreRequest) !ApiResponse(types.RestoreJob) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.ClusterRestoreResponse).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get durable restore job status
+    /// GET /db/v1/restore/jobs/{job_id}
+    pub fn getRestoreJob(self: *@This(), job_id: []const u8) !ApiResponse(types.RestoreJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Request cooperative restore cancellation
+    /// DELETE /db/v1/restore/jobs/{job_id}
+    pub fn cancelRestoreJob(self: *@This(), job_id: []const u8) !ApiResponse(types.RestoreJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
     /// List secrets status
@@ -1276,7 +1298,7 @@ pub const Client = struct {
 
     /// Restore a table from backup
     /// POST /db/v1/tables/{tableName}/restore
-    pub fn restoreTable(self: *@This(), table_name: []const u8, body: types.RestoreRequest) !ApiResponse(std.json.Value) {
+    pub fn restoreTable(self: *@This(), table_name: []const u8, body: types.RestoreRequest) !ApiResponse(types.RestoreJob) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/restore", .{ self.base_url, encoded_table_name });
@@ -1284,7 +1306,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
     /// Update a table's schema

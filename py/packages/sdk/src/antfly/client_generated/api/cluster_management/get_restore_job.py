@@ -6,52 +6,35 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.backup_request import BackupRequest
 from ...models.error import Error
 from ...models.restore_job import RestoreJob
-from ...types import UNSET, Response, Unset
+from ...types import Response
 
 
 def _get_kwargs(
-    table_name: str,
-    *,
-    body: BackupRequest,
-    idempotency_key: str | Unset = UNSET,
+    job_id: int,
 ) -> dict[str, Any]:
-    headers: dict[str, Any] = {}
-    if not isinstance(idempotency_key, Unset):
-        headers["Idempotency-Key"] = idempotency_key
 
     _kwargs: dict[str, Any] = {
-        "method": "post",
-        "url": "/db/v1/tables/{table_name}/restore".format(
-            table_name=quote(str(table_name), safe=""),
+        "method": "get",
+        "url": "/db/v1/restore/jobs/{job_id}".format(
+            job_id=quote(str(job_id), safe=""),
         ),
     }
 
-    _kwargs["json"] = body.to_dict()
-
-    headers["Content-Type"] = "application/json"
-
-    _kwargs["headers"] = headers
     return _kwargs
 
 
 def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | RestoreJob | None:
-    if response.status_code == 202:
-        response_202 = RestoreJob.from_dict(response.json())
+    if response.status_code == 200:
+        response_200 = RestoreJob.from_dict(response.json())
 
-        return response_202
+        return response_200
 
-    if response.status_code == 400:
-        response_400 = Error.from_dict(response.json())
+    if response.status_code == 404:
+        response_404 = Error.from_dict(response.json())
 
-        return response_400
-
-    if response.status_code == 500:
-        response_500 = Error.from_dict(response.json())
-
-        return response_500
+        return response_404
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -69,18 +52,14 @@ def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
 
 def sync_detailed(
-    table_name: str,
+    job_id: int,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
-    idempotency_key: str | Unset = UNSET,
 ) -> Response[Error | RestoreJob]:
-    """Restore a table from backup
+    """Get durable restore job status
 
     Args:
-        table_name (str):
-        idempotency_key (str | Unset):
-        body (BackupRequest):
+        job_id (int):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -91,9 +70,7 @@ def sync_detailed(
     """
 
     kwargs = _get_kwargs(
-        table_name=table_name,
-        body=body,
-        idempotency_key=idempotency_key,
+        job_id=job_id,
     )
 
     response = client.get_httpx_client().request(
@@ -104,18 +81,14 @@ def sync_detailed(
 
 
 def sync(
-    table_name: str,
+    job_id: int,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
-    idempotency_key: str | Unset = UNSET,
 ) -> Error | RestoreJob | None:
-    """Restore a table from backup
+    """Get durable restore job status
 
     Args:
-        table_name (str):
-        idempotency_key (str | Unset):
-        body (BackupRequest):
+        job_id (int):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -126,26 +99,20 @@ def sync(
     """
 
     return sync_detailed(
-        table_name=table_name,
+        job_id=job_id,
         client=client,
-        body=body,
-        idempotency_key=idempotency_key,
     ).parsed
 
 
 async def asyncio_detailed(
-    table_name: str,
+    job_id: int,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
-    idempotency_key: str | Unset = UNSET,
 ) -> Response[Error | RestoreJob]:
-    """Restore a table from backup
+    """Get durable restore job status
 
     Args:
-        table_name (str):
-        idempotency_key (str | Unset):
-        body (BackupRequest):
+        job_id (int):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -156,9 +123,7 @@ async def asyncio_detailed(
     """
 
     kwargs = _get_kwargs(
-        table_name=table_name,
-        body=body,
-        idempotency_key=idempotency_key,
+        job_id=job_id,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -167,18 +132,14 @@ async def asyncio_detailed(
 
 
 async def asyncio(
-    table_name: str,
+    job_id: int,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
-    idempotency_key: str | Unset = UNSET,
 ) -> Error | RestoreJob | None:
-    """Restore a table from backup
+    """Get durable restore job status
 
     Args:
-        table_name (str):
-        idempotency_key (str | Unset):
-        body (BackupRequest):
+        job_id (int):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -190,9 +151,7 @@ async def asyncio(
 
     return (
         await asyncio_detailed(
-            table_name=table_name,
+            job_id=job_id,
             client=client,
-            body=body,
-            idempotency_key=idempotency_key,
         )
     ).parsed

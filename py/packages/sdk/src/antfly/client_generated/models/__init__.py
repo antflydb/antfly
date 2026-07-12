@@ -524,7 +524,10 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
-from .restore_table_response_202 import RestoreTableResponse202
+from .restore_job import RestoreJob
+from .restore_job_phase import RestoreJobPhase
+from .restore_job_result import RestoreJobResult
+from .restore_job_scope import RestoreJobScope
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
@@ -1172,7 +1175,10 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
-    "RestoreTableResponse202",
+    "RestoreJob",
+    "RestoreJobPhase",
+    "RestoreJobResult",
+    "RestoreJobScope",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",

@@ -60,6 +60,16 @@ pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.jso
     return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get durable restore job status
+pub const GetRestoreJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// Request cooperative restore cancellation
+pub const CancelRestoreJobPathParams = struct {
+    job_id: []const u8,
+};
+
 /// Store a secret
 pub const PutSecretPathParams = struct {
     /// Secret key name (e.g., openai.api_key)
@@ -515,6 +525,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
+    .{ .method = "GET", .path = "/restore/jobs/{job_id}", .operation_id = "getRestoreJob" },
+    .{ .method = "DELETE", .path = "/restore/jobs/{job_id}", .operation_id = "cancelRestoreJob" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
@@ -588,6 +600,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "evaluate")) @compileError("ServerRouter: Impl missing required method 'evaluate'");
         if (!@hasDecl(Impl, "globalQuery")) @compileError("ServerRouter: Impl missing required method 'globalQuery'");
         if (!@hasDecl(Impl, "restore")) @compileError("ServerRouter: Impl missing required method 'restore'");
+        if (!@hasDecl(Impl, "getRestoreJob")) @compileError("ServerRouter: Impl missing required method 'getRestoreJob'");
+        if (!@hasDecl(Impl, "cancelRestoreJob")) @compileError("ServerRouter: Impl missing required method 'cancelRestoreJob'");
         if (!@hasDecl(Impl, "listSecrets")) @compileError("ServerRouter: Impl missing required method 'listSecrets'");
         if (!@hasDecl(Impl, "putSecret")) @compileError("ServerRouter: Impl missing required method 'putSecret'");
         if (!@hasDecl(Impl, "deleteSecret")) @compileError("ServerRouter: Impl missing required method 'deleteSecret'");
@@ -662,6 +676,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/eval", evaluate);
             try server.post("/query", globalQuery);
             try server.post("/restore", restore);
+            try server.get("/restore/jobs/:job_id", getRestoreJob);
+            try server.delete("/restore/jobs/:job_id", cancelRestoreJob);
             try server.get("/secrets", listSecrets);
             try server.put("/secrets/:key", putSecret);
             try server.delete("/secrets/:key", deleteSecret);
@@ -791,6 +807,22 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn restore(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.restore(ctx);
+        }
+
+        /// Get durable restore job status
+        /// GET /restore/jobs/{job_id}
+        fn getRestoreJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.getRestoreJob(ctx, job_id);
+        }
+
+        /// Request cooperative restore cancellation
+        /// DELETE /restore/jobs/{job_id}
+        fn cancelRestoreJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
+            return impl.cancelRestoreJob(ctx, job_id);
         }
 
         /// List secrets status
@@ -1240,6 +1272,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response

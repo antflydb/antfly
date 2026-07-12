@@ -129,6 +129,7 @@ pub const ReplicationSourceStatus = types.ReplicationSourceStatus;
 pub const ReplicationTransformOp = types.ReplicationTransformOp;
 pub const RerankerProfile = types.RerankerProfile;
 pub const ResourceType = types.ResourceType;
+pub const RestoreJob = types.RestoreJob;
 pub const RestoreRequest = types.RestoreRequest;
 pub const RetrievalAgentRequest = types.RetrievalAgentRequest;
 pub const RetrievalAgentResult = types.RetrievalAgentResult;

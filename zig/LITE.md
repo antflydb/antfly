@@ -122,7 +122,7 @@ antfly lite import app.aflite --from app.afb
 antfly lite check app.aflite
 antfly lite compact app.aflite
 antfly lite vacuum app.aflite
-antfly lite serve app.aflite --addr 127.0.0.1:8080
+antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
 
 `antfly lite init` should be non-destructive: it creates a new `.aflite` file
@@ -151,8 +151,25 @@ appear as the public index layout for native Lite files.
 full standalone runtime. It serves the normal `/db/v1` API and is equivalent to
 `antfly standalone --storage-engine lite --storage-path <file>`. Lite does not
 define a storage-specific HTTP namespace. The convenience command binds only
-to loopback hosts; use the canonical standalone command for an explicitly
-configured production listener.
+to loopback hosts. It forwards the complete standalone option surface,
+including configuration, authentication, TLS, secrets, inference, and
+connections. It owns `--storage-engine`, `--storage-path`, `--host`, and
+`--port`; conflicting duplicates fail closed.
+
+Network backup and restore always use named, capability-scoped `external_io`
+connections. This includes `file://`, whose URI path is logical and resolved
+beneath the filesystem connection's configured root. S3 and GCS connections
+have distinct credential shapes and bucket/prefix scopes. Offline Lite
+artifact commands may still use explicit local paths or ambient cloud
+credentials because they run with the invoking user's filesystem authority.
+
+Restore through `/db/v1` is a durable asynchronous job, not request-duration
+work. The accepted response contains a job ID; status and cooperative
+cancellation use `/db/v1/restore/jobs/{job_id}`. Idempotency keys make retries
+safe; requests without a key create independent jobs. Interrupted work is
+resumed after restart. Terminal state and explicit idempotency keys are retained
+for seven days in a bounded durable 10,000-job history. Cancellation is checked
+at safe table and publication boundaries.
 
 An artifact first created through embedded commands has one root database. On
 its first standalone start, Antfly atomically adopts that root as the
@@ -486,10 +503,14 @@ antfly restore --format portable --input app.afb --table docs
 or:
 
 ```sh
-antfly lite promote app.aflite --target http://cluster:8080 --table docs
+antfly lite promote app.aflite --target http://cluster:8080 --table docs \
+  --connection archive-writer --location s3://archive/promotions/app
 ```
 
-`promote` should just orchestrate portable backup upload plus normal restore. It
+`promote` orchestrates portable backup upload plus normal restore. The named
+connection is required by the target API and scopes its read access to the
+chosen location; the CLI uses the invoking user's authority to stage/upload the
+portable artifact. It
 should not invent a separate migration protocol until backup/restore proves too
 slow for large databases.
 

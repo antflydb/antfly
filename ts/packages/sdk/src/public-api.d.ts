@@ -450,12 +450,33 @@ export interface paths {
          *     - `skip_if_exists`: Skip existing tables and restore the rest
          *     - `overwrite`: Drop existing tables and restore from backup
          *
-         *     The restore is asynchronous - this endpoint triggers the restore process
-         *     and returns immediately. The actual data restoration happens via the
-         *     reconciliation loop as shards are started.
+         *     The restore is a durable asynchronous job. The request returns after the
+         *     job record is persisted. Poll the restore job resource for progress.
+         *     Interrupted running jobs are resumed after restart. Cancellation is
+         *     cooperative between table and artifact publication boundaries.
          */
         post: operations["restore"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/restore/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        /** Get durable restore job status */
+        get: operations["getRestoreJob"];
+        put?: never;
+        post?: never;
+        /** Request cooperative restore cancellation */
+        delete: operations["cancelRestoreJob"];
         options?: never;
         head?: never;
         patch?: never;
@@ -4623,20 +4644,20 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Local filesystem: `file:///path/to/backup`
+             *     - Scoped filesystem connection: `file:///logical/path`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
+             *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
              *     The backup includes all table data, indexes, and metadata for the specified table.
              * @example s3://mybucket/antfly-backups/users-table/2025-01-15
              */
             location: string;
             /**
-             * @description ID of a configured `external_io` connection. Required for remote
-             *     backup and restore locations; local `file://` operations omit it.
-             *     S3 backups require `backup.write`, restores require `restore.read`,
-             *     and the location bucket and prefix must be allowlisted.
+             * @description ID of a configured `external_io` connection. Required for every
+             *     network API backup and restore. Object locations enforce bucket and
+             *     prefix scopes; filesystem URI paths resolve beneath the connection root.
              */
-            connection?: string;
+            connection: string;
             /**
              * @description Backup format to use:
              *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
@@ -4659,15 +4680,16 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Local filesystem: `file:///path/to/backup`
+             *     - Scoped filesystem connection: `file:///logical/path`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
+             *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
              *     The backup includes all table data, indexes, and metadata.
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
              */
             location: string;
-            /** @description Optional configured `external_io` connection with the `backup.write` capability. */
-            connection?: string;
+            /** @description Required configured `external_io` connection with the `backup.write` capability. */
+            connection: string;
             /**
              * @description Backup format to use:
              *     - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
@@ -4729,8 +4751,8 @@ export interface components {
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15
              */
             location: string;
-            /** @description Optional configured `external_io` connection with the `restore.read` capability. */
-            connection?: string;
+            /** @description Required configured `external_io` connection with the `restore.read` capability. */
+            connection: string;
             /**
              * @description Optional list of tables to restore. If omitted, all tables in the backup are restored.
              * @example [
@@ -4749,6 +4771,32 @@ export interface components {
              * @enum {string}
              */
             restore_mode?: "fail_if_exists" | "skip_if_exists" | "overwrite";
+        };
+        RestoreJob: {
+            /** Format: int64 */
+            job_id: number;
+            /** Format: int64 */
+            attempt_id: number;
+            /** @enum {string} */
+            scope: "table" | "cluster";
+            table_name?: string;
+            backup_id: string;
+            /** @enum {string} */
+            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            cancel_requested: boolean;
+            result?: {
+                [key: string]: unknown;
+            };
+            error?: string;
+            /** Format: int64 */
+            created_at_ms: number;
+            /** Format: int64 */
+            updated_at_ms: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed.
+             */
+            expires_at_ms: number;
         };
         ClusterRestoreResponse: {
             /** @description Status of each table restore */
@@ -12910,7 +12958,10 @@ export interface operations {
     restore: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Stable key used to safely retry creation of this restore job. Requests without this header create a new job. */
+                "Idempotency-Key"?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -12926,11 +12977,57 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ClusterRestoreResponse"];
+                    "application/json": components["schemas"]["RestoreJob"];
                 };
             };
             400: components["responses"]["BadRequest"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    getRestoreJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Restore job status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    cancelRestoreJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated restore job status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"];
+                };
+            };
+            404: components["responses"]["NotFound"];
         };
     };
     listBackups: {
@@ -13383,7 +13480,10 @@ export interface operations {
     restoreTable: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Stable key used to safely retry creation of this restore job. Requests without this header create a new job. */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Name of the table to restore into */
                 tableName: string;
@@ -13396,16 +13496,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Restore process triggered successfully */
+            /** @description Durable restore job accepted */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** @example triggered */
-                        restore?: string;
-                    };
+                    "application/json": components["schemas"]["RestoreJob"];
                 };
             };
             400: components["responses"]["BadRequest"];

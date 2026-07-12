@@ -360,14 +360,15 @@ func (c *AntflyClient) CancelDocumentArtifactReprocessJob(ctx context.Context, t
 }
 
 // Backup backs up a table
-func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location string) error {
+func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location, connection string) error {
 	if tableName == "" {
 		return fmt.Errorf("empty table name")
 	}
 
 	req := oapi.BackupRequest{
-		BackupId: backupID,
-		Location: location,
+		BackupId:   backupID,
+		Location:   location,
+		Connection: connection,
 	}
 
 	resp, err := c.client.BackupTable(ctx, tableName, req)
@@ -385,29 +386,33 @@ func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location
 }
 
 // Restore restores a table from a backup
-func (c *AntflyClient) Restore(ctx context.Context, tableName, backupID, location string) error {
+func (c *AntflyClient) Restore(ctx context.Context, tableName, backupID, location, connection, idempotencyKey string) (*RestoreJob, error) {
 	if tableName == "" {
-		return fmt.Errorf("empty table name")
+		return nil, fmt.Errorf("empty table name")
 	}
 
 	req := oapi.RestoreRequest{
-		BackupId: backupID,
-		Location: location,
+		BackupId:   backupID,
+		Location:   location,
+		Connection: connection,
 	}
 
-	resp, err := c.client.RestoreTable(ctx, tableName, req)
+	resp, err := c.client.RestoreTable(ctx, tableName, &oapi.RestoreTableParams{IdempotencyKey: idempotencyKey}, req)
 	if err != nil {
-		return fmt.Errorf("restore request failed: %w", err)
+		return nil, fmt.Errorf("restore request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Restore API might return 202 Accepted
 	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("restore failed: %w", readErrorResponse(resp))
+		return nil, fmt.Errorf("restore failed: %w", readErrorResponse(resp))
 	}
 
-	return nil
+	return decodeRestoreJob(resp)
 }
+
+// RestoreJob is the durable asynchronous restore state returned by the API.
+type RestoreJob = oapi.RestoreJob
 
 // ClusterBackupResult represents the result of a cluster backup operation
 type ClusterBackupResult struct {
@@ -424,10 +429,11 @@ type TableBackupStatus struct {
 }
 
 // ClusterBackup backs up multiple tables or all tables in the cluster
-func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location string, tableNames []string) (*ClusterBackupResult, error) {
+func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location, connection string, tableNames []string) (*ClusterBackupResult, error) {
 	req := oapi.ClusterBackupRequest{
 		BackupId:   backupID,
 		Location:   location,
+		Connection: connection,
 		TableNames: tableNames,
 	}
 
@@ -462,31 +468,19 @@ func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location str
 	}, nil
 }
 
-// ClusterRestoreResult represents the result of a cluster restore operation
-type ClusterRestoreResult struct {
-	Status string
-	Tables []TableRestoreStatus
-}
-
-// TableRestoreStatus represents restore status for a single table
-type TableRestoreStatus struct {
-	Name   string
-	Status string
-	Error  string
-}
-
 // ClusterRestore restores multiple tables from a cluster backup
-func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location string, tableNames []string, restoreMode string) (*ClusterRestoreResult, error) {
+func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location, connection string, tableNames []string, restoreMode, idempotencyKey string) (*RestoreJob, error) {
 	req := oapi.ClusterRestoreRequest{
 		BackupId:   backupID,
 		Location:   location,
+		Connection: connection,
 		TableNames: tableNames,
 	}
 	if restoreMode != "" {
 		req.RestoreMode = oapi.ClusterRestoreRequestRestoreMode(restoreMode)
 	}
 
-	resp, err := c.client.Restore(ctx, req)
+	resp, err := c.client.Restore(ctx, &oapi.RestoreParams{IdempotencyKey: idempotencyKey}, req)
 	if err != nil {
 		return nil, fmt.Errorf("cluster restore request failed: %w", err)
 	}
@@ -497,24 +491,41 @@ func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location st
 		return nil, fmt.Errorf("cluster restore failed: %w", readErrorResponse(resp))
 	}
 
-	var result oapi.ClusterRestoreResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("parsing response: %w", err)
-	}
+	return decodeRestoreJob(resp)
+}
 
-	tables := make([]TableRestoreStatus, len(result.Tables))
-	for i, t := range result.Tables {
-		tables[i] = TableRestoreStatus{
-			Name:   t.Name,
-			Status: string(t.Status),
-			Error:  t.Error,
-		}
+// GetRestoreJob returns durable restore progress and terminal results.
+func (c *AntflyClient) GetRestoreJob(ctx context.Context, jobID int64) (*RestoreJob, error) {
+	resp, err := c.client.GetRestoreJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("get restore job request failed: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("get restore job failed: %w", readErrorResponse(resp))
+	}
+	return decodeRestoreJob(resp)
+}
 
-	return &ClusterRestoreResult{
-		Status: string(result.Status),
-		Tables: tables,
-	}, nil
+// CancelRestoreJob requests cancellation at the next safe restore boundary.
+func (c *AntflyClient) CancelRestoreJob(ctx context.Context, jobID int64) (*RestoreJob, error) {
+	resp, err := c.client.CancelRestoreJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("cancel restore job request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("cancel restore job failed: %w", readErrorResponse(resp))
+	}
+	return decodeRestoreJob(resp)
+}
+
+func decodeRestoreJob(resp *http.Response) (*RestoreJob, error) {
+	var job RestoreJob
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		return nil, fmt.Errorf("parsing restore job response: %w", err)
+	}
+	return &job, nil
 }
 
 // BackupInfo represents metadata about a stored backup
