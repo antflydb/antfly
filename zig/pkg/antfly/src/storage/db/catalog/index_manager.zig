@@ -1418,6 +1418,22 @@ pub const IndexManager = struct {
         };
     }
 
+    pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
+        self.catalog_mutex.lockShared();
+        errdefer self.catalog_mutex.unlockShared();
+        const mutex = if (self.denseIndex(index_name)) |entry|
+            entry.apply_mutex
+        else if (self.sparseIndex(index_name)) |entry|
+            entry.apply_mutex
+        else
+            return error.IndexNotFound;
+        lockAtomicWithBackoff(mutex);
+        return .{
+            .manager = self,
+            .mutex = mutex,
+        };
+    }
+
     pub fn setTextMainBackend(self: *IndexManager, backend: persistent_mod.MainBackend) void {
         self.text_main_backend = backend;
     }
@@ -13355,6 +13371,33 @@ test "index create ignores caller supplied coverage generation" {
     const stored_generation = configs[0].coverage_generation;
     try std.testing.expect(stored_generation != 0);
     try std.testing.expect(stored_generation != caller_generation);
+}
+
+test "vector coverage and derived replay share one index apply lock" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "coverage-apply-lock");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.add(&store, .{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+
+    const expected_mutex = manager.denseIndex("external_v1").?.apply_mutex;
+    var coverage_guard = try manager.lockVectorIndexApply("external_v1");
+    try std.testing.expectEqual(expected_mutex, coverage_guard.mutex);
+    coverage_guard.unlock();
+
+    var replay_guard = try manager.lockManagedIndexApply(.{ .name = "external_v1", .kind = .dense_vector });
+    try std.testing.expectEqual(expected_mutex, replay_guard.mutex);
+    replay_guard.unlock();
 }
 
 test "index catalog preserves malformed vector config for quarantine" {

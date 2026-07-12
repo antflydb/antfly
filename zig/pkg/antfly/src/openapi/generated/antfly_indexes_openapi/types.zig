@@ -190,6 +190,7 @@ pub const AntflyType = enum {
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,
     missing_group,
+    unknown_group,
     remote_unknown_group,
     stale_group,
     summary_unavailable,
@@ -199,6 +200,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
         const s = switch (self) {
             .runtime_unavailable => "runtime_unavailable",
             .missing_group => "missing_group",
+            .unknown_group => "unknown_group",
             .remote_unknown_group => "remote_unknown_group",
             .stale_group => "stale_group",
             .summary_unavailable => "summary_unavailable",
@@ -215,6 +217,7 @@ pub const DerivedCoverageObservationIncompleteReason = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "runtime_unavailable", .runtime_unavailable },
             .{ "missing_group", .missing_group },
+            .{ "unknown_group", .unknown_group },
             .{ "remote_unknown_group", .remote_unknown_group },
             .{ "stale_group", .stale_group },
             .{ "summary_unavailable", .summary_unavailable },

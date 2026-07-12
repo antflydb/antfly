@@ -8124,8 +8124,48 @@ fn queueDerivedCoverageProduced(runtime: *EnrichmentRuntime, window: *GeneratedR
 fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
     if (transitions.len == 0) return;
 
-    if (runtime.coverage_apply_mutex) |mutex| mutex.lockExclusive();
-    defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockExclusive();
+    const ordered = try runtime.alloc.dupe(CoverageOutcomeTransition, transitions);
+    defer runtime.alloc.free(ordered);
+    std.mem.sort(CoverageOutcomeTransition, ordered, {}, struct {
+        fn lessThan(_: void, lhs: CoverageOutcomeTransition, rhs: CoverageOutcomeTransition) bool {
+            const order = std.mem.order(u8, lhs.index_name, rhs.index_name);
+            if (order != .eq) return order == .lt;
+            return std.mem.order(u8, lhs.marker_key, rhs.marker_key) == .lt;
+        }
+    }.lessThan);
+
+    var group_start: usize = 0;
+    while (group_start < ordered.len) {
+        var group_end = group_start + 1;
+        while (group_end < ordered.len and std.mem.eql(u8, ordered[group_start].index_name, ordered[group_end].index_name)) : (group_end += 1) {}
+
+        var apply_guard = runtime.index_manager.lockVectorIndexApply(ordered[group_start].index_name) catch |err| switch (err) {
+            error.IndexNotFound => {
+                group_start = group_end;
+                continue;
+            },
+        };
+
+        const current_generation = runtime.index_manager.coverageGenerationForIndex(ordered[group_start].index_name);
+        var retained: usize = 0;
+        for (ordered[group_start..group_end]) |transition| {
+            if (current_generation == null or transition.generation != current_generation.?) continue;
+            ordered[group_start + retained] = transition;
+            retained += 1;
+        }
+        if (retained > 0) {
+            applyCoverageOutcomeTransitionsForIndex(runtime, ordered[group_start .. group_start + retained]) catch |err| {
+                apply_guard.unlock();
+                return err;
+            };
+        }
+        apply_guard.unlock();
+        group_start = group_end;
+    }
+}
+
+fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
+    if (transitions.len == 0) return;
 
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(runtime.alloc);
@@ -8248,7 +8288,7 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     var transition = try initCoverageOutcomeTransition(&runtime, "visual", 7, "doc:1", .skipped);
     defer deinitCoverageOutcomeTransition(alloc, transition);
 
-    try applyCoverageOutcomeTransitions(&runtime, &.{transition});
+    try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
     const stored_outcome = try storeGetAlloc(&runtime, transition.marker_key);
     defer runtime.alloc.free(stored_outcome);
     try std.testing.expectEqualStrings("skipped", stored_outcome);
@@ -8257,13 +8297,13 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     try std.testing.expectEqual(@as(u64, 1), runtime.skipped_source_count);
 
     transition.outcome = .produced;
-    try applyCoverageOutcomeTransitions(&runtime, &.{ transition, transition });
+    try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{ transition, transition });
     try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
     try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
     try std.testing.expectEqual(@as(u64, 0), runtime.skipped_source_count);
 
     transition.outcome = .terminal_failed;
-    try applyCoverageOutcomeTransitions(&runtime, &.{transition});
+    try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
     try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
     try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
 }

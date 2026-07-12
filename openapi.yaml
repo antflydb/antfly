@@ -16511,6 +16511,7 @@ components:
       enum:
         - runtime_unavailable
         - missing_group
+        - unknown_group
         - remote_unknown_group
         - stale_group
         - summary_unavailable

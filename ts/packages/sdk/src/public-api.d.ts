@@ -8828,7 +8828,7 @@ export interface components {
          * @description A structured reason why the coverage projection cannot be treated as globally complete.
          * @enum {string}
          */
-        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch";
+        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "unknown_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch";
         DerivedCoverageStatus: {
             policy: components["schemas"]["DerivedCoverageStatusPolicy"];
             /** @description Whether every expected shard contributed a fresh runtime observation to this projection. */

@@ -417,6 +417,8 @@ pub fn encodeIndexList(
     };
     const expected_group_ids = try expectedTableGroupIds(alloc, snapshot, table.table_id);
     defer if (expected_group_ids.len > 0) alloc.free(expected_group_ids);
+    var status_lookup = try RuntimeStatusLookup.init(alloc, expected_group_ids, local_statuses);
+    defer status_lookup.deinit();
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -427,7 +429,7 @@ pub fn encodeIndexList(
         if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
-        try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses);
+        try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses, &status_lookup);
     }
     try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
@@ -484,10 +486,12 @@ fn encodeSingleIndexLookupWithTopology(
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) ![]u8 {
     if (config != .object) return error.InvalidTableIndexMetadata;
+    var status_lookup = try RuntimeStatusLookup.init(alloc, expected_group_ids, local_statuses);
+    defer status_lookup.deinit();
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendIndexStatus(alloc, &out, index_name, config, expected_group_ids, local_statuses);
+    try appendIndexStatus(alloc, &out, index_name, config, expected_group_ids, local_statuses, &status_lookup);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -645,6 +649,55 @@ fn expectedTableGroupIds(
     return group_ids;
 }
 
+const RuntimeStatusLookup = struct {
+    const IndexMap = std.StringHashMapUnmanaged(*const db_mod.types.DBIndexStats);
+
+    alloc: std.mem.Allocator,
+    expected_group_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    runtime_indexes: []IndexMap = &.{},
+
+    fn init(
+        alloc: std.mem.Allocator,
+        expected_group_ids: []const u64,
+        local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    ) !RuntimeStatusLookup {
+        var lookup = RuntimeStatusLookup{ .alloc = alloc };
+        errdefer lookup.deinit();
+        try lookup.expected_group_indexes.ensureTotalCapacity(alloc, @intCast(expected_group_ids.len));
+        for (expected_group_ids, 0..) |group_id, i| {
+            lookup.expected_group_indexes.putAssumeCapacity(group_id, i);
+        }
+
+        const statuses = if (local_statuses) |runtime| runtime.items else &.{};
+        if (statuses.len == 0) return lookup;
+        lookup.runtime_indexes = try alloc.alloc(IndexMap, statuses.len);
+        @memset(lookup.runtime_indexes, .empty);
+        for (statuses, 0..) |*status, runtime_index| {
+            const map = &lookup.runtime_indexes[runtime_index];
+            try map.ensureTotalCapacity(alloc, @intCast(status.stats.indexes.len));
+            for (status.stats.indexes) |*item| map.putAssumeCapacity(item.name, item);
+        }
+        return lookup;
+    }
+
+    fn deinit(self: *RuntimeStatusLookup) void {
+        for (self.runtime_indexes) |*map| map.deinit(self.alloc);
+        if (self.runtime_indexes.len > 0) self.alloc.free(self.runtime_indexes);
+        self.expected_group_indexes.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn expectedGroupIndex(self: *const RuntimeStatusLookup, expected_group_ids: []const u64, group_id: u64) ?usize {
+        if (expected_group_ids.len == 0) return null;
+        return self.expected_group_indexes.get(group_id);
+    }
+
+    fn findIndex(self: *const RuntimeStatusLookup, runtime_index: usize, index_name: []const u8) ?db_mod.types.DBIndexStats {
+        if (runtime_index >= self.runtime_indexes.len) return null;
+        return (self.runtime_indexes[runtime_index].get(index_name) orelse return null).*;
+    }
+};
+
 fn appendIndexStatus(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -652,6 +705,7 @@ fn appendIndexStatus(
     config: std.json.Value,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    status_lookup: *const RuntimeStatusLookup,
 ) !void {
     const index_type = inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata;
     const embeddings_coverage_policy = if (index_type == .embeddings)
@@ -673,9 +727,9 @@ fn appendIndexStatus(
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, false);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, status_lookup, false);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, true);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, status_lookup, true);
     try out.append(alloc, '}');
 }
 
@@ -964,6 +1018,7 @@ fn appendIndexRuntimeStatus(
     graph_source_status: ?GraphSourceStatus,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    status_lookup: *const RuntimeStatusLookup,
     shard_view: bool,
 ) !void {
     if (shard_view) {
@@ -977,12 +1032,12 @@ fn appendIndexRuntimeStatus(
         defer if (emitted_expected.len > 0) alloc.free(emitted_expected);
 
         if (local_statuses) |runtime| {
-            for (runtime.items) |item_runtime| {
+            for (runtime.items, 0..) |item_runtime, runtime_index| {
                 const expected_index = if (expected_group_ids.len > 0)
-                    expectedGroupIndex(expected_group_ids, item_runtime.group_id) orelse continue
+                    status_lookup.expectedGroupIndex(expected_group_ids, item_runtime.group_id) orelse continue
                 else
                     null;
-                const item = findIndexStatus(item_runtime.stats.indexes, index_name) orelse continue;
+                const item = status_lookup.findIndex(runtime_index, index_name) orelse continue;
                 if (expected_index) |i| emitted_expected[i] = true;
                 if (emitted) try out.append(alloc, ',');
                 emitted = true;
@@ -1017,7 +1072,7 @@ fn appendIndexRuntimeStatus(
     }
 
     const aggregate = if (local_statuses) |runtime|
-        aggregateIndexStatus(runtime.items, index_name, expected_group_ids, coverage_config_hash) orelse
+        aggregateIndexStatusIndexed(runtime.items, index_name, expected_group_ids, coverage_config_hash, status_lookup) orelse
             if (expected_group_ids.len > 0) missingAggregateIndexStatus(expected_group_ids.len) else null
     else if (expected_group_ids.len > 0)
         missingAggregateIndexStatus(expected_group_ids.len)
@@ -1083,6 +1138,7 @@ const AggregatedIndexStatus = struct {
     stale_group_count: u64 = 0,
     missing_group_count: u64 = 0,
     remote_unknown_group_count: u64 = 0,
+    unknown_group_count: u64 = 0,
     runtime_present: bool = false,
     runtime_fresh: bool = false,
     algebraic_parse_error_count: u64 = 0,
@@ -1133,10 +1189,7 @@ fn missingAggregateIndexStatus(expected_group_count: usize) AggregatedIndexStatu
 }
 
 fn statusFreshnessCountsAsFresh(metadata: runtime_status.RuntimeStatusMetadata) bool {
-    return switch (metadata.freshness) {
-        .fresh, .unknown => true,
-        else => false,
-    };
+    return metadata.freshness == .fresh;
 }
 
 fn statusFreshnessName(freshness: runtime_status.RuntimeStatusFreshness) []const u8 {
@@ -1157,15 +1210,32 @@ fn aggregateIndexStatus(
     expected_group_ids: []const u64,
     coverage_config_hash: u64,
 ) ?AggregatedIndexStatus {
+    return aggregateIndexStatusIndexed(runtimes, index_name, expected_group_ids, coverage_config_hash, null);
+}
+
+fn aggregateIndexStatusIndexed(
+    runtimes: []const runtime_status.LocalTableRuntimeStatus,
+    index_name: []const u8,
+    expected_group_ids: []const u64,
+    coverage_config_hash: u64,
+    status_lookup: ?*const RuntimeStatusLookup,
+) ?AggregatedIndexStatus {
     var aggregate: AggregatedIndexStatus = .{ .coverage_config_hash = coverage_config_hash };
     var found = false;
     var runtime_count: usize = 0;
     var active_count: usize = 0;
     var active_progress_sum: f64 = 0.0;
 
-    for (runtimes) |runtime| {
-        if (!expectedGroupAllowsStatus(expected_group_ids, runtime.group_id)) continue;
-        const item = findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
+    for (runtimes, 0..) |runtime, runtime_index| {
+        const expected = if (status_lookup) |lookup|
+            expected_group_ids.len == 0 or lookup.expectedGroupIndex(expected_group_ids, runtime.group_id) != null
+        else
+            expectedGroupAllowsStatus(expected_group_ids, runtime.group_id);
+        if (!expected) continue;
+        const item = if (status_lookup) |lookup|
+            lookup.findIndex(runtime_index, index_name) orelse continue
+        else
+            findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
         if (aggregate.kind == null) aggregate.kind = item.kind;
         if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
@@ -1179,6 +1249,8 @@ fn aggregateIndexStatus(
             aggregate.runtime_fresh = true;
         } else if (statusFreshnessCountsAsRemoteUnknown(runtime.metadata)) {
             aggregate.remote_unknown_group_count += 1;
+        } else if (runtime.metadata.freshness == .unknown) {
+            aggregate.unknown_group_count += 1;
         } else {
             aggregate.stale_group_count += 1;
         }
@@ -1560,7 +1632,7 @@ test "derived coverage aggregation rejects mixed config observations" {
 
     var reasons = std.ArrayListUnmanaged(u8).empty;
     defer reasons.deinit(std.testing.allocator);
-    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 41, true);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 41, true, null);
     try std.testing.expectEqualStrings("[\"config_mismatch\"]", reasons.items);
 
     var missing_status = std.ArrayListUnmanaged(u8).empty;
@@ -1585,6 +1657,50 @@ test "derived coverage aggregation rejects mixed config observations" {
     );
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"observation_incomplete_reasons\":[\"runtime_unavailable\",\"missing_group\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"pending\":null") != null);
+}
+
+test "derived coverage rejects unknown freshness for aggregate and shard views" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_produced_count = 1,
+        .coverage_config_hash = 41,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .remote_store, .freshness = .unknown },
+        .stats = .{ .source_doc_count = 1, .index_count = 1, .indexes = indexes[0..] },
+    }};
+
+    const aggregate = aggregateIndexStatus(&runtimes, "visual", &.{1}, 41) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.unknown_group_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.table_doc_count);
+    try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 41));
+
+    var shard_status = std.ArrayListUnmanaged(u8).empty;
+    defer shard_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &shard_status,
+        .embeddings,
+        indexes[0],
+        1,
+        .partial,
+        false,
+        41,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        runtimes[0].metadata,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"observation_complete\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"observation_incomplete_reasons\":[\"unknown_group\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"pending\":null") != null);
 }
 
 test "derived coverage semantic fingerprint ignores execution policy" {
@@ -1700,6 +1816,7 @@ fn aggregateRuntimeCoverageIncomplete(item: anytype, expected_config_hash: u64) 
     const Item = @TypeOf(item);
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0) return true;
     if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0) return true;
+    if (@hasField(Item, "unknown_group_count") and item.unknown_group_count > 0) return true;
     if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0) return true;
     if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count") and
         item.expected_group_count != item.fresh_group_count) return true;
@@ -1715,8 +1832,10 @@ fn appendCoverageIncompleteReasons(
     item: anytype,
     expected_config_hash: u64,
     runtime_present: bool,
+    metadata: ?runtime_status.RuntimeStatusMetadata,
 ) !void {
     const Item = @TypeOf(item);
+    const observation_current = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
     try out.append(alloc, '[');
     var emitted = false;
     const ReasonWriter = struct {
@@ -1730,14 +1849,21 @@ fn appendCoverageIncompleteReasons(
     if (!runtime_present) try ReasonWriter.append(alloc, out, &emitted, "runtime_unavailable");
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0)
         try ReasonWriter.append(alloc, out, &emitted, "missing_group");
+    if ((@hasField(Item, "unknown_group_count") and item.unknown_group_count > 0) or
+        (metadata != null and metadata.?.freshness == .unknown))
+        try ReasonWriter.append(alloc, out, &emitted, "unknown_group");
     if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0)
         try ReasonWriter.append(alloc, out, &emitted, "remote_unknown_group");
+    if (metadata != null and metadata.?.freshness == .remote_unknown)
+        try ReasonWriter.append(alloc, out, &emitted, "remote_unknown_group");
     if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0)
+        try ReasonWriter.append(alloc, out, &emitted, "stale_group");
+    if (metadata != null and metadata.?.freshness != .fresh and metadata.?.freshness != .unknown and metadata.?.freshness != .remote_unknown)
         try ReasonWriter.append(alloc, out, &emitted, "stale_group");
     if (@hasField(Item, "coverage_summary_ready") and !item.coverage_summary_ready)
         try ReasonWriter.append(alloc, out, &emitted, "summary_unavailable");
     const config_mismatch = (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) or
-        (runtime_present and @hasField(Item, "coverage_config_hash") and item.coverage_config_hash != expected_config_hash);
+        (observation_current and @hasField(Item, "coverage_config_hash") and item.coverage_config_hash != expected_config_hash);
     if (config_mismatch) try ReasonWriter.append(alloc, out, &emitted, "config_mismatch");
     try out.append(alloc, ']');
 }
@@ -1863,8 +1989,9 @@ fn appendSingleIndexRuntimeStatus(
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
+    const coverage_runtime_present = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
     const embeddings_view = if (index_type == .embeddings)
-        embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_config_hash, enrichment, runtime_present)
+        embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_config_hash, enrichment, coverage_runtime_present)
     else
         null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
@@ -1978,7 +2105,7 @@ fn appendSingleIndexRuntimeStatus(
         const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
         const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
         const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
-        const observation_complete = runtime_present and !aggregateRuntimeCoverageIncomplete(item, coverage_config_hash);
+        const observation_complete = coverage_runtime_present and !aggregateRuntimeCoverageIncomplete(item, coverage_config_hash);
         const coverage = evaluateCoverage(
             embeddings_coverage_policy,
             table_doc_count,
@@ -2014,14 +2141,14 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"observation_complete\":");
         try out.appendSlice(alloc, if (observation_complete) "true" else "false");
         try out.appendSlice(alloc, ",\"observation_incomplete_reasons\":");
-        try appendCoverageIncompleteReasons(alloc, out, item, coverage_config_hash, runtime_present);
+        try appendCoverageIncompleteReasons(alloc, out, item, coverage_config_hash, runtime_present, metadata);
         try out.appendSlice(alloc, ",\"config_fingerprint\":");
         try appendCoverageFingerprint(alloc, out, coverage_config_hash);
         try out.appendSlice(alloc, ",\"summary_ready\":");
-        const coverage_summary_ready = runtime_present and if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
+        const coverage_summary_ready = coverage_runtime_present and if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
         try out.appendSlice(alloc, if (coverage_summary_ready) "true" else "false");
         try out.appendSlice(alloc, ",\"config_mismatch_group_count\":");
-        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) item.coverage_config_mismatch_count else @intFromBool(runtime_present and @hasField(@TypeOf(item), "coverage_config_hash") and item.coverage_config_hash != coverage_config_hash);
+        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) item.coverage_config_mismatch_count else @intFromBool(coverage_runtime_present and @hasField(@TypeOf(item), "coverage_config_hash") and item.coverage_config_hash != coverage_config_hash);
         try appendIntValue(alloc, out, config_mismatch_group_count);
         try out.appendSlice(alloc, ",\"source_total\":");
         try appendIntValue(alloc, out, table_doc_count);
@@ -4229,6 +4356,7 @@ test "partial coverage embeddings readiness counts skipped source units" {
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .source_doc_count = 2,
             .doc_count = 2,
@@ -4301,6 +4429,7 @@ test "partial coverage embeddings readiness does not mask pending enrichment" {
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .source_doc_count = 2,
             .doc_count = 2,
