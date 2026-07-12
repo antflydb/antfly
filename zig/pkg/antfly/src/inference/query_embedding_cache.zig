@@ -43,6 +43,8 @@ const Entry = struct {
     vector: []f32,
     charge_bytes: usize,
     expires_at_ns: u64,
+    pins: usize = 0,
+    retired: bool = false,
     newer: ?*Entry = null,
     older: ?*Entry = null,
 };
@@ -70,6 +72,7 @@ pub const QueryEmbeddingCache = struct {
     newest: ?*Entry = null,
     oldest: ?*Entry = null,
     live_bytes: usize = 0,
+    active_pins: usize = 0,
     counters: Stats = .{},
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, config: Config) QueryEmbeddingCache {
@@ -83,6 +86,7 @@ pub const QueryEmbeddingCache = struct {
     pub fn deinit(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) void {
         self.mutex.lockUncancelable(self.io);
         std.debug.assert(self.flights.count() == 0);
+        std.debug.assert(self.active_pins == 0);
         while (self.oldest) |entry| self.removeEntryLocked(entry, budget, false);
         self.entries.deinit(self.alloc);
         self.flights.deinit(self.alloc);
@@ -108,10 +112,17 @@ pub const QueryEmbeddingCache = struct {
             if (now < entry.expires_at_ns) {
                 self.touchLocked(entry, now);
                 self.counters.hits += 1;
+                self.pinEntryLocked(entry);
+                self.mutex.unlock(io);
+
                 const result = caller_alloc.dupe(f32, entry.vector) catch |err| {
+                    self.mutex.lockUncancelable(io);
+                    self.unpinEntryLocked(entry, budget);
                     self.mutex.unlock(io);
                     return err;
                 };
+                self.mutex.lockUncancelable(io);
+                self.unpinEntryLocked(entry, budget);
                 self.mutex.unlock(io);
                 return result;
             }
@@ -129,12 +140,13 @@ pub const QueryEmbeddingCache = struct {
                 self.mutex.unlock(io);
                 return err;
             };
-            self.mutex.lockUncancelable(io);
-            const result = self.copyFlightResultLocked(caller_alloc, flight) catch |err| {
+            const result = copyFlightResult(caller_alloc, flight) catch |err| {
+                self.mutex.lockUncancelable(io);
                 self.releaseFlightLocked(key, flight);
                 self.mutex.unlock(io);
                 return err;
             };
+            self.mutex.lockUncancelable(io);
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
             return result;
@@ -187,11 +199,15 @@ pub const QueryEmbeddingCache = struct {
             self.counters.rejected_admissions += 1;
         };
         flight.ready.set(io);
-        const result = self.copyFlightResultLocked(caller_alloc, flight) catch |err| {
+        self.mutex.unlock(io);
+
+        const result = copyFlightResult(caller_alloc, flight) catch |err| {
+            self.mutex.lockUncancelable(io);
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
             return err;
         };
+        self.mutex.lockUncancelable(io);
         self.releaseFlightLocked(key, flight);
         self.mutex.unlock(io);
         return result;
@@ -233,12 +249,6 @@ pub const QueryEmbeddingCache = struct {
                 error.Canceled => return error.Canceled,
             };
         }
-    }
-
-    fn copyFlightResultLocked(self: *QueryEmbeddingCache, alloc: std.mem.Allocator, flight: *Flight) ![]f32 {
-        _ = self;
-        if (flight.err) |err| return err;
-        return try alloc.dupe(f32, flight.result orelse return error.QueryEmbeddingProducerFailed);
     }
 
     fn releaseFlightLocked(self: *QueryEmbeddingCache, key: Key, flight: *Flight) void {
@@ -324,15 +334,43 @@ pub const QueryEmbeddingCache = struct {
     }
 
     fn removeEntryLocked(self: *QueryEmbeddingCache, entry: *Entry, budget: *cache_budget.CacheBudget, expired: bool) void {
+        std.debug.assert(!entry.retired);
         _ = self.entries.remove(entry.key);
         self.unlinkLocked(entry);
+        entry.retired = true;
+        if (entry.pins == 0) self.destroyEntryLocked(entry, budget);
+        if (expired) self.counters.expirations += 1 else self.counters.evictions += 1;
+    }
+
+    fn pinEntryLocked(self: *QueryEmbeddingCache, entry: *Entry) void {
+        std.debug.assert(!entry.retired);
+        entry.pins += 1;
+        self.active_pins += 1;
+    }
+
+    fn unpinEntryLocked(self: *QueryEmbeddingCache, entry: *Entry, budget: *cache_budget.CacheBudget) void {
+        std.debug.assert(entry.pins > 0);
+        std.debug.assert(self.active_pins > 0);
+        entry.pins -= 1;
+        self.active_pins -= 1;
+        if (entry.retired and entry.pins == 0) self.destroyEntryLocked(entry, budget);
+    }
+
+    fn destroyEntryLocked(self: *QueryEmbeddingCache, entry: *Entry, budget: *cache_budget.CacheBudget) void {
+        std.debug.assert(entry.retired);
+        std.debug.assert(entry.pins == 0);
         self.live_bytes -= entry.charge_bytes;
         budget.release(entry.charge_bytes);
         self.alloc.free(entry.vector);
         self.alloc.destroy(entry);
-        if (expired) self.counters.expirations += 1 else self.counters.evictions += 1;
     }
 };
+
+fn copyFlightResult(alloc: std.mem.Allocator, flight: *const Flight) ![]f32 {
+    std.debug.assert(flight.done);
+    if (flight.err) |err| return err;
+    return try alloc.dupe(f32, flight.result orelse return error.QueryEmbeddingProducerFailed);
+}
 
 fn deadlineExpired(deadline_ns: ?u64) bool {
     const deadline = deadline_ns orelse return false;
@@ -547,6 +585,43 @@ pub fn testByteBudgetEviction() !void {
 
 test "query embedding cache enforces byte budget with LRU eviction" {
     try testByteBudgetEviction();
+}
+
+pub fn testPinnedHitRetainsBudgetUntilCopyCompletes() !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, io, .{});
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 5 };
+    const key: Key = [_]u8{4} ** 32;
+
+    const result = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
+    std.testing.allocator.free(result);
+    const charge = cache.live_bytes;
+
+    cache.mutex.lockUncancelable(io);
+    const entry = cache.entries.get(key).?;
+    cache.pinEntryLocked(entry);
+    cache.removeEntryLocked(entry, &budget, false);
+    const retained_entries = cache.entries.count();
+    const retained_live_bytes = cache.live_bytes;
+    const retained_budget_bytes = budget.stats().used_bytes;
+    cache.mutex.unlock(io);
+    try std.testing.expectEqual(@as(usize, 0), retained_entries);
+    try std.testing.expectEqual(charge, retained_live_bytes);
+    try std.testing.expectEqual(charge, retained_budget_bytes);
+
+    cache.mutex.lockUncancelable(io);
+    cache.unpinEntryLocked(entry, &budget);
+    const released_live_bytes = cache.live_bytes;
+    const released_budget_bytes = budget.stats().used_bytes;
+    cache.mutex.unlock(io);
+    try std.testing.expectEqual(@as(usize, 0), released_live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), released_budget_bytes);
+}
+
+test "query embedding cache pins hit values outside the LRU lock" {
+    try testPinnedHitRetainsBudgetUntilCopyCompletes();
 }
 
 pub fn testStatsExpireIdleEntries() !void {

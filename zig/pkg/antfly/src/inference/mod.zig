@@ -95,6 +95,7 @@ test "query embedding cache owns results and coalesces misses" {
     try query_embedding_cache.testConcurrentCoalescing();
     try query_embedding_cache.testInflightAdmissionBound();
     try query_embedding_cache.testByteBudgetEviction();
+    try query_embedding_cache.testPinnedHitRetainsBudgetUntilCopyCompletes();
     try query_embedding_cache.testStatsExpireIdleEntries();
     try query_embedding_cache.testStatsBoundExpirationWork();
 }

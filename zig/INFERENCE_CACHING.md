@@ -82,7 +82,12 @@ after query preparation exposes a stable, fully rendered text-only operation.
 
 Cached vectors and in-flight producer results are cache-owned. Every caller
 receives an owned copy, so request cleanup cannot invalidate another request's
-result and callers cannot mutate cache contents.
+result and callers cannot mutate cache contents. Hit entries are pinned while
+the caller-owned copy is made outside the global LRU mutex. Eviction detaches a
+pinned entry immediately but retains its memory charge until the final pin is
+released, preserving the hard budget without serializing unrelated hit copies.
+Flight references similarly keep completed producer results alive while
+producers and waiters copy outside the mutex.
 
 Provider results cross a strict validation boundary before they can enter the
 cache or search/index code. Dense and sparse batches must match the requested
