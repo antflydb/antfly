@@ -5,9 +5,11 @@
 // the ELv2 at https://www.antfly.io/licensing/ELv2-license.
 
 const cluster_api_http = @import("api/cluster_api_http.zig");
+const http_server = @import("api/http_server.zig");
 const public_table_http = @import("api/public_table_http.zig");
 
 test {
     _ = cluster_api_http;
+    _ = http_server;
     _ = public_table_http;
 }

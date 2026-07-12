@@ -190,11 +190,19 @@ than modifying an existing table. Destructive overwrite is intentionally not a
 restore mode until the catalog supports an atomic staged-generation swap.
 Terminal job state and explicit idempotency keys are retained for seven days;
 the history is bounded by 10,000 jobs and 64 KiB per encoded job, and rejects
-new work instead of silently evicting an unexpired key. Job IDs are random opaque
-63-bit values, so multiple API processes do not share a sequential allocator.
-At most two restore jobs execute concurrently per API process; additional jobs
-remain durably queued, preventing restore traffic from creating an unbounded
-background-I/O fanout.
+new work instead of silently evicting an unexpired key. Job IDs are random
+opaque 63-bit values. In distributed deployments, job records, idempotency
+fences, completed-table checkpoints, and the runnable queue are metadata-Raft
+state. Followers serve job reads after a linearizable read barrier; creation,
+cancellation, and execution are metadata-leader operations. A leadership-term
+change is detected by a backend-runtime maintenance supervisor, without
+requiring client traffic. It reloads replicated state, fences the old worker
+owner, and returns incomplete attempts to their original FIFO positions with a
+higher attempt ID. Mutations are acknowledged only after a Raft read barrier
+confirms the proposed value is committed and applied. At most two restore jobs
+execute across the control-plane leader. The runnable deque is rebuilt once on
+leadership acquisition and consumed incrementally, so completing a job does
+not rescan retained terminal history.
 Table restore jobs are visible to administrators of that table; cluster restore
 jobs require cluster administration. Cancellation is observed at table-publication
 boundaries.
@@ -245,6 +253,9 @@ renewing leases, encoding, or waiting for durable I/O.
 - `storage.local`, `storage.lite`, and `storage.object` are mutually exclusive.
 - Lite has exactly one writable process per file. A second writer fails closed
   on the file lock; readers must use a stable snapshot or a read-only mode.
+- Filesystems without advisory locks are unsupported for normal Lite opens.
+  Reader, writer, stable-snapshot, and maintenance paths return
+  `FileLocksUnsupported`; they never reopen the file without fencing.
 - Raft, shard replication, horizontal scaling, and distributed role settings
   are invalid with Lite.
 - A Lite file contains database metadata, documents, indexes, schemas,
@@ -265,14 +276,24 @@ renewing leases, encoding, or waiting for durable I/O.
 Lite installs a scoped DB-open provider on the standalone backend runtime.
 Logical group paths become cached key and index namespaces inside the file, so
 the existing `/db/v1`, SQL, transaction, indexing, and inference code paths are
-reused unchanged. Prefix-bounded cursors prevent cross-table scans;
-per-namespace snapshots share unchanged document payloads. Cold write-only
-transactions do not materialize a table; small hot tables update their cache
-incrementally, while large hot tables invalidate it in constant time instead
-of rebuilding every live document. A checkpointed namespace-head directory and
-per-namespace document links make cold materialization proportional to the
-selected namespace's history. Missing namespace metadata fails closed as file
-corruption. Cached namespace runtimes avoid allocations and storage
+reused unchanged. Prefix-bounded cursors prevent cross-table scans. Read
+snapshots cache only ordered live keys; values are resolved lazily from a
+pinned append-only document root, and cursors retain only their current value.
+Point reads walk the pinned per-namespace chain directly and never build the
+key index; only ordered cursor operations materialize it. Pinned point and
+cursor-value reads use concurrent positional I/O rather than holding the
+store-wide mutation mutex, and key snapshots use one compact ownership array
+instead of a heap allocation per key.
+Cache-budget exhaustion falls back to a transaction-owned key index instead of
+making valid data unreadable. A `std.Io.RwLock` permits normal append-only
+commits while readers pin roots and makes vacuum/rewrite wait before reclaiming
+pages. Cold write-only transactions do not materialize a table, and commits
+invalidate hot key indexes in constant time. A checkpointed namespace-head
+directory and per-namespace document links make key-index construction
+proportional to the selected namespace's history. Recreating an existing Lite
+artifact publishes a complete new inode by atomic rename, so readers pinned to
+the prior generation are never exposed to truncation. Missing namespace
+metadata fails closed as file corruption. Cached namespace runtimes avoid allocations and storage
 reinitialization on repeated reader/writer opens. The standalone metadata
 catalog and durable HTTP transaction sessions are stored in reserved system
 namespaces in the same file. Metadata is published in memory only with a

@@ -201,7 +201,6 @@ pub const PathWriterLock = struct {
 
 const LockFile = struct {
     file: std.Io.File,
-    locks_supported: bool = true,
 };
 
 pub const CreateOptions = struct {
@@ -306,9 +305,9 @@ const PageLinkCopy = struct {
 /// `writePage` (which updates the cache) or vacuum replacement (which
 /// clears it), sidecar writer locks serialize writers, and read-only
 /// data-file shared locks block the exclusive data-rewrite lock needed for
-/// free-page reuse and vacuum. If the filesystem reports
-/// `FileLocksUnsupported`, the owning `NativeFile` disables this cache for
-/// that handle and reads page bytes from disk instead.
+/// free-page reuse and vacuum. Filesystems that cannot provide those locks are
+/// rejected before a `NativeFile` is returned, so cached pages are never used
+/// by an unfenced handle.
 const PageCache = struct {
     const default_limit_bytes: usize = 64 * 1024 * 1024;
     const default_link_limit_bytes: usize = 16 * 1024 * 1024;
@@ -565,18 +564,15 @@ pub const NativeFile = struct {
         errdefer allocator.free(owned_path);
 
         var writer_lock_file: ?std.Io.File = null;
-        var page_cache_enabled = true;
         if (!opts.read_only) {
             const writer_lock = try acquireWriterLock(allocator, io, path);
             writer_lock_file = writer_lock.file;
-            page_cache_enabled = writer_lock.locks_supported;
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
         const opened_file = try openDataFile(io, path, if (opts.read_only) .reader else .writer);
         const file = opened_file.file;
         errdefer file.close(io);
-        page_cache_enabled = page_cache_enabled and opened_file.locks_supported;
 
         var header_bytes: [header_size]u8 = undefined;
         try readHeaderExactAt(file, io, &header_bytes);
@@ -593,7 +589,7 @@ pub const NativeFile = struct {
             .header = header,
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
-            .page_cache_enabled = .init(page_cache_enabled),
+            .page_cache_enabled = .init(true),
         };
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -632,16 +628,48 @@ pub const NativeFile = struct {
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, .{});
 
-        const file = try createDataFile(io, path, .{
+        const replace_existing = !exclusive and pathExists(io, path);
+        const replacement_path = if (replace_existing)
+            try realPathAlloc(allocator, io, path)
+        else
+            null;
+        defer if (replacement_path) |canonical| allocator.free(canonical);
+        const create_target = if (replacement_path) |canonical| canonical else path;
+        const staging_path = if (replace_existing)
+            try std.fmt.allocPrint(allocator, "{s}.tmp-aflite-create", .{create_target})
+        else
+            null;
+        defer if (staging_path) |tmp_path| allocator.free(tmp_path);
+        errdefer if (staging_path) |tmp_path| deleteFilePath(io, tmp_path) catch {};
+
+        // Reinitializing an existing artifact is an atomic generation swap.
+        // Truncating the existing inode would corrupt snapshots held by
+        // concurrent read-only processes, whose shared lock intentionally
+        // permits an append-only writer.
+        const create_path = staging_path orelse create_target;
+        var file = try createDataFile(io, create_path, .{
             .truncate = true,
             .exclusive = exclusive,
         });
-        errdefer file.close(io);
+        var file_open = true;
+        errdefer if (file_open) file.close(io);
 
         try file.writePositionalAll(io, &encoded, 0);
         if (!no_sync) {
             try file.sync(io);
-            try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+        }
+        if (staging_path) |tmp_path| {
+            file.close(io);
+            file_open = false;
+            renameFilePath(io, tmp_path, create_target) catch |err| {
+                deleteFilePath(io, tmp_path) catch {};
+                return err;
+            };
+            if (!no_sync) try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
+            file = (try openDataFile(io, path, .writer)).file;
+            file_open = true;
+        } else if (!no_sync) {
+            try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
         }
 
         var result = NativeFile{
@@ -653,7 +681,7 @@ pub const NativeFile = struct {
             .header = .{},
             .read_only = false,
             .no_sync = no_sync,
-            .page_cache_enabled = .init(writer_lock.locks_supported),
+            .page_cache_enabled = .init(true),
         };
         if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -669,11 +697,6 @@ pub const NativeFile = struct {
         self.allocator.free(self.path);
         self.io_impl.deinit();
         self.* = undefined;
-    }
-
-    fn disablePageCacheForUnsupportedLocks(self: *NativeFile) void {
-        self.page_cache_enabled.store(false, .monotonic);
-        self.page_cache.clear(self.allocator);
     }
 
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
@@ -1507,14 +1530,18 @@ pub const NativeFile = struct {
     }
 
     fn loadNamespaceDirectoryWithDepthAlloc(self: *NativeFile, allocator: Allocator) !?LoadedNamespaceDirectory {
-        var root = self.activeCheckpoint().namespace_directory_root_page;
+        return try self.loadNamespaceDirectoryWithDepthAtCheckpointAlloc(allocator, self.activeCheckpoint());
+    }
+
+    fn loadNamespaceDirectoryWithDepthAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot) !?LoadedNamespaceDirectory {
+        var root = checkpoint.namespace_directory_root_page;
         if (root == 0) return null;
         var directory = NamespaceDirectory.empty;
         errdefer deinitNamespaceDirectory(allocator, &directory);
         var depth: u16 = 0;
         var walked: u64 = 0;
         while (root != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(allocator, root, .catalog);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(allocator, root, .catalog, checkpoint);
             defer allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
             if (!std.mem.eql(u8, entry.key, namespace_directory_key) or entry.is_delete)
@@ -1523,7 +1550,7 @@ pub const NativeFile = struct {
             defer allocator.free(raw);
             const kind = try applyNamespaceDirectoryRecord(allocator, &directory, raw);
             walked += 1;
-            if (walked > self.activeCheckpoint().page_count) return error.InvalidNativePageChain;
+            if (walked > checkpoint.page_count) return error.InvalidNativePageChain;
             switch (kind) {
                 .snapshot => {
                     if (entry.previous_page != 0) return error.InvalidNamespaceDirectory;
@@ -1541,6 +1568,11 @@ pub const NativeFile = struct {
 
     fn loadNamespaceDirectoryAlloc(self: *NativeFile, allocator: Allocator) !?NamespaceDirectory {
         const loaded = (try self.loadNamespaceDirectoryWithDepthAlloc(allocator)) orelse return null;
+        return loaded.entries;
+    }
+
+    fn loadNamespaceDirectoryAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot) !?NamespaceDirectory {
+        const loaded = (try self.loadNamespaceDirectoryWithDepthAtCheckpointAlloc(allocator, checkpoint)) orelse return null;
         return loaded.entries;
     }
 
@@ -1737,16 +1769,29 @@ pub const NativeFile = struct {
     }
 
     pub fn getDocumentAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
-        var page_id = self.activeCheckpoint().document_root_page;
+        const checkpoint = self.activeCheckpoint();
+        const namespace = documentNamespace(key);
+        const root = if (namespace.len == 0)
+            checkpoint.document_root_page
+        else
+            try self.documentSnapshotRootAtCheckpoint(allocator, namespace, checkpoint);
+        return try self.getDocumentAtRootAlloc(allocator, checkpoint, root, namespace.len != 0, key);
+    }
+
+    /// Resolves a key against a pinned append-only document root. Document
+    /// history pages are reclaimed only by vacuum, allowing normal commits to
+    /// proceed while a reader retains this root.
+    pub fn getDocumentAtRootAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, root_page: u64, namespace_chain: bool, key: []const u8) !?[]u8 {
+        var page_id = root_page;
         while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(allocator, page_id, .document, checkpoint);
             defer allocator.free(payload);
             const entry = try decodeDocumentEntry(payload);
             if (std.mem.eql(u8, entry.key, key)) {
                 if (entry.is_delete) return null;
                 return try self.documentEntryValueAlloc(allocator, entry);
             }
-            page_id = entry.previous_page;
+            page_id = if (namespace_chain) entry.previous_namespace_page else entry.previous_page;
         }
         return null;
     }
@@ -1759,17 +1804,46 @@ pub const NativeFile = struct {
     /// persisted namespace directory and per-namespace page links, making the
     /// walk proportional to that namespace's history.
     pub fn snapshotDocumentsWithPrefixAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8) ![]OwnedDocument {
-        if (prefix.len == 0) return try self.snapshotDocumentsFromChainAlloc(allocator, prefix, self.activeCheckpoint().document_root_page, false);
-        var directory = (try self.loadNamespaceDirectoryAlloc(allocator)) orelse {
-            if (self.activeCheckpoint().document_root_page == 0) return try allocator.alloc(OwnedDocument, 0);
+        return try self.snapshotDocumentsWithPrefixModeAlloc(allocator, prefix, true);
+    }
+
+    /// Returns the ordered live key set without loading document payloads.
+    /// Callers can resolve values lazily with `getDocumentAlloc`; this keeps
+    /// cursor snapshots proportional to key cardinality rather than data size.
+    pub fn snapshotDocumentKeysWithPrefixAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8) ![]OwnedDocument {
+        return try self.snapshotDocumentsWithPrefixModeAlloc(allocator, prefix, false);
+    }
+
+    pub fn snapshotDocumentKeysWithPrefixAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8, checkpoint: CheckpointSlot) ![]OwnedDocument {
+        return try self.snapshotDocumentsWithPrefixModeAtCheckpointAlloc(allocator, prefix, false, checkpoint);
+    }
+
+    pub fn documentSnapshotRootAtCheckpoint(self: *NativeFile, allocator: Allocator, prefix: []const u8, checkpoint: CheckpointSlot) !u64 {
+        if (prefix.len == 0) return checkpoint.document_root_page;
+        var directory = (try self.loadNamespaceDirectoryAtCheckpointAlloc(allocator, checkpoint)) orelse {
+            if (checkpoint.document_root_page == 0) return 0;
+            return error.InvalidNamespaceDirectory;
+        };
+        defer NativeFile.deinitNamespaceDirectory(allocator, &directory);
+        return directory.get(prefix) orelse 0;
+    }
+
+    fn snapshotDocumentsWithPrefixModeAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8, include_values: bool) ![]OwnedDocument {
+        return try self.snapshotDocumentsWithPrefixModeAtCheckpointAlloc(allocator, prefix, include_values, self.activeCheckpoint());
+    }
+
+    fn snapshotDocumentsWithPrefixModeAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8, include_values: bool, checkpoint: CheckpointSlot) ![]OwnedDocument {
+        if (prefix.len == 0) return try self.snapshotDocumentsFromChainAlloc(allocator, prefix, checkpoint.document_root_page, false, include_values, checkpoint);
+        var directory = (try self.loadNamespaceDirectoryAtCheckpointAlloc(allocator, checkpoint)) orelse {
+            if (checkpoint.document_root_page == 0) return try allocator.alloc(OwnedDocument, 0);
             return error.InvalidNamespaceDirectory;
         };
         defer NativeFile.deinitNamespaceDirectory(allocator, &directory);
         const head = directory.get(prefix) orelse return try allocator.alloc(OwnedDocument, 0);
-        return try self.snapshotDocumentsFromChainAlloc(allocator, prefix, head, true);
+        return try self.snapshotDocumentsFromChainAlloc(allocator, prefix, head, true, include_values, checkpoint);
     }
 
-    fn snapshotDocumentsFromChainAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8, root_page: u64, namespace_chain: bool) ![]OwnedDocument {
+    fn snapshotDocumentsFromChainAlloc(self: *NativeFile, allocator: Allocator, prefix: []const u8, root_page: u64, namespace_chain: bool, include_values: bool, checkpoint: CheckpointSlot) ![]OwnedDocument {
         var docs = std.ArrayListUnmanaged(OwnedDocument).empty;
         errdefer {
             for (docs.items) |doc| {
@@ -1792,7 +1866,7 @@ pub const NativeFile = struct {
 
         var page_id = root_page;
         while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(allocator, page_id, .document, checkpoint);
             defer allocator.free(payload);
             const entry = try decodeDocumentEntry(payload);
 
@@ -1813,7 +1887,10 @@ pub const NativeFile = struct {
                     try docs.ensureUnusedCapacity(allocator, 1);
                     const owned_key = try allocator.dupe(u8, entry.key);
                     errdefer allocator.free(owned_key);
-                    const owned_value = try self.documentEntryValueAlloc(allocator, entry);
+                    const owned_value = if (include_values)
+                        try self.documentEntryValueAlloc(allocator, entry)
+                    else
+                        try allocator.alloc(u8, 0);
                     docs.appendAssumeCapacity(.{ .key = owned_key, .value = owned_value });
                     seen.putAssumeCapacity(owned_key, {});
                 }
@@ -1961,7 +2038,6 @@ pub const NativeFile = struct {
 
         var data_lock = try acquireDataRewriteLock(self.io_impl.io(), self.path);
         defer data_lock.file.close(self.io_impl.io());
-        if (!data_lock.locks_supported) self.disablePageCacheForUnsupportedLocks();
 
         const before_size = (try self.file.stat(self.io_impl.io())).size;
         const previous = self.activeCheckpoint();
@@ -2457,7 +2533,6 @@ pub const NativeFile = struct {
                 else => return err,
             };
             if (data_lock) |lock| {
-                if (!lock.locks_supported) self.disablePageCacheForUnsupportedLocks();
                 data_lock_file = lock.file;
             }
         }
@@ -2964,11 +3039,35 @@ pub fn create(io: std.Io, path: []const u8) !void {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
 
-    var file = try createDataFile(io, path, .{ .truncate = true });
-    defer file.close(io);
+    const replace_existing = pathExists(io, path);
+    const replacement_path = if (replace_existing)
+        try realPathAlloc(std.heap.page_allocator, io, path)
+    else
+        null;
+    defer if (replacement_path) |canonical| std.heap.page_allocator.free(canonical);
+    const create_target = if (replacement_path) |canonical| canonical else path;
+    const staging_path = if (replace_existing)
+        try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-aflite-create", .{create_target})
+    else
+        null;
+    defer if (staging_path) |tmp_path| std.heap.page_allocator.free(tmp_path);
+    errdefer if (staging_path) |tmp_path| deleteFilePath(io, tmp_path) catch {};
+
+    var file = try createDataFile(io, staging_path orelse create_target, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
 
     try file.writePositionalAll(io, &encoded, 0);
     try file.sync(io);
+    if (staging_path) |tmp_path| {
+        file.close(io);
+        file_open = false;
+        renameFilePath(io, tmp_path, create_target) catch |err| {
+            deleteFilePath(io, tmp_path) catch {};
+            return err;
+        };
+    }
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
 }
 
 pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
@@ -2990,14 +3089,10 @@ fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !LockFile {
         .lock = if (lock_mode == .reader) .shared else .none,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => {
-            return .{
-                .file = try std.Io.Dir.cwd().openFile(io, path, .{
-                    .mode = if (lock_mode == .reader) .read_only else .read_write,
-                }),
-                .locks_supported = false,
-            };
-        },
+        // Snapshot safety and maintenance fencing depend on the kernel lock.
+        // Silently reopening without it turns an unsupported filesystem into
+        // a data-corruption hazard, so every normal Lite open fails closed.
+        error.FileLocksUnsupported => return error.FileLocksUnsupported,
         else => return err,
     };
     return .{ .file = file };
@@ -3025,15 +3120,7 @@ fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFi
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => {
-            return .{
-                .file = try std.Io.Dir.cwd().createFile(io, lock_path, .{
-                    .read = true,
-                    .truncate = false,
-                }),
-                .locks_supported = false,
-            };
-        },
+        error.FileLocksUnsupported => return error.FileLocksUnsupported,
         else => return err,
     };
     return .{ .file = file };
@@ -3091,14 +3178,7 @@ fn acquireDataRewriteLock(io: std.Io, path: []const u8) !LockFile {
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => {
-            return .{
-                .file = try std.Io.Dir.cwd().openFile(io, path, .{
-                    .mode = .read_write,
-                }),
-                .locks_supported = false,
-            };
-        },
+        error.FileLocksUnsupported => return error.FileLocksUnsupported,
         else => return err,
     };
     return .{ .file = file };
@@ -3877,6 +3957,75 @@ test "lite native createNew rejects existing aflite without truncating" {
     const value = (try reopened.getDocumentAlloc(allocator, "doc:keep")) orelse return error.TestExpectedEqual;
     defer allocator.free(value);
     try std.testing.expectEqualStrings("survives", value);
+}
+
+test "lite native recreate atomically replaces the generation pinned by readers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-recreate-pinned-reader.aflite");
+    defer allocator.free(path);
+
+    {
+        var original = try NativeFile.create(allocator, path);
+        defer original.close();
+        try original.putDocument("doc:old", "pinned");
+    }
+
+    var pinned = try NativeFile.open(allocator, path, true);
+    defer pinned.close();
+
+    {
+        var replacement = try NativeFile.create(allocator, path);
+        defer replacement.close();
+        try std.testing.expectEqual(@as(u64, 0), replacement.activeCheckpoint().commit_sequence);
+    }
+
+    const old_value = (try pinned.getDocumentAlloc(allocator, "doc:old")) orelse return error.TestExpectedEqual;
+    defer allocator.free(old_value);
+    try std.testing.expectEqualStrings("pinned", old_value);
+
+    var current = try NativeFile.open(allocator, path, true);
+    defer current.close();
+    try std.testing.expect((try current.getDocumentAlloc(allocator, "doc:old")) == null);
+}
+
+test "lite native recreate through symlink preserves canonical lock identity" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_path = try testPath(allocator, tmp, "native-recreate-symlink-target.aflite");
+    defer allocator.free(target_path);
+    const alias_path = try testPath(allocator, tmp, "native-recreate-symlink-alias.aflite");
+    defer allocator.free(alias_path);
+
+    {
+        var original = try NativeFile.create(allocator, target_path);
+        defer original.close();
+        try original.putDocument("doc:old", "replaced");
+    }
+    const canonical_target = try realPathAlloc(allocator, std.testing.io, target_path);
+    defer allocator.free(canonical_target);
+    try std.Io.Dir.cwd().symLink(std.testing.io, canonical_target, alias_path, .{});
+
+    {
+        var replacement = try NativeFile.create(allocator, alias_path);
+        defer replacement.close();
+        try std.testing.expectEqual(@as(u64, 0), replacement.activeCheckpoint().commit_sequence);
+    }
+
+    const canonical_alias = try realPathAlloc(allocator, std.testing.io, alias_path);
+    defer allocator.free(canonical_alias);
+    try std.testing.expectEqualStrings(canonical_target, canonical_alias);
+
+    var current = try NativeFile.open(allocator, target_path, true);
+    defer current.close();
+    try std.testing.expect((try current.getDocumentAlloc(allocator, "doc:old")) == null);
 }
 
 test "lite native open rejects unsupported format version" {
@@ -5531,38 +5680,6 @@ test "lite native page and link caches report usage to resource manager" {
     link_stats = manager.sliceStats(.lite_native_link_cache);
     try std.testing.expectEqual(@as(u64, 0), page_stats.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), link_stats.used_bytes);
-}
-
-test "lite native disables page and link caches when lock support is unavailable" {
-    const allocator = std.testing.allocator;
-
-    var manager = resource_manager_mod.ResourceManager.init(.{});
-    var file = NativeFile{
-        .allocator = allocator,
-        .io_impl = undefined,
-        .path = &.{},
-        .file = undefined,
-        .header = .{},
-    };
-    defer file.page_cache.deinit(allocator);
-    file.page_cache.attachResourceManager(&manager);
-
-    file.page_cache.put(allocator, 1, "0123456789ab");
-    file.page_cache.putLinks(allocator, 1, .{
-        .kind = .document,
-        .link_page = 0,
-        .external_value_root_page = 7,
-        .external_value_len = 128,
-    });
-    try std.testing.expect(manager.sliceStats(.lite_native_page_cache).used_bytes > 0);
-    try std.testing.expect(manager.sliceStats(.lite_native_link_cache).used_bytes > 0);
-
-    file.disablePageCacheForUnsupportedLocks();
-    try std.testing.expect(!file.page_cache_enabled.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
-    try std.testing.expectEqual(@as(usize, 0), file.page_cache.link_bytes);
-    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_link_cache).used_bytes);
 }
 
 test "lite native page and link caches shrink under hard resource pressure" {

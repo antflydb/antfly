@@ -16,12 +16,14 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const platform_time = antfly.platform_time;
 
-const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 const portable_backup = antfly.portable_backup;
 
 const default_backup_location = "file:///tmp/antfly_backups";
+const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
+const restore_poll_interval_ms: u64 = 1000;
 
 const BackupArgs = struct {
     help: bool = false,
@@ -48,6 +50,9 @@ const RestoreArgs = struct {
     url: ?[]const u8 = null,
     input_path: ?[]const u8 = null,
     connection: ?[]const u8 = null,
+    idempotency_key: ?[]const u8 = null,
+    wait: bool = false,
+    wait_timeout_ms: u64 = default_restore_wait_timeout_ms,
 };
 
 const InputRestorePlan = struct {
@@ -152,18 +157,18 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         defer allocator.free(location);
         var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location, connection);
         defer plan.deinit(allocator);
-        var resp = try client.restoreTable(plan.tableName(), plan.request);
+        var resp = try client.restoreTableWithOptions(plan.tableName(), plan.request, .{ .idempotency_key = opts.idempotency_key });
         defer resp.deinit();
-        std.debug.print("Restore command successfully initiated.\n", .{});
+        try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
         return;
     }
 
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
     if (opts.table_name) |tbl| {
-        var resp = try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = opts.format });
+        var resp = try client.restoreTableWithOptions(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = opts.format }, .{ .idempotency_key = opts.idempotency_key });
         defer resp.deinit();
-        std.debug.print("Restore command successfully initiated.\n", .{});
+        try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
         return;
     }
 
@@ -177,18 +182,72 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         table_names = names.items;
     }
 
-    var resp = try client.clusterRestore(.{
+    var resp = try client.clusterRestoreWithOptions(.{
         .backup_id = bid,
         .location = opts.location,
         .connection = connection,
         .table_names = table_names,
         .restore_mode = opts.restore_mode,
-    });
+    }, .{ .idempotency_key = opts.idempotency_key });
     defer resp.deinit();
-    if (resp.data) |data| {
-        try cli.writeJson(allocator, io, data.value);
+    try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
+}
+
+fn writeRestoreResponse(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *antfly_client.AntflyClient,
+    accepted: *antfly_client.openapi.ApiResponse(antfly_client.types.RestoreJob),
+    wait: bool,
+    timeout_ms: u64,
+) !void {
+    const initial = if (accepted.data) |*data| data.value else return error.InvalidRestoreResponse;
+    if (!wait or isTerminalRestorePhase(initial.phase)) {
+        try cli.writeJson(allocator, io, initial);
+        return restorePhaseResult(initial.phase);
     }
-    std.debug.print("Restore command successfully initiated.\n", .{});
+
+    var terminal = try waitForRestoreJob(client, io, initial.job_id, timeout_ms);
+    defer terminal.deinit();
+    const job = if (terminal.data) |*data| data.value else return error.InvalidRestoreResponse;
+    try cli.writeJson(allocator, io, job);
+    return restorePhaseResult(job.phase);
+}
+
+pub fn waitForRestoreJob(
+    client: *antfly_client.AntflyClient,
+    io: std.Io,
+    job_id: i64,
+    timeout_ms: u64,
+) !antfly_client.openapi.ApiResponse(antfly_client.types.RestoreJob) {
+    var job_id_buf: [32]u8 = undefined;
+    const job_id_text = try std.fmt.bufPrint(&job_id_buf, "{d}", .{job_id});
+    const started_ns = platform_time.monotonicNs();
+    const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    while (true) {
+        var response = try client.getRestoreJob(job_id_text);
+        if (response.data) |*data| {
+            if (isTerminalRestorePhase(data.value.phase)) return response;
+        } else {
+            response.deinit();
+            return error.InvalidRestoreResponse;
+        }
+        response.deinit();
+        const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+        if (elapsed_ns >= timeout_ns) return error.RestoreWaitTimeout;
+        const poll_ns = restore_poll_interval_ms * std.time.ns_per_ms;
+        const delay_ns = @min(poll_ns, timeout_ns - elapsed_ns);
+        io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch return error.RestoreWaitInterrupted;
+    }
+}
+
+pub fn isTerminalRestorePhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, "succeeded") or std.mem.eql(u8, phase, "failed") or std.mem.eql(u8, phase, "cancelled");
+}
+
+pub fn restorePhaseResult(phase: []const u8) !void {
+    if (std.mem.eql(u8, phase, "failed")) return error.RestoreJobFailed;
+    if (std.mem.eql(u8, phase, "cancelled")) return error.RestoreJobCancelled;
 }
 
 fn prepareInputRestorePlan(
@@ -277,6 +336,14 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
             out.input_path = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--url")) {
             out.url = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--idempotency-key")) {
+            out.idempotency_key = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--wait")) {
+            out.wait = true;
+        } else if (std.mem.eql(u8, arg, "--wait-timeout")) {
+            const seconds = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
+            out.wait_timeout_ms = try std.math.mul(u64, seconds, 1000);
+            out.wait = true;
         } else {
             return error.UnknownArgument;
         }
@@ -295,14 +362,9 @@ fn isPortableRestoreInputPath(path: []const u8) bool {
 }
 
 fn restoreInputLocationAlloc(allocator: std.mem.Allocator, input_path: []const u8, opts: RestoreArgs) ![]u8 {
-    if (opts.location_explicit or !std.mem.endsWith(u8, input_path, ".aflite")) {
-        return try allocator.dupe(u8, opts.location);
-    }
-    return try defaultLiteInputRestoreLocationAlloc(allocator);
-}
-
-fn defaultLiteInputRestoreLocationAlloc(allocator: std.mem.Allocator) ![]u8 {
-    return try lite_paths.defaultBackupsLocationAlloc(allocator);
+    _ = input_path;
+    if (!opts.location_explicit) return error.RestoreInputLocationRequired;
+    return try allocator.dupe(u8, opts.location);
 }
 
 fn printBackupUsage() void {
@@ -322,14 +384,15 @@ fn printBackupUsage() void {
 fn printRestoreUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly restore --table <name> --backup-id <id> --connection <id> [--location <uri>] [--format native|portable] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> [--location <uri>] [--mode <mode>] [--url <url>]
-        \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> [--backup-id <id>] [--location <uri>] [--url <url>]
+        \\  antfly restore --table <name> --backup-id <id> --connection <id> [--location <uri>] [--format native|portable] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> [--location <uri>] [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\
         \\notes:
         \\  `--input db.aflite` stages an Antfly Lite database as a portable backup,
         \\  then restores it through the normal Antfly table restore path.
-        \\  Without --location, .aflite input stages under ~/.antfly/lite/backups.
+        \\  Input restore requires a location writable by this client and readable
+        \\  by the target's named connection. These may use different credentials.
         \\
     , .{});
 }
@@ -387,7 +450,7 @@ test "restore cli parser accepts aflite input shape" {
     try std.testing.expectEqualStrings("lite-app", opts.backup_id.?);
 }
 
-test "restore input location defaults aflite staging under lite workspace" {
+test "restore input location requires explicit shared staging" {
     const allocator = std.testing.allocator;
 
     var argv = [_][*:0]const u8{
@@ -400,13 +463,10 @@ test "restore input location defaults aflite staging under lite workspace" {
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(!opts.location_explicit);
 
-    const location = try restoreInputLocationAlloc(allocator, opts.input_path.?, opts);
-    defer allocator.free(location);
-    try std.testing.expect(std.mem.startsWith(u8, location, "file://"));
-    try std.testing.expect(std.mem.endsWith(u8, location, "/.antfly/lite/backups"));
+    try std.testing.expectError(error.RestoreInputLocationRequired, restoreInputLocationAlloc(allocator, opts.input_path.?, opts));
 }
 
-test "restore input location keeps generic default for afb input" {
+test "restore afb input also requires explicit shared staging" {
     const allocator = std.testing.allocator;
 
     var argv = [_][*:0]const u8{
@@ -419,9 +479,7 @@ test "restore input location keeps generic default for afb input" {
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(!opts.location_explicit);
 
-    const location = try restoreInputLocationAlloc(allocator, opts.input_path.?, opts);
-    defer allocator.free(location);
-    try std.testing.expectEqualStrings(default_backup_location, location);
+    try std.testing.expectError(error.RestoreInputLocationRequired, restoreInputLocationAlloc(allocator, opts.input_path.?, opts));
 }
 
 test "restore input plan stages aflite as portable table restore" {

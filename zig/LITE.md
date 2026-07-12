@@ -71,11 +71,18 @@ The implementation now consists of:
   path. Missing directory or namespace-link metadata is treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Snapshot
-  caches are maintained per namespace and charged to the shared resource
-  governor. Cold write-only transactions do not materialize live documents;
-  commits incrementally merge small hot snapshots and invalidate large hot
-  snapshots in constant time. Readers rebuild on demand and fail explicitly
-  when the configured snapshot budget cannot be reserved.
+  caches retain ordered live keys only and are charged to the shared resource
+  governor; values are loaded lazily from a pinned append-only document root,
+  and a cursor owns only its current value. Point reads walk the pinned
+  per-namespace chain without building the ordered key index; only cursor
+  operations materialize it. Cold write-only transactions do not
+  materialize live documents, and commits invalidate hot key indexes in
+  constant time. Pinned point and cursor-value reads use concurrent positional
+  I/O, and key snapshots use one compact ownership array rather than a heap
+  object per key. Cache-budget exhaustion uses a transaction-owned key index
+  rather than rejecting reads based on document payload volume. A
+  `std.Io.RwLock` allows normal append-only commits while readers pin roots and
+  blocks vacuum before it can reclaim those roots.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
 - `storage/lite/backend.zig` caches one runtime per logical table/group and
@@ -175,6 +182,10 @@ explicit idempotency keys are retained for seven days in a history bounded by
 10,000 jobs and 64 KiB per encoded job. Cancellation is checked at safe table
 publication boundaries. A standalone process executes at most two restore jobs
 concurrently; the remainder stay durably queued inside the `.aflite` file.
+`antfly restore` always prints the accepted or terminal job document. Use
+`--idempotency-key` for retry-safe submission and `--wait` (optionally
+`--wait-timeout <seconds>`) for a terminal exit status. Failed and cancelled
+terminal jobs exit nonzero.
 
 An artifact first created through embedded commands has one root database. On
 its first standalone start, Antfly atomically adopts that root as the
@@ -271,6 +282,16 @@ the replacement is fsynced, atomically renamed, and adopted through its
 already-open read/write handle before the parent directory is fsynced. A
 post-rename sync error therefore cannot leave the process writing an unlinked
 old inode.
+
+All normal Lite opens require working advisory file locks. The writer lease,
+reader snapshot lock, stable-snapshot source lock, and vacuum/rewrite lock fail
+closed with `FileLocksUnsupported`; Antfly never retries without a lock.
+Filesystems and CSI drivers without advisory-lock semantics are unsupported for
+writable Lite deployments.
+
+Reinitializing an existing artifact is an atomic generation swap, not an
+in-place truncate. Readers already holding the old inode finish against their
+pinned generation; readers opened after the rename see the new database.
 
 The Kubernetes operator exposes the same topology/storage separation through
 `spec.mode: Standalone` plus `spec.storage.engine: lite`. The optional
@@ -502,35 +523,40 @@ The flow:
 
 ```sh
 antfly lite backup app.aflite --out app.afb
-antfly restore --format portable --input app.afb --table docs
+antfly restore --format portable --input app.afb --table docs \
+  --location s3://archive/promotions/app --connection promotion-reader --wait
 ```
 
 or:
 
 ```sh
 antfly lite promote app.aflite --target http://cluster:8080 --table docs \
-  --connection archive-writer --location s3://archive/promotions/app
+  --connection promotion-reader --location s3://archive/promotions/app
 ```
 
 `promote` orchestrates portable backup upload plus normal restore. The named
 connection is required by the target API and scopes its read access to the
-chosen location; the CLI uses the invoking user's authority to stage/upload the
-portable artifact. It
+chosen location; the CLI uses the invoking user's separate local or ambient
+write authority to stage/upload the portable artifact. Multiple named target
+connections may select different buckets, accounts, prefixes, and reader
+roles. Promotion waits for terminal success by default, prints the restore job,
+and exits nonzero on failure. `--no-wait` returns the accepted job instead. It
 should not invent a separate migration protocol until backup/restore proves too
 slow for large databases.
 
-When `antfly lite promote` needs a local staging location and the user does not
-pass `--location`, it should use `~/.antfly/lite/backups`, not a process-global
-`/tmp` directory. Explicit `--location` values continue to support normal
-Antfly backup targets such as `file://`, `s3://`, or `gs://`.
-The direct normal restore shortcut for `.aflite` input should use the same
-Lite-local default staging location when `--location` is omitted.
+`promote` and network `restore --input` require an explicit `--location`.
+Client-local defaults are unsafe because a remote server resolves filesystem
+connections in its own namespace. The location must be writable by the CLI and
+readable through the target's named connection; `file://` is appropriate only
+for genuinely shared storage, while `s3://` and `gs://` are the normal remote
+choices.
 
 Normal Antfly should also be able to restore directly from a `.aflite` live
 database file:
 
 ```sh
-antfly restore --input app.aflite --table docs
+antfly restore --input app.aflite --table docs \
+  --location gs://migration-staging/app --connection migration-reader --wait
 ```
 
 That direct path should not make `.aflite` the backup format. It should open

@@ -266,6 +266,11 @@ test "public API request body limit matches Go linear merge contract" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
 }
 
+pub const RestoreExecutionGuard = struct {
+    ptr: *anyopaque,
+    is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
+};
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     ard_base_url: ?[]const u8 = null,
@@ -306,6 +311,7 @@ pub const ApiHttpServerConfig = struct {
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
     restore_job_store_path: ?[]const u8 = null,
+    restore_execution_guard: ?RestoreExecutionGuard = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -1087,6 +1093,7 @@ pub const ApiHttpServer = struct {
     restore_job_owner_id: u64 = 0,
     restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
+    restore_leadership_term: std.atomic.Value(u64) = .init(0),
     session_maintenance_owner_id: u64 = 0,
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     mcp_sessions: mcp.InMemorySessionStore = .{},
@@ -1298,6 +1305,25 @@ pub const ApiHttpServer = struct {
 
     pub fn attachRestoreJobRuntimeStore(self: *ApiHttpServer, store: *backend_erased.Store) !void {
         try self.restore_job_store.attachRuntime(store);
+    }
+
+    pub fn attachReplicatedRestoreJobStore(self: *ApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
+        try self.restore_job_store.attachReplicated(persistence);
+    }
+
+    /// Rotates worker ownership and rebuilds the runnable queue from replicated
+    /// state at a metadata Raft leadership boundary.
+    pub fn prepareRestoreLeadership(self: *ApiHttpServer, leadership_term: u64) !void {
+        const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
+        if (self.restore_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.restore_job_owner_id);
+        self.restore_job_owner_id = runtime.allocOwnerId();
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        self.scheduled_restore_jobs.clearRetainingCapacity();
+        self.restore_schedule_mutex.unlock();
+        self.restore_jobs_resumed.store(false, .release);
+        try self.restore_job_store.prepareReplicatedLeadership(self.alloc);
+        self.restore_leadership_term.store(leadership_term, .release);
+        if (runtime.threaded_jobs != null) try self.resumeRestoreJobsOnce();
     }
 
     pub fn attachRestoreJobStorePath(self: *ApiHttpServer, path: []const u8) !void {
@@ -7386,7 +7412,14 @@ pub const ApiHttpServer = struct {
 
     fn restoreCancelled(self: *ApiHttpServer, cancellation: ?RestoreCancellation) bool {
         const token = cancellation orelse return false;
+        if (!self.restoreExecutionPermitted()) return true;
         return self.restore_job_store.cancellationRequested(self.alloc, token.job_id, token.attempt_id) catch true;
+    }
+
+    fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
+        const guard = self.cfg.restore_execution_guard orelse return true;
+        const term = self.restore_leadership_term.load(.acquire);
+        return term != 0 and guard.is_current(guard.ptr, term);
     }
 
     pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -8284,9 +8317,8 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(encoded);
         var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer state.deinit();
-        if (!restore_jobs.isTerminal(state.value.phase)) self.submitRestoreJob(state.value.job_id) catch |err| {
-            return try restoreJobStartErrorResponse(self.alloc, err);
-        };
+        if (!restore_jobs.isTerminal(state.value.phase)) self.schedulePendingRestoreJobs() catch |err|
+            std.log.err("accepted table restore job scheduling deferred job_id={d} err={s}", .{ state.value.job_id, @errorName(err) });
         return try self.restoreJobResponse(202, encoded);
     }
 
@@ -8342,9 +8374,8 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(encoded);
         var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer state.deinit();
-        if (!restore_jobs.isTerminal(state.value.phase)) self.submitRestoreJob(state.value.job_id) catch |err| {
-            return try restoreJobStartErrorResponse(self.alloc, err);
-        };
+        if (!restore_jobs.isTerminal(state.value.phase)) self.schedulePendingRestoreJobs() catch |err|
+            std.log.err("accepted cluster restore job scheduling deferred job_id={d} err={s}", .{ state.value.job_id, @errorName(err) });
         return try self.restoreJobResponse(202, encoded);
     }
 
@@ -8356,16 +8387,29 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    /// Cheap supervisor tick: the durable FIFO makes this O(available slots),
+    /// not O(retained history). It retries transient dispatch failures without
+    /// requiring another client request.
+    pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
+        try self.schedulePendingRestoreJobs();
+    }
+
     fn schedulePendingRestoreJobs(self: *ApiHttpServer) !void {
         if (self.restore_jobs_closing.load(.acquire)) return;
-        const ids = try self.restore_job_store.pendingIds(self.alloc);
+        if (!self.restoreExecutionPermitted()) return;
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return;
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        const scheduled_count = self.scheduled_restore_jobs.count();
+        self.restore_schedule_mutex.unlock();
+        if (scheduled_count >= max_concurrent_restore_jobs) return;
+        const ids = try self.restore_job_store.takePendingIds(self.alloc, max_concurrent_restore_jobs - scheduled_count);
         defer self.alloc.free(ids);
         for (ids) |job_id| {
-            platform_sync.lockYielding(&self.restore_schedule_mutex);
-            const at_capacity = self.scheduled_restore_jobs.count() >= max_concurrent_restore_jobs;
-            self.restore_schedule_mutex.unlock();
-            if (at_capacity) break;
             self.submitRestoreJob(job_id) catch |err| {
+                self.restore_job_store.requeuePending(job_id) catch |requeue_err| {
+                    std.log.err("failed to requeue restore job job_id={d} err={s}", .{ job_id, @errorName(requeue_err) });
+                };
                 std.log.err("failed to schedule restore job job_id={d} err={s}", .{ job_id, @errorName(err) });
             };
         }
@@ -8381,7 +8425,11 @@ pub const ApiHttpServer = struct {
         }
         if (self.scheduled_restore_jobs.count() >= max_concurrent_restore_jobs) {
             self.restore_schedule_mutex.unlock();
-            return;
+            // Another concurrent scheduler filled the last slot after this
+            // caller removed the job from the runnable queue. Surface that
+            // race so the caller puts the job back instead of losing it until
+            // the next process restart/leadership rebuild.
+            return error.RestoreSchedulingCapacity;
         }
         self.scheduled_restore_jobs.put(self.alloc, job_id, {}) catch |err| {
             self.restore_schedule_mutex.unlock();
@@ -8417,6 +8465,10 @@ pub const ApiHttpServer = struct {
     }
 
     fn runRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
+        if (!self.restoreExecutionPermitted()) {
+            try self.restore_job_store.requeuePending(job_id);
+            return;
+        }
         const running_encoded = (try self.restore_job_store.begin(self.alloc, job_id)) orelse return;
         defer self.alloc.free(running_encoded);
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
@@ -8436,11 +8488,13 @@ pub const ApiHttpServer = struct {
         defer location.deinit(self.alloc);
         const result = switch (state.scope) {
             .table => blk: {
+                if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
                 executePublicTableRestore(self, self.alloc, state.table_name orelse return error.CorruptRestoreJobStore, state.backup_id, state.location, &location) catch |err| {
                     const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                     self.alloc.free(failed);
                     return;
                 };
+                if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
                 break :blk try backups_api.encodeRestoreTriggered(self.alloc);
             },
             .cluster => executePublicClusterRestoreWithCancellation(self, self.alloc, .{
@@ -8464,7 +8518,7 @@ pub const ApiHttpServer = struct {
         const encoded = if (cancel)
             (try self.restore_job_store.cancel(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found")
         else
-            (try self.restore_job_store.load(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+            (try self.restore_job_store.loadCached(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         return try self.restoreJobResponse(200, encoded);
     }
@@ -8556,6 +8610,7 @@ fn restoreJobIdFromPath(path: []const u8) ?u64 {
 }
 
 fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    if (isRetryableMetadataLeadershipError(err)) return try metadataNotLeaderResponse(alloc);
     return switch (err) {
         error.InvalidIdempotencyKey => try textResponse(alloc, 400, "invalid idempotency key"),
         error.IdempotencyConflict => try textResponse(alloc, 409, "idempotency key reused for a different restore"),
@@ -10700,6 +10755,7 @@ fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !u
 fn parseListBackupsParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListBackupsParams {
     return .{
         .location = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "location")) orelse return error.MissingLocation,
+        .connection = try parseSimpleQueryParamDecodedAlloc(alloc, query, "connection"),
     };
 }
 
@@ -11548,7 +11604,7 @@ fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !h
     return .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
 }
 
-fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     const headers = try alloc.alloc(http_common.Header, 2);
     var initialized_headers: usize = 0;
     errdefer {
@@ -11705,8 +11761,9 @@ test "generated client query params decode for metadata parsers" {
     try std.testing.expectEqualStrings("tenant/docs v1", tables.prefix.?);
     try std.testing.expectEqualStrings("docs*", tables.pattern.?);
 
-    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one");
+    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one&connection=archive-reader");
     try std.testing.expectEqualStrings("s3://bucket/path one", backups.location);
+    try std.testing.expectEqualStrings("archive-reader", backups.connection.?);
 
     const permission = try parseRemovePermissionFromUserParams(arena, "resource=docs%2Ftenant&resourceType=table");
     try std.testing.expectEqualStrings("docs/tenant", permission.resource);
@@ -23595,8 +23652,10 @@ test "api http server lists cluster backups through public route" {
     try backups_api.writeClusterManifest(alloc, backup_root, &manifest);
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
-    const uri = try std.fmt.allocPrint(alloc, "/backups?location={s}", .{location_uri});
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
+    const uri = try std.fmt.allocPrint(alloc, "/backups?location={s}&connection=test-backups", .{location_uri});
     defer alloc.free(uri);
 
     var resp = try server.handle(.{
@@ -23825,13 +23884,15 @@ test "api http server returns retryable not leader through public cluster adapte
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
 
     var resp = try server.handle(.{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"table_names\":[\"docs\"]}",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\",\"table_names\":[\"docs\"]}",
     });
     defer resp.deinit(alloc);
 

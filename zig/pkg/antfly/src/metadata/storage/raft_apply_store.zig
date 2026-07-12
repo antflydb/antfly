@@ -117,6 +117,13 @@ pub const TransitionCommand = union(enum) {
     remove_shuffle_join_lease: struct {
         job_id: u64,
     },
+    upsert_restore_job: struct {
+        key: []const u8,
+        value: []const u8,
+    },
+    remove_restore_job: struct {
+        key: []const u8,
+    },
     upsert_reallocation_request: metadata.ReallocationRequestRecord,
     remove_reallocation_request: struct {},
     upsert_extension_package: extension_domain.PackageManifest,
@@ -195,6 +202,11 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.required_extension_name);
                 alloc.free(record.package_name);
             },
+            .upsert_restore_job => |record| {
+                alloc.free(record.key);
+                alloc.free(record.value);
+            },
+            .remove_restore_job => |record| alloc.free(record.key),
             .apply_extension_lifecycle => |*delta| freeExtensionLifecycleDelta(alloc, delta.*),
             else => {},
         }
@@ -219,8 +231,18 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             try group_ids.requireDataGroupId(record.receiver_group_id);
         },
         .upsert_shuffle_join_lease => |record| try group_ids.requireDataGroupId(record.owner_group_id),
+        .upsert_restore_job => |record| {
+            try validateRestoreJobLogicalKey(record.key);
+            if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
+        },
+        .remove_restore_job => |record| try validateRestoreJobLogicalKey(record.key),
         else => {},
     }
+}
+
+fn validateRestoreJobLogicalKey(key: []const u8) !void {
+    if (key.len <= restore_job_logical_prefix.len or key.len > max_restore_job_logical_key_bytes or
+        !std.mem.startsWith(u8, key, restore_job_logical_prefix)) return error.InvalidRestoreJobRecord;
 }
 
 test "transition command validation rejects metadata group ids in data group fields" {
@@ -241,6 +263,70 @@ test "transition command validation rejects metadata group ids in data group fie
     for (commands) |command| {
         try std.testing.expectError(error.ReservedGroupId, validateTransitionCommandDataGroupIds(command));
     }
+}
+
+test "restore job transition encoding is append-only compatible" {
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{
+            .key = "\x00\x00__api_restore_jobs__:000000000000002a",
+            .value = "{\"job_id\":42}",
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)).?;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded == .upsert_restore_job);
+    try std.testing.expectEqualStrings("\x00\x00__api_restore_jobs__:000000000000002a", decoded.upsert_restore_job.key);
+    try std.testing.expectEqualStrings("{\"job_id\":42}", decoded.upsert_restore_job.value);
+}
+
+test "metadata raft apply store replicates restore job records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-job-store", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const group_id = group_ids.main_metadata_group_id;
+    const logical_key = "\x00\x00__api_restore_jobs__:000000000000002a";
+    const value = "{\"job_id\":42,\"phase\":\"queued\"}";
+
+    const upsert = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = logical_key, .value = value },
+    });
+    defer std.testing.allocator.free(upsert);
+    const upsert_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = upsert },
+    });
+    defer std.testing.allocator.free(upsert_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 1,
+        .entries_bytes = upsert_entries,
+    });
+    const loaded = (try store.getRestoreJobValue(std.testing.allocator, group_id, logical_key)).?;
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings(value, loaded);
+    const rows = try store.listRestoreJobRows(std.testing.allocator, group_id);
+    defer store.freeRestoreJobRows(std.testing.allocator, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings(logical_key, rows[0].key);
+
+    const remove = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_restore_job = .{ .key = logical_key },
+    });
+    defer std.testing.allocator.free(remove);
+    const remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = remove },
+    });
+    defer std.testing.allocator.free(remove_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 2,
+        .entries_bytes = remove_entries,
+    });
+    try std.testing.expect((try store.getRestoreJobValue(std.testing.allocator, group_id, logical_key)) == null);
 }
 
 pub const RaftApplyStoreConfig = struct {
@@ -265,6 +351,7 @@ pub const ProjectionSignalKind = enum {
     merge_transition,
     schema_progress,
     restore_progress,
+    restore_job,
     replication_source_status,
 };
 
@@ -956,6 +1043,57 @@ pub const RaftApplyStore = struct {
         return try readShuffleJoinLeaseRecord(encoded, &pos);
     }
 
+    pub const RestoreJobRow = struct {
+        key: []u8,
+        value: []u8,
+    };
+
+    pub fn listRestoreJobRows(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]RestoreJobRow {
+        var prefix_buf: [192]u8 = undefined;
+        const prefix = try restoreJobPrefixForGroup(&prefix_buf, group_id);
+        var rows = std.ArrayListUnmanaged(RestoreJobRow).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| alloc.free(key);
+        while (true) {
+            const page = try self.store.scanPrefixPage(alloc, prefix, after_key, 512);
+            defer docstore.DocStore.freeResults(alloc, page);
+            if (page.len == 0) break;
+            for (page) |row| try rows.append(alloc, .{
+                .key = try alloc.dupe(u8, row.key[prefix.len..]),
+                .value = try alloc.dupe(u8, row.value),
+            });
+            if (page.len < 512) break;
+            const next = try alloc.dupe(u8, page[page.len - 1].key);
+            if (after_key) |key| alloc.free(key);
+            after_key = next;
+        }
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        var key_buf: [256]u8 = undefined;
+        const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+        return self.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
+    pub fn freeRestoreJobRows(_: *RaftApplyStore, alloc: std.mem.Allocator, rows: []RestoreJobRow) void {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
         const batch = try self.ensureLoaded(group_id) orelse return error.MissingAppliedBatch;
@@ -1439,6 +1577,29 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
+            .upsert_restore_job => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                try txn.put(key, record.value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .restore_job,
+                    .metadata_group_id = group_id,
+                });
+            },
+            .remove_restore_job => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .restore_job,
+                    .metadata_group_id = group_id,
+                });
+            },
             .upsert_reallocation_request => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
@@ -1902,6 +2063,8 @@ const TransitionTag = enum(u8) {
     upsert_extension_dependency = 38,
     remove_extension_dependency = 39,
     apply_extension_lifecycle = 40,
+    upsert_restore_job = 41,
+    remove_restore_job = 42,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -2078,6 +2241,15 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle));
             try appendJsonRecord(alloc, &out, delta);
         },
+        .upsert_restore_job => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_restore_job));
+            try appendRequiredString(alloc, &out, record.key);
+            try appendRequiredString(alloc, &out, record.value);
+        },
+        .remove_restore_job => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job));
+            try appendRequiredString(alloc, &out, record.key);
+        },
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -2246,6 +2418,15 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .apply_extension_lifecycle => .{
             .apply_extension_lifecycle = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
+        },
+        .upsert_restore_job => .{
+            .upsert_restore_job = .{
+                .key = try readRequiredString(alloc, encoded, &pos),
+                .value = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
+        .remove_restore_job => .{
+            .remove_restore_job = .{ .key = try readRequiredString(alloc, encoded, &pos) },
         },
     };
 }
@@ -3905,6 +4086,18 @@ pub fn extensionDependencyPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
 
 pub fn shuffleJoinLeasePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_shuffle_join_lease:{d}:", .{group_id});
+}
+
+pub fn restoreJobPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_restore_job:{d}:", .{group_id});
+}
+
+fn restoreJobKeyForGroup(buf: []u8, group_id: u64, logical_key: []const u8) ![]const u8 {
+    try validateRestoreJobLogicalKey(logical_key);
+    const prefix = try restoreJobPrefixForGroup(buf, group_id);
+    if (prefix.len + logical_key.len > buf.len) return error.NoSpaceLeft;
+    @memcpy(buf[prefix.len .. prefix.len + logical_key.len], logical_key);
+    return buf[0 .. prefix.len + logical_key.len];
 }
 
 pub fn rangePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
@@ -5674,3 +5867,6 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
         try std.testing.expectEqual(@as(u64, 52), splits[0].destination_group_id);
     }
 }
+const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
+const max_restore_job_logical_key_bytes: usize = 128;
+const max_restore_job_value_bytes: usize = 64 * 1024;

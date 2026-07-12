@@ -717,6 +717,9 @@ const PromoteOptions = struct {
     backup_id: []const u8,
     location: []const u8,
     connection: []const u8,
+    idempotency_key: ?[]const u8 = null,
+    wait: bool = true,
+    wait_timeout_ms: u64 = 30 * 60 * 1000,
 
     fn deinit(self: *PromoteOptions, allocator: Allocator) void {
         allocator.free(self.backup_id);
@@ -725,7 +728,17 @@ const PromoteOptions = struct {
     }
 };
 
-const PromoteRestoreFn = *const fn (ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) anyerror!void;
+const PromoteRestoreFn = *const fn (ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) anyerror!i64;
+
+const PromoteSubmission = struct {
+    staged: lite_restore_staging.StagedRestore,
+    restore_job_id: i64,
+
+    fn deinit(self: *PromoteSubmission, allocator: Allocator) void {
+        self.staged.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
@@ -750,18 +763,20 @@ fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     defer client.deinit();
     try client.setBaseUrl(opts.target);
 
-    var staged = try promoteWithRestore(allocator, path, opts, &client, promoteRestoreWithClient);
-    defer staged.deinit(allocator);
+    var submission = try promoteWithRestore(allocator, path, opts, &client, promoteRestoreWithClient);
+    defer submission.deinit(allocator);
 
-    cli.writeStdout(io, "{\"promoted\":true,\"table\":");
-    try writeJsonString(allocator, io, opts.table);
-    cli.writeStdout(io, ",\"target\":");
-    try writeJsonString(allocator, io, opts.target);
-    cli.writeStdout(io, ",\"backup_id\":");
-    try writeJsonString(allocator, io, staged.backup_id);
-    cli.writeStdout(io, ",\"location\":");
-    try writeJsonString(allocator, io, staged.location);
-    cli.writeStdout(io, "}\n");
+    var response = if (opts.wait)
+        try cli.backup.waitForRestoreJob(&client, io, submission.restore_job_id, opts.wait_timeout_ms)
+    else blk: {
+        var job_id_buf: [32]u8 = undefined;
+        const job_id = try std.fmt.bufPrint(&job_id_buf, "{d}", .{submission.restore_job_id});
+        break :blk try client.getRestoreJob(job_id);
+    };
+    defer response.deinit();
+    const job = if (response.data) |*data| data.value else return error.InvalidRestoreResponse;
+    try cli.writeJson(allocator, io, job);
+    if (opts.wait) try cli.backup.restorePhaseResult(job.phase);
 }
 
 fn promoteWithRestore(
@@ -770,24 +785,25 @@ fn promoteWithRestore(
     opts: PromoteOptions,
     restore_ctx: *anyopaque,
     restore_fn: PromoteRestoreFn,
-) !lite_restore_staging.StagedRestore {
+) !PromoteSubmission {
     var staged = try lite_restore_staging.stageAfliteRestoreBackup(allocator, path, opts.table, opts.backup_id, opts.location);
     errdefer staged.deinit(allocator);
 
-    try restore_fn(restore_ctx, opts.table, .{
+    const restore_job_id = try restore_fn(restore_ctx, opts.table, .{
         .backup_id = staged.backup_id,
         .location = staged.location,
         .connection = opts.connection,
         .format = "portable",
-    });
+    }, opts.idempotency_key);
 
-    return staged;
+    return .{ .staged = staged, .restore_job_id = restore_job_id };
 }
 
-fn promoteRestoreWithClient(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
+fn promoteRestoreWithClient(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) !i64 {
     const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ctx));
-    var resp = try client.restoreTable(table, request);
+    var resp = try client.restoreTableWithOptions(table, request, .{ .idempotency_key = idempotency_key });
     defer resp.deinit();
+    return if (resp.data) |*data| data.value.job_id else error.InvalidRestoreResponse;
 }
 
 fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.process.Args.Iterator) !PromoteOptions {
@@ -796,6 +812,9 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
     var backup_id: ?[]const u8 = null;
     var location: ?[]const u8 = null;
     var connection: ?[]const u8 = null;
+    var idempotency_key: ?[]const u8 = null;
+    var wait = true;
+    var wait_timeout_ms: u64 = 30 * 60 * 1000;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "--url")) {
             target = try nextRequiredArg(args);
@@ -807,6 +826,14 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
             location = try nextRequiredArg(args);
         } else if (std.mem.eql(u8, arg, "--connection")) {
             connection = try nextRequiredArg(args);
+        } else if (std.mem.eql(u8, arg, "--idempotency-key")) {
+            idempotency_key = try nextRequiredArg(args);
+        } else if (std.mem.eql(u8, arg, "--no-wait")) {
+            wait = false;
+        } else if (std.mem.eql(u8, arg, "--wait-timeout")) {
+            const seconds = try std.fmt.parseUnsigned(u64, try nextRequiredArg(args), 10);
+            wait_timeout_ms = try std.math.mul(u64, seconds, 1000);
+            wait = true;
         } else {
             return error.UnknownArgument;
         }
@@ -815,18 +842,17 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
     const resolved_table = table orelse return error.MissingArgument;
     const resolved_backup_id = if (backup_id) |id| try allocator.dupe(u8, id) else try lite_restore_staging.defaultBackupIdAlloc(allocator, path);
     errdefer allocator.free(resolved_backup_id);
-    const resolved_location = if (location) |value| try allocator.dupe(u8, value) else try defaultLitePromoteLocationAlloc(allocator);
+    const resolved_location = try allocator.dupe(u8, location orelse return error.MissingArgument);
     return .{
         .target = resolved_target,
         .table = resolved_table,
         .backup_id = resolved_backup_id,
         .location = resolved_location,
         .connection = connection orelse return error.MissingArgument,
+        .idempotency_key = idempotency_key,
+        .wait = wait,
+        .wait_timeout_ms = wait_timeout_ms,
     };
-}
-
-fn defaultLitePromoteLocationAlloc(allocator: Allocator) ![]u8 {
-    return try lite_paths.defaultBackupsLocationAlloc(allocator);
 }
 
 fn nextRequiredArg(args: *std.process.Args.Iterator) ![]const u8 {
@@ -1381,7 +1407,7 @@ fn printUsage(argv0: []const u8) void {
         \\  restore <backup.afb> --out <db.aflite> [--replace]
         \\  restore <source.aflite> --out <db.aflite> [--replace] (stable snapshot copy)
         \\  import <db.aflite> --from <backup.afb|source.aflite> [--replace]
-        \\  promote <db.aflite> --target <url> --table <name> --connection <name> [--backup-id <id>] [--location <uri>]
+        \\  promote <db.aflite> --target <url> --table <name> --connection <reader> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--no-wait] [--wait-timeout <seconds>]
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
@@ -1483,13 +1509,20 @@ test "lite promote parser requires values and derives default backup id" {
     }
 
     {
-        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--backup-id", "explicit-id" };
+        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--backup-id", "explicit-id", "--location", "s3://promotions/app", "--idempotency-key", "promote-app", "--no-wait" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("explicit-id", opts.backup_id);
-        try std.testing.expect(std.mem.startsWith(u8, opts.location, "file://"));
-        try std.testing.expect(std.mem.endsWith(u8, opts.location, "/.antfly/lite/backups"));
+        try std.testing.expectEqualStrings("s3://promotions/app", opts.location);
+        try std.testing.expectEqualStrings("promote-app", opts.idempotency_key.?);
+        try std.testing.expect(!opts.wait);
+    }
+
+    {
+        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try std.testing.expectError(error.MissingArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 
     {
@@ -2855,7 +2888,7 @@ test "lite promote helper stages backup then submits normal restore request" {
         format: []const u8 = "",
         connection: []const u8 = "",
 
-        fn restore(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
+        fn restore(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest, _: ?[]const u8) !i64 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.called = true;
             self.table = table;
@@ -2863,14 +2896,17 @@ test "lite promote helper stages backup then submits normal restore request" {
             self.location = request.location;
             self.format = request.format orelse "";
             self.connection = request.connection;
+            return 42;
         }
     };
 
     var capture = Capture{};
-    var staged = try promoteWithRestore(allocator, src_path, opts, &capture, Capture.restore);
-    defer staged.deinit(allocator);
+    var submission = try promoteWithRestore(allocator, src_path, opts, &capture, Capture.restore);
+    defer submission.deinit(allocator);
+    const staged = submission.staged;
 
     try std.testing.expect(capture.called);
+    try std.testing.expectEqual(@as(i64, 42), submission.restore_job_id);
     try std.testing.expectEqualStrings("docs", capture.table);
     try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
     try std.testing.expectEqualStrings(staged.location, capture.location);
