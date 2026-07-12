@@ -1686,15 +1686,24 @@ pub const PersistentIndex = struct {
 
     /// Tombstone a document by external ID and persist the segment deletion bitmap.
     pub fn deleteById(self: *PersistentIndex, doc_id: []const u8) !bool {
-        const delete_info = (try self.writer.deleteByIdTracked(self.alloc, doc_id)) orelse return false;
-        defer self.alloc.free(delete_info.bitmap_bytes);
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        const delete_infos = try self.writer.deleteAllByIdTracked(self.alloc, doc_id);
+        defer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+        if (delete_infos.len == 0) return false;
+        var persisted = false;
+        defer if (!persisted) self.writer.rollbackDeleteInfos(delete_infos);
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
 
-        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, delete_info.seg_id));
-        try txn.put(.deletions, &seg_key, delete_info.bitmap_bytes);
+        for (delete_infos) |delete_info| {
+            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, delete_info.seg_id));
+            try txn.put(.deletions, &seg_key, delete_info.bitmap_bytes);
+        }
         try txn.commit();
+        persisted = true;
         return true;
     }
 
@@ -2911,6 +2920,44 @@ test "persistent index classifies active segments for split" {
     try std.testing.expectEqual(SegmentSplitClass.left_only, plan[0].class);
     try std.testing.expectEqual(SegmentSplitClass.right_only, plan[1].class);
     try std.testing.expectEqual(SegmentSplitClass.mixed, plan[2].class);
+}
+
+test "persistent index preserves deletion of repeated document versions across reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var index = try PersistentIndex.open(alloc, .{ .path = path });
+        defer index.close();
+
+        const first = try buildSimpleSegment(alloc, "doc:a", "gamma");
+        defer alloc.free(first);
+        try index.indexSegment(first);
+        try std.testing.expect(try index.deleteById("doc:a"));
+
+        const second = try buildSimpleSegment(alloc, "doc:a", "delta");
+        defer alloc.free(second);
+        try index.indexSegment(second);
+        try std.testing.expect(try index.deleteById("doc:a"));
+
+        const final = try buildSimpleSegment(alloc, "doc:a", "epsilon");
+        defer alloc.free(final);
+        try index.indexSegment(final);
+    }
+
+    var reopened = try PersistentIndex.open(alloc, .{ .path = path });
+    defer reopened.close();
+    const stale = try reopened.snapshot().search(alloc, "body", &.{"gamma"}, 10);
+    defer alloc.free(stale.hits);
+    try std.testing.expectEqual(@as(u32, 0), stale.total_count);
+    const superseded = try reopened.snapshot().search(alloc, "body", &.{"delta"}, 10);
+    defer alloc.free(superseded.hits);
+    try std.testing.expectEqual(@as(u32, 0), superseded.total_count);
+    const current = try reopened.snapshot().search(alloc, "body", &.{"epsilon"}, 10);
+    defer alloc.free(current.hits);
+    try std.testing.expectEqual(@as(u32, 1), current.total_count);
 }
 
 test "persistent index hands off right-only segments to child index" {

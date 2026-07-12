@@ -618,6 +618,22 @@ pub const RoaringBitmap = struct {
         }
     }
 
+    /// Remove without changing the container representation. This is used by
+    /// rollback paths that must not allocate while undoing a failed mutation.
+    pub fn removeRetainingStorage(self: *RoaringBitmap, val: u32) void {
+        self.invalidateRankCache();
+        const key: u16 = @intCast(val >> 16);
+        const low: u16 = @truncate(val);
+        const idx = self.findChunk(key) orelse return;
+        switch (self.containers.items[idx]) {
+            .array => |*values| {
+                const pos = arraySearchPos(values.items, low);
+                if (pos < values.items.len and values.items[pos] == low) _ = values.orderedRemove(pos);
+            },
+            .bitmap => |bitmap| bitmapUnset(bitmap, low),
+        }
+    }
+
     pub fn contains(self: *const RoaringBitmap, val: u32) bool {
         const key: u16 = @intCast(val >> 16);
         const low: u16 = @truncate(val);

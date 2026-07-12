@@ -245,6 +245,7 @@ const LocalSwarmMetadata = struct {
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .create_table = createTable,
+                .replace_table_definition = replaceTableDefinition,
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
@@ -396,6 +397,28 @@ const LocalSwarmMetadata = struct {
         for (ranges) |range| try self.manager.upsertRange(range);
         self.epoch +|= 1;
         try self.persistLocked();
+    }
+
+    fn replaceTableDefinition(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current = self.findTableByNameLocked(replacement.name) orelse return error.TableNotFound;
+        if (!antfly.metadata.table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        const previous = try antfly.metadata.table_manager.cloneTable(self.alloc, current.*);
+        defer antfly.metadata.table_manager.freeTable(self.alloc, previous);
+        const previous_epoch = self.epoch;
+
+        try self.manager.upsertTable(replacement);
+        self.epoch +|= 1;
+        self.persistLocked() catch |err| {
+            self.manager.upsertTable(previous) catch |rollback_err| {
+                std.log.err("local metadata table definition rollback failed table={s} err={s}", .{ replacement.name, @errorName(rollback_err) });
+            };
+            self.epoch = previous_epoch;
+            return err;
+        };
     }
 
     fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {

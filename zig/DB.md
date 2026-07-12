@@ -69,11 +69,23 @@ acquires and releases the table-level restore reservation itself, so direct
 callers cannot omit write fencing. Cluster restore, which must hold that
 reservation across metadata replacement and remote snapshot staging, uses the
 explicit `restoreTableReserved()` operation while retaining the same reservation.
-For overwrite mode, cluster restore first performs the old table's exclusive
-drop transition and acquires the restore reservation only after the table is
-absent. The drop drains admission while it runs, and the absent table cannot
-accept traffic before restore recreates it, so this ordering preserves the
-write fence without making drop wait on its own restore-preparation reservation.
+For overwrite mode, cluster restore preserves the existing table ID, ranges,
+and target shard IDs. It stages source shard data into each target shard's
+sibling generation and repairs it using the backup's schema and index catalog.
+Only after that candidate is sealed does the exclusive transition atomically
+upsert the table definition and exchange the storage generation. A metadata
+publication is rolled back if storage publication fails before the namespace
+exchange; after exchange, durability uncertainty is a committed result and
+must not roll metadata back. Failed download, import, validation, or repair
+therefore leaves both the live definition and generation untouched.
+Definition publication and rollback are full-definition compare-and-swap
+mutations. A concurrent schema, index, placement, or restore-intent update
+therefore makes the transition fail closed instead of being overwritten by a
+stale publish or rollback.
+Queued structural reconciliation closes new write admission before draining
+current writers. This prevents continuous traffic from starving index/catalog
+convergence, while reads remain admitted against the currently published
+generation until the short publication transition begins.
 This includes the embedded
 `BoundTableWriteSource`: it closes its current owner, restores into a sibling
 generation, publishes atomically, and reopens either the unchanged live
@@ -213,6 +225,17 @@ forwarding API source must not create a second activity or cache domain over the
 same table-group path. Its read-preparation and primary-lookup interfaces must
 delegate to the canonical local write owner even when those interfaces were
 captured before owner attachment.
+
+Split and merge control paths follow the same rule. Transition coordinators
+borrow the raft host's apply store and retain the managed destination or
+receiver DB lease for their full lifetime; observation never reopens either
+path. Pending destinations are leased by globally unique group ID so metadata
+publication and visible-root generation changes cannot hide an already-open
+writer behind a stale table label. A process-local transition admission lock
+serializes fallback coordinators while a destination is not yet published.
+Destination identity comes from its projected range when available, with the
+source range used only for pre-publication bootstrap; identity reassignment is
+never performed against a live managed DB.
 
 Allocator ownership is part of the same lifetime contract. APIs that return
 owned storage/index buffers accept the allocator that must later free them, or

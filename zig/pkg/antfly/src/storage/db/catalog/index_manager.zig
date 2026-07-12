@@ -3020,7 +3020,7 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
-        var stored_cfg = try indexConfigWithFreshCoverageGeneration(self.alloc, cfg);
+        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
         defer stored_cfg.deinit(self.alloc);
 
         const enrichment_checkpoint = self.enrichments.items.len;
@@ -13132,15 +13132,6 @@ fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !
     return stored_cfg;
 }
 
-fn indexConfigWithFreshCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
-    var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
-    errdefer stored_cfg.deinit(alloc);
-    stored_cfg.coverage_generation = try newCoverageGeneration();
-    stored_cfg.coverage_config_fingerprint = null;
-    try populateCoverageConfigFingerprint(alloc, &stored_cfg);
-    return stored_cfg;
-}
-
 fn populateCoverageConfigFingerprint(alloc: Allocator, cfg: *types.IndexConfig) !void {
     if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) {
         cfg.coverage_config_fingerprint = null;
@@ -13339,7 +13330,7 @@ test "index catalog preserves coverage generation and migrates legacy generation
     try std.testing.expect(legacy_decoded[0].coverage_config_fingerprint != null);
 }
 
-test "index create ignores caller supplied coverage generation" {
+test "index create preserves authoritative coverage generation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -13357,18 +13348,17 @@ test "index create ignores caller supplied coverage generation" {
 
     const caller_generation: u64 = 0x1234_5678_9abc_def0;
     try manager.add(&store, .{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\"}",
         .coverage_generation = caller_generation,
     });
 
     const configs = try manager.listIndexesPublic(alloc);
     defer types.freeIndexConfigs(alloc, configs);
     try std.testing.expectEqual(@as(usize, 1), configs.len);
-    const stored_generation = configs[0].coverage_generation;
-    try std.testing.expect(stored_generation != 0);
-    try std.testing.expect(stored_generation != caller_generation);
+    try std.testing.expectEqual(caller_generation, configs[0].coverage_generation);
+    try std.testing.expect(configs[0].coverage_config_fingerprint != null);
 }
 
 test "vector coverage and derived replay share one index apply lock" {

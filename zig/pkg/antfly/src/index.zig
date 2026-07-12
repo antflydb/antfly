@@ -1132,51 +1132,103 @@ pub const IndexWriter = struct {
     /// Delete a document by its external ID.
     /// Returns true if the document was found and deleted, false if not found.
     pub fn deleteById(self: *IndexWriter, doc_id: []const u8) !bool {
-        const delete_info = (try self.deleteByIdTracked(self.alloc, doc_id)) orelse return false;
-        self.alloc.free(delete_info.bitmap_bytes);
-        return true;
+        const delete_infos = try self.deleteAllByIdTracked(self.alloc, doc_id);
+        defer freeDeleteInfos(self.alloc, delete_infos);
+        return delete_infos.len != 0;
     }
 
     pub const DeleteInfo = struct {
         seg_id: u64,
         bitmap_bytes: []u8,
+        local_ids: []u32,
+        applied_count: usize,
+        created_bitmap: bool,
     };
 
-    /// Delete a document and return the updated deletion bitmap for persistence.
-    /// Caller owns `bitmap_bytes`.
-    pub fn deleteByIdTracked(self: *IndexWriter, alloc: Allocator, doc_id: []const u8) !?DeleteInfo {
+    pub fn freeDeleteInfos(alloc: Allocator, delete_infos: []DeleteInfo) void {
+        for (delete_infos) |delete_info| {
+            if (delete_info.bitmap_bytes.len > 0) alloc.free(delete_info.bitmap_bytes);
+            alloc.free(delete_info.local_ids);
+        }
+        alloc.free(delete_infos);
+    }
+
+    pub fn rollbackDeleteInfos(self: *IndexWriter, delete_infos: []const DeleteInfo) void {
+        self.lockMutex();
+        defer self.mu.unlock();
+        self.rollbackDeleteInfosLocked(delete_infos);
+    }
+
+    fn rollbackDeleteInfosLocked(self: *IndexWriter, delete_infos: []const DeleteInfo) void {
+        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        for (delete_infos) |delete_info| {
+            for (snap.segments) |*seg| {
+                if (seg.id != delete_info.seg_id) continue;
+                if (seg.shared.deleted) |*deleted| {
+                    for (delete_info.local_ids[0..delete_info.applied_count]) |local_id| deleted.removeRetainingStorage(local_id);
+                    if (delete_info.created_bitmap and deleted.cardinality() == 0) {
+                        deleted.deinit();
+                        seg.shared.deleted = null;
+                    }
+                }
+                snap.global_doc_count +|= @intCast(delete_info.applied_count);
+                break;
+            }
+        }
+    }
+
+    /// Delete every live copy of a document and return one updated deletion
+    /// bitmap per affected segment for atomic persistence by the caller.
+    pub fn deleteAllByIdTracked(self: *IndexWriter, alloc: Allocator, doc_id: []const u8) ![]DeleteInfo {
         self.lockMutex();
         defer self.mu.unlock();
 
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        var delete_infos = std.ArrayListUnmanaged(DeleteInfo).empty;
+        errdefer {
+            self.rollbackDeleteInfosLocked(delete_infos.items);
+            for (delete_infos.items) |delete_info| {
+                if (delete_info.bitmap_bytes.len > 0) alloc.free(delete_info.bitmap_bytes);
+                alloc.free(delete_info.local_ids);
+            }
+            delete_infos.deinit(alloc);
+        }
 
-        // Find which segment contains this doc ID
         for (snap.segments) |*seg| {
+            var local_ids = std.ArrayListUnmanaged(u32).empty;
+            defer local_ids.deinit(alloc);
             for (0..seg.reader.doc_count) |local_id| {
                 const stored = seg.reader.storedDoc(@intCast(local_id)) orelse continue;
                 if (std.mem.eql(u8, stored.id, doc_id)) {
-                    // Already deleted?
                     if (seg.shared.deleted) |d| {
-                        if (d.contains(@intCast(local_id))) return null;
+                        if (d.contains(@intCast(local_id))) continue;
                     }
-
-                    // Set deletion bit
-                    if (seg.shared.deleted == null) {
-                        seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
-                    }
-                    try seg.shared.deleted.?.add(@intCast(local_id));
-
-                    // Update global doc count in snapshot
-                    snap.global_doc_count -|= 1;
-
-                    return .{
-                        .seg_id = seg.id,
-                        .bitmap_bytes = try seg.shared.deleted.?.toBytes(alloc),
-                    };
+                    try local_ids.append(alloc, @intCast(local_id));
                 }
             }
+            if (local_ids.items.len == 0) continue;
+
+            const owned_local_ids = try local_ids.toOwnedSlice(alloc);
+            var local_ids_transferred = false;
+            errdefer if (!local_ids_transferred) alloc.free(owned_local_ids);
+            const created_bitmap = seg.shared.deleted == null;
+            try delete_infos.append(alloc, .{
+                .seg_id = seg.id,
+                .bitmap_bytes = &.{},
+                .local_ids = owned_local_ids,
+                .applied_count = 0,
+                .created_bitmap = created_bitmap,
+            });
+            local_ids_transferred = true;
+            if (created_bitmap) seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
+            for (owned_local_ids) |local_id| {
+                try seg.shared.deleted.?.add(local_id);
+                delete_infos.items[delete_infos.items.len - 1].applied_count += 1;
+                snap.global_doc_count -|= 1;
+            }
+            delete_infos.items[delete_infos.items.len - 1].bitmap_bytes = try seg.shared.deleted.?.toBytes(alloc);
         }
-        return null;
+        return try delete_infos.toOwnedSlice(alloc);
     }
 
     /// Update a document by its external ID: deletes the old version and indexes the new one.
@@ -1450,6 +1502,67 @@ test "deleteById across multiple segments" {
         defer alloc.free(results.hits);
         try std.testing.expectEqual(@as(usize, 1), results.hits.len);
     }
+}
+
+test "deleteById removes every live duplicate across historical segments" {
+    const alloc = std.testing.allocator;
+
+    const old_seg = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:a", .terms = &.{.{ .term = "old", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(old_seg);
+    const current_seg = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:a", .terms = &.{.{ .term = "current", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(current_seg);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(old_seg);
+    try std.testing.expect(try writer.deleteById("doc:a"));
+    try writer.addSegment(current_seg);
+
+    try std.testing.expect(try writer.deleteById("doc:a"));
+    try std.testing.expectEqual(@as(u32, 0), writer.snapshot().global_doc_count);
+    try std.testing.expect(!try writer.deleteById("doc:a"));
+
+    const old_results = try writer.snapshot().search(alloc, "body", &.{"old"}, 10);
+    defer alloc.free(old_results.hits);
+    try std.testing.expectEqual(@as(usize, 0), old_results.hits.len);
+    const current_results = try writer.snapshot().search(alloc, "body", &.{"current"}, 10);
+    defer alloc.free(current_results.hits);
+    try std.testing.expectEqual(@as(usize, 0), current_results.hits.len);
+}
+
+test "tracked multi-segment deletion can roll back before persistence" {
+    const alloc = std.testing.allocator;
+    const old_seg = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:a", .terms = &.{.{ .term = "old", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(old_seg);
+    const current_seg = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "doc:a", .terms = &.{.{ .term = "current", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(current_seg);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(old_seg);
+    try writer.addSegment(current_seg);
+
+    const delete_infos = try writer.deleteAllByIdTracked(alloc, "doc:a");
+    defer IndexWriter.freeDeleteInfos(alloc, delete_infos);
+    try std.testing.expectEqual(@as(usize, 2), delete_infos.len);
+    try std.testing.expectEqual(@as(u32, 0), writer.snapshot().global_doc_count);
+
+    writer.rollbackDeleteInfos(delete_infos);
+    try std.testing.expectEqual(@as(u32, 2), writer.snapshot().global_doc_count);
+    const old_results = try writer.snapshot().search(alloc, "body", &.{"old"}, 10);
+    defer alloc.free(old_results.hits);
+    try std.testing.expectEqual(@as(usize, 1), old_results.hits.len);
+    const current_results = try writer.snapshot().search(alloc, "body", &.{"current"}, 10);
+    defer alloc.free(current_results.hits);
+    try std.testing.expectEqual(@as(usize, 1), current_results.hits.len);
 }
 
 test "index writer removeSegments frees staged segment list when retired allocation fails" {

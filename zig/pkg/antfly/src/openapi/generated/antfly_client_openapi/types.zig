@@ -1446,7 +1446,7 @@ pub const ClusterRestoreRequest = struct {
     location: []const u8,
     /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
     table_names: ?[]const []const u8 = null,
-    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
     restore_mode: ?[]const u8 = null,
 };
 
@@ -6885,12 +6885,14 @@ pub const ResourceType = enum {
     }
 };
 
-pub const RestoreCommittedDurableResponse = struct {
+/// An accepted restore. `triggered` means asynchronous restoration has started. `committed` means the new generation is published but its durability barrier has not yet been confirmed.
+pub const RestoreAcceptedResponse = struct {
     restore: []const u8,
-    durability: []const u8,
+    /// Present only when `restore` is `committed`.
+    durability: ?[]const u8 = null,
 };
 
-pub const RestoreCommittedPendingResponse = struct {
+pub const RestoreCommittedDurableResponse = struct {
     restore: []const u8,
     durability: []const u8,
 };
@@ -6902,10 +6904,6 @@ pub const RestoreRequest = struct {
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
-};
-
-pub const RestoreTriggeredResponse = struct {
-    restore: []const u8,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.

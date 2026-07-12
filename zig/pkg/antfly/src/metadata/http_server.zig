@@ -81,6 +81,11 @@ const RestoreExtensionsRequest = struct {
     extension_dependencies: []const extension_domain.ExtensionDependency = &.{},
 };
 
+pub const ReplaceTableDefinitionRequest = struct {
+    expected: metadata_table_manager.TableRecord,
+    definition: metadata_table_manager.TableRecord,
+};
+
 pub const ReseedExactCutoverResult = struct {
     slot_name: []u8,
     publication_name: []u8,
@@ -102,6 +107,7 @@ pub const AdminSource = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
+        replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
@@ -154,6 +160,11 @@ pub const AdminSource = struct {
     pub fn createTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const fn_ptr = self.vtable.create_table orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn replaceTableDefinition(self: AdminSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+        const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, expected, replacement);
     }
 
     pub fn restoreTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
@@ -301,6 +312,7 @@ pub const AdminSource = struct {
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .create_table = metadataServiceCreateTable,
+                .replace_table_definition = metadataServiceReplaceTableDefinition,
                 .restore_table = metadataServiceRestoreTable,
                 .drop_table = metadataServiceDropTable,
                 .update_schema = metadataServiceUpdateSchema,
@@ -340,6 +352,7 @@ pub const AdminSource = struct {
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .create_table = metadataHttpServiceCreateTable,
+                .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
                 .restore_table = metadataHttpServiceRestoreTable,
                 .drop_table = metadataHttpServiceDropTable,
                 .update_schema = metadataHttpServiceUpdateSchema,
@@ -398,6 +411,19 @@ pub const AdminSource = struct {
         _ = svc;
     }
 
+    fn replaceTableDefinitionOnService(
+        svc: anytype,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
+        if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
+        try svc.upsertTable(replacement);
+    }
+
     fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -409,6 +435,12 @@ pub const AdminSource = struct {
             alloc.free(ranges);
         }
         _ = try workflow.createTableWithRanges(svc, table, ranges);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceReplaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try replaceTableDefinitionOnService(svc, expected, replacement);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -706,6 +738,12 @@ pub const AdminSource = struct {
         std.log.info("metadata create table reconciled table={s}", .{table_name});
         try flushMetadataHttpServiceMutation(svc);
         std.log.info("metadata create table round complete table={s}", .{table_name});
+    }
+
+    fn metadataHttpServiceReplaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try replaceTableDefinitionOnService(svc, expected, replacement);
+        try flushMetadataHttpServiceMutation(svc);
     }
 
     fn metadataHttpServiceRestoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
@@ -1280,6 +1318,25 @@ pub const MetadataHttpServer = struct {
                     self.requestNodeShutdown(alloc, node_id) catch |err| switch (err) {
                         error.NodeNotFound => return try textResponse(alloc, 404, "node not found"),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        else => return err,
+                    };
+                    return try textResponse(alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalTableDefinition(req.uri)) |table| {
+                    var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, alloc, req.body, .{ .allocate = .alloc_always }) catch {
+                        return try textResponse(alloc, 400, "invalid table definition replacement");
+                    };
+                    defer parsed.deinit();
+                    if (!std.mem.eql(u8, parsed.value.definition.name, table.table_name)) {
+                        return try textResponse(alloc, 400, "table definition name mismatch");
+                    }
+                    if (!std.mem.eql(u8, parsed.value.expected.name, table.table_name)) {
+                        return try textResponse(alloc, 400, "expected table definition name mismatch");
+                    }
+                    self.source.replaceTableDefinition(parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
+                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
+                        error.ExtensionOwnedObject, error.UnsupportedOperation => return try textResponse(alloc, 405, "method not allowed"),
                         else => return err,
                     };
                     return try textResponse(alloc, 202, "accepted");
@@ -3015,6 +3072,64 @@ test "metadata http server maps extension-owned object mutations to method not a
     var drop_table_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/tables/memories" });
     defer drop_table_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), drop_table_resp.status);
+}
+
+test "metadata http server replaces a table definition through compare-and-swap" {
+    const FakeSource = struct {
+        replaced: bool = false,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .replace_table_definition = replaceTableDefinition,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (expected.table_id != 42 or !std.mem.eql(u8, expected.description, "original")) return error.TableGenerationChanged;
+            try std.testing.expectEqual(@as(u64, 42), replacement.table_id);
+            try std.testing.expectEqualStrings("docs", replacement.name);
+            try std.testing.expectEqualStrings("restored", replacement.description);
+            self.replaced = true;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var response = try server.handle(.{
+        .method = .PUT,
+        .uri = "/internal/v1/tables/docs/definition",
+        .body =
+        \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
+        ,
+    });
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 202), response.status);
+    try std.testing.expect(source.replaced);
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {

@@ -4618,15 +4618,19 @@ export interface components {
             format?: "native" | "portable";
         };
         RestoreRequest: components["schemas"]["BackupRequest"];
-        RestoreTriggeredResponse: {
+        /**
+         * @description An accepted restore. `triggered` means asynchronous restoration has
+         *     started. `committed` means the new generation is published but its
+         *     durability barrier has not yet been confirmed.
+         */
+        RestoreAcceptedResponse: {
             /** @enum {string} */
-            restore: "triggered";
-        };
-        RestoreCommittedPendingResponse: {
-            /** @enum {string} */
-            restore: "committed";
-            /** @enum {string} */
-            durability: "pending";
+            restore: "triggered" | "committed";
+            /**
+             * @description Present only when `restore` is `committed`.
+             * @enum {string}
+             */
+            durability?: "pending";
         };
         RestoreCommittedDurableResponse: {
             /** @enum {string} */
@@ -4723,7 +4727,7 @@ export interface components {
              * @description How to handle existing tables:
              *     - `fail_if_exists`: Abort if any table already exists (default)
              *     - `skip_if_exists`: Skip existing tables, restore others
-             *     - `overwrite`: Drop and recreate existing tables
+             *     - `overwrite`: Atomically replace existing table generations after staging and validation
              * @default fail_if_exists
              * @example skip_if_exists
              * @enum {string}
@@ -4735,10 +4739,10 @@ export interface components {
             tables: components["schemas"]["TableRestoreStatus"][];
             /**
              * @description Overall restore status
-             * @example triggered
+             * @example completed
              * @enum {string}
              */
-            status: "triggered" | "partial" | "failed";
+            status: "completed" | "triggered" | "durability_pending" | "partial" | "failed";
         };
         TableRestoreStatus: {
             /**
@@ -13455,7 +13459,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RestoreTriggeredResponse"] | components["schemas"]["RestoreCommittedPendingResponse"];
+                    "application/json": components["schemas"]["RestoreAcceptedResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];

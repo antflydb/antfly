@@ -526,7 +526,7 @@ def test_table_backup_restore_round_trip(backup_api):
         _wait_until_absent(backup_api, table_name, "doc:db", timeout_s=10.0, interval_s=0.5)
 
         restore = backup_api.restore_table(table_name, backup_id=backup_id, location=location)
-        assert restore["restore"] == "triggered"
+        assert restore == {"restore": "committed", "durability": "durable"}
 
         restored_doc = wait_until(
             lambda: _lookup_doc(backup_api, table_name, "doc:db"),
@@ -626,7 +626,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         _wait_until_absent(backup_api, table_name, "doc:a", timeout_s=10.0, interval_s=0.5)
 
         restore = backup_api.restore_table(table_name, backup_id=backup_id, location=location)
-        assert restore["restore"] == "triggered"
+        assert restore == {"restore": "committed", "durability": "durable"}
 
         restored_doc = wait_until(
             lambda: _lookup_doc(backup_api, table_name, "doc:a"),
@@ -740,8 +740,8 @@ def test_cluster_backup_restore_round_trip(backup_api):
             location=location,
             restore_mode="fail_if_exists",
         )
-        assert restore["status"] == "triggered"
-        assert {table["status"] for table in restore["tables"]} == {"triggered"}
+        assert restore["status"] == "completed"
+        assert {table["status"] for table in restore["tables"]} == {"committed"}
 
         for table_name, expected_title in (
             (table_a, "Cluster Backup Alpha"),
@@ -878,8 +878,8 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
         location=location,
         restore_mode="fail_if_exists",
     )
-    assert restore["status"] == "triggered"
-    assert {table["status"] for table in restore["tables"]} == {"triggered"}
+    assert restore["status"] == "completed"
+    assert {table["status"] for table in restore["tables"]} == {"committed"}
 
     for table_name, expected_title in (
         (table_a, f"{backend.upper()} Backup Alpha"),
@@ -950,7 +950,7 @@ def test_cluster_restore_modes(backup_api):
             location=location,
             restore_mode="skip_if_exists",
         )
-        assert skip_restore["status"] == "triggered"
+        assert skip_restore["status"] == "completed"
         assert {table["status"] for table in skip_restore["tables"]} == {"skipped"}
 
         skipped_a = _lookup_doc(backup_api, table_a, "doc:1")
@@ -963,8 +963,8 @@ def test_cluster_restore_modes(backup_api):
             location=location,
             restore_mode="overwrite",
         )
-        assert overwrite_restore["status"] == "triggered"
-        assert {table["status"] for table in overwrite_restore["tables"]} == {"triggered"}
+        assert overwrite_restore["status"] == "completed", overwrite_restore
+        assert {table["status"] for table in overwrite_restore["tables"]} == {"committed"}, overwrite_restore
 
         restored_docs = wait_until(
             lambda: _lookup_docs(backup_api, (table_a, table_b), "doc:1"),
@@ -1019,7 +1019,7 @@ def test_cluster_backup_restore_partial_statuses(backup_api):
         )
         assert restore["status"] == "partial"
         restore_by_name = {table["name"]: table for table in restore["tables"]}
-        assert restore_by_name[table_name]["status"] == "triggered"
+        assert restore_by_name[table_name]["status"] == "committed"
         assert restore_by_name["missing"]["status"] == "failed"
         assert "backup does not include table" in restore_by_name["missing"]["error"]
 

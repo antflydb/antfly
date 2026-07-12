@@ -8534,6 +8534,17 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
             std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
+            // Re-evaluate after every replay/rebuild phase. Those phases can
+            // advance the durable replay target without rebuilding vectors,
+            // leaving a completed artifact projection with an older applied
+            // watermark or a rebuilding checkpoint. A restore must not publish
+            // its completion marker until both forms of debt converge.
+            _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            if (try self.hasPendingDenseArtifactRebuild(alloc) or
+                try self.denseArtifactWatermarkRepairNeeded(alloc))
+            {
+                return error.RestoreRuntimeRepairIncomplete;
+            }
             try self.saveAllLiveIndexStatusSnapshots(alloc);
             try self.core.index_manager.syncAll(true);
             try self.core.syncStore(true);
@@ -11405,9 +11416,10 @@ pub const DB = struct {
 
             const artifact_target_count = target_counts.per_target_index.get(dense_index_idx) orelse 0;
             if (artifact_target_count == 0) continue;
-            if (entry.index.stats().active_count < artifact_target_count) continue;
+            if (entry.index.stats().active_count != artifact_target_count) continue;
 
             const applied_sequence = try self.core.loadAppliedSequence(alloc, entry.config.name);
+            const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
             const target_sequence = try self.probeDerivedReplayTargetSequence(
                 alloc,
                 self.core.replaySource(),
@@ -11417,10 +11429,24 @@ pub const DB = struct {
                 },
                 applied_sequence,
             );
-            if (applied_sequence >= target_sequence) continue;
+            const checkpoint_needs_finalization = checkpoint.status == .rebuilding or
+                checkpoint.applied_sequence < target_sequence;
+            if (applied_sequence >= target_sequence and !checkpoint_needs_finalization) continue;
 
             repaired += 1;
-            if (repair) try self.core.saveAppliedSequence(entry.config.name, target_sequence);
+            if (repair) {
+                if (applied_sequence < target_sequence) try self.core.saveAppliedSequence(entry.config.name, target_sequence);
+                const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
+                defer alloc.free(rebuild_root_path);
+                const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+                try rebuild_state.clear();
+                try self.core.saveProjectionCheckpoint(entry.config.name, .{
+                    .applied_sequence = target_sequence,
+                    .status = .clean,
+                    .generation = checkpoint.generation + @intFromBool(checkpoint.status == .rebuilding),
+                    .config_hash = types.indexConfigHash(entry.config),
+                });
+            }
         }
         return repaired;
     }
@@ -11847,6 +11873,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         force_generated_artifact_names: []const []const u8,
+        skip_terminally_covered: bool,
     ) !usize {
         if (self.enrichment_runtime == null) return 0;
 
@@ -11869,7 +11896,7 @@ pub const DB = struct {
             try appendGeneratedEnrichments(self, &pending_batch, .{
                 .writes = replay_batch.writes,
                 .sync_level = .write,
-            }, replay_batch.extracted, force_generated_artifact_names);
+            }, replay_batch.extracted, force_generated_artifact_names, skip_terminally_covered);
             if (pending_batch.generated_enrichment_refs.len != 0) {
                 generated_ref_count += pending_batch.generated_enrichment_refs.len;
                 const sequence = try appendDerivedBatchRecord(self, pending_batch);
@@ -11891,7 +11918,7 @@ pub const DB = struct {
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
-        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{});
+        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true);
     }
 
     pub fn reprocessGeneratedEnrichmentFromStoredDocs(
@@ -11901,9 +11928,9 @@ pub const DB = struct {
     ) !usize {
         if (artifact_name) |name| {
             const force_artifacts = [_][]const u8{name};
-            return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts);
+            return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts, false);
         }
-        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{});
+        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, false);
     }
 
     fn waitForSyncLevel(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -22738,6 +22765,7 @@ fn appendGeneratedEnrichments(
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
     force_generated_artifact_names: []const []const u8,
+    skip_terminally_covered: bool,
 ) !void {
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
     errdefer {
@@ -22782,11 +22810,39 @@ fn appendGeneratedEnrichments(
         defer enrichment_types.deinitGeneratedRequests(self.alloc, generated);
         for (generated) |request| {
             if (!generatedRequestMatchesForcedArtifact(force_generated_artifact_names, request)) continue;
+            if (skip_terminally_covered and try generatedRequestHasTerminalCoverage(self, request)) continue;
             try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request));
         }
     }
 
     batch.generated_enrichment_refs = try planned.toOwnedSlice(self.alloc);
+}
+
+fn generatedRequestHasTerminalCoverage(self: *DB, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    const index_names = switch (request.kind) {
+        .dense_embedding => try self.core.index_manager.denseIndexesForEmbedding(self.alloc, requestEmbeddingName(request), request.expected_dims),
+        .sparse_embedding => try self.core.index_manager.sparseIndexesForEmbedding(self.alloc, requestEmbeddingName(request)),
+        .chunk_text => try self.core.index_manager.vectorIndexesForChunk(self.alloc, requestArtifactName(request)),
+        .asset => try self.core.index_manager.vectorIndexesDependingOnArtifact(self.alloc, requestArtifactName(request)),
+    };
+    defer {
+        for (index_names) |index_name| self.alloc.free(index_name);
+        self.alloc.free(index_names);
+    }
+    if (index_names.len == 0) return false;
+
+    for (index_names) |index_name| {
+        const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return false;
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(self.alloc, index_name, generation, request.doc_key);
+        defer self.alloc.free(marker_key);
+        const outcome = self.core.store.get(self.alloc, marker_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer self.alloc.free(outcome);
+        if (std.meta.stringToEnum(DerivedCoverageOutcome, outcome) == null) return error.InvalidDerivedCoverageOutcome;
+    }
+    return true;
 }
 
 fn deleteEnrichmentArtifactsForBatch(self: *DB, req: types.BatchRequest, extracted: []const mapper.ExtractedWrite) ![][]u8 {
@@ -24240,6 +24296,7 @@ fn saveAppliedSequencesBatchContext(
             ctx.applied_sequence_checkpoint_path,
             enriched_updates,
         );
+        for (enriched_updates) |update| try finalizeCoveredDenseProjectionCheckpoint(async_ctx, update.index_name, update.sequence);
         try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
         return;
     }
@@ -29975,6 +30032,31 @@ fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequ
     return try flushPendingAppliedSequencesLocked(ctx, false);
 }
 
+fn finalizeCoveredDenseProjectionCheckpoint(ctx: *AsyncContext, index_name: []const u8, applied_sequence: u64) !void {
+    const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse return;
+    if (checkpoint.status != .rebuilding) return;
+    if (asyncContextHasActiveExternalDenseBulkWork(ctx) or ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return;
+
+    const expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return;
+    const entry = ctx.index_manager.denseIndex(index_name) orelse return;
+    if (entry.index.stats().active_count != expected_count) return;
+
+    const clean_checkpoint: apply_state.ProjectionCheckpoint = .{
+        .applied_sequence = applied_sequence,
+        .status = .clean,
+        .generation = checkpoint.generation +| 1,
+        .config_hash = checkpoint.config_hash,
+    };
+    try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
+    try apply_state.saveProjectionCheckpointWithSidecar(
+        ctx.alloc,
+        ctx.store,
+        ctx.applied_sequence_checkpoint_path,
+        index_name,
+        clean_checkpoint,
+    );
+}
+
 fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []const u8) !bool {
     const pending = ctx.applied_sequence_coalescer.takePending(index_name) orelse return false;
     defer ctx.alloc.free(pending.owned_name);
@@ -29994,6 +30076,7 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
+    try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
     try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
 
@@ -30039,6 +30122,7 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
         ctx.applied_sequence_checkpoint_path,
         enriched_updates,
     );
+    for (enriched_updates) |update| try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence);
     try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
@@ -53186,6 +53270,83 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
     try std.testing.expectEqual(@as(u64, 11), stats.indexes[0].projection_checkpoint_generation);
 }
 
+test "db dense artifact coverage finalizes a completed rebuilding checkpoint" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    try db.addIndex(dense_cfg);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":\"AACAPwAAAAAAAAAA\"}}" }},
+        .sync_level = .full_index,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try db.core.saveAppliedSequence("dense_idx", target_sequence -| 1);
+    try db.core.saveProjectionCheckpoint("dense_idx", .{
+        .applied_sequence = target_sequence -| 1,
+        .status = .rebuilding,
+        .generation = 7,
+        .config_hash = types.indexConfigHash(dense_cfg),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expectEqual(target_sequence, try db.core.loadAppliedSequence(alloc, "dense_idx"));
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(target_sequence, checkpoint.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 8), checkpoint.generation);
+    try std.testing.expectEqual(types.indexConfigHash(dense_cfg), checkpoint.config_hash);
+}
+
+test "db external dense ingest finalizes an exactly covered rebuilding checkpoint" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        .coverage_generation = 42,
+    };
+    try db.addIndex(dense_cfg);
+    try db.core.saveProjectionCheckpoint("dense_idx", .{
+        .status = .rebuilding,
+        .config_hash = types.indexConfigHash(dense_cfg),
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expect(checkpoint.applied_sequence > 0);
+    try std.testing.expectEqual(@as(u64, 1), checkpoint.generation);
+}
+
 test "db corrupt projection sidecar degrades non-dense checkpoint and can be replaced" {
     const alloc = std.testing.allocator;
 
@@ -63781,7 +63942,13 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         });
         defer restored.close();
 
+        var targets_before = try restored.collectDenseArtifactTargetCounts(alloc, null);
+        defer targets_before.deinit(alloc);
+        const target_count_before = targets_before.per_target_index.get(0) orelse return error.TestUnexpectedResult;
         try std.testing.expect(try restored.repairRestoreRuntimeStateIfNeeded(alloc));
+        var targets_after = try restored.collectDenseArtifactTargetCounts(alloc, null);
+        defer targets_after.deinit(alloc);
+        try std.testing.expectEqual(target_count_before, targets_after.per_target_index.get(0) orelse return error.TestUnexpectedResult);
 
         const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
         defer alloc.free(query_vec);

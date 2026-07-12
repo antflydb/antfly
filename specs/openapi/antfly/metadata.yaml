@@ -4510,25 +4510,22 @@ components:
     RestoreRequest:
       allOf: # Identical to BackupRequest
         - $ref: "#/components/schemas/BackupRequest"
-    RestoreTriggeredResponse:
+    RestoreAcceptedResponse:
       type: object
       additionalProperties: false
       required: [restore]
+      description: |
+        An accepted restore. `triggered` means asynchronous restoration has
+        started. `committed` means the new generation is published but its
+        durability barrier has not yet been confirmed.
       properties:
         restore:
           type: string
-          enum: [triggered]
-    RestoreCommittedPendingResponse:
-      type: object
-      additionalProperties: false
-      required: [restore, durability]
-      properties:
-        restore:
-          type: string
-          enum: [committed]
+          enum: [triggered, committed]
         durability:
           type: string
           enum: [pending]
+          description: Present only when `restore` is `committed`.
     RestoreCommittedDurableResponse:
       type: object
       additionalProperties: false
@@ -4649,7 +4646,7 @@ components:
             How to handle existing tables:
             - `fail_if_exists`: Abort if any table already exists (default)
             - `skip_if_exists`: Skip existing tables, restore others
-            - `overwrite`: Drop and recreate existing tables
+            - `overwrite`: Atomically replace existing table generations after staging and validation
           example: "skip_if_exists"
     ClusterRestoreResponse:
       type: object
@@ -4664,9 +4661,9 @@ components:
           description: Status of each table restore
         status:
           type: string
-          enum: [triggered, partial, failed]
+          enum: [completed, triggered, durability_pending, partial, failed]
           description: Overall restore status
-          example: "triggered"
+          example: "completed"
     TableRestoreStatus:
       type: object
       required:
@@ -8712,9 +8709,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: "#/components/schemas/RestoreTriggeredResponse"
-                  - $ref: "#/components/schemas/RestoreCommittedPendingResponse"
+                $ref: "#/components/schemas/RestoreAcceptedResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":

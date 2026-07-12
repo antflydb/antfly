@@ -1,7 +1,8 @@
 from enum import Enum
 
 
-class RestoreTriggeredResponseRestore(str, Enum):
+class RestoreAcceptedResponseRestore(str, Enum):
+    COMMITTED = "committed"
     TRIGGERED = "triggered"
 
     def __str__(self) -> str:

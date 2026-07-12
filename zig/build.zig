@@ -3304,6 +3304,7 @@ pub fn build(b: *std.Build) void {
         "db split destination read-only open does not create missing root",
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
+        "db split status borrows the live raft apply store without a second writer",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
@@ -3996,6 +3997,7 @@ pub fn build(b: *std.Build) void {
             "metadata state classifies mixed-version doc identity lifecycle reports",
             "metadata state marks doc identity rebuild required on range namespace mismatch",
             "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
+            "metadata http server replaces a table definition through compare-and-swap",
             "metadata http server serves status and filtered admin routes",
             "metadata http server maps source split merge doc identity conflicts",
             "metadata http client preserves split merge doc identity conflicts",
@@ -4368,6 +4370,8 @@ pub fn build(b: *std.Build) void {
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
+            "provisioned table write request queues structural reconcile ahead of later writes",
+            "provisioned structural reconcile blocks table write admission",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
         },
@@ -4463,6 +4467,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "public api swarm-like e2e backs up drops and restores a table",
+            "api restore rollback preserves a concurrently replaced table definition",
+            "api http server cluster overwrite stages before replacing metadata without dropping live table",
         },
     });
     const run_lib_api_swarm_backup_restore_tests = b.addRunArtifact(lib_api_swarm_backup_restore_tests);
@@ -5030,6 +5036,18 @@ pub fn build(b: *std.Build) void {
 
     const persistent_test_step = b.step("persistent-test", "Run storage/persistent unit tests");
     persistent_test_step.dependOn(&run_persistent_unit_tests.step);
+
+    const persistent_delete_regression_tests = b.addTest(.{
+        .root_module = persistent_test_mod,
+        .filters = &.{
+            "deleteById removes every live duplicate across historical segments",
+            "tracked multi-segment deletion can roll back before persistence",
+            "persistent index preserves deletion of repeated document versions across reopen",
+        },
+    });
+    const run_persistent_delete_regression_tests = b.addRunArtifact(persistent_delete_regression_tests);
+    const persistent_delete_regression_step = b.step("persistent-delete-regression-test", "Run atomic multi-segment deletion regressions");
+    persistent_delete_regression_step.dependOn(&run_persistent_delete_regression_tests.step);
 
     const persistent_sim_tests = b.addTest(.{
         .root_module = persistent_test_mod,

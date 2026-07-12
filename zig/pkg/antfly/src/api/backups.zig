@@ -97,6 +97,22 @@ pub const TableRestorePlan = struct {
     manifest: *const TableBackupManifest,
     source_location: ?[]const u8 = null,
     reconcile_only: bool = false,
+    replace_existing: bool = false,
+    publication_hook: ?RestorePublicationHook = null,
+};
+
+pub const RestorePublicationHook = struct {
+    ptr: *anyopaque,
+    publish_definition: *const fn (ptr: *anyopaque) anyerror!void,
+    rollback_definition: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn publish(self: @This()) !void {
+        try self.publish_definition(self.ptr);
+    }
+
+    pub fn rollback(self: @This()) !void {
+        try self.rollback_definition(self.ptr);
+    }
 };
 
 pub fn validateRestorableManifestLayout(manifest: *const TableBackupManifest) !void {
@@ -1687,17 +1703,51 @@ fn clusterBackupOverallStatus(statuses: []const ClusterTableBackupStatus) []cons
 
 fn clusterRestoreOverallStatus(statuses: []const ClusterTableRestoreStatus) []const u8 {
     var triggered: usize = 0;
+    var committed: usize = 0;
+    var durability_pending: usize = 0;
+    var skipped: usize = 0;
     var failed: usize = 0;
     for (statuses) |status| {
         if (std.mem.eql(u8, status.status, "triggered")) {
             triggered += 1;
+        } else if (std.mem.eql(u8, status.status, "committed")) {
+            committed += 1;
+        } else if (std.mem.eql(u8, status.status, "durability_pending")) {
+            durability_pending += 1;
+        } else if (std.mem.eql(u8, status.status, "skipped")) {
+            skipped += 1;
         } else if (std.mem.eql(u8, status.status, "failed")) {
             failed += 1;
         }
     }
-    if (triggered == 0 and failed > 0) return "failed";
+    const successful = triggered + committed + durability_pending + skipped;
+    if (successful == 0 and failed > 0) return "failed";
     if (failed > 0) return "partial";
-    return "triggered";
+    if (durability_pending > 0) return "durability_pending";
+    if (triggered > 0) return "triggered";
+    return "completed";
+}
+
+test "cluster restore overall status distinguishes accepted committed and partial outcomes" {
+    try std.testing.expectEqualStrings("completed", clusterRestoreOverallStatus(&.{
+        .{ .name = "a", .status = "committed" },
+        .{ .name = "b", .status = "skipped" },
+    }));
+    try std.testing.expectEqualStrings("triggered", clusterRestoreOverallStatus(&.{
+        .{ .name = "a", .status = "committed" },
+        .{ .name = "b", .status = "triggered" },
+    }));
+    try std.testing.expectEqualStrings("durability_pending", clusterRestoreOverallStatus(&.{
+        .{ .name = "a", .status = "committed" },
+        .{ .name = "b", .status = "durability_pending" },
+    }));
+    try std.testing.expectEqualStrings("partial", clusterRestoreOverallStatus(&.{
+        .{ .name = "a", .status = "committed" },
+        .{ .name = "b", .status = "failed" },
+    }));
+    try std.testing.expectEqualStrings("failed", clusterRestoreOverallStatus(&.{
+        .{ .name = "a", .status = "failed" },
+    }));
 }
 
 fn currentTimestampRfc3339(alloc: std.mem.Allocator) ![]u8 {

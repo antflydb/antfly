@@ -23,6 +23,10 @@ const shard_mod = @import("../../storage/shard.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const shard_state_store = @import("shard_state_store.zig");
 
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
 pub const AppliedDataBatch = struct {
     commit_index: u64,
     entry_count: usize,
@@ -58,6 +62,7 @@ pub const RaftApplyStore = struct {
     path: []u8,
     backend: lsm_backend.BackendHandle,
     store: docstore.DocStore,
+    batches_mutex: std.atomic.Mutex = .unlocked,
     batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
 
     const OwnedBatch = struct {
@@ -133,6 +138,8 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
+        lockAtomic(&self.batches_mutex);
+        defer self.batches_mutex.unlock();
         const batch = (try self.ensureLoaded(group_id)) orelse return null;
         return .{
             .commit_index = batch.commit_index,
@@ -215,6 +222,8 @@ pub const RaftApplyStore = struct {
     }
 
     fn writeBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
+        lockAtomic(&self.batches_mutex);
+        defer self.batches_mutex.unlock();
         const metadata = try describeEntries(self.alloc, entries_bytes);
         defer if (metadata.last_normal_data) |data| self.alloc.free(data);
         defer {

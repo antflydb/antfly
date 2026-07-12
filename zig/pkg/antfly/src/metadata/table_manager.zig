@@ -57,6 +57,21 @@ pub const TableRecord = struct {
 // remains as the current storage/runtime name during the migration.
 pub const TableDefinition = TableRecord;
 
+pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
+    return lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.name, rhs.name) and
+        std.mem.eql(u8, lhs.description, rhs.description) and
+        std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
+        std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
+        std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
+        std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
+        std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        lhs.desired_replica_count == rhs.desired_replica_count and
+        lhs.min_ranges == rhs.min_ranges;
+}
+
 pub const TableMigrationState = struct {
     schema_json: []const u8,
     read_schema_json: []const u8,

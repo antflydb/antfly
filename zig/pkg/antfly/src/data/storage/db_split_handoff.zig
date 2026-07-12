@@ -31,25 +31,46 @@ pub const DestinationConfig = struct {
     db: db_mod.OpenOptions = .{},
 };
 
+pub const BorrowedDestinationDb = struct {
+    db: *db_mod.DB,
+    ctx: *anyopaque,
+    release_fn: *const fn (*anyopaque) void,
+
+    pub fn release(self: BorrowedDestinationDb) void {
+        self.release_fn(self.ctx);
+    }
+};
+
 pub const SyncConfig = struct {
     source_root_dir: []const u8,
     dest_root_dir: []const u8,
     source_group_id: u64,
     dest_group_id: u64,
     source: data_store.RaftApplyStoreConfig = .{ .root_dir = "" },
+    source_store: ?*data_store.RaftApplyStore = null,
     dest: DestinationConfig = .{ .root_dir = "" },
+    dest_db: ?*db_mod.DB = null,
+    dest_lease: ?BorrowedDestinationDb = null,
 };
 
 pub fn observeSplitStatus(alloc: std.mem.Allocator, cfg: SyncConfig) !SplitSyncStatus {
-    var source = try data_store.RaftApplyStore.init(alloc, cfg.source);
-    defer source.deinit();
+    var owned_source: ?data_store.RaftApplyStore = null;
+    defer if (owned_source) |*source| source.deinit();
+    const source = cfg.source_store orelse source: {
+        owned_source = try data_store.RaftApplyStore.init(alloc, cfg.source);
+        break :source &owned_source.?;
+    };
 
-    var dest_opts = cfg.dest.db;
-    dest_opts.open_mode = .status_only;
-    dest_opts.start_index_workers = false;
-    var dest_db = try db_mod.DB.open(alloc, cfg.dest_root_dir, dest_opts);
-    defer dest_db.close();
-    try validateConfiguredDestinationIdentityNamespace(dest_opts.identity_namespace, &dest_db);
+    var owned_dest: ?db_mod.DB = null;
+    defer if (owned_dest) |*dest| dest.close();
+    const dest_db = cfg.dest_db orelse dest: {
+        var dest_opts = cfg.dest.db;
+        dest_opts.open_mode = .status_only;
+        dest_opts.start_index_workers = false;
+        owned_dest = try db_mod.DB.open(alloc, cfg.dest_root_dir, dest_opts);
+        break :dest &owned_dest.?;
+    };
+    try validateConfiguredDestinationIdentityNamespace(cfg.dest.db.identity_namespace, dest_db);
 
     const dest_range = dest_db.getRange();
     const bootstrapped = dest_range.start.len > 0 or dest_range.end.len > 0;
@@ -86,7 +107,10 @@ pub const MergeConfig = struct {
     donor_group_id: u64,
     receiver_group_id: u64,
     donor: data_store.RaftApplyStoreConfig = .{ .root_dir = "" },
+    donor_store: ?*data_store.RaftApplyStore = null,
     receiver: DestinationConfig = .{ .root_dir = "" },
+    receiver_db: ?*db_mod.DB = null,
+    receiver_lease: ?BorrowedDestinationDb = null,
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
 };
 
@@ -115,7 +139,9 @@ pub const Destination = struct {
     alloc: std.mem.Allocator,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
-    db: db_mod.DB,
+    db: *db_mod.DB,
+    owned_db: ?*db_mod.DB,
+    borrowed_lease: ?BorrowedDestinationDb,
 
     pub fn init(alloc: std.mem.Allocator, cfg: DestinationConfig) !Destination {
         return try initWithCreateRoot(alloc, cfg, true);
@@ -133,11 +159,29 @@ pub const Destination = struct {
             try std.Io.Dir.cwd().access(io_impl.io(), root_dir, .{});
         }
 
+        const db = try alloc.create(db_mod.DB);
+        errdefer alloc.destroy(db);
+        db.* = try db_mod.DB.open(alloc, root_dir, cfg.db);
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
             .root_dir = root_dir,
-            .db = try db_mod.DB.open(alloc, root_dir, cfg.db),
+            .db = db,
+            .owned_db = db,
+            .borrowed_lease = null,
+        };
+    }
+
+    pub fn initBorrowed(alloc: std.mem.Allocator, root_dir_raw: []const u8, lease: BorrowedDestinationDb) !Destination {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        return .{
+            .alloc = alloc,
+            .io_impl = io_impl,
+            .root_dir = try alloc.dupe(u8, root_dir_raw),
+            .db = lease.db,
+            .owned_db = null,
+            .borrowed_lease = lease,
         };
     }
 
@@ -174,7 +218,11 @@ pub const Destination = struct {
     }
 
     pub fn deinit(self: *Destination) void {
-        self.db.close();
+        if (self.owned_db) |owned| {
+            owned.close();
+            self.alloc.destroy(owned);
+        }
+        if (self.borrowed_lease) |lease| lease.release();
         self.alloc.free(self.root_dir);
         self.io_impl.deinit();
         self.* = undefined;
@@ -379,7 +427,8 @@ pub const SyncCoordinator = struct {
     dest_group_id: u64,
     source_cfg: data_store.RaftApplyStoreConfig,
     dest_cfg: DestinationConfig,
-    source: data_store.RaftApplyStore,
+    source: *data_store.RaftApplyStore,
+    source_owned: bool,
     dest: Destination,
 
     pub fn init(alloc: std.mem.Allocator, cfg: SyncConfig) !SyncCoordinator {
@@ -397,9 +446,22 @@ pub const SyncCoordinator = struct {
         var dest_cfg = cfg.dest;
         dest_cfg.root_dir = dest_root_dir;
 
-        var source = try data_store.RaftApplyStore.init(alloc, source_cfg);
-        errdefer source.deinit();
-        var dest = try Destination.init(alloc, dest_cfg);
+        var source_owned = false;
+        const source = cfg.source_store orelse source: {
+            const owned = try alloc.create(data_store.RaftApplyStore);
+            errdefer alloc.destroy(owned);
+            owned.* = try data_store.RaftApplyStore.init(alloc, source_cfg);
+            source_owned = true;
+            break :source owned;
+        };
+        errdefer if (source_owned) {
+            source.deinit();
+            alloc.destroy(source);
+        };
+        var dest = if (cfg.dest_lease) |lease|
+            try Destination.initBorrowed(alloc, dest_root_dir, lease)
+        else
+            try Destination.init(alloc, dest_cfg);
         errdefer dest.deinit();
 
         return .{
@@ -411,24 +473,30 @@ pub const SyncCoordinator = struct {
             .source_cfg = source_cfg,
             .dest_cfg = dest_cfg,
             .source = source,
+            .source_owned = source_owned,
             .dest = dest,
         };
     }
 
     pub fn deinit(self: *SyncCoordinator) void {
         self.dest.deinit();
-        self.source.deinit();
+        if (self.source_owned) {
+            self.source.deinit();
+            self.alloc.destroy(self.source);
+        }
         freeConfig(self.alloc, self.source_cfg);
         self.alloc.free(self.dest_root_dir);
         self.* = undefined;
     }
 
     pub fn reopenSource(self: *SyncCoordinator) !void {
+        if (!self.source_owned) return error.BorrowedSplitSourceStore;
         self.source.deinit();
-        self.source = try data_store.RaftApplyStore.init(self.alloc, self.source_cfg);
+        self.source.* = try data_store.RaftApplyStore.init(self.alloc, self.source_cfg);
     }
 
     pub fn reopenDestination(self: *SyncCoordinator) !void {
+        if (self.dest.owned_db == null) return error.BorrowedSplitDestinationDb;
         self.dest.deinit();
         self.dest = try Destination.init(self.alloc, self.dest_cfg);
     }
@@ -476,7 +544,7 @@ pub const SyncCoordinator = struct {
                 state.original_range_end,
             });
             defer self.alloc.free(restore);
-            try self.applySourceControlEntryVia(&self.source, restore);
+            try self.applySourceControlEntryVia(self.source, restore);
         } else if (source_range_end) |range_end| {
             const current_range = try self.source.currentRange(self.alloc, self.source_group_id);
             defer range_state.freeRange(self.alloc, current_range);
@@ -485,12 +553,12 @@ pub const SyncCoordinator = struct {
                 range_end,
             });
             defer self.alloc.free(restore);
-            try self.applySourceControlEntryVia(&self.source, restore);
+            try self.applySourceControlEntryVia(self.source, restore);
         }
 
         const op = try std.fmt.allocPrint(self.alloc, "split_prepare:{s}", .{split_key});
         defer self.alloc.free(op);
-        try self.applySourceControlEntryVia(&self.source, op);
+        try self.applySourceControlEntryVia(self.source, op);
         return true;
     }
 
@@ -568,7 +636,7 @@ pub const SyncCoordinator = struct {
     }
 
     fn applySourceControlEntry(self: *SyncCoordinator, op: []const u8) !void {
-        try self.applySourceControlEntryVia(&self.source, op);
+        try self.applySourceControlEntryVia(self.source, op);
     }
 
     fn applySourceControlEntryVia(self: *SyncCoordinator, source: *data_store.RaftApplyStore, op: []const u8) !void {
@@ -600,7 +668,8 @@ pub const MergeCoordinator = struct {
     receiver_group_id: u64,
     donor_cfg: data_store.RaftApplyStoreConfig,
     receiver_cfg: DestinationConfig,
-    donor: data_store.RaftApplyStore,
+    donor: *data_store.RaftApplyStore,
+    donor_owned: bool,
     receiver: Destination,
     receiver_accepts_donor_range: bool,
     receiver_base_range: db_types.ByteRange,
@@ -623,9 +692,22 @@ pub const MergeCoordinator = struct {
         var receiver_cfg = cfg.receiver;
         receiver_cfg.root_dir = receiver_root_dir;
 
-        var donor = try data_store.RaftApplyStore.init(alloc, donor_cfg);
-        errdefer donor.deinit();
-        var receiver = try Destination.init(alloc, receiver_cfg);
+        var donor_owned = false;
+        const donor = cfg.donor_store orelse donor: {
+            const owned = try alloc.create(data_store.RaftApplyStore);
+            errdefer alloc.destroy(owned);
+            owned.* = try data_store.RaftApplyStore.init(alloc, donor_cfg);
+            donor_owned = true;
+            break :donor owned;
+        };
+        errdefer if (donor_owned) {
+            donor.deinit();
+            alloc.destroy(donor);
+        };
+        var receiver = if (cfg.receiver_lease) |lease|
+            try Destination.initBorrowed(alloc, receiver_root_dir, lease)
+        else
+            try Destination.init(alloc, receiver_cfg);
         errdefer receiver.deinit();
 
         const persisted = try receiver.loadMergeState(alloc);
@@ -649,6 +731,7 @@ pub const MergeCoordinator = struct {
             .donor_cfg = donor_cfg,
             .receiver_cfg = receiver_cfg,
             .donor = donor,
+            .donor_owned = donor_owned,
             .receiver = receiver,
             .receiver_accepts_donor_range = if (persisted) |state|
                 state.phase == .accepting or state.phase == .finalized or state.phase == .rolling_back
@@ -666,7 +749,10 @@ pub const MergeCoordinator = struct {
 
     pub fn deinit(self: *MergeCoordinator) void {
         self.receiver.deinit();
-        self.donor.deinit();
+        if (self.donor_owned) {
+            self.donor.deinit();
+            self.alloc.destroy(self.donor);
+        }
         range_state.freeRange(self.alloc, self.receiver_base_range);
         freeConfig(self.alloc, self.donor_cfg);
         self.alloc.free(self.receiver_root_dir);
@@ -674,11 +760,13 @@ pub const MergeCoordinator = struct {
     }
 
     pub fn reopenDonor(self: *MergeCoordinator) !void {
+        if (!self.donor_owned) return error.BorrowedMergeDonorStore;
         self.donor.deinit();
-        self.donor = try data_store.RaftApplyStore.init(self.alloc, self.donor_cfg);
+        self.donor.* = try data_store.RaftApplyStore.init(self.alloc, self.donor_cfg);
     }
 
     pub fn reopenReceiver(self: *MergeCoordinator) !void {
+        if (self.receiver.owned_db == null) return error.BorrowedMergeReceiverDb;
         self.receiver.deinit();
         self.receiver = try Destination.init(self.alloc, self.receiver_cfg);
     }
@@ -877,17 +965,7 @@ pub const SyncResult = struct {
     cutover_ready: bool,
 };
 
-pub const SplitSyncStatus = struct {
-    phase: SplitTransitionPhase,
-    source_split_phase: ?shard_mod.SplitPhase,
-    bootstrapped: bool,
-    replay_required: bool,
-    replay_caught_up: bool,
-    cutover_ready: bool,
-    destination_ready_for_reads: bool,
-    source_delta_sequence: u64,
-    dest_delta_sequence: u64,
-};
+pub const SplitSyncStatus = range_transition.SplitStatus;
 
 pub const MergeSyncStatus = range_transition.MergeStatus;
 
@@ -1374,6 +1452,34 @@ test "db split status rejects stale destination identity namespace" {
             },
         },
     }));
+}
+
+test "db split status borrows the live raft apply store without a second writer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-borrowed-src", .{tmp.sub_path});
+    defer std.testing.allocator.free(src_root);
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-borrowed-dst", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+
+    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+    defer source.deinit();
+    {
+        var dest = try Destination.init(std.testing.allocator, .{ .root_dir = dst_root });
+        dest.deinit();
+    }
+
+    const status = try observeSplitStatus(std.testing.allocator, .{
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 7001,
+        .dest_group_id = 7002,
+        .source = .{ .root_dir = src_root },
+        .source_store = &source,
+        .dest = .{ .root_dir = dst_root },
+    });
+    try std.testing.expectEqual(SplitTransitionPhase.rolled_back, status.phase);
 }
 
 test "db split sync coordinator tracks explicit split transition phases" {
