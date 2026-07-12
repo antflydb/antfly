@@ -19,11 +19,13 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const cache_budget = @import("../common/cache_budget.zig");
+const platform_time = @import("../platform/time.zig");
 const scraping = @import("antfly_scraping");
 const db_mod = @import("../storage/db/mod.zig");
 
 pub const max_query_embedding_input_bytes: usize = 1024 * 1024;
 pub const max_query_embedding_template_bytes: usize = 64 * 1024;
+pub const default_query_embedding_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -161,6 +163,10 @@ fn embedTemplateInteractive(
     return try runtime.embedQueryWithTemplate(alloc, index_name, text, embedding_template);
 }
 
+fn effectiveQueryEmbeddingDeadlineNs(request_deadline_ns: ?u64, now_ns: u64) u64 {
+    return request_deadline_ns orelse now_ns +| default_query_embedding_timeout_ns;
+}
+
 pub fn planSemanticQuery(
     planning: QueryPlanningContext,
     alloc: std.mem.Allocator,
@@ -174,6 +180,9 @@ pub fn planSemanticQuery(
     if (embedding_template) |value| {
         if (value.len > max_query_embedding_template_bytes) return error.QueryEmbeddingInputTooLarge;
     }
+    const now_ns = platform_time.monotonicNs();
+    const embedding_deadline_ns = effectiveQueryEmbeddingDeadlineNs(planning.query_embedding_deadline_ns, now_ns);
+    if (embedding_deadline_ns <= now_ns) return error.Timeout;
 
     var snapshot = try planning.adminSnapshot();
     defer planning.freeAdminSnapshot(&snapshot);
@@ -182,7 +191,7 @@ pub fn planSemanticQuery(
     var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, table.indexes_json, .{
         .antfly_provider = planning.antfly_provider,
         .io = planning.io,
-        .deadline_ns = planning.query_embedding_deadline_ns,
+        .deadline_ns = embedding_deadline_ns,
         .remote_content = planning.remote_content,
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,
@@ -199,7 +208,7 @@ pub fn planSemanticQuery(
             };
             const cache = planning.query_embedding_cache orelse
                 break :blk try TemplateQueryComputeContext.run(&compute_context, alloc);
-            break :blk try cache.computeUncached(alloc, planning.query_embedding_deadline_ns, &compute_context, TemplateQueryComputeContext.run);
+            break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, TemplateQueryComputeContext.run);
         } else blk: {
             var compute_context = DenseQueryComputeContext{
                 .runtime = &runtime,
@@ -209,12 +218,12 @@ pub fn planSemanticQuery(
             const cache = planning.query_embedding_cache orelse
                 break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
             const budget = planning.query_embedding_budget orelse
-                break :blk try cache.computeUncached(alloc, planning.query_embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+                break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
             const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
-                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, planning.query_embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
+                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
                 else => return err,
             };
-            break :blk try cache.getOrCompute(budget, alloc, key, planning.query_embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+            break :blk try cache.getOrCompute(budget, alloc, key, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
         },
         .k = limit,
     };
@@ -242,6 +251,8 @@ pub fn resolveDenseQuery(
 
 test "semantic query planning reuses equivalent embeddings across tables and isolates principals" {
     const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(u64, 123 + default_query_embedding_timeout_ns), effectiveQueryEmbeddingDeadlineNs(null, 123));
+    try std.testing.expectEqual(@as(u64, 456), effectiveQueryEmbeddingDeadlineNs(456, 123));
     const FakeCatalog = struct {
         const indexes_json =
             \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test-embedder"}}}
@@ -344,6 +355,14 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     try std.testing.expectError(
         error.QueryEmbeddingInputTooLarge,
         planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", oversized_template, 5),
+    );
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+
+    var expired = base;
+    expired.query_embedding_deadline_ns = 1;
+    try std.testing.expectError(
+        error.Timeout,
+        planSemanticQuery(expired, alloc, "docs_a", "semantic_idx", "same query", null, 5),
     );
     try std.testing.expectEqual(@as(usize, 4), provider.calls);
 }

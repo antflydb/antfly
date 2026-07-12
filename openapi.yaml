@@ -11884,7 +11884,9 @@ components:
 
             sorting, and response post-processing. If the deadline expires before the query
 
-            completes, the HTTP API returns 504.
+            completes, the HTTP API returns 504. When omitted, semantic query embedding planning
+
+            and provider I/O use a 30-second default deadline.
           example: 5000
         order_by:
           type: array

@@ -109,6 +109,11 @@ extend a waiter's deadline. Completion of one key never wakes waiters for
 unrelated keys. Errors are delivered to current waiters but are never cached.
 Producer computation runs without the cache lock.
 
+When a query does not provide `timeout_ms`, query embedding planning, provider
+pacing, and provider transport receive a 30-second default deadline. Explicit
+query deadlines remain authoritative. This prevents a stalled upstream or a
+deep rate-limit schedule from retaining a request indefinitely.
+
 Shutdown requires request handling to stop before `ApiHttpServer.deinit`, which
 asserts that no flights remain before freeing cache state.
 
