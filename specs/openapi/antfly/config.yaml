@@ -581,9 +581,17 @@ components:
             connections should require infrastructure-provisioned buckets.
         buckets:
           type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
-          description: Buckets this connection is configured for.
+            minLength: 3
+            maxLength: 63
+          description: >-
+            Explicit bucket allowlist for this connection. S3 connections must
+            configure at least one bucket; omission never means unrestricted
+            access.
         prefix:
           type: string
           description: Key-prefix boundary enforced for every use of this connection.

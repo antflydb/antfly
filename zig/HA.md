@@ -580,7 +580,7 @@ error, then layer type checks on top of the shared classifier:
   whitespace instead of relying on implicit trimming.
 
 Admin authentication should be explicit but operationally simple. The Antfly
-runtime may be started with `--ha-admin-token-env <name>`; when set, the Zig
+runtime may be started with `--admin-token-env <name>`; when set, the Zig
 process reads a bearer token from that environment variable at startup and
 requires `Authorization: Bearer <token>` on typed `/admin/v1/ha` routes. Health
 checks and node-to-node `/internal/v1` replication traffic are separate from
@@ -809,7 +809,7 @@ Treat the e2e work as a set of concrete product-path gates:
   standby startup, primary writes, standby catch-up, read-only enforcement, and
   standby restart/replay using real processes and durable files;
 - the admin-auth gate proves typed `/admin/v1/ha` calls require bearer auth when
-  `--ha-admin-token-env` is configured, while health checks and replication
+  `--admin-token-env` is configured, while health checks and replication
   traffic remain separate from that control-plane auth;
 - the freshness gate proves standby reads report stale, `at_least_lsn`, and
   primary-only routing decisions instead of serving ambiguous read-after-write
@@ -1061,7 +1061,7 @@ be validated against that operator package.
   `ANTFLY_HA_ADMIN_TOKEN`. Kubernetes should inject that variable into the
   operator pod from a Secret; the operator should not require broad direct
   Secret read permissions just to make HA admin API calls.
-- Support runtime-side admin auth by passing `--ha-admin-token-env` from
+- Support runtime-side admin auth by passing `--admin-token-env` from
   `spec.highAvailability.runtime.adminTokenEnvVar`. Antfly pods should receive
   the same token through `spec.standalone.envFrom` or the explicit
   `spec.highAvailability.runtime.adminTokenSecretRef` secret-key injection.

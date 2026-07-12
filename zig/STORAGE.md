@@ -102,11 +102,13 @@ Serverless derives its `artifacts`, `manifests`, `wal`, `progress`, and
 bucket, or prefix, which supports separate durability classes, accounts, and
 least-privilege credentials. Referenced connections must be S3 `external_io`
 connections with the `storage.primary` capability, and any configured bucket
-allowlist is enforced at startup. Low-level URI flags and environment variables
-are supported only without a connection-based config; mixing them is rejected
-because a location override without an identity override is ambiguous. Lanes
-that resolve to the same connection share one object-store client and HTTP
-connection pool; distinct credential sources remain isolated.
+allowlist is enforced at startup. S3 connections require a non-empty explicit
+bucket allowlist; unrestricted bucket access is never inferred from omission.
+Low-level URI flags and environment variables are supported only without a
+connection-based config; mixing them is rejected because a location override
+without an identity override is ambiguous. Lanes that resolve to the same
+connection share one object-store client and HTTP connection pool; distinct
+credential sources remain isolated.
 
 Primary storage credentials are deliberately independent from
 `remote_content.s3`. The former grants Antfly write authority over database
@@ -120,8 +122,8 @@ connection and therefore support multiple accounts in one process. Expiring
 credentials refresh before their safety window. Static keys remain available
 through secret references for S3-compatible systems, but should never be
 committed plaintext.
-Pass `--secret-store-path` (or
-`ANTFLY_SECRET_STORE_PATH`) when those JSON values use `${secret:...}`.
+Pass `--secret-store-path` (or `ANTFLY_SECRET_STORE_PATH`) when those JSON
+values use `${secret:...}`.
 
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Requests may name an `external_io` connection while the
@@ -231,12 +233,14 @@ asynchronous job acquires the file maintenance gate and requests may wait until
 it completes. Shutdown and explicit cancellation stop native checks and vacuum
 at safe page/record boundaries; a replacement file is never published after
 cancellation. Idempotency keys are retained for at least 24 hours within a
-server process. After a process restart callers must reconcile status before
-retrying, and the bounded history rejects new jobs instead of silently evicting
-an unexpired key. Vacuum retains one logical record class at a time rather than
-holding metadata, index, and document key sets simultaneously, streams one
-value at a time into a durable replacement file, and atomically renames it; it
-has no artificial distinct-key ceiling and does not allocate a second
-database-sized output image. Lite also keeps `lite
-check`, `compact`, and `vacuum` for offline files. Backup and restore remain
-portable `/db/v1` operations rather than storage maintenance.
+server process. Job IDs include a random boot namespace, so an identifier from
+a previous process returns `404` instead of aliasing a new job. After restart,
+callers reconcile storage state before retrying. The bounded history rejects
+new jobs instead of silently evicting an unexpired key. Vacuum retains one
+logical record class at a time rather than holding metadata, index, and
+document key sets simultaneously, streams one value at a time into a durable
+replacement file, and atomically renames it; it has no artificial distinct-key
+ceiling and does not allocate a second database-sized output image. Lite also
+keeps `lite check`, `lite compact`, and `lite vacuum` for offline files. Backup
+and restore remain portable `/db/v1` operations rather than storage
+maintenance.

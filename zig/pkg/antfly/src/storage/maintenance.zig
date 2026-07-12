@@ -7,6 +7,8 @@ const std = @import("std");
 const platform_time = @import("../platform/time.zig");
 const platform_sync = @import("antfly_platform").sync;
 
+var coordinator_boot_sequence: std.atomic.Value(u64) = .init(1);
+
 pub const Operation = enum { check, compact, vacuum };
 pub const State = enum { queued, running, succeeded, failed, canceled };
 
@@ -90,7 +92,7 @@ pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     source: Source,
     mutex: std.atomic.Mutex = .unlocked,
-    next_job_id: u64 = 1,
+    next_job_id: u64,
     active_job_id: ?u64 = null,
     jobs: std.ArrayListUnmanaged(*Job) = .empty,
 
@@ -131,7 +133,31 @@ pub const Coordinator = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, source: Source) Coordinator {
-        return .{ .allocator = allocator, .source = source };
+        const seed = [2]u64{
+            platform_time.realtimeNs(),
+            coordinator_boot_sequence.fetchAdd(1, .monotonic),
+        };
+        var boot_id: u32 = undefined;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        io_impl.io().randomSecure(std.mem.asBytes(&boot_id)) catch {
+            boot_id = @truncate(std.hash.Wyhash.hash(0x616e74666c792d6d, std.mem.asBytes(&seed)));
+        };
+        // OpenAPI's portable integer representation is signed 64-bit even for
+        // uint64 formats. Reserve the sign bit while retaining a 31-bit random
+        // boot namespace and a 32-bit per-process sequence.
+        boot_id &= 0x7fff_ffff;
+        if (boot_id == 0) boot_id = 1;
+        const first_job_id = (@as(u64, boot_id) << 32) | 1;
+        return initWithFirstJobId(allocator, source, first_job_id);
+    }
+
+    fn initWithFirstJobId(allocator: std.mem.Allocator, source: Source, first_job_id: u64) Coordinator {
+        return .{
+            .allocator = allocator,
+            .source = source,
+            .next_job_id = @max(first_job_id, 1),
+        };
     }
 
     pub fn deinit(self: *Coordinator) void {
@@ -161,6 +187,7 @@ pub const Coordinator = struct {
             }
         }
         if (self.active_job_id != null) return error.MaintenanceBusy;
+        if (@as(u32, @truncate(self.next_job_id)) == std.math.maxInt(u32)) return error.MaintenanceJobIdExhausted;
         self.pruneExpiredLocked(nowMs());
         if (self.jobs.items.len >= max_retained_jobs) return error.MaintenanceHistoryFull;
 
@@ -306,6 +333,32 @@ test "storage maintenance coordinator is idempotent and single flight" {
     }
     try std.testing.expectEqual(@as(u64, 1), fake.runs.load(.monotonic));
     try std.testing.expectError(error.IdempotencyConflict, coordinator.start(.vacuum, "same-key"));
+}
+
+test "storage maintenance job ids are namespaced by server boot" {
+    var token: u8 = 0;
+    const source = Source{
+        .ptr = &token,
+        .vtable = &.{
+            .status = struct {
+                fn call(_: *anyopaque) Status {
+                    return .{ .engine = "fake", .maintenance = .{} };
+                }
+            }.call,
+            .run = struct {
+                fn call(_: *anyopaque, _: Operation, _: *const CancelToken) anyerror!Result {
+                    return .{};
+                }
+            }.call,
+        },
+    };
+    var first = Coordinator.initWithFirstJobId(std.testing.allocator, source, 11);
+    defer first.deinit();
+    var second = Coordinator.initWithFirstJobId(std.testing.allocator, source, 12);
+    defer second.deinit();
+    try std.testing.expect(first.next_job_id != second.next_job_id);
+    try std.testing.expectEqual(@as(u64, 11), first.next_job_id);
+    try std.testing.expectEqual(@as(u64, 12), second.next_job_id);
 }
 
 test "storage maintenance cancellation reaches a cooperative engine" {

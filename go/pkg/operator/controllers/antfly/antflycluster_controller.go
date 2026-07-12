@@ -224,7 +224,7 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
 		}
 		if adminTokenEnvVar != "" {
-			appendHAArg("--ha-admin-token-env", adminTokenEnvVar)
+			appendHAArg("--admin-token-env", adminTokenEnvVar)
 		}
 		if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
 			appendHAUint("--ha-retention-max-lag-lsn", ha.Retention.MaxLagLSN)
@@ -256,7 +256,7 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
 		}
 		if adminTokenEnvVar != "" {
-			appendHAArg("--ha-admin-token-env", adminTokenEnvVar)
+			appendHAArg("--admin-token-env", adminTokenEnvVar)
 		}
 		if standby != nil && strings.TrimSpace(standby.UpstreamURL) != "" && strings.TrimSpace(standby.SlotName) != "" {
 			appendHAArg("--ha-standby-upstream-url", standby.UpstreamURL)

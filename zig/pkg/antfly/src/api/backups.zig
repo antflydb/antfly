@@ -163,8 +163,10 @@ const AwsCredentialContext = struct {
             .access_key_id = @constCast(credentials.access_key_id),
             .secret_access_key = @constCast(credentials.secret_access_key),
             .session_token = if (credentials.session_token) |value| @constCast(value) else null,
-            .release_ctx = lease.releaseContext(),
-            .release_fn = bedrock.CredentialCache.Lease.releaseOpaque,
+            .ownership = .{ .borrowed = .{
+                .ctx = lease.releaseContext(),
+                .release = bedrock.CredentialCache.Lease.releaseOpaque,
+            } },
         };
     }
 };
@@ -188,16 +190,15 @@ fn authorizedS3Connection(
         }
     }
     if (!capability_allowed) return error.ConnectionCapabilityDenied;
-    if (external.buckets.len > 0) {
-        var bucket_allowed = false;
-        for (external.buckets) |allowed| {
-            if (std.mem.eql(u8, allowed, bucket)) {
-                bucket_allowed = true;
-                break;
-            }
+    if (external.buckets.len == 0) return error.ConnectionBucketDenied;
+    var bucket_allowed = false;
+    for (external.buckets) |allowed| {
+        if (std.mem.eql(u8, allowed, bucket)) {
+            bucket_allowed = true;
+            break;
         }
-        if (!bucket_allowed) return error.ConnectionBucketDenied;
     }
+    if (!bucket_allowed) return error.ConnectionBucketDenied;
     if (external.prefix) |scope_raw| {
         const scope = std.mem.trim(u8, scope_raw, "/");
         const prefix = std.mem.trim(u8, raw_prefix, "/");

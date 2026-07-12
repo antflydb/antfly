@@ -222,10 +222,12 @@ Bearer ...`; without either mechanism the admin surface fails closed.
 
 POST requests return `202` and a job document. `Idempotency-Key` safely returns
 the original job on retries for at least 24 hours within the current server
-process. After restart, callers reconcile storage/job status before retrying.
-The bounded history rejects new work rather than dropping an unexpired key.
-`DELETE` requests cooperative cancellation; native maintenance checks the
-token at safe page and record boundaries, including during shutdown. Only one maintenance job runs at a time; a
+process. Job IDs include a random server-boot namespace, so stale IDs cannot
+alias jobs created after restart. Callers reconcile storage state before
+retrying. The bounded history rejects new work rather than dropping an
+unexpired key. `DELETE` requests cooperative cancellation; native maintenance
+checks the token at safe page and record boundaries, including during shutdown.
+Only one maintenance job runs at a time; a
 conflicting request returns `409`, and an engine that does not support an
 operation returns `422`. Completed jobs are retained in a bounded in-memory
 history. Lite reports `online: false`: check, compaction, and vacuum acquire the

@@ -968,6 +968,23 @@ test "common config isolates named AWS credential sources and rejects credential
     ));
 }
 
+test "common config requires an explicit unique S3 bucket allowlist" {
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "connections": {
+        \\    "archive": { "kind": "external_io", "capabilities": ["backup.write"], "external_io": { "protocol": "s3" } }
+        \\  }
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "connections": {
+        \\    "archive": { "kind": "external_io", "capabilities": ["backup.write"], "external_io": { "protocol": "s3", "buckets": ["archive-bucket", "archive-bucket"] } }
+        \\  }
+        \\}
+    ));
+}
+
 test "common config command deployment context supplies topology and rejects conflicting assertions" {
     var cfg = try Config.parseFromSliceWithSecretsForDeployment(std.testing.allocator,
         \\{
@@ -1299,16 +1316,15 @@ fn validateStorageConnection(
         }
     }
     if (!authorized) return error.InvalidConfig;
-    if (external.buckets.len > 0) {
-        authorized = false;
-        for (external.buckets) |allowed| {
-            if (std.mem.eql(u8, allowed, bucket)) {
-                authorized = true;
-                break;
-            }
+    if (external.buckets.len == 0) return error.InvalidConfig;
+    authorized = false;
+    for (external.buckets) |allowed| {
+        if (std.mem.eql(u8, allowed, bucket)) {
+            authorized = true;
+            break;
         }
-        if (!authorized) return error.InvalidConfig;
     }
+    if (!authorized) return error.InvalidConfig;
     if (external.prefix) |scope| {
         const normalized_scope = std.mem.trim(u8, scope, "/");
         if (normalized_scope.len > 0) {
@@ -1429,6 +1445,18 @@ fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Val
     cfg.hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{};
     cfg.credentials = try parseAwsCredentialConfig(alloc, value.object.get("credentials"));
     cfg.use_ssl = try optionalBoolField(value.object, "use_ssl");
+
+    if (cfg.protocol == .s3) {
+        if (cfg.buckets.len == 0 or cfg.buckets.len > 64) return error.InvalidConfig;
+        for (cfg.buckets, 0..) |bucket, i| {
+            if (bucket.len < 3 or bucket.len > 63 or !std.mem.eql(u8, bucket, std.mem.trim(u8, bucket, " \t\r\n"))) {
+                return error.InvalidConfig;
+            }
+            for (cfg.buckets[0..i]) |previous| {
+                if (std.mem.eql(u8, previous, bucket)) return error.InvalidConfig;
+            }
+        }
+    }
 
     if (value.object.get("headers")) |headers| {
         if (headers != .object) return error.InvalidConfig;

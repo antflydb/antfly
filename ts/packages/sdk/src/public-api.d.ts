@@ -2650,7 +2650,10 @@ export interface components {
          * @description Connection status. "connected" means a live probe or listing succeeded,
          *     "error" means the probe failed (see the error field), "configured" means
          *     the connection is present but was not probed, and "unsupported" means
-         *     no probe is available for this connection kind or provider.
+         *     no probe is available for this connection kind or provider. For S3,
+         *     connected means an authenticated HeadBucket request succeeded for every
+         *     explicitly allowlisted bucket. It verifies bucket discovery permission,
+         *     not mutation permissions such as PutObject.
          * @enum {string}
          */
         ConnectionStatus: "connected" | "error" | "configured" | "unsupported";

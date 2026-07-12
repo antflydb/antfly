@@ -2231,6 +2231,7 @@ pub const ApiHttpServer = struct {
             error.IdempotencyConflict => return try textResponse(self.alloc, 409, "idempotency key reused for another operation"),
             error.InvalidIdempotencyKey => return try textResponse(self.alloc, 400, "invalid idempotency key"),
             error.MaintenanceHistoryFull => return try textResponse(self.alloc, 429, "maintenance job history is full; retry after retained job records expire"),
+            error.MaintenanceJobIdExhausted => return try textResponse(self.alloc, 503, "maintenance job namespace exhausted; restart the server before submitting more maintenance work"),
             else => return err,
         };
         return try storageMaintenanceJobResponse(self.alloc, 202, snapshot);
@@ -12434,6 +12435,9 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
     defer start_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), start_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, start_resp.body, "\"operation\":\"check\"") != null);
+    const maintenance_job_id = coordinator.active_job_id.?;
+    const maintenance_job_path = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}", .{ admin_routes.maintenance_jobs_prefix, maintenance_job_id });
+    defer std.testing.allocator.free(maintenance_job_path);
 
     var replay_resp = try server.handle(.{
         .method = .POST,
@@ -12443,12 +12447,14 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
     });
     defer replay_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), replay_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, replay_resp.body, "\"job_id\":1") != null);
+    const expected_job_id = try std.fmt.allocPrint(std.testing.allocator, "\"job_id\":{d}", .{maintenance_job_id});
+    defer std.testing.allocator.free(expected_job_id);
+    try std.testing.expect(std.mem.indexOf(u8, replay_resp.body, expected_job_id) != null);
 
-    while (coordinator.get(1).?.state != .succeeded) std.Thread.yield() catch {};
+    while (coordinator.get(maintenance_job_id).?.state != .succeeded) std.Thread.yield() catch {};
     var get_resp = try server.handle(.{
         .method = .GET,
-        .uri = admin_routes.maintenance_jobs_prefix ++ "1",
+        .uri = maintenance_job_path,
         .authorization = "Bearer maintenance-secret",
     });
     defer get_resp.deinit(std.testing.allocator);
@@ -12457,7 +12463,7 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
 
     var cancel_resp = try server.handle(.{
         .method = .DELETE,
-        .uri = admin_routes.maintenance_jobs_prefix ++ "1",
+        .uri = maintenance_job_path,
         .authorization = "Bearer maintenance-secret",
     });
     defer cancel_resp.deinit(std.testing.allocator);

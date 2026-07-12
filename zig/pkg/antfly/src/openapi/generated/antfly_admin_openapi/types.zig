@@ -475,6 +475,7 @@ pub const StandbyBootstrapRequest = struct {
 };
 
 pub const StorageMaintenanceJob = struct {
+    /// Opaque job identifier namespaced to one server boot.
     job_id: i64,
     operation: StorageMaintenanceOperation,
     state: StorageMaintenanceState,

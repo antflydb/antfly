@@ -109,19 +109,30 @@ pub const CredentialCache = struct {
     };
 
     io_init_mutex: std.atomic.Mutex = .unlocked,
+    closed: std.atomic.Value(bool) = .init(false),
     io: ?std.Io = null,
     mutex: std.Io.Mutex = .init,
     refreshed: std.Io.Condition = .init,
     refreshing: bool = false,
+    closing: bool = false,
+    active_calls: usize = 0,
     cached: ?*Snapshot = null,
 
     pub fn deinit(self: *CredentialCache, alloc: std.mem.Allocator) void {
         _ = alloc;
-        const io = self.io orelse return;
+        self.closed.store(true, .release);
+        while (!self.io_init_mutex.tryLock()) std.atomic.spinLoopHint();
+        const maybe_io = self.io;
+        self.io_init_mutex.unlock();
+        const io = maybe_io orelse return;
         self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        if (self.cached) |snapshot| snapshot.release();
+        self.closing = true;
+        self.refreshed.broadcast(io);
+        while (self.refreshing or self.active_calls != 0) self.refreshed.waitUncancelable(io, &self.mutex);
+        const cached = self.cached;
         self.cached = null;
+        self.mutex.unlock(io);
+        if (cached) |snapshot| snapshot.release();
     }
 
     pub fn get(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
@@ -140,10 +151,22 @@ pub const CredentialCache = struct {
     /// refresh replaces the cache entry.
     pub fn getLeaseForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Lease {
         const source_key = credentialSourceKey(region, source);
-        const io = self.bindIo(http.io);
+        const io = try self.bindIo(http.io);
+        self.mutex.lockUncancelable(io);
+        if (self.closing) {
+            self.mutex.unlock(io);
+            return error.CredentialCacheClosed;
+        }
+        self.active_calls += 1;
+        self.mutex.unlock(io);
+        defer self.finishCall(io);
         while (true) {
             const now = currentUnixSeconds();
             self.mutex.lockUncancelable(io);
+            if (self.closing) {
+                self.mutex.unlock(io);
+                return error.CredentialCacheClosed;
+            }
             if (self.cached) |snapshot| {
                 if (snapshot.source_key == source_key and snapshot.credentials.isFresh(now)) {
                     snapshot.retain();
@@ -172,13 +195,16 @@ pub const CredentialCache = struct {
             var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| {
                 self.mutex.lockUncancelable(io);
                 self.refreshing = false;
-                const fallback = if (self.cached) |snapshot| blk: {
+                const closing = self.closing;
+                const fallback = if (!closing and self.cached != null) blk: {
+                    const snapshot = self.cached.?;
                     if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(currentUnixSeconds())) break :blk null;
                     snapshot.retain();
                     break :blk snapshot;
                 } else null;
                 self.refreshed.broadcast(io);
                 self.mutex.unlock(io);
+                if (closing) return error.CredentialCacheClosed;
                 if (fallback) |snapshot| return .{ .snapshot = snapshot };
                 return err;
             };
@@ -191,6 +217,13 @@ pub const CredentialCache = struct {
             fresh = undefined;
 
             self.mutex.lockUncancelable(io);
+            if (self.closing) {
+                self.refreshing = false;
+                self.refreshed.broadcast(io);
+                self.mutex.unlock(io);
+                snapshot.release();
+                return error.CredentialCacheClosed;
+            }
             const old = self.cached;
             self.cached = snapshot;
             snapshot.retain(); // caller lease
@@ -209,9 +242,19 @@ pub const CredentialCache = struct {
         self.mutex.unlock(io);
     }
 
-    fn bindIo(self: *CredentialCache, io: std.Io) std.Io {
+    fn finishCall(self: *CredentialCache, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        std.debug.assert(self.active_calls > 0);
+        self.active_calls -= 1;
+        self.refreshed.broadcast(io);
+        self.mutex.unlock(io);
+    }
+
+    fn bindIo(self: *CredentialCache, io: std.Io) !std.Io {
+        if (self.closed.load(.acquire)) return error.CredentialCacheClosed;
         while (!self.io_init_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.io_init_mutex.unlock();
+        if (self.closed.load(.acquire)) return error.CredentialCacheClosed;
         if (self.io == null) self.io = io;
         return self.io.?;
     }
@@ -1404,6 +1447,37 @@ test "metadata credential parsers" {
 
 test "credential url encoding" {
     try testCredentialUrlEncoding();
+}
+
+test "credential cache shutdown waits for an in-flight refresh" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var cache = CredentialCache{};
+    _ = try cache.bindIo(io);
+    cache.mutex.lockUncancelable(io);
+    cache.refreshing = true;
+    cache.mutex.unlock(io);
+
+    const Worker = struct {
+        fn run(target: *CredentialCache, worker_io: std.Io) void {
+            while (true) {
+                target.mutex.lockUncancelable(worker_io);
+                const closing = target.closing;
+                target.mutex.unlock(worker_io);
+                if (closing) break;
+                std.Thread.yield() catch {};
+            }
+            target.finishFailedRefresh(worker_io);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &cache, io });
+    cache.deinit(std.testing.allocator);
+    thread.join();
+    try std.testing.expect(cache.closing);
+    try std.testing.expect(!cache.refreshing);
+    try std.testing.expect(cache.cached == null);
+    try std.testing.expectError(error.CredentialCacheClosed, cache.bindIo(io));
 }
 
 test "request shape batches by provider request" {

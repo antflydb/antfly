@@ -160,7 +160,7 @@ class HAStandaloneNode:
         )
         env = os.environ.copy()
         if self.admin_token_env is not None:
-            command.extend(["--ha-admin-token-env", self.admin_token_env])
+            command.extend(["--admin-token-env", self.admin_token_env])
             assert self.admin_token is not None
             env[self.admin_token_env] = self.admin_token
 

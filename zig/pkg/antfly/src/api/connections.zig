@@ -327,6 +327,9 @@ pub fn buildConnectionsResponse(
 
     if (sources.node_config) |node_config| {
         try appendConfiguredConnections(arena, &connections, sources, cache, opts, kinds, node_config);
+        if (opts.probe and kinds.contains(.external_io)) {
+            try resolveExternalIoProbes(arena, &connections, node_config, cache, opts);
+        }
     }
 
     return .{ .connections = connections.items };
@@ -387,8 +390,6 @@ fn appendConfiguredConnections(
             .external_io => try appendConfiguredExternalIoConnection(
                 arena,
                 connections,
-                cache,
-                opts,
                 entry.key_ptr.*,
                 cfg,
             ),
@@ -497,13 +498,11 @@ fn appendConfiguredWebSearchConnection(
 fn appendConfiguredExternalIoConnection(
     arena: Allocator,
     connections: *std.ArrayListUnmanaged(Connection),
-    cache: ?*Cache,
-    opts: BuildOptions,
     id: []const u8,
     cfg: common_config.Config.ConnectionConfig,
 ) !void {
     const external_cfg = cfg.external_io orelse return error.InvalidConfig;
-    var connection = Connection{
+    const connection = Connection{
         .id = id,
         .name = id,
         .display_name = cfg.display_name,
@@ -519,13 +518,6 @@ fn appendConfiguredExternalIoConnection(
             .hosts = external_cfg.hosts,
         },
     };
-
-    if (opts.probe and external_cfg.protocol == .s3) {
-        if (try probeConfiguredExternalIoS3(arena, id, external_cfg, cache, opts)) |probe| {
-            connection.status = probe.status;
-            connection.@"error" = probe.err_name;
-        }
-    }
 
     try connections.append(arena, connection);
 }
@@ -835,55 +827,162 @@ const ProbeResult = struct {
     err_name: ?[]const u8 = null,
 };
 
-/// Probe an external-IO S3 connection by checking its first bucket with the
-/// same endpoint, region, addressing style, and credential source used by the
-/// production object-store client.
-fn probeConfiguredExternalIoS3(
-    arena: Allocator,
-    name: []const u8,
+const S3ProbeJob = struct {
     cfg: common_config.Config.ExternalIoConnectionConfig,
+    timeout_ms: u64,
+    arena_state: std.heap.ArenaAllocator,
+    failed_bucket: ?usize = null,
+    err: ?anyerror = null,
+
+    fn run(job: *S3ProbeJob) void {
+        probeS3Buckets(job.arena_state.allocator(), job.cfg, job.timeout_ms, &job.failed_bucket) catch |err| {
+            job.err = err;
+        };
+    }
+};
+
+/// Probes configured S3 connections concurrently through a bounded worker
+/// pool. One worker resolves credentials once and reuses one HTTP client for
+/// every bucket belonging to that connection.
+fn resolveExternalIoProbes(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    node_config: *const common_config.Config,
     cache: ?*Cache,
     opts: BuildOptions,
-) !?ProbeResult {
-    const buckets = cfg.buckets;
-    if (buckets.len == 0) return null;
-
-    const cache_key = try std.fmt.allocPrint(arena, "objectstore\x1f{s}\x1f{s}", .{ name, buckets[0] });
+) !void {
+    const Pending = struct {
+        connection_index: usize,
+        cache_key: []const u8,
+        job: *S3ProbeJob,
+    };
+    var pending = std.ArrayListUnmanaged(Pending).empty;
+    defer for (pending.items) |item| item.job.arena_state.deinit();
     const now_ns = platform_time.monotonicNs();
-    if (!opts.refresh) {
-        if (cache) |c| {
-            if (try c.lookupCopy(arena, cache_key, now_ns, opts.ttl_ns)) |entry| {
-                return .{
-                    .status = if (entry.ok) .connected else .@"error",
-                    .err_name = if (entry.ok) null else entry.err_name,
-                };
+
+    for (connections.items, 0..) |*connection, connection_index| {
+        if (connection.kind != .external_io or connection.external_io.?.protocol != .s3) continue;
+        const configured = node_config.connections.get(connection.id) orelse return error.InvalidConfig;
+        const cfg = configured.external_io orelse return error.InvalidConfig;
+        if (cfg.buckets.len == 0) {
+            connection.status = .@"error";
+            connection.@"error" = "MissingBucketAllowlist";
+            continue;
+        }
+
+        const cache_key = try s3ProbeCacheKeyAlloc(arena, connection.id, cfg);
+        if (!opts.refresh) {
+            if (cache) |c| {
+                if (try c.lookupCopy(arena, cache_key, now_ns, opts.ttl_ns)) |entry| {
+                    connection.status = if (entry.ok) .connected else .@"error";
+                    connection.@"error" = if (entry.ok) null else entry.err_name;
+                    continue;
+                }
             }
         }
+
+        const job = try arena.create(S3ProbeJob);
+        job.* = .{
+            .cfg = cfg,
+            .timeout_ms = @max(opts.timeout_ms, 1),
+            .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        };
+        try pending.append(arena, .{ .connection_index = connection_index, .cache_key = cache_key, .job = job });
     }
 
-    const outcome: ProbeResult = blk: {
-        probeS3Bucket(arena, cfg, buckets[0]) catch |err| {
-            break :blk .{ .status = .@"error", .err_name = @errorName(err) };
-        };
-        break :blk .{ .status = .connected };
-    };
-
-    if (cache) |c| {
-        c.store(cache_key, .{
-            .captured_at_ns = now_ns,
-            .ok = outcome.status == .connected,
-            .err_name = @constCast(outcome.err_name orelse ""),
-        }) catch |err| {
-            std.log.warn("connections: probe cache store failed err={}", .{err});
-        };
+    const max_workers = @min(@max(opts.max_workers, 1), 64);
+    var offset: usize = 0;
+    while (offset < pending.items.len) {
+        const end = @min(pending.items.len, offset + max_workers);
+        var threads: [64]?std.Thread = @splat(null);
+        for (pending.items[offset..end], 0..) |item, slot| {
+            threads[slot] = std.Thread.spawn(.{}, S3ProbeJob.run, .{item.job}) catch blk: {
+                // Resource pressure must not turn a healthy connection into a
+                // cached health failure. Preserve bounded concurrency and run
+                // this probe on the request thread when a worker cannot start.
+                item.job.run();
+                break :blk null;
+            };
+        }
+        for (threads[0 .. end - offset]) |maybe_thread| {
+            if (maybe_thread) |thread| thread.join();
+        }
+        offset = end;
     }
-    return outcome;
+
+    for (pending.items) |item| {
+        const connection = &connections.items[item.connection_index];
+        const outcome: ProbeResult = if (item.job.err) |err| .{
+            .status = .@"error",
+            .err_name = if (item.job.failed_bucket) |bucket_index|
+                try std.fmt.allocPrint(arena, "bucket {s}: {s}", .{ item.job.cfg.buckets[bucket_index], @errorName(err) })
+            else
+                @errorName(err),
+        } else .{ .status = .connected };
+        connection.status = outcome.status;
+        connection.@"error" = outcome.err_name;
+
+        if (cache) |c| {
+            c.store(item.cache_key, .{
+                // TTL starts when the probe completes, not before potentially
+                // slow credential resolution and network I/O.
+                .captured_at_ns = platform_time.monotonicNs(),
+                .ok = outcome.status == .connected,
+                .err_name = @constCast(outcome.err_name orelse ""),
+            }) catch |err| {
+                std.log.warn("connections: probe cache store failed err={}", .{err});
+            };
+        }
+    }
 }
 
-fn probeS3Bucket(
+fn s3ProbeCacheKeyAlloc(arena: Allocator, name: []const u8, cfg: common_config.Config.ExternalIoConnectionConfig) ![]u8 {
+    // Credential material participates in identity so rotation invalidates a
+    // stale probe, but only its cryptographic digest is retained as a cache
+    // key. A full digest also makes cross-connection aliasing negligible.
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hashProbeField(&hash, name);
+    hashProbeOptionalField(&hash, cfg.endpoint);
+    hashProbeOptionalField(&hash, cfg.region);
+    hashProbeField(&hash, @tagName(cfg.addressing_style));
+    hashProbeField(&hash, if (cfg.use_ssl orelse true) "tls" else "plain");
+    for (cfg.buckets) |bucket| hashProbeField(&hash, bucket);
+    hashProbeField(&hash, @tagName(cfg.credentials.source));
+    hashProbeOptionalField(&hash, cfg.credentials.access_key_id);
+    hashProbeOptionalField(&hash, cfg.credentials.secret_access_key);
+    hashProbeOptionalField(&hash, cfg.credentials.session_token);
+    hashProbeOptionalField(&hash, cfg.credentials.profile);
+    hashProbeOptionalField(&hash, cfg.credentials.shared_credentials_file);
+    hashProbeOptionalField(&hash, cfg.credentials.role_arn);
+    hashProbeOptionalField(&hash, cfg.credentials.token_file);
+    hashProbeOptionalField(&hash, cfg.credentials.session_name);
+    hashProbeOptionalField(&hash, cfg.credentials.sts_endpoint);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    return try std.fmt.allocPrint(arena, "objectstore\x1f{s}", .{digest_hex});
+}
+
+fn hashProbeField(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    const len: u64 = @intCast(value.len);
+    hash.update(std.mem.asBytes(&len));
+    hash.update(value);
+}
+
+fn hashProbeOptionalField(hash: *std.crypto.hash.sha2.Sha256, value: ?[]const u8) void {
+    if (value) |present| {
+        hash.update(&.{1});
+        hashProbeField(hash, present);
+    } else {
+        hash.update(&.{0});
+    }
+}
+
+fn probeS3Buckets(
     arena: Allocator,
     cfg: common_config.Config.ExternalIoConnectionConfig,
-    bucket: []const u8,
+    timeout_ms: u64,
+    failed_bucket: *?usize,
 ) !void {
     var dynamic_credentials: ?bedrock.Credentials = null;
     defer if (dynamic_credentials) |*credentials| credentials.deinit(arena);
@@ -891,7 +990,12 @@ fn probeS3Bucket(
     if (cfg.credentials.source != .static) {
         var io_impl = std.Io.Threaded.init(arena, .{});
         defer io_impl.deinit();
-        var http = httpx.Client.init(arena, io_impl.io());
+        var http = httpx.Client.initWithConfig(arena, io_impl.io(), .{ .timeouts = .{
+            .connect_ms = timeout_ms,
+            .read_ms = timeout_ms,
+            .write_ms = timeout_ms,
+            .request_ms = timeout_ms,
+        } });
         defer http.deinit();
         var credential_cache: bedrock.CredentialCache = .{};
         defer credential_cache.deinit(arena);
@@ -912,17 +1016,10 @@ fn probeS3Bucket(
         dynamic_credentials = try credential_cache.getForSource(arena, &http, cfg.region orelse "us-east-1", source);
     }
 
-    const access_key_id = if (dynamic_credentials) |credentials|
-        credentials.access_key_id
-    else
-        cfg.credentials.access_key_id orelse return error.InvalidConnectionCredentials;
-    const secret_access_key = if (dynamic_credentials) |credentials|
-        credentials.secret_access_key
-    else
-        cfg.credentials.secret_access_key orelse return error.InvalidConnectionCredentials;
+    const access_key_id = if (dynamic_credentials) |credentials| credentials.access_key_id else cfg.credentials.access_key_id orelse return error.InvalidConnectionCredentials;
+    const secret_access_key = if (dynamic_credentials) |credentials| credentials.secret_access_key else cfg.credentials.secret_access_key orelse return error.InvalidConnectionCredentials;
     const session_token = if (dynamic_credentials) |credentials| credentials.session_token else cfg.credentials.session_token;
-
-    const s3_config = try objectstore.s3.fromEnvAlloc(
+    var s3_config = try objectstore.s3.fromEnvAlloc(
         arena,
         cfg.endpoint,
         cfg.use_ssl orelse true,
@@ -935,16 +1032,44 @@ fn probeS3Bucket(
             .virtual_hosted => .virtual_hosted,
         },
     );
+    s3_config.request_timeout_ms = timeout_ms;
     var s3_client = try objectstore.s3.Client.init(arena, s3_config);
     var client = s3_client.client();
     defer client.deinit();
-    const exists = try client.bucketExists(bucket);
-    if (!exists) return error.BucketNotFound;
+    for (cfg.buckets, 0..) |bucket, bucket_index| {
+        const exists = client.bucketExists(bucket) catch |err| {
+            failed_bucket.* = bucket_index;
+            return err;
+        };
+        if (!exists) {
+            failed_bucket.* = bucket_index;
+            return error.BucketNotFound;
+        }
+    }
 }
 
 // --- Tests ---
 
 const table_manager = @import("../metadata/table_manager.zig");
+
+test "S3 probe cache identity covers every bucket and credential source" {
+    const alloc = std.testing.allocator;
+    var first = common_config.Config.ExternalIoConnectionConfig{
+        .protocol = .s3,
+        .buckets = @constCast(&[_][]u8{ @constCast("bucket-one"), @constCast("bucket-two") }),
+        .credentials = .{ .source = .profile, .profile = @constCast("reader-a") },
+    };
+    const first_key = try s3ProbeCacheKeyAlloc(alloc, "archive", first);
+    defer alloc.free(first_key);
+    first.buckets = @constCast(&[_][]u8{ @constCast("bucket-one"), @constCast("bucket-three") });
+    const bucket_key = try s3ProbeCacheKeyAlloc(alloc, "archive", first);
+    defer alloc.free(bucket_key);
+    try std.testing.expect(!std.mem.eql(u8, first_key, bucket_key));
+    first.credentials.profile = @constCast("reader-b");
+    const credential_key = try s3ProbeCacheKeyAlloc(alloc, "archive", first);
+    defer alloc.free(credential_key);
+    try std.testing.expect(!std.mem.eql(u8, bucket_key, credential_key));
+}
 
 test "build response reports mock connected and types filter" {
     const alloc = std.testing.allocator;

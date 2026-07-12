@@ -108,8 +108,10 @@ const S3ClientPool = struct {
                 .access_key_id = @constCast(credentials.access_key_id),
                 .secret_access_key = @constCast(credentials.secret_access_key),
                 .session_token = if (credentials.session_token) |value| @constCast(value) else null,
-                .release_ctx = lease.releaseContext(),
-                .release_fn = bedrock.CredentialCache.Lease.releaseOpaque,
+                .ownership = .{ .borrowed = .{
+                    .ctx = lease.releaseContext(),
+                    .release = bedrock.CredentialCache.Lease.releaseOpaque,
+                } },
             };
         }
     };

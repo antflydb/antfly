@@ -32,6 +32,10 @@ pub const Config = struct {
     credentials: Credentials,
     addressing_style: AddressingStyle = .virtual_hosted,
     credential_provider: ?CredentialProvider = null,
+    /// Optional hard ceiling for one object-store HTTP request. Production
+    /// clients normally use the transport defaults; health probes set this so
+    /// an unreachable endpoint cannot monopolize an API worker.
+    request_timeout_ms: ?u64 = null,
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         self.credentials.deinit(alloc);
@@ -52,19 +56,29 @@ pub const Config = struct {
 };
 
 pub const DynamicCredentials = struct {
+    pub const Borrowed = struct {
+        ctx: *anyopaque,
+        release: *const fn (*anyopaque) void,
+    };
+
+    pub const Ownership = union(enum) {
+        owned,
+        borrowed: Borrowed,
+    };
+
     access_key_id: []u8,
     secret_access_key: []u8,
     session_token: ?[]u8 = null,
-    release_ctx: ?*anyopaque = null,
-    release_fn: ?*const fn (*anyopaque) void = null,
+    ownership: Ownership = .owned,
 
     pub fn deinit(self: *DynamicCredentials, alloc: Allocator) void {
-        if (self.release_fn) |release| {
-            release(self.release_ctx.?);
-        } else {
-            alloc.free(self.access_key_id);
-            alloc.free(self.secret_access_key);
-            if (self.session_token) |value| alloc.free(value);
+        switch (self.ownership) {
+            .owned => {
+                alloc.free(self.access_key_id);
+                alloc.free(self.secret_access_key);
+                if (self.session_token) |value| alloc.free(value);
+            },
+            .borrowed => |borrowed| borrowed.release(borrowed.ctx),
         }
         self.* = undefined;
     }
@@ -132,13 +146,23 @@ const HttpxTransport = struct {
     io_impl: std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator) HttpxTransport {
+    fn init(alloc: Allocator, request_timeout_ms: ?u64) HttpxTransport {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
+        const client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
+            .timeouts = .{
+                .connect_ms = timeout_ms,
+                .read_ms = timeout_ms,
+                .write_ms = timeout_ms,
+                .keep_alive_ms = timeout_ms,
+                .idle_ms = timeout_ms,
+                .request_ms = timeout_ms,
+            },
+        } else .{};
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = httpx.Client.init(alloc, io_impl.io()),
+            .client = httpx.Client.initWithConfig(alloc, io_impl.io(), client_config),
         };
     }
 
@@ -194,7 +218,7 @@ pub const Client = struct {
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = HttpxTransport.init(alloc);
+        transport.* = HttpxTransport.init(alloc, cfg.request_timeout_ms);
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -243,7 +267,9 @@ pub const Client = struct {
         var response = try self.perform(.HEAD, target, &.{}, null, null);
         defer response.deinit(self.alloc);
         return switch (response.status) {
-            200, 204, 301, 403 => true,
+            200, 204 => true,
+            301 => error.BucketRegionMismatch,
+            401, 403 => error.AccessDenied,
             404 => false,
             else => return unexpectedStatusError(response.status),
         };
@@ -1490,6 +1516,55 @@ test "s3 client refreshes dynamic credentials for every signed request" {
     try std.testing.expect(try client.bucketExists("bucket"));
     try std.testing.expectEqual(@as(usize, 2), provider.calls);
     try std.testing.expectEqual(@as(usize, 2), fake.requests);
+}
+
+test "s3 bucket existence fails closed on access denied" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        fn request(
+            _: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+        ) !TransportResponse {
+            try std.testing.expectEqual(HttpMethod.HEAD, method);
+            return .{ .status = 403, .body = try request_alloc.alloc(u8, 0) };
+        }
+    };
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.example.invalid"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "denied"),
+            .secret_access_key = try alloc.dupe(u8, "denied"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+    };
+    var s3_client = Client.initWithRequestFn(alloc, cfg, null, Fake.request);
+    var client = s3_client.client();
+    defer client.deinit();
+    try std.testing.expectError(error.AccessDenied, client.bucketExists("private-bucket"));
+}
+
+test "borrowed dynamic credentials release through tagged ownership" {
+    const alloc = std.testing.allocator;
+    const Release = struct {
+        fn call(ptr: *anyopaque) void {
+            const released: *bool = @ptrCast(@alignCast(ptr));
+            released.* = true;
+        }
+    };
+    var released = false;
+    var credentials = DynamicCredentials{
+        .access_key_id = @constCast("borrowed-key"),
+        .secret_access_key = @constCast("borrowed-secret"),
+        .ownership = .{ .borrowed = .{ .ctx = &released, .release = Release.call } },
+    };
+    credentials.deinit(alloc);
+    try std.testing.expect(released);
 }
 
 test "s3 client round-trips against env-configured endpoint" {

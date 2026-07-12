@@ -246,7 +246,7 @@ pub const ExternalIoConnectionConfig = struct {
     addressing_style: ?[]const u8 = null,
     /// Whether runtime startup may create missing buckets. Production connections should require infrastructure-provisioned buckets.
     bucket_provisioning: ?[]const u8 = null,
-    /// Buckets this connection is configured for.
+    /// Explicit bucket allowlist for this connection. S3 connections must configure at least one bucket; omission never means unrestricted access.
     buckets: ?[]const []const u8 = null,
     /// Key-prefix boundary enforced for every use of this connection.
     prefix: ?[]const u8 = null,
