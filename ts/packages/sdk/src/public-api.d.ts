@@ -4618,6 +4618,22 @@ export interface components {
             format?: "native" | "portable";
         };
         RestoreRequest: components["schemas"]["BackupRequest"];
+        RestoreTriggeredResponse: {
+            /** @enum {string} */
+            restore: "triggered";
+        };
+        RestoreCommittedPendingResponse: {
+            /** @enum {string} */
+            restore: "committed";
+            /** @enum {string} */
+            durability: "pending";
+        };
+        RestoreCommittedDurableResponse: {
+            /** @enum {string} */
+            restore: "committed";
+            /** @enum {string} */
+            durability: "durable";
+        };
         ClusterBackupRequest: {
             /**
              * @description Unique identifier for this backup. Used to reference the backup for restore operations.
@@ -13430,12 +13446,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** @enum {string} */
-                        restore: "committed";
-                        /** @enum {string} */
-                        durability: "durable";
-                    };
+                    "application/json": components["schemas"]["RestoreCommittedDurableResponse"];
                 };
             };
             /** @description Restore committed or triggered successfully */
@@ -13444,15 +13455,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** @enum {string} */
-                        restore: "triggered";
-                    } | {
-                        /** @enum {string} */
-                        restore: "committed";
-                        /** @enum {string} */
-                        durability: "pending";
-                    };
+                    "application/json": components["schemas"]["RestoreTriggeredResponse"] | components["schemas"]["RestoreCommittedPendingResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];

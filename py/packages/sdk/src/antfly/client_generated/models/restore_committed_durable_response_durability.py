@@ -1,8 +1,8 @@
 from enum import Enum
 
 
-class RestoreTableResponse202Type1Durability(str, Enum):
-    PENDING = "pending"
+class RestoreCommittedDurableResponseDurability(str, Enum):
+    DURABLE = "durable"
 
     def __str__(self) -> str:
         return str(self.value)

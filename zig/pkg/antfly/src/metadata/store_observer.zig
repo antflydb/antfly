@@ -210,7 +210,9 @@ fn runtimeStatusEqual(
             left.coverage_produced_count != right.coverage_produced_count or
             left.coverage_skipped_count != right.coverage_skipped_count or
             left.coverage_terminal_failed_count != right.coverage_terminal_failed_count or
+            left.coverage_generation != right.coverage_generation or
             left.coverage_config_hash != right.coverage_config_hash or
+            left.coverage_identity_ready != right.coverage_identity_ready or
             left.coverage_summary_ready != right.coverage_summary_ready or
             left.backfill_active != right.backfill_active or
             left.backfill_progress_millis != right.backfill_progress_millis or

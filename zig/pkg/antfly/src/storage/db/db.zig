@@ -9052,6 +9052,13 @@ pub const DB = struct {
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
+        if (restart_enrichment) self.enrichment_runtime.?.stop();
+        defer if (restart_enrichment) {
+            self.enrichment_runtime.?.start() catch |err| {
+                std.log.err("failed to restart enrichment runtime after index creation index={s} err={s}", .{ cfg.name, @errorName(err) });
+            };
+        };
         lockApply(self);
         var apply_locked = true;
         errdefer if (apply_locked) self.core.unlockApply();
@@ -9066,8 +9073,31 @@ pub const DB = struct {
         const needs_enrichment_replay = try self.core.indexRequiresEnrichmentReplay(cfg.name);
         self.core.unlockApply();
         apply_locked = false;
+        var worker_applied = applied;
+        if (needs_enrichment_replay) {
+            // A newly admitted managed index owns a fresh coverage generation.
+            // Journal entries at or before the current head may belong to a
+            // retired incarnation with the same public name, so establish the
+            // new worker's baseline at that head after rebuilding current
+            // materialized artifacts. Fresh enrichment replay is appended below
+            // and therefore remains visible to the worker.
+            const rebuilt = switch (cfg.kind) {
+                .dense_vector => try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048),
+                .sparse_vector => try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048),
+                else => 0,
+            };
+            const generation_baseline = self.core.nextDerivedSequence();
+            if (rebuilt > 0 or generation_baseline > worker_applied) {
+                worker_applied = generation_baseline;
+                try self.core.saveAppliedSequence(cfg.name, worker_applied);
+                try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
+                    .index_name = cfg.name,
+                    .sequence = worker_applied,
+                }});
+            }
+        }
         if (self.start_index_workers) {
-            try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, applied);
+            try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
         }
         if (needs_enrichment_replay) {
             if (self.enrichment_runtime != null) {
@@ -9078,6 +9108,10 @@ pub const DB = struct {
                     try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
                 }
             }
+        }
+        if (self.start_index_workers) {
+            const current_target = self.core.nextDerivedSequence();
+            if (current_target > worker_applied) self.executor.notifyIndexes(current_target, &.{cfg.name});
         }
     }
 
@@ -10090,6 +10124,13 @@ pub const DB = struct {
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const restart_enrichment = if (self.enrichment_runtime) |runtime| runtime.isStarted() else false;
+        if (restart_enrichment) self.enrichment_runtime.?.stop();
+        defer if (restart_enrichment) {
+            self.enrichment_runtime.?.start() catch |err| {
+                std.log.err("failed to restart enrichment runtime after index deletion index={s} err={s}", .{ name, @errorName(err) });
+            };
+        };
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
@@ -10210,11 +10251,13 @@ pub const DB = struct {
     }
 
     fn resolutionStageStats(self: *DB) types.ReplayStageStats {
+        if (!self.hasConfiguredResolvers()) return .{};
         if (self.resolution_runtime) |runtime| return runtime.stats();
         return self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false) catch .{};
     }
 
     fn promotionStageStats(self: *DB) types.ReplayStageStats {
+        if (!self.hasConfiguredResolvers()) return .{};
         if (self.promotion_runtime) |runtime| return runtime.stats();
         return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
     }
@@ -29430,10 +29473,6 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     if (asyncContextHasActiveExternalDenseBulkWork(ctx)) return false;
     if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return true;
 
-    const now_ns = monotonicTimeNs();
-    if (!shouldRunTargetAdvanceRepair(ctx, index_ref.name, now_ns)) return false;
-    try noteTargetAdvanceRepairRun(ctx, index_ref.name, now_ns);
-
     const expected_doc_count = (try denseTargetCountForIndexContext(ctx, index_ref.name)) orelse {
         std.log.warn(
             "dense replay target advance deferred by missing durable artifact counter index={s}",
@@ -29443,6 +29482,10 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     };
     if (expected_doc_count == 0) return true;
     if (entry.index.stats().active_count >= expected_doc_count) return true;
+
+    const now_ns = monotonicTimeNs();
+    if (!shouldRunTargetAdvanceRepair(ctx, index_ref.name, now_ns)) return false;
+    try noteTargetAdvanceRepairRun(ctx, index_ref.name, now_ns);
 
     std.log.warn(
         "dense replay target advance blocked by coverage gap index={s} indexed={} expected_docs={}",
@@ -43218,6 +43261,58 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try db.runUntilIdle();
 }
 
+test "db managed dense delete quiesces rate-limited enrichment and recreates cleanly" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+        },
+    });
+    defer db.close();
+
+    const cfg: types.IndexConfig = .{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    };
+    try db.addIndex(cfg);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta architecture notes\"}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma implementation details\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var attempts: usize = 0;
+    while (attempts < 200 and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+
+    const delete_started_ns = monotonicTimeNs();
+    try std.testing.expect(try db.deleteIndex("semantic_idx"));
+    try std.testing.expect(monotonicTimeNs() - delete_started_ns < 2 * std.time.ns_per_s);
+
+    gated.allowAll();
+    try db.addIndex(cfg);
+    try db.runUntilIdle();
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+    try std.testing.expectEqual(@as(u64, 3), stats.indexes[0].doc_count);
+    try std.testing.expect(stats.indexes[0].replay_applied_sequence >= stats.indexes[0].replay_target_sequence);
+}
+
 test "db open quarantines dense index with unsupported artifact version" {
     const alloc = std.testing.allocator;
 
@@ -43960,6 +44055,57 @@ test "db chunked dense enrichment replays cached artifacts after dense reset wit
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db recreated managed dense index converges replay and irrelevant resolver stages" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    const config: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    };
+    try db.addIndex(config);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"abcdefghijklmno\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const calls_before_recreate = counting.calls;
+    try std.testing.expect(calls_before_recreate > 0);
+    try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    try noteTargetAdvanceRepairRun(db.async_context, "dv_v1", monotonicTimeNs());
+    try std.testing.expect(try db.deleteIndex("dv_v1"));
+    try db.addIndex(config);
+    try db.runUntilIdle();
+
+    try std.testing.expect(counting.calls >= calls_before_recreate);
+    try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    const replay = for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "dv_v1")) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(replay.replay_applied_sequence >= replay.replay_target_sequence);
+    try std.testing.expect(!stats.resolution.enabled);
+    try std.testing.expect(!stats.resolution.catch_up_required);
+    try std.testing.expect(!stats.promotion.enabled);
+    try std.testing.expect(!stats.promotion.catch_up_required);
 }
 
 test "db reopened chunked dense HBC deletes stale vectors through artifact loader" {

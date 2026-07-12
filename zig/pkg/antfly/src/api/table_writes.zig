@@ -48,6 +48,7 @@ const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
+const coverage_policy_mod = @import("coverage_policy.zig");
 const query_api = @import("query.zig");
 const runtime_status = @import("runtime_status.zig");
 const http_server = @import("http_server.zig");
@@ -4247,6 +4248,7 @@ pub const ProvisionedTableWriteSource = struct {
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
+    dirty_write_all_tables: std.atomic.Value(bool) = .init(false),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     dirty_write_table_hashes: [max_cached_write_tables]u64 = [_]u64{0} ** max_cached_write_tables,
     dirty_write_table_hashes_len: usize = 0,
@@ -5819,9 +5821,7 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 }
-                lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
-                self.local_db_mutex.unlock();
                 self.notifyLocalChange(table_name, .data);
                 return;
             },
@@ -5834,9 +5834,7 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 }
-                lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
-                self.local_db_mutex.unlock();
             },
             .publish_consistent => {
                 if (db) |managed_db| {
@@ -5851,16 +5849,12 @@ pub const ProvisionedTableWriteSource = struct {
                             }
                         };
                         self.invalidateReadCache(table_name);
-                        lockAtomic(&self.local_db_mutex);
                         self.markWriteCacheDirty(table_name);
-                        self.local_db_mutex.unlock();
                         self.notifyLocalChange(table_name, .data);
                         return;
                     }
                 }
-                lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
-                self.local_db_mutex.unlock();
             },
             .publish_blocking => {
                 if (db) |managed_db| {
@@ -5872,9 +5866,7 @@ pub const ProvisionedTableWriteSource = struct {
                                 @errorName(err),
                             });
                             self.invalidateRuntimeStatusCache(table_name);
-                            lockAtomic(&self.local_db_mutex);
                             self.markWriteCacheDirty(table_name);
-                            self.local_db_mutex.unlock();
                             self.invalidateReadCache(table_name);
                             self.notifyLocalChange(table_name, .data);
                             return;
@@ -5886,9 +5878,7 @@ pub const ProvisionedTableWriteSource = struct {
                     }
                 }
                 self.invalidateRuntimeStatusCache(table_name);
-                lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
-                self.local_db_mutex.unlock();
             },
             .invalidate => {},
         }
@@ -7506,6 +7496,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn isWriteCacheDirtyForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        if (self.dirty_write_all_tables.load(.acquire)) return true;
         if (self.dirty_write_table_count.load(.acquire) == 0) return false;
         lockAtomic(&self.dirty_write_tables_mutex);
         defer self.dirty_write_tables_mutex.unlock();
@@ -7515,6 +7506,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn clearAllDirtyWriteTablesLocked(self: *ProvisionedTableWriteSource) void {
         self.dirty_write_table_hashes_len = 0;
         self.dirty_write_table_count.store(0, .release);
+        self.dirty_write_all_tables.store(false, .release);
     }
 
     fn clearAllDirtyWriteTables(self: *ProvisionedTableWriteSource) void {
@@ -7541,6 +7533,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn hasDirtyWriteTableWithLocalDbLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        if (self.dirty_write_all_tables.load(.acquire)) {
+            const cache = self.write_cache orelse return false;
+            return cache.bulkIngestSessionOpenForTable(table_name) or cache.hasLiveEntryForTableLocked(table_name);
+        }
         if (self.dirty_write_table_count.load(.acquire) == 0) return false;
         const dirty = dirty_blk: {
             lockAtomic(&self.dirty_write_tables_mutex);
@@ -7572,8 +7568,9 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.dirty_write_table_hashes_len >= self.dirty_write_table_hashes.len) {
+            self.dirty_write_all_tables.store(true, .release);
+            self.dirty_write_table_count.store(@intCast(self.dirty_write_table_hashes_len), .release);
             self.dirty_write_tables_mutex.unlock();
-            self.clearWriteCacheLocked();
             return;
         }
         self.dirty_write_table_hashes[self.dirty_write_table_hashes_len] = table_hash;
@@ -7583,6 +7580,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn invalidateDirtyWriteCacheForRead(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        if (self.dirty_write_all_tables.load(.acquire)) {
+            self.invalidateWriteCache(table_name);
+            return;
+        }
         lockAtomic(&self.dirty_write_tables_mutex);
         const dirty = self.hasDirtyWriteTableLocked(table_name);
         self.dirty_write_tables_mutex.unlock();
@@ -12206,6 +12207,7 @@ fn parseIndexConfigWithOptions(
         .name = try alloc.dupe(u8, index_name),
         .kind = kind,
         .config_json = config_json,
+        .coverage_generation = coverage_policy_mod.incarnation(parsed.value) orelse 0,
     };
 }
 
@@ -12680,6 +12682,7 @@ fn applyIndexCreateToCachedDb(
         .name = owned_name,
         .kind = kind,
         .config_json = config_json,
+        .coverage_generation = coverage_policy_mod.incarnation(lookup.config) orelse 0,
     }) catch |err| switch (err) {
         error.IndexAlreadyExists => {},
         else => return err,
@@ -21443,13 +21446,14 @@ test "provisioned create index updates cached writer in place" {
     const original_entry = cached.entry.?;
     try std.testing.expect(cached.db.core.index_manager.denseIndex("semantic_idx") == null);
 
-    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}}";
+    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"_antfly_coverage_incarnation\":42}}";
     _ = try source.source().createIndex(alloc, "docs", "semantic_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expect(write_cache.entries.items[0] == original_entry);
     try std.testing.expect(cached.db.core.index_manager.denseIndex("semantic_idx") != null);
+    try std.testing.expectEqual(@as(?u64, 42), cached.db.core.index_manager.coverageGenerationForIndex("semantic_idx"));
 
     var outer_cache = ProvisionedTableWriteCache.init(alloc);
     defer outer_cache.deinit();
@@ -21458,7 +21462,7 @@ test "provisioned create index updates cached writer in place" {
     _ = outer_source.withLocalWriteOwner(&source);
 
     Catalog.indexes_json_buf =
-        \\{"semantic_idx":{"type":"embeddings","dimension":3,"external":true},"owner_forwarded_idx":{"type":"embeddings","dimension":3,"external":true}}
+        \\{"semantic_idx":{"type":"embeddings","dimension":3,"external":true,"_antfly_coverage_incarnation":42},"owner_forwarded_idx":{"type":"embeddings","dimension":3,"external":true,"_antfly_coverage_incarnation":43}}
     ;
     _ = try outer_source.source().createIndex(alloc, "docs", "owner_forwarded_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
 
@@ -21466,8 +21470,9 @@ test "provisioned create index updates cached writer in place" {
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(write_cache.entries.items[0] == original_entry);
     try std.testing.expect(cached.db.core.index_manager.denseIndex("owner_forwarded_idx") != null);
+    try std.testing.expectEqual(@as(?u64, 43), cached.db.core.index_manager.coverageGenerationForIndex("owner_forwarded_idx"));
 
-    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}}";
+    Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"_antfly_coverage_incarnation\":42}}";
     _ = try source.source().dropIndex(alloc, "docs", "owner_forwarded_idx");
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);

@@ -526,14 +526,14 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
-from .restore_table_response_200 import RestoreTableResponse200
-from .restore_table_response_200_durability import RestoreTableResponse200Durability
-from .restore_table_response_200_restore import RestoreTableResponse200Restore
-from .restore_table_response_202_type_0 import RestoreTableResponse202Type0
-from .restore_table_response_202_type_0_restore import RestoreTableResponse202Type0Restore
-from .restore_table_response_202_type_1 import RestoreTableResponse202Type1
-from .restore_table_response_202_type_1_durability import RestoreTableResponse202Type1Durability
-from .restore_table_response_202_type_1_restore import RestoreTableResponse202Type1Restore
+from .restore_committed_durable_response import RestoreCommittedDurableResponse
+from .restore_committed_durable_response_durability import RestoreCommittedDurableResponseDurability
+from .restore_committed_durable_response_restore import RestoreCommittedDurableResponseRestore
+from .restore_committed_pending_response import RestoreCommittedPendingResponse
+from .restore_committed_pending_response_durability import RestoreCommittedPendingResponseDurability
+from .restore_committed_pending_response_restore import RestoreCommittedPendingResponseRestore
+from .restore_triggered_response import RestoreTriggeredResponse
+from .restore_triggered_response_restore import RestoreTriggeredResponseRestore
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
@@ -1180,14 +1180,14 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
-    "RestoreTableResponse200",
-    "RestoreTableResponse200Durability",
-    "RestoreTableResponse200Restore",
-    "RestoreTableResponse202Type0",
-    "RestoreTableResponse202Type0Restore",
-    "RestoreTableResponse202Type1",
-    "RestoreTableResponse202Type1Durability",
-    "RestoreTableResponse202Type1Restore",
+    "RestoreCommittedDurableResponse",
+    "RestoreCommittedDurableResponseDurability",
+    "RestoreCommittedDurableResponseRestore",
+    "RestoreCommittedPendingResponse",
+    "RestoreCommittedPendingResponseDurability",
+    "RestoreCommittedPendingResponseRestore",
+    "RestoreTriggeredResponse",
+    "RestoreTriggeredResponseRestore",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",

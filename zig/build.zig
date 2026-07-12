@@ -4328,8 +4328,10 @@ pub fn build(b: *std.Build) void {
         .root_module = api_derived_coverage_test_mod,
         .filters = &.{
             "coverage policy accepts only the public embeddings contract",
+            "coverage policy assigns persistent private incarnations only to embeddings",
             "derived coverage evaluation is policy exact and observation gated",
             "derived coverage aggregation rejects mixed config observations",
+            "derived coverage aggregation rejects stale index incarnations",
             "derived coverage reasons expose counter mismatch",
             "derived coverage rejects unknown freshness for aggregate and shard views",
             "cached all-skipped coverage observation is a runtime fact",
@@ -4513,6 +4515,7 @@ pub fn build(b: *std.Build) void {
             "metadata store observer ",
             "metadata state machine projects transitions through metadata apply store",
             "table provisioner restore rejects mismatched doc identity namespace",
+            "table provisioner replaces embedding index when metadata incarnation changes",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

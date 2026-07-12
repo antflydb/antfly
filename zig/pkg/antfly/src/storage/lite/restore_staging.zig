@@ -1022,7 +1022,6 @@ test "lite portable backup roundtrips through normal table backup APIs" {
         .backup_root = backup_root,
         .manifest = &lite_manifest,
     });
-    try normal_db.core.loadIndexes();
     _ = try normal_db.rebuildDenseIndexesForTargetCoverage(allocator);
     _ = try normal_db.rebuildSparseIndexesForTargetCoverage(allocator);
     try normal_db.rebuildGraphIndexesForTargetCoverage(allocator);

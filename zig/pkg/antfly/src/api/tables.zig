@@ -608,7 +608,9 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
     if (root.get("indexes")) |value| {
         if (value != .null) {
             try validateIndexesValue(value);
-            req.indexes_json = try stringifyJsonValue(alloc, value);
+            const public_indexes_json = try stringifyJsonValue(alloc, value);
+            defer alloc.free(public_indexes_json);
+            req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, public_indexes_json);
         } else req.indexes_json = try alloc.dupe(u8, default_indexes_json);
     } else {
         req.indexes_json = try alloc.dupe(u8, default_indexes_json);

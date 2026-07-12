@@ -471,6 +471,10 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
     };
 }
 
+fn isEnrichmentControlError(err: anyerror) bool {
+    return err == error.EnrichmentRetryAborted;
+}
+
 test "enrichment treats missing local model as retryable" {
     try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
 }
@@ -1157,6 +1161,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = self;
     }
 
+    pub fn isStarted(_: *const @This()) bool {
+        return false;
+    }
+
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
@@ -1423,6 +1431,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.future = null;
         self.shutdown = false;
         self.ownership.release();
+    }
+
+    pub fn isStarted(self: *const EnrichmentRuntime) bool {
+        return self.future != null;
     }
 
     pub fn start(self: *EnrichmentRuntime) !void {
@@ -1804,6 +1816,7 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
     var max_seen = runtime.applied_sequence;
 
     retry_pending: while (true) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
         defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
         var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
@@ -1916,22 +1929,22 @@ fn processPendingDocumentGroup(
         }
         switch (request.kind) {
             .asset => processAsset(runtime, request, deferred_assets, window) catch |err| {
-                if (isRetryableEnrichmentError(err)) return err;
+                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .chunk_text => processChunkText(runtime, request, chunk_cache, window) catch |err| {
-                if (isRetryableEnrichmentError(err)) return err;
+                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, window) catch |err| {
-                if (isRetryableEnrichmentError(err)) return err;
+                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
-                if (isRetryableEnrichmentError(err)) return err;
+                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
@@ -2104,7 +2117,7 @@ fn flushAssetProducerBatch(
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
         if (err == error.OutOfMemory) return err;
-        if (isRetryableEnrichmentError(err)) return err;
+        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
     };
     if (produced.len != items.items.len) {
@@ -2127,7 +2140,7 @@ fn flushAssetProducerBatch(
             runtime.alloc.free(output);
             produced[idx] = "";
             if (err == error.OutOfMemory) return err;
-            if (isRetryableEnrichmentError(err)) return err;
+            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
@@ -2146,14 +2159,14 @@ fn flushAssetProducerBatchSequential(
         const request = item.asRequest();
         const produced = producer.produce(runtime.alloc, request) catch |err| {
             if (err == error.OutOfMemory) return err;
-            if (isRetryableEnrichmentError(err)) return err;
+            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
         defer runtime.alloc.free(produced);
         applyAssetProducerBatchOutput(runtime, item, produced, window) catch |err| {
             if (err == error.OutOfMemory) return err;
-            if (isRetryableEnrichmentError(err)) return err;
+            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             recordIsolatedRequestError(runtime, window, item.request, err);
         };
     }
@@ -2333,7 +2346,7 @@ fn processDocumentExtractionAsset(
     };
     defer collect_ctx.deinit(runtime.alloc);
     document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |err| {
-        if (isRetryableEnrichmentError(err)) return err;
+        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -2471,7 +2484,7 @@ fn processDocumentExtractionAsset(
         .mode = .store_artifacts,
     };
     document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, store_ctx.sink()) catch |err| {
-        if (isRetryableEnrichmentError(err)) return err;
+        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -2805,7 +2818,7 @@ fn flushRuntimeGeneratedTextBatch(
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
-        if (isRetryableEnrichmentError(err)) return err;
+        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind);
     };
     if (produced.len != requests.len) {
@@ -2825,7 +2838,7 @@ fn flushRuntimeGeneratedTextBatch(
     for (produced, unit_indices, 0..) |item, unit_idx, i| {
         produced[i] = &.{};
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind) catch |err| {
-            if (isRetryableEnrichmentError(err)) return err;
+            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
@@ -2845,12 +2858,12 @@ fn flushRuntimeGeneratedTextBatchSequential(
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
         const produced = producer.produce(runtime.alloc, request) catch |err| {
-            if (isRetryableEnrichmentError(err)) return err;
+            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
             continue;
         };
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind) catch |err| {
-            if (isRetryableEnrichmentError(err)) return err;
+            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
@@ -4474,7 +4487,7 @@ fn flushChunkedDenseItems(
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
         noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-        if (isRetryableEnrichmentError(err)) return err;
+        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         for (batch_items) |item| recordIsolatedRequestError(runtime, window, item.request, err);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
@@ -5096,7 +5109,7 @@ fn processPlainDenseWindow(
         }
 
         flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window) catch |err| {
-            if (isRetryableEnrichmentError(err)) return err;
+            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             for (items.items) |item| recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };

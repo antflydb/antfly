@@ -634,9 +634,9 @@ fn clearPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) bool {
     return true;
 }
 
-const RetiredGenerationCleanup = struct {
+const RetiredGenerationCleanupBatch = struct {
     alloc: Allocator,
-    path: []u8,
+    paths: [][]u8,
     parent: []u8,
 
     fn run(ptr: *anyopaque) !void {
@@ -648,40 +648,60 @@ const RetiredGenerationCleanup = struct {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        std.Io.Dir.cwd().deleteTree(io, self.path) catch |err| switch (err) {
-            error.NotDir => return,
-            else => return err,
-        };
+        var first_error: ?anyerror = null;
+        for (self.paths) |path| {
+            std.Io.Dir.cwd().deleteTree(io, path) catch |err| switch (err) {
+                error.NotDir => {},
+                else => if (first_error == null) {
+                    first_error = err;
+                },
+            };
+        }
         try fs_paths.syncDirPortable(io, self.parent);
+        if (first_error) |err| return err;
     }
 
     fn deinit(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const alloc = self.alloc;
-        alloc.free(self.path);
+        for (self.paths) |path| alloc.free(path);
+        alloc.free(self.paths);
         alloc.free(self.parent);
         alloc.destroy(self);
     }
 };
 
 fn scheduleRetiredGenerationCleanup(scheduler: ?CleanupScheduler, path: []const u8, parent: []const u8) !void {
+    return try scheduleRetiredGenerationCleanupBatch(scheduler, &.{path}, parent);
+}
+
+fn scheduleRetiredGenerationCleanupBatch(scheduler: ?CleanupScheduler, paths: []const []const u8, parent: []const u8) !void {
     const active = scheduler orelse return;
-    const work = try active.alloc.create(RetiredGenerationCleanup);
+    if (paths.len == 0) return;
+    const work = try active.alloc.create(RetiredGenerationCleanupBatch);
     errdefer active.alloc.destroy(work);
+    const owned_paths = try active.alloc.alloc([]u8, paths.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned_paths[0..initialized]) |path| active.alloc.free(path);
+        active.alloc.free(owned_paths);
+    }
+    for (paths, 0..) |path, i| {
+        owned_paths[i] = try active.alloc.dupe(u8, path);
+        initialized += 1;
+    }
     work.* = .{
         .alloc = active.alloc,
-        .path = try active.alloc.dupe(u8, path),
-        .parent = undefined,
+        .paths = owned_paths,
+        .parent = try active.alloc.dupe(u8, parent),
     };
-    errdefer active.alloc.free(work.path);
-    work.parent = try active.alloc.dupe(u8, parent);
     errdefer active.alloc.free(work.parent);
     try active.lane.submit(.{
         .owner_id = active.owner_id,
         .class = .cleanup,
         .ptr = work,
-        .run = RetiredGenerationCleanup.run,
-        .deinit = RetiredGenerationCleanup.deinit,
+        .run = RetiredGenerationCleanupBatch.run,
+        .deinit = RetiredGenerationCleanupBatch.deinit,
     });
 }
 
@@ -711,11 +731,18 @@ fn cleanupStagedGenerations(alloc: Allocator, io: std.Io, live_path: []const u8,
     };
     defer dir.close(io);
 
+    var stale_paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (stale_paths.items) |path| alloc.free(path);
+        stale_paths.deinit(alloc);
+    }
+
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
         if (entry.kind != .directory or !isGeneratedStageName(entry.name, stage_prefix)) continue;
         const stale_path = try std.fs.path.join(alloc, &.{ parent, entry.name });
-        defer alloc.free(stale_path);
+        var stale_path_owned = true;
+        defer if (stale_path_owned) alloc.free(stale_path);
         const has_marker = hasPublicationMarker(alloc, io, stale_path) catch |err| {
             std.log.warn("stale generation marker validation deferred path={s} err={s}", .{ stale_path, @errorName(err) });
             continue;
@@ -725,10 +752,12 @@ fn cleanupStagedGenerations(alloc: Allocator, io: std.Io, live_path: []const u8,
         } else {
             std.log.debug("stale generation cleanup remains deferred without threaded runtime path={s} marker={}", .{ stale_path, has_marker });
         }
-        scheduleRetiredGenerationCleanup(scheduler, stale_path, parent) catch |err| {
-            std.log.warn("stale generation cleanup scheduling deferred path={s} err={s}", .{ stale_path, @errorName(err) });
-        };
+        try stale_paths.append(alloc, stale_path);
+        stale_path_owned = false;
     }
+    scheduleRetiredGenerationCleanupBatch(scheduler, stale_paths.items, parent) catch |err| {
+        std.log.warn("stale generation cleanup batch scheduling deferred path={s} count={} err={s}", .{ live_path, stale_paths.items.len, @errorName(err) });
+    };
 }
 
 fn reconcilePublishedGeneration(alloc: Allocator, io: std.Io, live_path: []const u8, scheduler: ?CleanupScheduler) !bool {

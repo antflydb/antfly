@@ -4510,6 +4510,36 @@ components:
     RestoreRequest:
       allOf: # Identical to BackupRequest
         - $ref: "#/components/schemas/BackupRequest"
+    RestoreTriggeredResponse:
+      type: object
+      additionalProperties: false
+      required: [restore]
+      properties:
+        restore:
+          type: string
+          enum: [triggered]
+    RestoreCommittedPendingResponse:
+      type: object
+      additionalProperties: false
+      required: [restore, durability]
+      properties:
+        restore:
+          type: string
+          enum: [committed]
+        durability:
+          type: string
+          enum: [pending]
+    RestoreCommittedDurableResponse:
+      type: object
+      additionalProperties: false
+      required: [restore, durability]
+      properties:
+        restore:
+          type: string
+          enum: [committed]
+        durability:
+          type: string
+          enum: [durable]
     ClusterBackupRequest:
       type: object
       required:
@@ -8676,39 +8706,15 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: false
-                required: [restore, durability]
-                properties:
-                  restore:
-                    type: string
-                    enum: [committed]
-                  durability:
-                    type: string
-                    enum: [durable]
+                $ref: "#/components/schemas/RestoreCommittedDurableResponse"
         "202":
           description: Restore committed or triggered successfully
           content:
             application/json:
               schema:
                 oneOf:
-                  - type: object
-                    additionalProperties: false
-                    required: [restore]
-                    properties:
-                      restore:
-                        type: string
-                        enum: [triggered]
-                  - type: object
-                    additionalProperties: false
-                    required: [restore, durability]
-                    properties:
-                      restore:
-                        type: string
-                        enum: [committed]
-                      durability:
-                        type: string
-                        enum: [pending]
+                  - $ref: "#/components/schemas/RestoreTriggeredResponse"
+                  - $ref: "#/components/schemas/RestoreCommittedPendingResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":

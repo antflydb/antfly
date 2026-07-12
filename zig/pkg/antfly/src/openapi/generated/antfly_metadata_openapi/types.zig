@@ -2153,6 +2153,16 @@ pub const RerankerProfile = struct {
     duration_ms: ?i64 = null,
 };
 
+pub const RestoreCommittedDurableResponse = struct {
+    restore: []const u8,
+    durability: []const u8,
+};
+
+pub const RestoreCommittedPendingResponse = struct {
+    restore: []const u8,
+    durability: []const u8,
+};
+
 pub const RestoreRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
@@ -2160,6 +2170,10 @@ pub const RestoreRequest = struct {
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
+};
+
+pub const RestoreTriggeredResponse = struct {
+    restore: []const u8,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.

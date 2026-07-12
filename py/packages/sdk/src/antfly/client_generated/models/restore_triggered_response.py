@@ -5,19 +5,19 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
-from ..models.restore_table_response_202_type_0_restore import RestoreTableResponse202Type0Restore
+from ..models.restore_triggered_response_restore import RestoreTriggeredResponseRestore
 
-T = TypeVar("T", bound="RestoreTableResponse202Type0")
+T = TypeVar("T", bound="RestoreTriggeredResponse")
 
 
 @_attrs_define
-class RestoreTableResponse202Type0:
+class RestoreTriggeredResponse:
     """
     Attributes:
-        restore (RestoreTableResponse202Type0Restore):
+        restore (RestoreTriggeredResponseRestore):
     """
 
-    restore: RestoreTableResponse202Type0Restore
+    restore: RestoreTriggeredResponseRestore
 
     def to_dict(self) -> dict[str, Any]:
         restore = self.restore.value
@@ -35,10 +35,10 @@ class RestoreTableResponse202Type0:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        restore = RestoreTableResponse202Type0Restore(d.pop("restore"))
+        restore = RestoreTriggeredResponseRestore(d.pop("restore"))
 
-        restore_table_response_202_type_0 = cls(
+        restore_triggered_response = cls(
             restore=restore,
         )
 
-        return restore_table_response_202_type_0
+        return restore_triggered_response

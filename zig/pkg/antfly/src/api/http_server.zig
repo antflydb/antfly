@@ -1669,7 +1669,9 @@ pub const ApiHttpServer = struct {
                 .coverage_produced_count = index.coverage_produced_count,
                 .coverage_skipped_count = index.coverage_skipped_count,
                 .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
+                .coverage_generation = index.coverage_generation,
                 .coverage_config_hash = index.coverage_config_hash,
+                .coverage_identity_ready = index.coverage_identity_ready,
                 .coverage_summary_ready = index.coverage_summary_ready,
                 .backfill_active = index.backfill_active,
                 .backfill_progress = @as(f64, @floatFromInt(index.backfill_progress_millis)) / 1000.0,
@@ -6797,7 +6799,11 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
-            _ = table_writes_source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
+            const table_after = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+            defer metadata_table_manager.freeTable(alloc, table_after);
+            const stored_index_json = (indexes_api.storedIndexConfigJsonAlloc(alloc, table_after.indexes_json, index_name) catch return error.InternalFailure) orelse return error.InternalFailure;
+            defer alloc.free(stored_index_json);
+            _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
                 error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
                 else => {
