@@ -183,6 +183,15 @@ class AuthApi:
                 raise_request_error_with_logs(err, self._server)
             return self._check(response)
 
+    def request_raw(self, method: str, path: str, **kwargs) -> requests.Response:
+        """Issue a request whose non-2xx response is part of the assertion contract."""
+        with self._request_lock:
+            raise_if_server_process_exited(self._server)
+            try:
+                return self.s.request(method, self._url_for(path), **kwargs)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+
     def create_table(self, table_name: str, payload: dict | None = None):
         body = payload or {"num_shards": 1}
         deadline = time.monotonic() + AUTH_SETUP_RETRY_TIMEOUT_SECONDS
@@ -596,17 +605,18 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
     assert found is not None
     assert found["title"] == "hello"
 
-    write_resp = stateful_auth_api.s.post(
-        f"{stateful_auth_api.url}/tables/docs/batch",
+    write_resp = stateful_auth_api.request_raw(
+        "POST",
+        "/tables/docs/batch",
         json={"inserts": {"doc-2": {"title": "blocked"}}},
         timeout=30,
     )
     assert write_resp.status_code == 403
 
-    tables_resp = stateful_auth_api.s.get(f"{stateful_auth_api.url}/tables", timeout=30)
+    tables_resp = stateful_auth_api.request_raw("GET", "/tables", timeout=30)
     assert tables_resp.status_code == 403
 
-    admin_resp = stateful_auth_api.s.get(f"{stateful_auth_api.auth_url}/users", timeout=30)
+    admin_resp = stateful_auth_api.request_raw("GET", "/auth/v1/users", timeout=30)
     assert admin_resp.status_code == 403
 
 

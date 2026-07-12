@@ -3334,6 +3334,28 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     try std.testing.expectEqualStrings("text/plain", forbidden.contentType().?);
     try std.testing.expectEqualStrings("forbidden", forbidden.body.?);
 
+    const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/batch", .{base_url});
+    defer alloc.free(batch_url);
+    const batch_headers = [_][2][]const u8{
+        .{ "authorization", reader_auth },
+        .{ "content-type", "application/json" },
+    };
+    for (0..100) |_| {
+        var denied_batch = try requestWithRetry(
+            &client,
+            client_io.io(),
+            .POST,
+            batch_url,
+            "{\"inserts\":{\"doc-2\":{\"title\":\"blocked\"}}}",
+            &batch_headers,
+            20,
+        );
+        defer denied_batch.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied_batch.status.code);
+        try std.testing.expectEqualStrings("text/plain", denied_batch.contentType().?);
+        try std.testing.expectEqualStrings("forbidden", denied_batch.body.?);
+    }
+
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
     const me_url = try std.fmt.allocPrint(alloc, "{s}/auth/v1/me", .{base_url});

@@ -6,6 +6,7 @@ pub const types = @import("types.zig");
 pub const AlgebraicIndexConfig = types.AlgebraicIndexConfig;
 pub const AlgebraicIndexStats = types.AlgebraicIndexStats;
 pub const AntflyType = types.AntflyType;
+pub const DerivedCoverageObservationIncompleteReason = types.DerivedCoverageObservationIncompleteReason;
 pub const DerivedCoveragePolicy = types.DerivedCoveragePolicy;
 pub const DerivedCoverageStatus = types.DerivedCoverageStatus;
 pub const DerivedCoverageStatusPolicy = types.DerivedCoverageStatusPolicy;

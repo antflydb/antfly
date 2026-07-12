@@ -114,6 +114,7 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
 from .derived_coverage_status_policy import DerivedCoverageStatusPolicy
@@ -769,6 +770,7 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",
     "DerivedCoverageStatusPolicy",

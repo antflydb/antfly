@@ -16506,12 +16506,26 @@ components:
         - partial
         - best_effort
         - external
+    DerivedCoverageObservationIncompleteReason:
+      type: string
+      enum:
+        - runtime_unavailable
+        - missing_group
+        - remote_unknown_group
+        - stale_group
+        - summary_unavailable
+        - config_mismatch
+      description: A structured reason why the coverage projection cannot be treated as globally complete.
     DerivedCoverageStatus:
       type: object
       additionalProperties: false
       required:
         - policy
         - observation_complete
+        - observation_incomplete_reasons
+        - config_fingerprint
+        - summary_ready
+        - config_mismatch_group_count
         - source_total
         - produced
         - skipped
@@ -16527,6 +16541,24 @@ components:
         observation_complete:
           type: boolean
           description: Whether every expected shard contributed a fresh runtime observation to this projection.
+        observation_incomplete_reasons:
+          type: array
+          items:
+            $ref: '#/components/schemas/DerivedCoverageObservationIncompleteReason'
+          description: Empty when observation_complete is true; otherwise identifies every known reason
+            the projection is incomplete.
+        config_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{16}$
+          description: Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal.
+            Non-semantic execution tuning does not affect it.
+        summary_ready:
+          type: boolean
+          description: Whether all observed shard-local coverage summaries were read atomically and completely.
+        config_mismatch_group_count:
+          type: integer
+          format: uint64
+          description: Freshly observed shard groups reporting a different semantic configuration fingerprint.
         source_total:
           type: integer
           format: uint64
@@ -16550,8 +16582,12 @@ components:
           format: uint64
           description: Terminal source outcomes counted by the configured policy.
         pending:
+          x-go-type-skip-optional-pointer: false
           type: integer
           format: uint64
+          nullable: true
+          description: Source documents without a policy-accepted terminal outcome. Null when observations
+            are incomplete and the global value is unknown.
         complete:
           type: boolean
           description: Whether observations are complete and every observed source has an outcome accepted

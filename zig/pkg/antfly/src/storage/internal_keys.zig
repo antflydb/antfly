@@ -288,9 +288,128 @@ pub fn derivedCoverageGeneration(config_json: []const u8) u64 {
     return std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json);
 }
 
+/// Returns a versioned fingerprint of the fields that define generated output.
+/// Object order, credentials, rate limits, and top-level execution tuning are
+/// intentionally ignored.
+pub fn derivedCoverageConfigFingerprint(alloc: Allocator, config_json: []const u8) !u64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed.deinit();
+
+    var hasher = std.hash.Wyhash.init(0x6472_636f_7665_7232);
+    hasher.update("antfly-derived-coverage-config-v2\x00");
+    try hashCanonicalJsonValue(alloc, &hasher, parsed.value, .root);
+    return hasher.final();
+}
+
+const CoverageFingerprintContext = enum {
+    root,
+    embedder,
+    other,
+};
+
+fn hashCanonicalJsonValue(
+    alloc: Allocator,
+    hasher: *std.hash.Wyhash,
+    value: std.json.Value,
+    context: CoverageFingerprintContext,
+) !void {
+    switch (value) {
+        .null => hasher.update("n"),
+        .bool => |flag| hasher.update(if (flag) "b1" else "b0"),
+        .integer => |number| {
+            hasher.update("i");
+            var buf: [32]u8 = undefined;
+            hashLengthPrefixed(hasher, std.fmt.bufPrint(&buf, "{d}", .{number}) catch unreachable);
+        },
+        .float => |number| {
+            hasher.update("f");
+            var buf: [64]u8 = undefined;
+            hashLengthPrefixed(hasher, std.fmt.bufPrint(&buf, "{d}", .{number}) catch unreachable);
+        },
+        .number_string => |number| {
+            hasher.update("r");
+            hashLengthPrefixed(hasher, number);
+        },
+        .string => |string| {
+            hasher.update("s");
+            hashLengthPrefixed(hasher, string);
+        },
+        .array => |array| {
+            hasher.update("a");
+            hashUsize(hasher, array.items.len);
+            for (array.items) |item| try hashCanonicalJsonValue(alloc, hasher, item, .other);
+        },
+        .object => |object| {
+            var keys = try alloc.alloc([]const u8, object.count());
+            defer alloc.free(keys);
+            var key_count: usize = 0;
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                if (!derivedCoverageConfigKeyIsSemantic(context, entry.key_ptr.*)) continue;
+                keys[key_count] = entry.key_ptr.*;
+                key_count += 1;
+            }
+            std.mem.sort([]const u8, keys[0..key_count], {}, struct {
+                fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.lessThan);
+
+            hasher.update("o");
+            hashUsize(hasher, key_count);
+            for (keys[0..key_count]) |key| {
+                hashLengthPrefixed(hasher, key);
+                const child_context: CoverageFingerprintContext = if (context == .root and std.mem.eql(u8, key, "embedder")) .embedder else .other;
+                try hashCanonicalJsonValue(alloc, hasher, object.get(key).?, child_context);
+            }
+        },
+    }
+}
+
+fn derivedCoverageConfigKeyIsSemantic(context: CoverageFingerprintContext, key: []const u8) bool {
+    if (context == .root and std.mem.eql(u8, key, "execution")) return false;
+    if (context != .embedder) return true;
+    return !std.mem.eql(u8, key, "api_key") and !std.mem.eql(u8, key, "requests_per_minute") and !std.mem.eql(u8, key, "burst");
+}
+
+fn hashLengthPrefixed(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    hashUsize(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+fn hashUsize(hasher: *std.hash.Wyhash, value: usize) void {
+    var buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &buf, @intCast(value), .little);
+    hasher.update(&buf);
+}
+
 pub fn derivedCoverageGenerationForConfig(coverage_generation: u64, config_json: []const u8) u64 {
     if (coverage_generation != 0) return coverage_generation;
     return derivedCoverageGeneration(config_json);
+}
+
+test "derived coverage config fingerprint is semantic and execution independent" {
+    const alloc = std.testing.allocator;
+    const first = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"field\":\"body\",\"dims\":384,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"},\"embedder\":{\"model\":\"clipclap\",\"api_key\":\"first\",\"requests_per_minute\":10},\"execution\":{\"embedding\":{\"batch_items\":16}}}",
+    );
+    const reordered = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"body\",\"kind\":\"dense_embedding\"},\"execution\":{\"embedding\":{\"batch_items\":1024}},\"embedder\":{\"requests_per_minute\":1000,\"api_key\":\"rotated\",\"model\":\"clipclap\"},\"dims\":384,\"field\":\"body\"}",
+    );
+    const changed = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"content\",\"kind\":\"dense_embedding\"},\"dims\":384,\"field\":\"body\"}",
+    );
+    const semantic_burst = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"body\",\"kind\":\"dense_embedding\",\"burst\":2},\"embedder\":{\"model\":\"clipclap\"},\"dims\":384,\"field\":\"body\"}",
+    );
+
+    try std.testing.expectEqual(first, reordered);
+    try std.testing.expect(first != changed);
+    try std.testing.expect(first != semantic_burst);
 }
 
 pub fn derivedCoverageOutcomePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {

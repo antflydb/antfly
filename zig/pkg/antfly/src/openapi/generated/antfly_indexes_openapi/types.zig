@@ -186,6 +186,44 @@ pub const AntflyType = enum {
     }
 };
 
+/// A structured reason why the coverage projection cannot be treated as globally complete.
+pub const DerivedCoverageObservationIncompleteReason = enum {
+    runtime_unavailable,
+    missing_group,
+    remote_unknown_group,
+    stale_group,
+    summary_unavailable,
+    config_mismatch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .runtime_unavailable => "runtime_unavailable",
+            .missing_group => "missing_group",
+            .remote_unknown_group => "remote_unknown_group",
+            .stale_group => "stale_group",
+            .summary_unavailable => "summary_unavailable",
+            .config_mismatch => "config_mismatch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "missing_group", .missing_group },
+            .{ "remote_unknown_group", .remote_unknown_group },
+            .{ "stale_group", .stale_group },
+            .{ "summary_unavailable", .summary_unavailable },
+            .{ "config_mismatch", .config_mismatch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// How generation-scoped source outcomes determine derived-index completeness.
 pub const DerivedCoveragePolicy = enum {
     strict,
@@ -219,6 +257,14 @@ pub const DerivedCoverageStatus = struct {
     policy: DerivedCoverageStatusPolicy,
     /// Whether every expected shard contributed a fresh runtime observation to this projection.
     observation_complete: bool,
+    /// Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete.
+    observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
+    /// Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it.
+    config_fingerprint: []const u8,
+    /// Whether all observed shard-local coverage summaries were read atomically and completely.
+    summary_ready: bool,
+    /// Freshly observed shard groups reporting a different semantic configuration fingerprint.
+    config_mismatch_group_count: i64,
     /// Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
     source_total: i64,
     /// Source documents with a durable produced outcome for this index generation.
@@ -229,7 +275,8 @@ pub const DerivedCoverageStatus = struct {
     terminal_failed: i64,
     /// Terminal source outcomes counted by the configured policy.
     covered: i64,
-    pending: i64,
+    /// Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+    pending: ?i64,
     /// Whether observations are complete and every observed source has an outcome accepted by the policy.
     complete: bool,
     /// Whether coverage is complete without terminal failures.

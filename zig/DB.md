@@ -316,9 +316,13 @@ partial complete     = produced + skipped >= source_total
 best_effort complete = produced + skipped + terminal_failed >= source_total
 ```
 
-Counts are mutually exclusive per `(index, generation, source document)`, and
-`pending` is `source_total - min(source_total, covered-by-policy)`. Runtime replay
-debt remains an independent readiness gate. Health is stricter:
+Counts are mutually exclusive per `(index, generation, source document)`. When
+the distributed observation is complete, `pending` is `source_total -
+min(source_total, covered-by-policy)`. When any expected shard observation is
+missing or unusable, the global pending count is unknown and the public status
+reports `pending: null`; it never presents an observed lower bound as an exact
+global count. Runtime replay debt remains an independent readiness gate. Health
+is stricter:
 
 ```text
 healthy = complete and terminal_failed == 0
@@ -335,9 +339,15 @@ entries. Distributed projections sum cardinality and outcomes only from fresh
 shard observations; `observation_complete` is false if any expected shard is
 missing, stale, remotely unknown, reports an incomplete counter summary, or
 reports a stored-config fingerprint different from the requested index config.
-An incomplete observation can never report complete or healthy coverage. The
-fingerprint is stable across shard-local marker generations, preventing rolling
-reconfiguration from combining outcomes that describe different indexes.
+An incomplete observation can never report complete or healthy coverage and
+includes structured reasons such as `missing_group`, `stale_group`,
+`summary_unavailable`, and `config_mismatch`. The configuration fingerprint is
+a versioned canonical hash of semantic generated-output configuration: object
+ordering, credentials, provider rate limits, and top-level execution batching
+are excluded. It is encoded as a fixed-width hexadecimal string at the API
+boundary and remains stable across shard-local marker generations, preventing
+rolling reconfiguration from combining outcomes that describe different
+indexes.
 
 ### Coverage Policy
 
@@ -351,7 +361,7 @@ readiness:
 - `best_effort`: intentional skips and terminal failures may satisfy completion,
   but terminal failures make the status degraded
 
-The policy should be explicit in index and enrichment config, for example:
+The policy is explicit on each consuming managed embeddings index, for example:
 
 ```json
 {
@@ -360,6 +370,13 @@ The policy should be explicit in index and enrichment config, for example:
   "template": "{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}"
 }
 ```
+
+Enrichment definitions do not independently expose coverage policy in the
+current API. They durably record producer outcomes; the consuming index decides
+which terminal outcomes satisfy its readiness contract. This avoids conflicting
+producer/index policies and gives one unambiguous status per index. A future
+artifact-level readiness API may add producer policy as a separate contract,
+but it must not silently override index policy.
 
 Today eligibility is an execution outcome: a managed template that renders no
 input records a durable `skipped` result. A future declarative eligibility

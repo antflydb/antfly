@@ -764,7 +764,7 @@ const EmbeddingsCoveragePolicy = coverage_policy_mod.Policy;
 fn expectedCoverageConfigHash(alloc: std.mem.Allocator, index_name: []const u8, config: std.json.Value) !u64 {
     const stored = try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, config);
     defer alloc.free(stored);
-    return internal_keys.derivedCoverageGeneration(stored);
+    return try internal_keys.derivedCoverageConfigFingerprint(alloc, stored);
 }
 
 fn embeddingsCoveragePolicyName(policy: EmbeddingsCoveragePolicy) []const u8 {
@@ -1470,7 +1470,7 @@ const EmbeddingsRuntimeView = struct {
 
 const CoverageEvaluation = struct {
     covered: u64,
-    pending: u64,
+    pending: ?u64,
     complete: bool,
     healthy: bool,
     degraded: bool,
@@ -1495,7 +1495,7 @@ fn evaluateCoverage(
     const complete = observation_complete and covered == source_total;
     return .{
         .covered = covered,
-        .pending = source_total -| covered,
+        .pending = if (observation_complete) source_total -| covered else null,
         .complete = complete,
         .healthy = complete and terminal_failed == 0,
         .degraded = complete and terminal_failed > 0,
@@ -1506,7 +1506,7 @@ fn evaluateCoverage(
 test "derived coverage evaluation is policy exact and observation gated" {
     const strict = evaluateCoverage(.strict, 3, 1, 1, 1, true);
     try std.testing.expectEqual(@as(u64, 1), strict.covered);
-    try std.testing.expectEqual(@as(u64, 2), strict.pending);
+    try std.testing.expectEqual(@as(?u64, 2), strict.pending);
     try std.testing.expect(!strict.complete);
 
     const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true);
@@ -1520,13 +1520,13 @@ test "derived coverage evaluation is policy exact and observation gated" {
     try std.testing.expect(best_effort.degraded);
 
     const incomplete_observation = evaluateCoverage(.partial, 3, 1, 2, 0, false);
-    try std.testing.expectEqual(@as(u64, 0), incomplete_observation.pending);
+    try std.testing.expectEqual(@as(?u64, null), incomplete_observation.pending);
     try std.testing.expect(!incomplete_observation.complete);
     try std.testing.expect(!incomplete_observation.healthy);
 
     const external_partial = evaluateCoverage(.external, 3, 1, 0, 0, true);
     try std.testing.expectEqual(@as(u64, 1), external_partial.covered);
-    try std.testing.expectEqual(@as(u64, 2), external_partial.pending);
+    try std.testing.expectEqual(@as(?u64, 2), external_partial.pending);
     try std.testing.expect(!external_partial.complete);
 
     const external_complete = evaluateCoverage(.external, 3, 3, 0, 0, true);
@@ -1557,6 +1557,56 @@ test "derived coverage aggregation rejects mixed config observations" {
     try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_config_mismatch_count);
     try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 41));
+
+    var reasons = std.ArrayListUnmanaged(u8).empty;
+    defer reasons.deinit(std.testing.allocator);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 41, true);
+    try std.testing.expectEqualStrings("[\"config_mismatch\"]", reasons.items);
+
+    var missing_status = std.ArrayListUnmanaged(u8).empty;
+    defer missing_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &missing_status,
+        .embeddings,
+        missingAggregateIndexStatus(1),
+        0,
+        .partial,
+        false,
+        41,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        false,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"observation_incomplete_reasons\":[\"runtime_unavailable\",\"missing_group\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"pending\":null") != null);
+}
+
+test "derived coverage semantic fingerprint ignores execution policy" {
+    var first = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3,\"execution\":{\"embedding\":{\"batch_items\":16}}}",
+        .{},
+    );
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"execution\":{\"embedding\":{\"batch_items\":1024}},\"dimension\":3,\"external\":true,\"type\":\"embeddings\"}",
+        .{},
+    );
+    defer second.deinit();
+
+    try std.testing.expectEqual(
+        try expectedCoverageConfigHash(std.testing.allocator, "external_idx", first.value),
+        try expectedCoverageConfigHash(std.testing.allocator, "external_idx", second.value),
+    );
 }
 
 fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, coverage_config_hash: u64, enrichment: ?db_mod.types.EnrichmentStats, runtime_present: bool) EmbeddingsRuntimeView {
@@ -1657,6 +1707,45 @@ fn aggregateRuntimeCoverageIncomplete(item: anytype, expected_config_hash: u64) 
     if (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) return true;
     if (@hasField(Item, "coverage_config_hash") and item.coverage_config_hash != expected_config_hash) return true;
     return false;
+}
+
+fn appendCoverageIncompleteReasons(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    item: anytype,
+    expected_config_hash: u64,
+    runtime_present: bool,
+) !void {
+    const Item = @TypeOf(item);
+    try out.append(alloc, '[');
+    var emitted = false;
+    const ReasonWriter = struct {
+        fn append(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), wrote: *bool, reason: []const u8) !void {
+            if (wrote.*) try list.append(a, ',');
+            wrote.* = true;
+            try appendJsonString(a, list, reason);
+        }
+    };
+
+    if (!runtime_present) try ReasonWriter.append(alloc, out, &emitted, "runtime_unavailable");
+    if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0)
+        try ReasonWriter.append(alloc, out, &emitted, "missing_group");
+    if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0)
+        try ReasonWriter.append(alloc, out, &emitted, "remote_unknown_group");
+    if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0)
+        try ReasonWriter.append(alloc, out, &emitted, "stale_group");
+    if (@hasField(Item, "coverage_summary_ready") and !item.coverage_summary_ready)
+        try ReasonWriter.append(alloc, out, &emitted, "summary_unavailable");
+    const config_mismatch = (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) or
+        (runtime_present and @hasField(Item, "coverage_config_hash") and item.coverage_config_hash != expected_config_hash);
+    if (config_mismatch) try ReasonWriter.append(alloc, out, &emitted, "config_mismatch");
+    try out.append(alloc, ']');
+}
+
+fn appendCoverageFingerprint(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), fingerprint: u64) !void {
+    var buf: [16]u8 = undefined;
+    const encoded = std.fmt.bufPrint(&buf, "{x:0>16}", .{fingerprint}) catch unreachable;
+    try appendJsonString(alloc, out, encoded);
 }
 
 fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
@@ -1889,13 +1978,14 @@ fn appendSingleIndexRuntimeStatus(
         const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
         const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
         const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
+        const observation_complete = runtime_present and !aggregateRuntimeCoverageIncomplete(item, coverage_config_hash);
         const coverage = evaluateCoverage(
             embeddings_coverage_policy,
             table_doc_count,
             produced_count,
             skipped_count,
             terminal_failed_count,
-            runtime_present and !aggregateRuntimeCoverageIncomplete(item, coverage_config_hash),
+            observation_complete,
         );
         const coverage_complete = coverage.complete;
         const artifact_publish_pending = replay_target_sequence > 0 and
@@ -1922,16 +2012,17 @@ fn appendSingleIndexRuntimeStatus(
         try out.append(alloc, ':');
         try appendJsonString(alloc, out, embeddingsCoveragePolicyName(embeddings_coverage_policy));
         try out.appendSlice(alloc, ",\"observation_complete\":");
-        try out.appendSlice(alloc, if (runtime_present and !aggregateRuntimeCoverageIncomplete(item, coverage_config_hash)) "true" else "false");
-        try out.appendSlice(alloc, ",\"config_hash\":");
-        try appendIntValue(alloc, out, coverage_config_hash);
+        try out.appendSlice(alloc, if (observation_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"observation_incomplete_reasons\":");
+        try appendCoverageIncompleteReasons(alloc, out, item, coverage_config_hash, runtime_present);
+        try out.appendSlice(alloc, ",\"config_fingerprint\":");
+        try appendCoverageFingerprint(alloc, out, coverage_config_hash);
         try out.appendSlice(alloc, ",\"summary_ready\":");
-        const coverage_summary_ready = if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
+        const coverage_summary_ready = runtime_present and if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
         try out.appendSlice(alloc, if (coverage_summary_ready) "true" else "false");
-        if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) {
-            try out.appendSlice(alloc, ",\"config_mismatch_group_count\":");
-            try appendIntValue(alloc, out, item.coverage_config_mismatch_count);
-        }
+        try out.appendSlice(alloc, ",\"config_mismatch_group_count\":");
+        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) item.coverage_config_mismatch_count else @intFromBool(runtime_present and @hasField(@TypeOf(item), "coverage_config_hash") and item.coverage_config_hash != coverage_config_hash);
+        try appendIntValue(alloc, out, config_mismatch_group_count);
         try out.appendSlice(alloc, ",\"source_total\":");
         try appendIntValue(alloc, out, table_doc_count);
         try out.appendSlice(alloc, ",\"produced\":");
@@ -1943,7 +2034,11 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"covered\":");
         try appendIntValue(alloc, out, coverage.covered);
         try out.appendSlice(alloc, ",\"pending\":");
-        try appendIntValue(alloc, out, coverage.pending);
+        if (coverage.pending) |pending| {
+            try appendIntValue(alloc, out, pending);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
         try out.appendSlice(alloc, ",\"complete\":");
         try out.appendSlice(alloc, if (coverage_complete) "true" else "false");
         try out.appendSlice(alloc, ",\"healthy\":");
@@ -4170,7 +4265,10 @@ test "partial coverage embeddings readiness counts skipped source units" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"partial\",\"observation_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"observation_incomplete_reasons\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"config_fingerprint\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"summary_ready\":true,\"config_mismatch_group_count\":0,\"source_total\":2,\"produced\":1,\"skipped\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"skipped_source_count\":1") != null);
 }

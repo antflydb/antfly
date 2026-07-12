@@ -8824,10 +8824,26 @@ export interface components {
         };
         /** @enum {string} */
         DerivedCoverageStatusPolicy: "strict" | "partial" | "best_effort" | "external";
+        /**
+         * @description A structured reason why the coverage projection cannot be treated as globally complete.
+         * @enum {string}
+         */
+        DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch";
         DerivedCoverageStatus: {
             policy: components["schemas"]["DerivedCoverageStatusPolicy"];
             /** @description Whether every expected shard contributed a fresh runtime observation to this projection. */
             observation_complete: boolean;
+            /** @description Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete. */
+            observation_incomplete_reasons: components["schemas"]["DerivedCoverageObservationIncompleteReason"][];
+            /** @description Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it. */
+            config_fingerprint: string;
+            /** @description Whether all observed shard-local coverage summaries were read atomically and completely. */
+            summary_ready: boolean;
+            /**
+             * Format: uint64
+             * @description Freshly observed shard groups reporting a different semantic configuration fingerprint.
+             */
+            config_mismatch_group_count: number;
             /**
              * Format: uint64
              * @description Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
@@ -8853,8 +8869,11 @@ export interface components {
              * @description Terminal source outcomes counted by the configured policy.
              */
             covered: number;
-            /** Format: uint64 */
-            pending: number;
+            /**
+             * Format: uint64
+             * @description Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+             */
+            pending: number | null;
             /** @description Whether observations are complete and every observed source has an outcome accepted by the policy. */
             complete: boolean;
             /** @description Whether coverage is complete without terminal failures. */

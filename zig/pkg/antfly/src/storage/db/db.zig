@@ -12803,7 +12803,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
                     if (async_indexing.dense_catch_up.active) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
@@ -12826,7 +12826,7 @@ pub const DB = struct {
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
@@ -12980,7 +12980,7 @@ pub const DB = struct {
                             }
                         }
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
                         item.backfill_progress = @min(
                             1.0,
@@ -13010,7 +13010,7 @@ pub const DB = struct {
                             item.backfill_progress = progress;
                         }
                     }
-                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
+                    try self.populateDerivedCoverageCounts(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json), &item);
                     if (!item.backfill_active and item.replay_target_sequence > 0) {
                         item.backfill_progress = @min(
                             1.0,
@@ -13143,7 +13143,8 @@ pub const DB = struct {
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
-                self.populateDerivedCoverageCountsBestEffort(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), internal_keys.derivedCoverageGeneration(cfg.config_json), &item);
+                const config_fingerprint = internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json) catch 0;
+                self.populateDerivedCoverageCountsBestEffort(cfg.name, internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json), config_fingerprint, &item);
             }
             const index_repair_summary = try self.artifactRepairSummaryIndexSnapshotForStats(alloc, cfg.name, repair_summary.ready, &repair_index_fallback);
             item.repair_issue_count = index_repair_summary.count;
@@ -44673,7 +44674,7 @@ test "db managed conditional embeddings persist exact mixed corpus coverage acro
     defer cleanupTempDir(path);
     const config_json =
         "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"image_url\",\"source_template\":\"{{#if image_url}}{{image_url}}{{/if}}\"}}";
-    const expected_config_hash = internal_keys.derivedCoverageGeneration(config_json);
+    const expected_config_hash = try internal_keys.derivedCoverageConfigFingerprint(alloc, config_json);
 
     const ExpectCoverage = struct {
         fn run(db_value: *DB, config_hash: u64, produced: u64, skipped: u64) !void {
