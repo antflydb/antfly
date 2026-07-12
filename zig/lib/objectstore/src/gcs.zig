@@ -341,15 +341,30 @@ pub const JsonApiClient = struct {
         src_path: []const u8,
         opts: types.PutOptions,
     ) !types.PutResult {
+        return try self.putFileWithThreshold(alloc, io, bucket, key, src_path, opts, resumable_upload_threshold);
+    }
+
+    fn putFileWithThreshold(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        src_path: []const u8,
+        opts: types.PutOptions,
+        resumable_threshold: u64,
+    ) !types.PutResult {
         const source = try openFilePath(io, src_path);
         defer source.close(io);
         const stat = try source.stat(io);
-        if (stat.size <= resumable_upload_threshold) {
+        if (stat.size <= resumable_threshold) {
             const body = try alloc.alloc(u8, @intCast(stat.size));
             defer alloc.free(body);
             if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
             var extra: [1]u8 = undefined;
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
             return try self.putObject(alloc, bucket, key, body, opts);
         }
         if (opts.if_match_etag != null) return error.ConditionalResumableUploadUnsupported;
@@ -382,6 +397,8 @@ pub const JsonApiClient = struct {
         while (offset < stat.size) {
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
             if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
             const last = offset + wanted - 1;
             const content_range = try std.fmt.allocPrint(alloc, "bytes {d}-{d}/{d}", .{ offset, last, stat.size });
             defer alloc.free(content_range);
@@ -1106,6 +1123,59 @@ test "gcs resumable upload url preserves create-only semantics" {
         "https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=resumable&name=folder%2Fdoc.txt&ifGenerationMatch=0",
         url,
     );
+}
+
+test "gcs file upload completes a resumable lifecycle with bounded chunks" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const source_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-gcs-resumable-{d}", .{test_support.integrationNonce()});
+    defer alloc.free(source_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, source_path) catch {};
+    {
+        var source = try std.Io.Dir.createFileAbsolute(io, source_path, .{ .truncate = true });
+        defer source.close(io);
+        try source.writePositionalAll(io, "resumable-payload", 0);
+        try source.sync(io);
+    }
+
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            defer self.calls += 1;
+            return switch (self.calls) {
+                0 => blk: {
+                    try std.testing.expectEqual(HttpMethod.POST, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "uploadType=resumable") != null);
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.alloc(u8, 0),
+                        .location = try request_alloc.dupe(u8, "https://upload.example/session-1"),
+                    };
+                },
+                1 => blk: {
+                    try std.testing.expectEqual(HttpMethod.PUT, method);
+                    try std.testing.expectEqualStrings("https://upload.example/session-1", url);
+                    try std.testing.expectEqualStrings("resumable-payload", body.?);
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"backup/segment\",\"etag\":\"final-etag\",\"generation\":\"7\",\"size\":\"17\"}"),
+                    };
+                },
+                else => error.UnexpectedCall,
+            };
+        }
+    };
+    const cfg = try jsonApiClientConfigWithBearerTokenAlloc(alloc, "token", null);
+    var state = State{};
+    var gcs_client = JsonApiClient.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = gcs_client.client();
+    defer client.deinit();
+    var result = try gcs_client.putFileWithThreshold(alloc, io, "bucket", "backup/segment", source_path, .{}, 0);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("final-etag", result.etag.?);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 
 test "gcs local grpc reference path can be discovered when present" {

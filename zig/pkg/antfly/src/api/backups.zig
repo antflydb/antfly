@@ -599,6 +599,11 @@ const RemoteBackupStore = struct {
             try std.fmt.allocPrint(alloc, "{s}/", .{base_key});
         defer alloc.free(key_prefix);
 
+        if (try self.client.getPrefixWithIo(self.io, self.bucket, key_prefix, dest_path)) |downloaded| {
+            if (downloaded == 0) return error.FileNotFound;
+            return;
+        }
+
         var found = false;
         var continuation_token: ?[]u8 = null;
         defer if (continuation_token) |token| alloc.free(token);

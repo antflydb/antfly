@@ -171,11 +171,21 @@ support fail closed rather than weakening conditional writes. Upload staging
 lives outside the enumerable key namespace, so concurrent pagination cannot
 observe partial objects or internal temporary keys.
 
+Whole-file filesystem restores use a provider-native streaming path: the
+object is opened once, SHA-256 is recomputed while copying, and the destination
+is renamed into place only after the checksum matches the envelope. This
+detects local media corruption without adding whole-object memory or repeated
+open/stat overhead. Recursive filesystem restores use a native prefix transfer,
+walking the selected archive once instead of rescanning the namespace for every
+logical page; S3 and GCS continue using their service-native continuation
+tokens.
+
 Backup uploads are bounded as well. Filesystem connections stream directly
 into their staged object envelope; S3 multipart parts and GCS resumable chunks
 start at 16 MiB and grow for very large objects to keep request counts bounded.
-Failed sessions are aborted or cancelled, source-file
-growth and truncation are detected, and providers without a streaming upload
+Failed sessions are aborted or cancelled, and source size and modification time
+are fenced throughout upload so concurrent rewrites fail before completion.
+Providers without a streaming upload
 capability reject files above 64 MiB instead of attempting an unbounded heap
 allocation. Filesystem listing retains only the smallest requested page plus
 one continuation candidate, so page memory is bounded by the requested page

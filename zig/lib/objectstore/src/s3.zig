@@ -362,15 +362,30 @@ pub const Client = struct {
         src_path: []const u8,
         opts: types.PutOptions,
     ) !types.PutResult {
+        return try self.putFileWithThreshold(alloc, io, bucket, key, src_path, opts, multipart_upload_threshold);
+    }
+
+    fn putFileWithThreshold(
+        self: *Client,
+        alloc: Allocator,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        src_path: []const u8,
+        opts: types.PutOptions,
+        multipart_threshold: u64,
+    ) !types.PutResult {
         const source = try openFilePath(io, src_path);
         defer source.close(io);
         const stat = try source.stat(io);
-        if (stat.size <= multipart_upload_threshold) {
+        if (stat.size <= multipart_threshold) {
             const body = try alloc.alloc(u8, @intCast(stat.size));
             defer alloc.free(body);
             if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
             var extra: [1]u8 = undefined;
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
             return try self.putObject(alloc, bucket, key, body, opts);
         }
         if (opts.if_match_etag != null or opts.if_none_match) return error.ConditionalMultipartUnsupported;
@@ -382,9 +397,11 @@ pub const Client = struct {
         if (part_count > max_multipart_parts) return error.ObjectTooLarge;
 
         var initiate_query = std.ArrayListUnmanaged(QueryPair).empty;
-        defer freeQueryPairs(alloc, initiate_query.items);
+        errdefer deinitQueryList(alloc, &initiate_query);
         try appendQueryPair(alloc, &initiate_query, "uploads", "");
-        var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_query.items);
+        const initiate_pairs = try initiate_query.toOwnedSlice(alloc);
+        defer freeQueryPairs(alloc, initiate_pairs);
+        var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_pairs);
         defer initiate_target.deinit(alloc);
         var initiated = try self.perform(.POST, initiate_target, &.{}, null, opts.content_type);
         defer initiated.deinit(alloc);
@@ -406,13 +423,17 @@ pub const Client = struct {
         while (offset < stat.size) : (part_number += 1) {
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
             if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
             const part_number_text = try std.fmt.allocPrint(alloc, "{d}", .{part_number});
             defer alloc.free(part_number_text);
             var query = std.ArrayListUnmanaged(QueryPair).empty;
-            defer freeQueryPairs(alloc, query.items);
+            errdefer deinitQueryList(alloc, &query);
             try appendQueryPair(alloc, &query, "partNumber", part_number_text);
             try appendQueryPair(alloc, &query, "uploadId", upload_id);
-            var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query.items);
+            const query_pairs = try query.toOwnedSlice(alloc);
+            defer freeQueryPairs(alloc, query_pairs);
+            var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query_pairs);
             defer target.deinit(alloc);
             var response = try self.perform(.PUT, target, &.{}, buffer[0..wanted], null);
             defer response.deinit(alloc);
@@ -427,9 +448,11 @@ pub const Client = struct {
         const completion_xml = try completeMultipartXmlAlloc(alloc, etags.items);
         defer alloc.free(completion_xml);
         var complete_query = std.ArrayListUnmanaged(QueryPair).empty;
-        defer freeQueryPairs(alloc, complete_query.items);
+        errdefer deinitQueryList(alloc, &complete_query);
         try appendQueryPair(alloc, &complete_query, "uploadId", upload_id);
-        var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_query.items);
+        const complete_pairs = try complete_query.toOwnedSlice(alloc);
+        defer freeQueryPairs(alloc, complete_pairs);
+        var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_pairs);
         defer complete_target.deinit(alloc);
         var response = try self.perform(.POST, complete_target, &.{}, completion_xml, "application/xml");
         defer response.deinit(alloc);
@@ -450,9 +473,11 @@ pub const Client = struct {
 
     fn abortMultipartUpload(self: *Client, bucket: []const u8, key: []const u8, upload_id: []const u8) !void {
         var query = std.ArrayListUnmanaged(QueryPair).empty;
-        defer freeQueryPairs(self.alloc, query.items);
+        errdefer deinitQueryList(self.alloc, &query);
         try appendQueryPair(self.alloc, &query, "uploadId", upload_id);
-        var target = try objectTargetAllocWithQuery(self.alloc, self.cfg, bucket, key, query.items);
+        const query_pairs = try query.toOwnedSlice(self.alloc);
+        defer freeQueryPairs(self.alloc, query_pairs);
+        var target = try objectTargetAllocWithQuery(self.alloc, self.cfg, bucket, key, query_pairs);
         defer target.deinit(self.alloc);
         var response = try self.perform(.DELETE, target, &.{}, null, null);
         defer response.deinit(self.alloc);
@@ -888,20 +913,30 @@ fn appendQueryPair(alloc: Allocator, list: *std.ArrayListUnmanaged(QueryPair), n
 
 fn cloneQueryPairsAlloc(alloc: Allocator, pairs: []const QueryPair) ![]QueryPair {
     const out = try alloc.alloc(QueryPair, pairs.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..@min(out.len, pairs.len)]) |pair| {
+        for (out[0..initialized]) |pair| {
             alloc.free(pair.name);
             alloc.free(pair.value);
         }
         alloc.free(out);
     }
     for (pairs, 0..) |pair, idx| {
-        out[idx] = .{
-            .name = try alloc.dupe(u8, pair.name),
-            .value = try alloc.dupe(u8, pair.value),
-        };
+        const name = try alloc.dupe(u8, pair.name);
+        errdefer alloc.free(name);
+        const value = try alloc.dupe(u8, pair.value);
+        out[idx] = .{ .name = name, .value = value };
+        initialized += 1;
     }
     return out;
+}
+
+fn deinitQueryList(alloc: Allocator, list: *std.ArrayListUnmanaged(QueryPair)) void {
+    for (list.items) |pair| {
+        alloc.free(pair.name);
+        alloc.free(pair.value);
+    }
+    list.deinit(alloc);
 }
 
 fn freeQueryPairs(alloc: Allocator, pairs: []const QueryPair) void {
@@ -1534,6 +1569,67 @@ test "s3 multipart completion preserves ordered quoted etags" {
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;etag-one&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;etag-two&quot;</ETag></Part></CompleteMultipartUpload>",
         xml,
     );
+}
+
+test "s3 file upload completes a multipart lifecycle with bounded parts" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const source_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-s3-multipart-{d}", .{test_support.integrationNonce()});
+    defer alloc.free(source_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, source_path) catch {};
+    {
+        var source = try std.Io.Dir.createFileAbsolute(io, source_path, .{ .truncate = true });
+        defer source.close(io);
+        try source.writePositionalAll(io, "multipart-payload", 0);
+        try source.sync(io);
+    }
+
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            defer self.calls += 1;
+            return switch (self.calls) {
+                0 => blk: {
+                    try std.testing.expectEqual(HttpMethod.POST, method);
+                    try std.testing.expect(std.mem.endsWith(u8, url, "?uploads="));
+                    break :blk .{ .status = 200, .body = try request_alloc.dupe(u8, "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>") };
+                },
+                1 => blk: {
+                    try std.testing.expectEqual(HttpMethod.PUT, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "partNumber=1&uploadId=upload-1") != null);
+                    try std.testing.expectEqualStrings("multipart-payload", body.?);
+                    break :blk .{ .status = 200, .body = try request_alloc.alloc(u8, 0), .etag = try request_alloc.dupe(u8, "\"part-1\"") };
+                },
+                2 => blk: {
+                    try std.testing.expectEqual(HttpMethod.POST, method);
+                    try std.testing.expect(std.mem.endsWith(u8, url, "?uploadId=upload-1"));
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "<PartNumber>1</PartNumber>") != null);
+                    break :blk .{ .status = 200, .body = try request_alloc.dupe(u8, "<CompleteMultipartUploadResult><ETag>\"final-etag\"</ETag></CompleteMultipartUploadResult>") };
+                },
+                else => error.UnexpectedCall,
+            };
+        }
+    };
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "127.0.0.1:9000"),
+            .use_ssl = false,
+            .access_key_id = try alloc.dupe(u8, "key"),
+            .secret_access_key = try alloc.dupe(u8, "secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var state = State{};
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = s3_client.client();
+    defer client.deinit();
+    var result = try s3_client.putFileWithThreshold(alloc, io, "bucket", "backup/segment", source_path, .{}, 0);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("final-etag", result.etag.?);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
 test "s3 client signs and issues object operations through request fn" {

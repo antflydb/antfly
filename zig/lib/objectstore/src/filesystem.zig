@@ -148,6 +148,59 @@ pub const FilesystemClient = struct {
         return .{ .etag = etag };
     }
 
+    fn getFile(self: *FilesystemClient, alloc: Allocator, destination_io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8) !void {
+        const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
+        defer alloc.free(object_path);
+        const source = try openFilePath(self.io, object_path);
+        defer source.close(self.io);
+        const source_stat = try source.stat(self.io);
+        var header = try readObjectHeader(alloc, self.io, source, source_stat.size);
+        defer header.deinit(alloc);
+        try streamVerifiedObjectToFile(
+            alloc,
+            self.io,
+            destination_io,
+            source,
+            header,
+            dest_path,
+        );
+    }
+
+    fn getPrefix(self: *FilesystemClient, alloc: Allocator, destination_io: std.Io, bucket: []const u8, prefix: []const u8, dest_path: []const u8) !usize {
+        try validatePrefix(prefix);
+        const object_root = try objectRootAlloc(alloc, self.root_dir, bucket);
+        defer alloc.free(object_root);
+        const trimmed_prefix = if (prefix.len == 0) prefix else prefix[0 .. prefix.len - 1];
+        const prefix_root = if (trimmed_prefix.len == 0)
+            try alloc.dupe(u8, object_root)
+        else
+            try std.fs.path.join(alloc, &.{ object_root, trimmed_prefix });
+        defer alloc.free(prefix_root);
+        var dir = std.Io.Dir.cwd().openDir(self.io, prefix_root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer dir.close(self.io);
+        var walker = try dir.walk(alloc);
+        defer walker.deinit();
+
+        var count: usize = 0;
+        while (try walker.next(self.io)) |entry| {
+            if (entry.kind == .directory) continue;
+            if (entry.kind != .file) return error.CorruptObjectNamespace;
+            const key = if (prefix.len == 0)
+                try alloc.dupe(u8, entry.path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, entry.path });
+            defer alloc.free(key);
+            const destination = try std.fs.path.join(alloc, &.{ dest_path, entry.path });
+            defer alloc.free(destination);
+            try self.getFile(alloc, destination_io, bucket, key, destination);
+            count += 1;
+        }
+        return count;
+    }
+
     fn getObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
         if (opts.version_id != null) return error.VersioningUnsupported;
         if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
@@ -343,6 +396,8 @@ pub const FilesystemClient = struct {
         .make_bucket = erasedMakeBucket,
         .put_object = erasedPutObject,
         .put_file = erasedPutFile,
+        .get_file = erasedGetFile,
+        .get_prefix = erasedGetPrefix,
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
@@ -373,6 +428,16 @@ pub const FilesystemClient = struct {
     fn erasedPutFile(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         return try self.putFile(alloc, io, bucket, key, src_path, opts);
+    }
+
+    fn erasedGetFile(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8) !void {
+        const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
+        return try self.getFile(alloc, io, bucket, key, dest_path);
+    }
+
+    fn erasedGetPrefix(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, prefix: []const u8, dest_path: []const u8) !usize {
+        const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
+        return try self.getPrefix(alloc, io, bucket, prefix, dest_path);
     }
 
     fn erasedGetObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
@@ -580,6 +645,9 @@ fn writeObjectFileAtomically(
     }
     var extra: [1]u8 = undefined;
     if (try source.readPositionalAll(source_io, &extra, offset) != 0) return error.SourceFileChanged;
+    const final_source_stat = try source.stat(source_io);
+    if (final_source_stat.size != source_stat.size or !std.meta.eql(final_source_stat.mtime, source_stat.mtime))
+        return error.SourceFileChanged;
     try writer.end();
 
     var digest: [32]u8 = undefined;
@@ -660,6 +728,69 @@ fn readObjectRangeAlloc(io: std.Io, alloc: Allocator, path: []const u8, start: u
     return body;
 }
 
+fn streamVerifiedObjectToFile(
+    alloc: Allocator,
+    source_io: std.Io,
+    destination_io: std.Io,
+    source: std.Io.File,
+    header: ObjectHeader,
+    dest_path: []const u8,
+) !void {
+    try ensureParentDir(destination_io, dest_path);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-objectstore-download-{d}", .{ dest_path, uniqueNs() });
+    defer alloc.free(tmp_path);
+    errdefer deleteFilePath(destination_io, tmp_path) catch {};
+
+    var output = try createFilePath(destination_io, tmp_path);
+    var output_open = true;
+    defer if (output_open) output.close(destination_io);
+    var writer_buf: [64 * 1024]u8 = undefined;
+    var writer = output.writer(destination_io, &writer_buf);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var read_buf: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < header.content_length) {
+        const wanted: usize = @intCast(@min(header.content_length - offset, read_buf.len));
+        const file_offset = std.math.add(u64, header.data_offset, offset) catch return error.CorruptObject;
+        const n = try source.readPositionalAll(source_io, read_buf[0..wanted], file_offset);
+        if (n != wanted) return error.CorruptObject;
+        hasher.update(read_buf[0..n]);
+        try writer.interface.writeAll(read_buf[0..n]);
+        offset += n;
+    }
+    try writer.end();
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var actual_etag: [64]u8 = undefined;
+    digestHex(&actual_etag, &digest);
+    if (!std.mem.eql(u8, &actual_etag, &header.etag)) return error.ChecksumMismatch;
+    try output.sync(destination_io);
+    output.close(destination_io);
+    output_open = false;
+    try renameFilePath(destination_io, tmp_path, dest_path);
+}
+
+fn createFilePath(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true })
+    else
+        try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+}
+
+fn deleteFilePath(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.deleteFileAbsolute(io, path)
+    else
+        try std.Io.Dir.cwd().deleteFile(io, path);
+}
+
+fn renameFilePath(io: std.Io, source: []const u8, destination: []const u8) !void {
+    if (std.fs.path.isAbsolute(destination))
+        try std.Io.Dir.renameAbsolute(source, destination, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io);
+}
+
 fn computePartRange(total_len: usize, part_number: u32) !struct { start: usize, end: usize } {
     if (part_number == 0) return error.InvalidPartNumber;
     const start = (part_number - 1) * multipart_part_size;
@@ -683,11 +814,16 @@ fn sha256HexAlloc(alloc: Allocator, body: []const u8) ![]u8 {
 
 fn digestHexAlloc(alloc: Allocator, digest: *const [32]u8) ![]u8 {
     const out = try alloc.alloc(u8, 64);
+    digestHex(out, digest);
+    return out;
+}
+
+fn digestHex(out: []u8, digest: *const [32]u8) void {
+    std.debug.assert(out.len == 64);
     for (digest, 0..) |byte, idx| {
         out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
         out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
     }
-    return out;
 }
 
 fn bucketRootAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8) ![]u8 {
@@ -751,6 +887,14 @@ fn validateKey(key: []const u8) !void {
             std.mem.indexOfScalar(u8, segment, '\\') != null)
             return error.InvalidObjectKey;
     }
+}
+
+fn validatePrefix(prefix: []const u8) !void {
+    if (prefix.len == 0) return;
+    if (!std.mem.endsWith(u8, prefix, "/")) return error.InvalidObjectPrefix;
+    const trimmed = prefix[0 .. prefix.len - 1];
+    if (trimmed.len == 0) return error.InvalidObjectPrefix;
+    try validateKey(trimmed);
 }
 
 const ListCandidate = struct {
@@ -909,4 +1053,66 @@ test "filesystem pagination retains only the requested ordered window" {
     try std.testing.expectEqualStrings("logs/a/", collapsed.common_prefixes[0]);
     try std.testing.expectEqualStrings("logs/b/", collapsed.common_prefixes[1]);
     try std.testing.expectEqualStrings("logs/b/", collapsed.next_continuation_token.?);
+}
+
+test "filesystem whole-file download verifies payload checksum before publication" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "download-integrity");
+    defer cleanupTmp(path);
+
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+    var put = try client.putObject("bucket", "backup/segment", "integrity", .{});
+    put.deinit(alloc);
+
+    const object_path = try objectPathAlloc(alloc, fs.root_dir, "bucket", "backup/segment");
+    defer alloc.free(object_path);
+    var raw = try std.Io.Dir.openFileAbsolute(fs.io, object_path, .{ .mode = .read_write });
+    try raw.writePositionalAll(fs.io, "X", object_header_len);
+    raw.close(fs.io);
+
+    const destination = try std.fs.path.join(alloc, &.{ std.mem.span(path), "restore", "segment" });
+    defer alloc.free(destination);
+    try std.testing.expectError(error.ChecksumMismatch, client.getFile("bucket", "backup/segment", destination, .{}));
+    try std.testing.expect(!fileExists(fs.io, destination));
+}
+
+test "filesystem native prefix download walks once and confines descendants" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "prefix-download");
+    defer cleanupTmp(path);
+
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+    const objects = [_][2][]const u8{
+        .{ "backup/a", "alpha" },
+        .{ "backup/nested/b", "beta" },
+        .{ "backup-sibling/c", "wrong" },
+    };
+    for (objects) |object| {
+        var put = try client.putObject("bucket", object[0], object[1], .{});
+        put.deinit(alloc);
+    }
+
+    const destination = try std.fs.path.join(alloc, &.{ std.mem.span(path), "restore" });
+    defer alloc.free(destination);
+    const count = (try client.getPrefixWithIo(fs.io, "bucket", "backup/", destination)).?;
+    try std.testing.expectEqual(@as(usize, 2), count);
+    const alpha_path = try std.fs.path.join(alloc, &.{ destination, "a" });
+    defer alloc.free(alpha_path);
+    const alpha = try readFileAlloc(alloc, alpha_path);
+    defer alloc.free(alpha);
+    try std.testing.expectEqualStrings("alpha", alpha);
+    const beta_path = try std.fs.path.join(alloc, &.{ destination, "nested", "b" });
+    defer alloc.free(beta_path);
+    const beta = try readFileAlloc(alloc, beta_path);
+    defer alloc.free(beta);
+    try std.testing.expectEqualStrings("beta", beta);
+    const sibling_path = try std.fs.path.join(alloc, &.{ destination, "c" });
+    defer alloc.free(sibling_path);
+    try std.testing.expect(!fileExists(fs.io, sibling_path));
 }

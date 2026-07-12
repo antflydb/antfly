@@ -30,6 +30,8 @@ pub const Client = struct {
         make_bucket: *const fn (*anyopaque, []const u8) anyerror!void,
         put_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult,
         put_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult = null,
+        get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
+        get_prefix: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!usize = null,
         get_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, types.GetOptions) anyerror!types.GetResult,
         get_object_attributes: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectAttributes,
         stat_object: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectMetadata,
@@ -95,6 +97,7 @@ pub const Client = struct {
     }
 
     fn getWholeFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8) !void {
+        if (self.vtable.get_file) |get_file| return try get_file(self.ptr, self.allocator, io, bucket, key, dest_path);
         var meta = try self.statObject(bucket, key);
         defer meta.deinit(self.allocator);
         try ensureParentDir(io, dest_path);
@@ -126,6 +129,13 @@ pub const Client = struct {
 
     pub fn getObjectAttributes(self: *Client, bucket: []const u8, key: []const u8) !types.ObjectAttributes {
         return try self.vtable.get_object_attributes(self.ptr, self.allocator, bucket, key);
+    }
+
+    /// Returns null when the provider has no native prefix transfer. A
+    /// non-null count is the number of files atomically published below dest.
+    pub fn getPrefixWithIo(self: *Client, io: std.Io, bucket: []const u8, prefix: []const u8, dest_path: []const u8) !?usize {
+        const get_prefix = self.vtable.get_prefix orelse return null;
+        return try get_prefix(self.ptr, self.allocator, io, bucket, prefix, dest_path);
     }
 
     pub fn statObject(self: *Client, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
