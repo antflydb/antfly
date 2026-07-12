@@ -277,6 +277,7 @@ const RemoteBackupStore = struct {
     gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
     s3_client: ?*object_storage.S3.Client = null,
     credential_context: ?*AwsCredentialContext = null,
+    resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null,
     owns_client: bool = true,
     create_bucket_if_missing: bool = false,
     bucket: []u8,
@@ -304,6 +305,8 @@ const RemoteBackupStore = struct {
         const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
         var create_bucket_if_missing = false;
+        var resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null;
+        errdefer if (resolved_credentials) |*credentials| credentials.deinit(alloc);
         const cfg = if (options.connection) |connection_id| blk: {
             const external = try authorizedObjectConnection(
                 options.node_config orelse return error.ConnectionConfigUnavailable,
@@ -314,17 +317,26 @@ const RemoteBackupStore = struct {
                 options.required_capability,
             );
             create_bucket_if_missing = external.bucket_provisioning == .create_if_missing;
-            break :blk try gcsConfigForConnection(alloc, external);
+            resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, external, options.secret_store);
+            break :blk try gcsConfigForConnection(alloc, resolved_credentials.?.apply(external));
         } else try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
+        errdefer {
+            var client = gcs.client();
+            client.deinit();
+        }
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
 
         return .{
             .alloc = alloc,
             .client = gcs.client(),
             .gcs_client = gcs,
+            .resolved_credentials = resolved_credentials,
             .create_bucket_if_missing = create_bucket_if_missing,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -342,10 +354,13 @@ const RemoteBackupStore = struct {
             alloc.destroy(context);
         };
         var create_bucket_if_missing = false;
+        var resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null;
+        errdefer if (resolved_credentials) |*credentials| credentials.deinit(alloc);
         const cfg = if (options.connection) |connection_id| blk: {
             const connection = try authorizedObjectConnection(options.node_config orelse return error.ConnectionConfigUnavailable, connection_id, .s3, bucket, prefix, options.required_capability);
             create_bucket_if_missing = connection.bucket_provisioning == .create_if_missing;
-            break :blk try s3ConfigForConnection(alloc, connection, &credential_context);
+            resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, connection, options.secret_store);
+            break :blk try s3ConfigForConnection(alloc, resolved_credentials.?.apply(connection), &credential_context);
         } else blk: {
             var overrides = try loadS3SecretOverrides(alloc, options.secret_store);
             defer overrides.deinit(alloc);
@@ -361,15 +376,23 @@ const RemoteBackupStore = struct {
             );
         };
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
+        errdefer {
+            var client = s3.client();
+            client.deinit();
+        }
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
 
         return .{
             .alloc = alloc,
             .client = s3.client(),
             .s3_client = s3,
             .credential_context = credential_context,
+            .resolved_credentials = resolved_credentials,
             .create_bucket_if_missing = create_bucket_if_missing,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -397,6 +420,7 @@ const RemoteBackupStore = struct {
             context.deinit();
             self.alloc.destroy(context);
         }
+        if (self.resolved_credentials) |*credentials| credentials.deinit(self.alloc);
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;
@@ -736,6 +760,7 @@ pub fn backupLocationErrorMessage(err: anyerror) ?[]const u8 {
         error.ConnectionBucketDenied => "backup location bucket is outside the connection allowlist",
         error.ConnectionPrefixDenied => "backup location prefix is outside the connection scope",
         error.InvalidConnectionCredentials => "backup connection credential configuration is invalid",
+        error.SecretNotFound => "a secret referenced by the backup connection was not found",
         error.BucketNotFound => "backup bucket does not exist and the connection does not allow provisioning",
         else => null,
     };

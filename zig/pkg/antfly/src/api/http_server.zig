@@ -1362,6 +1362,7 @@ pub const ApiHttpServer = struct {
             .antfly_provider = self.antfly_provider,
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
+            .secret_store = self.cfg.secret_store,
             .io = if (self.cfg.backend_runtime) |runtime|
                 if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
             else

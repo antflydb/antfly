@@ -406,6 +406,56 @@ pub const Config = struct {
         }
     };
 
+    /// Owned credential material for an external-I/O client snapshot.
+    /// The node config retains `${secret:...}` references; callers resolve an
+    /// owned snapshot immediately before constructing a client so rotations
+    /// take effect without a process restart.
+    pub const ResolvedExternalIoCredentials = struct {
+        aws: AwsCredentialConfig = .{},
+        gcs: GcsCredentialConfig = .{},
+
+        pub fn deinit(self: *ResolvedExternalIoCredentials, alloc: std.mem.Allocator) void {
+            self.aws.deinit(alloc);
+            self.gcs.deinit(alloc);
+            self.* = undefined;
+        }
+
+        pub fn apply(self: *const ResolvedExternalIoCredentials, external: ExternalIoConnectionConfig) ExternalIoConnectionConfig {
+            var resolved = external;
+            resolved.credentials = self.aws;
+            resolved.gcs_credentials = self.gcs;
+            return resolved;
+        }
+    };
+
+    pub fn resolveExternalIoCredentials(
+        alloc: std.mem.Allocator,
+        external: ExternalIoConnectionConfig,
+        secret_store: ?*secrets.FileStore,
+    ) !ResolvedExternalIoCredentials {
+        var resolved = ResolvedExternalIoCredentials{
+            .aws = .{ .source = external.credentials.source },
+            .gcs = .{ .source = external.gcs_credentials.source },
+        };
+        errdefer resolved.deinit(alloc);
+
+        resolved.aws.access_key_id = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.access_key_id);
+        resolved.aws.secret_access_key = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.secret_access_key);
+        resolved.aws.session_token = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.session_token);
+        resolved.aws.profile = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.profile);
+        resolved.aws.shared_credentials_file = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.shared_credentials_file);
+        resolved.aws.role_arn = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.role_arn);
+        resolved.aws.token_file = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.token_file);
+        resolved.aws.session_name = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.session_name);
+        resolved.aws.sts_endpoint = try resolveOptionalConnectionSecret(alloc, secret_store, external.credentials.sts_endpoint);
+
+        resolved.gcs.bearer_token = try resolveOptionalConnectionSecret(alloc, secret_store, external.gcs_credentials.bearer_token);
+        resolved.gcs.service_account_json = try resolveOptionalConnectionSecret(alloc, secret_store, external.gcs_credentials.service_account_json);
+        resolved.gcs.credentials_path = try resolveOptionalConnectionSecret(alloc, secret_store, external.gcs_credentials.credentials_path);
+        resolved.gcs.scope = try resolveOptionalConnectionSecret(alloc, secret_store, external.gcs_credentials.scope);
+        return resolved;
+    }
+
     pub const CdcConnectionConfig = struct {
         provider: []u8,
         dsn: ?[]u8 = null,
@@ -475,7 +525,7 @@ pub const Config = struct {
             for (replacement_strings.items) |value| alloc.free(value);
             replacement_strings.deinit(alloc);
         }
-        try resolveSecretReferencesInValue(alloc, &parsed_tree.value, secret_store, &replacement_strings);
+        try resolveSecretReferencesInValue(alloc, &parsed_tree.value, secret_store, &replacement_strings, .config_root);
         const root = switch (parsed_tree.value) {
             .object => |object| object,
             else => return error.InvalidConfig,
@@ -1842,11 +1892,29 @@ fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []u8) void {
     alloc.free(values);
 }
 
+fn resolveOptionalConnectionSecret(
+    alloc: std.mem.Allocator,
+    secret_store: ?*secrets.FileStore,
+    raw: ?[]const u8,
+) !?[]u8 {
+    const value = raw orelse return null;
+    return try secrets.resolveReferenceOwned(alloc, secret_store, value);
+}
+
+const SecretResolutionContext = enum {
+    config_root,
+    connections,
+    connection,
+    external_io,
+    normal,
+};
+
 fn resolveSecretReferencesInValue(
     alloc: std.mem.Allocator,
     value: *std.json.Value,
     secret_store: ?*secrets.FileStore,
     replacement_strings: *std.ArrayList([]u8),
+    context: SecretResolutionContext,
 ) !void {
     switch (value.*) {
         .string => |raw| {
@@ -1856,12 +1924,24 @@ fn resolveSecretReferencesInValue(
             value.* = .{ .string = resolved };
         },
         .array => |*arr| {
-            for (arr.items) |*item| try resolveSecretReferencesInValue(alloc, item, secret_store, replacement_strings);
+            for (arr.items) |*item| try resolveSecretReferencesInValue(alloc, item, secret_store, replacement_strings, .normal);
         },
         .object => |*obj| {
             var it = obj.iterator();
             while (it.next()) |entry| {
-                try resolveSecretReferencesInValue(alloc, entry.value_ptr, secret_store, replacement_strings);
+                // External-I/O credentials are operational secrets: retain
+                // references in the immutable node config and resolve them at
+                // each backup, restore, or probe. This makes rotation effective
+                // without weakening bucket/prefix authorization. Other config
+                // secrets keep their established startup-resolution behavior.
+                const child_context: SecretResolutionContext = switch (context) {
+                    .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else .normal,
+                    .connections => .connection,
+                    .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else .normal,
+                    .external_io => if (std.mem.eql(u8, entry.key_ptr.*, "credentials")) continue else .normal,
+                    .normal => .normal,
+                };
+                try resolveSecretReferencesInValue(alloc, entry.value_ptr, secret_store, replacement_strings, child_context);
             }
         },
         else => {},
@@ -2385,6 +2465,62 @@ test "common config resolves secret references through the provided store" {
     var cfg = try Config.parseFromSliceWithSecrets(alloc, raw, &secret_store);
     defer cfg.deinit();
     try std.testing.expectEqualStrings("http://127.0.0.1:8089", cfg.inference.api_url.?);
+}
+
+test "common config external io credentials retain references and observe secret rotation" {
+    const alloc = std.testing.allocator;
+    const store_path = ".zig-cache/test-connection-secret-rotation.json";
+    defer {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+    }
+    var secret_store = try secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+    var first_key = try secret_store.put(alloc, "archive.key", "KEY-ONE");
+    defer first_key.deinit(alloc);
+    var first_secret = try secret_store.put(alloc, "archive.secret", "SECRET-ONE");
+    defer first_secret.deinit(alloc);
+
+    const raw =
+        \\{
+        \\  "storage": { "engine": "local", "local": { "base_dir": "antflydb" } },
+        \\  "connections": {
+        \\    "archive": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write"],
+        \\      "external_io": {
+        \\        "protocol": "s3",
+        \\        "buckets": ["archive-bucket"],
+        \\        "credentials": {
+        \\          "source": "static",
+        \\          "access_key_id": "${secret:archive.key}",
+        \\          "secret_access_key": "${secret:archive.secret}"
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try Config.parseFromSliceWithSecrets(alloc, raw, &secret_store);
+    defer cfg.deinit();
+    const external = cfg.connections.get("archive").?.external_io.?;
+    try std.testing.expectEqualStrings("${secret:archive.key}", external.credentials.access_key_id.?);
+    try std.testing.expectEqualStrings("${secret:archive.secret}", external.credentials.secret_access_key.?);
+
+    var resolved = try Config.resolveExternalIoCredentials(alloc, external, &secret_store);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("KEY-ONE", resolved.aws.access_key_id.?);
+    try std.testing.expectEqualStrings("SECRET-ONE", resolved.aws.secret_access_key.?);
+
+    var rotated_key = try secret_store.put(alloc, "archive.key", "KEY-TWO");
+    defer rotated_key.deinit(alloc);
+    var rotated_secret = try secret_store.put(alloc, "archive.secret", "SECRET-TWO");
+    defer rotated_secret.deinit(alloc);
+    var rotated = try Config.resolveExternalIoCredentials(alloc, external, &secret_store);
+    defer rotated.deinit(alloc);
+    try std.testing.expectEqualStrings("KEY-TWO", rotated.aws.access_key_id.?);
+    try std.testing.expectEqualStrings("SECRET-TWO", rotated.aws.secret_access_key.?);
 }
 
 test "common config inherits antfly content security from remote content" {

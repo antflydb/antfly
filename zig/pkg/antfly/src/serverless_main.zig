@@ -124,7 +124,11 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
-    var configured_uris = try ConfiguredStorageUris.init(alloc, if (loaded_config) |*cfg| cfg else null);
+    var configured_uris = try ConfiguredStorageUris.init(
+        alloc,
+        if (loaded_config) |*cfg| cfg else null,
+        if (secret_store) |*store| store else null,
+    );
     defer configured_uris.deinit(alloc);
     if (loaded_config != null) try rejectStorageUriOverrides(init.environ_map, cli);
 
@@ -404,8 +408,13 @@ const ConfiguredStorageUris = struct {
     progress: ?[]u8 = null,
     catalog: ?[]u8 = null,
     s3_options: [5]?serverless.BootstrapConfig.S3Options = .{ null, null, null, null, null },
+    resolved_credentials: [5]?antfly.common.config.Config.ResolvedExternalIoCredentials = .{ null, null, null, null, null },
 
-    fn init(alloc: std.mem.Allocator, cfg: ?*const antfly.common.config.Config) !ConfiguredStorageUris {
+    fn init(
+        alloc: std.mem.Allocator,
+        cfg: ?*const antfly.common.config.Config,
+        secret_store: ?*antfly.common.secrets.FileStore,
+    ) !ConfiguredStorageUris {
         const config = cfg orelse return .{};
         if (config.deployment_mode != .serverless or config.storage.engine != .object) return error.InvalidServerlessStorageConfig;
         const connection = config.storage.object_connection orelse return error.InvalidServerlessStorageConfig;
@@ -429,7 +438,13 @@ const ConfiguredStorageUris = struct {
                 try objectUriAlloc(alloc, lane_bucket, lane_prefix)
             else
                 try objectLaneUriAlloc(alloc, lane_bucket, prefix, name);
-            out.s3_options[index] = try storageS3Options(config, lane_connection);
+            out.s3_options[index] = try storageS3Options(
+                alloc,
+                config,
+                lane_connection,
+                secret_store,
+                &out.resolved_credentials[index],
+            );
         }
         return out;
     }
@@ -440,18 +455,26 @@ const ConfiguredStorageUris = struct {
         if (self.wal) |value| alloc.free(value);
         if (self.progress) |value| alloc.free(value);
         if (self.catalog) |value| alloc.free(value);
+        for (&self.resolved_credentials) |*maybe_credentials| {
+            if (maybe_credentials.*) |*credentials| credentials.deinit(alloc);
+        }
         self.* = .{};
     }
 };
 
 fn storageS3Options(
+    alloc: std.mem.Allocator,
     config: *const antfly.common.config.Config,
     connection_id: []const u8,
+    secret_store: ?*antfly.common.secrets.FileStore,
+    resolved_credentials: *?antfly.common.config.Config.ResolvedExternalIoCredentials,
 ) !serverless.BootstrapConfig.S3Options {
     const connection = config.connections.get(connection_id) orelse return error.InvalidServerlessStorageConfig;
     if (connection.kind != .external_io) return error.InvalidServerlessStorageConfig;
-    const external = connection.external_io orelse return error.InvalidServerlessStorageConfig;
-    if (external.protocol != .s3) return error.InvalidServerlessStorageConfig;
+    const configured_external = connection.external_io orelse return error.InvalidServerlessStorageConfig;
+    if (configured_external.protocol != .s3) return error.InvalidServerlessStorageConfig;
+    resolved_credentials.* = try antfly.common.config.Config.resolveExternalIoCredentials(alloc, configured_external, secret_store);
+    const external = resolved_credentials.*.?.apply(configured_external);
     var options = serverless.BootstrapConfig.S3Options{
         .endpoint = external.endpoint,
         .region = external.region,
@@ -813,18 +836,35 @@ test "serverless main backend summary prefers parsed location" {
 
 test "serverless main derives multi-bucket lanes and per-connection credentials" {
     const alloc = std.testing.allocator;
-    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+    const store_path = ".zig-cache/test-serverless-storage-secrets.json";
+    defer {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+    }
+    var secret_store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+    inline for (.{
+        .{ "data.key", "data-key" },
+        .{ "data.secret", "data-secret" },
+        .{ "wal.key", "wal-key" },
+        .{ "wal.secret", "wal-secret" },
+    }) |entry| {
+        var stored = try secret_store.put(alloc, entry[0], entry[1]);
+        stored.deinit(alloc);
+    }
+    var cfg = try antfly.common.config.Config.parseFromSliceWithSecrets(alloc,
         \\{
         \\  "deployment_mode": "serverless",
         \\  "connections": {
-        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "region": "us-west-2", "buckets": ["data-bucket"], "credentials": { "source": "static", "access_key_id": "data-key", "secret_access_key": "data-secret" } } },
-        \\    "wal": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "endpoint": "minio:9000", "use_ssl": false, "buckets": ["wal-bucket"], "credentials": { "source": "static", "access_key_id": "wal-key", "secret_access_key": "wal-secret" } } }
+        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "region": "us-west-2", "buckets": ["data-bucket"], "credentials": { "source": "static", "access_key_id": "${secret:data.key}", "secret_access_key": "${secret:data.secret}" } } },
+        \\    "wal": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "endpoint": "minio:9000", "use_ssl": false, "buckets": ["wal-bucket"], "credentials": { "source": "static", "access_key_id": "${secret:wal.key}", "secret_access_key": "${secret:wal.secret}" } } }
         \\  },
         \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket", "prefix": "/prod/", "lanes": { "wal": { "connection": "wal", "bucket": "wal-bucket", "prefix": "/durable/" } } } }
         \\}
-    );
+    , &secret_store);
     defer cfg.deinit();
-    var configured = try ConfiguredStorageUris.init(alloc, &cfg);
+    var configured = try ConfiguredStorageUris.init(alloc, &cfg, &secret_store);
     defer configured.deinit(alloc);
     try std.testing.expectEqualStrings("s3://data-bucket/prod/artifacts", configured.artifacts.?);
     try std.testing.expectEqualStrings("s3://wal-bucket/durable", configured.wal.?);

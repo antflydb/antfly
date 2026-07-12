@@ -125,6 +125,23 @@ committed plaintext.
 Pass `--secret-store-path` (or `ANTFLY_SECRET_STORE_PATH`) when those JSON
 values use `${secret:...}`.
 
+External-I/O credential references remain references in the loaded node
+configuration. Antfly resolves an owned credential snapshot immediately before
+each backup, restore, or connection probe, and keeps it alive for the object
+client lifetime. Updating the secret store therefore affects new operations
+without restarting the process; in-flight operations continue with the
+snapshot they opened with. Probe-cache identities include a digest of the
+resolved snapshot, so rotation cannot reuse a stale successful probe. Bucket,
+prefix, protocol, and capability authorization remain immutable node config and
+cannot be expanded by rotating a credential.
+
+Primary object-storage clients resolve connection references once during
+serverless bootstrap because they own long-lived pools and durability state.
+Use `default`, `profile`, or `web_identity` for automatically refreshed primary
+credentials. Rotating a `static` primary-storage secret requires a controlled
+process restart; this does not affect the per-operation rotation behavior of
+backup and restore connections.
+
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the
 `s3://` location continues to identify the artifact:

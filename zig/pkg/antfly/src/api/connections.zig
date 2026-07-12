@@ -26,6 +26,7 @@ const objectstore = @import("objectstore");
 const platform_time = @import("../platform/time.zig");
 const platform_sync = @import("antfly_platform").sync;
 const common_config = @import("../common/config.zig");
+const common_secrets = @import("../common/secrets.zig");
 const metadata_api = @import("../metadata/api.zig");
 const bedrock = @import("../inference/bedrock.zig");
 const list_models = @import("../inference/list_models.zig");
@@ -148,6 +149,9 @@ pub const Sources = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    /// Live secret source used to resolve external-I/O credential references
+    /// immediately before a probe.
+    secret_store: ?*common_secrets.FileStore = null,
     /// Shared server runtime for bounded connection discovery fanout. Tests
     /// and embedded callers without a runtime fall back to sequential work.
     io: ?std.Io = null,
@@ -376,7 +380,7 @@ pub fn buildConnectionsResponse(
     if (sources.node_config) |node_config| {
         try appendConfiguredConnections(arena, &connections, sources, cache, effective_opts, kinds, node_config);
         if (effective_opts.probe and kinds.contains(.external_io)) {
-            try resolveExternalIoProbes(arena, &connections, node_config, cache, effective_opts, sources.io);
+            try resolveExternalIoProbes(arena, &connections, node_config, cache, effective_opts, sources.io, sources.secret_store);
         }
     }
 
@@ -955,6 +959,7 @@ fn resolveExternalIoProbes(
     cache: ?*Cache,
     opts: BuildOptions,
     io: ?std.Io,
+    secret_store: ?*common_secrets.FileStore,
 ) !void {
     const Pending = struct {
         connection_index: usize,
@@ -984,7 +989,13 @@ fn resolveExternalIoProbes(
             continue;
         }
         const configured = node_config.connections.get(connection.id) orelse return error.InvalidConfig;
-        const cfg = configured.external_io orelse return error.InvalidConfig;
+        const raw_cfg = configured.external_io orelse return error.InvalidConfig;
+        var resolved_credentials = common_config.Config.resolveExternalIoCredentials(arena, raw_cfg, secret_store) catch |err| {
+            connection.status = .@"error";
+            connection.@"error" = @errorName(err);
+            continue;
+        };
+        const cfg = resolved_credentials.apply(raw_cfg);
         if (cfg.buckets.len == 0) {
             connection.status = .@"error";
             connection.@"error" = "MissingBucketAllowlist";
