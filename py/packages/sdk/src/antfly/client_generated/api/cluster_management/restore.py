@@ -44,10 +44,20 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
         return response_400
 
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
         return response_500
+
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -79,7 +89,8 @@ def sync_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted. Poll the restore job resource for progress.
+    job record is persisted and an asynchronous worker is available. Poll
+    the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection
@@ -125,7 +136,8 @@ def sync(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted. Poll the restore job resource for progress.
+    job record is persisted and an asynchronous worker is available. Poll
+    the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection
@@ -166,7 +178,8 @@ async def asyncio_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted. Poll the restore job resource for progress.
+    job record is persisted and an asynchronous worker is available. Poll
+    the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection
@@ -210,7 +223,8 @@ async def asyncio(
     - `skip_if_exists`: Skip existing tables and restore the rest
 
     The restore is a durable asynchronous job. The request returns after the
-    job record is persisted. Poll the restore job resource for progress.
+    job record is persisted and an asynchronous worker is available. Poll
+    the restore job resource for progress.
     Completed table boundaries are durably checkpointed and are not repeated
     after restart. If a process stops between table publication and its
     completion checkpoint, recovery fails closed for operator inspection

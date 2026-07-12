@@ -1248,9 +1248,10 @@ pub fn runFromIterator(
     if (lite_backend) |*backend| {
         node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
     }
-    var storage_maintenance = antfly.storage_maintenance.Coordinator.init(
+    var storage_maintenance = try antfly.storage_maintenance.Coordinator.init(
         alloc,
         if (lite_backend) |*backend| backend.maintenanceSource() else antfly.storage_maintenance.localSource,
+        node_backend_runtime.ptr(),
     );
     defer storage_maintenance.deinit();
 

@@ -8088,7 +8088,8 @@ paths:
         - `skip_if_exists`: Skip existing tables and restore the rest
 
         The restore is a durable asynchronous job. The request returns after the
-        job record is persisted. Poll the restore job resource for progress.
+        job record is persisted and an asynchronous worker is available. Poll
+        the restore job resource for progress.
         Completed table boundaries are durably checkpointed and are not repeated
         after restart. If a process stops between table publication and its
         completion checkpoint, recovery fails closed for operator inspection
@@ -8123,6 +8124,10 @@ paths:
                 $ref: "#/components/schemas/RestoreJob"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /restore/jobs/{job_id}:
@@ -8852,6 +8857,10 @@ paths:
                 $ref: "#/components/schemas/RestoreJob"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/schema:

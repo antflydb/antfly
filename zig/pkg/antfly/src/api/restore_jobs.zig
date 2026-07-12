@@ -126,7 +126,7 @@ pub const Store = struct {
         return .{ .alloc = alloc };
     }
 
-    pub fn initWithIo(alloc: std.mem.Allocator, io: ?std.Io) Store {
+    pub fn initWithIo(alloc: std.mem.Allocator, io: std.Io) Store {
         return .{ .alloc = alloc, .io = io };
     }
 
@@ -421,6 +421,7 @@ pub const Store = struct {
 
     pub fn start(self: *Store, alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
         try validateStartRequest(req);
+        const io = self.io orelse return error.AsyncRestoreUnavailable;
         const fingerprint = try requestFingerprintAlloc(alloc, req);
         defer alloc.free(fingerprint);
         const explicit_idempotency_key = if (req.idempotency_key) |provided| blk: {
@@ -428,12 +429,6 @@ pub const Store = struct {
             break :blk provided;
         } else null;
         var entropy: [16]u8 = undefined;
-        var fallback_io: ?std.Io.Threaded = null;
-        defer if (fallback_io) |*io_impl| io_impl.deinit();
-        const io = self.io orelse blk: {
-            fallback_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-            break :blk fallback_io.?.io();
-        };
         try io.randomSecure(&entropy);
 
         self.lock();
@@ -982,7 +977,7 @@ const TestReplicatedPersistence = struct {
 };
 
 test "restore job store is idempotent and fenced" {
-    var store = Store.init(std.testing.allocator);
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
     const req: StartRequest = .{
         .scope = .cluster,
@@ -1010,7 +1005,7 @@ test "restore job store is idempotent and fenced" {
 }
 
 test "restore job runnable queue drains incrementally and preserves insertion order" {
-    var store = Store.init(std.testing.allocator);
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
     var created: [3]u64 = undefined;
     for (&created, 0..) |*job_id, i| {
@@ -1041,7 +1036,7 @@ test "restore job runnable queue drains incrementally and preserves insertion or
 test "replicated restore leadership rebuild preserves FIFO and recovers running attempts" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.init(std.testing.allocator);
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -1095,7 +1090,7 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
 }
 
 test "restore requests without idempotency keys create independent opaque jobs" {
-    var store = Store.init(std.testing.allocator);
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
     const req: StartRequest = .{
         .scope = .table,
@@ -1126,7 +1121,7 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
 
     var job_id: u64 = 0;
     {
-        var first_store = Store.init(alloc);
+        var first_store = Store.initWithIo(alloc, std.testing.io);
         defer first_store.deinit();
         try first_store.attachRuntime(&runtime);
         const started = try first_store.start(alloc, .{
@@ -1179,5 +1174,11 @@ test "restore job store rejects oversized request state" {
         .location = "s3://archive/backups",
         .connection = "archive-reader",
         .table_names = &.{ "docs", "docs" },
+    }));
+    try std.testing.expectError(error.AsyncRestoreUnavailable, store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/backups",
+        .connection = "archive-reader",
     }));
 }

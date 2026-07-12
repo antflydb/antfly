@@ -188,7 +188,9 @@ their connection root through absolute paths, traversal components, or existing
 symlink ancestors.
 
 Restore is a durable asynchronous job. `POST /db/v1/restore` and table restore
-persist the job before returning `202`; clients poll or cancel
+verify that the shared asynchronous backend-runtime lane is available, then
+persist the job before returning `202`; otherwise admission fails with `503`
+and creates no durable job. Clients poll or cancel
 `/db/v1/restore/jobs/{job_id}`. `Idempotency-Key` safely coalesces retries,
 while requests without a key create independent jobs. Completed table boundaries
 are durably checkpointed and are not repeated after restart. An ambiguous
@@ -306,8 +308,8 @@ while readers pin roots and makes vacuum/rewrite wait before reclaiming pages.
 A checkpointed namespace-head directory and per-namespace document links retain
 efficient table-history maintenance independently of the global ordered index.
 Recreating an existing Lite artifact publishes a complete new inode by atomic
-rename, so readers pinned to
-the prior generation are never exposed to truncation. Missing namespace
+rename, so readers pinned to the prior generation are never exposed to
+truncation. Missing namespace
 metadata fails closed as file corruption. Hash-indexed namespace runtimes give
 expected `O(1)` reuse without storage reinitialization on repeated reader/writer
 opens. The standalone metadata
@@ -326,7 +328,9 @@ Otherwise they are disabled unless standalone is started with
 The same routes exist for every engine and return `422` when unsupported. The
 status capability reports whether maintenance preserves request availability.
 Lite maintenance is currently coordinated but exclusive (`online: false`): the
-asynchronous job acquires the file maintenance gate, readiness becomes false,
+asynchronous job runs through the server's shared `std.Io` backend-runtime lane
+with fenced owner shutdown, acquires the file maintenance gate, readiness
+becomes false,
 and new database requests fail fast with `503` instead of accumulating behind
 the maintenance lock. Admin status and cancellation remain available. Shutdown
 and explicit cancellation stop native checks and vacuum

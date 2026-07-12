@@ -3871,6 +3871,7 @@ pub fn build(b: *std.Build) void {
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
         "api http server returns retryable not leader through public cluster adapter mutation",
+        "api http server rejects restore before persistence without an asynchronous worker",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "api http server retries stale metadata table-exists restore race",
@@ -3963,9 +3964,11 @@ pub fn build(b: *std.Build) void {
     const lib_storage_maintenance_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
+            "storage maintenance requires an asynchronous backend runtime",
             "storage maintenance coordinator is idempotent and single flight",
             "storage maintenance job ids are namespaced by server boot",
             "storage maintenance cancellation reaches a cooperative engine",
+            "storage maintenance shutdown fences and drains its backend runtime owner",
             "storage maintenance snapshots remain valid after retention pruning",
             "storage maintenance append allocation failure does not wedge coordinator",
         },

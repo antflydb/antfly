@@ -4,6 +4,7 @@
 // except in compliance with the Elastic License 2.0.
 
 const std = @import("std");
+const background_runtime = @import("background_runtime.zig");
 const platform_time = @import("../platform/time.zig");
 const platform_sync = @import("antfly_platform").sync;
 
@@ -92,6 +93,8 @@ pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     source: Source,
     mutex: std.atomic.Mutex = .unlocked,
+    durable_jobs: background_runtime.DurableJobLane,
+    job_owner_id: u64,
     id_seed: u64,
     id_sequence: u64 = 1,
     exclusive_active: std.atomic.Value(bool) = .init(false),
@@ -113,11 +116,9 @@ pub const Coordinator = struct {
         // @errorName strings have static lifetime, so response snapshots never
         // borrow heap memory from a prunable Job.
         error_name: ?[]const u8 = null,
-        thread: ?std.Thread = null,
         cancel: CancelToken = .{},
 
         fn deinit(self: *Job, allocator: std.mem.Allocator) void {
-            if (self.thread) |thread| thread.join();
             if (self.idempotency_key) |key| allocator.free(key);
             allocator.destroy(self);
         }
@@ -134,24 +135,49 @@ pub const Coordinator = struct {
         error_name: ?[]const u8,
     };
 
-    pub fn init(allocator: std.mem.Allocator, source: Source) Coordinator {
+    const JobExecution = struct {
+        coordinator: *Coordinator,
+        job: *Job,
+
+        fn run(ptr: *anyopaque) !void {
+            const execution: *JobExecution = @ptrCast(@alignCast(ptr));
+            execution.coordinator.runJob(execution.job);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const execution: *JobExecution = @ptrCast(@alignCast(ptr));
+            execution.coordinator.allocator.destroy(execution);
+        }
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        source: Source,
+        runtime: *background_runtime.BackendRuntime,
+    ) !Coordinator {
+        if (runtime.backend == .manual or runtime.io() == null) return error.AsyncMaintenanceRuntimeRequired;
         const seed = [2]u64{
             platform_time.realtimeNs(),
             coordinator_boot_sequence.fetchAdd(1, .monotonic),
         };
         var seed_random: u64 = undefined;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        io_impl.io().randomSecure(std.mem.asBytes(&seed_random)) catch {
+        runtime.io().?.randomSecure(std.mem.asBytes(&seed_random)) catch {
             seed_random = std.hash.Wyhash.hash(0x616e74666c792d6d, std.mem.asBytes(&seed));
         };
-        return initWithSeed(allocator, source, seed_random);
+        return initWithSeed(allocator, source, runtime, seed_random);
     }
 
-    fn initWithSeed(allocator: std.mem.Allocator, source: Source, seed: u64) Coordinator {
+    fn initWithSeed(
+        allocator: std.mem.Allocator,
+        source: Source,
+        runtime: *background_runtime.BackendRuntime,
+        seed: u64,
+    ) Coordinator {
         return .{
             .allocator = allocator,
             .source = source,
+            .durable_jobs = runtime.durable_jobs,
+            .job_owner_id = runtime.allocOwnerId(),
             .id_seed = if (seed == 0) 1 else seed,
         };
     }
@@ -163,6 +189,7 @@ pub const Coordinator = struct {
     pub fn deinit(self: *Coordinator) void {
         // No new jobs can be submitted once the owning HTTP server is down.
         for (self.jobs.items) |job| job.cancel.request();
+        self.durable_jobs.closeOwner(self.job_owner_id);
         for (self.jobs.items) |job| job.deinit(self.allocator);
         self.jobs.deinit(self.allocator);
         self.* = undefined;
@@ -175,7 +202,6 @@ pub const Coordinator = struct {
     pub fn start(self: *Coordinator, operation: Operation, idempotency_key: ?[]const u8) !Snapshot {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        self.reapCompletedThreadsLocked();
 
         if (idempotency_key) |key| {
             if (key.len == 0 or key.len > 256) return error.InvalidIdempotencyKey;
@@ -208,18 +234,26 @@ pub const Coordinator = struct {
         self.active_job_id = job.id;
         const exclusive = !self.source.status().maintenance.online;
         if (exclusive) self.exclusive_active.store(true, .release);
-        job.thread = std.Thread.spawn(.{}, runJob, .{ self, job }) catch |err| {
+        errdefer {
             self.active_job_id = null;
             if (exclusive) self.exclusive_active.store(false, .release);
-            return err;
-        };
+        }
+        const execution = try self.allocator.create(JobExecution);
+        errdefer self.allocator.destroy(execution);
+        execution.* = .{ .coordinator = self, .job = job };
+        try self.durable_jobs.submit(.{
+            .owner_id = self.job_owner_id,
+            .class = .maintenance,
+            .ptr = execution,
+            .run = JobExecution.run,
+            .deinit = JobExecution.deinit,
+        });
         return snapshotLocked(job);
     }
 
     pub fn get(self: *Coordinator, job_id: u64) ?Snapshot {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        self.reapCompletedThreadsLocked();
         for (self.jobs.items) |job| {
             if (job.id == job_id) return snapshotLocked(job);
         }
@@ -229,7 +263,6 @@ pub const Coordinator = struct {
     pub fn cancel(self: *Coordinator, job_id: u64) ?Snapshot {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        self.reapCompletedThreadsLocked();
         for (self.jobs.items) |job| {
             if (job.id != job_id) continue;
             if (job.state == .queued or job.state == .running) job.cancel.request();
@@ -292,18 +325,11 @@ pub const Coordinator = struct {
                 i += 1;
                 continue;
             }
-            _ = self.jobs.orderedRemove(i);
+            // Retention order is not observable. Swap removal keeps bulk
+            // expiry linear instead of repeatedly shifting the remaining
+            // bounded history.
+            _ = self.jobs.swapRemove(i);
             job.deinit(self.allocator);
-        }
-    }
-
-    fn reapCompletedThreadsLocked(self: *Coordinator) void {
-        for (self.jobs.items) |job| {
-            if (job.state != .succeeded and job.state != .failed and job.state != .canceled) continue;
-            if (job.thread) |thread| {
-                thread.join();
-                job.thread = null;
-            }
         }
     }
 
@@ -325,6 +351,15 @@ fn nowMs() i64 {
     return @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
 }
 
+test "storage maintenance requires an asynchronous backend runtime" {
+    var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer runtime.deinit();
+    try std.testing.expectError(
+        error.AsyncMaintenanceRuntimeRequired,
+        Coordinator.init(std.testing.allocator, localSource, runtime.ptr()),
+    );
+}
+
 test "storage maintenance coordinator is idempotent and single flight" {
     const Fake = struct {
         runs: std.atomic.Value(u64) = .init(0),
@@ -343,7 +378,9 @@ test "storage maintenance coordinator is idempotent and single flight" {
         }
     };
     var fake = Fake{};
-    var coordinator = Coordinator.init(std.testing.allocator, fake.source());
+    var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var coordinator = try Coordinator.init(std.testing.allocator, fake.source(), runtime.ptr());
     defer coordinator.deinit();
     const first = try coordinator.start(.check, "same-key");
     const replay = try coordinator.start(.check, "same-key");
@@ -374,9 +411,11 @@ test "storage maintenance job ids are namespaced by server boot" {
             }.call,
         },
     };
-    var first = Coordinator.initWithSeed(std.testing.allocator, source, 11);
+    var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var first = Coordinator.initWithSeed(std.testing.allocator, source, runtime.ptr(), 11);
     defer first.deinit();
-    var second = Coordinator.initWithSeed(std.testing.allocator, source, 12);
+    var second = Coordinator.initWithSeed(std.testing.allocator, source, runtime.ptr(), 12);
     defer second.deinit();
     const first_id = first.nextJobIdLocked().?;
     const second_id = second.nextJobIdLocked().?;
@@ -401,7 +440,9 @@ test "storage maintenance cancellation reaches a cooperative engine" {
         }
     };
     var fake = Fake{};
-    var coordinator = Coordinator.init(std.testing.allocator, fake.source());
+    var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var coordinator = try Coordinator.init(std.testing.allocator, fake.source(), runtime.ptr());
     defer coordinator.deinit();
     const started = try coordinator.start(.vacuum, "cancel-me");
     try std.testing.expect(coordinator.isExclusiveActive());
@@ -415,6 +456,38 @@ test "storage maintenance cancellation reaches a cooperative engine" {
         }
         std.Thread.yield() catch {};
     }
+}
+
+test "storage maintenance shutdown fences and drains its backend runtime owner" {
+    const Fake = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        stopped: std.atomic.Value(bool) = .init(false),
+
+        fn source(self: *@This()) Source {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
+        }
+        fn status(_: *anyopaque) Status {
+            return .{ .engine = "fake", .maintenance = .{ .vacuum = true } };
+        }
+        fn run(ptr: *anyopaque, _: Operation, cancel: *const CancelToken) anyerror!Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.started.store(true, .release);
+            defer self.stopped.store(true, .release);
+            while (true) {
+                try cancel.check();
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+
+    var fake = Fake{};
+    var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var coordinator = try Coordinator.init(std.testing.allocator, fake.source(), runtime.ptr());
+    _ = try coordinator.start(.vacuum, "shutdown-drain");
+    while (!fake.started.load(.acquire)) std.Thread.yield() catch {};
+    coordinator.deinit();
+    try std.testing.expect(fake.stopped.load(.acquire));
 }
 
 test "storage maintenance snapshots remain valid after retention pruning" {
@@ -431,7 +504,9 @@ test "storage maintenance snapshots remain valid after retention pruning" {
         }
     };
     var fake = Fake{};
-    var coordinator = Coordinator.init(std.testing.allocator, fake.source());
+    var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var coordinator = try Coordinator.init(std.testing.allocator, fake.source(), runtime.ptr());
     defer coordinator.deinit();
 
     const first = try coordinator.start(.check, null);
@@ -469,7 +544,9 @@ test "storage maintenance append allocation failure does not wedge coordinator" 
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var fake = Fake{};
-    var coordinator = Coordinator.init(failing.allocator(), fake.source());
+    var runtime = try background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var coordinator = try Coordinator.init(failing.allocator(), fake.source(), runtime.ptr());
     defer coordinator.deinit();
 
     // Job allocation succeeds; growing the job list fails.

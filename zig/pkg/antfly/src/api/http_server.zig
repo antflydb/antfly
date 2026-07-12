@@ -1145,7 +1145,10 @@ pub const ApiHttpServer = struct {
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
             }),
-            .restore_job_store = restore_jobs.Store.initWithIo(alloc, if (cfg.backend_runtime) |runtime| runtime.io() else null),
+            .restore_job_store = if (cfg.backend_runtime) |runtime|
+                if (runtime.io()) |io| restore_jobs.Store.initWithIo(alloc, io) else restore_jobs.Store.init(alloc)
+            else
+                restore_jobs.Store.init(alloc),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .restore_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .session_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
@@ -8295,16 +8298,17 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableRestore(self: *ApiHttpServer, table_name: []const u8, body: []const u8, idempotency_key: ?[]const u8) !http_common.HttpResponse {
-        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid restore request");
+        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer parsed.deinit();
-        backups_api.validateBackupId(parsed.value.backup_id) catch return try textResponse(self.alloc, 400, "invalid backup id");
+        backups_api.validateBackupId(parsed.value.backup_id) catch return try jsonErrorResponse(self.alloc, 400, "invalid backup id");
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const connection = parsed.value.connection;
         var location = backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
-        }) catch |err| return try textResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
         const encoded = self.restore_job_store.start(self.alloc, .{
             .scope = .table,
@@ -8351,16 +8355,17 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterRestore(self: *ApiHttpServer, body: []const u8, idempotency_key: ?[]const u8) !http_common.HttpResponse {
-        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid restore request");
+        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
-        const connection = req.connection orelse return try textResponse(self.alloc, 400, "restore requires a named external_io connection");
-        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try textResponse(self.alloc, 400, "invalid restore mode");
+        const connection = req.connection orelse return try jsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
+        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore mode");
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
-        }) catch |err| return try textResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
         const encoded = self.restore_job_store.start(self.alloc, .{
             .scope = .cluster,
@@ -8392,6 +8397,12 @@ pub const ApiHttpServer = struct {
     /// requiring another client request.
     pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
         try self.schedulePendingRestoreJobs();
+    }
+
+    fn ensureAsyncRestoreWorker(self: *const ApiHttpServer) !void {
+        if (self.restore_jobs_closing.load(.acquire)) return error.AsyncRestoreUnavailable;
+        const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
+        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return error.AsyncRestoreUnavailable;
     }
 
     fn schedulePendingRestoreJobs(self: *ApiHttpServer) !void {
@@ -8516,9 +8527,9 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !http_common.HttpResponse {
         const encoded = if (cancel)
-            (try self.restore_job_store.cancel(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found")
+            (try self.restore_job_store.cancel(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found")
         else
-            (try self.restore_job_store.loadCached(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+            (try self.restore_job_store.loadCached(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         return try self.restoreJobResponse(200, encoded);
     }
@@ -8612,13 +8623,13 @@ fn restoreJobIdFromPath(path: []const u8) ?u64 {
 fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
     if (isRetryableMetadataLeadershipError(err)) return try metadataNotLeaderResponse(alloc);
     return switch (err) {
-        error.InvalidIdempotencyKey => try textResponse(alloc, 400, "invalid idempotency key"),
-        error.IdempotencyConflict => try textResponse(alloc, 409, "idempotency key reused for a different restore"),
-        error.AsyncRestoreUnavailable => try textResponse(alloc, 503, "asynchronous restore worker unavailable"),
-        error.RestoreJobCapacityExceeded => try textResponse(alloc, 503, "restore job history is at capacity"),
-        error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try textResponse(alloc, 400, "restore request is too large"),
-        error.DuplicateRestoreTableName => try textResponse(alloc, 400, "restore request contains duplicate table names"),
-        else => try textResponse(alloc, 500, "failed to create restore job"),
+        error.InvalidIdempotencyKey => try jsonErrorResponse(alloc, 400, "invalid idempotency key"),
+        error.IdempotencyConflict => try jsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
+        error.AsyncRestoreUnavailable => try jsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
+        error.RestoreJobCapacityExceeded => try jsonErrorResponse(alloc, 503, "restore job history is at capacity"),
+        error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try jsonErrorResponse(alloc, 400, "restore request is too large"),
+        error.DuplicateRestoreTableName => try jsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
+        else => try jsonErrorResponse(alloc, 500, "failed to create restore job"),
     };
 }
 
@@ -12827,7 +12838,9 @@ test "api http server exposes storage status and asynchronous maintenance jobs" 
 
     var status_source = FakeStatus{};
     var maintenance_source = FakeMaintenance{};
-    var coordinator = maintenance_mod.Coordinator.init(std.testing.allocator, maintenance_source.source());
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var coordinator = try maintenance_mod.Coordinator.init(std.testing.allocator, maintenance_source.source(), backend_runtime.ptr());
     defer coordinator.deinit();
     var server = ApiHttpServer.init(std.testing.allocator, .{
         .storage_maintenance = &coordinator,
@@ -23899,6 +23912,35 @@ test "api http server returns retryable not leader through public cluster adapte
 
     try expectPublicMetadataNotLeaderResponse(resp);
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
+}
+
+test "api http server rejects restore before persistence without an asynchronous worker" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .node_config = &node_config }, source.iface(), null, null);
+    defer server.deinit();
+
+    var response = try server.handlePublicTableRestore(
+        "docs",
+        "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\"}",
+        "restore-without-worker",
+    );
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"asynchronous restore worker unavailable\"}", response.body);
+    try std.testing.expectEqual(@as(usize, 0), server.restore_job_store.jobs.count());
 }
 
 test "api http server backs up and restores a table through public routes" {

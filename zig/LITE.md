@@ -174,7 +174,9 @@ artifact commands may still use explicit local paths or ambient cloud
 credentials because they run with the invoking user's filesystem authority.
 
 Restore through `/db/v1` is a durable asynchronous job, not request-duration
-work. The accepted response contains a job ID; status and cooperative
+work. Admission requires the standalone process's shared asynchronous
+backend-runtime lane; an unavailable worker returns `503` before any job is
+persisted. The accepted response contains a job ID; status and cooperative
 cancellation use `/db/v1/restore/jobs/{job_id}`. Idempotency keys make retries
 safe; requests without a key create independent jobs. Restore state lives inside
 the `.aflite` file, and completed table boundaries are durably checkpointed and
@@ -260,8 +262,10 @@ POST requests return `202` and a job document. `Idempotency-Key` safely returns
 the original job on retries for at least 24 hours within the current server
 process. Job IDs are opaque, non-sequential 63-bit values and callers reconcile
 storage state after restart before retrying. The bounded history rejects new
-work rather than dropping an unexpired key. `DELETE` requests cooperative
-cancellation; native maintenance
+work rather than dropping an unexpired key. Jobs execute on the shared
+`std.Io` backend-runtime lane; coordinator shutdown fences its owner, requests
+cooperative cancellation, and drains outstanding work before releasing the
+Lite handle. `DELETE` requests cooperative cancellation; native maintenance
 checks the token at safe page and record boundaries, including during shutdown.
 Only one maintenance job runs at a time; a
 conflicting request returns `409`, and an engine that does not support an

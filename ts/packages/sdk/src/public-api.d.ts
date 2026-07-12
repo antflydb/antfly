@@ -450,7 +450,8 @@ export interface paths {
          *     - `skip_if_exists`: Skip existing tables and restore the rest
          *
          *     The restore is a durable asynchronous job. The request returns after the
-         *     job record is persisted. Poll the restore job resource for progress.
+         *     job record is persisted and an asynchronous worker is available. Poll
+         *     the restore job resource for progress.
          *     Completed table boundaries are durably checkpointed and are not repeated
          *     after restart. If a process stops between table publication and its
          *     completion checkpoint, recovery fails closed for operator inspection
@@ -12996,7 +12997,9 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getRestoreJob: {
@@ -13525,7 +13528,9 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     updateSchema: {
