@@ -5605,6 +5605,14 @@ pub const IndexManager = struct {
         return false;
     }
 
+    pub fn denseIndexUsesExternalCoverage(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.dense_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.external;
+        }
+        return false;
+    }
+
     pub fn sparseIndexUsesManagedDirectField(self: *const IndexManager, index_name: []const u8) bool {
         for (self.sparse_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, index_name)) continue;

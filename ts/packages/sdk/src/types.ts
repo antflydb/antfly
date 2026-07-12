@@ -196,6 +196,9 @@ export type PermissionType = components["schemas"]["PermissionType"];
 // Backup/Restore types
 export type BackupRequest = components["schemas"]["BackupRequest"];
 export type RestoreRequest = components["schemas"]["RestoreRequest"];
+export type RestoreTableResponse =
+  | { restore: "triggered" }
+  | { restore: "committed"; durability: "pending" | "durable" };
 
 // Lookup/Scan types
 export type ScanKeysRequest = Omit<components["schemas"]["ScanKeysRequest"], "filter_query"> & {

@@ -16530,6 +16530,9 @@ components:
         source_total:
           type: integer
           format: uint64
+          description: Source documents observed across fresh shard reports. This is the exact table total
+            only when observation_complete is true; otherwise it is a lower bound and all outcome counts
+            are partial observations.
         produced:
           type: integer
           format: uint64
@@ -16551,10 +16554,14 @@ components:
           format: uint64
         complete:
           type: boolean
+          description: Whether observations are complete and every observed source has an outcome accepted
+            by the policy.
         healthy:
           type: boolean
+          description: Whether coverage is complete without terminal failures.
         degraded:
           type: boolean
+          description: Whether coverage is complete under best_effort but includes terminal failures.
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)

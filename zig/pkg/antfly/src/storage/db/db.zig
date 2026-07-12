@@ -24427,7 +24427,7 @@ fn scanDerivedCoverageOutcomeFromStore(
     generation: u64,
     outcome: []const u8,
 ) !u64 {
-    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(alloc, index_name, generation, outcome);
+    const lower = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(alloc, index_name, generation);
     defer alloc.free(lower);
     const upper = try internal_keys.nextPrefixAlloc(alloc, lower);
     defer if (upper) |key| alloc.free(key);
@@ -24435,18 +24435,18 @@ fn scanDerivedCoverageOutcomeFromStore(
 
     var skipped: u64 = 0;
     const CountState = struct {
-        skipped: *u64,
+        count: *u64,
+        outcome_name: []const u8,
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = key;
-            _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            state.skipped.* += 1;
+            if (std.mem.eql(u8, value, state.outcome_name)) state.count.* += 1;
             return .@"continue";
         }
     };
 
-    var state = CountState{ .skipped = &skipped };
+    var state = CountState{ .count = &skipped, .outcome_name = outcome };
     try store.scanWithContext(lower, upper_bound, .{}, &state, CountState.scanEntry);
     return skipped;
 }
@@ -24497,8 +24497,6 @@ fn setDerivedCoverageOutcomes(
     }
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(alloc);
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer deletes.deinit(alloc);
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
     var changed = false;
@@ -24507,30 +24505,28 @@ fn setDerivedCoverageOutcomes(
         if (seen.contains(transition.doc_key)) continue;
         try seen.put(alloc, transition.doc_key, {});
         const target_index = @intFromEnum(transition.outcome);
-        inline for (tags, 0..) |existing_outcome, i| {
-            const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, transition.doc_key, @tagName(existing_outcome));
-            owned_marker_keys.append(alloc, marker_key) catch |err| {
-                alloc.free(marker_key);
-                return err;
-            };
-            const existing = store.get(alloc, marker_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            if (existing) |value| alloc.free(value);
-            const present = existing != null;
-            if (i == target_index) {
-                if (!present) {
-                    counter_counts[i] +|= 1;
-                    try writes.append(alloc, .{ .key = marker_key, .value = @tagName(transition.outcome) });
-                    changed = true;
-                }
-            } else if (present) {
-                if (counter_counts[i] == 0) return error.InvalidDerivedCoverageCounter;
-                counter_counts[i] -= 1;
-                try deletes.append(alloc, marker_key);
-                changed = true;
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, transition.doc_key);
+        owned_marker_keys.append(alloc, marker_key) catch |err| {
+            alloc.free(marker_key);
+            return err;
+        };
+        const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const existing_outcome: ?DerivedCoverageOutcome = if (existing) |value| blk: {
+            defer alloc.free(value);
+            break :blk std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+        } else null;
+        if (existing_outcome == null or existing_outcome.? != transition.outcome) {
+            if (existing_outcome) |previous| {
+                const previous_index = @intFromEnum(previous);
+                if (counter_counts[previous_index] == 0) return error.InvalidDerivedCoverageCounter;
+                counter_counts[previous_index] -= 1;
             }
+            counter_counts[target_index] +|= 1;
+            try writes.append(alloc, .{ .key = marker_key, .value = @tagName(transition.outcome) });
+            changed = true;
         }
     }
     if (!changed) return;
@@ -24542,7 +24538,7 @@ fn setDerivedCoverageOutcomes(
             .value = internal_keys.encodeDerivedCoverageOutcomeCount(&counter_values[i], counter_counts[i]),
         });
     }
-    try store.putBatch(writes.items, deletes.items);
+    try store.putBatch(writes.items, &.{});
 }
 
 fn accountDirectDenseCoverage(
@@ -24551,7 +24547,9 @@ fn accountDirectDenseCoverage(
     batch: derived_types.DerivedBatch,
     writes: []const mapper.DenseEmbeddingWrite,
 ) !void {
-    if (!ctx.index_manager.denseIndexUsesManagedDirectField(index_name)) return;
+    const managed_direct = ctx.index_manager.denseIndexUsesManagedDirectField(index_name);
+    const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_name);
+    if (!managed_direct and !external) return;
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
@@ -24559,12 +24557,20 @@ fn accountDirectDenseCoverage(
     }
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
     defer outcomes.deinit(ctx.alloc);
-    for (batch.documents) |doc| {
-        if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
-        try outcomes.append(ctx.alloc, .{
-            .doc_key = doc.key,
-            .outcome = if (produced.contains(doc.key)) .produced else .skipped,
-        });
+    if (managed_direct) {
+        for (batch.documents) |doc| {
+            if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
+            try outcomes.append(ctx.alloc, .{
+                .doc_key = doc.key,
+                .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+            });
+        }
+    } else {
+        var iter = produced.keyIterator();
+        while (iter.next()) |doc_key| {
+            if (internal_keys.isInternalUserKey(doc_key.*) or !ctx.index_manager.byte_range.contains(doc_key.*)) continue;
+            try outcomes.append(ctx.alloc, .{ .doc_key = doc_key.*, .outcome = .produced });
+        }
     }
     try setDerivedCoverageOutcomes(ctx.alloc, ctx.store, ctx.index_manager, index_name, outcomes.items);
 }
@@ -24611,29 +24617,27 @@ fn deleteDerivedCoverageForDocKeys(
     var unique_deletes = std.StringHashMapUnmanaged(void).empty;
     defer unique_deletes.deinit(alloc);
 
-    const outcomes = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+    const outcomes = std.meta.tags(DerivedCoverageOutcome);
     var removed_counts = [_]u64{0} ** outcomes.len;
     for (doc_keys) |doc_key| {
-        for (outcomes, 0..) |outcome, outcome_index| {
-            const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key, outcome);
-            errdefer alloc.free(marker_key);
-            if (unique_deletes.contains(marker_key)) {
-                alloc.free(marker_key);
-                continue;
-            }
-            const had_marker = blk: {
-                const existing = store.get(alloc, marker_key) catch |err| switch (err) {
-                    error.NotFound => break :blk false,
-                    else => return err,
-                };
-                alloc.free(existing);
-                break :blk true;
-            };
-            if (had_marker) removed_counts[outcome_index] +|= 1;
-            try deletes.append(alloc, marker_key);
-            errdefer _ = deletes.pop();
-            try unique_deletes.put(alloc, marker_key, {});
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key);
+        errdefer alloc.free(marker_key);
+        if (unique_deletes.contains(marker_key)) {
+            alloc.free(marker_key);
+            continue;
         }
+        const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing) |value| {
+            defer alloc.free(value);
+            const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+            removed_counts[@intFromEnum(outcome)] +|= 1;
+        }
+        try deletes.append(alloc, marker_key);
+        errdefer _ = deletes.pop();
+        try unique_deletes.put(alloc, marker_key, {});
     }
 
     if (deletes.items.len == 0) return;
@@ -24651,9 +24655,9 @@ fn deleteDerivedCoverageForDocKeys(
     var counter_write_count: usize = 0;
     for (outcomes, removed_counts, 0..) |outcome, removed_count, outcome_index| {
         if (removed_count == 0) continue;
-        const current_count = try derivedCoverageOutcomeCounterValueForStore(alloc, store, index_name, generation, outcome);
+        const current_count = try derivedCoverageOutcomeCounterValueForStore(alloc, store, index_name, generation, @tagName(outcome));
         if (current_count < removed_count) return error.InvalidDerivedCoverageCounter;
-        counter_keys[outcome_index] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
+        counter_keys[outcome_index] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(outcome));
         counter_writes[counter_write_count] = .{
             .key = counter_keys[outcome_index].?,
             .value = internal_keys.encodeDerivedCoverageOutcomeCount(&counter_values[outcome_index], current_count - removed_count),
@@ -52116,6 +52120,87 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
     });
     defer dense_after.deinit();
     try std.testing.expectEqualStrings("doc:a", dense_after.hits[0].id);
+
+    const ExpectCoverage = struct {
+        fn run(db_value: *DB, source: u64, produced: u64, skipped: u64) !void {
+            const stats = try db_value.stats(std.testing.allocator);
+            defer types.freeDBStats(std.testing.allocator, stats);
+            try std.testing.expectEqual(source, stats.source_doc_count);
+            var checked: usize = 0;
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "dv_v1") and !std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+                try std.testing.expectEqual(produced, index_stats.coverage_produced_count);
+                try std.testing.expectEqual(skipped, index_stats.coverage_skipped_count);
+                checked += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 2), checked);
+        }
+    };
+    try ExpectCoverage.run(&db, 5, 4, 1);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"now missing vectors\"}" }}, .sync_level = .full_index });
+    try ExpectCoverage.run(&db, 5, 3, 2);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:missing", .value = "{\"embedding\":[1,1,0],\"sparse\":{\"indices\":[17],\"values\":[1.0]}}" }}, .sync_level = .full_index });
+    try ExpectCoverage.run(&db, 5, 4, 1);
+
+    try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .full_index });
+    try ExpectCoverage.run(&db, 4, 3, 1);
+}
+
+test "db external dense coverage tracks exact writes deletes and reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const ExpectCoverage = struct {
+        fn run(db_value: *DB, source: u64, produced: u64) !void {
+            const stats = try db_value.stats(std.testing.allocator);
+            defer types.freeDBStats(std.testing.allocator, stats);
+            try std.testing.expectEqual(source, stats.source_doc_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "external_v1")) continue;
+                try std.testing.expectEqual(produced, index_stats.coverage_produced_count);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_skipped_count);
+                return;
+            }
+            return error.IndexNotFound;
+        }
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{
+            .name = "external_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try std.testing.expect(db.core.index_manager.denseIndexUsesExternalCoverage("external_v1"));
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:covered", .value = "{\"title\":\"covered\",\"_embeddings\":{\"external_v1\":[1,0,0]}}" },
+                .{ .key = "doc:pending", .value = "{\"title\":\"pending\"}" },
+            },
+            .sync_level = .full_index,
+        });
+        try ExpectCoverage.run(&db, 2, 1);
+
+        try db.batch(.{ .writes = &.{.{ .key = "doc:covered", .value = "{\"title\":\"vector removed\"}" }}, .sync_level = .full_index });
+        try ExpectCoverage.run(&db, 2, 0);
+        try db.batch(.{ .writes = &.{.{ .key = "doc:pending", .value = "{\"_embeddings\":{\"external_v1\":[0,1,0]}}" }}, .sync_level = .full_index });
+        try ExpectCoverage.run(&db, 2, 1);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+        try ExpectCoverage.run(&reopened, 2, 1);
+        try reopened.batch(.{ .deletes = &.{"doc:pending"}, .sync_level = .full_index });
+        try ExpectCoverage.run(&reopened, 1, 0);
+    }
 }
 
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {

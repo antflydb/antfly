@@ -113,7 +113,7 @@ const CoverageOutcomeTransition = struct {
     index_name: []u8,
     generation: u64,
     outcome: CoverageOutcome,
-    marker_keys: [coverage_outcome_count][]u8,
+    marker_key: []u8,
     counter_keys: [coverage_outcome_count][]u8,
 };
 
@@ -7905,6 +7905,38 @@ fn storePutBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, d
     }
 }
 
+fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var batch = runtime.store.beginBatch() catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        var committed = false;
+        defer if (!committed) batch.abort();
+        for (writes) |write| try batch.put(write.key, write.value);
+        for (deletes) |key| batch.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        batch.commit() catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        committed = true;
+        try runtime.store.sync(false);
+        return;
+    }
+}
+
 fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
@@ -7973,19 +8005,19 @@ fn initCoverageOutcomeTransition(runtime: *EnrichmentRuntime, index_name: []cons
         .index_name = try runtime.alloc.dupe(u8, index_name),
         .generation = generation,
         .outcome = outcome,
-        .marker_keys = undefined,
+        .marker_key = undefined,
         .counter_keys = undefined,
     };
-    var initialized_markers: usize = 0;
+    var marker_initialized = false;
     var initialized_counters: usize = 0;
     errdefer {
-        for (transition.marker_keys[0..initialized_markers]) |key| runtime.alloc.free(key);
+        if (marker_initialized) runtime.alloc.free(transition.marker_key);
         for (transition.counter_keys[0..initialized_counters]) |key| runtime.alloc.free(key);
         runtime.alloc.free(transition.index_name);
     }
+    transition.marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key);
+    marker_initialized = true;
     inline for (std.meta.tags(CoverageOutcome), 0..) |candidate_outcome, i| {
-        transition.marker_keys[i] = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key, coverageOutcomeName(candidate_outcome));
-        initialized_markers += 1;
         transition.counter_keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(runtime.alloc, index_name, generation, coverageOutcomeName(candidate_outcome));
         initialized_counters += 1;
     }
@@ -7994,7 +8026,7 @@ fn initCoverageOutcomeTransition(runtime: *EnrichmentRuntime, index_name: []cons
 
 fn deinitCoverageOutcomeTransition(alloc: Allocator, transition: CoverageOutcomeTransition) void {
     alloc.free(transition.index_name);
-    for (transition.marker_keys) |key| alloc.free(key);
+    alloc.free(transition.marker_key);
     for (transition.counter_keys) |key| alloc.free(key);
 }
 
@@ -8029,7 +8061,7 @@ fn loadDerivedCoverageOutcomeCounter(runtime: *EnrichmentRuntime, counter_key: [
 }
 
 fn scanDerivedCoverageOutcome(runtime: *EnrichmentRuntime, index_name: []const u8, generation: u64, outcome: CoverageOutcome) !u64 {
-    const lower = try internal_keys.derivedCoverageOutcomeKindPrefixAlloc(runtime.alloc, index_name, generation, coverageOutcomeName(outcome));
+    const lower = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(runtime.alloc, index_name, generation);
     defer runtime.alloc.free(lower);
     const upper = try internal_keys.nextPrefixAlloc(runtime.alloc, lower);
     defer if (upper) |key| runtime.alloc.free(key);
@@ -8037,17 +8069,17 @@ fn scanDerivedCoverageOutcome(runtime: *EnrichmentRuntime, index_name: []const u
 
     var skipped: u64 = 0;
     const CountState = struct {
-        skipped: *u64,
+        count: *u64,
+        outcome_name: []const u8,
 
         fn scan(ctx_ptr: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
             _ = key;
-            _ = value;
             const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
-            ctx.skipped.* += 1;
+            if (std.mem.eql(u8, value, ctx.outcome_name)) ctx.count.* += 1;
             return .@"continue";
         }
     };
-    var state = CountState{ .skipped = &skipped };
+    var state = CountState{ .count = &skipped, .outcome_name = coverageOutcomeName(outcome) };
     try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &state, CountState.scan);
     return skipped;
 }
@@ -8061,10 +8093,10 @@ fn queueDerivedCoverageOutcomeForIndex(runtime: *EnrichmentRuntime, window: *Gen
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
     const transition = try initCoverageOutcomeTransition(runtime, index_name, generation, doc_key, outcome);
     errdefer deinitCoverageOutcomeTransition(runtime.alloc, transition);
-    const identity_key = transition.marker_keys[@intFromEnum(CoverageOutcome.produced)];
+    const identity_key = transition.marker_key;
     if (window.coverage_transition_keys.getKey(identity_key)) |existing_key| {
         for (window.coverage_transitions.items) |*queued| {
-            if (std.mem.eql(u8, queued.marker_keys[@intFromEnum(CoverageOutcome.produced)], existing_key)) {
+            if (std.mem.eql(u8, queued.marker_key, existing_key)) {
                 queued.outcome = outcome;
                 break;
             }
@@ -8097,8 +8129,6 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
 
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(runtime.alloc);
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer deletes.deinit(runtime.alloc);
 
     const CounterState = struct {
         key: []const u8,
@@ -8135,56 +8165,48 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
     var skipped_delta: i64 = 0;
     for (transitions) |transition| {
         const target_outcome = transition.outcome;
-        const target_index = @intFromEnum(target_outcome);
-        const target_key = transition.marker_keys[target_index];
-        if (seen_transitions.contains(target_key)) continue;
-        try seen_transitions.put(runtime.alloc, target_key, {});
+        if (seen_transitions.contains(transition.marker_key)) continue;
+        try seen_transitions.put(runtime.alloc, transition.marker_key, {});
 
         inline for (std.meta.tags(CoverageOutcome)) |candidate_outcome| {
             _ = try counterState(runtime, &counter_states, &counter_indexes, transition, candidate_outcome);
         }
 
-        var present = [_]bool{false} ** coverage_outcome_count;
-        for (std.meta.tags(CoverageOutcome), 0..) |outcome, i| {
-            const existing = storeGetAlloc(runtime, transition.marker_keys[i]) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            if (existing) |value| {
-                runtime.alloc.free(value);
-                present[i] = true;
+        const existing_value = storeGetAlloc(runtime, transition.marker_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (existing_value) |value| runtime.alloc.free(value);
+        const existing_outcome: ?CoverageOutcome = if (existing_value) |value|
+            std.meta.stringToEnum(CoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome
+        else
+            null;
+
+        if (existing_outcome == null or existing_outcome.? != target_outcome) {
+            if (existing_outcome) |previous_outcome| {
+                const previous_state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, previous_outcome);
+                if (counter_states.items[previous_state_index].count == 0) return error.InvalidDerivedCoverageCounter;
+                counter_states.items[previous_state_index].count -= 1;
+                if (previous_outcome == .skipped) skipped_delta -= 1;
             }
-            _ = outcome;
-        }
-
-        for (std.meta.tags(CoverageOutcome), 0..) |outcome, i| {
-            if (!present[i] or i == target_index) continue;
-            const state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, outcome);
-            if (counter_states.items[state_index].count == 0) return error.InvalidDerivedCoverageCounter;
-            counter_states.items[state_index].count -= 1;
-            try deletes.append(runtime.alloc, transition.marker_keys[i]);
-            if (outcome == .skipped) skipped_delta -= 1;
-        }
-
-        if (!present[target_index]) {
             const state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, target_outcome);
             counter_states.items[state_index].count +|= 1;
             try writes.append(runtime.alloc, .{
-                .key = transition.marker_keys[target_index],
+                .key = transition.marker_key,
                 .value = coverageOutcomeName(target_outcome),
             });
             if (target_outcome == .skipped) skipped_delta += 1;
         }
     }
 
-    if (writes.items.len == 0 and deletes.items.len == 0) return;
+    if (writes.items.len == 0) return;
     for (counter_states.items) |*state| {
         try writes.append(runtime.alloc, .{
             .key = state.key,
             .value = internal_keys.encodeDerivedCoverageOutcomeCount(&state.value, state.count),
         });
     }
-    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+    try storeCoverageBatchWithRetry(runtime, writes.items, &.{});
     if (skipped_delta > 0) {
         runtime.skipped_source_count +|= @intCast(skipped_delta);
     } else if (skipped_delta < 0) {
@@ -8227,6 +8249,9 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     defer deinitCoverageOutcomeTransition(alloc, transition);
 
     try applyCoverageOutcomeTransitions(&runtime, &.{transition});
+    const stored_outcome = try storeGetAlloc(&runtime, transition.marker_key);
+    defer runtime.alloc.free(stored_outcome);
+    try std.testing.expectEqualStrings("skipped", stored_outcome);
     try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
     try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
     try std.testing.expectEqual(@as(u64, 1), runtime.skipped_source_count);

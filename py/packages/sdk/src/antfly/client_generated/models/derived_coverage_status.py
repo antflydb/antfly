@@ -17,15 +17,18 @@ class DerivedCoverageStatus:
         policy (DerivedCoverageStatusPolicy):
         observation_complete (bool): Whether every expected shard contributed a fresh runtime observation to this
             projection.
-        source_total (int):
+        source_total (int): Source documents observed across fresh shard reports. This is the exact table total only
+            when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial
+            observations.
         produced (int): Source documents with a durable produced outcome for this index generation.
         skipped (int): Source documents intentionally producing no indexable output.
         terminal_failed (int): Source documents whose generation failed non-retryably.
         covered (int): Terminal source outcomes counted by the configured policy.
         pending (int):
-        complete (bool):
-        healthy (bool):
-        degraded (bool):
+        complete (bool): Whether observations are complete and every observed source has an outcome accepted by the
+            policy.
+        healthy (bool): Whether coverage is complete without terminal failures.
+        degraded (bool): Whether coverage is complete under best_effort but includes terminal failures.
     """
 
     policy: DerivedCoverageStatusPolicy

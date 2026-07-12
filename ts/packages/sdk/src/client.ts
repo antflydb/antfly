@@ -39,6 +39,7 @@ import type {
   QueryResult,
   ResourceType,
   RestoreRequest,
+  RestoreTableResponse,
   RetrievalAgentRequest,
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
@@ -915,7 +916,10 @@ export class AntflyClient {
     /**
      * Restore a table from backup
      */
-    restore: async (tableName: string, request: RestoreRequest) => {
+    restore: async (
+      tableName: string,
+      request: RestoreRequest
+    ): Promise<RestoreTableResponse | undefined> => {
       const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/restore", {
         params: { path: { tableName } },
         body: request,

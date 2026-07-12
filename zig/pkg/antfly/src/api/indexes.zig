@@ -1461,50 +1461,54 @@ fn evaluateCoverage(
     skipped: u64,
     terminal_failed: u64,
     observation_complete: bool,
-    external_complete: bool,
 ) CoverageEvaluation {
     const policy_covered = switch (policy) {
         .strict => produced,
         .partial => produced +| skipped,
         .best_effort => produced +| skipped +| terminal_failed,
-        .external => if (external_complete) source_total else 0,
+        .external => produced,
     };
     const covered = @min(source_total, policy_covered);
-    const complete = observation_complete and switch (policy) {
-        .external => external_complete,
-        else => covered == source_total,
-    };
+    const complete = observation_complete and covered == source_total;
     return .{
         .covered = covered,
         .pending = source_total -| covered,
         .complete = complete,
         .healthy = complete and terminal_failed == 0,
         .degraded = complete and terminal_failed > 0,
-        .source_visible = source_total == 0 or policy_covered > 0 or
-            (policy == .external and external_complete),
+        .source_visible = source_total == 0 or policy_covered > 0,
     };
 }
 
 test "derived coverage evaluation is policy exact and observation gated" {
-    const strict = evaluateCoverage(.strict, 3, 1, 1, 1, true, false);
+    const strict = evaluateCoverage(.strict, 3, 1, 1, 1, true);
     try std.testing.expectEqual(@as(u64, 1), strict.covered);
     try std.testing.expectEqual(@as(u64, 2), strict.pending);
     try std.testing.expect(!strict.complete);
 
-    const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true, false);
+    const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true);
     try std.testing.expectEqual(@as(u64, 3), partial.covered);
     try std.testing.expect(partial.complete);
     try std.testing.expect(partial.healthy);
 
-    const best_effort = evaluateCoverage(.best_effort, 3, 1, 1, 1, true, false);
+    const best_effort = evaluateCoverage(.best_effort, 3, 1, 1, 1, true);
     try std.testing.expect(best_effort.complete);
     try std.testing.expect(!best_effort.healthy);
     try std.testing.expect(best_effort.degraded);
 
-    const incomplete_observation = evaluateCoverage(.partial, 3, 1, 2, 0, false, false);
+    const incomplete_observation = evaluateCoverage(.partial, 3, 1, 2, 0, false);
     try std.testing.expectEqual(@as(u64, 0), incomplete_observation.pending);
     try std.testing.expect(!incomplete_observation.complete);
     try std.testing.expect(!incomplete_observation.healthy);
+
+    const external_partial = evaluateCoverage(.external, 3, 1, 0, 0, true);
+    try std.testing.expectEqual(@as(u64, 1), external_partial.covered);
+    try std.testing.expectEqual(@as(u64, 2), external_partial.pending);
+    try std.testing.expect(!external_partial.complete);
+
+    const external_complete = evaluateCoverage(.external, 3, 3, 0, 0, true);
+    try std.testing.expect(external_complete.complete);
+    try std.testing.expect(external_complete.healthy);
 }
 
 fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, enrichment: ?db_mod.types.EnrichmentStats, runtime_present: bool) EmbeddingsRuntimeView {
@@ -1526,7 +1530,6 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         skipped_count,
         terminal_failed_count,
         !coverage_incomplete,
-        table_doc_count == 0 or item.doc_count > 0,
     );
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
     const source_coverage_visible = coverage.source_visible;
@@ -1841,7 +1844,6 @@ fn appendSingleIndexRuntimeStatus(
             skipped_count,
             terminal_failed_count,
             runtime_present and !aggregateRuntimeCoverageIncomplete(item),
-            !backfill_active,
         );
         const coverage_complete = coverage.complete;
         const artifact_publish_pending = replay_target_sequence > 0 and

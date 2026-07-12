@@ -407,6 +407,14 @@ outcomes and persist them under one apply lock and one store transaction; batch
 mutation paths deduplicate source keys with hash sets, keeping cleanup linear in
 the number of distinct source units rather than quadratic in batch size.
 
+Each source uses one marker key whose value is the outcome enum. Transitions
+therefore require one point read and one marker write rather than probing one key
+per possible outcome. Aggregate counters remain separate and atomically updated;
+if counters require repair, a bounded maintenance scan reconstructs them from
+marker values. External embedding writes participate in the same accounting:
+only a durably applied `_embeddings` value is `produced`, and a source without an
+external vector remains pending rather than being assumed covered.
+
 Public status reports physical vector or sparse-entry `doc_count` separately
 from source coverage. Readiness must never substitute physical cardinality for
 the durable `produced` source count because chunked documents can create many

@@ -8828,7 +8828,10 @@ export interface components {
             policy: components["schemas"]["DerivedCoverageStatusPolicy"];
             /** @description Whether every expected shard contributed a fresh runtime observation to this projection. */
             observation_complete: boolean;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
+             */
             source_total: number;
             /**
              * Format: uint64
@@ -8852,8 +8855,11 @@ export interface components {
             covered: number;
             /** Format: uint64 */
             pending: number;
+            /** @description Whether observations are complete and every observed source has an outcome accepted by the policy. */
             complete: boolean;
+            /** @description Whether coverage is complete without terminal failures. */
             healthy: boolean;
+            /** @description Whether coverage is complete under best_effort but includes terminal failures. */
             degraded: boolean;
         };
         /** @description Statistics for an embeddings index (dense or sparse) */

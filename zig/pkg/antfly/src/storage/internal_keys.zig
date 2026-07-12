@@ -30,6 +30,7 @@ pub const asset_state_kind: u8 = 0x33;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
 pub const derived_coverage_kind: u8 = 0x36;
+pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
 pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 
 pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
@@ -311,7 +312,7 @@ pub fn derivedCoverageOutcomeGenerationPrefixAlloc(alloc: Allocator, index_name:
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn derivedCoverageOutcomeKindPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64, outcome: []const u8) ![]u8 {
+pub fn derivedCoverageOutcomeMarkerPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
@@ -319,11 +320,11 @@ pub fn derivedCoverageOutcomeKindPrefixAlloc(alloc: Allocator, index_name: []con
     var generation_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &generation_buf, generation, .little);
     try list.appendSlice(alloc, &generation_buf);
-    try appendEncodedComponent(&list, alloc, outcome);
+    try list.append(alloc, derived_coverage_outcome_marker_kind);
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, doc_key: []const u8, outcome: []const u8) ![]u8 {
+pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, doc_key: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
@@ -331,7 +332,7 @@ pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, 
     var generation_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &generation_buf, generation, .little);
     try list.appendSlice(alloc, &generation_buf);
-    try appendEncodedComponent(&list, alloc, outcome);
+    try list.append(alloc, derived_coverage_outcome_marker_kind);
     try appendEncodedComponent(&list, alloc, doc_key);
     return try list.toOwnedSlice(alloc);
 }
@@ -1567,13 +1568,13 @@ test "derived coverage outcome keys are generation scoped" {
 
     const index_prefix = try derivedCoverageOutcomePrefixAlloc(alloc, "semantic_idx");
     defer alloc.free(index_prefix);
-    const old_prefix = try derivedCoverageOutcomeKindPrefixAlloc(alloc, "semantic_idx", old_generation, "skipped");
+    const old_prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, "semantic_idx", old_generation);
     defer alloc.free(old_prefix);
-    const new_prefix = try derivedCoverageOutcomeKindPrefixAlloc(alloc, "semantic_idx", new_generation, "skipped");
+    const new_prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, "semantic_idx", new_generation);
     defer alloc.free(new_prefix);
-    const old_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", old_generation, "doc:1", "skipped");
+    const old_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", old_generation, "doc:1");
     defer alloc.free(old_key);
-    const new_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", new_generation, "doc:1", "skipped");
+    const new_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", new_generation, "doc:1");
     defer alloc.free(new_key);
     const skipped_count_key = try derivedCoverageOutcomeCountKeyAlloc(alloc, "semantic_idx", new_generation, "skipped");
     defer alloc.free(skipped_count_key);

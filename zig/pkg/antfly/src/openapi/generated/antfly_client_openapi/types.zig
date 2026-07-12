@@ -1892,6 +1892,7 @@ pub const DerivedCoverageStatus = struct {
     policy: DerivedCoverageStatusPolicy,
     /// Whether every expected shard contributed a fresh runtime observation to this projection.
     observation_complete: bool,
+    /// Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
     source_total: i64,
     /// Source documents with a durable produced outcome for this index generation.
     produced: i64,
@@ -1902,8 +1903,11 @@ pub const DerivedCoverageStatus = struct {
     /// Terminal source outcomes counted by the configured policy.
     covered: i64,
     pending: i64,
+    /// Whether observations are complete and every observed source has an outcome accepted by the policy.
     complete: bool,
+    /// Whether coverage is complete without terminal failures.
     healthy: bool,
+    /// Whether coverage is complete under best_effort but includes terminal failures.
     degraded: bool,
 };
 
