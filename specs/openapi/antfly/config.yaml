@@ -558,6 +558,14 @@ components:
       additionalProperties: false
       required:
         - protocol
+      oneOf:
+        - title: S3 external IO
+          required: [protocol, buckets]
+          properties:
+            protocol: { type: string, enum: [s3] }
+        - title: Non-S3 external IO
+          properties:
+            protocol: { type: string, enum: [gcs, filesystem, http] }
       properties:
         protocol:
           $ref: "#/components/schemas/ExternalIoProtocol"

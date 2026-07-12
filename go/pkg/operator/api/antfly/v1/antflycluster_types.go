@@ -307,8 +307,8 @@ const (
 type ClusterMode string
 
 const (
-	// ClusterModeClustered is the existing split metadata/data topology.
-	ClusterModeClustered ClusterMode = "Clustered"
+	// ClusterModeDistributed is the existing split metadata/data topology.
+	ClusterModeDistributed ClusterMode = "Distributed"
 
 	// ClusterModeStandalone is the single-node operator-managed standalone topology.
 	ClusterModeStandalone ClusterMode = "Standalone"
@@ -318,8 +318,8 @@ const (
 type AntflyClusterSpec struct {
 	// Mode selects the runtime topology managed by the operator.
 	// +optional
-	// +kubebuilder:validation:Enum=Clustered;Standalone
-	// +kubebuilder:default=Clustered
+	// +kubebuilder:validation:Enum=Distributed;Standalone
+	// +kubebuilder:default=Distributed
 	Mode ClusterMode `json:"mode,omitempty"`
 
 	// Image is the container image to use for Antfly
@@ -351,12 +351,12 @@ type AntflyClusterSpec struct {
 	ProductTier *ProductTierSpec `json:"productTier,omitempty"`
 
 	// MetadataNodes defines the configuration for metadata nodes (StatefulSet).
-	// Required for Clustered mode and must be omitted in Standalone mode.
+	// Required for Distributed mode and must be omitted in Standalone mode.
 	// +optional
 	MetadataNodes MetadataNodesSpec `json:"metadataNodes,omitempty"`
 
 	// DataNodes defines the configuration for data nodes (StatefulSet).
-	// Required for Clustered mode and must be omitted in Standalone mode.
+	// Required for Distributed mode and must be omitted in Standalone mode.
 	// +optional
 	DataNodes DataNodesSpec `json:"dataNodes,omitempty"`
 
@@ -429,12 +429,12 @@ type ProductTierSpec struct {
 	StandaloneTier string `json:"standaloneTier,omitempty"`
 
 	// MetadataTier optionally records the metadata-node sub-tier name when
-	// Mode=Clustered.
+	// Mode=Distributed.
 	// +optional
 	MetadataTier string `json:"metadataTier,omitempty"`
 
 	// DataTier optionally records the data-node sub-tier name when
-	// Mode=Clustered.
+	// Mode=Distributed.
 	// +optional
 	DataTier string `json:"dataTier,omitempty"`
 
@@ -1185,7 +1185,7 @@ type StorageSpec struct {
 	PVCRetentionPolicy *PVCRetentionPolicy `json:"pvcRetentionPolicy,omitempty"`
 
 	// StorageAutoGrow configures operator-owned grow-only disk autoscaling.
-	// Clustered mode currently applies this policy only to data PVCs. Standalone
+	// Distributed mode currently applies this policy only to data PVCs. Standalone
 	// mode applies it to the standalone PVC.
 	// +optional
 	StorageAutoGrow *StorageAutoGrowSpec `json:"storageAutoGrow,omitempty"`
@@ -1196,7 +1196,7 @@ type StorageAutoGrowSpec struct {
 	// Enabled controls whether the operator automatically grows storage.
 	Enabled bool `json:"enabled,omitempty"`
 
-	// MaxDataStorage is the maximum size for clustered data PVC auto-grow.
+	// MaxDataStorage is the maximum size for distributed data PVC auto-grow.
 	MaxDataStorage string `json:"maxDataStorage,omitempty"`
 
 	// MaxStandaloneStorage is the maximum size for standalone PVC auto-grow. If omitted

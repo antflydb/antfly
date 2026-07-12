@@ -3336,9 +3336,9 @@ spec:
                 - resources
                 type: object
               mode:
-                default: Clustered
+                default: Distributed
                 enum:
-                - Clustered
+                - Distributed
                 - Standalone
                 type: string
               productTier:

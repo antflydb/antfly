@@ -1173,7 +1173,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, self.api_server.clusterApi());
+        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config);
         return respondOwnedApiResponse(ctx, &resp);
     }
 

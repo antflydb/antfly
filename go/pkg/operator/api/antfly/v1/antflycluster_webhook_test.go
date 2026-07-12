@@ -1424,7 +1424,7 @@ func TestValidateCreate_StorageAutoGrowValid(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_ProductTierRequiresExplicitClusteredShape(t *testing.T) {
+func TestValidateCreate_ProductTierRequiresExplicitDistributedShape(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.ProductTier = &ProductTierSpec{
 		Name:      "pro",
@@ -1442,7 +1442,7 @@ func TestValidateCreate_ProductTierRequiresExplicitClusteredShape(t *testing.T) 
 	}
 }
 
-func TestValidateCreate_ProductTierValidClusteredShape(t *testing.T) {
+func TestValidateCreate_ProductTierValidDistributedShape(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.ProductTier = &ProductTierSpec{
 		Name:         "pro",
@@ -1799,7 +1799,7 @@ func TestValidateCreate_StandaloneLocalRejectsLiteFileName(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_ClusteredRejectsLiteStorage(t *testing.T) {
+func TestValidateCreate_DistributedRejectsLiteStorage(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.Storage.Engine = "lite"
 	cluster.Spec.Storage.LiteFileName = "data.aflite"
@@ -1808,7 +1808,7 @@ func TestValidateCreate_ClusteredRejectsLiteStorage(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_StandaloneRejectsClusteredFields(t *testing.T) {
+func TestValidateCreate_StandaloneRejectsDistributedFields(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.MetadataNodes.Replicas = 3
 
@@ -1886,7 +1886,7 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 
 	err := newCluster.ValidateUpdate(oldCluster)
 	if err == nil {
-		t.Fatal("expected error when changing mode from Clustered to Standalone")
+		t.Fatal("expected error when changing mode from Distributed to Standalone")
 	}
 	if !strings.Contains(err.Error(), "spec.mode") {
 		t.Fatalf("expected immutable mode validation error, got: %v", err)

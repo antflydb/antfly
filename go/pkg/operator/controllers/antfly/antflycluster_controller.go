@@ -822,17 +822,17 @@ const (
 type topologyMode string
 
 const (
-	topologyModeClustered  topologyMode = "clustered"
-	topologyModeStandalone topologyMode = "standalone"
-	topologyModeInvalid    topologyMode = "invalid"
+	topologyModeDistributed topologyMode = "distributed"
+	topologyModeStandalone  topologyMode = "standalone"
+	topologyModeInvalid     topologyMode = "invalid"
 )
 
 func effectiveTopologyMode(cluster *antflyv1.AntflyCluster) topologyMode {
 	switch cluster.Spec.Mode {
 	case antflyv1.ClusterModeStandalone:
 		return topologyModeStandalone
-	case antflyv1.ClusterModeClustered, "":
-		return topologyModeClustered
+	case antflyv1.ClusterModeDistributed, "":
+		return topologyModeDistributed
 	default:
 		return topologyModeInvalid
 	}
@@ -928,7 +928,7 @@ func shouldFinalizeDataScaleDown(status *antflyv1.DataScaleDownStatus, currentRe
 
 func (r *AntflyClusterReconciler) ensureTopologyResourcesMatchMode(ctx context.Context, cluster *antflyv1.AntflyCluster, mode topologyMode) error {
 	if mode == topologyModeInvalid {
-		return fmt.Errorf("unsupported spec.mode %q; reconciliation is blocked until the resource uses Clustered or Standalone", cluster.Spec.Mode)
+		return fmt.Errorf("unsupported spec.mode %q; reconciliation is blocked until the resource uses Distributed or Standalone", cluster.Spec.Mode)
 	}
 
 	expected := map[string]struct{}{}
@@ -1008,7 +1008,7 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 	standaloneMode := isStandaloneMode(cluster)
 
 	if cluster.Spec.Mode == "" {
-		cluster.Spec.Mode = antflyv1.ClusterModeClustered
+		cluster.Spec.Mode = antflyv1.ClusterModeDistributed
 	}
 
 	if standaloneMode && cluster.Spec.Standalone != nil {
@@ -1518,7 +1518,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if standaloneMode {
-		// Standalone mode is a single topology and does not support clustered autoscaling.
+		// Standalone mode is a single topology and does not support distributed autoscaling.
 		if workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
 			log.Info("Ignoring data node autoscaling because standalone mode is enabled")
 		}
@@ -2152,10 +2152,10 @@ func (r *AntflyClusterReconciler) generateCompleteConfig(cluster *antflyv1.Antfl
 		return r.generateStandaloneConfig(cluster)
 	}
 
-	return r.generateClusteredConfig(cluster)
+	return r.generateDistributedConfig(cluster)
 }
 
-func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.AntflyCluster) (string, error) {
+func (r *AntflyClusterReconciler) generateDistributedConfig(cluster *antflyv1.AntflyCluster) (string, error) {
 	// Parse user-provided configuration
 	var userConfig map[string]any
 	if err := json.Unmarshal([]byte(cluster.Spec.Config), &userConfig); err != nil {
@@ -3642,7 +3642,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 
 	cluster.Status.MetadataNodesReady = metadataSts.Status.ReadyReplicas
 	cluster.Status.DataNodesReady = dataSts.Status.ReadyReplicas
-	cluster.Status.Mode = antflyv1.ClusterModeClustered
+	cluster.Status.Mode = antflyv1.ClusterModeDistributed
 	cluster.Status.ReadyReplicas = metadataSts.Status.ReadyReplicas + dataSts.Status.ReadyReplicas
 	cluster.Status.StandaloneNodesReady = 0
 	cluster.Status.StandaloneStatus = nil
@@ -8328,7 +8328,7 @@ func effectiveTopologyModeForAPI(cluster *antflyv1.AntflyCluster) antflyv1.Clust
 	if isStandaloneMode(cluster) {
 		return antflyv1.ClusterModeStandalone
 	}
-	return antflyv1.ClusterModeClustered
+	return antflyv1.ClusterModeDistributed
 }
 
 func resourceSpecSummary(resources antflyv1.ResourceSpec) string {

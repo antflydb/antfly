@@ -1269,14 +1269,14 @@ pub fn listClusterBackupsFromLocation(
     return try listClusterBackupsFromOpenedLocation(alloc, &location, location_uri);
 }
 
-fn listClusterBackupsFromOpenedLocation(
+pub fn listClusterBackupsFromOpenedLocation(
     alloc: std.mem.Allocator,
     location: *BackupLocation,
     location_uri: []const u8,
 ) ![]BackupInfo {
     switch (location.*) {
+        .file => |path| return try listClusterBackups(alloc, path, location_uri),
         .remote => {},
-        .file => unreachable,
     }
 
     var infos = std.ArrayListUnmanaged(BackupInfo).empty;

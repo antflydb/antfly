@@ -700,8 +700,8 @@ components:
       description: >-
         Stable caller key used to return the original job on safe retries.
         Completed keys are retained for at least 24 hours within one server
-        process. Job IDs contain a random server-boot namespace so an ID from a
-        previous process cannot alias a new job after restart.
+        process. Job IDs are opaque 63-bit process-seeded values with retained
+        history collision checks; callers must treat them as non-sequential.
       schema:
         type: string
         minLength: 1
@@ -787,7 +787,7 @@ components:
           format: uint64
           minimum: 1
           maximum: 9223372036854775807
-          description: Opaque job identifier namespaced to one server boot.
+          description: Opaque non-sequential job identifier.
         operation: { $ref: "#/components/schemas/StorageMaintenanceOperation" }
         state: { $ref: "#/components/schemas/StorageMaintenanceState" }
         created_at_ms: { type: integer, format: int64 }

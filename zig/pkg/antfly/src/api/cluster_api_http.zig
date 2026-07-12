@@ -47,6 +47,7 @@ pub const ClusterApi = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             location_uri: []const u8,
+            location: *backups_api.BackupLocation,
         ) ExecuteListError![]u8,
         execute_cluster_backup: *const fn (
             ptr: *anyopaque,
@@ -67,8 +68,9 @@ pub const ClusterApi = struct {
         self: ClusterApi,
         alloc: std.mem.Allocator,
         location_uri: []const u8,
+        location: *backups_api.BackupLocation,
     ) ExecuteListError![]u8 {
-        return try self.vtable.execute_cluster_backup_list(self.ptr, alloc, location_uri);
+        return try self.vtable.execute_cluster_backup_list(self.ptr, alloc, location_uri, location);
     }
 
     pub fn executeClusterBackup(
@@ -104,9 +106,25 @@ pub const OwnedResponse = struct {
 pub fn handleClusterBackupList(
     alloc: std.mem.Allocator,
     location_uri: []const u8,
+    connection: ?[]const u8,
     api: ClusterApi,
+    secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
 ) !OwnedResponse {
-    const body = api.executeClusterBackupList(alloc, location_uri) catch |err| switch (err) {
+    if (isRemoteLocation(location_uri) and connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "remote backup listing requires a named connection") };
+    }
+    var location = backups_api.openBackupLocationWithOptions(alloc, location_uri, .{
+        .secret_store = secret_store,
+        .node_config = node_config,
+        .connection = connection,
+        .required_capability = "restore.read",
+    }) catch |err| {
+        if (backups_api.backupLocationErrorMessage(err)) |msg| return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
+        return err;
+    };
+    defer location.deinit(alloc);
+    const body = api.executeClusterBackupList(alloc, location_uri, &location) catch |err| switch (err) {
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
         error.UnsupportedBackupLocation => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup location") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -126,6 +144,9 @@ pub fn handleClusterBackup(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     };
     defer backups_api.freeClusterBackupRequest(alloc, &req);
+    if (isRemoteLocation(req.location) and req.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "remote backup requires a named connection") };
+    }
 
     var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
         .secret_store = secret_store,
@@ -159,6 +180,9 @@ pub fn handleClusterRestore(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
     defer backups_api.freeClusterRestoreRequest(alloc, &req);
+    if (isRemoteLocation(req.location) and req.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "remote restore requires a named connection") };
+    }
 
     var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
         .secret_store = secret_store,
@@ -185,4 +209,38 @@ pub fn handleClusterRestore(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
     return .{ .status = 202, .body = response_body };
+}
+
+fn isRemoteLocation(location: []const u8) bool {
+    return std.mem.startsWith(u8, location, "s3://") or
+        std.mem.startsWith(u8, location, "gs://") or
+        std.mem.startsWith(u8, location, "gcs://");
+}
+
+test "cluster backup APIs require named connections for remote locations" {
+    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null);
+    defer list.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), list.status);
+
+    var backup = try handleClusterBackup(
+        std.testing.allocator,
+        "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
+        undefined,
+        null,
+        null,
+    );
+    defer backup.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), backup.status);
+    try std.testing.expectEqualStrings("remote backup requires a named connection", backup.body);
+
+    var restore = try handleClusterRestore(
+        std.testing.allocator,
+        "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
+        undefined,
+        null,
+        null,
+    );
+    defer restore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), restore.status);
+    try std.testing.expectEqualStrings("remote restore requires a named connection", restore.body);
 }

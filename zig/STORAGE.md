@@ -138,8 +138,9 @@ The server requires `backup.write` or `restore.read` respectively and verifies
 the location bucket and segment-bounded prefix against the connection. This
 supports several buckets, accounts, roles, and read/write trust domains in one
 process without promoting storage credentials to process-global environment
-variables. Omitting `--connection` retains the environment/secret-store path
-for local development and S3-compatible deployments.
+variables. Remote backup and restore requests require a named connection;
+ambient process credentials are not exposed through the network API. Offline
+Lite tooling may still use environment credentials when explicitly requested.
 
 The canonical and convenience forms are equivalent:
 
@@ -229,12 +230,15 @@ Otherwise they are disabled unless standalone is started with
 The same routes exist for every engine and return `422` when unsupported. The
 status capability reports whether maintenance preserves request availability.
 Lite maintenance is currently coordinated but exclusive (`online: false`): the
-asynchronous job acquires the file maintenance gate and requests may wait until
-it completes. Shutdown and explicit cancellation stop native checks and vacuum
+asynchronous job acquires the file maintenance gate, readiness becomes false,
+and new database requests fail fast with `503` instead of accumulating behind
+the maintenance lock. Admin status and cancellation remain available. Shutdown
+and explicit cancellation stop native checks and vacuum
 at safe page/record boundaries; a replacement file is never published after
 cancellation. Idempotency keys are retained for at least 24 hours within a
-server process. Job IDs include a random boot namespace, so an identifier from
-a previous process returns `404` instead of aliasing a new job. After restart,
+server process. Job IDs use 63-bit process-seeded opaque values with collision
+checks, so identifiers do not expose sequence information and cross-process
+aliasing is negligible. After restart,
 callers reconcile storage state before retrying. The bounded history rejects
 new jobs instead of silently evicting an unexpired key. Vacuum retains one
 logical record class at a time rather than holding metadata, index, and

@@ -257,6 +257,53 @@ pub const ExternalIoConnectionConfig = struct {
     credentials: ?AwsCredentialConfig = null,
     /// Whether S3-compatible endpoints should use TLS.
     use_ssl: ?bool = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("protocol");
+        try jw.write(self.protocol);
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.addressing_style) |value| {
+            try jw.objectField("addressing_style");
+            try jw.write(value);
+        }
+        if (self.bucket_provisioning) |value| {
+            try jw.objectField("bucket_provisioning");
+            try jw.write(value);
+        }
+        if (self.buckets) |value| {
+            try jw.objectField("buckets");
+            try jw.write(value);
+        }
+        if (self.prefix) |value| {
+            try jw.objectField("prefix");
+            try jw.write(value);
+        }
+        if (self.hosts) |value| {
+            try jw.objectField("hosts");
+            try jw.write(value);
+        }
+        if (self.headers) |value| {
+            try jw.objectField("headers");
+            try jw.write(value);
+        }
+        if (self.credentials) |value| {
+            try jw.objectField("credentials");
+            try jw.write(value);
+        }
+        if (self.use_ssl) |value| {
+            try jw.objectField("use_ssl");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ExternalIoConnectionVariant = struct {

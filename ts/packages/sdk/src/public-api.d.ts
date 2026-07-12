@@ -4631,9 +4631,10 @@ export interface components {
              */
             location: string;
             /**
-             * @description Optional ID of a configured `external_io` connection. S3 backups require
-             *     the `backup.write` capability; restores require `restore.read`. The
-             *     location bucket and prefix must be within the connection's allowlist.
+             * @description ID of a configured `external_io` connection. Required for remote
+             *     backup and restore locations; local `file://` operations omit it.
+             *     S3 backups require `backup.write`, restores require `restore.read`,
+             *     and the location bucket and prefix must be allowlisted.
              */
             connection?: string;
             /**
@@ -12318,14 +12319,17 @@ export interface operations {
                  */
                 types?: string;
                 /**
-                 * @description Comma-separated list of expansions. Supported value: "models" —
-                 *     live-query each inference provider's model listing API.
+                 * @description Comma-separated list of expansions. Supported values: `models` to
+                 *     live-query inference model listings and `status` to live-probe
+                 *     external connections. Live work is opt-in and single-flight per
+                 *     server.
                  */
                 include?: string;
                 /**
-                 * @description Set to "true" to bypass the short server-side cache for live
-                 *     provider model listings and probes. This does not force a node
-                 *     config or metadata reload.
+                 * @description Set to "true" to bypass the short server-side cache for requested
+                 *     live expansions. Live expansion passes are serialized to prevent
+                 *     concurrent refresh amplification. This does not force a node config
+                 *     or metadata reload.
                  */
                 refresh?: string;
             };
@@ -12939,6 +12943,8 @@ export interface operations {
                  * @example s3://mybucket/antfly-backups/
                  */
                 location: string;
+                /** @description Named `external_io` connection. Required for remote locations. */
+                connection?: string;
             };
             header?: never;
             path?: never;

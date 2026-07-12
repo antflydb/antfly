@@ -721,34 +721,39 @@ pub const DurableSessionStore = struct {
         }
     }
 
-    pub fn scanPrefix(self: *DurableSessionStore, alloc: std.mem.Allocator, prefix: []const u8) ![]docstore_mod.OwnedKVPair {
-        return switch (self.backend) {
-            .docstore => |store| try store.scanPrefix(alloc, prefix),
-            .runtime => |store| blk: {
+    pub fn scanPrefixWithContext(
+        self: *DurableSessionStore,
+        prefix: []const u8,
+        ctx: *anyopaque,
+        callback: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!bool,
+    ) !void {
+        switch (self.backend) {
+            .docstore => |store| {
+                const Adapter = struct {
+                    context: *anyopaque,
+                    visit: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!bool,
+
+                    fn run(raw: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                        const adapter: *@This() = @ptrCast(@alignCast(raw.?));
+                        if (!std.mem.startsWith(u8, key, session_prefix)) return .stop;
+                        return if (try adapter.visit(adapter.context, key, value)) .@"continue" else .stop;
+                    }
+                };
+                var adapter = Adapter{ .context = ctx, .visit = callback };
+                try store.scanWithContext(prefix, &.{}, .{}, &adapter, Adapter.run);
+            },
+            .runtime => |store| {
                 var txn = try store.beginCurrentScan();
                 defer txn.abort();
                 var cursor = try txn.openCursor();
                 defer cursor.close();
-                var rows: std.ArrayListUnmanaged(docstore_mod.OwnedKVPair) = .empty;
-                errdefer {
-                    for (rows.items) |row| {
-                        alloc.free(row.key);
-                        alloc.free(row.value);
-                    }
-                    rows.deinit(alloc);
-                }
                 var entry = try cursor.seekAtOrAfter(prefix);
                 while (entry) |row| : (entry = try cursor.next()) {
                     if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                    const key = try alloc.dupe(u8, row.key);
-                    errdefer alloc.free(key);
-                    const value = try alloc.dupe(u8, row.value);
-                    errdefer alloc.free(value);
-                    try rows.append(alloc, .{ .key = key, .value = value });
+                    if (!(try callback(ctx, row.key, row.value))) break;
                 }
-                break :blk try rows.toOwnedSlice(alloc);
             },
-        };
+        }
     }
 
     pub fn sessionCount(self: *DurableSessionStore) !usize {
@@ -1061,13 +1066,27 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         self.mutex.lock();
-        defer self.mutex.unlock();
-        const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const current = (self.loadIntoCacheLocked(alloc, txn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        }) orelse {
+            self.mutex.unlock();
+            return null;
+        };
         var out: OwnedTransactionCommitRequest = if (current.staged) |staged|
-            try staged.clone(alloc)
+            staged.clone(alloc) catch |err| {
+                self.mutex.unlock();
+                return err;
+            }
         else
             .{ .sync_level = current.sync_level };
         errdefer out.deinit(alloc);
+        var candidate = current.clone(alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        errdefer candidate.deinit(alloc);
         if (extra_req) |req| {
             try out.mergeFrom(alloc, req);
         }
@@ -1075,11 +1094,13 @@ pub const SessionRegistry = struct {
             out.deinit(alloc);
             return null;
         }
-        var candidate = try current.clone(alloc);
-        errdefer candidate.deinit(alloc);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistAndPublishLocked(alloc, current, &candidate);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
         return out;
     }
 
@@ -1088,12 +1109,24 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         self.mutex.lock();
-        defer self.mutex.unlock();
-        const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const current = (self.loadIntoCacheLocked(alloc, txn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        }) orelse {
+            self.mutex.unlock();
+            return null;
+        };
         if (self.max_savepoints) |limit| {
-            if (current.savepoints.count() >= limit) return error.SavepointLimitExceeded;
+            if (current.savepoints.count() >= limit) {
+                self.mutex.unlock();
+                return error.SavepointLimitExceeded;
+            }
         }
-        var candidate = try current.clone(alloc);
+        var candidate = current.clone(alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
         errdefer candidate.deinit(alloc);
         const savepoint_id = candidate.next_savepoint_id;
         candidate.next_savepoint_id += 1;
@@ -1112,7 +1145,11 @@ pub const SessionRegistry = struct {
         savepoint_inserted = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistAndPublishLocked(alloc, current, &candidate);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
     }
 
@@ -1121,18 +1158,35 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         self.mutex.lock();
-        defer self.mutex.unlock();
-        const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
-        const savepoint = current.savepoints.getPtr(savepoint_id) orelse return null;
-        var candidate = try current.clone(alloc);
+        const current = (self.loadIntoCacheLocked(alloc, txn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        }) orelse {
+            self.mutex.unlock();
+            return null;
+        };
+        if (!current.savepoints.contains(savepoint_id)) {
+            self.mutex.unlock();
+            return null;
+        }
+        var candidate = current.clone(alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
         errdefer candidate.deinit(alloc);
+        const savepoint = candidate.savepoints.getPtr(savepoint_id).?;
         if (candidate.staged) |*staged| staged.deinit(alloc);
         candidate.staged = try savepoint.snapshot.clone(alloc);
         deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
         candidate.read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistAndPublishLocked(alloc, current, &candidate);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
     }
 
@@ -1156,25 +1210,55 @@ pub const SessionRegistry = struct {
     }
 
     pub fn listStatuses(self: *SessionRegistry, alloc: std.mem.Allocator) ![]SessionStatus {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         var statuses = std.ArrayListUnmanaged(SessionStatus).empty;
         errdefer statuses.deinit(alloc);
 
         if (self.durable) |durable| {
-            const rows = try durable.scanPrefix(alloc, session_prefix);
-            defer docstore_mod.DocStore.freeResults(alloc, rows);
-            for (rows) |row| {
-                if (row.key.len <= session_prefix.len) continue;
-                const txn_id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
-                var session = decodeSessionRecord(alloc, txn_id, row.value) catch continue;
-                defer session.deinit(alloc);
-                try statuses.append(alloc, try sessionStatusFromSession(self, alloc, &session));
-            }
+            // Decode one row at a time so listing does not duplicate every
+            // potentially large staged transaction record in memory.
+            const Scan = struct {
+                registry: *SessionRegistry,
+                allocator: std.mem.Allocator,
+                statuses: *std.ArrayListUnmanaged(SessionStatus),
+
+                fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+                    const scan: *@This() = @ptrCast(@alignCast(raw));
+                    if (key.len <= session_prefix.len) return true;
+                    const txn_id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
+                    var session = decodeSessionRecord(scan.allocator, txn_id, value) catch return true;
+                    defer session.deinit(scan.allocator);
+                    const counts = stagedCounts(session.staged);
+                    const savepoint_count = session.savepoints.count();
+                    try scan.statuses.append(scan.allocator, .{
+                        .txn_id = session.txn_id,
+                        .owner_node_id = session.owner_node_id,
+                        .begin_timestamp = session.begin_timestamp,
+                        .last_touched_timestamp = session.last_touched_timestamp,
+                        .lease_expires_at = 0,
+                        .sync_level = session.sync_level,
+                        .staged_table_count = counts.tables,
+                        .staged_read_count = counts.reads,
+                        .staged_write_count = counts.writes,
+                        .staged_delete_count = counts.deletes,
+                        .read_snapshot_count = session.read_snapshots.count(),
+                        .savepoint_count = savepoint_count,
+                        .savepoint_limit = scan.registry.max_savepoints,
+                        .remaining_savepoints = if (scan.registry.max_savepoints) |limit| limit - @min(limit, savepoint_count) else null,
+                        .durable = true,
+                    });
+                    return true;
+                }
+            };
+            var scan = Scan{ .registry = self, .allocator = alloc, .statuses = &statuses };
+            try durable.scanPrefixWithContext(session_prefix, &scan, Scan.visit);
+            // Avoid nested backend reads by loading lease metadata only after
+            // the scan transaction has closed.
+            for (statuses.items) |*status| status.lease_expires_at = try self.loadLeaseExpiryLocked(alloc, status.txn_id);
             return try statuses.toOwnedSlice(alloc);
         }
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
@@ -1195,20 +1279,39 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.durable == null) return false;
-        const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return false;
-        if (current.owner_node_id == owner_node_id) return true;
-        var candidate = try current.clone(alloc);
+        if (self.durable == null) {
+            self.mutex.unlock();
+            return false;
+        }
+        const current = (self.loadIntoCacheLocked(alloc, txn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        }) orelse {
+            self.mutex.unlock();
+            return false;
+        };
+        if (current.owner_node_id == owner_node_id) {
+            self.mutex.unlock();
+            return true;
+        }
+        const expected_owner = current.owner_node_id;
+        var candidate = current.clone(alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
         errdefer candidate.deinit(alloc);
         candidate.owner_node_id = owner_node_id;
         touchSession(&candidate);
         if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const now_ns = nextTxnTimestamp();
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try self.durable.?.saveWithLease(candidate, current.owner_node_id, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
-            self.publishCandidateLocked(alloc, current, &candidate);
-        } else try self.persistAndPublishLocked(alloc, current, &candidate);
+            if (!(try self.durable.?.saveWithLease(candidate, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
+        } else try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
         return true;
     }
 
@@ -1223,62 +1326,113 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.durable == null) return false;
-        if (self.lease_store == null or self.owner_lease_ttl_ns == null) return false;
-        const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return false;
-        if (current.owner_node_id == owner_node_id) return true;
+        if (self.durable == null or self.lease_store == null or self.owner_lease_ttl_ns == null) {
+            self.mutex.unlock();
+            return false;
+        }
+        const current = (self.loadIntoCacheLocked(alloc, txn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        }) orelse {
+            self.mutex.unlock();
+            return false;
+        };
+        if (current.owner_node_id == owner_node_id) {
+            self.mutex.unlock();
+            return true;
+        }
+        const expected_owner = current.owner_node_id;
         const effective_now = now_ns orelse nextTxnTimestamp();
-        var candidate = try current.clone(alloc);
+        var candidate = current.clone(alloc) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
         errdefer candidate.deinit(alloc);
         candidate.owner_node_id = owner_node_id;
         touchSession(&candidate);
         const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-        if (!(try self.durable.?.saveWithLease(candidate, current.owner_node_id, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
-        self.publishCandidateLocked(alloc, current, &candidate);
+        if (!(try self.durable.?.saveWithLease(candidate, expected_owner, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
         return true;
     }
 
     pub fn cleanupExpired(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
-        self.lockAllSessions();
-        defer self.unlockAllSessions();
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+        // Discover candidates without excluding unrelated session mutations.
+        // Each candidate is revalidated under its stripe before deletion.
+        // Durable scanning may be slow but no registry/session lock is held.
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
+        var expired_set = std.AutoHashMapUnmanaged(db_mod.types.TxnId, void).empty;
+        defer expired_set.deinit(alloc);
 
+        self.mutex.lock();
         var loaded_it = self.sessions.iterator();
         while (loaded_it.next()) |entry| {
             if (entry.value_ptr.last_touched_timestamp < cutoff_ns) {
-                try expired_ids.append(alloc, entry.key_ptr.*);
+                const result = expired_set.getOrPut(alloc, entry.key_ptr.*) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                };
+                if (!result.found_existing) expired_ids.append(alloc, entry.key_ptr.*) catch |err| {
+                    _ = expired_set.remove(entry.key_ptr.*);
+                    self.mutex.unlock();
+                    return err;
+                };
             }
         }
+        self.mutex.unlock();
 
         if (self.durable) |durable| {
-            const rows = try durable.scanPrefix(alloc, session_prefix);
-            defer docstore_mod.DocStore.freeResults(alloc, rows);
-            for (rows) |row| {
-                if (row.key.len <= session_prefix.len) continue;
-                const txn_id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
-                if (containsTxnId(expired_ids.items, txn_id)) continue;
-                var session = decodeSessionRecord(alloc, txn_id, row.value) catch continue;
-                defer session.deinit(alloc);
-                if (session.last_touched_timestamp < cutoff_ns) {
-                    try expired_ids.append(alloc, txn_id);
+            const Scan = struct {
+                allocator: std.mem.Allocator,
+                cutoff: u64,
+                ids: *std.ArrayListUnmanaged(db_mod.types.TxnId),
+                seen: *std.AutoHashMapUnmanaged(db_mod.types.TxnId, void),
+
+                fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+                    const scan: *@This() = @ptrCast(@alignCast(raw));
+                    if (key.len <= session_prefix.len) return true;
+                    const txn_id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
+                    if (scan.seen.contains(txn_id)) return true;
+                    var session = decodeSessionRecord(scan.allocator, txn_id, value) catch return true;
+                    defer session.deinit(scan.allocator);
+                    if (session.last_touched_timestamp < scan.cutoff) {
+                        const result = try scan.seen.getOrPut(scan.allocator, txn_id);
+                        if (!result.found_existing) scan.ids.append(scan.allocator, txn_id) catch |err| {
+                            _ = scan.seen.remove(txn_id);
+                            return err;
+                        };
+                    }
+                    return true;
                 }
-            }
+            };
+            var scan = Scan{ .allocator = alloc, .cutoff = cutoff_ns, .ids = &expired_ids, .seen = &expired_set };
+            try durable.scanPrefixWithContext(session_prefix, &scan, Scan.visit);
         }
 
+        var removed_count: usize = 0;
         for (expired_ids.items) |txn_id| {
+            const session_lock = self.sessionLock(txn_id);
+            session_lock.lock();
+            defer session_lock.unlock();
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const current = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse continue;
+            if (current.last_touched_timestamp >= cutoff_ns) continue;
+            const owner_node_id = current.owner_node_id;
             try self.deletePersistentLocked(txn_id);
             if (self.sessions.fetchRemove(txn_id)) |removed| {
                 var session = removed.value;
-                self.releaseLeaseLocked(txn_id, session.owner_node_id) catch {};
+                self.releaseLeaseLocked(txn_id, owner_node_id) catch {};
                 session.deinit(alloc);
+                removed_count += 1;
             }
         }
-        return expired_ids.items.len;
+        return removed_count;
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
@@ -1362,14 +1516,33 @@ pub const SessionRegistry = struct {
     }
 
     pub fn renewOwnedLeases(self: *SessionRegistry, owner_node_id: u64, now_ns: u64) !usize {
+        var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
+        defer ids.deinit(self.durable.?.alloc);
         self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.lease_store == null or self.owner_lease_ttl_ns == null) return 0;
-        var renewed: usize = 0;
+        if (self.lease_store == null or self.owner_lease_ttl_ns == null or self.durable == null) {
+            self.mutex.unlock();
+            return 0;
+        }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.owner_node_id != owner_node_id) continue;
-            try self.renewLeaseLockedAt(entry.key_ptr.*, owner_node_id, now_ns);
+            ids.append(self.durable.?.alloc, entry.key_ptr.*) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+        }
+        self.mutex.unlock();
+
+        var renewed: usize = 0;
+        for (ids.items) |txn_id| {
+            const session_lock = self.sessionLock(txn_id);
+            session_lock.lock();
+            defer session_lock.unlock();
+            self.mutex.lock();
+            const still_owned = if (self.sessions.getPtr(txn_id)) |session| session.owner_node_id == owner_node_id else false;
+            self.mutex.unlock();
+            if (!still_owned) continue;
+            try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
             renewed += 1;
         }
         return renewed;
@@ -2727,13 +2900,6 @@ fn stagedCounts(staged: ?OwnedTransactionCommitRequest) struct { tables: usize, 
         };
     }
     return .{ .tables = 0, .reads = 0, .writes = 0, .deletes = 0 };
-}
-
-fn containsTxnId(ids: []const db_mod.types.TxnId, txn_id: db_mod.types.TxnId) bool {
-    for (ids) |existing| {
-        if (std.mem.eql(u8, &existing, &txn_id)) return true;
-    }
-    return false;
 }
 
 const SessionLeaseState = enum {

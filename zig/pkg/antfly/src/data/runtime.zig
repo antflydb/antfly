@@ -3092,6 +3092,17 @@ pub const DataServer = struct {
         }
         try self.maybeRequestRuntimeStatusRefresh();
         try self.maybeRequestProvisionedStartupCatchUp();
+        // Session cleanup and lease renewal may touch durable storage. Keep
+        // that work off HTTP request fibers; this runtime loop is the sole
+        // opportunistic scheduler for the API server.
+        if (self.http_server) |*http_server| {
+            http_server.scheduleSessionMaintenance() catch |err| {
+                // Session maintenance is periodic and retryable. A transient
+                // allocation, queue, or storage error must not terminate the
+                // data runtime's availability loop.
+                std.log.warn("failed to schedule session maintenance err={s}", .{@errorName(err)});
+            };
+        }
     }
 
     pub fn deinit(self: *DataServer) void {

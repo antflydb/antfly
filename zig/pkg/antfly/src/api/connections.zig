@@ -21,10 +21,10 @@
 // response.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 const platform_time = @import("../platform/time.zig");
+const platform_sync = @import("antfly_platform").sync;
 const common_config = @import("../common/config.zig");
 const metadata_api = @import("../metadata/api.zig");
 const bedrock = @import("../inference/bedrock.zig");
@@ -152,7 +152,7 @@ pub const Sources = struct {
 pub const BuildOptions = struct {
     include_models: bool = false,
     refresh: bool = false,
-    probe: bool = true,
+    probe: bool = false,
     timeout_ms: u64 = 5_000,
     max_workers: usize = 8,
     ttl_ns: u64 = 30 * std.time.ns_per_s,
@@ -166,6 +166,11 @@ pub const BuildOptions = struct {
 pub const Cache = struct {
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    live_probe_mutex: std.atomic.Mutex = .unlocked,
+    /// Protected by live_probe_mutex. These independently coalesce refreshes
+    /// without letting a model-list pass suppress a requested storage probe.
+    last_model_pass_ns: u64 = 0,
+    last_probe_pass_ns: u64 = 0,
     entries: std.StringArrayHashMapUnmanaged(Entry) = .{},
 
     pub const Entry = struct {
@@ -190,17 +195,19 @@ pub const Cache = struct {
     }
 
     fn lock(self: *Cache) void {
-        while (!self.mutex.tryLock()) {
-            if (comptime builtin.os.tag == .freestanding) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            std.Thread.yield() catch {};
-        }
+        platform_sync.lockYielding(&self.mutex);
     }
 
     fn unlock(self: *Cache) void {
         self.mutex.unlock();
+    }
+
+    fn lockLiveProbes(self: *Cache) void {
+        platform_sync.lockYielding(&self.live_probe_mutex);
+    }
+
+    fn unlockLiveProbes(self: *Cache) void {
+        self.live_probe_mutex.unlock();
     }
 
     pub fn deinit(self: *Cache) void {
@@ -322,14 +329,35 @@ pub fn buildConnectionsResponse(
 ) !ConnectionsResponse {
     var kinds = std.EnumSet(ConnectionKind).initFull();
     if (opts.types_filter) |filter| kinds = parseKindFilter(filter);
+    const models_requested = opts.include_models and kinds.contains(.inference);
+    const probes_requested = opts.probe and kinds.contains(.external_io);
+    const live_requested = models_requested or probes_requested;
+    const request_started_ns = platform_time.monotonicNs();
+    if (live_requested and cache != null) cache.?.lockLiveProbes();
+    defer if (live_requested and cache != null) cache.?.unlockLiveProbes();
+    var effective_opts = opts;
+    if (live_requested and cache != null and opts.refresh and
+        (!models_requested or cache.?.last_model_pass_ns >= request_started_ns) and
+        (!probes_requested or cache.?.last_probe_pass_ns >= request_started_ns))
+    {
+        // A refresh completed while this request waited. Consume its fresh
+        // cache entries instead of serially repeating the same external work.
+        effective_opts.refresh = false;
+    }
 
     var connections = std.ArrayListUnmanaged(Connection).empty;
 
     if (sources.node_config) |node_config| {
-        try appendConfiguredConnections(arena, &connections, sources, cache, opts, kinds, node_config);
-        if (opts.probe and kinds.contains(.external_io)) {
-            try resolveExternalIoProbes(arena, &connections, node_config, cache, opts);
+        try appendConfiguredConnections(arena, &connections, sources, cache, effective_opts, kinds, node_config);
+        if (effective_opts.probe and kinds.contains(.external_io)) {
+            try resolveExternalIoProbes(arena, &connections, node_config, cache, effective_opts);
         }
+    }
+
+    if (live_requested and cache != null) {
+        const completed_ns = platform_time.monotonicNs();
+        if (models_requested) cache.?.last_model_pass_ns = completed_ns;
+        if (probes_requested) cache.?.last_probe_pass_ns = completed_ns;
     }
 
     return .{ .connections = connections.items };
@@ -352,6 +380,15 @@ pub fn includeHasModels(include: ?[]const u8) bool {
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |value| {
         if (std.mem.eql(u8, std.mem.trim(u8, value, " \t"), "models")) return true;
+    }
+    return false;
+}
+
+pub fn includeHasStatus(include: ?[]const u8) bool {
+    const raw = include orelse return false;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |value| {
+        if (std.mem.eql(u8, std.mem.trim(u8, value, " \t"), "status")) return true;
     }
     return false;
 }
@@ -861,7 +898,11 @@ fn resolveExternalIoProbes(
     const now_ns = platform_time.monotonicNs();
 
     for (connections.items, 0..) |*connection, connection_index| {
-        if (connection.kind != .external_io or connection.external_io.?.protocol != .s3) continue;
+        if (connection.kind != .external_io) continue;
+        if (connection.external_io.?.protocol != .s3) {
+            connection.status = .unsupported;
+            continue;
+        }
         const configured = node_config.connections.get(connection.id) orelse return error.InvalidConfig;
         const cfg = configured.external_io orelse return error.InvalidConfig;
         if (cfg.buckets.len == 0) {
@@ -1169,13 +1210,14 @@ test "build response reports configured external io connections" {
         arena,
         .{ .node_config = &cfg },
         null,
-        .{ .types_filter = "external_io", .probe = false },
+        .{ .types_filter = "external_io" },
     );
     try std.testing.expectEqual(@as(usize, 2), response.connections.len);
     for (response.connections) |connection| {
         try std.testing.expectEqual(ConnectionKind.external_io, connection.kind);
         try std.testing.expect(connection.id.len > 0);
         try std.testing.expect(connection.external_io != null);
+        try std.testing.expectEqual(ConnectionStatus.configured, connection.status);
     }
 
     const backups = response.connections[0];
@@ -1227,7 +1269,7 @@ test "build response reports configured web search connections" {
         \\        "region": "us",
         \\        "include_content": true,
         \\        "include_highlights": true,
-        \\        "api_key": "${secret:exa.api_key}",
+        \\        "api_key": "test-only-key",
         \\        "include_domains": ["docs.example.com"]
         \\      }
         \\    }
@@ -1353,4 +1395,8 @@ test "include param parsing" {
     try std.testing.expect(!includeHasModels(null));
     try std.testing.expect(!includeHasModels(""));
     try std.testing.expect(!includeHasModels("modeling"));
+    try std.testing.expect(includeHasStatus("status"));
+    try std.testing.expect(includeHasStatus("models, status"));
+    try std.testing.expect(!includeHasStatus(null));
+    try std.testing.expect(!includeHasStatus("statuses"));
 }

@@ -9011,7 +9011,7 @@ func TestHTTPClientDefaultHasTimeout(t *testing.T) {
 	g.Expect(reconciler.httpClient().Timeout).To(Equal(10 * time.Second))
 }
 
-func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
+func TestUpdateProductTierStatusReportsDistributedShape(t *testing.T) {
 	g := NewWithT(t)
 	reconciler := &AntflyClusterReconciler{}
 	cluster := &antflyv1.AntflyCluster{
@@ -9054,7 +9054,7 @@ func TestUpdateProductTierStatusReportsClusteredShape(t *testing.T) {
 
 	g.Expect(cluster.Status.ProductTierStatus).NotTo(BeNil())
 	g.Expect(cluster.Status.ProductTierStatus.Name).To(Equal("pro"))
-	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeClustered))
+	g.Expect(cluster.Status.ProductTierStatus.Mode).To(Equal(antflyv1.ClusterModeDistributed))
 	g.Expect(cluster.Status.ProductTierStatus.MetadataResources).To(Equal("cpu=500m memory=1Gi"))
 	g.Expect(cluster.Status.ProductTierStatus.DataStorage).To(Equal("100Gi"))
 	g.Expect(cluster.Status.ProductTierStatus.DataAutoscaling).To(Equal("enabled min=3 max=8"))
@@ -9800,7 +9800,7 @@ func TestReconcileServices_StandaloneCreatesStandaloneAndPublicAPI(t *testing.T)
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
-func TestCreatePublicAPIService_ClusteredTargetsMetadataAPI(t *testing.T) {
+func TestCreatePublicAPIService_DistributedTargetsMetadataAPI(t *testing.T) {
 	g := NewWithT(t)
 
 	enabled := true

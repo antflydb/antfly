@@ -47,14 +47,16 @@ pub const RemoveRoleFromUserParams = struct {
 pub const ListBackupsParams = struct {
     /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
     location: []const u8,
+    /// Named `external_io` connection. Required for remote locations.
+    connection: ?[]const u8 = null,
 };
 
 pub const ListConnectionsParams = struct {
     /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
-    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
+    /// Comma-separated list of expansions. Supported values: `models` to live-query inference model listings and `status` to live-probe external connections. Live work is opt-in and single-flight per server.
     include: ?[]const u8 = null,
-    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
+    /// Set to "true" to bypass the short server-side cache for requested live expansions. Live expansion passes are serialized to prevent concurrent refresh amplification. This does not force a node config or metadata reload.
     refresh: ?[]const u8 = null,
 };
 
@@ -629,6 +631,14 @@ pub const Client = struct {
         try query_buf.appendSlice(self.allocator, "location=");
         try query_buf.appendSlice(self.allocator, encoded_query_value_location);
         sep = '&';
+        if (params.connection) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "connection=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
             self.allocator.free(url);

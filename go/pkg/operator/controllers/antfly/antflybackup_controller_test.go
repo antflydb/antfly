@@ -508,7 +508,7 @@ func TestBackupClusterDependencyChangedPredicate(t *testing.T) {
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			Image: "antfly:v1",
-			Mode:  antflyv1.ClusterModeClustered,
+			Mode:  antflyv1.ClusterModeDistributed,
 		},
 	}
 

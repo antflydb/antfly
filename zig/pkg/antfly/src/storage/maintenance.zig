@@ -92,7 +92,9 @@ pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     source: Source,
     mutex: std.atomic.Mutex = .unlocked,
-    next_job_id: u64,
+    id_seed: u64,
+    id_sequence: u64 = 1,
+    exclusive_active: std.atomic.Value(bool) = .init(false),
     active_job_id: ?u64 = null,
     jobs: std.ArrayListUnmanaged(*Job) = .empty,
 
@@ -137,27 +139,25 @@ pub const Coordinator = struct {
             platform_time.realtimeNs(),
             coordinator_boot_sequence.fetchAdd(1, .monotonic),
         };
-        var boot_id: u32 = undefined;
+        var seed_random: u64 = undefined;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        io_impl.io().randomSecure(std.mem.asBytes(&boot_id)) catch {
-            boot_id = @truncate(std.hash.Wyhash.hash(0x616e74666c792d6d, std.mem.asBytes(&seed)));
+        io_impl.io().randomSecure(std.mem.asBytes(&seed_random)) catch {
+            seed_random = std.hash.Wyhash.hash(0x616e74666c792d6d, std.mem.asBytes(&seed));
         };
-        // OpenAPI's portable integer representation is signed 64-bit even for
-        // uint64 formats. Reserve the sign bit while retaining a 31-bit random
-        // boot namespace and a 32-bit per-process sequence.
-        boot_id &= 0x7fff_ffff;
-        if (boot_id == 0) boot_id = 1;
-        const first_job_id = (@as(u64, boot_id) << 32) | 1;
-        return initWithFirstJobId(allocator, source, first_job_id);
+        return initWithSeed(allocator, source, seed_random);
     }
 
-    fn initWithFirstJobId(allocator: std.mem.Allocator, source: Source, first_job_id: u64) Coordinator {
+    fn initWithSeed(allocator: std.mem.Allocator, source: Source, seed: u64) Coordinator {
         return .{
             .allocator = allocator,
             .source = source,
-            .next_job_id = @max(first_job_id, 1),
+            .id_seed = if (seed == 0) 1 else seed,
         };
+    }
+
+    pub fn isExclusiveActive(self: *const Coordinator) bool {
+        return self.exclusive_active.load(.acquire);
     }
 
     pub fn deinit(self: *Coordinator) void {
@@ -187,14 +187,14 @@ pub const Coordinator = struct {
             }
         }
         if (self.active_job_id != null) return error.MaintenanceBusy;
-        if (@as(u32, @truncate(self.next_job_id)) == std.math.maxInt(u32)) return error.MaintenanceJobIdExhausted;
         self.pruneExpiredLocked(nowMs());
         if (self.jobs.items.len >= max_retained_jobs) return error.MaintenanceHistoryFull;
 
         const job = try self.allocator.create(Job);
         errdefer self.allocator.destroy(job);
+        const job_id = self.nextJobIdLocked() orelse return error.MaintenanceJobIdExhausted;
         job.* = .{
-            .id = self.next_job_id,
+            .id = job_id,
             .operation = operation,
             .idempotency_key = if (idempotency_key) |key| try self.allocator.dupe(u8, key) else null,
             .created_at_ms = nowMs(),
@@ -205,10 +205,12 @@ pub const Coordinator = struct {
         // Publish coordinator state only after every allocation needed to own
         // the queued job has succeeded. In particular, an OOM growing `jobs`
         // must not leave the coordinator permanently busy.
-        self.next_job_id +|= 1;
         self.active_job_id = job.id;
+        const exclusive = !self.source.status().maintenance.online;
+        if (exclusive) self.exclusive_active.store(true, .release);
         job.thread = std.Thread.spawn(.{}, runJob, .{ self, job }) catch |err| {
             self.active_job_id = null;
+            if (exclusive) self.exclusive_active.store(false, .release);
             return err;
         };
         return snapshotLocked(job);
@@ -255,6 +257,26 @@ pub const Coordinator = struct {
         }
         job.completed_at_ms = nowMs();
         if (self.active_job_id == job.id) self.active_job_id = null;
+        self.exclusive_active.store(false, .release);
+    }
+
+    fn nextJobIdLocked(self: *Coordinator) ?u64 {
+        var attempts: usize = 0;
+        while (attempts < 16) : (attempts += 1) {
+            const material = [2]u64{ self.id_seed, self.id_sequence };
+            self.id_sequence +%= 1;
+            var candidate = std.hash.Wyhash.hash(0xa66f_6c79_6d61_696e, std.mem.asBytes(&material)) & std.math.maxInt(i64);
+            if (candidate == 0) candidate = 1;
+            var collision = false;
+            for (self.jobs.items) |job| {
+                if (job.id == candidate) {
+                    collision = true;
+                    break;
+                }
+            }
+            if (!collision) return candidate;
+        }
+        return null;
     }
 
     fn pruneExpiredLocked(self: *Coordinator, now_ms: i64) void {
@@ -352,13 +374,15 @@ test "storage maintenance job ids are namespaced by server boot" {
             }.call,
         },
     };
-    var first = Coordinator.initWithFirstJobId(std.testing.allocator, source, 11);
+    var first = Coordinator.initWithSeed(std.testing.allocator, source, 11);
     defer first.deinit();
-    var second = Coordinator.initWithFirstJobId(std.testing.allocator, source, 12);
+    var second = Coordinator.initWithSeed(std.testing.allocator, source, 12);
     defer second.deinit();
-    try std.testing.expect(first.next_job_id != second.next_job_id);
-    try std.testing.expectEqual(@as(u64, 11), first.next_job_id);
-    try std.testing.expectEqual(@as(u64, 12), second.next_job_id);
+    const first_id = first.nextJobIdLocked().?;
+    const second_id = second.nextJobIdLocked().?;
+    try std.testing.expect(first_id != second_id);
+    try std.testing.expect(first_id <= std.math.maxInt(i64));
+    try std.testing.expect(second_id <= std.math.maxInt(i64));
 }
 
 test "storage maintenance cancellation reaches a cooperative engine" {
@@ -380,11 +404,13 @@ test "storage maintenance cancellation reaches a cooperative engine" {
     var coordinator = Coordinator.init(std.testing.allocator, fake.source());
     defer coordinator.deinit();
     const started = try coordinator.start(.vacuum, "cancel-me");
+    try std.testing.expect(coordinator.isExclusiveActive());
     _ = coordinator.cancel(started.job_id).?;
     while (true) {
         const snapshot = coordinator.get(started.job_id).?;
         if (snapshot.state == .canceled) {
             try std.testing.expectEqualStrings("MaintenanceCanceled", snapshot.error_name.?);
+            try std.testing.expect(!coordinator.isExclusiveActive());
             break;
         }
         std.Thread.yield() catch {};

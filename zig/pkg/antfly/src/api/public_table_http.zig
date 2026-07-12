@@ -690,6 +690,9 @@ pub fn handleTableBackup(
     const backup_format = parseBackupFormat(parsed_req.value.format) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") };
     };
+    if (isRemoteBackupLocation(parsed_req.value.location) and parsed_req.value.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "remote backup requires a named connection") };
+    }
 
     var location = backups_api.openBackupLocationWithOptions(alloc, parsed_req.value.location, .{
         .secret_store = secret_store,
@@ -738,6 +741,10 @@ pub fn handleTableRestore(
     };
     defer parsed_req.deinit();
 
+    if (isRemoteBackupLocation(parsed_req.value.location) and parsed_req.value.connection == null) {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "remote restore requires a named connection") };
+    }
+
     var location = backups_api.openBackupLocationWithOptions(alloc, parsed_req.value.location, .{
         .secret_store = secret_store,
         .node_config = node_config,
@@ -765,6 +772,38 @@ pub fn handleTableRestore(
         .status = 202,
         .body = try backups_api.encodeRestoreTriggered(alloc),
     };
+}
+
+fn isRemoteBackupLocation(location: []const u8) bool {
+    return std.mem.startsWith(u8, location, "s3://") or
+        std.mem.startsWith(u8, location, "gs://") or
+        std.mem.startsWith(u8, location, "gcs://");
+}
+
+test "public table backup and restore require named connections for remote locations" {
+    var backup = try handleTableBackup(
+        std.testing.allocator,
+        "docs",
+        "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
+        undefined,
+        null,
+        null,
+    );
+    defer backup.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), backup.status);
+    try std.testing.expectEqualStrings("remote backup requires a named connection", backup.body);
+
+    var restore = try handleTableRestore(
+        std.testing.allocator,
+        "docs",
+        "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
+        undefined,
+        null,
+        null,
+    );
+    defer restore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), restore.status);
+    try std.testing.expectEqualStrings("remote restore requires a named connection", restore.body);
 }
 
 pub fn handleTableListIndexes(

@@ -1516,6 +1516,7 @@ pub fn build(b: *std.Build) void {
     });
     termite_onnx_graph_mod.addImport("protobuf", protobuf_mod);
     termite_onnx_graph_mod.addImport("ml", termite_ml_mod);
+    termite_onnx_graph_mod.addImport("structlog", structlog_mod);
     const termite_pjrt_xla_proto_mod = b.createModule(.{
         .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
         .target = target,
@@ -2254,6 +2255,10 @@ pub fn build(b: *std.Build) void {
 
     const lib_onnx_tests = b.addTest(.{
         .root_module = termite_onnx_graph_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_onnx_tests = b.addRunArtifact(lib_onnx_tests);
     run_lib_onnx_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
@@ -3929,7 +3934,9 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "storage maintenance coordinator is idempotent and single flight",
-            "storage maintenance snapshots remain valid after job pruning",
+            "storage maintenance job ids are namespaced by server boot",
+            "storage maintenance cancellation reaches a cooperative engine",
+            "storage maintenance snapshots remain valid after retention pruning",
             "storage maintenance append allocation failure does not wedge coordinator",
         },
         .test_runner = .{
@@ -3941,6 +3948,80 @@ pub fn build(b: *std.Build) void {
     const lib_storage_maintenance_test_step = b.step("lib-storage-maintenance-test", "Run storage maintenance coordinator ownership and concurrency tests");
     lib_storage_maintenance_test_step.dependOn(&run_lib_storage_maintenance_tests.step);
     unit_test_step.dependOn(lib_storage_maintenance_test_step);
+
+    const api_connections_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_connections_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_connections_test_mod, true, true);
+    const lib_api_connections_tests = b.addTest(.{
+        .root_module = api_connections_test_mod,
+        .filters = &.{
+            "S3 probe cache identity covers every bucket and credential source",
+            "build response reports mock connected and types filter",
+            "build response reports configured external io connections",
+            "build response reports configured web search connections",
+            "build response includes cdc replication sources with generic cdc kind",
+            "include param parsing",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_connections_tests = b.addRunArtifact(lib_api_connections_tests);
+    const lib_api_connections_test_step = b.step("lib-api-connections-test", "Run connection inventory and probe-admission tests");
+    lib_api_connections_test_step.dependOn(&run_lib_api_connections_tests.step);
+
+    const api_storage_authority_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_storage_authority_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_storage_authority_test_mod, true, true);
+    const lib_api_storage_authority_tests = b.addTest(.{
+        .root_module = api_storage_authority_test_mod,
+        .filters = &.{
+            "public table backup and restore require named connections for remote locations",
+            "cluster backup APIs require named connections for remote locations",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_storage_authority_tests = b.addRunArtifact(lib_api_storage_authority_tests);
+    const lib_api_storage_authority_test_step = b.step("lib-api-storage-authority-test", "Run remote backup credential-boundary tests");
+    lib_api_storage_authority_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
+
+    const api_session_maintenance_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_session_maintenance_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_session_maintenance_test_mod, true, true);
+    const lib_api_session_maintenance_tests = b.addTest(.{
+        .root_module = api_session_maintenance_test_mod,
+        .filters = &.{
+            "durable session mutations publish only after persistence succeeds",
+            "transaction session registry adopts durable session ownership",
+            "transaction session registry only adopts durable sessions after lease expiry",
+            "transaction session registry reports status and cleans expired durable sessions",
+            "transaction session registry enforces savepoint limits and reports remaining capacity",
+            "transaction session registry can renew owned leases opportunistically",
+            "api http server keeps session maintenance off public request paths",
+            "api http server can renew owned session leases via explicit maintenance hook",
+            "api http server keeps session maintenance off internal request paths",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_session_maintenance_tests = b.addRunArtifact(lib_api_session_maintenance_tests);
+    const lib_api_session_maintenance_test_step = b.step("lib-api-session-maintenance-test", "Run durable session concurrency and background-maintenance tests");
+    lib_api_session_maintenance_test_step.dependOn(&run_lib_api_session_maintenance_tests.step);
 
     const lib_api_docid_tests = b.addTest(.{
         .root_module = lib_test_mod,

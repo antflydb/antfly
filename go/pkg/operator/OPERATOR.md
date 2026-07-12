@@ -128,7 +128,7 @@ Standalone mode uses:
 
 - `spec.standalone.resources`
 
-Clustered mode uses:
+Distributed mode uses:
 
 - `spec.metadataNodes.resources`
 - `spec.dataNodes.resources`

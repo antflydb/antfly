@@ -25,9 +25,10 @@ class BackupRequest:
 
             The backup includes all table data, indexes, and metadata for the specified table.
              Example: s3://mybucket/antfly-backups/users-table/2025-01-15.
-        connection (str | Unset): Optional ID of a configured `external_io` connection. S3 backups require
-            the `backup.write` capability; restores require `restore.read`. The
-            location bucket and prefix must be within the connection's allowlist.
+        connection (str | Unset): ID of a configured `external_io` connection. Required for remote
+            backup and restore locations; local `file://` operations omit it.
+            S3 backups require `backup.write`, restores require `restore.read`,
+            and the location bucket and prefix must be allowlisted.
         format_ (BackupRequestFormat | Unset): Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be

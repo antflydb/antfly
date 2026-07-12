@@ -876,7 +876,7 @@ pub const BackupRequest = struct {
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
-    /// Optional ID of a configured `external_io` connection. S3 backups require the `backup.write` capability; restores require `restore.read`. The location bucket and prefix must be within the connection's allowlist.
+    /// ID of a configured `external_io` connection. Required for remote backup and restore locations; local `file://` operations omit it. S3 backups require `backup.write`, restores require `restore.read`, and the location bucket and prefix must be allowlisted.
     connection: ?[]const u8 = null,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
@@ -6752,7 +6752,7 @@ pub const RestoreRequest = struct {
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
-    /// Optional ID of a configured `external_io` connection. S3 backups require the `backup.write` capability; restores require `restore.read`. The location bucket and prefix must be within the connection's allowlist.
+    /// ID of a configured `external_io` connection. Required for remote backup and restore locations; local `file://` operations omit it. S3 backups require `backup.write`, restores require `restore.read`, and the location bucket and prefix must be allowlisted.
     connection: ?[]const u8 = null,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,

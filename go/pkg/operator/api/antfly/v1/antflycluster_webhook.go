@@ -54,7 +54,7 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 // Default applies admission defaults to AntflyCluster.
 func (r *AntflyCluster) Default() {
 	if r.Spec.Mode == "" {
-		r.Spec.Mode = ClusterModeClustered
+		r.Spec.Mode = ClusterModeDistributed
 	}
 
 	defaultStorageAutoGrow(&r.Spec.Storage)
@@ -764,7 +764,7 @@ Attempted change: "%s"`,
 			old.Spec.Storage.StorageClass, r.Spec.Storage.StorageClass))
 	}
 
-	if newMode == ClusterModeClustered && oldMode == ClusterModeClustered {
+	if newMode == ClusterModeDistributed && oldMode == ClusterModeDistributed {
 		if r.Spec.MetadataNodes.Replicas < old.Spec.MetadataNodes.Replicas {
 			errors = append(errors, fmt.Sprintf(
 				`field 'spec.metadataNodes.replicas' cannot be decreased yet (current: %d, attempted: %d)
@@ -1095,7 +1095,7 @@ func (r *AntflyCluster) validateStorageAutoGrowConfig() error {
 			errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxStandaloneStorage: %q is not a valid resource quantity", maxSize))
 		}
 	} else if autoGrow.MaxDataStorage == "" {
-		errors = append(errors, "spec.storage.storageAutoGrow.maxDataStorage is required when storage auto-grow is enabled in clustered mode")
+		errors = append(errors, "spec.storage.storageAutoGrow.maxDataStorage is required when storage auto-grow is enabled in distributed mode")
 	} else if _, err := resource.ParseQuantity(autoGrow.MaxDataStorage); err != nil {
 		errors = append(errors, fmt.Sprintf("spec.storage.storageAutoGrow.maxDataStorage: %q is not a valid resource quantity", autoGrow.MaxDataStorage))
 	}
@@ -1146,16 +1146,16 @@ func (r *AntflyCluster) validateProductTierMapping() error {
 		}
 	} else {
 		if !resourceSpecHasCPUAndMemory(r.Spec.MetadataNodes.Resources) {
-			errors = append(errors, "spec.metadataNodes.resources must include cpu and memory requests or limits for a clustered product tier")
+			errors = append(errors, "spec.metadataNodes.resources must include cpu and memory requests or limits for a distributed product tier")
 		}
 		if !resourceSpecHasCPUAndMemory(r.Spec.DataNodes.Resources) {
-			errors = append(errors, "spec.dataNodes.resources must include cpu and memory requests or limits for a clustered product tier")
+			errors = append(errors, "spec.dataNodes.resources must include cpu and memory requests or limits for a distributed product tier")
 		}
 		if r.Spec.Storage.MetadataStorage == "" {
-			errors = append(errors, "spec.storage.metadataStorage is required for a clustered product tier")
+			errors = append(errors, "spec.storage.metadataStorage is required for a distributed product tier")
 		}
 		if r.Spec.Storage.DataStorage == "" {
-			errors = append(errors, "spec.storage.dataStorage is required for a clustered product tier")
+			errors = append(errors, "spec.storage.dataStorage is required for a distributed product tier")
 		}
 	}
 
@@ -1730,7 +1730,7 @@ func (r *AntflyCluster) validateModeConfig() error {
 	}
 
 	switch r.Spec.Mode {
-	case ClusterModeClustered:
+	case ClusterModeDistributed:
 		if r.Spec.Standalone != nil {
 			return fmt.Errorf("spec.standalone may only be set when spec.mode=Standalone")
 		}
@@ -1742,7 +1742,7 @@ func (r *AntflyCluster) validateModeConfig() error {
 			return err
 		}
 	default:
-		return fmt.Errorf("spec.mode must be one of: Clustered, Standalone")
+		return fmt.Errorf("spec.mode must be one of: Distributed, Standalone")
 	}
 
 	return nil
@@ -1750,7 +1750,7 @@ func (r *AntflyCluster) validateModeConfig() error {
 
 func (r *AntflyCluster) effectiveMode() ClusterMode {
 	if r.Spec.Mode == "" {
-		return ClusterModeClustered
+		return ClusterModeDistributed
 	}
 	return r.Spec.Mode
 }
@@ -1828,12 +1828,12 @@ func ValidateOperatorManagedStorageSpec(mode ClusterMode, storage StorageSpec) e
 
 	effectiveMode := mode
 	if effectiveMode == "" {
-		effectiveMode = ClusterModeClustered
+		effectiveMode = ClusterModeDistributed
 	}
 	switch effectiveMode {
-	case ClusterModeClustered:
+	case ClusterModeDistributed:
 		if engine != "local" {
-			return fmt.Errorf("spec.storage.engine=%q is not supported when spec.mode=Clustered", engine)
+			return fmt.Errorf("spec.storage.engine=%q is not supported when spec.mode=Distributed", engine)
 		}
 		if storage.LiteFileName != "" {
 			return fmt.Errorf("spec.storage.liteFileName may only be set when spec.storage.engine=lite")

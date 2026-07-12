@@ -187,6 +187,9 @@ const StandaloneHealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
+        if (self.data_server.http_server) |*api_server| {
+            if (api_server.storageMaintenanceExclusiveActive()) return false;
+        }
         return standaloneReadyFromState(
             self.data_server.http_server != null,
             self.unified_api_ready.load(.acquire),
@@ -2045,6 +2048,10 @@ fn serveUnifiedInner(
     // Internal group routes are still served by the legacy ApiHttpServer
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
+    defer {
+        if (active_api_server == api_server) active_api_server = null;
+    }
+    try server.use(.{ .name = "storage-maintenance-admission", .handler = storageMaintenanceAdmission });
     try registerStorageMaintenanceRoutes(&server);
     try registerHAAdminRoutes(&server);
     try registerHAInternalRoutes(&server);
@@ -2105,7 +2112,27 @@ fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 }
 
 fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    if (active_api_server) |api_server| {
+        if (api_server.storageMaintenanceExclusiveActive()) {
+            _ = ctx.status(503);
+            return ctx.json(.{ .status = "maintenance" });
+        }
+    }
     return ctx.json(.{ .status = "ready" });
+}
+
+fn storageMaintenanceAdmission(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
+    const api_server = active_api_server orelse return next.call(ctx);
+    if (!api_server.storageMaintenanceExclusiveActive()) return next.call(ctx);
+    const path = ctx.request.uri.path;
+    if (std.mem.eql(u8, path, "/healthz") or
+        std.mem.eql(u8, path, "/readyz") or
+        std.mem.startsWith(u8, path, antfly.admin.routes.maintenance ++ "/"))
+    {
+        return next.call(ctx);
+    }
+    _ = ctx.status(503);
+    return ctx.text("storage maintenance in progress");
 }
 
 fn registerMcpRoutes(server: anytype) !void {
@@ -2139,6 +2166,7 @@ fn registerStorageMaintenanceRoutes(server: anytype) !void {
     try server.post(antfly.admin.routes.maintenance_compact, haAdminBridgeHandler);
     try server.post(antfly.admin.routes.maintenance_vacuum, haAdminBridgeHandler);
     try server.get(antfly.admin.routes.maintenance_jobs_prefix ++ "*", haAdminBridgeHandler);
+    try server.delete(antfly.admin.routes.maintenance_jobs_prefix ++ "*", haAdminBridgeHandler);
 }
 
 fn registerHAInternalRoutes(server: anytype) !void {
