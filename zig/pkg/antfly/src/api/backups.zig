@@ -122,24 +122,37 @@ pub const OpenOptions = struct {
     node_config: ?*const common_config.Config = null,
     connection: ?[]const u8 = null,
     required_capability: []const u8 = "",
+    /// Borrow the server's shared backend runtime for dynamic credential HTTP
+    /// refresh. CLI and embedded callers may omit it and receive an owned
+    /// threaded fallback.
+    io: ?std.Io = null,
 };
 
 const AwsCredentialContext = struct {
     alloc: std.mem.Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: ?*std.Io.Threaded,
     http: httpx.Client,
     cache: bedrock.CredentialCache = .{},
     region: []u8,
     source: bedrock.CredentialSource,
 
-    fn init(alloc: std.mem.Allocator, region: []const u8, source: bedrock.CredentialSource) !AwsCredentialContext {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        errdefer io_impl.deinit();
+    fn init(alloc: std.mem.Allocator, region: []const u8, source: bedrock.CredentialSource, shared_io: ?std.Io) !AwsCredentialContext {
+        const owned_region = try alloc.dupe(u8, region);
+        errdefer alloc.free(owned_region);
+        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .http = httpx.Client.init(alloc, io_impl.io()),
-            .region = try alloc.dupe(u8, region),
+            .http = httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
+            .region = owned_region,
             .source = source,
         };
     }
@@ -147,7 +160,10 @@ const AwsCredentialContext = struct {
     fn deinit(self: *AwsCredentialContext) void {
         self.cache.deinit(self.alloc);
         self.http.deinit();
-        self.io_impl.deinit();
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.alloc.free(self.region);
         self.* = undefined;
     }
@@ -231,6 +247,7 @@ fn s3ConfigForConnection(
     alloc: std.mem.Allocator,
     external: common_config.Config.ExternalIoConnectionConfig,
     credential_context: *?*AwsCredentialContext,
+    io: ?std.Io,
 ) !object_storage.S3.Config {
     const static = external.credentials.source == .static;
     var cfg = try object_storage.S3.fromEnvAlloc(
@@ -265,7 +282,7 @@ fn s3ConfigForConnection(
     };
     const context = try alloc.create(AwsCredentialContext);
     errdefer alloc.destroy(context);
-    context.* = try AwsCredentialContext.init(alloc, cfg.credentials.region, source);
+    context.* = try AwsCredentialContext.init(alloc, cfg.credentials.region, source, io);
     credential_context.* = context;
     cfg.credential_provider = context.provider();
     return cfg;
@@ -273,6 +290,8 @@ fn s3ConfigForConnection(
 
 const RemoteBackupStore = struct {
     alloc: std.mem.Allocator,
+    io_impl: ?*std.Io.Threaded = null,
+    io: std.Io,
     client: object_storage.ObjectStorage,
     gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
     s3_client: ?*object_storage.S3.Client = null,
@@ -302,6 +321,16 @@ const RemoteBackupStore = struct {
     }
 
     fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8, options: OpenOptions) !RemoteBackupStore {
+        const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
+        const io = options.io orelse io_impl.?.io();
         const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
         var create_bucket_if_missing = false;
@@ -318,8 +347,12 @@ const RemoteBackupStore = struct {
             );
             create_bucket_if_missing = external.bucket_provisioning == .create_if_missing;
             resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, external, options.secret_store);
-            break :blk try gcsConfigForConnection(alloc, resolved_credentials.?.apply(external));
-        } else try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+            break :blk try gcsConfigForConnection(alloc, resolved_credentials.?.apply(external), io);
+        } else blk: {
+            var env_cfg = try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+            env_cfg.io = io;
+            break :blk env_cfg;
+        };
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
         errdefer {
             var client = gcs.client();
@@ -331,6 +364,8 @@ const RemoteBackupStore = struct {
 
         return .{
             .alloc = alloc,
+            .io_impl = io_impl,
+            .io = io,
             .client = gcs.client(),
             .gcs_client = gcs,
             .resolved_credentials = resolved_credentials,
@@ -346,6 +381,16 @@ const RemoteBackupStore = struct {
         prefix: []const u8,
         options: OpenOptions,
     ) !RemoteBackupStore {
+        const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
+        const io = options.io orelse io_impl.?.io();
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
         var credential_context: ?*AwsCredentialContext = null;
@@ -356,11 +401,11 @@ const RemoteBackupStore = struct {
         var create_bucket_if_missing = false;
         var resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null;
         errdefer if (resolved_credentials) |*credentials| credentials.deinit(alloc);
-        const cfg = if (options.connection) |connection_id| blk: {
+        var cfg = if (options.connection) |connection_id| blk: {
             const connection = try authorizedObjectConnection(options.node_config orelse return error.ConnectionConfigUnavailable, connection_id, .s3, bucket, prefix, options.required_capability);
             create_bucket_if_missing = connection.bucket_provisioning == .create_if_missing;
             resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, connection, options.secret_store);
-            break :blk try s3ConfigForConnection(alloc, resolved_credentials.?.apply(connection), &credential_context);
+            break :blk try s3ConfigForConnection(alloc, resolved_credentials.?.apply(connection), &credential_context, io);
         } else blk: {
             var overrides = try loadS3SecretOverrides(alloc, options.secret_store);
             defer overrides.deinit(alloc);
@@ -375,6 +420,7 @@ const RemoteBackupStore = struct {
                 .path,
             );
         };
+        cfg.io = io;
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
         errdefer {
             var client = s3.client();
@@ -386,6 +432,8 @@ const RemoteBackupStore = struct {
 
         return .{
             .alloc = alloc,
+            .io_impl = io_impl,
+            .io = io,
             .client = s3.client(),
             .s3_client = s3,
             .credential_context = credential_context,
@@ -402,13 +450,22 @@ const RemoteBackupStore = struct {
         bucket: []const u8,
         prefix: []const u8,
     ) !RemoteBackupStore {
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
         return .{
             .alloc = alloc,
+            .io_impl = io_impl,
+            .io = io_impl.io(),
             .client = client,
             .owns_client = false,
             .create_bucket_if_missing = true,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -421,6 +478,10 @@ const RemoteBackupStore = struct {
             self.alloc.destroy(context);
         }
         if (self.resolved_credentials) |*credentials| credentials.deinit(self.alloc);
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;
@@ -500,9 +561,7 @@ const RemoteBackupStore = struct {
     fn uploadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_path: []const u8, dest_suffix: []const u8) !void {
         try self.ensureBucket();
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        const io = self.io;
 
         var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
         defer src_dir.close(io);
@@ -551,6 +610,7 @@ const RemoteBackupStore = struct {
 pub fn gcsConfigForConnection(
     alloc: std.mem.Allocator,
     external: common_config.Config.ExternalIoConnectionConfig,
+    io: ?std.Io,
 ) !object_storage.Gcs.JsonApiConfig {
     var cfg = switch (external.gcs_credentials.source) {
         .default => try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc),
@@ -563,7 +623,7 @@ pub fn gcsConfigForConnection(
             var account = if (external.gcs_credentials.service_account_json) |raw|
                 try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
             else
-                try google_auth.serviceAccountFromFileAlloc(alloc, external.gcs_credentials.credentials_path orelse return error.InvalidConnectionCredentials);
+                try google_auth.serviceAccountFromFileAllocWithIo(alloc, external.gcs_credentials.credentials_path orelse return error.InvalidConnectionCredentials, io);
             var account_owned = true;
             errdefer if (account_owned) account.deinit(alloc);
             const account_project_id = if (account.project_id) |value| try alloc.dupe(u8, value) else null;
@@ -577,7 +637,7 @@ pub fn gcsConfigForConnection(
             errdefer auth_cfg.deinit(alloc);
             const source = try alloc.create(google_auth.CachedTokenSource);
             errdefer alloc.destroy(source);
-            source.* = try google_auth.CachedTokenSource.init(alloc, auth_cfg);
+            source.* = try google_auth.CachedTokenSource.initWithIo(alloc, auth_cfg, io);
             var value = try object_storage.Gcs.jsonApiClientConfigAlloc(alloc);
             value.auth = .{ .google_token_source = source };
             if (external.project_id orelse account_project_id) |project_id| value.project_id = try alloc.dupe(u8, project_id);
@@ -585,6 +645,7 @@ pub fn gcsConfigForConnection(
         },
     };
     errdefer cfg.deinit(alloc);
+    cfg.io = io;
     if (external.endpoint) |endpoint| {
         alloc.free(cfg.endpoint);
         cfg.endpoint = try alloc.dupe(u8, endpoint);
@@ -734,7 +795,7 @@ pub fn openBackupLocationWithOptions(
                 connection_id,
                 options.required_capability,
             );
-            return .{ .file = try resolveFilesystemLocationAlloc(alloc, external.root.?, location) };
+            return .{ .file = try resolveFilesystemLocationAlloc(alloc, external.root.?, location, options.io) };
         }
         return .{ .file = try alloc.dupe(u8, try parseFileLocation(location)) };
     }
@@ -876,14 +937,14 @@ pub fn validateArtifactRelativePath(path: []const u8) !void {
     }
 }
 
-fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []const u8, location: []const u8) ![]u8 {
+fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []const u8, location: []const u8, shared_io: ?std.Io) ![]u8 {
     const uri_path = try parseFileLocation(location);
     const relative = std.mem.trimStart(u8, uri_path, "/");
     if (relative.len > 0) try validateArtifactRelativePath(relative);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = shared_io orelse io_impl.?.io();
     const canonical_root = try std.Io.Dir.realPathFileAbsoluteAlloc(io, configured_root, alloc);
     defer alloc.free(canonical_root);
     const candidate = if (relative.len == 0)

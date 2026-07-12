@@ -681,6 +681,7 @@ pub fn handleTableBackup(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
+    io: ?std.Io,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
@@ -698,6 +699,7 @@ pub fn handleTableBackup(
         .node_config = node_config,
         .connection = parsed_req.value.connection,
         .required_capability = "backup.write",
+        .io = io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -731,6 +733,7 @@ pub fn handleTableRestore(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
+    io: ?std.Io,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
@@ -745,6 +748,7 @@ pub fn handleTableRestore(
         .node_config = node_config,
         .connection = parsed_req.value.connection,
         .required_capability = "restore.read",
+        .io = io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -777,6 +781,7 @@ test "public table backup and restore require named connections" {
         undefined,
         null,
         null,
+        null,
     );
     defer backup.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), backup.status);
@@ -787,6 +792,7 @@ test "public table backup and restore require named connections" {
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
         undefined,
+        null,
         null,
         null,
     );
@@ -2363,6 +2369,7 @@ test "public table backup handler maps unsupported multi-range error" {
         Backend.iface(),
         null,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -2415,6 +2422,7 @@ test "public table backup handler accepts portable format" {
         backend.iface(),
         null,
         &node_config,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -2462,6 +2470,7 @@ test "public table restore handler maps target already exists" {
         Backend.iface(),
         null,
         &node_config,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 

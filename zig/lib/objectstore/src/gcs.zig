@@ -63,6 +63,9 @@ pub const JsonApiConfig = struct {
     /// Optional end-to-end HTTP deadline. Object transfers leave this unset;
     /// control-plane probes set a bounded deadline explicitly.
     request_timeout_ms: ?u64 = null,
+    /// Optional borrowed application runtime. When absent, the client owns a
+    /// threaded fallback for standalone library use.
+    io: ?std.Io = null,
 
     pub fn deinit(self: *JsonApiConfig, alloc: Allocator) void {
         alloc.free(self.endpoint);
@@ -121,30 +124,40 @@ const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []c
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator, request_timeout_ms: ?u64) HttpxTransport {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        errdefer io_impl.deinit();
+    fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
             .client = if (request_timeout_ms) |timeout_ms|
-                httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .timeouts = .{
+                httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), .{ .timeouts = .{
                     .connect_ms = timeout_ms,
                     .read_ms = timeout_ms,
                     .write_ms = timeout_ms,
                     .request_ms = timeout_ms,
                 } })
             else
-                httpx.Client.init(alloc, io_impl.io()),
+                httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
         };
     }
 
     fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
-        self.io_impl.deinit();
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.* = undefined;
     }
 
@@ -181,6 +194,20 @@ const HttpxTransport = struct {
     }
 };
 
+test "gcs http transport borrows a shared io runtime" {
+    const alloc = std.testing.allocator;
+    var shared = std.Io.Threaded.init(alloc, .{});
+    defer shared.deinit();
+    var transport = try HttpxTransport.init(alloc, null, shared.io());
+    defer transport.deinit();
+    try std.testing.expect(transport.io_impl == null);
+
+    var fallback = try HttpxTransport.init(alloc, null, null);
+    defer fallback.deinit();
+    try std.testing.expect(fallback.io_impl != null);
+    try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
+}
+
 pub const JsonApiClient = struct {
     alloc: Allocator,
     cfg: JsonApiConfig,
@@ -191,7 +218,7 @@ pub const JsonApiClient = struct {
     pub fn init(alloc: Allocator, cfg: JsonApiConfig) !JsonApiClient {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = HttpxTransport.init(alloc, cfg.request_timeout_ms);
+        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
         return .{
             .alloc = alloc,
             .cfg = cfg,

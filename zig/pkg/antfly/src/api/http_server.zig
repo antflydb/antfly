@@ -1376,6 +1376,14 @@ pub const ApiHttpServer = struct {
         return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(response, .{})});
     }
 
+    /// Shared asynchronous I/O runtime for short-lived API helpers. Borrowers
+    /// must not retain it beyond the server lifetime.
+    pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return null;
+        return io_impl.io();
+    }
+
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
         return .{
             .ptr = self,
@@ -8286,7 +8294,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config);
+        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -8313,6 +8321,7 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
+            .io = self.sharedApiIo(),
         }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
         const encoded = self.restore_job_store.start(self.alloc, .{
@@ -8332,7 +8341,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8, connection: ?[]const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, connection, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config);
+        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, connection, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => blk: {
@@ -8346,7 +8355,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterBackup(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config);
+        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => blk: {
@@ -8370,6 +8379,7 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
+            .io = self.sharedApiIo(),
         }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
         const encoded = self.restore_job_store.start(self.alloc, .{
@@ -8497,6 +8507,7 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = state.connection,
             .required_capability = "restore.read",
+            .io = self.sharedApiIo(),
         }) catch |err| {
             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
             self.alloc.free(failed);

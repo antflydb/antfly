@@ -142,6 +142,17 @@ credentials. Rotating a `static` primary-storage secret requires a controlled
 process restart; this does not affect the per-operation rotation behavior of
 backup and restore connections.
 
+Object-store clients created by the API borrow the process's shared backend
+`std.Io` runtime for S3/GCS requests and credential refresh. Connection probes
+retain bounded fanout without constructing a scheduler per connection, and
+restore workers do not create a scheduler per job. Embedded and CLI callers
+without a backend runtime receive one client-owned fallback. Serverless keeps a
+single pool runtime shared by its credential-isolated S3 clients. Google access
+token refresh is serialized with a `std.Io.Mutex`, so concurrent GCS operations
+reuse one immutable cached token instead of racing refresh and reclamation. A
+failed proactive refresh continues serving the still-valid token until its
+actual expiry, then fails closed.
+
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the
 `s3://` location continues to identify the artifact:

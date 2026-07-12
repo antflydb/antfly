@@ -346,6 +346,12 @@ refresh in place, while rotating static primary keys requires a controlled
 restart. Connection capabilities and bucket/prefix scopes remain config-owned
 authorization and are never sourced from the secret store.
 
+Live probes use bounded fanout on the server's shared `std.Io` runtime. S3,
+GCS, and credential-refresh transports borrow that runtime rather than creating
+one threaded scheduler per connection. This keeps probe cost proportional to
+active network work and the configured worker bound, even when many buckets and
+credential domains are registered.
+
 ### CDC
 
 CDC connections describe change-stream sources. Postgres is the first provider.

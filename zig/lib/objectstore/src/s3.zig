@@ -36,6 +36,9 @@ pub const Config = struct {
     /// clients normally use the transport defaults; health probes set this so
     /// an unreachable endpoint cannot monopolize an API worker.
     request_timeout_ms: ?u64 = null,
+    /// Optional borrowed application runtime. When absent, the client owns a
+    /// threaded fallback for standalone library use.
+    io: ?std.Io = null,
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         self.credentials.deinit(alloc);
@@ -143,12 +146,19 @@ const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []c
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator, request_timeout_ms: ?u64) HttpxTransport {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        errdefer io_impl.deinit();
+    fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
         const client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
             .timeouts = .{
                 .connect_ms = timeout_ms,
@@ -162,13 +172,16 @@ const HttpxTransport = struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = httpx.Client.initWithConfig(alloc, io_impl.io(), client_config),
+            .client = httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), client_config),
         };
     }
 
     fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
-        self.io_impl.deinit();
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.* = undefined;
     }
 
@@ -208,6 +221,20 @@ const HttpxTransport = struct {
     }
 };
 
+test "s3 http transport borrows a shared io runtime" {
+    const alloc = std.testing.allocator;
+    var shared = std.Io.Threaded.init(alloc, .{});
+    defer shared.deinit();
+    var transport = try HttpxTransport.init(alloc, null, shared.io());
+    defer transport.deinit();
+    try std.testing.expect(transport.io_impl == null);
+
+    var fallback = try HttpxTransport.init(alloc, null, null);
+    defer fallback.deinit();
+    try std.testing.expect(fallback.io_impl != null);
+    try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
+}
+
 pub const Client = struct {
     alloc: Allocator,
     cfg: Config,
@@ -218,7 +245,7 @@ pub const Client = struct {
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = HttpxTransport.init(alloc, cfg.request_timeout_ms);
+        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
         return .{
             .alloc = alloc,
             .cfg = cfg,

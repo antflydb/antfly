@@ -933,7 +933,7 @@ const ObjectProbeJob = struct {
                 }
             }
         }
-        probeObjectBuckets(job.arena_state.allocator(), job.cfg, job.timeout_ms, &job.failed_bucket) catch |err| {
+        probeObjectBuckets(job.arena_state.allocator(), job.cfg, job.timeout_ms, &job.failed_bucket, job.io) catch |err| {
             job.err = err;
             if (job.cache) |cache| cache.store(job.cache_key, .{
                 .captured_at_ns = platform_time.monotonicNs(),
@@ -976,7 +976,7 @@ fn resolveExternalIoProbes(
         if (protocol == .filesystem) {
             const configured = node_config.connections.get(connection.id) orelse return error.InvalidConfig;
             const cfg = configured.external_io orelse return error.InvalidConfig;
-            probeFilesystemRoot(cfg.root orelse "") catch |err| {
+            probeFilesystemRoot(cfg.root orelse "", io) catch |err| {
                 connection.status = .@"error";
                 connection.@"error" = @errorName(err);
                 continue;
@@ -1129,14 +1129,15 @@ fn probeS3Buckets(
     cfg: common_config.Config.ExternalIoConnectionConfig,
     timeout_ms: u64,
     failed_bucket: *?usize,
+    shared_io: ?std.Io,
 ) !void {
     var dynamic_credentials: ?bedrock.Credentials = null;
     defer if (dynamic_credentials) |*credentials| credentials.deinit(arena);
 
     if (cfg.credentials.source != .static) {
-        var io_impl = std.Io.Threaded.init(arena, .{});
-        defer io_impl.deinit();
-        var http = httpx.Client.initWithConfig(arena, io_impl.io(), .{ .timeouts = .{
+        var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(arena, .{}) else null;
+        defer if (io_impl) |*owned| owned.deinit();
+        var http = httpx.Client.initWithConfig(arena, shared_io orelse io_impl.?.io(), .{ .timeouts = .{
             .connect_ms = timeout_ms,
             .read_ms = timeout_ms,
             .write_ms = timeout_ms,
@@ -1179,6 +1180,7 @@ fn probeS3Buckets(
         },
     );
     s3_config.request_timeout_ms = timeout_ms;
+    s3_config.io = shared_io;
     var s3_client = try objectstore.s3.Client.init(arena, s3_config);
     var client = s3_client.client();
     defer client.deinit();
@@ -1199,10 +1201,11 @@ fn probeObjectBuckets(
     cfg: common_config.Config.ExternalIoConnectionConfig,
     timeout_ms: u64,
     failed_bucket: *?usize,
+    io: ?std.Io,
 ) !void {
     return switch (cfg.protocol) {
-        .s3 => probeS3Buckets(arena, cfg, timeout_ms, failed_bucket),
-        .gcs => probeGcsBuckets(arena, cfg, timeout_ms, failed_bucket),
+        .s3 => probeS3Buckets(arena, cfg, timeout_ms, failed_bucket, io),
+        .gcs => probeGcsBuckets(arena, cfg, timeout_ms, failed_bucket, io),
         else => error.InvalidConfig,
     };
 }
@@ -1212,8 +1215,9 @@ fn probeGcsBuckets(
     cfg: common_config.Config.ExternalIoConnectionConfig,
     timeout_ms: u64,
     failed_bucket: *?usize,
+    io: ?std.Io,
 ) !void {
-    var gcs_cfg = try backups_api.gcsConfigForConnection(arena, cfg);
+    var gcs_cfg = try backups_api.gcsConfigForConnection(arena, cfg, io);
     gcs_cfg.request_timeout_ms = timeout_ms;
     var gcs = try objectstore.Gcs.JsonApiClient.init(arena, gcs_cfg);
     var client = gcs.client();
@@ -1230,11 +1234,11 @@ fn probeGcsBuckets(
     }
 }
 
-fn probeFilesystemRoot(root: []const u8) !void {
+fn probeFilesystemRoot(root: []const u8, shared_io: ?std.Io) !void {
     if (!std.fs.path.isAbsolute(root)) return error.InvalidFilesystemRoot;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = shared_io orelse io_impl.?.io();
     var dir = try std.Io.Dir.openDirAbsolute(io, root, .{});
     defer dir.close(io);
 }

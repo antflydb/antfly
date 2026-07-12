@@ -111,6 +111,7 @@ pub fn handleClusterBackupList(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
+    io: ?std.Io,
 ) !OwnedResponse {
     if (connection == null) {
         return .{ .status = 400, .body = try alloc.dupe(u8, "backup listing requires a named external_io connection") };
@@ -120,6 +121,7 @@ pub fn handleClusterBackupList(
         .node_config = node_config,
         .connection = connection,
         .required_capability = "restore.read",
+        .io = io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         return err;
@@ -140,6 +142,7 @@ pub fn handleClusterBackup(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
+    io: ?std.Io,
 ) !OwnedResponse {
     var req = backups_api.parseClusterBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
@@ -154,6 +157,7 @@ pub fn handleClusterBackup(
         .node_config = node_config,
         .connection = req.connection,
         .required_capability = "backup.write",
+        .io = io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -176,6 +180,7 @@ pub fn handleClusterRestore(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
+    io: ?std.Io,
 ) !OwnedResponse {
     var req = backups_api.parseClusterRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
@@ -190,6 +195,7 @@ pub fn handleClusterRestore(
         .node_config = node_config,
         .connection = req.connection,
         .required_capability = "restore.read",
+        .io = io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -214,7 +220,7 @@ pub fn handleClusterRestore(
 }
 
 test "cluster backup APIs require named connections" {
-    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null);
+    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null, null);
     defer list.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), list.status);
 
@@ -222,6 +228,7 @@ test "cluster backup APIs require named connections" {
         std.testing.allocator,
         "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
         undefined,
+        null,
         null,
         null,
     );
@@ -233,6 +240,7 @@ test "cluster backup APIs require named connections" {
         std.testing.allocator,
         "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
         undefined,
+        null,
         null,
         null,
     );

@@ -69,20 +69,17 @@ pub const RuntimeStatus = api_mod.RuntimeStatusResult;
 const S3ClientPool = struct {
     const AwsCredentialContext = struct {
         alloc: Allocator,
-        io_impl: std.Io.Threaded,
         http: @import("httpx").Client,
         cache: bedrock.CredentialCache = .{},
         region: []u8,
         source: bedrock.CredentialSource,
 
-        fn init(alloc: Allocator, region: []const u8, source: bedrock.CredentialSource) !AwsCredentialContext {
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            errdefer io_impl.deinit();
+        fn init(alloc: Allocator, region: []const u8, source: bedrock.CredentialSource, io: std.Io) !AwsCredentialContext {
+            const owned_region = try alloc.dupe(u8, region);
             return .{
                 .alloc = alloc,
-                .io_impl = io_impl,
-                .http = @import("httpx").Client.init(alloc, io_impl.io()),
-                .region = try alloc.dupe(u8, region),
+                .http = @import("httpx").Client.init(alloc, io),
+                .region = owned_region,
                 .source = source,
             };
         }
@@ -90,7 +87,6 @@ const S3ClientPool = struct {
         fn deinit(self: *AwsCredentialContext) void {
             self.cache.deinit(self.alloc);
             self.http.deinit();
-            self.io_impl.deinit();
             self.alloc.free(self.region);
             self.* = undefined;
         }
@@ -124,10 +120,14 @@ const S3ClientPool = struct {
     };
 
     alloc: Allocator,
+    io_impl: *std.Io.Threaded,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
-    fn init(alloc: Allocator) S3ClientPool {
-        return .{ .alloc = alloc };
+    fn init(alloc: Allocator) !S3ClientPool {
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        return .{ .alloc = alloc, .io_impl = io_impl };
     }
 
     fn deinit(self: *S3ClientPool) void {
@@ -140,6 +140,8 @@ const S3ClientPool = struct {
             self.alloc.destroy(entry.impl);
         }
         self.entries.deinit(self.alloc);
+        self.io_impl.deinit();
+        self.alloc.destroy(self.io_impl);
         self.* = undefined;
     }
 
@@ -156,6 +158,7 @@ const S3ClientPool = struct {
             config_options.secret_access_key = "dynamic-provider";
         }
         var config = try object_store_support.s3ConfigAlloc(self.alloc, config_options);
+        config.io = self.io_impl.io();
         var config_owned = true;
         errdefer if (config_owned) config.deinit(self.alloc);
         var credential_context: ?*AwsCredentialContext = null;
@@ -166,7 +169,7 @@ const S3ClientPool = struct {
         if (dynamic_credentials) {
             const context = try self.alloc.create(AwsCredentialContext);
             errdefer self.alloc.destroy(context);
-            context.* = try AwsCredentialContext.init(self.alloc, config.credentials.region, options.credential_source);
+            context.* = try AwsCredentialContext.init(self.alloc, config.credentials.region, options.credential_source, self.io_impl.io());
             credential_context = context;
             config.credential_provider = context.provider();
         }
@@ -287,7 +290,7 @@ pub const OwnedStack = struct {
     pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig) !void {
         try validateConfig(alloc, cfg);
         self.alloc = alloc;
-        self.s3_client_pool = S3ClientPool.init(alloc);
+        self.s3_client_pool = try S3ClientPool.init(alloc);
         errdefer self.s3_client_pool.deinit();
         self.query_cache = null;
         self.managed_query_embedder = null;
