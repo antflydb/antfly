@@ -82,8 +82,10 @@ The implementation now consists of:
   key, and its current value, so sequential next/previous traversal is
   amortized `O(1)` and cold-scan memory remains bounded by tree height and the
   page cache rather than live-key count or document payload volume. Tombstones
-  remain indexed until vacuum and are skipped during iteration. Pinned reads
-  use concurrent positional I/O. A
+  remain indexed until vacuum and are skipped during iteration. Write cursors
+  merge a sorted, latest-write-wins overlay containing only that transaction's
+  pending mutations; this provides read-your-writes without materializing the
+  durable namespace. Pinned reads use concurrent positional I/O. A
   `std.Io.RwLock` allows normal append-only commits while readers pin roots and
   blocks vacuum before it can reclaim those roots.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the

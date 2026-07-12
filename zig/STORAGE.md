@@ -296,7 +296,9 @@ keys to their newest document pages. Point reads and cursor seeks are
 root-to-leaf path, making sequential next/previous traversal amortized `O(1)`
 per key while retaining memory proportional only to tree height; they skip
 indexed tombstones and never materialize a table-sized key array. Prefix bounds
-prevent cross-table scans. Initial imports and vacuum use
+prevent cross-table scans. Write cursors merge a sorted overlay bounded by the
+transaction's pending mutations, preserving read-your-writes without loading
+the durable keyspace. Initial imports and vacuum use
 a streaming packed-tree builder, retaining one leaf plus one separator per
 output page rather than all live keys. Normal commits copy only the affected
 tree path, and the shared bounded page cache serves index and document pages.

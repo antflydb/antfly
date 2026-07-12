@@ -499,6 +499,7 @@ pub const Txn = struct {
     allocator: Allocator,
     store: ?*Store = null,
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
+    pending_generation: u64 = 0,
     read_only: bool = true,
     writer_reserved: bool = false,
     prefix: []const u8 = "",
@@ -644,6 +645,7 @@ pub const Txn = struct {
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
         try self.pending.append(self.allocator, .{ .key = owned_key, .value = owned_value });
+        self.pending_generation +%= 1;
     }
 
     pub fn delete(self: *Txn, key: []const u8) !void {
@@ -654,6 +656,7 @@ pub const Txn = struct {
             try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         try self.pending.append(self.allocator, .{ .key = owned_key });
+        self.pending_generation +%= 1;
     }
 
     pub fn setReplayOpaque(self: *Txn, sequence: u64, payload: []const u8) !void {
@@ -708,99 +711,329 @@ fn validatePrefix(prefix: []const u8) !void {
 }
 
 pub const Cursor = struct {
+    const OverlayEntry = struct {
+        key: []const u8,
+        value: ?[]const u8,
+    };
+    const Direction = enum { forward, backward };
+
     txn: *Txn,
     index_cursor: native.DocumentIndexCursor,
     current_key: ?[]u8 = null,
     upper_bound: ?[]const u8 = null,
     owned_value: ?[]u8 = null,
+    overlay: []OverlayEntry = &.{},
+    overlay_generation: u64 = std.math.maxInt(u64),
+    disk_candidate: ?native.DocumentIndexEntry = null,
+    last_direction: ?Direction = null,
 
     pub fn close(self: *Cursor) void {
         self.index_cursor.deinit();
+        if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
+        if (self.current_key) |key| self.txn.allocator.free(key);
+        if (self.owned_value) |value| self.txn.allocator.free(value);
+        if (self.overlay.len > 0) self.txn.allocator.free(self.overlay);
+        self.current_key = null;
+        self.owned_value = null;
+        self.disk_candidate = null;
+        self.overlay = &.{};
+    }
+
+    pub fn first(self: *Cursor) !backend_adapter.Entry {
+        try self.ensureOverlay();
+        self.clearBufferedDisk();
+        const disk = if (self.txn.prefix.len == 0)
+            try self.index_cursor.first()
+        else
+            try self.index_cursor.seekAtOrAfter(self.txn.prefix, false);
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(self.txn.prefix, false), .forward);
+    }
+
+    pub fn last(self: *Cursor) !backend_adapter.Entry {
+        try self.ensureOverlay();
+        self.clearBufferedDisk();
+        if (self.upper_bound) |upper_bound| {
+            const upper = try self.txn.prefixedKey(upper_bound);
+            defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
+            return try self.resolveMerged(
+                try self.index_cursor.seekAtOrBefore(upper, true),
+                self.overlayAtOrBefore(upper, true),
+                .backward,
+            );
+        }
+        if (self.txn.prefix.len == 0) {
+            return try self.resolveMerged(
+                try self.index_cursor.last(),
+                if (self.overlay.len == 0) null else self.overlay.len - 1,
+                .backward,
+            );
+        } else {
+            const upper = try self.namespaceUpperBound();
+            defer self.txn.allocator.free(upper);
+            return try self.resolveMerged(
+                try self.index_cursor.seekAtOrBefore(upper, true),
+                self.overlayAtOrBefore(upper, true),
+                .backward,
+            );
+        }
+    }
+
+    pub fn next(self: *Cursor) !backend_adapter.Entry {
+        try self.ensureOverlay();
+        const current = self.current_key orelse return error.NotFound;
+        const disk = if (self.last_direction == .forward)
+            self.takeBufferedDisk() orelse try self.index_cursor.next()
+        else blk: {
+            self.clearBufferedDisk();
+            break :blk try self.index_cursor.seekAtOrAfter(current, true);
+        };
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(current, true), .forward);
+    }
+
+    pub fn prev(self: *Cursor) !backend_adapter.Entry {
+        try self.ensureOverlay();
+        const current = self.current_key orelse return error.NotFound;
+        const disk = if (self.last_direction == .backward)
+            self.takeBufferedDisk() orelse try self.index_cursor.prev()
+        else blk: {
+            self.clearBufferedDisk();
+            break :blk try self.index_cursor.seekAtOrBefore(current, true);
+        };
+        return try self.resolveMerged(disk, self.overlayAtOrBefore(current, true), .backward);
+    }
+
+    pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
+        try self.ensureOverlay();
+        const lookup_key = try self.txn.prefixedKey(key);
+        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
+        self.clearBufferedDisk();
+        return try self.resolveMerged(
+            try self.index_cursor.seekAtOrAfter(lookup_key, false),
+            self.overlayAtOrAfter(lookup_key, false),
+            .forward,
+        );
+    }
+
+    pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !backend_adapter.Entry {
+        try self.ensureOverlay();
+        const lookup_key = try self.txn.prefixedKey(key);
+        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
+        self.clearBufferedDisk();
+        if (self.upper_bound) |upper_bound| {
+            const upper = try self.txn.prefixedKey(upper_bound);
+            defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
+            if (std.mem.order(u8, lookup_key, upper) != .lt) {
+                return try self.resolveMerged(
+                    try self.index_cursor.seekAtOrBefore(upper, true),
+                    self.overlayAtOrBefore(upper, true),
+                    .backward,
+                );
+            }
+        }
+        return try self.resolveMerged(
+            try self.index_cursor.seekAtOrBefore(lookup_key, false),
+            self.overlayAtOrBefore(lookup_key, false),
+            .backward,
+        );
+    }
+
+    pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
+        self.clearBufferedDisk();
+        self.last_direction = null;
+        self.upper_bound = upper;
+    }
+
+    fn resolveMerged(
+        self: *Cursor,
+        initial_disk: ?native.DocumentIndexEntry,
+        initial_overlay_index: ?usize,
+        direction: Direction,
+    ) !backend_adapter.Entry {
+        const store = self.txn.store orelse return error.InvalidTransactionState;
+        var disk = initial_disk;
+        errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        var overlay_index = initial_overlay_index;
+
+        while (true) {
+            if (disk) |candidate| {
+                if (!self.keyInRange(candidate.key)) {
+                    var out_of_range = candidate;
+                    out_of_range.deinit(self.txn.allocator);
+                    disk = null;
+                }
+            }
+            const overlay_candidate = if (overlay_index) |index| blk: {
+                const candidate = self.overlay[index];
+                if (!self.keyInRange(candidate.key)) {
+                    overlay_index = null;
+                    break :blk null;
+                }
+                break :blk candidate;
+            } else null;
+
+            const choose_overlay = if (overlay_candidate) |pending| blk: {
+                const indexed = disk orelse break :blk true;
+                const order = std.mem.order(u8, pending.key, indexed.key);
+                break :blk switch (direction) {
+                    .forward => order != .gt,
+                    .backward => order != .lt,
+                };
+            } else false;
+
+            if (choose_overlay) {
+                const pending = overlay_candidate.?;
+                if (disk) |indexed| {
+                    if (std.mem.eql(u8, pending.key, indexed.key)) {
+                        var consumed = indexed;
+                        consumed.deinit(self.txn.allocator);
+                        disk = null;
+                        disk = try self.advanceDisk(direction);
+                    }
+                }
+                overlay_index = self.advanceOverlayIndex(overlay_index.?, direction);
+                const value = pending.value orelse continue;
+                const buffered_disk = disk;
+                disk = null;
+                return try self.installPending(pending.key, value, buffered_disk, direction);
+            }
+
+            if (disk) |indexed| {
+                var consumed = indexed;
+                disk = null;
+                const value = store.file.documentValueAtIndexEntryAlloc(self.txn.allocator, self.txn.checkpoint, consumed) catch |err| {
+                    consumed.deinit(self.txn.allocator);
+                    return err;
+                };
+                if (value) |owned_value| return self.installDisk(consumed, owned_value, direction);
+                consumed.deinit(self.txn.allocator);
+                disk = try self.advanceDisk(direction);
+                continue;
+            }
+            return error.NotFound;
+        }
+    }
+
+    fn ensureOverlay(self: *Cursor) !void {
+        if (self.overlay_generation == self.txn.pending_generation) return;
+        const alloc = self.txn.allocator;
+        const indices = try alloc.alloc(usize, self.txn.pending.items.len);
+        defer alloc.free(indices);
+        for (indices, 0..) |*index, i| index.* = i;
+        std.mem.sort(usize, indices, self.txn, struct {
+            fn lessThan(txn: *Txn, lhs: usize, rhs: usize) bool {
+                const order = std.mem.order(u8, txn.pending.items[lhs].key, txn.pending.items[rhs].key);
+                return order == .lt or (order == .eq and lhs < rhs);
+            }
+        }.lessThan);
+
+        var rebuilt = std.ArrayListUnmanaged(OverlayEntry).empty;
+        defer rebuilt.deinit(alloc);
+        var i: usize = 0;
+        while (i < indices.len) {
+            var latest = indices[i];
+            i += 1;
+            while (i < indices.len and std.mem.eql(u8, self.txn.pending.items[latest].key, self.txn.pending.items[indices[i]].key)) : (i += 1) {
+                latest = indices[i];
+            }
+            const mutation = self.txn.pending.items[latest];
+            try rebuilt.append(alloc, .{ .key = mutation.key, .value = mutation.value });
+        }
+        const owned = try rebuilt.toOwnedSlice(alloc);
+        if (self.overlay.len > 0) alloc.free(self.overlay);
+        self.overlay = owned;
+        self.overlay_generation = self.txn.pending_generation;
+    }
+
+    fn overlayAtOrAfter(self: *const Cursor, key: []const u8, strict: bool) ?usize {
+        var left: usize = 0;
+        var right = self.overlay.len;
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            const order = std.mem.order(u8, self.overlay[mid].key, key);
+            if (order == .lt or (strict and order == .eq)) left = mid + 1 else right = mid;
+        }
+        return if (left < self.overlay.len) left else null;
+    }
+
+    fn overlayAtOrBefore(self: *const Cursor, key: []const u8, strict: bool) ?usize {
+        var left: usize = 0;
+        var right = self.overlay.len;
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            const order = std.mem.order(u8, self.overlay[mid].key, key);
+            if (order == .lt or (!strict and order == .eq)) left = mid + 1 else right = mid;
+        }
+        return if (left == 0) null else left - 1;
+    }
+
+    fn advanceOverlayIndex(self: *const Cursor, index: usize, direction: Direction) ?usize {
+        return switch (direction) {
+            .forward => if (index + 1 < self.overlay.len) index + 1 else null,
+            .backward => if (index > 0) index - 1 else null,
+        };
+    }
+
+    fn advanceDisk(self: *Cursor, direction: Direction) !?native.DocumentIndexEntry {
+        return switch (direction) {
+            .forward => try self.index_cursor.next(),
+            .backward => try self.index_cursor.prev(),
+        };
+    }
+
+    fn keyInRange(self: *const Cursor, full_key: []const u8) bool {
+        if (!std.mem.startsWith(u8, full_key, self.txn.prefix)) return false;
+        if (self.upper_bound) |upper| {
+            if (std.mem.order(u8, full_key[self.txn.prefix.len..], upper) != .lt) return false;
+        }
+        return true;
+    }
+
+    fn installPending(
+        self: *Cursor,
+        full_key: []const u8,
+        value: []const u8,
+        buffered_disk: ?native.DocumentIndexEntry,
+        direction: Direction,
+    ) !backend_adapter.Entry {
+        var disk = buffered_disk;
+        errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        const owned_key = try self.txn.allocator.dupe(u8, full_key);
+        errdefer self.txn.allocator.free(owned_key);
+        const owned_value = try self.txn.allocator.dupe(u8, value);
+        errdefer self.txn.allocator.free(owned_value);
+        self.clearCurrent();
+        self.current_key = owned_key;
+        self.owned_value = owned_value;
+        self.disk_candidate = disk;
+        disk = null;
+        self.last_direction = direction;
+        return .{ .key = owned_key[self.txn.prefix.len..], .value = owned_value };
+    }
+
+    fn installDisk(self: *Cursor, indexed: native.DocumentIndexEntry, value: []u8, direction: Direction) backend_adapter.Entry {
+        self.clearCurrent();
+        self.current_key = indexed.key;
+        self.owned_value = value;
+        self.last_direction = direction;
+        return .{ .key = indexed.key[self.txn.prefix.len..], .value = value };
+    }
+
+    fn clearCurrent(self: *Cursor) void {
         if (self.current_key) |key| self.txn.allocator.free(key);
         if (self.owned_value) |value| self.txn.allocator.free(value);
         self.current_key = null;
         self.owned_value = null;
     }
 
-    pub fn first(self: *Cursor) !backend_adapter.Entry {
-        const candidate = if (self.txn.prefix.len == 0)
-            try self.index_cursor.first()
-        else
-            try self.index_cursor.seekAtOrAfter(self.txn.prefix, false);
-        return try self.resolveCandidate(candidate, .forward);
+    fn clearBufferedDisk(self: *Cursor) void {
+        if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
+        self.disk_candidate = null;
     }
 
-    pub fn last(self: *Cursor) !backend_adapter.Entry {
-        const candidate = if (self.txn.prefix.len == 0)
-            try self.index_cursor.last()
-        else blk: {
-            const upper = try self.namespaceUpperBound();
-            defer self.txn.allocator.free(upper);
-            break :blk try self.index_cursor.seekAtOrBefore(upper, true);
-        };
-        return try self.resolveCandidate(candidate, .backward);
-    }
-
-    pub fn next(self: *Cursor) !backend_adapter.Entry {
-        if (self.current_key == null) return error.NotFound;
-        return try self.resolveCandidate(try self.index_cursor.next(), .forward);
-    }
-
-    pub fn prev(self: *Cursor) !backend_adapter.Entry {
-        if (self.current_key == null) return error.NotFound;
-        return try self.resolveCandidate(try self.index_cursor.prev(), .backward);
-    }
-
-    pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        const lookup_key = try self.txn.prefixedKey(key);
-        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
-        return try self.resolveCandidate(try self.index_cursor.seekAtOrAfter(lookup_key, false), .forward);
-    }
-
-    pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        const lookup_key = try self.txn.prefixedKey(key);
-        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
-        return try self.resolveCandidate(try self.index_cursor.seekAtOrBefore(lookup_key, false), .backward);
-    }
-
-    pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
-        self.upper_bound = upper;
-    }
-
-    const Direction = enum { forward, backward };
-
-    fn resolveCandidate(self: *Cursor, initial: ?native.DocumentIndexEntry, direction: Direction) !backend_adapter.Entry {
-        const store = self.txn.store orelse return error.InvalidTransactionState;
-        var candidate = initial;
-        while (candidate) |indexed| {
-            var owned_indexed = indexed;
-            const full_key = owned_indexed.key;
-            if (!std.mem.startsWith(u8, full_key, self.txn.prefix)) {
-                owned_indexed.deinit(self.txn.allocator);
-                return error.NotFound;
-            }
-            const key = full_key[self.txn.prefix.len..];
-            if (self.upper_bound) |upper| {
-                if (std.mem.order(u8, key, upper) != .lt) {
-                    owned_indexed.deinit(self.txn.allocator);
-                    return error.NotFound;
-                }
-            }
-            const value = try store.file.documentValueAtIndexEntryAlloc(self.txn.allocator, self.txn.checkpoint, owned_indexed);
-            if (value) |owned_value| {
-                if (self.current_key) |previous| self.txn.allocator.free(previous);
-                if (self.owned_value) |previous| self.txn.allocator.free(previous);
-                self.current_key = full_key;
-                self.owned_value = owned_value;
-                return .{ .key = self.current_key.?[self.txn.prefix.len..], .value = owned_value };
-            }
-            candidate = switch (direction) {
-                .forward => try self.index_cursor.next(),
-                .backward => try self.index_cursor.prev(),
-            };
-            owned_indexed.deinit(self.txn.allocator);
-        }
-        return error.NotFound;
+    fn takeBufferedDisk(self: *Cursor) ?native.DocumentIndexEntry {
+        const candidate = self.disk_candidate;
+        self.disk_candidate = null;
+        return candidate;
     }
 
     fn namespaceUpperBound(self: *Cursor) ![]u8 {
@@ -1121,6 +1354,86 @@ test "lite native docstore runtime scans ordered snapshot" {
     try std.testing.expectEqualStrings("doc:b", next.key);
     const seek = (try cursor.seekAtOrAfter("doc:bb")).?;
     try std.testing.expectEqualStrings("doc:c", seek.key);
+}
+
+test "lite native write cursors merge pending writes and deletes in order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-write-cursor.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var seed = try Txn.openWrite(&store);
+    try seed.put("doc:a", "disk-a");
+    try seed.put("doc:c", "disk-c");
+    try seed.put("doc:e", "disk-e");
+    try seed.commit();
+
+    var write = try Txn.openWrite(&store);
+    defer write.abort();
+    try write.put("doc:b", "pending-b");
+    try write.put("doc:c", "pending-c-old");
+    try write.put("doc:c", "pending-c");
+    try write.delete("doc:e");
+    try write.put("doc:d", "pending-d-old");
+    try write.delete("doc:d");
+    try write.put("doc:d", "pending-d");
+
+    var cursor = try write.openCursor();
+    defer cursor.close();
+    var entry = try cursor.first();
+    try std.testing.expectEqualStrings("doc:a", entry.key);
+    try std.testing.expectEqualStrings("disk-a", entry.value);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    try std.testing.expectEqualStrings("pending-b", entry.value);
+    entry = try cursor.prev();
+    try std.testing.expectEqualStrings("doc:a", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    try std.testing.expectEqualStrings("pending-c", entry.value);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+    try std.testing.expectEqualStrings("pending-d", entry.value);
+    try std.testing.expectError(error.NotFound, cursor.next());
+
+    entry = try cursor.last();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+    entry = try cursor.prev();
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    entry = try cursor.seekAtOrAfter("doc:bb");
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    entry = try cursor.seekAtOrBefore("doc:bb");
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    cursor.setUpperBound("doc:d");
+    entry = try cursor.seekAtOrAfter("doc:c");
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    try std.testing.expectError(error.NotFound, cursor.next());
+    entry = try cursor.last();
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    entry = try cursor.seekAtOrBefore("doc:z");
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    cursor.setUpperBound(null);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+
+    // A cursor opened before later mutations refreshes only its small sorted
+    // overlay; it does not rematerialize the durable namespace.
+    try write.put("doc:aa", "pending-aa");
+    try write.delete("doc:c");
+    entry = try cursor.seekAtOrAfter("doc:a");
+    try std.testing.expectEqualStrings("doc:a", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:aa", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+    try std.testing.expectError(error.NotFound, cursor.next());
 }
 
 test "lite native docstore persists replay lanes across reopen and truncation" {
