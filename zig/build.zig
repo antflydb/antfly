@@ -4339,6 +4339,7 @@ pub fn build(b: *std.Build) void {
             "coverage policy assigns persistent private incarnations only to embeddings",
             "restore manifest preserves trusted coverage incarnation metadata",
             "public index config encoders redact coverage incarnation",
+            "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage aggregation rejects stale index incarnations",

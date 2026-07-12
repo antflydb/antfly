@@ -69,6 +69,19 @@ fn newIncarnation(io: std.Io) !i64 {
 pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     if (value != .object) return error.InvalidIndexConfig;
     try validateIndexConfig(value);
+    const index_type = value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) {
+        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    }
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return try withIncarnationAlloc(alloc, value, @intCast(try newIncarnation(io_impl.io())));
+}
+
+pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, coverage_incarnation: u64) ![]u8 {
+    if (value != .object or coverage_incarnation == 0 or coverage_incarnation > std.math.maxInt(i64)) return error.InvalidIndexConfig;
+    try validateIndexConfig(value);
 
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
@@ -84,9 +97,7 @@ pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value
     if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) {
         return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
     }
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    try cloned.value.object.put(arena, incarnation_field, .{ .integer = try newIncarnation(io_impl.io()) });
+    try cloned.value.object.put(arena, incarnation_field, .{ .integer = @intCast(coverage_incarnation) });
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
 }
 

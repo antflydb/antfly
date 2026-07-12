@@ -113,15 +113,18 @@ transition or process reconciliation; they do not block read admission. Every
 open DB retains a shared generation lease and a shared filesystem publication
 lock through `DB.close()`. An exclusive transition
 blocks new opens and cannot publish until all prior DB owners have closed.
-Reconciliation is cached per process generation and a new exclusive transition
-invalidates that cache entry, keeping normal opens at an O(1) hash lookup after
-the first check. The persistent sibling lock file also excludes overlapping
-restore publishers across processes. Stale-stage GC only considers names with
+Reconciliation is cached only while a local reader retains the shared
+publication lock. The final reader invalidates the cache entry, so a later open
+must observe publication debt created by another process. The persistent sibling
+lock file also excludes overlapping restore publishers across processes.
+Stale-stage GC only considers names with
 Antfly's complete generated-stage grammar while holding that exclusive lock;
 it schedules marked abandoned candidates and markerless retired roots left by a
 completed exchange, while ignoring arbitrary prefix-matching directories. A
-manual runtime never performs recursive cleanup inline; it leaves the sibling
-for a later threaded serving runtime or operator cleanup.
+manual runtime admits the reconciled read generation and downgrades the
+publication lock before recursively reclaiming the exact stale paths identified
+under exclusivity. This preserves bounded disk use without holding publication
+downtime across potentially large directory deletion.
 
 A restore whose namespace exchange committed but whose parent sync failed is
 reported as durability pending. Retrying the same backup is idempotent: Antfly
@@ -395,7 +398,9 @@ ordering, credentials, provider rate limits, and top-level execution batching
 are excluded. It is encoded as a fixed-width hexadecimal string at the API
 boundary and remains stable across shard-local marker generations, preventing
 rolling reconfiguration from combining outcomes that describe different
-indexes.
+indexes. An idempotent index mutation or an operational-only configuration
+change preserves the catalog-owned coverage incarnation while storing the new
+operational settings; a generated-output change assigns a fresh incarnation.
 
 ### Coverage Policy
 

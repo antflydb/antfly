@@ -27,6 +27,7 @@ const public_table_http = @import("public_table_http.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
+const coverage_policy = @import("coverage_policy.zig");
 const table_contract = @import("table_contract.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -1463,6 +1464,8 @@ pub const ApiHttpServer = struct {
         snapshot: ?*const metadata_api.AdminSnapshot,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
+        var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
+        defer item_indexes.deinit(self.alloc);
         errdefer {
             for (items.items) |*item| item.deinit(self.alloc);
             items.deinit(self.alloc);
@@ -1479,12 +1482,12 @@ pub const ApiHttpServer = struct {
                     read_statuses_present = true;
                     errdefer owned.deinit(self.alloc);
                     read_needs_refresh = runtimeStatusesNeedWriterRefresh(owned.items);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &item_indexes, &owned);
                 }
             }
         }
         if (snapshot) |admin_snapshot| {
-            try self.appendRemoteRuntimeStatusesFromSnapshot(&items, table_name, admin_snapshot);
+            try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot);
         }
         const should_query_writes = if (snapshot == null)
             self.table_reads == null or !read_statuses_present or read_needs_refresh
@@ -1500,7 +1503,7 @@ pub const ApiHttpServer = struct {
             if (write_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned);
+                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &item_indexes, &owned);
             }
         }
         if (items.items.len == 0) {
@@ -1546,9 +1549,12 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         owned: *runtime_status.LocalTableRuntimeStatuses,
     ) !void {
         try items.ensureUnusedCapacity(self.alloc, owned.items.len);
+        const additional_indexes = std.math.cast(u32, owned.items.len) orelse return error.TooManyRuntimeStatuses;
+        try item_indexes.ensureUnusedCapacity(self.alloc, additional_indexes);
         for (owned.items) |item| {
             if (!self.localRuntimeStatusAllowedBySnapshot(table_name, snapshot, item)) {
                 var discard = item;
@@ -1556,7 +1562,7 @@ pub const ApiHttpServer = struct {
                 continue;
             }
             var candidate = item;
-            try upsertRuntimeStatus(self.alloc, items, &candidate);
+            try upsertRuntimeStatus(self.alloc, items, item_indexes, &candidate);
         }
         if (owned.items.len > 0) self.alloc.free(owned.items);
         owned.items = &.{};
@@ -1569,6 +1575,7 @@ pub const ApiHttpServer = struct {
     fn appendRemoteRuntimeStatusesFromSnapshot(
         self: *ApiHttpServer,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         table_name: []const u8,
         snapshot: *const metadata_api.AdminSnapshot,
     ) !void {
@@ -1583,7 +1590,7 @@ pub const ApiHttpServer = struct {
                 var status = try localRuntimeStatusFromRemoteReport(self.alloc, remote);
                 var consumed = false;
                 errdefer if (!consumed) status.deinit(self.alloc);
-                try upsertRuntimeStatus(self.alloc, items, &status);
+                try upsertRuntimeStatus(self.alloc, items, item_indexes, &status);
                 consumed = true;
             }
         }
@@ -1592,10 +1599,11 @@ pub const ApiHttpServer = struct {
     fn upsertRuntimeStatus(
         alloc: std.mem.Allocator,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         status: *runtime_status.LocalTableRuntimeStatus,
     ) !void {
-        for (items.items) |*existing| {
-            if (existing.group_id != status.group_id) continue;
+        if (item_indexes.get(status.group_id)) |existing_index| {
+            const existing = &items.items[existing_index];
             if (!runtimeStatusPreferred(status.*, existing.*)) {
                 status.deinit(alloc);
                 return;
@@ -1605,7 +1613,11 @@ pub const ApiHttpServer = struct {
             status.* = undefined;
             return;
         }
-        try items.append(alloc, status.*);
+        try items.ensureUnusedCapacity(alloc, 1);
+        try item_indexes.ensureUnusedCapacity(alloc, 1);
+        const index = items.items.len;
+        items.appendAssumeCapacity(status.*);
+        item_indexes.putAssumeCapacity(status.group_id, index);
         status.* = undefined;
     }
 
@@ -21076,6 +21088,21 @@ test "api http server create index waits for exact target config projection" {
     defer create_index_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
     try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
+
+    var first_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
+    defer first_lookup.deinit();
+    const first_incarnation = coverage_policy.incarnation(first_lookup.config) orelse return error.TestUnexpectedResult;
+    var retry_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/embed_idx",
+        .content_type = "application/json",
+        .body = create_index_body,
+    });
+    defer retry_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), retry_resp.status);
+    var retry_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
+    defer retry_lookup.deinit();
+    try std.testing.expectEqual(first_incarnation, coverage_policy.incarnation(retry_lookup.config).?);
 }
 
 test "api http server create index expands schema-derived algebraic config" {
@@ -21901,6 +21928,8 @@ test "api http server create table with local writes waits for projected presenc
 test "api runtime status upsert keeps one authoritative observation per group" {
     const alloc = std.testing.allocator;
     var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
+    var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
+    defer item_indexes.deinit(alloc);
     defer {
         for (items.items) |*item| item.deinit(alloc);
         items.deinit(alloc);
@@ -21918,7 +21947,7 @@ test "api runtime status upsert keeps one authoritative observation per group" {
         },
         .stats = .{},
     };
-    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &remote);
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &remote);
     try std.testing.expectEqual(@as(usize, 1), items.items.len);
 
     var stale_writer = runtime_status.LocalTableRuntimeStatus{
@@ -21933,7 +21962,7 @@ test "api runtime status upsert keeps one authoritative observation per group" {
         },
         .stats = .{},
     };
-    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &stale_writer);
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &stale_writer);
     try std.testing.expectEqual(@as(usize, 1), items.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.remote_store, items.items[0].metadata.source);
 
@@ -21949,7 +21978,7 @@ test "api runtime status upsert keeps one authoritative observation per group" {
         },
         .stats = .{},
     };
-    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &current_writer);
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &current_writer);
     try std.testing.expectEqual(@as(usize, 1), items.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, items.items[0].metadata.source);
 }

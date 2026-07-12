@@ -4686,6 +4686,16 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn tryBeginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        if (self.findTableActivityLocked(table_name, null)) |index| {
+            const entry = self.active_table_activities.items[index];
+            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return false;
+        }
+        const entry = self.activityEntryLocked(table_name, null);
+        entry.table_request_active += 1;
+        return true;
+    }
+
     fn endTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         const index = self.findTableActivityLocked(table_name, null) orelse {
@@ -4937,6 +4947,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginTableRequestLocked(table_name);
+    }
+
+    fn tryBeginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        return self.tryBeginTableRequestLocked(table_name);
     }
 
     fn endTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -6812,7 +6829,12 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) void {
-        self.beginTableRequest(table_name);
+        // Status is derived observability state. Never queue it behind a
+        // structural transition: callers can already hold a table request or
+        // group operation, and re-entering writer-preferring admission while a
+        // reconcile waits would deadlock both sides. The dirty bit keeps a
+        // skipped publication retryable by the background status publisher.
+        if (!self.tryBeginTableRequest(table_name)) return;
         defer self.endTableRequest(table_name);
 
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
@@ -23132,6 +23154,58 @@ test "provisioned table write request queues structural reconcile ahead of later
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     write_thread.join();
+}
+
+test "best effort table request admission does not deadlock behind queued reconcile" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const ReconcileWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.beginStructuralReconcileActivity("docs");
+            defer self.source.endStructuralReconcileActivity("docs");
+            self.entered.store(true, .release);
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-best-effort-table-request", NoCatalog.iface());
+    source.beginTableRequest("docs");
+    var request_active = true;
+
+    var worker = ReconcileWorker{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, ReconcileWorker.run, .{&worker});
+    var thread_joined = false;
+    defer {
+        if (request_active) source.endTableRequest("docs");
+        if (!thread_joined) thread.join();
+    }
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    while (!source.hasGroupActivityBestEffort("docs", 7001)) {
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    try std.testing.expect(!source.tryBeginTableRequest("docs"));
+    try std.testing.expect(!worker.entered.load(.acquire));
+
+    source.endTableRequest("docs");
+    request_active = false;
+    thread.join();
+    thread_joined = true;
+    try std.testing.expect(worker.entered.load(.acquire));
 }
 
 test "provisioned structural reconcile blocks table write admission" {

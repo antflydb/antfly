@@ -21,6 +21,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const tables_api = @import("tables.zig");
 const runtime_status = @import("runtime_status.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
+const json_helpers = @import("json_helpers.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -53,7 +54,12 @@ pub fn addIndexToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
-    const stored_config = coverage_policy_mod.withIncarnationIfMissingAlloc(alloc, config.value) catch return error.InvalidCreateIndexRequest;
+    const stored_config = storedIndexConfigForMutationAlloc(
+        alloc,
+        index_name,
+        root.get(index_name),
+        config.value,
+    ) catch return error.InvalidCreateIndexRequest;
     defer alloc.free(stored_config);
 
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -79,6 +85,59 @@ pub fn addIndexToTableIndexesJson(
     try out.appendSlice(alloc, stored_config);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn storedIndexConfigForMutationAlloc(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    existing: ?std.json.Value,
+    requested: std.json.Value,
+) ![]u8 {
+    try coverage_policy_mod.validateStoredIndexConfig(requested);
+    if (coverage_policy_mod.incarnation(requested) != null) {
+        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(requested, .{})});
+    }
+    if (existing) |current| {
+        if (coverage_policy_mod.incarnation(current)) |current_incarnation| {
+            const exact_match = try equivalentIndexConfigValues(alloc, index_name, current, requested);
+            const output_match = if (exact_match)
+                true
+            else
+                equivalentDerivedOutputConfig(alloc, index_name, current, requested);
+            if (output_match) {
+                return try coverage_policy_mod.withIncarnationAlloc(alloc, requested, current_incarnation);
+            }
+        }
+    }
+    return try coverage_policy_mod.withFreshIncarnationAlloc(alloc, requested);
+}
+
+fn equivalentDerivedOutputConfig(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    lhs: std.json.Value,
+    rhs: std.json.Value,
+) bool {
+    const lhs_fingerprint = expectedCoverageConfigHash(alloc, index_name, lhs) catch return false;
+    const rhs_fingerprint = expectedCoverageConfigHash(alloc, index_name, rhs) catch return false;
+    return lhs_fingerprint == rhs_fingerprint;
+}
+
+fn equivalentIndexConfigValues(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    lhs: std.json.Value,
+    rhs: std.json.Value,
+) !bool {
+    const lhs_json = try canonicalIndexConfigJson(alloc, index_name, lhs);
+    defer alloc.free(lhs_json);
+    const rhs_json = try canonicalIndexConfigJson(alloc, index_name, rhs);
+    defer alloc.free(rhs_json);
+    var lhs_parsed = try std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{});
+    defer lhs_parsed.deinit();
+    var rhs_parsed = try std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{});
+    defer rhs_parsed.deinit();
+    return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
 }
 
 pub fn storedIndexConfigJsonAlloc(
@@ -613,11 +672,7 @@ pub fn equivalentIndexConfigJson(
     var it = lhs_object.iterator();
     while (it.next()) |entry| {
         const rhs_value = rhs_object.get(entry.key_ptr.*) orelse return false;
-        const lhs_config = try canonicalIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
-        defer alloc.free(lhs_config);
-        const rhs_config = try canonicalIndexConfigJson(alloc, entry.key_ptr.*, rhs_value);
-        defer alloc.free(rhs_config);
-        if (!std.mem.eql(u8, lhs_config, rhs_config)) return false;
+        if (!try equivalentIndexConfigValues(alloc, entry.key_ptr.*, entry.value_ptr.*, rhs_value)) return false;
     }
     return true;
 }
@@ -2922,6 +2977,50 @@ test "public index config encoders redact coverage incarnation" {
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
     defer std.testing.allocator.free(encoded_single);
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, coverage_policy_mod.incarnation_field) == null);
+}
+
+test "identical index mutation retries preserve coverage incarnation" {
+    const alloc = std.testing.allocator;
+    const requested = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":384}";
+    const first = try addIndexToTableIndexesJson(alloc, tables_api.default_indexes_json, "embed_idx", requested);
+    defer alloc.free(first);
+    const retried = try addIndexToTableIndexesJson(
+        alloc,
+        first,
+        "embed_idx",
+        "{\"dimension\":384,\"external\":true,\"type\":\"embeddings\"}",
+    );
+    defer alloc.free(retried);
+
+    var first_lookup = (try lookupSingleIndexConfig(alloc, first, "embed_idx")).?;
+    defer first_lookup.deinit();
+    var retried_lookup = (try lookupSingleIndexConfig(alloc, retried, "embed_idx")).?;
+    defer retried_lookup.deinit();
+    const first_incarnation = coverage_policy_mod.incarnation(first_lookup.config) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(first_incarnation, coverage_policy_mod.incarnation(retried_lookup.config).?);
+
+    const tuned = try addIndexToTableIndexesJson(
+        alloc,
+        retried,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":384,\"execution\":{\"embedding\":{\"batch_items\":64}}}",
+    );
+    defer alloc.free(tuned);
+    var tuned_lookup = (try lookupSingleIndexConfig(alloc, tuned, "embed_idx")).?;
+    defer tuned_lookup.deinit();
+    try std.testing.expectEqual(first_incarnation, coverage_policy_mod.incarnation(tuned_lookup.config).?);
+    try std.testing.expect(tuned_lookup.config.object.get("execution") != null);
+
+    const changed = try addIndexToTableIndexesJson(
+        alloc,
+        tuned,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":768}",
+    );
+    defer alloc.free(changed);
+    var changed_lookup = (try lookupSingleIndexConfig(alloc, changed, "embed_idx")).?;
+    defer changed_lookup.deinit();
+    try std.testing.expect(first_incarnation != coverage_policy_mod.incarnation(changed_lookup.config).?);
 }
 
 test "index status encoder projects inline enrichment configs as names" {
