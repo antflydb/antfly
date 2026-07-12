@@ -4255,6 +4255,7 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps write unavailable errors",
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
+            "public table query handler preserves embedding failure status",
             "public table query handler maps HA read gate errors",
             "public table query handler maps unsupported exact sort",
             "public table query handler exposes stable count-only sort rejection reason",

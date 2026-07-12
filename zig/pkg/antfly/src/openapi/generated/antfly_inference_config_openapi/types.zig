@@ -665,6 +665,8 @@ pub const QueryEmbeddingCacheConfig = struct {
     max_bytes_mb: ?i64 = null,
     /// Idle expiration in milliseconds. Cache hits refresh the expiry time.
     ttl_ms: ?i64 = null,
+    /// Maximum distinct query embedding computations in flight. Existing-key waiters continue to coalesce when this limit is reached.
+    max_inflight: ?i64 = null,
 };
 
 pub const ReadRequest = struct {

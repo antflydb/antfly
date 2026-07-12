@@ -1132,7 +1132,7 @@ pub const ApiHttpServer = struct {
             .connections_cache = connections_api.Cache.init(alloc),
             .local_inference_cache_budget = cache_budget.CacheBudget.init(effective_query_embedding_cache.max_bytes),
             .shared_inference_cache_budget = cfg.inference_cache_budget,
-            .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, effective_query_embedding_cache),
+            .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, queryEmbeddingCacheIo(cfg), effective_query_embedding_cache),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
         };
@@ -1146,7 +1146,15 @@ pub const ApiHttpServer = struct {
             .enabled = configured.enabled,
             .max_bytes = std.math.mul(usize, configured.max_bytes_mb, 1024 * 1024) catch std.math.maxInt(usize),
             .ttl_ns = configured.ttl_ms * std.time.ns_per_ms,
+            .max_inflight = configured.max_inflight,
         };
+    }
+
+    fn queryEmbeddingCacheIo(cfg: ApiHttpServerConfig) std.Io {
+        if (cfg.backend_runtime) |runtime| {
+            if (runtime.apiIoImpl()) |io_impl| return io_impl.io();
+        }
+        return std.Io.Threaded.global_single_threaded.io();
     }
 
     pub fn requestStats(self: *ApiHttpServer) RequestStats {
@@ -5990,6 +5998,10 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.QueryEmbeddingOverloaded => return error.QueryEmbeddingOverloaded,
+            error.EmbedRateLimited => return error.EmbedRateLimited,
+            error.EmbedTransientFailure => return error.EmbedTransientFailure,
+            error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -6078,6 +6090,11 @@ pub const ApiHttpServer = struct {
                 error.TableNotFound => return error.TableNotFound,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+                error.QueryEmbeddingOverloaded,
+                error.EmbedRateLimited,
+                error.EmbedTransientFailure,
+                error.EmbedUpstreamFailure,
+                => return err,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -6100,6 +6117,11 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.QueryEmbeddingOverloaded,
+            error.EmbedRateLimited,
+            error.EmbedTransientFailure,
+            error.EmbedUpstreamFailure,
+            => return err,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -6489,8 +6511,13 @@ pub const ApiHttpServer = struct {
     ) !query_api.QueryResponse {
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
-            std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
-            return error.InvalidQueryRequest;
+            const normalized = normalizePublicQueryParseError(err);
+            if (normalized == error.InvalidQueryRequest) {
+                std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
+            } else {
+                std.log.debug("public table query embedding failed table={s} err={}", .{ table_name, normalized });
+            }
+            return normalized;
         };
         defer query_req.deinit(alloc);
         if (request_deadline_ns) |deadline| {
@@ -7325,6 +7352,10 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
             error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
             error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
+            error.QueryEmbeddingOverloaded => return try textResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => return try textResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => return try textResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
             error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
@@ -7390,6 +7421,10 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
                 error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
                 error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
+                error.QueryEmbeddingOverloaded => return try textResponse(self.alloc, 429, "query embedding overloaded"),
+                error.EmbedRateLimited => return try textResponse(self.alloc, 429, "query embedding rate limited"),
+                error.EmbedTransientFailure => return try textResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+                error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
                 error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                 error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
@@ -9924,6 +9959,33 @@ fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.Http
     return try textResponse(alloc, 400, "invalid query request");
 }
 
+fn normalizePublicQueryParseError(err: anyerror) anyerror {
+    return switch (err) {
+        error.QueryEmbeddingOverloaded,
+        error.EmbedRateLimited,
+        error.EmbedTransientFailure,
+        error.ModelNotFound,
+        error.OutOfMemory,
+        error.Timeout,
+        => err,
+        error.EmbedRequestFailed,
+        error.EmptyEmbeddingResponse,
+        error.InvalidEmbeddingResponse,
+        error.InvalidEmbeddingDimensions,
+        error.SecretNotFound,
+        => error.EmbedUpstreamFailure,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.ConnectionTimedOut,
+        => error.EmbedTransientFailure,
+        else => error.InvalidQueryRequest,
+    };
+}
+
 fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ InvalidQueryRequest, UnsupportedExactSort } {
     if (queryBodyHasSortPageControls(alloc, body)) return error.UnsupportedExactSort;
     return error.InvalidQueryRequest;
@@ -11717,7 +11779,8 @@ test "api http server applies node query embedding cache policy and explicit ove
         \\    "query_embedding_cache": {
         \\      "enabled": false,
         \\      "max_bytes_mb": 7,
-        \\      "ttl_ms": 1234
+        \\      "ttl_ms": 1234,
+        \\      "max_inflight": 42
         \\    }
         \\  }
         \\}
@@ -11728,14 +11791,31 @@ test "api http server applies node query embedding cache policy and explicit ove
     try std.testing.expect(!configured.enabled);
     try std.testing.expectEqual(@as(usize, 7 * 1024 * 1024), configured.max_bytes);
     try std.testing.expectEqual(@as(u64, 1234 * std.time.ns_per_ms), configured.ttl_ns);
+    try std.testing.expectEqual(@as(usize, 42), configured.max_inflight);
 
     const explicit = ApiHttpServer.effectiveQueryEmbeddingCacheConfig(.{
         .node_config = &node_config,
-        .query_embedding_cache = .{ .enabled = true, .max_bytes = 99, .ttl_ns = 77 },
+        .query_embedding_cache = .{ .enabled = true, .max_bytes = 99, .ttl_ns = 77, .max_inflight = 3 },
     });
     try std.testing.expect(explicit.enabled);
     try std.testing.expectEqual(@as(usize, 99), explicit.max_bytes);
     try std.testing.expectEqual(@as(u64, 77), explicit.ttl_ns);
+    try std.testing.expectEqual(@as(usize, 3), explicit.max_inflight);
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+    const selected_io = ApiHttpServer.queryEmbeddingCacheIo(.{ .backend_runtime = runtime.ptr() });
+    const runtime_io = runtime.ptr().apiIoImpl().?.io();
+    try std.testing.expect(selected_io.userdata == runtime_io.userdata);
+    try std.testing.expect(selected_io.vtable == runtime_io.vtable);
+}
+
+test "api http query parsing preserves operational embedding failures" {
+    try std.testing.expectEqual(error.QueryEmbeddingOverloaded, normalizePublicQueryParseError(error.QueryEmbeddingOverloaded));
+    try std.testing.expectEqual(error.EmbedRateLimited, normalizePublicQueryParseError(error.EmbedRateLimited));
+    try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.EmbedUpstreamFailure, normalizePublicQueryParseError(error.InvalidEmbeddingResponse));
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicQueryParseError(error.InvalidCharacter));
 }
 
 test "api http public table dispatch preserves unsupported sorted query as exact sort" {

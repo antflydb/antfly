@@ -1457,6 +1457,12 @@ components:
           maximum: 86400000
           default: 300000
           description: Idle expiration in milliseconds. Cache hits refresh the expiry time.
+        max_inflight:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 1024
+          description: Maximum distinct query embedding computations in flight. Existing-key waiters continue to coalesce when this limit is reached.
 
     Config:
       type: object

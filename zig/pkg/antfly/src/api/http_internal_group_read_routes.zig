@@ -263,7 +263,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     };
 
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, .{});
+    var cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, std.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var provider = FakeProvider{};
     const base: QueryPlanningContext = .{

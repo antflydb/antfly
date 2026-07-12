@@ -37,6 +37,12 @@ local fallback budget. The stack-local `SemanticStatusResolver` and
 `ManagedEmbedder.embedQuery`, so waiters do not consume provider rate-limit
 capacity or local inference queue slots.
 
+The cache borrows the API lane's `std.Io` from `BackendRuntime`; it does not
+create or own an executor. This keeps synchronization, shutdown, and runtime
+resource ownership under the server lifecycle. Test or embedded construction
+without a backend runtime uses Zig's explicit global single-threaded I/O
+fallback and does not create a cache-private thread pool.
+
 Cache contents remain process-local. They do not belong in metadata Raft and do
 not require distributed invalidation. Multiple API replicas may each perform
 one cold computation. An inference-node L2 can be added if measurements show
@@ -103,10 +109,17 @@ inference:
     enabled: true
     max_bytes_mb: 64
     ttl_ms: 300000
+    max_inflight: 1024
 ```
 
 `max_bytes_mb: 0` disables result retention while preserving singleflight.
 `enabled: false` bypasses both caching and singleflight.
+
+`max_inflight` bounds distinct producer keys before provider pacing and local
+inference queueing. Requests for a key already in flight still coalesce when
+the limit is reached; new unique misses receive an overload response. This
+prevents high-cardinality traffic from turning the singleflight map into an
+unbounded upstream queue.
 
 Each entry charge includes the vector, entry object, key/value storage, and a
 conservative allowance for hash-table occupancy. The cache reserves its charge
@@ -125,6 +138,8 @@ or reject admission; resource-pressure observation alone is not enforcement.
 The data-server metrics endpoint exports query-cache hits, misses, coalesced
 waiters, producers, evictions, expirations, rejected admissions, entries, live
 bytes, aggregate producer compute time, and aggregate budget use/rejections.
+The endpoint also reports in-flight admission rejections so operators can
+distinguish upstream saturation from cache-capacity churn.
 Metrics snapshots also expire a bounded batch from an idle LRU tail, so a quiet
 node converges without allowing one scrape to monopolize the cache lock. These
 signals distinguish useful reuse from high churn, insufficient capacity, an

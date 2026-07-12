@@ -102,6 +102,7 @@ pub const Config = struct {
             enabled: bool = true,
             max_bytes_mb: usize = 64,
             ttl_ms: u64 = 300_000,
+            max_inflight: usize = 1024,
         };
 
         pub const WarmModelConfig = struct {
@@ -1018,11 +1019,13 @@ fn queryEmbeddingCacheFromOpenApi(
     const config = value orelse return .{};
     const max_bytes_mb = std.math.cast(usize, config.max_bytes_mb orelse 64) orelse return error.InvalidConfig;
     const ttl_ms = std.math.cast(u64, config.ttl_ms orelse 300_000) orelse return error.InvalidConfig;
-    if (max_bytes_mb > 1_048_576 or ttl_ms > 86_400_000) return error.InvalidConfig;
+    const max_inflight = std.math.cast(usize, config.max_inflight orelse 1024) orelse return error.InvalidConfig;
+    if (max_bytes_mb > 1_048_576 or ttl_ms > 86_400_000 or max_inflight == 0 or max_inflight > 65_536) return error.InvalidConfig;
     return .{
         .enabled = config.enabled orelse true,
         .max_bytes_mb = max_bytes_mb,
         .ttl_ms = ttl_ms,
+        .max_inflight = max_inflight,
     };
 }
 
@@ -1239,7 +1242,8 @@ test "common config extracts antfly settings" {
         \\    "query_embedding_cache": {
         \\      "enabled": false,
         \\      "max_bytes_mb": 128,
-        \\      "ttl_ms": 45000
+        \\      "ttl_ms": 45000,
+        \\      "max_inflight": 77
         \\    },
         \\    "preload": [
         \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
@@ -1269,6 +1273,7 @@ test "common config extracts antfly settings" {
     try std.testing.expect(!cfg.inference.query_embedding_cache.enabled);
     try std.testing.expectEqual(@as(usize, 128), cfg.inference.query_embedding_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(u64, 45_000), cfg.inference.query_embedding_cache.ttl_ms);
+    try std.testing.expectEqual(@as(usize, 77), cfg.inference.query_embedding_cache.max_inflight);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
@@ -1324,6 +1329,14 @@ test "common config rejects out of range query embedding cache policy" {
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8090",
         \\    "query_embedding_cache": { "ttl_ms": 86400001 }
+        \\  }
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8090",
+        \\    "query_embedding_cache": { "max_inflight": 0 }
         \\  }
         \\}
     ));

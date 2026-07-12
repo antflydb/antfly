@@ -16,6 +16,7 @@ pub const Config = struct {
     enabled: bool = true,
     max_bytes: usize = 64 * 1024 * 1024,
     ttl_ns: u64 = 5 * std.time.ns_per_min,
+    max_inflight: usize = 1024,
 };
 
 pub const Stats = struct {
@@ -24,12 +25,14 @@ pub const Stats = struct {
     coalesced_waiters: u64 = 0,
     producer_computations: u64 = 0,
     producer_compute_ns_total: u64 = 0,
+    inflight_rejections: u64 = 0,
     evictions: u64 = 0,
     expirations: u64 = 0,
     rejected_admissions: u64 = 0,
     entries: usize = 0,
     live_bytes: usize = 0,
     inflight: usize = 0,
+    max_inflight: usize = 0,
 };
 
 pub const ComputeFn = *const fn (context: *anyopaque, alloc: std.mem.Allocator) anyerror![]f32;
@@ -58,8 +61,8 @@ pub const QueryEmbeddingCache = struct {
     const metrics_expire_batch: usize = 256;
 
     alloc: std.mem.Allocator,
+    io: std.Io,
     config: Config,
-    threaded: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     entries: std.AutoHashMapUnmanaged(Key, *Entry) = .empty,
     flights: std.AutoHashMapUnmanaged(Key, *Flight) = .empty,
@@ -68,23 +71,21 @@ pub const QueryEmbeddingCache = struct {
     live_bytes: usize = 0,
     counters: Stats = .{},
 
-    pub fn init(alloc: std.mem.Allocator, config: Config) QueryEmbeddingCache {
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, config: Config) QueryEmbeddingCache {
         return .{
             .alloc = alloc,
+            .io = io,
             .config = config,
-            .threaded = std.Io.Threaded.init(alloc, .{}),
         };
     }
 
     pub fn deinit(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) void {
-        const io = self.threaded.io();
-        self.mutex.lockUncancelable(io);
+        self.mutex.lockUncancelable(self.io);
         std.debug.assert(self.flights.count() == 0);
         while (self.oldest) |entry| self.removeEntryLocked(entry, budget, false);
         self.entries.deinit(self.alloc);
         self.flights.deinit(self.alloc);
-        self.mutex.unlock(io);
-        self.threaded.deinit();
+        self.mutex.unlock(self.io);
         self.* = undefined;
     }
 
@@ -98,7 +99,7 @@ pub const QueryEmbeddingCache = struct {
     ) ![]f32 {
         if (!self.config.enabled) return compute(context, caller_alloc);
 
-        const io = self.threaded.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         if (self.entries.get(key)) |entry| {
             const now = platform_time.monotonicNs();
@@ -127,6 +128,12 @@ pub const QueryEmbeddingCache = struct {
             self.releaseFlightLocked(key, flight);
             self.mutex.unlock(io);
             return result;
+        }
+
+        if (self.flights.count() >= self.config.max_inflight) {
+            self.counters.inflight_rejections +|= 1;
+            self.mutex.unlock(io);
+            return error.QueryEmbeddingOverloaded;
         }
 
         const flight = self.alloc.create(Flight) catch {
@@ -176,7 +183,7 @@ pub const QueryEmbeddingCache = struct {
     }
 
     pub fn stats(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) Stats {
-        const io = self.threaded.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.expireOldestLocked(platform_time.monotonicNs(), budget, metrics_expire_batch);
@@ -184,6 +191,7 @@ pub const QueryEmbeddingCache = struct {
         result.entries = self.entries.count();
         result.live_bytes = self.live_bytes;
         result.inflight = self.flights.count();
+        result.max_inflight = self.config.max_inflight;
         return result;
     }
 
@@ -307,7 +315,7 @@ const TestCompute = struct {
 
 pub fn testOwnedValuesAndHits() !void {
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, .{});
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 4 };
     const key: Key = [_]u8{7} ** 32;
@@ -356,12 +364,11 @@ pub fn testConcurrentCoalescing() !void {
             };
         }
     };
-
-    var budget = cache_budget.CacheBudget.init(0);
-    var cache = QueryEmbeddingCache.init(std.heap.page_allocator, .{ .max_bytes = 0 });
-    defer cache.deinit(&budget);
     var compute_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer compute_io.deinit();
+    var budget = cache_budget.CacheBudget.init(0);
+    var cache = QueryEmbeddingCache.init(std.heap.page_allocator, compute_io.io(), .{ .max_bytes = 0 });
+    defer cache.deinit(&budget);
     var compute = SlowCompute{ .io = compute_io.io() };
     const key: Key = [_]u8{9} ** 32;
     var first = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = key };
@@ -391,10 +398,77 @@ test "query embedding cache coalesces concurrent misses" {
     try testConcurrentCoalescing();
 }
 
+pub fn testInflightAdmissionBound() !void {
+    const BlockingCompute = struct {
+        calls: std.atomic.Value(u64) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+        io: std.Io,
+
+        fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            return try alloc.dupe(f32, &.{1});
+        }
+    };
+    const Worker = struct {
+        cache: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        compute: *BlockingCompute,
+        key: Key,
+        result: ?[]f32 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.cache.getOrCompute(self.budget, std.heap.page_allocator, self.key, self.compute, BlockingCompute.run) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    const Releaser = struct {
+        fn run(compute: *BlockingCompute) void {
+            compute.io.sleep(.fromNanoseconds(100 * std.time.ns_per_ms), .awake) catch {};
+            compute.release.store(true, .release);
+        }
+    };
+
+    var compute_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer compute_io.deinit();
+    var budget = cache_budget.CacheBudget.init(0);
+    var cache = QueryEmbeddingCache.init(std.heap.page_allocator, compute_io.io(), .{ .max_bytes = 0, .max_inflight = 1 });
+    defer cache.deinit(&budget);
+    var compute = BlockingCompute{ .io = compute_io.io() };
+    var producer = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = [_]u8{1} ** 32 };
+    const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&producer});
+    while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
+    const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&compute});
+
+    const rejected_key: Key = [_]u8{2} ** 32;
+    try std.testing.expectError(
+        error.QueryEmbeddingOverloaded,
+        cache.getOrCompute(&budget, std.testing.allocator, rejected_key, &compute, BlockingCompute.run),
+    );
+    const current = cache.stats(&budget);
+    try std.testing.expectEqual(@as(u64, 1), current.inflight_rejections);
+    try std.testing.expectEqual(@as(usize, 1), current.inflight);
+    try std.testing.expectEqual(@as(u64, 1), compute.calls.load(.monotonic));
+
+    compute.release.store(true, .release);
+    releaser_thread.join();
+    producer_thread.join();
+    defer if (producer.result) |result| std.heap.page_allocator.free(result);
+    try std.testing.expectEqual(@as(?anyerror, null), producer.err);
+}
+
+test "query embedding cache bounds distinct in-flight misses" {
+    try testInflightAdmissionBound();
+}
+
 pub fn testByteBudgetEviction() !void {
     const one_entry_bytes = QueryEmbeddingCache.entryCharge(2);
     var budget = cache_budget.CacheBudget.init(one_entry_bytes);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, .{ .max_bytes = one_entry_bytes });
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{ .max_bytes = one_entry_bytes });
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 8 };
     const first_key: Key = [_]u8{1} ** 32;
@@ -423,7 +497,7 @@ test "query embedding cache enforces byte budget with LRU eviction" {
 
 pub fn testStatsExpireIdleEntries() !void {
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, .{ .ttl_ns = 0 });
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{ .ttl_ns = 0 });
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 3 };
     const key: Key = [_]u8{3} ** 32;
@@ -443,7 +517,7 @@ test "query embedding cache stats expire idle entries" {
 
 pub fn testStatsBoundExpirationWork() !void {
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, .{});
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 3 };
 
