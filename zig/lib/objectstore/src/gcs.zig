@@ -954,13 +954,23 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
     var parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
+    const content_length = if (parsed.value.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0;
+    const owned_bucket = try alloc.dupe(u8, parsed.value.bucket orelse bucket);
+    errdefer alloc.free(owned_bucket);
+    const key = try alloc.dupe(u8, parsed.value.name);
+    errdefer alloc.free(key);
+    const etag = if (parsed.value.etag) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (etag) |value| alloc.free(value);
+    const version_id = if (parsed.value.generation) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (version_id) |value| alloc.free(value);
+    const content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null;
     return .{
-        .bucket = try alloc.dupe(u8, parsed.value.bucket orelse bucket),
-        .key = try alloc.dupe(u8, parsed.value.name),
-        .etag = if (parsed.value.etag) |value| try alloc.dupe(u8, value) else null,
-        .version_id = if (parsed.value.generation) |value| try alloc.dupe(u8, value) else null,
-        .content_length = if (parsed.value.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0,
-        .content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null,
+        .bucket = owned_bucket,
+        .key = key,
+        .etag = etag,
+        .version_id = version_id,
+        .content_length = content_length,
+        .content_type = content_type,
         .last_modified_unix_ms = null,
     };
 }
@@ -980,34 +990,43 @@ fn parseListResponse(alloc: Allocator, body: []const u8) !types.ListResult {
     defer parsed.deinit();
 
     const items = parsed.value.items orelse &.{};
-    var entries = try alloc.alloc(types.ListEntry, items.len);
+    const entries = try alloc.alloc(types.ListEntry, items.len);
+    var entries_initialized: usize = 0;
     errdefer {
-        for (entries) |*entry| entry.deinit(alloc);
+        for (entries[0..entries_initialized]) |*entry| entry.deinit(alloc);
         alloc.free(entries);
     }
     for (items, 0..) |item, idx| {
+        const size = if (item.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0;
+        const key = try alloc.dupe(u8, item.name);
+        errdefer alloc.free(key);
+        const etag = if (item.etag) |value| try alloc.dupe(u8, value) else null;
         entries[idx] = .{
-            .key = try alloc.dupe(u8, item.name),
-            .etag = if (item.etag) |value| try alloc.dupe(u8, value) else null,
-            .size = if (item.size) |value| try std.fmt.parseUnsigned(u64, value, 10) else 0,
+            .key = key,
+            .etag = etag,
+            .size = size,
             .last_modified_unix_ms = null,
         };
+        entries_initialized += 1;
     }
 
     const prefixes_in = parsed.value.prefixes orelse &.{};
-    var prefixes = try alloc.alloc([]u8, prefixes_in.len);
+    const prefixes = try alloc.alloc([]u8, prefixes_in.len);
+    var prefixes_initialized: usize = 0;
     errdefer {
-        for (prefixes) |prefix| alloc.free(prefix);
+        for (prefixes[0..prefixes_initialized]) |prefix| alloc.free(prefix);
         alloc.free(prefixes);
     }
     for (prefixes_in, 0..) |prefix, idx| {
         prefixes[idx] = try alloc.dupe(u8, prefix);
+        prefixes_initialized += 1;
     }
 
+    const next_token = if (parsed.value.nextPageToken) |value| try alloc.dupe(u8, value) else null;
     return .{
         .entries = entries,
         .common_prefixes = prefixes,
-        .next_continuation_token = if (parsed.value.nextPageToken) |value| try alloc.dupe(u8, value) else null,
+        .next_continuation_token = next_token,
     };
 }
 
@@ -1123,6 +1142,25 @@ test "gcs resumable upload url preserves create-only semantics" {
         "https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=resumable&name=folder%2Fdoc.txt&ifGenerationMatch=0",
         url,
     );
+}
+
+test "gcs response parsers clean up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var metadata = try parseObjectMetadataResponse(
+                alloc,
+                "fallback",
+                "{\"bucket\":\"bucket\",\"name\":\"backup/a\",\"etag\":\"etag\",\"generation\":\"7\",\"size\":\"42\",\"contentType\":\"application/octet-stream\"}",
+            );
+            defer metadata.deinit(alloc);
+            var listed = try parseListResponse(
+                alloc,
+                "{\"items\":[{\"name\":\"backup/a\",\"etag\":\"a\",\"size\":\"1\"},{\"name\":\"backup/b\",\"etag\":\"b\",\"size\":\"2\"}],\"prefixes\":[\"backup/nested/\"],\"nextPageToken\":\"next\"}",
+            );
+            defer listed.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "gcs file upload completes a resumable lifecycle with bounded chunks" {

@@ -869,27 +869,27 @@ fn objectTargetAllocWithQuery(alloc: Allocator, cfg: Config, bucket: []const u8,
 
 fn buildObjectQueryAlloc(alloc: Allocator, version_id: ?[]const u8, part_number: ?u32) ![]QueryPair {
     var query = std.ArrayListUnmanaged(QueryPair).empty;
-    errdefer freeQueryPairs(alloc, query.items);
+    errdefer deinitQueryList(alloc, &query);
 
     if (version_id) |value| try appendQueryPair(alloc, &query, "versionId", value);
     if (part_number) |value| {
         const encoded = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        errdefer alloc.free(encoded);
-        try query.append(alloc, .{ .name = try alloc.dupe(u8, "partNumber"), .value = encoded });
+        defer alloc.free(encoded);
+        try appendQueryPair(alloc, &query, "partNumber", encoded);
     }
     return try query.toOwnedSlice(alloc);
 }
 
 fn buildDeleteQueryAlloc(alloc: Allocator, version_id: ?[]const u8) ![]QueryPair {
     var query = std.ArrayListUnmanaged(QueryPair).empty;
-    errdefer freeQueryPairs(alloc, query.items);
+    errdefer deinitQueryList(alloc, &query);
     if (version_id) |value| try appendQueryPair(alloc, &query, "versionId", value);
     return try query.toOwnedSlice(alloc);
 }
 
 fn buildListQueryAlloc(alloc: Allocator, opts: types.ListOptions) ![]QueryPair {
     var query = std.ArrayListUnmanaged(QueryPair).empty;
-    errdefer freeQueryPairs(alloc, query.items);
+    errdefer deinitQueryList(alloc, &query);
 
     try appendQueryPair(alloc, &query, "list-type", "2");
     if (opts.prefix.len > 0) try appendQueryPair(alloc, &query, "prefix", opts.prefix);
@@ -898,17 +898,18 @@ fn buildListQueryAlloc(alloc: Allocator, opts: types.ListOptions) ![]QueryPair {
     if (opts.continuation_token) |value| try appendQueryPair(alloc, &query, "continuation-token", value);
     if (opts.max_keys != 1000) {
         const value = try std.fmt.allocPrint(alloc, "{d}", .{opts.max_keys});
-        errdefer alloc.free(value);
-        try query.append(alloc, .{ .name = try alloc.dupe(u8, "max-keys"), .value = value });
+        defer alloc.free(value);
+        try appendQueryPair(alloc, &query, "max-keys", value);
     }
     return try query.toOwnedSlice(alloc);
 }
 
 fn appendQueryPair(alloc: Allocator, list: *std.ArrayListUnmanaged(QueryPair), name: []const u8, value: []const u8) !void {
-    try list.append(alloc, .{
-        .name = try alloc.dupe(u8, name),
-        .value = try alloc.dupe(u8, value),
-    });
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try list.append(alloc, .{ .name = owned_name, .value = owned_value });
 }
 
 fn cloneQueryPairsAlloc(alloc: Allocator, pairs: []const QueryPair) ![]QueryPair {
@@ -961,37 +962,38 @@ fn signHeadersAlloc(
     content_type: ?[]const u8,
 ) ![]HeaderPair {
     var headers = std.ArrayListUnmanaged(HeaderPair).empty;
-    errdefer freeHeaderPairs(alloc, headers.items);
+    errdefer deinitHeaderList(alloc, &headers);
 
-    try headers.append(alloc, .{ try alloc.dupe(u8, "Host"), try alloc.dupe(u8, host) });
-    try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-date"), try alloc.dupe(u8, amz_date) });
-    try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-content-sha256"), try alloc.dupe(u8, payload_hash) });
+    try appendHeaderCopy(alloc, &headers, "Host", host);
+    try appendHeaderCopy(alloc, &headers, "x-amz-date", amz_date);
+    try appendHeaderCopy(alloc, &headers, "x-amz-content-sha256", payload_hash);
     if (cfg.credentials.session_token) |token| {
-        try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-security-token"), try alloc.dupe(u8, token) });
+        try appendHeaderCopy(alloc, &headers, "x-amz-security-token", token);
     }
     if (content_type) |value| {
-        try headers.append(alloc, .{ try alloc.dupe(u8, "Content-Type"), try alloc.dupe(u8, value) });
+        try appendHeaderCopy(alloc, &headers, "Content-Type", value);
     }
     for (extra_headers) |pair| {
-        try headers.append(alloc, .{
-            try alloc.dupe(u8, pair[0]),
-            try alloc.dupe(u8, pair[1]),
-        });
+        try appendHeaderCopy(alloc, &headers, pair[0], pair[1]);
     }
 
-    const signature = try authorizationValueAlloc(
-        alloc,
-        cfg,
-        method,
-        canonical_uri,
-        query_pairs,
-        headers.items,
-        payload_hash,
-        amz_date,
-        scope_date,
-    );
-    errdefer alloc.free(signature);
-    try headers.append(alloc, .{ try alloc.dupe(u8, "Authorization"), signature });
+    {
+        const signature = try authorizationValueAlloc(
+            alloc,
+            cfg,
+            method,
+            canonical_uri,
+            query_pairs,
+            headers.items,
+            payload_hash,
+            amz_date,
+            scope_date,
+        );
+        errdefer alloc.free(signature);
+        const authorization_name = try alloc.dupe(u8, "Authorization");
+        errdefer alloc.free(authorization_name);
+        try headers.append(alloc, .{ authorization_name, signature });
+    }
     return try headers.toOwnedSlice(alloc);
 }
 
@@ -1082,8 +1084,9 @@ const CanonicalHeader = struct {
 
 fn canonicalHeadersAlloc(alloc: Allocator, headers: []const HeaderPair) !CanonicalHeaders {
     const entries = try alloc.alloc(CanonicalHeader, headers.len);
+    var initialized: usize = 0;
     errdefer {
-        for (entries[0..headers.len]) |entry| {
+        for (entries[0..initialized]) |entry| {
             alloc.free(entry.name);
             alloc.free(entry.value);
         }
@@ -1091,10 +1094,11 @@ fn canonicalHeadersAlloc(alloc: Allocator, headers: []const HeaderPair) !Canonic
     }
 
     for (headers, 0..) |pair, idx| {
-        entries[idx] = .{
-            .name = try asciiLowerAlloc(alloc, std.mem.trim(u8, pair[0], " ")),
-            .value = try alloc.dupe(u8, std.mem.trim(u8, pair[1], " ")),
-        };
+        const name = try asciiLowerAlloc(alloc, std.mem.trim(u8, pair[0], " "));
+        errdefer alloc.free(name);
+        const value = try alloc.dupe(u8, std.mem.trim(u8, pair[1], " "));
+        entries[idx] = .{ .name = name, .value = value };
+        initialized += 1;
     }
     std.mem.sort(CanonicalHeader, entries, {}, lessCanonicalHeader);
 
@@ -1113,36 +1117,33 @@ fn canonicalHeadersAlloc(alloc: Allocator, headers: []const HeaderPair) !Canonic
         try signed.appendSlice(alloc, entry.name);
     }
 
+    const header_block = try block.toOwnedSlice(alloc);
+    errdefer alloc.free(header_block);
+    const signed_headers = try signed.toOwnedSlice(alloc);
     return .{
         .entries = entries,
-        .header_block = try block.toOwnedSlice(alloc),
-        .signed_headers = try signed.toOwnedSlice(alloc),
+        .header_block = header_block,
+        .signed_headers = signed_headers,
     };
 }
 
 fn canonicalQueryStringAlloc(alloc: Allocator, pairs: []const QueryPair) ![]u8 {
     const encoded = try alloc.alloc(QueryPair, pairs.len);
+    var initialized: usize = 0;
     errdefer {
-        for (encoded[0..pairs.len]) |pair| {
+        for (encoded[0..initialized]) |pair| {
             alloc.free(pair.name);
             alloc.free(pair.value);
         }
         alloc.free(encoded);
     }
     for (pairs, 0..) |pair, idx| {
-        encoded[idx] = .{
-            .name = try encodeUriComponentAlloc(alloc, pair.name, true),
-            .value = try encodeUriComponentAlloc(alloc, pair.value, true),
-        };
+        const name = try encodeUriComponentAlloc(alloc, pair.name, true);
+        errdefer alloc.free(name);
+        const value = try encodeUriComponentAlloc(alloc, pair.value, true);
+        encoded[idx] = .{ .name = name, .value = value };
+        initialized += 1;
     }
-    defer {
-        for (encoded) |pair| {
-            alloc.free(pair.name);
-            alloc.free(pair.value);
-        }
-        alloc.free(encoded);
-    }
-
     std.mem.sort(QueryPair, encoded, {}, lessQueryPair);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -1152,7 +1153,13 @@ fn canonicalQueryStringAlloc(alloc: Allocator, pairs: []const QueryPair) ![]u8 {
         try out.append(alloc, '=');
         try out.appendSlice(alloc, pair.value);
     }
-    return try out.toOwnedSlice(alloc);
+    const result = try out.toOwnedSlice(alloc);
+    for (encoded) |pair| {
+        alloc.free(pair.name);
+        alloc.free(pair.value);
+    }
+    alloc.free(encoded);
+    return result;
 }
 
 fn signingKeyAlloc(alloc: Allocator, secret: []const u8, scope_date: []const u8, region: []const u8) ![]u8 {
@@ -1313,6 +1320,22 @@ fn freeHeaderPairs(alloc: Allocator, headers: []const HeaderPair) void {
     alloc.free(headers);
 }
 
+fn deinitHeaderList(alloc: Allocator, headers: *std.ArrayListUnmanaged(HeaderPair)) void {
+    for (headers.items) |pair| {
+        alloc.free(pair[0]);
+        alloc.free(pair[1]);
+    }
+    headers.deinit(alloc);
+}
+
+fn appendHeaderCopy(alloc: Allocator, headers: *std.ArrayListUnmanaged(HeaderPair), name: []const u8, value: []const u8) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try headers.append(alloc, .{ owned_name, owned_value });
+}
+
 fn unexpectedStatusError(status: u16) anyerror {
     return switch (status) {
         400 => error.InvalidRequest,
@@ -1340,31 +1363,56 @@ fn parseListResponse(alloc: Allocator, xml: []const u8) !types.ListResult {
     var search_from: usize = 0;
     while (findBlock(xml, "Contents", search_from)) |block| {
         search_from = block.end;
-        const key = try decodeXmlAlloc(alloc, block.inner, "Key");
-        errdefer alloc.free(key);
-        const etag_raw = try optionalTagAlloc(alloc, block.inner, "ETag");
-        errdefer if (etag_raw) |value| alloc.free(value);
         const size_raw = try requiredTagAlloc(alloc, block.inner, "Size");
         defer alloc.free(size_raw);
-        try entries.append(alloc, .{
+        const size = try std.fmt.parseInt(u64, size_raw, 10);
+        const key = try decodeXmlAlloc(alloc, block.inner, "Key");
+        const etag_raw = optionalTagAlloc(alloc, block.inner, "ETag") catch |err| {
+            alloc.free(key);
+            return err;
+        };
+        defer if (etag_raw) |value| alloc.free(value);
+        const etag = if (etag_raw) |value| alloc.dupe(u8, stripQuotes(value)) catch |err| {
+            alloc.free(key);
+            return err;
+        } else null;
+        var entry = types.ListEntry{
             .key = key,
-            .etag = if (etag_raw) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
-            .size = try std.fmt.parseInt(u64, size_raw, 10),
+            .etag = etag,
+            .size = size,
             .last_modified_unix_ms = null,
-        });
-        if (etag_raw) |value| alloc.free(value);
+        };
+        entries.append(alloc, entry) catch |err| {
+            entry.deinit(alloc);
+            return err;
+        };
     }
 
     search_from = 0;
     while (findBlock(xml, "CommonPrefixes", search_from)) |block| {
         search_from = block.end;
-        try prefixes.append(alloc, try decodeXmlAlloc(alloc, block.inner, "Prefix"));
+        const prefix = try decodeXmlAlloc(alloc, block.inner, "Prefix");
+        prefixes.append(alloc, prefix) catch |err| {
+            alloc.free(prefix);
+            return err;
+        };
     }
 
+    const owned_entries = try entries.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_entries) |*entry| entry.deinit(alloc);
+        alloc.free(owned_entries);
+    }
+    const owned_prefixes = try prefixes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_prefixes) |prefix| alloc.free(prefix);
+        alloc.free(owned_prefixes);
+    }
+    const next_token = try optionalTagAlloc(alloc, xml, "NextContinuationToken");
     return .{
-        .entries = try entries.toOwnedSlice(alloc),
-        .common_prefixes = try prefixes.toOwnedSlice(alloc),
-        .next_continuation_token = if (try optionalTagAlloc(alloc, xml, "NextContinuationToken")) |value| value else null,
+        .entries = owned_entries,
+        .common_prefixes = owned_prefixes,
+        .next_continuation_token = next_token,
     };
 }
 
@@ -1569,6 +1617,50 @@ test "s3 multipart completion preserves ordered quoted etags" {
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;etag-one&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;etag-two&quot;</ETag></Part></CompleteMultipartUpload>",
         xml,
     );
+}
+
+test "s3 query and signing builders clean up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const query = try buildListQueryAlloc(alloc, .{
+                .prefix = "backup/",
+                .continuation_token = "cursor",
+                .max_keys = 17,
+            });
+            defer freeQueryPairs(alloc, query);
+            const cfg = Config{
+                .credentials = .{
+                    .endpoint = @constCast("example.invalid"),
+                    .use_ssl = true,
+                    .access_key_id = @constCast("key"),
+                    .secret_access_key = @constCast("secret"),
+                    .session_token = @constCast("token"),
+                    .region = @constCast("us-east-1"),
+                },
+                .addressing_style = .path,
+            };
+            const headers = try signHeadersAlloc(
+                alloc,
+                cfg,
+                .GET,
+                "example.invalid",
+                "/bucket/key",
+                query,
+                &.{.{ "If-Match", "etag" }},
+                "00",
+                "20260712T000000Z",
+                "20260712",
+                "application/octet-stream",
+            );
+            defer freeHeaderPairs(alloc, headers);
+            var listed = try parseListResponse(
+                alloc,
+                "<ListBucketResult><Contents><Key>backup/a</Key><ETag>\"a\"</ETag><Size>1</Size></Contents><Contents><Key>backup/b</Key><ETag>\"b\"</ETag><Size>2</Size></Contents><CommonPrefixes><Prefix>backup/nested/</Prefix></CommonPrefixes><NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
+            );
+            defer listed.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "s3 file upload completes a multipart lifecycle with bounded parts" {
