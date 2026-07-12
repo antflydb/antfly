@@ -7274,7 +7274,7 @@ pub const ApiHttpServer = struct {
         req: backups_api.ClusterRestoreRequest,
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
-    ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
+    ) cluster_api_http.ClusterApi.ExecuteRestoreError!cluster_api_http.ClusterApi.RestoreExecution {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const op_alloc = self.alloc;
 
@@ -7438,7 +7438,11 @@ pub const ApiHttpServer = struct {
             };
         }
 
-        return backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
+        const body = backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
+        return .{
+            .status = clusterRestoreHttpStatus(statuses),
+            .body = body,
+        };
     }
 
     pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -8344,6 +8348,7 @@ pub const ApiHttpServer = struct {
         var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
             202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
@@ -9183,6 +9188,14 @@ fn clusterRestoreStatusesHaveNoErrors(statuses: []const backups_api.ClusterTable
         if (status.@"error" != null) return false;
     }
     return true;
+}
+
+fn clusterRestoreHttpStatus(statuses: []const backups_api.ClusterTableRestoreStatus) u16 {
+    for (statuses) |status| {
+        if (std.mem.eql(u8, status.status, "triggered") or
+            std.mem.eql(u8, status.status, "durability_pending")) return 202;
+    }
+    return 200;
 }
 
 fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const extension_domain.PackageManifest {
@@ -24267,7 +24280,7 @@ test "api http server cluster overwrite stages before replacing metadata without
     });
     defer restore_resp.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expectEqual(@as(u16, 200), restore_resp.status);
     try std.testing.expect(state.restored);
     try std.testing.expect(state.present);
     try std.testing.expect(state.definition_replaced);

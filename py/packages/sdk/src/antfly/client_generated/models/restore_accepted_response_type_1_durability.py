@@ -1,7 +1,7 @@
 from enum import Enum
 
 
-class RestoreAcceptedResponseDurability(str, Enum):
+class RestoreAcceptedResponseType1Durability(str, Enum):
     PENDING = "pending"
 
     def __str__(self) -> str:

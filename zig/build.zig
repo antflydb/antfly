@@ -3258,6 +3258,7 @@ pub fn build(b: *std.Build) void {
         "data runtime runRound backs off retryable provision metadata failures",
         "data runtime provisioned root refresh worker backs off retryable metadata failures",
         "data runtime data changes mark provisioned startup catch-up dirty",
+        "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
@@ -3305,6 +3306,7 @@ pub fn build(b: *std.Build) void {
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db split status borrows the live raft apply store without a second writer",
+        "data raft apply store applies delete operations into group state",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
@@ -4189,7 +4191,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
             "api auto bulk ingest does not open sessions for normal online writes",
             "auto bulk group writes release leases so idle finish can publish",
             "provisioned table write source rejects stale doc identity namespace before write",
@@ -4236,6 +4238,7 @@ pub fn build(b: *std.Build) void {
             "startup runtime status snapshot publishes live db when active cache is empty",
             "best effort startup runtime status publishes live db when cache is empty",
             "idle startup runtime status publish is live when startup flag is still set",
+            "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "managed startup catch-up uses provided indexes json without catalog fetch",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up finishes restore repair before terminal index load degradation",
@@ -4248,7 +4251,7 @@ pub fn build(b: *std.Build) void {
             "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
             "write cache retires shared HA generation stale entries before reuse",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

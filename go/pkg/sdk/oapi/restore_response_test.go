@@ -9,21 +9,18 @@ import (
 
 func TestParseRestoreTableAcceptedResponses(t *testing.T) {
 	tests := []struct {
-		name       string
-		body       string
-		restore    RestoreAcceptedResponseRestore
-		durability RestoreAcceptedResponseDurability
+		name      string
+		body      string
+		committed bool
 	}{
 		{
-			name:    "asynchronous restore triggered",
-			body:    `{"restore":"triggered"}`,
-			restore: RestoreAcceptedResponseRestoreTriggered,
+			name: "asynchronous restore triggered",
+			body: `{"restore":"triggered"}`,
 		},
 		{
-			name:       "committed restore durability pending",
-			body:       `{"restore":"committed","durability":"pending"}`,
-			restore:    RestoreAcceptedResponseRestoreCommitted,
-			durability: RestoreAcceptedResponseDurabilityPending,
+			name:      "committed restore durability pending",
+			body:      `{"restore":"committed","durability":"pending"}`,
+			committed: true,
 		},
 	}
 
@@ -40,11 +37,25 @@ func TestParseRestoreTableAcceptedResponses(t *testing.T) {
 			if response.JSON202 == nil {
 				t.Fatal("accepted restore response was not decoded")
 			}
-			if response.JSON202.Restore != test.restore {
-				t.Fatalf("restore = %q, want %q", response.JSON202.Restore, test.restore)
+			if test.committed {
+				accepted, err := response.JSON202.AsRestoreAcceptedResponse1()
+				if err != nil {
+					t.Fatalf("decode committed accepted restore: %v", err)
+				}
+				if accepted.Restore != RestoreAcceptedResponse1RestoreCommitted {
+					t.Fatalf("restore = %q, want committed", accepted.Restore)
+				}
+				if accepted.Durability != RestoreAcceptedResponse1DurabilityPending {
+					t.Fatalf("durability = %q, want pending", accepted.Durability)
+				}
+				return
 			}
-			if response.JSON202.Durability != test.durability {
-				t.Fatalf("durability = %q, want %q", response.JSON202.Durability, test.durability)
+			accepted, err := response.JSON202.AsRestoreAcceptedResponse0()
+			if err != nil {
+				t.Fatalf("decode triggered accepted restore: %v", err)
+			}
+			if accepted.Restore != RestoreAcceptedResponse0RestoreTriggered {
+				t.Fatalf("restore = %q, want triggered", accepted.Restore)
 			}
 		})
 	}

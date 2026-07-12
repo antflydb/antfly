@@ -6886,10 +6886,30 @@ pub const ResourceType = enum {
 };
 
 /// An accepted restore. `triggered` means asynchronous restoration has started. `committed` means the new generation is published but its durability barrier has not yet been confirmed.
-pub const RestoreAcceptedResponse = struct {
-    restore: []const u8,
-    /// Present only when `restore` is `committed`.
-    durability: ?[]const u8 = null,
+pub const RestoreAcceptedResponse = union(enum) {
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(_: @This(), _: anytype) !void {}
 };
 
 pub const RestoreCommittedDurableResponse = struct {

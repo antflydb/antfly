@@ -8,7 +8,8 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.backup_request import BackupRequest
 from ...models.error import Error
-from ...models.restore_accepted_response import RestoreAcceptedResponse
+from ...models.restore_accepted_response_type_0 import RestoreAcceptedResponseType0
+from ...models.restore_accepted_response_type_1 import RestoreAcceptedResponseType1
 from ...models.restore_committed_durable_response import RestoreCommittedDurableResponse
 from ...types import Response
 
@@ -37,14 +38,30 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse | None:
+) -> Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse | None:
     if response.status_code == 200:
         response_200 = RestoreCommittedDurableResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 202:
-        response_202 = RestoreAcceptedResponse.from_dict(response.json())
+
+        def _parse_response_202(data: object) -> RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_restore_accepted_response_type_0 = RestoreAcceptedResponseType0.from_dict(data)
+
+                return componentsschemas_restore_accepted_response_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_restore_accepted_response_type_1 = RestoreAcceptedResponseType1.from_dict(data)
+
+            return componentsschemas_restore_accepted_response_type_1
+
+        response_202 = _parse_response_202(response.json())
 
         return response_202
 
@@ -66,7 +83,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse]:
+) -> Response[Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -80,7 +97,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> Response[Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse]:
+) -> Response[Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse]:
     """Restore a table from backup
 
     Args:
@@ -92,7 +109,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse]
+        Response[Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse]
     """
 
     kwargs = _get_kwargs(
@@ -112,7 +129,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse | None:
+) -> Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse | None:
     """Restore a table from backup
 
     Args:
@@ -124,7 +141,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse
+        Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse
     """
 
     return sync_detailed(
@@ -139,7 +156,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> Response[Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse]:
+) -> Response[Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse]:
     """Restore a table from backup
 
     Args:
@@ -151,7 +168,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse]
+        Response[Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse]
     """
 
     kwargs = _get_kwargs(
@@ -169,7 +186,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse | None:
+) -> Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse | None:
     """Restore a table from backup
 
     Args:
@@ -181,7 +198,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | RestoreAcceptedResponse | RestoreCommittedDurableResponse
+        Error | RestoreAcceptedResponseType0 | RestoreAcceptedResponseType1 | RestoreCommittedDurableResponse
     """
 
     return (

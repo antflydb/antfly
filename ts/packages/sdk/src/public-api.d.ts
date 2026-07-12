@@ -450,9 +450,10 @@ export interface paths {
          *     - `skip_if_exists`: Skip existing tables and restore the rest
          *     - `overwrite`: Drop existing tables and restore from backup
          *
-         *     The restore is asynchronous - this endpoint triggers the restore process
-         *     and returns immediately. The actual data restoration happens via the
-         *     reconciliation loop as shards are started.
+         *     The endpoint stages and publishes locally owned table generations before
+         *     returning. It returns `200` when every requested operation has reached a
+         *     terminal result and `202` when any table is still restoring or awaiting
+         *     a durability barrier.
          */
         post: operations["restore"];
         delete?: never;
@@ -4625,12 +4626,12 @@ export interface components {
          */
         RestoreAcceptedResponse: {
             /** @enum {string} */
-            restore: "triggered" | "committed";
-            /**
-             * @description Present only when `restore` is `committed`.
-             * @enum {string}
-             */
-            durability?: "pending";
+            restore: "triggered";
+        } | {
+            /** @enum {string} */
+            restore: "committed";
+            /** @enum {string} */
+            durability: "pending";
         };
         RestoreCommittedDurableResponse: {
             /** @enum {string} */
@@ -12970,7 +12971,16 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Restore triggered successfully */
+            /** @description Restore processing reached terminal results for all requested tables */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClusterRestoreResponse"];
+                };
+            };
+            /** @description At least one table restore remains in progress or durability-pending */
             202: {
                 headers: {
                     [name: string]: unknown;

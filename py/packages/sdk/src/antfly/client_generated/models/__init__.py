@@ -526,9 +526,11 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
-from .restore_accepted_response import RestoreAcceptedResponse
-from .restore_accepted_response_durability import RestoreAcceptedResponseDurability
-from .restore_accepted_response_restore import RestoreAcceptedResponseRestore
+from .restore_accepted_response_type_0 import RestoreAcceptedResponseType0
+from .restore_accepted_response_type_0_restore import RestoreAcceptedResponseType0Restore
+from .restore_accepted_response_type_1 import RestoreAcceptedResponseType1
+from .restore_accepted_response_type_1_durability import RestoreAcceptedResponseType1Durability
+from .restore_accepted_response_type_1_restore import RestoreAcceptedResponseType1Restore
 from .restore_committed_durable_response import RestoreCommittedDurableResponse
 from .restore_committed_durable_response_durability import RestoreCommittedDurableResponseDurability
 from .restore_committed_durable_response_restore import RestoreCommittedDurableResponseRestore
@@ -1178,9 +1180,11 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
-    "RestoreAcceptedResponse",
-    "RestoreAcceptedResponseDurability",
-    "RestoreAcceptedResponseRestore",
+    "RestoreAcceptedResponseType0",
+    "RestoreAcceptedResponseType0Restore",
+    "RestoreAcceptedResponseType1",
+    "RestoreAcceptedResponseType1Durability",
+    "RestoreAcceptedResponseType1Restore",
     "RestoreCommittedDurableResponse",
     "RestoreCommittedDurableResponseDurability",
     "RestoreCommittedDurableResponseRestore",

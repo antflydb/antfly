@@ -482,6 +482,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_groups_with_debt", "gauge", "Provisioned table groups that still had replay debt when the most recent startup catch-up run examined them", self.data_server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_groups_cleared", "gauge", "Provisioned table groups whose replay debt was cleared by the most recent startup catch-up run", self.data_server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_busy_groups", "gauge", "Provisioned table groups deferred by the most recent startup catch-up run because foreground work held the writer lock", self.data_server.provisioned_startup_catch_up_last_busy_groups.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_quarantined_groups", "gauge", "Provisioned table groups parked by zero-progress startup catch-up backoff in the most recent run", self.data_server.provisioned_startup_catch_up_last_quarantined_groups.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_duration_ns", "gauge", "Duration of the most recent provisioned startup catch-up run in monotonic nanoseconds", self.data_server.provisioned_startup_catch_up_last_duration_ns.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_read_cache_hits_total", "counter", "Provisioned read-cache hits served from already-open local table DBs", read_cache_stats.hit_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_read_cache_misses_total", "counter", "Provisioned read-cache opens that had to open a local table DB", read_cache_stats.miss_count);
@@ -2125,8 +2126,10 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_last_groups_with_debt: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_last_groups_cleared: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_last_busy_groups: std.atomic.Value(u64) = .init(0),
+    provisioned_startup_catch_up_last_quarantined_groups: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_last_duration_ns: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_last_run_at_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_startup_catch_up_not_before_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_dirty: std.atomic.Value(bool) = .init(true),
     runtime_status_last_refresh_at_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_disk_usage_cache_mutex: std.atomic.Mutex = .unlocked,
@@ -2212,9 +2215,17 @@ pub const DataServer = struct {
         groups_with_debt: u64 = 0,
         groups_cleared: u64 = 0,
         busy_groups: u64 = 0,
+        quarantined_groups: u64 = 0,
         debt_remaining: bool = false,
+        unparked_debt_remaining: bool = false,
+        earliest_retry_at_ms: u64 = 0,
         duration_ns: u64 = 0,
     };
+
+    fn startupCatchUpNotBeforeMs(stats: ProvisionedStartupCatchUpStats, inspection_complete: bool) u64 {
+        if (!inspection_complete or !stats.debt_remaining or stats.unparked_debt_remaining) return 0;
+        return stats.earliest_retry_at_ms;
+    }
 
     const StartupCatchUpGroupDisposition = enum {
         attempt,
@@ -3981,7 +3992,11 @@ pub const DataServer = struct {
         _ = table_name;
         self.runtime_status_dirty.store(true, .release);
         switch (kind) {
-            .data, .structural => self.provisioned_startup_catch_up_dirty.store(true, .release),
+            .data => self.provisioned_startup_catch_up_dirty.store(true, .release),
+            .structural => {
+                self.clearProvisionedStartupCatchUpBackoffs();
+                self.provisioned_startup_catch_up_dirty.store(true, .release);
+            },
         }
     }
 
@@ -5736,8 +5751,13 @@ pub const DataServer = struct {
         defer self.provisioned_startup_catch_up_last_groups_with_debt.store(stats.groups_with_debt, .monotonic);
         defer self.provisioned_startup_catch_up_last_groups_cleared.store(stats.groups_cleared, .monotonic);
         defer self.provisioned_startup_catch_up_last_busy_groups.store(stats.busy_groups, .monotonic);
+        defer self.provisioned_startup_catch_up_last_quarantined_groups.store(stats.quarantined_groups, .monotonic);
         defer self.provisioned_startup_catch_up_last_duration_ns.store(stats.duration_ns, .monotonic);
         defer stats.duration_ns = platform_time.monotonicNs() - started_ns;
+        defer self.provisioned_startup_catch_up_not_before_ms.store(
+            startupCatchUpNotBeforeMs(stats, inspection_complete),
+            .release,
+        );
         defer self.provisioned_startup_catch_up_dirty.store(
             if (inspection_complete) stats.debt_remaining else true,
             .release,
@@ -5791,6 +5811,7 @@ pub const DataServer = struct {
                     .skip_nonlocal => continue,
                     .retry_unknown => {
                         stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
                         continue;
                     },
                 }
@@ -5799,6 +5820,7 @@ pub const DataServer = struct {
                     _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
                     std.log.warn("provisioned startup catch-up path failed group={} table={s} err={}", .{ group_id, table.name, err });
                     stats.debt_remaining = true;
+                    stats.unparked_debt_remaining = true;
                     continue;
                 };
                 defer self.alloc.free(db_path);
@@ -5808,12 +5830,14 @@ pub const DataServer = struct {
                 _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
                     error.FileNotFound => {
                         stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
                         continue;
                     },
                     else => {
                         _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
                         std.log.warn("provisioned startup catch-up stat failed group={} table={s} err={}", .{ group_id, table.name, err });
                         stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
                         continue;
                     },
                 };
@@ -5823,6 +5847,7 @@ pub const DataServer = struct {
                         _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
                         std.log.warn("provisioned startup catch-up target set failed group={} table={s} err={}", .{ group_id, table.name, err });
                         stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
                         continue;
                     };
                     defer self.clearProvisionedStartupCatchUpTarget();
@@ -5839,6 +5864,7 @@ pub const DataServer = struct {
                         _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
                         std.log.warn("provisioned startup catch-up failed group={} table={s} err={}", .{ group_id, table.name, err });
                         stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
                         continue;
                     };
                 };
@@ -5847,11 +5873,26 @@ pub const DataServer = struct {
                     stats.busy_groups += 1;
                     if (self.runtime_status_dirty.load(.acquire) or self.runtime_status_refresh_active.load(.acquire)) {
                         stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
                         continue;
                     }
                     const cached_debt: ?bool = self.cachedRuntimeStatusHasStartupCatchUpDebt(table.name, group_id) catch true;
                     if (cached_debt orelse true) {
                         stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
+                    }
+                    continue;
+                }
+                if (result.quarantined) {
+                    stats.groups_with_debt += 1;
+                    stats.quarantined_groups += 1;
+                    stats.debt_remaining = true;
+                    if (stats.earliest_retry_at_ms == 0 or result.retry_at_ms < stats.earliest_retry_at_ms) {
+                        stats.earliest_retry_at_ms = result.retry_at_ms;
+                    }
+                    if (result.quarantine_retry_scheduled) {
+                        const retry_in_ms = result.retry_at_ms -| started_at_ms;
+                        std.log.err("provisioned startup catch-up quarantined after repeated zero progress group={} table={s} retry_in_ms={}", .{ group_id, table.name, retry_in_ms });
                     }
                     continue;
                 }
@@ -5867,6 +5908,7 @@ pub const DataServer = struct {
                     stats.groups_cleared += 1;
                 } else {
                     stats.debt_remaining = true;
+                    stats.unparked_debt_remaining = true;
                     std.log.warn("provisioned startup catch-up debt persists group={} table={s}", .{ group_id, table.name });
                 }
             }
@@ -5982,6 +6024,8 @@ pub const DataServer = struct {
         if (!self.provisioned_startup_catch_up_dirty.load(.acquire)) return;
 
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        const not_before_ms = self.provisioned_startup_catch_up_not_before_ms.load(.acquire);
+        if (not_before_ms != 0 and now_ms < not_before_ms) return;
         const last_at_ms = self.provisioned_startup_catch_up_last_run_at_ms.load(.monotonic);
         if (last_at_ms != 0 and now_ms -| last_at_ms < provisioned_startup_catch_up_interval_ms) return;
         try self.requestProvisionedStartupCatchUp();
@@ -6060,7 +6104,16 @@ pub const DataServer = struct {
     }
 
     pub fn requestProvisionedStartupCatchUpNow(self: *DataServer) !void {
+        self.clearProvisionedStartupCatchUpBackoffs();
+        self.provisioned_startup_catch_up_dirty.store(true, .release);
         try self.requestProvisionedStartupCatchUp();
+    }
+
+    fn clearProvisionedStartupCatchUpBackoffs(self: *DataServer) void {
+        self.provisioned_startup_catch_up_not_before_ms.store(0, .release);
+        const source = self.liveRuntimeWriteSource();
+        source.clearStartupCatchUpBackoffs();
+        if (source != &self.write_source) self.write_source.clearStartupCatchUpBackoffs();
     }
 
     fn requestProvisionedStartupCatchUpWithSpawner(
@@ -6854,6 +6907,7 @@ pub const DataServer = struct {
         self.pruneStaleVisibleWriteCaches();
         self.last_provision_fingerprint = fingerprint;
         self.last_provision_metadata_epoch = head.metadata_epoch;
+        self.clearProvisionedStartupCatchUpBackoffs();
         self.invalidateLocalGroupStatusCache();
         self.runtime_status_dirty.store(true, .release);
         self.provisioned_startup_catch_up_dirty.store(true, .release);
@@ -13256,6 +13310,24 @@ test "data runtime status refresh publishes sibling placeholder when only one gr
     try std.testing.expect(saw_78);
 }
 
+test "data runtime startup catch-up parks scheduler when only quarantined debt remains" {
+    const retry_at_ms = 45_000;
+    try std.testing.expectEqual(@as(u64, 0), DataServer.startupCatchUpNotBeforeMs(.{}, true));
+    try std.testing.expectEqual(@as(u64, 0), DataServer.startupCatchUpNotBeforeMs(.{
+        .debt_remaining = true,
+        .earliest_retry_at_ms = retry_at_ms,
+    }, false));
+    try std.testing.expectEqual(retry_at_ms, DataServer.startupCatchUpNotBeforeMs(.{
+        .debt_remaining = true,
+        .earliest_retry_at_ms = retry_at_ms,
+    }, true));
+    try std.testing.expectEqual(@as(u64, 0), DataServer.startupCatchUpNotBeforeMs(.{
+        .debt_remaining = true,
+        .unparked_debt_remaining = true,
+        .earliest_retry_at_ms = retry_at_ms,
+    }, true));
+}
+
 test "data runtime provisioned startup catch-up clears replay debt for local groups" {
     const alloc = std.testing.allocator;
 
@@ -13819,7 +13891,7 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
     }
 }
 
-test "data runtime startup catch-up retries unresolved leadership and later clears debt" {
+test "data runtime startup catch-up retries unresolved leadership and observes leader open replay" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -14058,8 +14130,8 @@ test "data runtime startup catch-up retries unresolved leadership and later clea
     try std.testing.expectEqual(@as(u64, 2), server.provisioned_startup_catch_up_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), server.provisioned_startup_catch_up_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
     try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.monotonic));
 
     {

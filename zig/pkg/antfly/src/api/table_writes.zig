@@ -74,6 +74,9 @@ const auto_bulk_ingest_max_hbc_leaf_splits_per_publish: usize = 256;
 const provisioned_write_coalesce_max_waiters: usize = 64;
 const provisioned_write_coalesce_max_ops: usize = 10_000;
 const startup_obsolete_reclaim_max_steps: usize = 64;
+const startup_catch_up_no_progress_threshold: u8 = 3;
+const startup_catch_up_quarantine_base_ms: u64 = 30 * std.time.ms_per_s;
+const startup_catch_up_quarantine_max_ms: u64 = 10 * std.time.s_per_min * std.time.ms_per_s;
 const artifact_repair_max_groups_per_request: usize = 64;
 const restore_trash_dir_name = ".antfly-restore-trash";
 // Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
@@ -86,6 +89,10 @@ const auto_bulk_ingest_finish_options: backend_types.BulkIngestFinishOptions = .
     .max_deferred_l0_runs = 64,
     .max_deferred_hbc_leaf_splits_per_publish = auto_bulk_ingest_max_hbc_leaf_splits_per_publish,
 };
+
+fn startupCatchUpMonotonicMs() u64 {
+    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+}
 const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const replicated_apply_writer_open_retry_ns: u64 = 10 * std.time.ns_per_ms;
 
@@ -4202,6 +4209,10 @@ pub const ProvisionedTableWriteSource = struct {
         cleared_debt: bool = false,
         terminal_degraded: bool = false,
         busy: bool = false,
+        made_progress: bool = false,
+        quarantined: bool = false,
+        quarantine_retry_scheduled: bool = false,
+        retry_at_ms: u64 = 0,
     };
 
     pub const LocalChangeKind = enum {
@@ -4280,6 +4291,8 @@ pub const ProvisionedTableWriteSource = struct {
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     dirty_write_all_tables: std.atomic.Value(bool) = .init(false),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
+    startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
+    startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     dirty_write_table_hashes: [max_cached_write_tables]u64 = [_]u64{0} ** max_cached_write_tables,
     dirty_write_table_hashes_len: usize = 0,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
@@ -4295,6 +4308,11 @@ pub const ProvisionedTableWriteSource = struct {
         structural_reconcile_active: bool = false,
         structural_reconcile_waiters: usize = 0,
         restore_preparations: usize = 0,
+    };
+
+    const StartupCatchUpBackoff = struct {
+        consecutive_no_progress: u8 = 0,
+        retry_at_ms: u64 = 0,
     };
 
     const WriteCoalesceQueue = struct {
@@ -4485,6 +4503,10 @@ pub const ProvisionedTableWriteSource = struct {
         self.freeRestoreRepairCompletions();
         self.freeStructuralReconcileTables();
         self.freeWriteCoalesceQueues();
+        lockAtomic(&self.startup_catch_up_backoff_mutex);
+        self.startup_catch_up_backoffs.deinit(std.heap.page_allocator);
+        self.startup_catch_up_backoffs = .empty;
+        self.startup_catch_up_backoff_mutex.unlock();
         self.table_activity_mutex.lockUncancelable(io);
         for (self.active_table_activities.items) |entry| {
             std.heap.page_allocator.free(entry.table_name);
@@ -6358,6 +6380,14 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_write_owner) |owner| {
             return try owner.catchUpTableGroupBestEffortWithMetadata(alloc, group_id, table_name, metadata);
         }
+        const now_ms = startupCatchUpMonotonicMs();
+        if (self.startupCatchUpRetryAt(group_id, now_ms)) |retry_at_ms| {
+            return .{
+                .had_debt = true,
+                .quarantined = true,
+                .retry_at_ms = retry_at_ms,
+            };
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const lsm_root_generation = self.visibleRootGeneration(group_id);
@@ -6380,9 +6410,14 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         self.local_db_mutex.unlock();
+        var preserve_startup_cache = false;
+        errdefer {
+            var failed_result = StartupCatchUpResult{ .had_debt = true };
+            self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), &failed_result);
+        }
         defer {
             lockAtomic(&self.local_db_mutex);
-            self.clearStartupWriteCacheLocked();
+            if (!preserve_startup_cache) self.clearStartupWriteCacheLocked();
             self.local_db_mutex.unlock();
             self.endGroupOperation(table_name, group_id);
         }
@@ -6514,9 +6549,60 @@ pub const ProvisionedTableWriteSource = struct {
             db,
             configured_indexes,
         );
-        const result = try catchUpManagedDb(self, alloc, group_id, table_name, db);
+        var result = try catchUpManagedDb(self, alloc, group_id, table_name, db);
         try publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db);
+        self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), &result);
+        preserve_startup_cache = result.had_debt and !result.cleared_debt and
+            !result.terminal_degraded and !result.busy and !result.made_progress;
         return result;
+    }
+
+    fn startupCatchUpRetryAt(self: *ProvisionedTableWriteSource, group_id: u64, now_ms: u64) ?u64 {
+        lockAtomic(&self.startup_catch_up_backoff_mutex);
+        defer self.startup_catch_up_backoff_mutex.unlock();
+        const state = self.startup_catch_up_backoffs.get(group_id) orelse return null;
+        if (state.retry_at_ms == 0 or now_ms >= state.retry_at_ms) return null;
+        return state.retry_at_ms;
+    }
+
+    pub fn clearStartupCatchUpBackoffs(self: *ProvisionedTableWriteSource) void {
+        lockAtomic(&self.startup_catch_up_backoff_mutex);
+        defer self.startup_catch_up_backoff_mutex.unlock();
+        self.startup_catch_up_backoffs.deinit(std.heap.page_allocator);
+        self.startup_catch_up_backoffs = .empty;
+    }
+
+    fn updateStartupCatchUpBackoff(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        now_ms: u64,
+        result: *StartupCatchUpResult,
+    ) void {
+        lockAtomic(&self.startup_catch_up_backoff_mutex);
+        defer self.startup_catch_up_backoff_mutex.unlock();
+        if (result.busy) return;
+        if (!result.had_debt or result.cleared_debt or result.made_progress) {
+            _ = self.startup_catch_up_backoffs.remove(group_id);
+            return;
+        }
+
+        const entry = self.startup_catch_up_backoffs.getOrPut(std.heap.page_allocator, group_id) catch return;
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.consecutive_no_progress +|= 1;
+        if (entry.value_ptr.consecutive_no_progress < startup_catch_up_no_progress_threshold) return;
+
+        const exponent = @min(
+            entry.value_ptr.consecutive_no_progress - startup_catch_up_no_progress_threshold,
+            8,
+        );
+        const delay_ms = @min(
+            startup_catch_up_quarantine_base_ms << @intCast(exponent),
+            startup_catch_up_quarantine_max_ms,
+        );
+        entry.value_ptr.retry_at_ms = now_ms +| delay_ms;
+        result.quarantined = true;
+        result.quarantine_retry_scheduled = true;
+        result.retry_at_ms = entry.value_ptr.retry_at_ms;
     }
 
     pub fn runLsmMaintenanceRound(self: *ProvisionedTableWriteSource) !bool {
@@ -15257,6 +15343,15 @@ fn catchUpManagedDb(
 
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts: usize = 0;
+    var made_progress = false;
+    defer if (made_progress) {
+        // Only retire shared handles after this isolated owner changed durable
+        // state. Zero-progress retries must keep their cached owner so the next
+        // observation cannot reopen and rebuild the same DB from scratch.
+        source.invalidateReadCache(table_name);
+        source.invalidateWriteCacheForTable(table_name);
+        source.clearDirtyWriteTable(table_name);
+    };
     if (restore_repair_needed) {
         std.log.info("managed restore repair begin table={s} group_id={d}", .{ table_name, group_id });
         progress_ctx.phase = .artifact_rebuild;
@@ -15265,6 +15360,7 @@ fn catchUpManagedDb(
             std.log.warn("managed startup catch-up restore repair failed table={s} err={}", .{ table_name, err });
             return err;
         };
+        made_progress = repaired_restore_runtime;
         try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
         std.log.info("managed restore repair step complete table={s} group_id={d} repaired={}", .{ table_name, group_id, repaired_restore_runtime });
     } else if (had_debt) {
@@ -15297,6 +15393,11 @@ fn catchUpManagedDb(
             try runTestAfterStartupCatchUpReplayPassHook(db);
 
             const next_debt_signature = try startupReplayDebtSignature(alloc, db);
+            if (next_debt_signature.remaining < last_debt_signature.remaining or
+                next_debt_signature.applied_sum > last_debt_signature.applied_sum)
+            {
+                made_progress = true;
+            }
             if (next_debt_signature.remaining == 0) break;
             if (next_debt_signature.applied_sum <= last_debt_signature.applied_sum and next_debt_signature.target_sum <= last_debt_signature.target_sum) break;
             last_debt_signature = next_debt_signature;
@@ -15316,6 +15417,7 @@ fn catchUpManagedDb(
             std.log.warn("managed startup catch-up dense rebuild failed table={s} err={}", .{ table_name, err });
             return err;
         };
+        made_progress = made_progress or repaired_dense_artifacts > 0;
         if (repaired_dense_artifacts > 0) {
             db.runUntilIdle() catch |err| {
                 std.log.warn("managed startup catch-up dense rebuild idle drain failed table={s} err={}", .{ table_name, err });
@@ -15332,15 +15434,6 @@ fn catchUpManagedDb(
 
     if (repaired_restore_runtime) db.clearDenseHbcCaches();
 
-    // Startup catch-up mutates on-disk index/runtime state through an isolated
-    // DB instance. Drop shared cached handles for this table so future reads
-    // and writer-side status probes reopen against the updated state. Do not
-    // invalidate the startup cache here because `db` may still alias its live
-    // entry until the caller's deferred startup-cache clear runs.
-    source.invalidateReadCache(table_name);
-    source.invalidateWriteCacheForTable(table_name);
-    source.clearDirtyWriteTable(table_name);
-
     const after = db.listDerivedReplayDebt(alloc) catch |err| {
         std.log.warn("managed startup catch-up post-check debt failed table={s} err={}", .{ table_name, err });
         return err;
@@ -15355,6 +15448,7 @@ fn catchUpManagedDb(
             return .{
                 .had_debt = initial_repair_debt,
                 .cleared_debt = false,
+                .made_progress = made_progress,
             };
         }
     }
@@ -15365,6 +15459,7 @@ fn catchUpManagedDb(
         return .{
             .had_debt = initial_repair_debt,
             .cleared_debt = false,
+            .made_progress = made_progress,
         };
     }
     if (db.restoreRuntimeRepairNeeded() catch |err| {
@@ -15374,6 +15469,7 @@ fn catchUpManagedDb(
         return .{
             .had_debt = initial_repair_debt,
             .cleared_debt = false,
+            .made_progress = made_progress,
         };
     }
     if (try managedDbHasIndexLoadFailure(alloc, db)) {
@@ -15381,11 +15477,13 @@ fn catchUpManagedDb(
         return .{
             .had_debt = true,
             .terminal_degraded = true,
+            .made_progress = made_progress,
         };
     }
     return .{
         .had_debt = initial_repair_debt,
         .cleared_debt = had_debt or repaired_restore_runtime or repaired_dense_artifacts > 0,
+        .made_progress = made_progress or initial_repair_debt,
     };
 }
 
@@ -26640,6 +26738,49 @@ test "managed startup catch-up open disables optional runtimes and workers" {
     try std.testing.expect(db.ttl_runtime == null);
     try std.testing.expect(db.transaction_runtime == null);
     try std.testing.expect(db.text_merge_runtime == null);
+}
+
+test "managed startup catch-up quarantines repeated zero progress with bounded backoff" {
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-startup-catch-up-backoff", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    var first = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7001, 1_000, &first);
+    try std.testing.expect(!first.quarantined);
+
+    var second = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7001, 1_001, &second);
+    try std.testing.expect(!second.quarantined);
+
+    var third = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7001, 1_002, &third);
+    try std.testing.expect(third.quarantined);
+    try std.testing.expect(third.quarantine_retry_scheduled);
+    try std.testing.expectEqual(@as(u64, 31_002), third.retry_at_ms);
+    try std.testing.expectEqual(@as(?u64, 31_002), source.startupCatchUpRetryAt(7001, 2_000));
+    try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7001, 31_002));
+
+    var fourth = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7001, 31_002, &fourth);
+    try std.testing.expectEqual(@as(u64, 91_002), fourth.retry_at_ms);
+
+    var busy = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .busy = true };
+    source.updateStartupCatchUpBackoff(7001, 40_000, &busy);
+    try std.testing.expectEqual(@as(?u64, 91_002), source.startupCatchUpRetryAt(7001, 40_000));
+
+    var progress = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .made_progress = true };
+    source.updateStartupCatchUpBackoff(7001, 40_001, &progress);
+    try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7001, 40_001));
+
+    var terminal_attempt: usize = 0;
+    while (terminal_attempt < startup_catch_up_no_progress_threshold) : (terminal_attempt += 1) {
+        var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .terminal_degraded = true };
+        source.updateStartupCatchUpBackoff(7002, 50_000 + terminal_attempt, &terminal);
+        try std.testing.expectEqual(terminal_attempt + 1 == startup_catch_up_no_progress_threshold, terminal.quarantined);
+    }
+
+    source.clearStartupCatchUpBackoffs();
+    try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7002, 50_003));
 }
 
 test "managed startup catch-up uses provided indexes json without catalog fetch" {

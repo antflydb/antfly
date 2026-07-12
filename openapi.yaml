@@ -2863,11 +2863,13 @@ paths:
         - `overwrite`: Drop existing tables and restore from backup
 
 
-        The restore is asynchronous - this endpoint triggers the restore process
+        The endpoint stages and publishes locally owned table generations before
 
-        and returns immediately. The actual data restoration happens via the
+        returning. It returns `200` when every requested operation has reached a
 
-        reconciliation loop as shards are started.
+        terminal result and `202` when any table is still restoring or awaiting
+
+        a durability barrier.
       operationId: restore
       requestBody:
         required: true
@@ -2876,8 +2878,14 @@ paths:
             schema:
               $ref: '#/components/schemas/ClusterRestoreRequest'
       responses:
+        '200':
+          description: Restore processing reached terminal results for all requested tables
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterRestoreResponse'
         '202':
-          description: Restore triggered successfully
+          description: At least one table restore remains in progress or durability-pending
           content:
             application/json:
               schema:
@@ -10325,27 +10333,36 @@ components:
       allOf:
         - $ref: '#/components/schemas/BackupRequest'
     RestoreAcceptedResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - restore
       description: >
         An accepted restore. `triggered` means asynchronous restoration has
 
         started. `committed` means the new generation is published but its
 
         durability barrier has not yet been confirmed.
-      properties:
-        restore:
-          type: string
-          enum:
-            - triggered
-            - committed
-        durability:
-          type: string
-          enum:
-            - pending
-          description: Present only when `restore` is `committed`.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - restore
+          properties:
+            restore:
+              type: string
+              enum:
+                - triggered
+        - type: object
+          additionalProperties: false
+          required:
+            - restore
+            - durability
+          properties:
+            restore:
+              type: string
+              enum:
+                - committed
+            durability:
+              type: string
+              enum:
+                - pending
     RestoreCommittedDurableResponse:
       type: object
       additionalProperties: false

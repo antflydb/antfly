@@ -33,6 +33,11 @@ def _get_kwargs(
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
 ) -> ClusterRestoreResponse | Error | None:
+    if response.status_code == 200:
+        response_200 = ClusterRestoreResponse.from_dict(response.json())
+
+        return response_200
+
     if response.status_code == 202:
         response_202 = ClusterRestoreResponse.from_dict(response.json())
 
@@ -79,9 +84,10 @@ def sync_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The endpoint stages and publishes locally owned table generations before
+    returning. It returns `200` when every requested operation has reached a
+    terminal result and `202` when any table is still restoring or awaiting
+    a durability barrier.
 
     Args:
         body (ClusterRestoreRequest):
@@ -119,9 +125,10 @@ def sync(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The endpoint stages and publishes locally owned table generations before
+    returning. It returns `200` when every requested operation has reached a
+    terminal result and `202` when any table is still restoring or awaiting
+    a durability barrier.
 
     Args:
         body (ClusterRestoreRequest):
@@ -154,9 +161,10 @@ async def asyncio_detailed(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The endpoint stages and publishes locally owned table generations before
+    returning. It returns `200` when every requested operation has reached a
+    terminal result and `202` when any table is still restoring or awaiting
+    a durability barrier.
 
     Args:
         body (ClusterRestoreRequest):
@@ -192,9 +200,10 @@ async def asyncio(
     - `skip_if_exists`: Skip existing tables and restore the rest
     - `overwrite`: Drop existing tables and restore from backup
 
-    The restore is asynchronous - this endpoint triggers the restore process
-    and returns immediately. The actual data restoration happens via the
-    reconciliation loop as shards are started.
+    The endpoint stages and publishes locally owned table generations before
+    returning. It returns `200` when every requested operation has reached a
+    terminal result and `202` when any table is still restoring or awaiting
+    a durability barrier.
 
     Args:
         body (ClusterRestoreRequest):

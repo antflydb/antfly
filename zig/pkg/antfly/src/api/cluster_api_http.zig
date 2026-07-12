@@ -41,6 +41,11 @@ pub const ClusterApi = struct {
         InternalFailure,
     };
 
+    pub const RestoreExecution = struct {
+        status: u16,
+        body: []u8,
+    };
+
     pub const VTable = struct {
         execute_cluster_backup_list: *const fn (
             ptr: *anyopaque,
@@ -59,7 +64,7 @@ pub const ClusterApi = struct {
             req: backups_api.ClusterRestoreRequest,
             location: *backups_api.BackupLocation,
             restore_mode: []const u8,
-        ) ExecuteRestoreError![]u8,
+        ) ExecuteRestoreError!RestoreExecution,
     };
 
     pub fn executeClusterBackupList(
@@ -85,7 +90,7 @@ pub const ClusterApi = struct {
         req: backups_api.ClusterRestoreRequest,
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
-    ) ExecuteRestoreError![]u8 {
+    ) ExecuteRestoreError!RestoreExecution {
         return try self.vtable.execute_cluster_restore(self.ptr, alloc, req, location, restore_mode);
     }
 };
@@ -164,12 +169,12 @@ pub fn handleClusterRestore(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
 
-    const response_body = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
+    const result = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
-    return .{ .status = 202, .body = response_body };
+    return .{ .status = result.status, .body = result.body };
 }
