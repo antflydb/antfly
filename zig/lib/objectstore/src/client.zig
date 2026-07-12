@@ -126,6 +126,8 @@ pub const Client = struct {
     }
 
     pub fn listObjects(self: *Client, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
+        if (opts.max_keys == 0) return error.InvalidPageSize;
+        if (opts.start_after != null and opts.continuation_token != null) return error.AmbiguousContinuation;
         return try self.vtable.list_objects(self.ptr, self.allocator, bucket, opts);
     }
 };

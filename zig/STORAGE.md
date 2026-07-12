@@ -162,7 +162,14 @@ backup size. Local file transfer reuses the same `std.Io` runtime instead of
 constructing a scheduler for every artifact. Full-object downloads use bounded
 8 MiB range reads into an atomic temporary file and fence every range with the
 object's initial ETag, preventing both whole-object heap growth and mixed-version
-files when an archive is modified concurrently.
+files when an archive is modified concurrently. The filesystem provider keeps
+metadata and bytes in one versioned object envelope published by an atomic
+rename after syncing the staged file, performs range requests with positional
+`std.Io` reads, and serializes mutations with bounded striped advisory locks.
+Filesystems without lock
+support fail closed rather than weakening conditional writes. Upload staging
+lives outside the enumerable key namespace, so concurrent pagination cannot
+observe partial objects or internal temporary keys.
 
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the

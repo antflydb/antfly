@@ -18,23 +18,45 @@ const client_mod = @import("client.zig");
 const types = @import("types.zig");
 
 const multipart_part_size: usize = 5 * 1024 * 1024;
+const max_content_type_bytes: usize = 16 * 1024;
+const object_magic = "AFOBJ001";
+const object_header_len = object_magic.len + @sizeOf(u64) + @sizeOf(u32) + 64;
+const ObjectRange = struct { start: usize, end: usize };
 
 pub const FilesystemClient = struct {
     alloc: Allocator,
     root_dir: []u8,
+    io: std.Io,
+    io_impl: ?*std.Io.Threaded,
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !FilesystemClient {
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        try std.Io.Dir.cwd().createDirPath(io_impl.io(), root_dir);
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        return try initWithIoOwned(alloc, root_dir, io_impl.io(), io_impl);
+    }
+
+    pub fn initWithIo(alloc: Allocator, root_dir: []const u8, io: std.Io) !FilesystemClient {
+        return try initWithIoOwned(alloc, root_dir, io, null);
+    }
+
+    fn initWithIoOwned(alloc: Allocator, root_dir: []const u8, io: std.Io, io_impl: ?*std.Io.Threaded) !FilesystemClient {
+        try std.Io.Dir.cwd().createDirPath(io, root_dir);
         return .{
             .alloc = alloc,
             .root_dir = try alloc.dupe(u8, root_dir),
+            .io = io,
+            .io_impl = io_impl,
         };
     }
 
     pub fn deinit(self: *FilesystemClient) void {
         self.alloc.free(self.root_dir);
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.* = undefined;
     }
 
@@ -49,19 +71,19 @@ pub const FilesystemClient = struct {
     fn bucketExists(self: *FilesystemClient, bucket: []const u8) bool {
         const path = bucketRootAlloc(self.alloc, self.root_dir, bucket) catch return false;
         defer self.alloc.free(path);
-        return fileExists(path);
+        return fileExists(self.io, path);
     }
 
     fn makeBucket(self: *FilesystemClient, bucket: []const u8) !void {
         const objects_root = try objectRootAlloc(self.alloc, self.root_dir, bucket);
         defer self.alloc.free(objects_root);
-        const metadata_root = try metadataRootAlloc(self.alloc, self.root_dir, bucket);
-        defer self.alloc.free(metadata_root);
-
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        try std.Io.Dir.cwd().createDirPath(io_impl.io(), objects_root);
-        try std.Io.Dir.cwd().createDirPath(io_impl.io(), metadata_root);
+        const locks_root = try lockRootAlloc(self.alloc, self.root_dir, bucket);
+        defer self.alloc.free(locks_root);
+        const staging_root = try stagingRootAlloc(self.alloc, self.root_dir, bucket);
+        defer self.alloc.free(staging_root);
+        try std.Io.Dir.cwd().createDirPath(self.io, objects_root);
+        try std.Io.Dir.cwd().createDirPath(self.io, locks_root);
+        try std.Io.Dir.cwd().createDirPath(self.io, staging_root);
     }
 
     fn putObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
@@ -69,10 +91,9 @@ pub const FilesystemClient = struct {
 
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
         defer alloc.free(object_path);
-        const metadata_path = try metadataPathAlloc(alloc, self.root_dir, bucket, key);
-        defer alloc.free(metadata_path);
-
-        if (fileExists(object_path)) {
+        var object_lock = try lockObject(self.io, alloc, self.root_dir, bucket, key);
+        defer object_lock.deinit();
+        if (fileExists(self.io, object_path)) {
             var current = try self.statObject(alloc, bucket, key);
             defer current.deinit(alloc);
             if (opts.if_none_match) return error.PreconditionFailed;
@@ -83,18 +104,21 @@ pub const FilesystemClient = struct {
             return error.PreconditionFailed;
         }
 
-        try ensureParentDir(object_path);
-        try writeFileAtomically(object_path, body);
-        try ensureParentDir(metadata_path);
-        try writeOptionalStringAtomically(metadata_path, opts.content_type orelse "");
+        try ensureParentDir(self.io, object_path);
+        const etag = try sha256HexAlloc(alloc, body);
+        errdefer alloc.free(etag);
+        const staging_path = try stagingPathAlloc(alloc, self.root_dir, bucket);
+        defer alloc.free(staging_path);
+        try writeObjectAtomically(self.io, object_path, staging_path, body, etag, opts.content_type orelse "");
 
         return .{
-            .etag = try sha256HexAlloc(alloc, body),
+            .etag = etag,
         };
     }
 
     fn getObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
-        _ = opts.version_id;
+        if (opts.version_id != null) return error.VersioningUnsupported;
+        if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
         var meta = try self.statObject(alloc, bucket, key);
         errdefer meta.deinit(alloc);
 
@@ -104,21 +128,19 @@ pub const FilesystemClient = struct {
 
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
         defer alloc.free(object_path);
-        const raw = try readFileAlloc(alloc, object_path);
-        errdefer alloc.free(raw);
-
+        const total_len = std.math.cast(usize, meta.content_length) orelse return error.ObjectTooLarge;
         const part_range = if (opts.part_number) |part_number|
-            try computePartRange(raw.len, part_number)
+            try computePartRange(total_len, part_number)
         else
             null;
 
-        const body = if (opts.range) |range|
-            try dupeRangeAlloc(alloc, raw, range.offset, range.length)
+        const requested: ObjectRange = if (opts.range) |range|
+            try resolveRange(meta.content_length, range.offset, range.length)
         else if (part_range) |range|
-            try alloc.dupe(u8, raw[range.start..range.end])
+            .{ .start = range.start, .end = range.end }
         else
-            try alloc.dupe(u8, raw);
-        alloc.free(raw);
+            .{ .start = 0, .end = total_len };
+        const body = try readObjectRangeAlloc(self.io, alloc, object_path, requested.start, requested.end, meta.etag.?);
 
         meta.content_length = @intCast(body.len);
         return .{
@@ -157,59 +179,49 @@ pub const FilesystemClient = struct {
     fn statObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
         defer alloc.free(object_path);
-        const metadata_path = try metadataPathAlloc(alloc, self.root_dir, bucket, key);
-        defer alloc.free(metadata_path);
-
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const file_stat = try std.Io.Dir.cwd().statFile(io_impl.io(), object_path, .{});
-        const body = try readFileAlloc(alloc, object_path);
-        defer alloc.free(body);
-        const content_type = try readOptionalStringAlloc(alloc, metadata_path);
+        const file = try openFilePath(self.io, object_path);
+        defer file.close(self.io);
+        const file_stat = try file.stat(self.io);
+        var header = try readObjectHeader(alloc, self.io, file, file_stat.size);
+        defer header.deinit(alloc);
 
         return .{
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
-            .etag = try sha256HexAlloc(alloc, body),
-            .content_length = @intCast(file_stat.size),
-            .content_type = content_type,
+            .etag = try alloc.dupe(u8, &header.etag),
+            .content_length = header.content_length,
+            .content_type = if (header.content_type.len == 0) null else try alloc.dupe(u8, header.content_type),
             .last_modified_unix_ms = file_stat.mtime.toMilliseconds(),
         };
     }
 
     fn deleteObject(self: *FilesystemClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        if (opts.version_id != null) return error.VersioningUnsupported;
         const object_path = try objectPathAlloc(self.alloc, self.root_dir, bucket, key);
         defer self.alloc.free(object_path);
-        const metadata_path = try metadataPathAlloc(self.alloc, self.root_dir, bucket, key);
-        defer self.alloc.free(metadata_path);
-
+        var object_lock = try lockObject(self.io, self.alloc, self.root_dir, bucket, key);
+        defer object_lock.deinit();
         if (opts.if_match_etag) |expected| {
             var meta = try self.statObject(self.alloc, bucket, key);
             defer meta.deinit(self.alloc);
             if (meta.etag == null or !std.mem.eql(u8, meta.etag.?, expected)) return error.PreconditionFailed;
         }
 
-        try deleteFile(object_path);
-        deleteFile(metadata_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+        try deleteFile(self.io, object_path);
     }
 
     fn listObjects(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         const root = try objectRootAlloc(alloc, self.root_dir, bucket);
         defer alloc.free(root);
-        if (!fileExists(root)) {
+        if (!fileExists(self.io, root)) {
             return .{
                 .entries = try alloc.alloc(types.ListEntry, 0),
                 .common_prefixes = try alloc.alloc([]u8, 0),
             };
         }
 
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), root, .{ .iterate = true });
-        defer dir.close(io_impl.io());
+        var dir = try std.Io.Dir.cwd().openDir(self.io, root, .{ .iterate = true });
+        defer dir.close(self.io);
 
         var walker = try dir.walk(alloc);
         defer walker.deinit();
@@ -228,7 +240,7 @@ pub const FilesystemClient = struct {
             for (keys.items) |key| alloc.free(key);
             keys.deinit(alloc);
         }
-        while (try walker.next(io_impl.io())) |entry| {
+        while (try walker.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.startsWith(u8, entry.path, opts.prefix)) continue;
             try keys.append(alloc, try alloc.dupe(u8, entry.path));
@@ -353,10 +365,8 @@ fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
-fn fileExists(path: []const u8) bool {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    _ = std.Io.Dir.cwd().statFile(io_impl.io(), path, .{}) catch return false;
+fn fileExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return true;
 }
 
@@ -366,17 +376,40 @@ fn readFileAlloc(alloc: Allocator, path: []const u8) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(std.math.maxInt(usize)));
 }
 
-fn deleteFile(path: []const u8) !void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try std.Io.Dir.cwd().deleteFile(io_impl.io(), path);
+fn deleteFile(io: std.Io, path: []const u8) !void {
+    try std.Io.Dir.cwd().deleteFile(io, path);
 }
 
-fn ensureParentDir(path: []const u8) !void {
+fn ensureParentDir(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+}
+
+const ObjectLock = struct {
+    io: std.Io,
+    file: std.Io.File,
+
+    fn deinit(self: *ObjectLock) void {
+        self.file.unlock(self.io);
+        self.file.close(self.io);
+        self.* = undefined;
+    }
+};
+
+fn lockObject(io: std.Io, alloc: Allocator, root_dir: []const u8, bucket: []const u8, key: []const u8) !ObjectLock {
+    const path = try lockPathAlloc(alloc, root_dir, bucket, key);
+    defer alloc.free(path);
+    try ensureParentDir(io, path);
+
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.createFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().createFile(io, path, .{});
+    errdefer file.close(io);
+    // Conditional object mutations require an inter-process lock. Propagate
+    // FileLocksUnsupported rather than silently weakening compare-and-swap.
+    try file.lock(io, .exclusive);
+    return .{ .io = io, .file = file };
 }
 
 fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
@@ -410,30 +443,112 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
     }
 }
 
-fn writeOptionalStringAtomically(path: []const u8, value: []const u8) !void {
-    try writeFileAtomically(path, value);
-}
+const ObjectHeader = struct {
+    content_length: u64,
+    content_type: []u8,
+    etag: [64]u8,
+    data_offset: u64,
 
-fn readOptionalStringAlloc(alloc: Allocator, path: []const u8) !?[]u8 {
-    const raw = readFileAlloc(alloc, path) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    if (raw.len == 0) {
-        alloc.free(raw);
-        return null;
+    fn deinit(self: *ObjectHeader, alloc: Allocator) void {
+        alloc.free(self.content_type);
+        self.* = undefined;
     }
-    return raw;
+};
+
+fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
-fn dupeRangeAlloc(alloc: Allocator, bytes: []const u8, offset: u64, maybe_len: ?u64) ![]u8 {
-    if (offset > bytes.len) return error.InvalidRange;
-    const start: usize = @intCast(offset);
-    const end = if (maybe_len) |len|
-        @min(bytes.len, start + @as(usize, @intCast(len)))
+fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, body: []const u8, etag: []const u8, content_type: []const u8) !void {
+    if (etag.len != 64 or content_type.len > max_content_type_bytes) return error.InvalidObjectMetadata;
+
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
     else
-        bytes.len;
-    return try alloc.dupe(u8, bytes[start..end]);
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var file = if (std.fs.path.isAbsolute(tmp_path))
+            try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+        else
+            try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+
+        var fixed: [object_header_len]u8 = undefined;
+        @memcpy(fixed[0..object_magic.len], object_magic);
+        std.mem.writeInt(u64, fixed[object_magic.len..][0..8], @intCast(body.len), .little);
+        std.mem.writeInt(u32, fixed[object_magic.len + 8 ..][0..4], @intCast(content_type.len), .little);
+        @memcpy(fixed[object_magic.len + 12 ..], etag);
+
+        var buf: [4096]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try writer.interface.writeAll(&fixed);
+        try writer.interface.writeAll(content_type);
+        try writer.interface.writeAll(body);
+        try writer.end();
+        try file.sync(io);
+    }
+
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+}
+
+fn readObjectHeader(alloc: Allocator, io: std.Io, file: std.Io.File, file_size: u64) !ObjectHeader {
+    if (file_size < object_header_len) return error.CorruptObject;
+    var fixed: [object_header_len]u8 = undefined;
+    if (try file.readPositionalAll(io, &fixed, 0) != fixed.len) return error.CorruptObject;
+    if (!std.mem.eql(u8, fixed[0..object_magic.len], object_magic)) return error.UnsupportedObjectFormat;
+
+    const content_length = std.mem.readInt(u64, fixed[object_magic.len..][0..8], .little);
+    const content_type_len = std.mem.readInt(u32, fixed[object_magic.len + 8 ..][0..4], .little);
+    if (content_type_len > max_content_type_bytes) return error.CorruptObject;
+    const data_offset = std.math.add(u64, object_header_len, content_type_len) catch return error.CorruptObject;
+    const expected_size = std.math.add(u64, data_offset, content_length) catch return error.CorruptObject;
+    if (expected_size != file_size) return error.CorruptObject;
+
+    const content_type = try alloc.alloc(u8, content_type_len);
+    errdefer alloc.free(content_type);
+    if (content_type.len > 0 and try file.readPositionalAll(io, content_type, object_header_len) != content_type.len)
+        return error.CorruptObject;
+    var etag: [64]u8 = undefined;
+    @memcpy(&etag, fixed[object_magic.len + 12 ..]);
+    return .{
+        .content_length = content_length,
+        .content_type = content_type,
+        .etag = etag,
+        .data_offset = data_offset,
+    };
+}
+
+fn resolveRange(total_len: u64, offset: u64, maybe_len: ?u64) !ObjectRange {
+    if (offset > total_len or total_len > std.math.maxInt(usize)) return error.InvalidRange;
+    const end_u64 = if (maybe_len) |len|
+        @min(total_len, std.math.add(u64, offset, len) catch total_len)
+    else
+        total_len;
+    return .{ .start = @intCast(offset), .end = @intCast(end_u64) };
+}
+
+fn readObjectRangeAlloc(io: std.Io, alloc: Allocator, path: []const u8, start: usize, end: usize, expected_etag: []const u8) ![]u8 {
+    if (end < start) return error.InvalidRange;
+    const file = try openFilePath(io, path);
+    defer file.close(io);
+    const stat = try file.stat(io);
+    var header = try readObjectHeader(alloc, io, file, stat.size);
+    defer header.deinit(alloc);
+    if (!std.mem.eql(u8, &header.etag, expected_etag)) return error.PreconditionFailed;
+    if (end > header.content_length) return error.InvalidRange;
+
+    const body = try alloc.alloc(u8, end - start);
+    errdefer alloc.free(body);
+    const file_offset = std.math.add(u64, header.data_offset, start) catch return error.InvalidRange;
+    if (body.len > 0 and try file.readPositionalAll(io, body, file_offset) != body.len) return error.CorruptObject;
+    return body;
 }
 
 fn computePartRange(total_len: usize, part_number: u32) !struct { start: usize, end: usize } {
@@ -447,7 +562,7 @@ fn computePartRange(total_len: usize, part_number: u32) !struct { start: usize, 
 }
 
 fn partCount(content_length: u64) usize {
-    if (content_length == 0) return 1;
+    if (content_length == 0) return 0;
     return @intCast((content_length + multipart_part_size - 1) / multipart_part_size);
 }
 
@@ -463,29 +578,66 @@ fn sha256HexAlloc(alloc: Allocator, body: []const u8) ![]u8 {
 }
 
 fn bucketRootAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8) ![]u8 {
+    try validateBucket(bucket);
     return try std.fs.path.join(alloc, &.{ root_dir, "buckets", bucket });
 }
 
 fn objectRootAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8) ![]u8 {
+    try validateBucket(bucket);
     return try std.fs.path.join(alloc, &.{ root_dir, "buckets", bucket, "objects" });
 }
 
-fn metadataRootAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8) ![]u8 {
-    return try std.fs.path.join(alloc, &.{ root_dir, "buckets", bucket, "metadata" });
+fn lockRootAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8) ![]u8 {
+    try validateBucket(bucket);
+    return try std.fs.path.join(alloc, &.{ root_dir, "buckets", bucket, "locks" });
+}
+
+fn stagingRootAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8) ![]u8 {
+    try validateBucket(bucket);
+    return try std.fs.path.join(alloc, &.{ root_dir, "buckets", bucket, "staging" });
+}
+
+fn stagingPathAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8) ![]u8 {
+    const staging_root = try stagingRootAlloc(alloc, root_dir, bucket);
+    defer alloc.free(staging_root);
+    const basename = try std.fmt.allocPrint(alloc, "upload-{d}.tmp", .{uniqueNs()});
+    defer alloc.free(basename);
+    return try std.fs.path.join(alloc, &.{ staging_root, basename });
+}
+
+fn lockPathAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8, key: []const u8) ![]u8 {
+    const lock_root = try lockRootAlloc(alloc, root_dir, bucket);
+    defer alloc.free(lock_root);
+    // A bounded stripe set avoids retaining one lock inode for every object.
+    // Hash collisions only reduce write concurrency; they do not weaken CAS.
+    const stripe = std.hash.Wyhash.hash(0, key) & 0xfff;
+    const basename = try std.fmt.allocPrint(alloc, "stripe-{x}.lock", .{stripe});
+    defer alloc.free(basename);
+    return try std.fs.path.join(alloc, &.{ lock_root, basename });
 }
 
 fn objectPathAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8, key: []const u8) ![]u8 {
+    try validateKey(key);
     const object_root = try objectRootAlloc(alloc, root_dir, bucket);
     defer alloc.free(object_root);
     return try std.fs.path.join(alloc, &.{ object_root, key });
 }
 
-fn metadataPathAlloc(alloc: Allocator, root_dir: []const u8, bucket: []const u8, key: []const u8) ![]u8 {
-    const metadata_root = try metadataRootAlloc(alloc, root_dir, bucket);
-    defer alloc.free(metadata_root);
-    const basename = try std.fmt.allocPrint(alloc, "{s}.content_type", .{key});
-    defer alloc.free(basename);
-    return try std.fs.path.join(alloc, &.{ metadata_root, basename });
+fn validateBucket(bucket: []const u8) !void {
+    if (bucket.len == 0 or std.mem.eql(u8, bucket, ".") or std.mem.eql(u8, bucket, ".."))
+        return error.InvalidBucket;
+    if (std.mem.indexOfAny(u8, bucket, "/\\\x00") != null) return error.InvalidBucket;
+}
+
+fn validateKey(key: []const u8) !void {
+    if (key.len == 0 or std.fs.path.isAbsolute(key) or std.mem.indexOfScalar(u8, key, 0) != null)
+        return error.InvalidObjectKey;
+    var segments = std.mem.splitScalar(u8, key, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..") or
+            std.mem.indexOfScalar(u8, segment, '\\') != null)
+            return error.InvalidObjectKey;
+    }
 }
 
 fn lessEntry(_: void, lhs: types.ListEntry, rhs: types.ListEntry) bool {
@@ -549,6 +701,18 @@ test "filesystem client supports bucket/object lifecycle and file helpers" {
     try std.testing.expectEqualStrings("alpha", got.body);
     try std.testing.expectEqualStrings("text/plain", got.metadata.content_type.?);
 
+    var ranged = try client.getObject("docs", "nested/a.txt", .{ .range = .{ .offset = 1, .length = 3 } });
+    defer ranged.deinit(alloc);
+    try std.testing.expectEqualStrings("lph", ranged.body);
+    try std.testing.expectEqual(@as(u64, 3), ranged.metadata.content_length);
+
+    try std.testing.expectError(error.PreconditionFailed, client.putObject(
+        "docs",
+        "nested/a.txt",
+        "replacement",
+        .{ .if_match_etag = "stale" },
+    ));
+
     var attrs = try client.getObjectAttributes("docs", "nested/a.txt");
     defer attrs.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), attrs.parts.len);
@@ -569,4 +733,25 @@ test "filesystem client supports bucket/object lifecycle and file helpers" {
     const downloaded = try readFileAlloc(alloc, dst_path);
     defer alloc.free(downloaded);
     try std.testing.expectEqualStrings("beta", downloaded);
+}
+
+test "filesystem client rejects paths that escape its root" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "path-safety");
+    defer cleanupTmp(path);
+
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+
+    try std.testing.expectError(error.InvalidBucket, client.makeBucket("../outside"));
+    try std.testing.expectError(error.InvalidObjectKey, client.putObject("docs", "../outside", "no", .{}));
+    try std.testing.expectError(error.InvalidObjectKey, client.putObject("docs", "nested//outside", "no", .{}));
+    try std.testing.expectError(error.InvalidObjectKey, client.putObject("docs", "/outside", "no", .{}));
+    try std.testing.expectError(error.InvalidPageSize, client.listObjects("docs", .{ .max_keys = 0 }));
+    try std.testing.expectError(error.AmbiguousContinuation, client.listObjects("docs", .{
+        .start_after = "a",
+        .continuation_token = "b",
+    }));
 }
