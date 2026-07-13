@@ -106,7 +106,7 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
-        if (!self.config.enabled) return compute(context, caller_alloc);
+        if (!self.config.enabled) return self.computeUncached(caller_alloc, deadline_ns, context, compute);
 
         const io = self.io;
         self.mutex.lockUncancelable(io);
@@ -225,8 +225,6 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
-        if (!self.config.enabled) return compute(context, caller_alloc);
-
         const io = self.io;
         self.mutex.lockUncancelable(io);
         if (deadlineExpired(deadline_ns)) {
@@ -614,6 +612,70 @@ pub fn testInflightAdmissionBound() !void {
     try std.testing.expectEqual(@as(u64, 1), completed.uncached_computations);
     try std.testing.expectEqual(@as(usize, 0), completed.inflight);
     try std.testing.expectEqual(@as(u64, 2), compute.calls.load(.monotonic));
+}
+
+pub fn testDisabledCacheRetainsAdmissionBound() !void {
+    const BlockingCompute = struct {
+        calls: std.atomic.Value(u64) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            return try alloc.dupe(f32, &.{1});
+        }
+    };
+    const Worker = struct {
+        cache: *QueryEmbeddingCache,
+        budget: *cache_budget.CacheBudget,
+        compute: *BlockingCompute,
+        result: ?[]f32 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.cache.getOrCompute(
+                self.budget,
+                std.heap.page_allocator,
+                [_]u8{1} ** 32,
+                null,
+                self.compute,
+                BlockingCompute.run,
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var budget = cache_budget.CacheBudget.init(0);
+    var cache = QueryEmbeddingCache.init(std.heap.page_allocator, io, .{
+        .enabled = false,
+        .max_bytes = 0,
+        .max_inflight = 1,
+    });
+    defer cache.deinit(&budget);
+    var compute = BlockingCompute{};
+    var worker = Worker{ .cache = &cache, .budget = &budget, .compute = &compute };
+    const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+    try std.testing.expectError(
+        error.QueryEmbeddingOverloaded,
+        cache.getOrCompute(&budget, std.testing.allocator, [_]u8{2} ** 32, null, &compute, BlockingCompute.run),
+    );
+    try std.testing.expectEqual(@as(usize, 1), cache.stats(&budget).inflight);
+
+    compute.release.store(true, .release);
+    producer_thread.join();
+    defer if (worker.result) |result| std.heap.page_allocator.free(result);
+    try std.testing.expectEqual(@as(?anyerror, null), worker.err);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats(&budget).entries);
+}
+
+test "disabled query embedding cache retains provider admission" {
+    try testDisabledCacheRetainsAdmissionBound();
 }
 
 test "query embedding cache bounds distinct in-flight misses" {

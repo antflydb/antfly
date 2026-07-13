@@ -11636,7 +11636,7 @@ components:
             boost: 1.0
         semantic_search:
           type: string
-          maxLength: 1048576
+          x-antfly-max-utf8-bytes: 1048576
           description: >
             Natural language query for vector similarity search. Results are ranked by semantic similarity
 
@@ -11651,7 +11651,7 @@ components:
           example: artificial intelligence and machine learning applications
         embedding_template:
           type: string
-          maxLength: 65536
+          x-antfly-max-utf8-bytes: 65536
           description: >
             Optional Handlebars template for multimodal embedding of the semantic_search query.
 

@@ -1445,7 +1445,7 @@ components:
         enabled:
           type: boolean
           default: true
-          description: Enable query embedding result caching, concurrent miss coalescing, and provider admission control. When false, max_inflight is not enforced.
+          description: Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
         max_bytes_mb:
           type: integer
           minimum: 0

@@ -3216,6 +3216,7 @@ pub const ApiHttpServer = struct {
                 antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
                 inference_api_key: ?[]const u8,
+                io: std.Io,
 
                 fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                     return .{
@@ -3231,19 +3232,31 @@ pub const ApiHttpServer = struct {
                     messages: []const generating_runtime.ChatMessage,
                 ) !generating_runtime.GenerateResult {
                     const runner: *@This() = @ptrCast(@alignCast(ptr));
-                    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                    defer io_impl.deinit();
-                    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+                    var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
                     defer client.deinit();
                     return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
                 }
             };
-            var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
+            var generation_runner = QueryBuilderGenerationRunner{
+                .antfly_provider = self.antfly_provider,
+                .secret_store = self.cfg.secret_store,
+                .inference_api_key = self.cfg.inference_api_key,
+                .io = self.inferenceIo(),
+            };
             var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
             const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
                 error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
                 error.DocIdentityNamespaceMismatch => return try jsonErrorResponse(self.alloc, 503, "doc identity unavailable"),
-                else => return err,
+                error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
+                error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+                error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+                error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+                error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
+                error.Timeout => return try textResponse(self.alloc, 504, "query embedding timed out"),
+                else => {
+                    if (try queryEmbeddingOperationalResponse(self.alloc, err)) |operational_response| return operational_response;
+                    return err;
+                },
             };
             return try jsonResponse(self.alloc, response);
         }
@@ -3925,6 +3938,19 @@ pub const ApiHttpServer = struct {
                 return;
             },
             else => {
+                if (normalizeQueryEmbeddingOperationalError(err)) |normalized| {
+                    const message = switch (normalized) {
+                        error.QueryEmbeddingInputTooLarge => "query embedding input too large",
+                        error.QueryEmbeddingOverloaded => "query embedding overloaded",
+                        error.EmbedRateLimited => "query embedding rate limited",
+                        error.EmbedTransientFailure => "query embedding temporarily unavailable",
+                        error.EmbedUpstreamFailure => "query embedding provider failed",
+                        error.Timeout => "query embedding timed out",
+                        else => "query embedding failed",
+                    };
+                    try queue.status(alloc, task_id, context_id, "failed", message);
+                    return;
+                }
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
             },
@@ -4018,6 +4044,7 @@ pub const ApiHttpServer = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
+            io: std.Io,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -4033,14 +4060,17 @@ pub const ApiHttpServer = struct {
                 messages: []const generating_runtime.ChatMessage,
             ) !generating_runtime.GenerateResult {
                 const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+                var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
+        var generation_runner = RetrievalGenerationRunner{
+            .antfly_provider = self.antfly_provider,
+            .secret_store = self.cfg.secret_store,
+            .inference_api_key = self.cfg.inference_api_key,
+            .io = self.inferenceIo(),
+        };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -4050,7 +4080,14 @@ pub const ApiHttpServer = struct {
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return try textResponse(self.alloc, 400, "invalid retrieval agent request"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
+            error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
+            error.Timeout => return try textResponse(self.alloc, 504, "query embedding timed out"),
             else => {
+                if (try queryEmbeddingOperationalResponse(self.alloc, err)) |operational_response| return operational_response;
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
             },
@@ -10024,14 +10061,12 @@ fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.Http
     return try textResponse(alloc, 400, "invalid query request");
 }
 
-fn normalizePublicQueryParseError(err: anyerror) anyerror {
+pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
         error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
-        error.ModelNotFound,
-        error.OutOfMemory,
         error.Timeout,
         => err,
         error.EmbedRequestFailed,
@@ -10049,8 +10084,13 @@ fn normalizePublicQueryParseError(err: anyerror) anyerror {
         error.ConnectionTimedOut,
         error.Canceled,
         => error.EmbedTransientFailure,
-        else => error.InvalidQueryRequest,
+        else => null,
     };
+}
+
+fn normalizePublicQueryParseError(err: anyerror) anyerror {
+    if (err == error.ModelNotFound or err == error.OutOfMemory) return err;
+    return normalizeQueryEmbeddingOperationalError(err) orelse error.InvalidQueryRequest;
 }
 
 fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ InvalidQueryRequest, UnsupportedExactSort } {
@@ -11262,6 +11302,19 @@ fn retryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8
         .content_type = content_type,
         .headers = headers,
         .body = owned_body,
+    };
+}
+
+fn queryEmbeddingOperationalResponse(alloc: std.mem.Allocator, err: anyerror) !?http_common.HttpResponse {
+    const normalized = normalizeQueryEmbeddingOperationalError(err) orelse return null;
+    return switch (normalized) {
+        error.QueryEmbeddingInputTooLarge => try textResponse(alloc, 413, "query embedding input too large"),
+        error.QueryEmbeddingOverloaded => try retryableTextResponse(alloc, 429, "query embedding overloaded"),
+        error.EmbedRateLimited => try retryableTextResponse(alloc, 429, "query embedding rate limited"),
+        error.EmbedTransientFailure => try retryableTextResponse(alloc, 503, "query embedding temporarily unavailable"),
+        error.EmbedUpstreamFailure => try textResponse(alloc, 502, "query embedding provider failed"),
+        error.Timeout => try textResponse(alloc, 504, "query embedding timed out"),
+        else => null,
     };
 }
 

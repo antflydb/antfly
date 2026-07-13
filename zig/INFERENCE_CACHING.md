@@ -74,10 +74,12 @@ Authenticated requests use a principal scope. Anonymous and internal work use
 different domain tags, so a username cannot collide with either namespace.
 Callers never supply the complete cache namespace.
 
-File-backed stores are refreshed before reading their generation for a cache
-key. A rotated credential therefore changes the key before a hot sliding-TTL
-entry can be reused; the previous entry ages out normally without exposing
-secret material.
+File-backed stores refresh their metadata on the cache-key path at most once
+per second. The atomic fast path avoids a store lock and filesystem stat on
+every cache hit. Explicit secret writes and refreshes update the generation
+immediately; externally rotated files invalidate cache keys within the bounded
+refresh interval. Previous entries age out normally without exposing secret
+material.
 
 Text is not trimmed, lowercased, or whitespace-normalized. Those changes can
 alter tokenizer output. Templated and multimodal queries currently bypass the
@@ -154,7 +156,9 @@ inference:
 ```
 
 `max_bytes_mb: 0` disables result retention while preserving singleflight.
-`enabled: false` bypasses both caching and singleflight.
+`enabled: false` bypasses retention and singleflight while preserving the
+`max_inflight` provider admission bound. This allows operators to disable
+cache reuse without removing overload protection.
 
 `max_inflight` bounds all query embedding provider computations before provider
 pacing and local inference queueing. Requests for a cacheable key already in
@@ -175,6 +179,10 @@ internal security domain rather than any public principal namespace.
 Authenticated query-builder validation and retrieval-agent execution derive
 their cache namespace from the authenticated principal. Anonymous, principal,
 and trusted internal work cannot share cache entries or in-flight results.
+Agent generation and retrieval use the server-owned backend runtime I/O rather
+than creating request-scoped thread pools. Operational embedding failures are
+reported consistently as 413, 429, 502, 503, or 504 responses; retryable HTTP
+responses include `Retry-After`, and A2A tasks receive a sanitized failed state.
 
 Plain and templated semantic query text is limited to 1 MiB of UTF-8 input, and
 user-supplied embedding templates are limited to 64 KiB. Both limits are checked

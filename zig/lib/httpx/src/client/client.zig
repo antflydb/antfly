@@ -2740,6 +2740,33 @@ const python_tls_fixed_keepalive_server_script =
     "            continue\n" ++
     "listener.close()\n";
 
+const python_slow_drip_server_script =
+    "import socket\n" ++
+    "import sys\n" ++
+    "import time\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
+    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.listen(1)\n" ++
+    "conn, _ = listener.accept()\n" ++
+    "with conn:\n" ++
+    "    data = b''\n" ++
+    "    while b'\\r\\n\\r\\n' not in data:\n" ++
+    "        chunk = conn.recv(4096)\n" ++
+    "        if not chunk:\n" ++
+    "            break\n" ++
+    "        data += chunk\n" ++
+    "    conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 10\\r\\nConnection: close\\r\\n\\r\\n')\n" ++
+    "    try:\n" ++
+    "        for _ in range(10):\n" ++
+    "            conn.sendall(b'x')\n" ++
+    "            time.sleep(0.05)\n" ++
+    "    except (BrokenPipeError, ConnectionResetError):\n" ++
+    "        pass\n" ++
+    "listener.close()\n";
+
 fn reserveEphemeralPort(io: Io) !u16 {
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try socket_mod.TcpListener.init(listen_addr, io);
@@ -2757,6 +2784,41 @@ fn getWithRetry(client: *Client, io: Io, url: []const u8, max_attempts: usize) !
         };
     }
     unreachable;
+}
+
+test "request timeout is absolute across a slow-drip response" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_slow_drip_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 120, .read_ms = 1_000, .write_ms = 1_000 },
+    });
+    defer client.deinit();
+
+    try std.testing.expectError(error.Timeout, getWithRetry(&client, io, url, 20));
 }
 
 test "HTTPS client round trip via local TLS server" {

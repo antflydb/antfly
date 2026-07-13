@@ -659,7 +659,7 @@ pub const ModelsResponse = struct {
 
 /// Process-local cache for dense query embeddings. Cache lookup and singleflight happen before provider pacing and local inference queueing. Entries are isolated by the server-derived security domain and effective embedding operation. Templated and multimodal queries bypass retention and singleflight but share the max_inflight provider admission bound.
 pub const QueryEmbeddingCacheConfig = struct {
-    /// Enable query embedding result caching, concurrent miss coalescing, and provider admission control. When false, max_inflight is not enforced.
+    /// Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
     enabled: ?bool = null,
     /// Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
     max_bytes_mb: ?i64 = null,

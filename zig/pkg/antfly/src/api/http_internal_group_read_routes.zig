@@ -62,6 +62,47 @@ fn parseQueryPreflightRequest(
     };
 }
 
+fn queryEmbeddingOperationalResponse(alloc: std.mem.Allocator, err: anyerror) !?http_common.HttpResponse {
+    const normalized = normalizeQueryEmbeddingOperationalError(err) orelse return null;
+    return switch (normalized) {
+        error.QueryEmbeddingInputTooLarge => try http_route_helpers.textResponse(alloc, 413, "query embedding input too large"),
+        error.QueryEmbeddingOverloaded => try http_route_helpers.textResponse(alloc, 429, "query embedding overloaded"),
+        error.EmbedRateLimited => try http_route_helpers.textResponse(alloc, 429, "query embedding rate limited"),
+        error.EmbedTransientFailure => try http_route_helpers.textResponse(alloc, 503, "query embedding temporarily unavailable"),
+        error.EmbedUpstreamFailure => try http_route_helpers.textResponse(alloc, 502, "query embedding provider failed"),
+        error.Timeout => try http_route_helpers.textResponse(alloc, 504, "query embedding timed out"),
+        else => null,
+    };
+}
+
+fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
+    return switch (err) {
+        error.QueryEmbeddingInputTooLarge,
+        error.QueryEmbeddingOverloaded,
+        error.EmbedRateLimited,
+        error.EmbedTransientFailure,
+        error.EmbedUpstreamFailure,
+        error.Timeout,
+        => err,
+        error.EmbedRequestFailed,
+        error.EmptyEmbeddingResponse,
+        error.InvalidEmbeddingResponse,
+        error.InvalidEmbeddingDimensions,
+        error.SecretNotFound,
+        => error.EmbedUpstreamFailure,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.ConnectionTimedOut,
+        error.Canceled,
+        => error.EmbedTransientFailure,
+        else => null,
+    };
+}
+
 pub const CatalogSource = struct {
     ptr: *anyopaque,
     admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
@@ -677,7 +718,10 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() orelse return try http_route_helpers.textResponse(alloc, 400, "UnsupportedQueryRequest") };
             var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), query_route.table_name, req.body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
-                else => return err,
+                else => {
+                    if (try queryEmbeddingOperationalResponse(alloc, err)) |response| return response;
+                    return err;
+                },
             };
             defer query_req.deinit(alloc);
             ctx.query_router.route(query_route.table_name, &query_req.req) catch |err| switch (err) {
@@ -752,7 +796,10 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() orelse return try http_route_helpers.textResponse(alloc, 400, "UnsupportedQueryRequest") };
             var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), query_route.table_name, preflight_req.query_request_body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
-                else => return err,
+                else => {
+                    if (try queryEmbeddingOperationalResponse(alloc, err)) |response| return response;
+                    return err;
+                },
             };
             defer query_req.deinit(alloc);
             ctx.query_router.route(query_route.table_name, &query_req.req) catch |err| switch (err) {

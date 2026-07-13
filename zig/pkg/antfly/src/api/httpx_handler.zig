@@ -139,6 +139,22 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn respondQueryEmbeddingOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        const normalized = http_server_mod.normalizeQueryEmbeddingOperationalError(err) orelse return null;
+        const response = switch (normalized) {
+            error.QueryEmbeddingInputTooLarge => .{ @as(u16, 413), "query embedding input too large", false },
+            error.QueryEmbeddingOverloaded => .{ @as(u16, 429), "query embedding overloaded", true },
+            error.EmbedRateLimited => .{ @as(u16, 429), "query embedding rate limited", true },
+            error.EmbedTransientFailure => .{ @as(u16, 503), "query embedding temporarily unavailable", true },
+            error.EmbedUpstreamFailure => .{ @as(u16, 502), "query embedding provider failed", false },
+            error.Timeout => .{ @as(u16, 504), "query embedding timed out", false },
+            else => return null,
+        };
+        if (response[2]) try ctx.setHeader("Retry-After", "1");
+        _ = ctx.status(response[0]);
+        return try ctx.text(response[1]);
+    }
+
     const OffloadedTableBatch = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -1281,6 +1297,7 @@ pub const AntflyApiHandler = struct {
         const QueryBuilderGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            io: std.Io,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                 return .{
@@ -1296,14 +1313,16 @@ pub const AntflyApiHandler = struct {
                 messages: []const generating_runtime.ChatMessage,
             ) !generating_runtime.GenerateResult {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+                var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = QueryBuilderGenerationRunner{
+            .antfly_provider = self.api_server.antfly_provider,
+            .secret_store = self.api_server.cfg.secret_store,
+            .io = self.api_server.inferenceIo(),
+        };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
             error.InvalidQueryBuilderRequest => {
@@ -1314,7 +1333,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("doc identity unavailable");
             },
-            else => return err,
+            else => {
+                if (try respondQueryEmbeddingOperationalError(ctx, err)) |operational_response| return operational_response;
+                return err;
+            },
         };
         return ctx.json(response);
     }
@@ -1413,6 +1435,7 @@ pub const AntflyApiHandler = struct {
         const RetrievalGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            io: std.Io,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -1428,14 +1451,16 @@ pub const AntflyApiHandler = struct {
                 messages: []const generating_runtime.ChatMessage,
             ) !generating_runtime.GenerateResult {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+                var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{
+            .antfly_provider = self.api_server.antfly_provider,
+            .secret_store = self.api_server.cfg.secret_store,
+            .io = self.api_server.inferenceIo(),
+        };
 
         var query_runner = RetrievalQueryRunner{
             .server = self.api_server,
@@ -1456,6 +1481,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("doc identity unavailable");
             },
             else => {
+                if (try respondQueryEmbeddingOperationalError(ctx, err)) |response| return response;
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
             },

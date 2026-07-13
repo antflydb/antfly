@@ -5721,7 +5721,7 @@ components:
             boost: 1.0
         semantic_search:
           type: string
-          maxLength: 1048576
+          x-antfly-max-utf8-bytes: 1048576
           description: |
             Natural language query for vector similarity search. Results are ranked by semantic similarity
             to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
@@ -5732,7 +5732,7 @@ components:
           example: "artificial intelligence and machine learning applications"
         embedding_template:
           type: string
-          maxLength: 65536
+          x-antfly-max-utf8-bytes: 65536
           description: |
             Optional Handlebars template for multimodal embedding of the semantic_search query.
             The template has access to `this` which contains the semantic_search string value.

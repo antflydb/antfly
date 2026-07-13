@@ -176,6 +176,7 @@ pub const QueryTemplateError = error{
 const default_pacing_burst: u32 = 1;
 const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
 const max_embedding_request_timeout_ms: u64 = 30_000;
+const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
 fn monotonicNowNs() u64 {
@@ -710,7 +711,9 @@ pub const ManagedEmbedder = struct {
     ) ![32]u8 {
         const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse or entry.multimodal) return error.QueryEmbeddingNotCacheable;
-        if (entry.secret_store) |store| _ = try store.refreshIfChanged();
+        if (entry.secret_store) |store| {
+            _ = try store.refreshIfChangedThrottled(query_cache_secret_refresh_interval_ns);
+        }
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hashQueryCacheField(&hasher, "antfly-query-embedding-v1");
@@ -724,7 +727,7 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
         hashQueryCacheSecretIdentity(&hasher, entry.api_key);
-        hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generation() else 0);
+        hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
         hashQueryCacheField(&hasher, text);
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
@@ -2974,6 +2977,7 @@ pub fn testFileBackedApiKeyRotation() !void {
         .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"second-key-longer\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
     });
 
+    _ = try secret_store.refreshIfChanged();
     const rotated_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
     try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &rotated_cache_key));
 
