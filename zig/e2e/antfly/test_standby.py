@@ -956,7 +956,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert rejected.status_code >= 400, rejected.text
     with pytest.raises(requests.HTTPError) as missing_old_primary_doc:
-        ha_cluster.primary.lookup_key(table_name, "doc:old-primary")
+        # The fenced node is no longer authoritative. Ask explicitly for its
+        # retained local generation to verify that the rejected write did not
+        # reach storage; the default read-index mode must remain unavailable.
+        ha_cluster.primary.lookup_key(table_name, "doc:old-primary", consistency="stale")
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
 

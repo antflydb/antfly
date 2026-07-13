@@ -4289,13 +4289,11 @@ pub const ProvisionedTableWriteSource = struct {
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
-    dirty_write_all_tables: std.atomic.Value(bool) = .init(false),
+    dirty_write_tables: std.StringHashMapUnmanaged(void) = .empty,
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
     startup_catch_up_backoff_epoch: std.atomic.Value(u64) = .init(1),
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
-    dirty_write_table_hashes: [max_cached_write_tables]u64 = [_]u64{0} ** max_cached_write_tables,
-    dirty_write_table_hashes_len: usize = 0,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
 
     const TableActivity = struct {
@@ -4508,6 +4506,11 @@ pub const ProvisionedTableWriteSource = struct {
         self.startup_catch_up_backoffs.deinit(std.heap.page_allocator);
         self.startup_catch_up_backoffs = .empty;
         self.startup_catch_up_backoff_mutex.unlock();
+        lockAtomic(&self.dirty_write_tables_mutex);
+        self.clearAllDirtyWriteTablesLocked();
+        self.dirty_write_tables.deinit(std.heap.page_allocator);
+        self.dirty_write_tables = .empty;
+        self.dirty_write_tables_mutex.unlock();
         self.table_activity_mutex.lockUncancelable(io);
         for (self.active_table_activities.items) |entry| {
             std.heap.page_allocator.free(entry.table_name);
@@ -7718,20 +7721,16 @@ pub const ProvisionedTableWriteSource = struct {
         alloc.destroy(lease_ctx);
     }
 
-    fn writeCacheTableHash(table_name: []const u8) u64 {
-        return std.hash.Wyhash.hash(0, table_name);
+    fn hasDirtyWriteTableLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        return self.dirty_write_tables.contains(table_name);
     }
 
-    fn hasDirtyWriteTableLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const table_hash = writeCacheTableHash(table_name);
-        for (self.dirty_write_table_hashes[0..self.dirty_write_table_hashes_len]) |candidate| {
-            if (candidate == table_hash) return true;
-        }
-        return false;
+    fn publishDirtyWriteTableCountLocked(self: *ProvisionedTableWriteSource) void {
+        const count = self.dirty_write_tables.count();
+        self.dirty_write_table_count.store(@intCast(@min(count, std.math.maxInt(u32))), .release);
     }
 
     fn isWriteCacheDirtyForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        if (self.dirty_write_all_tables.load(.acquire)) return true;
         if (self.dirty_write_table_count.load(.acquire) == 0) return false;
         lockAtomic(&self.dirty_write_tables_mutex);
         defer self.dirty_write_tables_mutex.unlock();
@@ -7739,9 +7738,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn clearAllDirtyWriteTablesLocked(self: *ProvisionedTableWriteSource) void {
-        self.dirty_write_table_hashes_len = 0;
+        var keys = self.dirty_write_tables.keyIterator();
+        while (keys.next()) |table_name| std.heap.page_allocator.free(table_name.*);
+        self.dirty_write_tables.clearRetainingCapacity();
         self.dirty_write_table_count.store(0, .release);
-        self.dirty_write_all_tables.store(false, .release);
     }
 
     fn clearAllDirtyWriteTables(self: *ProvisionedTableWriteSource) void {
@@ -7753,25 +7753,13 @@ pub const ProvisionedTableWriteSource = struct {
     fn clearDirtyWriteTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.dirty_write_tables_mutex);
         defer self.dirty_write_tables_mutex.unlock();
-        const table_hash = writeCacheTableHash(table_name);
-        var i: usize = 0;
-        while (i < self.dirty_write_table_hashes_len) {
-            if (self.dirty_write_table_hashes[i] != table_hash) {
-                i += 1;
-                continue;
-            }
-            self.dirty_write_table_hashes_len -= 1;
-            self.dirty_write_table_hashes[i] = self.dirty_write_table_hashes[self.dirty_write_table_hashes_len];
-            break;
+        if (self.dirty_write_tables.fetchRemove(table_name)) |removed| {
+            std.heap.page_allocator.free(removed.key);
         }
-        self.dirty_write_table_count.store(@intCast(self.dirty_write_table_hashes_len), .release);
+        self.publishDirtyWriteTableCountLocked();
     }
 
     fn hasDirtyWriteTableWithLocalDbLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        if (self.dirty_write_all_tables.load(.acquire)) {
-            const cache = self.write_cache orelse return false;
-            return cache.bulkIngestSessionOpenForTable(table_name) or cache.hasLiveEntryForTableLocked(table_name);
-        }
         if (self.dirty_write_table_count.load(.acquire) == 0) return false;
         const dirty = dirty_blk: {
             lockAtomic(&self.dirty_write_tables_mutex);
@@ -7794,41 +7782,24 @@ pub const ProvisionedTableWriteSource = struct {
     fn markWriteCacheDirty(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         if (self.write_cache == null) return;
         lockAtomic(&self.dirty_write_tables_mutex);
-        const table_hash = writeCacheTableHash(table_name);
-        for (self.dirty_write_table_hashes[0..self.dirty_write_table_hashes_len]) |candidate| {
-            if (candidate == table_hash) {
-                self.dirty_write_table_count.store(@intCast(self.dirty_write_table_hashes_len), .release);
-                self.dirty_write_tables_mutex.unlock();
-                return;
-            }
-        }
-        if (self.dirty_write_table_hashes_len >= self.dirty_write_table_hashes.len) {
-            // Preserve bounded, allocation-free tracking without making the
-            // conservative fallback permanent. While `all_tables` is true,
-            // readers treat every table as dirty. Clearing both dependent
-            // caches makes all previously tracked entries clean at once; the
-            // current mutation then becomes the sole exact dirty entry.
-            self.dirty_write_all_tables.store(true, .release);
-            if (self.read_cache) |cache| cache.clear();
-            if (self.runtime_status_cache) |cache| cache.clear();
-            self.dirty_write_table_hashes[0] = table_hash;
-            self.dirty_write_table_hashes_len = 1;
-            self.dirty_write_table_count.store(1, .release);
-            self.dirty_write_all_tables.store(false, .release);
+        if (self.hasDirtyWriteTableLocked(table_name)) {
             self.dirty_write_tables_mutex.unlock();
             return;
         }
-        self.dirty_write_table_hashes[self.dirty_write_table_hashes_len] = table_hash;
-        self.dirty_write_table_hashes_len += 1;
-        self.dirty_write_table_count.store(@intCast(self.dirty_write_table_hashes_len), .release);
+        // Own the name until successful publication/invalidation clears it.
+        // This allocation happens once per clean-to-dirty transition, while
+        // repeated writes to an already dirty table remain allocation-free.
+        const owned_table_name = std.heap.page_allocator.dupe(u8, table_name) catch
+            @panic("out of memory tracking dirty write tables");
+        self.dirty_write_tables.put(std.heap.page_allocator, owned_table_name, {}) catch {
+            std.heap.page_allocator.free(owned_table_name);
+            @panic("out of memory tracking dirty write tables");
+        };
+        self.publishDirtyWriteTableCountLocked();
         self.dirty_write_tables_mutex.unlock();
     }
 
     fn invalidateDirtyWriteCacheForRead(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        if (self.dirty_write_all_tables.load(.acquire)) {
-            self.invalidateWriteCache(table_name);
-            return;
-        }
         lockAtomic(&self.dirty_write_tables_mutex);
         const dirty = self.hasDirtyWriteTableLocked(table_name);
         self.dirty_write_tables_mutex.unlock();
@@ -17971,7 +17942,7 @@ test "provisioned native backup restore repeats through shared read and write ow
     }
 }
 
-test "dirty table tracking recovers after bounded overflow" {
+test "dirty table tracking preserves exact identities beyond the cache bound" {
     const alloc = std.testing.allocator;
     var source = ProvisionedTableWriteSource.init(
         "/tmp/unused-antfly-dirty-table-overflow",
@@ -17981,19 +17952,6 @@ test "dirty table tracking recovers after bounded overflow" {
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     source.write_cache = &write_cache;
-    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
-    defer read_cache.deinit();
-    source.read_cache = &read_cache;
-    const read_epoch_key = try alloc.dupe(u8, "table-0");
-    read_cache.table_epochs.put(alloc, read_epoch_key, 7) catch |err| {
-        alloc.free(read_epoch_key);
-        return err;
-    };
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-    source.runtime_status_cache = &snapshot_cache;
-    try snapshot_cache.upsertGroupStatus("table-0", .{ .group_id = 7001, .stats = .{} });
-
     var names: [max_cached_write_tables + 1][]u8 = undefined;
     var initialized: usize = 0;
     defer for (names[0..initialized]) |name| alloc.free(name);
@@ -18004,18 +17962,18 @@ test "dirty table tracking recovers after bounded overflow" {
 
     for (names[0..max_cached_write_tables]) |name| source.markWriteCacheDirty(name);
     try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
-    try std.testing.expectEqual(max_cached_write_tables, source.dirty_write_table_hashes_len);
+    try std.testing.expectEqual(@as(u32, max_cached_write_tables), source.dirty_write_table_count.load(.acquire));
 
     source.markWriteCacheDirty(names[max_cached_write_tables]);
-    try std.testing.expect(!source.dirty_write_all_tables.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), source.dirty_write_table_hashes_len);
-    try std.testing.expect(!source.isWriteCacheDirtyForTable(names[0]));
+    try std.testing.expectEqual(@as(u32, max_cached_write_tables + 1), source.dirty_write_table_count.load(.acquire));
+    try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
     try std.testing.expect(source.isWriteCacheDirtyForTable(names[max_cached_write_tables]));
-    try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("table-0").?);
-    try std.testing.expect((try snapshot_cache.snapshot(alloc, "table-0")) == null);
 
+    source.clearDirtyWriteTable(names[0]);
     source.clearDirtyWriteTable(names[max_cached_write_tables]);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable(names[0]));
     try std.testing.expect(!source.isWriteCacheDirtyForTable(names[max_cached_write_tables]));
+    try std.testing.expectEqual(@as(u32, max_cached_write_tables - 1), source.dirty_write_table_count.load(.acquire));
     source.markWriteCacheDirty(names[0]);
     try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
 }
