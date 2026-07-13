@@ -71,3 +71,63 @@ func TestClusterRestoreCarriesConnectionAndExposesDurableJobLifecycle(t *testing
 		t.Fatalf("CancelRestoreJob: %v", err)
 	}
 }
+
+func TestListRestoreJobsFollowsEmptyFilteredPages(t *testing.T) {
+	const job = `{"job_id":"42","attempt_id":1,"scope":"table","table_name":"docs","backup_id":"daily","phase":"running","cancel_requested":false,"published_table_count":0,"completed_table_count":0,"created_at_ms":1,"updated_at_ms":2}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet || r.URL.Path != "/db/v1/restore/jobs" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("phase") != "running" || r.URL.Query().Get("scope") != "table" {
+			t.Errorf("unexpected restore filters: %s", r.URL.RawQuery)
+		}
+		if r.URL.Query().Get("cursor") == "" {
+			_, _ = w.Write([]byte(`{"jobs":[],"next_cursor":"100"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"jobs":[` + job + `]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	jobs, err := client.ListRestoreJobs(context.Background(), RestoreJobListOptions{Phase: RestoreJobPhaseRunning, Scope: RestoreJobScopeTable})
+	if err != nil {
+		t.Fatalf("ListRestoreJobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].JobId != "42" {
+		t.Fatalf("jobs = %#v, want job 42", jobs)
+	}
+}
+
+func TestListBackupsPreservesAllResultsAcrossPages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet || r.URL.Path != "/db/v1/backups" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("cursor") == "" {
+			_, _ = w.Write([]byte(`{"backups":[{"backup_id":"a","timestamp":"2026-01-01T00:00:00Z","antfly_version":"1","tables":["docs"]}],"next_cursor":"page-2"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"backups":[{"backup_id":"b","timestamp":"2026-01-02T00:00:00Z","antfly_version":"1","tables":["docs"]}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	backups, err := client.ListBackups(context.Background(), "file:///backups")
+	if err != nil {
+		t.Fatalf("ListBackups: %v", err)
+	}
+	if len(backups) != 2 || backups[0].BackupID != "a" || backups[1].BackupID != "b" {
+		t.Fatalf("backups = %#v, want a and b", backups)
+	}
+}

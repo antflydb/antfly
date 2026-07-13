@@ -930,12 +930,15 @@ fn serviceSecretStore(service: anytype) ?*common_secrets.FileStore {
 }
 
 fn persistRestoreTableIntent(service: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8, secret_store: ?*common_secrets.FileStore) !void {
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    if (tables_api.findTableByName(&snapshot, table_name) != null) return error.TableAlreadyExists;
-
     var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, secret_store);
     defer spec.deinit(alloc);
+
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    if (tables_api.findTableByName(&snapshot, table_name)) |existing| {
+        if (!try metadata_table_manager.restoreIntentTopologyCompatible(alloc, existing.*, snapshot.ranges, spec.table, spec.ranges))
+            return error.TableAlreadyExists;
+    }
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
@@ -6254,23 +6257,31 @@ pub const ApiHttpServer = struct {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
             return self.source.restoreTable(alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
-                error.TableAlreadyExists => {
-                    // A leader can fail after atomically publishing the
-                    // catalog restore intent but before checkpointing the
-                    // durable public job. Adopt only the same restore intent;
-                    // both active and already-completed intents are safe after
-                    // a worker crash before its publication checkpoint.
-                    switch (self.distributedRestoreIntentState(table_name, location_uri, backup_id) catch return err) {
+                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
+                error.InvalidBackupRequest,
+                error.BackupManifestTooLarge,
+                error.UnsupportedBackupMigrationState,
+                error.UnsupportedBackupFormat,
+                error.UnsupportedMultiRangeTable,
+                error.TableNotFound,
+                error.UnsupportedOperation,
+                error.OutOfMemory,
+                => return err,
+                else => {
+                    // A reconciliation plan publishes the table and ranges as
+                    // separate proposals. Any error after one proposal may be
+                    // an interrupted exact restore intent, not a clean abort.
+                    switch (self.distributedRestoreIntentState(table_name, location_uri, backup_id) catch |state_err| switch (state_err) {
+                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return state_err,
+                        else => .missing,
+                    }) {
                         .pending, .completed => return true,
                         .missing, .conflicting => {},
                     }
-                    if (self.tableExists(table_name) catch true) return err;
                     if (attempt + 1 >= 3) return err;
-                    self.waitForTableVisibility(table_name, .absent) catch {};
-                    sleepNs(500 * std.time.ns_per_ms);
+                    sleepNs(100 * std.time.ns_per_ms);
                     continue;
                 },
-                else => return err,
             };
         }
         return false;
@@ -9433,6 +9444,9 @@ pub const ApiHttpServer = struct {
         scope: ?restore_jobs.Scope = null,
     };
 
+    const restore_job_public_scan_batch_size: usize = 64;
+    const restore_job_public_scan_budget: usize = 128;
+
     pub fn handlePublicListRestoreJobs(
         self: *ApiHttpServer,
         identity: ?AuthenticatedIdentity,
@@ -9449,11 +9463,22 @@ pub const ApiHttpServer = struct {
 
         var scan_cursor = options.cursor;
         var last_returned_sequence: ?u64 = null;
-        var has_more = false;
+        var continuation_cursor: ?u64 = null;
+        var scanned: usize = 0;
         scan: while (true) {
-            var batch = try self.restore_job_store.listBatch(self.alloc, scan_cursor, 64);
+            const remaining_budget = restore_job_public_scan_budget - scanned;
+            if (remaining_budget == 0) {
+                continuation_cursor = scan_cursor;
+                break;
+            }
+            var batch = try self.restore_job_store.listBatch(
+                self.alloc,
+                scan_cursor,
+                @min(restore_job_public_scan_batch_size, remaining_budget),
+            );
             defer batch.deinit(self.alloc);
             if (batch.records.len == 0) break;
+            scanned += batch.records.len;
             for (batch.records) |encoded| {
                 var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
@@ -9464,19 +9489,20 @@ pub const ApiHttpServer = struct {
                     if (!restoreJobStateAllowed(authenticated, state)) continue;
                 }
                 if (jobs.items.len == options.limit) {
-                    has_more = true;
+                    continuation_cursor = last_returned_sequence;
                     break :scan;
                 }
                 jobs.appendAssumeCapacity(try restoreJobViewFromStateAlloc(arena, state));
                 last_returned_sequence = state.enqueue_sequence;
             }
             scan_cursor = batch.next_scan_cursor orelse break;
+            if (scanned == restore_job_public_scan_budget) {
+                continuation_cursor = scan_cursor;
+                break;
+            }
         }
 
-        const next_cursor = if (has_more and last_returned_sequence != null)
-            try std.fmt.allocPrint(arena, "{d}", .{last_returned_sequence.?})
-        else
-            null;
+        const next_cursor = if (continuation_cursor) |value| try std.fmt.allocPrint(arena, "{d}", .{value}) else null;
         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 200, .{
             .jobs = jobs.items,
             .next_cursor = next_cursor,
@@ -25547,6 +25573,86 @@ test "restore job list paginates after authorization filtering" {
     try std.testing.expect(second_json.value.object.get("next_cursor") == null);
 }
 
+test "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges" {
+    const table = metadata_table_manager.TableRecord{ .table_id = 7, .name = "docs", .min_ranges = 2 };
+    const expected = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 101, .table_id = 7, .start_key = "", .end_key = "m", .restore_backup_id = "daily", .restore_location = "file:///backup", .restore_snapshot_path = "101" },
+        .{ .group_id = 102, .table_id = 7, .start_key = "m", .restore_backup_id = "daily", .restore_location = "file:///backup", .restore_snapshot_path = "102" },
+    };
+    try std.testing.expect(try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, expected[0..1], table, &expected));
+    try std.testing.expect(try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, &expected, table, &expected));
+
+    const foreign = [_]metadata_table_manager.RangeRecord{.{ .group_id = 103, .table_id = 7, .start_key = "" }};
+    try std.testing.expect(!try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, &foreign, table, &expected));
+    var changed = table;
+    changed.schema_json = "{\"version\":2}";
+    try std.testing.expect(!try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, changed, &.{}, table, &expected));
+}
+
+test "restore job list bounds authorization scans with an empty continuation page" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-job-list-budget");
+    server.restore_job_store.io = std.testing.io;
+
+    const visible = try server.restore_job_store.start(alloc, .{
+        .scope = .table,
+        .table_name = "docs",
+        .backup_id = "visible",
+        .location = "file:///backups",
+        .connection = "archive",
+        .idempotency_namespace = "principal:operator:table:docs",
+    });
+    alloc.free(visible);
+    for (0..ApiHttpServer.restore_job_public_scan_budget) |_| {
+        const hidden = try server.restore_job_store.start(alloc, .{
+            .scope = .table,
+            .table_name = "private",
+            .backup_id = "hidden",
+            .location = "file:///backups",
+            .connection = "archive",
+            .idempotency_namespace = "principal:operator:table:private",
+        });
+        alloc.free(hidden);
+    }
+
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .admin);
+    defer permission.deinit(alloc);
+    const identity = AuthenticatedIdentity{
+        .username = @constCast("operator"),
+        .permissions = @constCast((&[_]usermgr.Permission{permission})[0..]),
+    };
+
+    var first = try server.handlePublicListRestoreJobs(identity, .{ .limit = 1 });
+    defer first.deinit(alloc);
+    var first_json = try std.json.parseFromSlice(std.json.Value, alloc, first.body, .{});
+    defer first_json.deinit();
+    try std.testing.expectEqual(@as(usize, 0), first_json.value.object.get("jobs").?.array.items.len);
+    const cursor = try std.fmt.parseUnsigned(u64, first_json.value.object.get("next_cursor").?.string, 10);
+
+    var second = try server.handlePublicListRestoreJobs(identity, .{ .limit = 1, .cursor = cursor });
+    defer second.deinit(alloc);
+    var second_json = try std.json.parseFromSlice(std.json.Value, alloc, second.body, .{});
+    defer second_json.deinit();
+    const jobs = second_json.value.object.get("jobs").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqualStrings("visible", jobs[0].object.get("backup_id").?.string);
+}
+
 test "api http server backs up and restores a table through public routes" {
     const alloc = std.testing.allocator;
     const StoredTitle = struct {
@@ -26710,6 +26816,39 @@ test "api http server retries stale metadata table-exists restore race" {
     defer alloc.free(terminal_restore);
     try std.testing.expectEqual(@as(usize, 2), restore_source.attempts);
     try std.testing.expect(restore_source.restored);
+}
+
+test "api http server retries interrupted metadata restore publication" {
+    const RestoreSource = struct {
+        attempts: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.attempts == 1) return error.TestPublicationInterrupted;
+        }
+    };
+
+    var source = RestoreSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    try std.testing.expect(try server.restoreMetadataTableWithRetry(std.testing.allocator, "docs", "file:///backup", "daily"));
+    try std.testing.expectEqual(@as(usize, 2), source.attempts);
 }
 
 test "api http server restore metadata spec uses range-scoped restore intent" {

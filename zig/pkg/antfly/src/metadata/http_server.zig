@@ -1899,12 +1899,15 @@ fn serviceSecretStore(service_impl: anytype) ?*common_secrets.FileStore {
 }
 
 fn persistRestoreTableIntent(service_impl: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
-    var snapshot = try service_impl.adminSnapshot();
-    defer service_impl.freeAdminSnapshot(&snapshot);
-    if (findTableByName(&snapshot, table_name) != null) return error.TableAlreadyExists;
-
     var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, serviceSecretStore(service_impl));
     defer spec.deinit(alloc);
+
+    var snapshot = try service_impl.adminSnapshot();
+    defer service_impl.freeAdminSnapshot(&snapshot);
+    if (findTableByName(&snapshot, table_name)) |existing| {
+        if (!try metadata_table_manager.restoreIntentTopologyCompatible(alloc, existing.*, snapshot.ranges, spec.table, spec.ranges))
+            return error.TableAlreadyExists;
+    }
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();

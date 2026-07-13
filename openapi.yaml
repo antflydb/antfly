@@ -11014,8 +11014,9 @@ components:
           minLength: 1
           maxLength: 20
           pattern: ^[1-9][0-9]{0,19}$
-          description: Opaque newest-first continuation cursor. Omitted when no additional authorized
-            jobs match the filters.
+          description: Opaque newest-first continuation cursor. A page can be empty and still include
+            a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained
+            scan is exhausted.
     ClusterRestoreResponse:
       type: object
       required:

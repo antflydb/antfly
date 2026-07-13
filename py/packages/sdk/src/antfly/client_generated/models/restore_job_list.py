@@ -19,8 +19,8 @@ class RestoreJobList:
     """
     Attributes:
         jobs (list[RestoreJob]):
-        next_cursor (str | Unset): Opaque newest-first continuation cursor. Omitted when no additional authorized jobs
-            match the filters.
+        next_cursor (str | Unset): Opaque newest-first continuation cursor. A page can be empty and still include a
+            cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted.
     """
 
     jobs: list[RestoreJob]

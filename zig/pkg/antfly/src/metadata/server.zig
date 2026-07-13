@@ -423,11 +423,10 @@ const MetadataAdminMux = struct {
                     },
                     else => return err,
                 };
-                // Mutations stay leader-serialized. GET polling may use the
-                // follower's locally applied replicated record; the
-                // persistence adapter returns NotLeader instead of a false
-                // NotFound until a newly committed job reaches this replica.
-                if (!local_leader and req.method != .GET)
+                // Mutations and collection reads stay leader-serialized. A
+                // follower can refresh one replicated job by key, but it has
+                // no linearizable snapshot for collection pagination.
+                if (!local_leader and (req.method != .GET or isRestoreJobCollectionRequest(req.uri)))
                     return try public_api_http_server.metadataNotLeaderResponse(alloc);
             }
             var response = self.public_api.handle(req) catch |err| switch (err) {
@@ -468,6 +467,11 @@ const MetadataAdminMux = struct {
             std.mem.eql(u8, path, "/db/v1/restore/jobs") or
             std.mem.startsWith(u8, path, "/db/v1/restore/jobs/")) return true;
         return std.mem.startsWith(u8, path, "/db/v1/tables/") and std.mem.endsWith(u8, path, "/restore");
+    }
+
+    fn isRestoreJobCollectionRequest(uri: []const u8) bool {
+        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query| uri[0..query] else uri;
+        return std.mem.eql(u8, path, "/db/v1/restore/jobs");
     }
 };
 
@@ -1317,4 +1321,20 @@ test "metadata admin mux routes public db v1 requests through public api server"
         error.NotLeader,
         metadataRestoreJobGet(server.svc, std.testing.allocator, "\x00\x00__api_restore_jobs__:0000000000000001"),
     );
+
+    var list_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "/db/v1/restore/jobs",
+    });
+    defer list_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), list_response.status);
+
+    // Point reads may proceed to authorization on a follower because the
+    // replicated persistence adapter refreshes the requested key directly.
+    var item_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "/db/v1/restore/jobs/1",
+    });
+    defer item_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), item_response.status);
 }

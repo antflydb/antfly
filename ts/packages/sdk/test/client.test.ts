@@ -339,6 +339,35 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("should paginate durable restore jobs across empty filtered pages", async () => {
+      const restoreJob = {
+        job_id: "42",
+        attempt_id: 1,
+        scope: "table" as const,
+        table_name: "docs",
+        backup_id: "nightly",
+        phase: "running" as const,
+        cancel_requested: false,
+        published_table_count: 0,
+        completed_table_count: 0,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+      };
+      mockGet
+        .mockResolvedValueOnce({ data: { jobs: [], next_cursor: "100" }, error: undefined })
+        .mockResolvedValueOnce({ data: { jobs: [restoreJob] }, error: undefined });
+
+      await expect(
+        client.restoreJobs.listAll({ phase: "running", scope: "table" })
+      ).resolves.toEqual([restoreJob]);
+      expect(mockGet).toHaveBeenNthCalledWith(1, "/db/v1/restore/jobs", {
+        params: { query: { phase: "running", scope: "table", cursor: undefined } },
+      });
+      expect(mockGet).toHaveBeenNthCalledWith(2, "/db/v1/restore/jobs", {
+        params: { query: { phase: "running", scope: "table", cursor: "100" } },
+      });
+    });
+
     it("should reject an invalid empty table restore response", async () => {
       mockPost.mockResolvedValueOnce({ data: undefined, error: undefined });
 

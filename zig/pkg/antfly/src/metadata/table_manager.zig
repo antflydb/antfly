@@ -98,6 +98,46 @@ pub const RangeRecord = struct {
     restore_snapshot_path: []const u8 = "",
 };
 
+pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
+    return lhs.group_id == rhs.group_id and
+        lhs.range_id == rhs.range_id and
+        lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.start_key, rhs.start_key) and
+        ((lhs.end_key == null and rhs.end_key == null) or
+            (lhs.end_key != null and rhs.end_key != null and std.mem.eql(u8, lhs.end_key.?, rhs.end_key.?))) and
+        lhs.doc_identity_shard_id == rhs.doc_identity_shard_id and
+        lhs.doc_identity_range_id == rhs.doc_identity_range_id and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path);
+}
+
+/// Returns true when an existing topology is either the exact requested
+/// restore intent or a prefix left by an interrupted multi-record publish.
+pub fn restoreIntentTopologyCompatible(
+    alloc: std.mem.Allocator,
+    existing_table: TableRecord,
+    existing_ranges: []const RangeRecord,
+    expected_table: TableRecord,
+    expected_ranges: []const RangeRecord,
+) !bool {
+    if (!tableDefinitionsEqual(existing_table, expected_table)) return false;
+
+    var expected_by_group: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty;
+    defer expected_by_group.deinit(alloc);
+    try expected_by_group.ensureTotalCapacity(alloc, @intCast(expected_ranges.len));
+    for (expected_ranges) |expected_range| {
+        if (expected_by_group.contains(expected_range.group_id)) return false;
+        expected_by_group.putAssumeCapacity(expected_range.group_id, expected_range);
+    }
+    for (existing_ranges) |existing_range| {
+        if (existing_range.table_id != existing_table.table_id) continue;
+        const expected_range = expected_by_group.get(existing_range.group_id) orelse return false;
+        if (!rangeRecordsEqual(existing_range, expected_range)) return false;
+    }
+    return true;
+}
+
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
 
