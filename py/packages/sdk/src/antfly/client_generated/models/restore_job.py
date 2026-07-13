@@ -32,8 +32,10 @@ class RestoreJob:
         expires_at_ms (int): Unix epoch milliseconds after which this terminal job record and its idempotency key may be
             removed.
         table_name (str | Unset):
-        completed_table_count (int | Unset): Number of table restore boundaries durably completed. Completed boundaries
-            are not repeated after restart.
+        published_table_count (int | Unset): Number of table restore intents durably published. Published tables are
+            adopted, not republished, after failover.
+        completed_table_count (int | Unset): Number of published tables whose placement replicas completed restore and
+            whose completion checkpoint is durable.
         total_table_count (int | Unset): Requested table count when known before execution.
         result (RestoreJobResult | Unset):
         error (str | Unset):
@@ -49,6 +51,7 @@ class RestoreJob:
     updated_at_ms: int
     expires_at_ms: int
     table_name: str | Unset = UNSET
+    published_table_count: int | Unset = UNSET
     completed_table_count: int | Unset = UNSET
     total_table_count: int | Unset = UNSET
     result: RestoreJobResult | Unset = UNSET
@@ -75,6 +78,8 @@ class RestoreJob:
         expires_at_ms = self.expires_at_ms
 
         table_name = self.table_name
+
+        published_table_count = self.published_table_count
 
         completed_table_count = self.completed_table_count
 
@@ -103,6 +108,8 @@ class RestoreJob:
         )
         if table_name is not UNSET:
             field_dict["table_name"] = table_name
+        if published_table_count is not UNSET:
+            field_dict["published_table_count"] = published_table_count
         if completed_table_count is not UNSET:
             field_dict["completed_table_count"] = completed_table_count
         if total_table_count is not UNSET:
@@ -139,6 +146,8 @@ class RestoreJob:
 
         table_name = d.pop("table_name", UNSET)
 
+        published_table_count = d.pop("published_table_count", UNSET)
+
         completed_table_count = d.pop("completed_table_count", UNSET)
 
         total_table_count = d.pop("total_table_count", UNSET)
@@ -163,6 +172,7 @@ class RestoreJob:
             updated_at_ms=updated_at_ms,
             expires_at_ms=expires_at_ms,
             table_name=table_name,
+            published_table_count=published_table_count,
             completed_table_count=completed_table_count,
             total_table_count=total_table_count,
             result=result,

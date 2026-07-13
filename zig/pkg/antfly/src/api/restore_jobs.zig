@@ -33,7 +33,8 @@ pub const JobState = struct {
     connection: []const u8,
     restore_mode: []const u8 = "fail_if_exists",
     table_names: ?[]const []const u8 = null,
-    completed_tables: ?[]const []const u8 = null,
+    published_table_indexes: ?[]const u16 = null,
+    completed_table_indexes: ?[]const u16 = null,
     phase: Phase = .queued,
     cancel_requested: bool = false,
     idempotency_key: []const u8,
@@ -167,6 +168,7 @@ pub const Store = struct {
                 if (row.value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
                 var parsed = std.json.parseFromSlice(JobState, self.alloc, row.value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
                 defer parsed.deinit();
+                try validateProgressState(parsed.value);
                 try self.validateRowKeyLocked(row.key, parsed.value.job_id);
                 if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= nowMillis()) {
                     try opened.docstore.delete(row.key);
@@ -185,7 +187,8 @@ pub const Store = struct {
                         .connection = parsed.value.connection,
                         .restore_mode = parsed.value.restore_mode,
                         .table_names = parsed.value.table_names,
-                        .completed_tables = parsed.value.completed_tables,
+                        .published_table_indexes = parsed.value.published_table_indexes,
+                        .completed_table_indexes = parsed.value.completed_table_indexes,
                         .phase = .queued,
                         .cancel_requested = parsed.value.cancel_requested,
                         .idempotency_key = parsed.value.idempotency_key,
@@ -276,6 +279,7 @@ pub const Store = struct {
         if (value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
         var parsed = std.json.parseFromSlice(JobState, self.alloc, value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
         defer parsed.deinit();
+        try validateProgressState(parsed.value);
         try self.validateRowKeyLocked(key, parsed.value.job_id);
         if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= nowMillis()) return;
         if (self.jobs.count() >= max_retained_restore_jobs) return error.RestoreJobCapacityExceeded;
@@ -393,7 +397,8 @@ pub const Store = struct {
                 .connection = parsed.value.connection,
                 .restore_mode = parsed.value.restore_mode,
                 .table_names = parsed.value.table_names,
-                .completed_tables = parsed.value.completed_tables,
+                .published_table_indexes = parsed.value.published_table_indexes,
+                .completed_table_indexes = parsed.value.completed_table_indexes,
                 .phase = .queued,
                 .cancel_requested = parsed.value.cancel_requested,
                 .idempotency_key = parsed.value.idempotency_key,
@@ -501,19 +506,35 @@ pub const Store = struct {
         return encoded;
     }
 
-    pub fn recordTableCompleted(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_name: []const u8) ![]u8 {
+    pub fn recordTablePublished(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
         self.lock();
         defer self.mutex.unlock();
         const current = self.jobs.get(job_id) orelse return error.NotFound;
         var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return error.RestoreJobFenced;
-        if (containsString(parsed.value.completed_tables orelse &.{}, table_name)) return try alloc.dupe(u8, current);
-        var completed = std.ArrayListUnmanaged([]const u8).empty;
+        if (containsTableIndex(parsed.value.published_table_indexes orelse &.{}, table_index)) return try alloc.dupe(u8, current);
+        var published = std.ArrayListUnmanaged(u16).empty;
+        defer published.deinit(alloc);
+        try published.appendSlice(alloc, parsed.value.published_table_indexes orelse &.{});
+        try published.append(alloc, table_index);
+        return try self.updateLocked(alloc, parsed.value, .{ .phase = .running, .published_table_indexes = published.items });
+    }
+
+    pub fn recordTableCompleted(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return error.RestoreJobFenced;
+        if (!containsTableIndex(parsed.value.published_table_indexes orelse &.{}, table_index)) return error.RestoreJobCheckpointOrder;
+        if (containsTableIndex(parsed.value.completed_table_indexes orelse &.{}, table_index)) return try alloc.dupe(u8, current);
+        var completed = std.ArrayListUnmanaged(u16).empty;
         defer completed.deinit(alloc);
-        try completed.appendSlice(alloc, parsed.value.completed_tables orelse &.{});
-        try completed.append(alloc, table_name);
-        return try self.updateLocked(alloc, parsed.value, .{ .phase = .running, .completed_tables = completed.items });
+        try completed.appendSlice(alloc, parsed.value.completed_table_indexes orelse &.{});
+        try completed.append(alloc, table_index);
+        return try self.updateLocked(alloc, parsed.value, .{ .phase = .running, .completed_table_indexes = completed.items });
     }
 
     pub fn load(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
@@ -539,6 +560,7 @@ pub const Store = struct {
             var parsed = std.json.parseFromSlice(JobState, alloc, value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
             defer parsed.deinit();
             if (parsed.value.job_id != job_id) return error.CorruptRestoreJobStore;
+            try validateProgressState(parsed.value);
             if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= nowMillis()) {
                 if (self.jobs.fetchRemove(job_id)) |removed| {
                     self.retained_bytes -= removed.value.len;
@@ -681,11 +703,12 @@ pub const Store = struct {
         cancel_requested: ?bool = null,
         result_json: ?[]const u8 = null,
         last_error: ?[]const u8 = null,
-        completed_tables: ?[]const []const u8 = null,
+        published_table_indexes: ?[]const u16 = null,
+        completed_table_indexes: ?[]const u16 = null,
     };
 
     fn updateLocked(self: *Store, alloc: std.mem.Allocator, current: JobState, update: Update) ![]u8 {
-        const encoded = try encode(alloc, .{
+        const next: JobState = .{
             .job_id = current.job_id,
             .enqueue_sequence = current.enqueue_sequence,
             .attempt_id = update.attempt_id orelse current.attempt_id,
@@ -696,7 +719,8 @@ pub const Store = struct {
             .connection = current.connection,
             .restore_mode = current.restore_mode,
             .table_names = current.table_names,
-            .completed_tables = update.completed_tables orelse current.completed_tables,
+            .published_table_indexes = update.published_table_indexes orelse current.published_table_indexes,
+            .completed_table_indexes = update.completed_table_indexes orelse current.completed_table_indexes,
             .phase = update.phase,
             .cancel_requested = update.cancel_requested orelse current.cancel_requested,
             .idempotency_key = current.idempotency_key,
@@ -710,7 +734,9 @@ pub const Store = struct {
                 nowMillis() +| restore_job_retention_ms
             else
                 current.expires_at_ms,
-        });
+        };
+        try validateProgressState(next);
+        const encoded = try encode(alloc, next);
         errdefer alloc.free(encoded);
         if (encoded.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
         try self.storeLocked(current.job_id, encoded);
@@ -871,9 +897,27 @@ fn validateStartRequest(req: StartRequest) !void {
     }
 }
 
-pub fn containsString(values: []const []const u8, needle: []const u8) bool {
-    for (values) |value| if (std.mem.eql(u8, value, needle)) return true;
+pub fn containsTableIndex(values: []const u16, needle: u16) bool {
+    for (values) |value| if (value == needle) return true;
     return false;
+}
+
+fn validateProgressState(state: JobState) !void {
+    const published = state.published_table_indexes orelse &.{};
+    const completed = state.completed_table_indexes orelse &.{};
+    if (published.len > max_tables_per_job or completed.len > published.len) return error.CorruptRestoreJobStore;
+    const table_count: usize = switch (state.scope) {
+        .table => 1,
+        .cluster => if (state.table_names) |names| names.len else max_tables_per_job,
+    };
+    for (published, 0..) |table_index, i| {
+        if (@as(usize, table_index) >= table_count) return error.CorruptRestoreJobStore;
+        if (containsTableIndex(published[0..i], table_index)) return error.CorruptRestoreJobStore;
+    }
+    for (completed, 0..) |table_index, i| {
+        if (!containsTableIndex(published, table_index) or containsTableIndex(completed[0..i], table_index))
+            return error.CorruptRestoreJobStore;
+    }
 }
 
 pub fn isTerminal(phase: Phase) bool {
@@ -1199,8 +1243,14 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
         defer alloc.free(running);
         var parsed_running = try std.json.parseFromSlice(JobState, alloc, running, .{});
         defer parsed_running.deinit();
-        const checkpoint = try first_store.recordTableCompleted(alloc, job_id, parsed_running.value.attempt_id, "docs");
-        defer alloc.free(checkpoint);
+        try std.testing.expectError(
+            error.RestoreJobCheckpointOrder,
+            first_store.recordTableCompleted(alloc, job_id, parsed_running.value.attempt_id, 0),
+        );
+        const published = try first_store.recordTablePublished(alloc, job_id, parsed_running.value.attempt_id, 0);
+        defer alloc.free(published);
+        const completed = try first_store.recordTableCompleted(alloc, job_id, parsed_running.value.attempt_id, 0);
+        defer alloc.free(completed);
     }
 
     var recovered_store = Store.init(alloc);
@@ -1211,8 +1261,47 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
     var parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(Phase.queued, parsed.value.phase);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.completed_tables.?.len);
-    try std.testing.expectEqualStrings("docs", parsed.value.completed_tables.?[0]);
+    try std.testing.expectEqualSlices(u16, &.{0}, parsed.value.published_table_indexes.?);
+    try std.testing.expectEqualSlices(u16, &.{0}, parsed.value.completed_table_indexes.?);
+}
+
+test "restore progress ordinals remain bounded at maximum table count" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "system/api-restore-jobs-ordinals" });
+    defer runtime.deinit();
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    try store.attachRuntime(&runtime);
+    const started = try store.start(alloc, .{
+        .scope = .cluster,
+        .backup_id = "large-cluster",
+        .location = "s3://archive/large-cluster",
+        .connection = "archive-reader",
+    });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{});
+    defer parsed_started.deinit();
+    const running = (try store.begin(alloc, parsed_started.value.job_id)).?;
+    defer alloc.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, alloc, running, .{});
+    defer parsed_running.deinit();
+
+    for (0..max_tables_per_job) |i| {
+        const published = try store.recordTablePublished(alloc, parsed_started.value.job_id, parsed_running.value.attempt_id, @intCast(i));
+        alloc.free(published);
+        const completed = try store.recordTableCompleted(alloc, parsed_started.value.job_id, parsed_running.value.attempt_id, @intCast(i));
+        alloc.free(completed);
+    }
+
+    const encoded = (try store.load(alloc, parsed_started.value.job_id)).?;
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len <= max_restore_job_record_bytes);
+    var parsed = try std.json.parseFromSlice(JobState, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, max_tables_per_job), parsed.value.published_table_indexes.?.len);
+    try std.testing.expectEqual(@as(usize, max_tables_per_job), parsed.value.completed_table_indexes.?.len);
 }
 
 test "restore job store rejects oversized request state" {

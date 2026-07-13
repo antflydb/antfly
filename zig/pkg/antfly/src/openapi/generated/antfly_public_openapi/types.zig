@@ -2306,7 +2306,9 @@ pub const RestoreJob = struct {
     backup_id: []const u8,
     phase: []const u8,
     cancel_requested: bool,
-    /// Number of table restore boundaries durably completed. Completed boundaries are not repeated after restart.
+    /// Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+    published_table_count: ?i64 = null,
+    /// Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
     completed_table_count: ?i64 = null,
     /// Requested table count when known before execution.
     total_table_count: ?i64 = null,

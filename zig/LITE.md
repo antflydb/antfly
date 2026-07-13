@@ -185,6 +185,8 @@ safe; requests without a key create independent jobs. Restore state lives inside
 the `.aflite` file, and completed table boundaries are durably checkpointed and
 not repeated after restart. Standalone restore is synchronous inside the worker,
 so terminal success means the restored table is readable, not merely accepted.
+Job status reports published and completed table counts separately; for Lite the
+two checkpoints normally advance back-to-back because restoration is local.
 An ambiguous publication/checkpoint interruption fails closed for operator
 inspection. Destructive overwrite is not exposed until
 table generations can be staged and atomically swapped. Terminal state and

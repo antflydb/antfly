@@ -323,13 +323,18 @@ engine, filesystem, or replicated-metadata job store are available, then persist
 the job before returning `202`; otherwise admission fails with `503` and creates
 no job. Clients poll or cancel
 `/db/v1/restore/jobs/{job_id}`. `Idempotency-Key` safely coalesces retries,
-while requests without a key create independent jobs. Catalog publication is
-durably checkpointed per table and is not repeated after restart. If leadership
+while requests without a key create independent jobs. Catalog publication and
+replica completion are recorded as separate durable per-table checkpoints.
+Publication is not repeated after restart. If leadership
 changes before that checkpoint, recovery adopts only an exact, still-active
 restore intent for the same backup and location; unrelated existing tables and
 an already-cleared ambiguous intent fail closed. In distributed deployments a
-job becomes `succeeded` only after every placement replica reports completion
-and the catalog clears the table's restore intents. Destructive overwrite is
+job becomes `succeeded` only after every placement replica reports completion,
+the catalog clears the table's restore intents, and the completion checkpoint is
+durable. Job status exposes separate published and completed table counts so
+operators can distinguish accepted work from readable restored data. Progress
+is stored as bounded manifest ordinals rather than repeated table-name strings,
+so its durable footprint remains O(table count). Destructive overwrite is
 intentionally not a restore mode until the catalog supports an atomic
 staged-generation swap.
 Cancellation is cooperative and best-effort: queued work becomes cancelled,
@@ -340,7 +345,7 @@ Terminal job state and explicit idempotency keys are retained for seven days;
 the history is bounded by 10,000 jobs and 64 KiB per encoded job, and rejects
 new work instead of silently evicting an unexpired key. Job IDs are random
 opaque 63-bit values. In distributed deployments, job records, idempotency
-fences, completed-table checkpoints, and the runnable queue are metadata-Raft
+fences, published/completed table checkpoints, and the runnable queue are metadata-Raft
 state. Followers may serve locally applied job state for scalable polling; if a
 new job has not applied there yet, they return a retryable `503` with
 `Retry-After` instead of a false `404`. The Antfly CLI retries this response

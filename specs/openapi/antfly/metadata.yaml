@@ -4739,11 +4739,16 @@ components:
         backup_id: { type: string }
         phase: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
         cancel_requested: { type: boolean }
+        published_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
         completed_table_count:
           type: integer
           format: int64
           minimum: 0
-          description: Number of table restore boundaries durably completed. Completed boundaries are not repeated after restart.
+          description: Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
         total_table_count:
           type: integer
           format: int64

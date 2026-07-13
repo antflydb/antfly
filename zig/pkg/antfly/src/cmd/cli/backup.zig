@@ -233,6 +233,7 @@ fn writeRestoreResponse(
     wait: bool,
     timeout_ms: u64,
 ) !void {
+    cli.expectHttpSuccess(accepted.*);
     const initial = if (accepted.data) |*data| data.value else return error.InvalidRestoreResponse;
     if (!wait or isTerminalRestorePhase(initial.phase)) {
         try cli.writeJson(allocator, io, initial);
@@ -261,6 +262,7 @@ pub fn waitForRestoreJob(
         if (response.data) |*data| {
             if (isTerminalRestorePhase(data.value.phase)) return response;
         } else if (classifyRestorePollResponse(response.status_code, false) == .invalid) {
+            cli.expectHttpSuccess(response);
             response.deinit();
             return error.InvalidRestoreResponse;
         } else {

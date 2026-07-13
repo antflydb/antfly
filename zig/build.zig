@@ -2438,6 +2438,7 @@ pub fn build(b: *std.Build) void {
             "replicated restore leadership rebuild preserves FIFO and recovers running attempts",
             "restore requests without idempotency keys create independent opaque jobs",
             "restore runtime store persists checkpoints and requeues interrupted work",
+            "restore progress ordinals remain bounded at maximum table count",
             "restore job store rejects oversized request state",
         },
         .test_runner = .{

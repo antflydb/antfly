@@ -6043,6 +6043,7 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
     ) !void {
         const io = self.sharedApiIo() orelse return error.AsyncRestoreUnavailable;
+        var poll_ms: u64 = 250;
         while (true) {
             if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
             switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id)) {
@@ -6051,7 +6052,8 @@ pub const ApiHttpServer = struct {
                 .missing => return error.TableNotFound,
                 .conflicting => return error.RestoreIntentConflict,
             }
-            io.sleep(std.Io.Duration.fromMilliseconds(1000), .awake) catch return error.RestoreWaitInterrupted;
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(poll_ms)), .awake) catch return error.RestoreWaitInterrupted;
+            poll_ms = @min(poll_ms * 2, 5000);
         }
     }
 
@@ -7580,7 +7582,7 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
         cancellation: ?RestoreCancellation,
-        completed_tables: []const []const u8,
+        published_table_indexes: []const u16,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
 
@@ -7606,8 +7608,8 @@ pub const ApiHttpServer = struct {
         if (table_names.len > restore_jobs.max_tables_per_job) return error.InvalidRequest;
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
-            for (table_names) |table_name| {
-                if (restore_jobs.containsString(completed_tables, table_name)) continue;
+            for (table_names, 0..) |table_name, table_index| {
+                if (restore_jobs.containsTableIndex(published_table_indexes, @intCast(table_index))) continue;
                 try self.ensureRestoreActive(cancellation);
                 if (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)) {
                     return error.TableAlreadyExists;
@@ -7621,18 +7623,14 @@ pub const ApiHttpServer = struct {
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
 
-            if (restore_jobs.containsString(completed_tables, table_name)) {
-                statuses[i].status = "triggered";
-                continue;
-            }
-
             if (backups_api.findClusterTable(&manifest, table_name) == null) {
                 statuses[i].@"error" = "backup does not include table";
                 continue;
             }
 
             const exists = self.tableExists(table_name) catch |err| return metadataAccessFailure(err);
-            if (std.mem.eql(u8, restore_mode, "skip_if_exists") and exists) {
+            const published = restore_jobs.containsTableIndex(published_table_indexes, @intCast(i));
+            if (!published and std.mem.eql(u8, restore_mode, "skip_if_exists") and exists) {
                 statuses[i].status = "skipped";
                 continue;
             }
@@ -7644,11 +7642,11 @@ pub const ApiHttpServer = struct {
 
             const table_backup_id = backups_api.findClusterTable(&manifest, table_name).?.table_backup_id;
 
-            // completed_tables is a durable publication checkpoint. On a
+            // published_table_indexes is a durable publication checkpoint. On a
             // resumed attempt, do not republish or reject the table merely
             // because it now exists; wait for the already-published replica
             // restore intent to drain instead.
-            if (restore_jobs.containsString(completed_tables, table_name)) {
+            if (restore_jobs.containsTableIndex(published_table_indexes, @intCast(i))) {
                 if (!self.cfg.deployment_mode.isStandalone()) {
                     self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id) catch |err| switch (err) {
                         error.RestoreJobFenced => return error.NotLeader,
@@ -7658,6 +7656,10 @@ pub const ApiHttpServer = struct {
                         },
                     };
                 }
+                self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
+                    if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                    return error.InternalFailure;
+                };
                 statuses[i].status = "triggered";
                 continue;
             }
@@ -7686,13 +7688,20 @@ pub const ApiHttpServer = struct {
                 };
                 if (restored_via_metadata) {
                     statuses[i].status = "triggered";
-                    self.checkpointRestoreTableCompleted(cancellation, table_name) catch return error.InternalFailure;
+                    self.checkpointRestoreTablePublished(cancellation, @intCast(i)) catch |err| {
+                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                        return error.InternalFailure;
+                    };
                     self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id) catch |err| switch (err) {
                         error.RestoreJobFenced => return error.NotLeader,
                         else => {
                             std.log.err("cluster restore completion wait failed table={s} backup_id={s} err={s}", .{ table_name, table_backup_id, @errorName(err) });
                             return error.InternalFailure;
                         },
+                    };
+                    self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
+                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                        return error.InternalFailure;
                     };
                     continue;
                 }
@@ -7718,7 +7727,14 @@ pub const ApiHttpServer = struct {
                 continue;
             };
             statuses[i].status = "triggered";
-            self.checkpointRestoreTableCompleted(cancellation, table_name) catch return error.InternalFailure;
+            self.checkpointRestoreTablePublished(cancellation, @intCast(i)) catch |err| {
+                if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                return error.InternalFailure;
+            };
+            self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
+                if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                return error.InternalFailure;
+            };
         }
 
         if (owns_table_names and clusterRestoreStatusesHaveNoErrors(statuses)) {
@@ -7741,9 +7757,15 @@ pub const ApiHttpServer = struct {
         return backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
     }
 
-    fn checkpointRestoreTableCompleted(self: *ApiHttpServer, cancellation: ?RestoreCancellation, table_name: []const u8) !void {
+    fn checkpointRestoreTablePublished(self: *ApiHttpServer, cancellation: ?RestoreCancellation, table_index: u16) !void {
         const token = cancellation orelse return;
-        const encoded = try self.restore_job_store.recordTableCompleted(self.alloc, token.job_id, token.attempt_id, table_name);
+        const encoded = try self.restore_job_store.recordTablePublished(self.alloc, token.job_id, token.attempt_id, table_index);
+        self.alloc.free(encoded);
+    }
+
+    fn checkpointRestoreTableCompleted(self: *ApiHttpServer, cancellation: ?RestoreCancellation, table_index: u16) !void {
+        const token = cancellation orelse return;
+        const encoded = try self.restore_job_store.recordTableCompleted(self.alloc, token.job_id, token.attempt_id, table_index);
         self.alloc.free(encoded);
     }
 
@@ -8850,14 +8872,14 @@ pub const ApiHttpServer = struct {
             .table => blk: {
                 if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
                 const table_name = state.table_name orelse return error.CorruptRestoreJobStore;
-                if (!restore_jobs.containsString(state.completed_tables orelse &.{}, table_name)) {
+                if (!restore_jobs.containsTableIndex(state.published_table_indexes orelse &.{}, 0)) {
                     executePublicTableRestore(self, self.alloc, table_name, state.backup_id, state.location, &location) catch |err| {
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
                     };
-                    self.checkpointRestoreTableCompleted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, table_name) catch |err| {
-                        if (err == error.RestoreJobFenced) return err;
+                    self.checkpointRestoreTablePublished(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
+                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
@@ -8871,6 +8893,12 @@ pub const ApiHttpServer = struct {
                         return;
                     };
                 }
+                self.checkpointRestoreTableCompleted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
+                    if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                    const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                    self.alloc.free(failed);
+                    return;
+                };
                 if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
                 break :blk try backups_api.encodeRestoreTriggered(self.alloc);
             },
@@ -8880,7 +8908,7 @@ pub const ApiHttpServer = struct {
                 .connection = state.connection,
                 .table_names = state.table_names,
                 .restore_mode = state.restore_mode,
-            }, &location, state.restore_mode, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.completed_tables orelse &.{}) catch |err| {
+            }, &location, state.restore_mode, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.published_table_indexes orelse &.{}) catch |err| {
                 if (err == error.NotLeader or err == error.RestoreJobFenced) return error.RestoreJobFenced;
                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                 self.alloc.free(failed);
@@ -8922,7 +8950,8 @@ pub const ApiHttpServer = struct {
             const value = try std.json.parseFromSlice(std.json.Value, arena, raw, .{});
             break :blk value.value;
         } else null;
-        const completed_table_count: usize = if (parsed.value.completed_tables) |tables| tables.len else 0;
+        const published_table_count: usize = if (parsed.value.published_table_indexes) |indexes| indexes.len else 0;
+        const completed_table_count: usize = if (parsed.value.completed_table_indexes) |indexes| indexes.len else 0;
         var response = try jsonResponseWithStatus(self.alloc, status, .{
             .job_id = parsed.value.job_id,
             .attempt_id = parsed.value.attempt_id,
@@ -8931,6 +8960,7 @@ pub const ApiHttpServer = struct {
             .backup_id = parsed.value.backup_id,
             .phase = parsed.value.phase,
             .cancel_requested = parsed.value.cancel_requested,
+            .published_table_count = published_table_count,
             .completed_table_count = completed_table_count,
             .total_table_count = if (parsed.value.scope == .table) @as(usize, 1) else if (parsed.value.table_names) |names| names.len else null,
             .result = result,

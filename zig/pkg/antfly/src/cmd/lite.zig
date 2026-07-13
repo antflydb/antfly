@@ -809,6 +809,7 @@ fn promoteRestoreWithClient(ctx: *anyopaque, allocator: Allocator, table: []cons
     const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ctx));
     var resp = try client.restoreTableWithOptions(table, request, .{ .idempotency_key = idempotency_key });
     defer resp.deinit();
+    cli.expectHttpSuccess(resp);
     const job = if (resp.data) |*data| data.value else return error.InvalidRestoreResponse;
     return .{
         .job_id = job.job_id,

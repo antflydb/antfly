@@ -4823,7 +4823,12 @@ export interface components {
             cancel_requested: boolean;
             /**
              * Format: int64
-             * @description Number of table restore boundaries durably completed. Completed boundaries are not repeated after restart.
+             * @description Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+             */
+            published_table_count?: number;
+            /**
+             * Format: int64
+             * @description Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
              */
             completed_table_count?: number;
             /**
