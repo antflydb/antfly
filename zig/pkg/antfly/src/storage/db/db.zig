@@ -329,6 +329,11 @@ pub const OpenMode = OpenOptions.OpenMode;
 
 pub const HAAsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
+    /// Serializes the final client-write gate check, HA WAL append, and sync
+    /// acknowledgement with a node-local promotion fence. When configured,
+    /// every acknowledged write is wholly before or wholly after the frozen
+    /// former-primary boundary.
+    transition_mutex: ?*std.atomic.Mutex = null,
     last_lsn: ?*std.atomic.Value(u64) = null,
     failure_count: ?*std.atomic.Value(u64) = null,
     sync_policy: ha_primary_mod.SyncPolicy = .{},
@@ -22791,6 +22796,11 @@ fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
 
 fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
     const mirror = ctx.ha_async_effect_mirror orelse return;
+    if (mirror.transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        defer mutex.unlock();
+    }
+    enforceHAWriteGateOptional(ctx.ha_write_gate) catch return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{
@@ -22806,6 +22816,11 @@ fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, pay
 
 fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
     const mirror = ctx.ha_async_effect_mirror orelse return;
+    if (mirror.transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        defer mutex.unlock();
+    }
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -22825,6 +22840,11 @@ fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload
 
 fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) void {
     const mirror = ctx.ha_async_batch_mirror orelse return;
+    if (mirror.transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        defer mutex.unlock();
+    }
+    enforceHAWriteGateOptional(ctx.ha_write_gate) catch return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{
@@ -22840,6 +22860,11 @@ fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, req
 
 fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !void {
     const mirror = ctx.ha_async_batch_mirror orelse return;
+    if (mirror.transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        defer mutex.unlock();
+    }
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -22859,6 +22884,11 @@ fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request
 
 fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) void {
     const mirror = ctx.ha_async_metadata_mirror orelse return;
+    if (mirror.transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        defer mutex.unlock();
+    }
+    enforceHAWriteGateOptional(ctx.ha_write_gate) catch return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{
@@ -22874,6 +22904,11 @@ fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, ta
 
 fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) !void {
     const mirror = ctx.ha_async_metadata_mirror orelse return;
+    if (mirror.transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        defer mutex.unlock();
+    }
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();

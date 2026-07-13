@@ -134,6 +134,18 @@ fn applyRestoreSnapshotIfNeeded(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
+    if (try restoreSnapshotAlreadyApplied(alloc, path, group_id, restore, options)) return;
+
+    try applyRestoreSnapshot(alloc, path, group_id, restore, options);
+}
+
+pub fn restoreSnapshotAlreadyApplied(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !bool {
     if (try db_mod.DB.readRestoreStateForPath(alloc, path)) |state_value| {
         var state = state_value;
         defer state.deinit(alloc);
@@ -146,12 +158,11 @@ fn applyRestoreSnapshotIfNeeded(
             if (!state.runtime_repair_complete or
                 try restoreSnapshotMatchesPath(alloc, path, restore, options))
             {
-                return;
+                return true;
             }
         }
     }
-
-    try applyRestoreSnapshot(alloc, path, group_id, restore, options);
+    return false;
 }
 
 fn applyRestoreSnapshot(

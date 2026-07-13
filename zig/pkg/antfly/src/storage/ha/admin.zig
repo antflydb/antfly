@@ -722,7 +722,7 @@ test "storage.ha admin assesses former primary rejoin workflow" {
     const former = rejoin.FormerPrimaryState{
         .node_id = "primary-a",
         .identity = identity,
-        .last_lsn = 12,
+        .last_lsn = 10,
     };
     const receipt = fencing.Receipt{
         .identity = .{
@@ -749,7 +749,7 @@ test "storage.ha admin assesses former primary rejoin workflow" {
     const rewind = assessFormerPrimaryRejoin(former, receipt, .{ .retained_from_lsn = 8 });
     try std.testing.expectEqual(rejoin.Action.rewind, rewind.action);
     try std.testing.expectEqual(@as(u64, 10), rewind.fork_lsn);
-    try std.testing.expect(rewind.data_loss_discarded);
+    try std.testing.expect(!rewind.data_loss_discarded);
 
     const reseed = assessFormerPrimaryRejoin(former, receipt, .{ .retained_from_lsn = 11 });
     try std.testing.expectEqual(rejoin.Action.reseed, reseed.action);

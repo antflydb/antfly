@@ -4873,6 +4873,58 @@ pub const ProvisionedTableWriteSource = struct {
         self.endStructuralTableActivity(table_name);
     }
 
+    fn restoreWriterCacheBusyLocked(
+        cache: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        return cache.hasLiveEntryForGroupTableLocked(group_id, table_name) or
+            cache.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name) or
+            cache.hasPendingCloseForGroupTableLocked(group_id, table_name);
+    }
+
+    fn drainRestoreWriterCaches(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        if (self.write_cache) |cache| cache.drainPendingClosesForGroupTable(group_id, table_name);
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache != cache) cache.drainPendingClosesForGroupTable(group_id, table_name);
+        }
+    }
+
+    fn waitForRestoreWriterRelease(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        deadline_ns: u64,
+    ) !void {
+        var logged_wait = false;
+        while (true) {
+            self.drainRestoreWriterCaches(table_name, group_id);
+
+            lockAtomic(&self.local_db_mutex);
+            var busy = false;
+            if (self.write_cache) |cache| {
+                busy = restoreWriterCacheBusyLocked(cache, table_name, group_id);
+            }
+            if (!busy) {
+                if (self.startup_write_cache) |cache| {
+                    if (self.write_cache != cache) {
+                        busy = restoreWriterCacheBusyLocked(cache, table_name, group_id);
+                    }
+                }
+            }
+            self.local_db_mutex.unlock();
+
+            if (!busy) return;
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return error.LsmRootWriterAlreadyOpen;
+            if (!logged_wait) {
+                logged_wait = true;
+                std.log.warn("restore waiting for active writer lease table={s} group_id={d}", .{ table_name, group_id });
+            }
+            sleepNs(replicated_apply_writer_open_retry_ns);
+        }
+    }
+
     fn abortLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.invalidateWriteCache(table_name);
@@ -8662,32 +8714,52 @@ pub const ProvisionedTableWriteSource = struct {
             }
 
             runTestBeforeRestoreWorkHook();
-            backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
+            const writer_deadline_ns = platform_time.monotonicNs() +| replicated_apply_writer_open_timeout_ns;
+            const restore_source = backup_restore.RestoreSource{
                 .backup_id = plan.manifest.backup_id,
                 .location = local_location,
                 .snapshot_path = shard.snapshot_path,
-            }, .{
+            };
+            const restore_options = backup_restore.RestoreOptions{
                 .expected_table_name = table_name,
                 .expected_identity_namespace = identity_namespace,
-            }) catch |err| {
-                switch (err) {
-                    error.IdentityNamespaceMismatch => std.log.warn("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
-                        table_name,
-                        group_id,
-                        path,
-                        shard.snapshot_path,
-                        err,
-                    }),
-                    else => std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
-                        table_name,
-                        group_id,
-                        path,
-                        shard.snapshot_path,
-                        err,
-                    }),
-                }
-                return err;
             };
+            if (!try backup_restore.restoreSnapshotAlreadyApplied(alloc, path, group_id, restore_source, restore_options)) {
+                try self.waitForRestoreWriterRelease(table_name, group_id, writer_deadline_ns);
+            }
+            while (true) {
+                backup_restore.applyRestoreSnapshotToPathWithOptions(
+                    alloc,
+                    path,
+                    group_id,
+                    restore_source,
+                    restore_options,
+                ) catch |err| {
+                    if (isTransientWriterOpenConflict(err) and platform_time.monotonicNs() < writer_deadline_ns) {
+                        try self.waitForRestoreWriterRelease(table_name, group_id, writer_deadline_ns);
+                        sleepNs(replicated_apply_writer_open_retry_ns);
+                        continue;
+                    }
+                    switch (err) {
+                        error.IdentityNamespaceMismatch => std.log.warn("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
+                            table_name,
+                            group_id,
+                            path,
+                            shard.snapshot_path,
+                            err,
+                        }),
+                        else => std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
+                            table_name,
+                            group_id,
+                            path,
+                            shard.snapshot_path,
+                            err,
+                        }),
+                    }
+                    return err;
+                };
+                break;
+            }
             self.requestRestoreRepairCatchUp(table_name, group_id);
         }
 
@@ -16114,8 +16186,11 @@ test "provisioned table write source backs up and restores a local table" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
     defer source.deinit();
+    source.write_cache = &write_cache;
     _ = try source.source().createTable(alloc, "docs", .{});
 
     _ = try source.source().batch(alloc, "docs", .{
@@ -16139,16 +16214,38 @@ test "provisioned table write source backs up and restores a local table" {
         .replication_sources_json = "[]",
     }, shards);
     defer manifest.deinit(alloc);
+    try backups_api.writeManifest(alloc, backup_root, &manifest);
 
     _ = try source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"beta\"}" }},
         .timestamp_ns = 2,
     });
 
+    write_cache.drainPendingCloses();
+    var cached = try source.getOrOpenCachedDbForLocalMutation(
+        alloc,
+        &write_cache,
+        db_path,
+        7001,
+        source.visibleRootGeneration(7001),
+        "docs",
+        true,
+    );
+    const Release = struct {
+        fn run(lease: *ProvisionedTableWriteCache.CachedDb) void {
+            sleepNs(100 * std.time.ns_per_ms);
+            lease.deinit(std.testing.allocator);
+        }
+    };
+    var release_thread = try std.Thread.spawn(.{}, Release.run, .{&cached});
+    defer release_thread.join();
+
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
     });
+    source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
+    source.drainRestoreRepairCompletionsScheduled();
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
     var db = try db_mod.DB.open(alloc, db_path, .{});

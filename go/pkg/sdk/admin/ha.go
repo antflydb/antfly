@@ -728,7 +728,11 @@ func validateHAFenceActionCorrelation(action HAActionReceipt, receipt HAFenceRec
 	if action.State != HAActionStateApplied && action.State != HAActionStateAlreadyApplied {
 		return fmt.Errorf("fence response action state mismatch")
 	}
-	if !validHAIdentifier(action.Target) || action.Target != promoted || action.NodeId != promoted {
+	// A fence receipt can be persisted first on the old writer and then on the
+	// candidate. The target is always the promoted node, while node_id identifies
+	// the endpoint that durably recorded this copy of the receipt.
+	if !validHAIdentifier(action.Target) || action.Target != promoted ||
+		(action.NodeId != promoted && action.NodeId != receipt.OldPrimaryId) {
 		return fmt.Errorf("fence response action node mismatch")
 	}
 	if action.ActionId != string(action.ActionKind)+":"+promoted {
@@ -2306,6 +2310,10 @@ func haPrimaryStatusQueryEditor(params *HAPrimaryStatusParams) oapi.RequestEdito
 		removeZeroQueryParam(query, "max_retained_bytes")
 		removeZeroQueryParam(query, "max_retained_age_ns")
 		removeZeroQueryParam(query, "sync_required")
+		removeEmptyQueryParam(query, "sync_mode")
+		removeEmptyQueryParam(query, "sync_selection")
+		removeEmptyQueryParam(query, "sync_standby")
+		removeEmptyQueryParam(query, "sync_failure")
 		if params.SyncSelection == HAPrimaryStatusSyncSelectionAll {
 			query.Del("sync_required")
 		}
@@ -2317,6 +2325,13 @@ func haPrimaryStatusQueryEditor(params *HAPrimaryStatusParams) oapi.RequestEdito
 func removeZeroQueryParam(query url.Values, key string) {
 	values, ok := query[key]
 	if ok && len(values) == 1 && values[0] == "0" {
+		query.Del(key)
+	}
+}
+
+func removeEmptyQueryParam(query url.Values, key string) {
+	values, ok := query[key]
+	if ok && len(values) == 1 && values[0] == "" {
 		query.Del(key)
 	}
 }

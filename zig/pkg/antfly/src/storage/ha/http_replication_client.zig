@@ -92,11 +92,13 @@ pub const Client = struct {
 
     pub fn identifySystem(self: *Client, base_uri: []const u8) !internal_api.HAIdentifySystemResponse {
         const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_identify);
-        errdefer self.alloc.free(uri);
+        var free_uri_on_error = true;
+        errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
             .method = .GET,
             .uri = uri,
         });
+        free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
         try mapStatus(resp.response.status);
@@ -132,13 +134,15 @@ pub const Client = struct {
         defer self.alloc.free(body);
 
         const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_slots);
-        errdefer self.alloc.free(uri);
+        var free_uri_on_error = true;
+        errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
         });
+        free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
         try mapStatus(resp.response.status);
@@ -352,13 +356,15 @@ pub const Client = struct {
         defer self.alloc.free(body);
 
         const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_start);
-        errdefer self.alloc.free(uri);
+        var free_uri_on_error = true;
+        errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
         });
+        free_uri_on_error = false;
         errdefer {
             self.alloc.free(resp.request_uri);
             resp.response.deinit(self.alloc);
@@ -761,6 +767,23 @@ const NoCallExecutor = struct {
     }
 };
 
+const NotFoundExecutor = struct {
+    fn executor(self: *NotFoundExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .execute = execute },
+        };
+    }
+
+    fn execute(_: *anyopaque, alloc: Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+        return .{
+            .status = 404,
+            .content_type = try alloc.dupe(u8, "text/plain"),
+            .body = try alloc.dupe(u8, "not found"),
+        };
+    }
+};
+
 const CorruptFrameExecutor = struct {
     identity: standby_mod.Identity,
 
@@ -1104,6 +1127,25 @@ test "storage.ha http replication client rejects invalid local inputs before exe
             ApplyCapture.apply,
             .{ .verify_upstream = false },
         ),
+    );
+}
+
+test "storage.ha http replication client releases transferred request URIs once on status errors" {
+    const alloc = std.testing.allocator;
+    var executor = NotFoundExecutor{};
+    var client = Client.init(alloc, executor.executor());
+
+    try std.testing.expectError(
+        error.InternalReplicationEndpointNotFound,
+        client.identifySystem("http://primary.internal.test"),
+    );
+    try std.testing.expectError(
+        error.InternalReplicationEndpointNotFound,
+        client.createReplicationSlot("http://primary.internal.test", "standby-a", 0),
+    );
+    try std.testing.expectError(
+        error.InternalReplicationEndpointNotFound,
+        client.startReplication("http://primary.internal.test", "standby-a", 1, .{}),
     );
 }
 
