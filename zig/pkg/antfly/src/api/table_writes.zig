@@ -4055,20 +4055,27 @@ pub const BoundTableWriteSource = struct {
         const identity_namespace = db.core.identity_namespace;
 
         db.close();
-        const open_options: db_mod.OpenOptions = .{
+        const recovery_open_options: db_mod.OpenOptions = .{
             .primary_backend = primary_backend,
             .backend_runtime = backend_runtime,
             .identity_namespace = identity_namespace,
+        };
+        // A restore publishes the snapshot's document-identity generation. The
+        // pre-restore namespace is valid only when reopening the old generation
+        // after a failed publication attempt.
+        const restored_open_options: db_mod.OpenOptions = .{
+            .primary_backend = primary_backend,
+            .backend_runtime = backend_runtime,
         };
         const publication_outcome = restoreBoundTableGeneration(
             alloc,
             snapshot_root,
             db_path,
             std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb"),
-            open_options,
+            restored_open_options,
             plan.io,
         ) catch |restore_err| {
-            self.db.* = db_mod.DB.open(alloc, db_path, open_options) catch |reopen_err| {
+            self.db.* = db_mod.DB.open(alloc, db_path, recovery_open_options) catch |reopen_err| {
                 std.log.err("bound restore failed and live generation could not be reopened path={s} restore_err={s} reopen_err={s}", .{
                     db_path,
                     @errorName(restore_err),
@@ -4080,7 +4087,7 @@ pub const BoundTableWriteSource = struct {
             owned_backend_runtime = null;
             return restore_err;
         };
-        self.db.* = db_mod.DB.open(alloc, db_path, open_options) catch |reopen_err| {
+        self.db.* = db_mod.DB.open(alloc, db_path, restored_open_options) catch |reopen_err| {
             std.log.err("bound restore committed but published generation could not be reopened path={s} err={s}", .{ db_path, @errorName(reopen_err) });
             return reopen_err;
         };

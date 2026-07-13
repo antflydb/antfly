@@ -1673,6 +1673,18 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
 
 fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
     return switch (err) {
+        // Promotion is durably committed before the runtime adopts the
+        // standby's resources. Keep the process available and fail closed so
+        // operators can repair configuration or storage and the next round
+        // can resume the idempotent adoption.
+        error.HAPromotedPrimaryLogMissing,
+        error.HAPromotedPrimarySlotsMissing,
+        error.HAStandbyOwnershipRequired,
+        error.HAStandbyOwnerMismatch,
+        error.PromotedLogMismatch,
+        error.PromotedProgressMismatch,
+        error.InvalidPromotionHandoff,
+        error.MissingPromotionSwitch,
         error.HttpConnectionClosing,
         error.ConnectionResetByPeer,
         error.ConnectionRefused,
@@ -3937,7 +3949,8 @@ pub const DataServer = struct {
         if (raft_status.soft.leader_id != null) return false;
         switch (raft_status.soft.role) {
             .follower, .pre_candidate => {},
-            .candidate, .leader => return false,
+            .candidate => if (raft_status.election_elapsed < raft_status.randomized_election_timeout) return false,
+            .leader => return false,
         }
         return localRaftStatusIsVoter(raft_status, local_node_id);
     }
@@ -10002,7 +10015,11 @@ test "data raft bootstrap campaign retries leaderless voter elections" {
     try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .candidate;
+    status.election_elapsed = 4;
+    status.randomized_election_timeout = 5;
     try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+    status.election_elapsed = 5;
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .leader;
     status.soft.leader_id = 1;
@@ -12674,7 +12691,7 @@ test "data runtime status refresh publishes synthetic missing status for absent 
     try std.testing.expectEqualStrings("search_idx", docs_cached.items[0].stats.indexes[0].name);
 }
 
-test "data runtime status refresh budget reuses cached group status instead of opening db" {
+test "data runtime status refresh budget preserves fresh cached group status for visible generation" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -12808,7 +12825,7 @@ test "data runtime status refresh budget reuses cached group status instead of o
     try std.testing.expectEqual(@as(usize, 1), docs_cached.items.len);
     try std.testing.expectEqual(@as(u64, 123), docs_cached.items[0].stats.doc_count);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.cached_snapshot, docs_cached.items[0].metadata.source);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, docs_cached.items[0].metadata.freshness);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, docs_cached.items[0].metadata.freshness);
 }
 
 test "data runtime status refresh reuses managed writer snapshot instead of reopening table db" {
@@ -17774,6 +17791,13 @@ test "data server promotion open failure preserves retryable standby" {
     try std.testing.expect(server.ha_promoted_primary == null);
     try std.testing.expect(server.ha_cfg.admin_context.?.standby != null);
     try std.testing.expect(server.ha_cfg.admin_context.?.primary == null);
+
+    // A durable promotion whose runtime resources cannot yet be adopted is a
+    // fail-closed retry state, not a reason to terminate the data process.
+    try server.runRound();
+    try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+    try std.testing.expect(standby != null);
+    try std.testing.expect(server.ha_promoted_primary == null);
 
     server.ha_cfg.standby_replication.?.standby_log_path = standby_log_alias;
     server.ha_cfg.standby_replication.?.standby_progress_path = standby_progress_alias;

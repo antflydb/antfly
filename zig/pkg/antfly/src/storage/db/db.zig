@@ -9146,9 +9146,6 @@ pub const DB = struct {
                 }});
             }
         }
-        if (self.start_index_workers) {
-            try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
-        }
         if (needs_enrichment_replay) {
             if (self.enrichment_runtime != null) {
                 const refs = try self.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
@@ -9158,6 +9155,12 @@ pub const DB = struct {
                     try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
                 }
             }
+        }
+        // Admit the new index incarnation only after its synchronous rebuild and
+        // generated-enrichment replay plan are complete. Otherwise the worker can
+        // open an HBC bulk session while addIndex is still mutating the same index.
+        if (self.start_index_workers) {
+            try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, worker_applied);
         }
         if (self.start_index_workers) {
             const current_target = self.core.nextDerivedSequence();

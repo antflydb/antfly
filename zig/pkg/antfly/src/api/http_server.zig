@@ -9341,6 +9341,7 @@ pub const ApiHttpServer = struct {
             .table => blk: {
                 if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
                 const table_name = state.table_name orelse return error.CorruptRestoreJobStore;
+                var restored_via_metadata = false;
                 if (!restore_jobs.containsTableIndex(state.published_table_ranges orelse &.{}, 0)) {
                     if (!restore_jobs.tableAttempted(state, 0)) {
                         self.checkpointRestoreTableStarted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
@@ -9350,8 +9351,14 @@ pub const ApiHttpServer = struct {
                             return;
                         };
                     }
+                    restored_via_metadata = true;
                     executePublicTableRestore(self, self.alloc, table_name, state.backup_id, state.location, &location) catch |err| switch (err) {
-                        error.RestoreDurabilityConfirmed => {},
+                        // The local owned-table path reports durable completion as
+                        // a sentinel because the public callback otherwise has no
+                        // result channel. Preserve that distinction: only a normal
+                        // return came through metadata reconciliation and owns a
+                        // distributed restore intent to wait on below.
+                        error.RestoreDurabilityConfirmed => restored_via_metadata = false,
                         error.RestoreDurabilityPending => {
                             self.checkpointRestoreTableDurabilityPending(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |checkpoint_err| {
                                 if (checkpoint_err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(checkpoint_err)) return error.RestoreJobFenced;
@@ -9377,8 +9384,21 @@ pub const ApiHttpServer = struct {
                         self.alloc.free(failed);
                         return;
                     };
+                } else if (!self.cfg.deployment_mode.isStandalone()) {
+                    // A resumed job may already have crossed publication. Infer
+                    // which completion protocol owns it from durable metadata;
+                    // local fallback restores intentionally have no such intent.
+                    restored_via_metadata = switch (try self.distributedRestoreIntentState(table_name, state.location, state.backup_id)) {
+                        .pending, .completed => true,
+                        .missing => false,
+                        .conflicting => {
+                            const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(error.RestoreIntentConflict));
+                            self.alloc.free(failed);
+                            return;
+                        },
+                    };
                 }
-                if (!self.cfg.deployment_mode.isStandalone()) {
+                if (restored_via_metadata and !self.cfg.deployment_mode.isStandalone()) {
                     self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
                         if (isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));

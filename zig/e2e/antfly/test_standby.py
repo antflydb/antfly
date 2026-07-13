@@ -426,6 +426,38 @@ def _wait_for_standby_applied(cluster: HACluster, lsn: int, *, timeout_s: float 
     )
 
 
+def _wait_for_promoted_write_check(
+    cluster: HACluster,
+    payload: dict[str, Any],
+    *,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    last_response: str | None = None
+    while time.monotonic() < deadline:
+        if cluster.standby.proc is not None and cluster.standby.proc.poll() is not None:
+            break
+        try:
+            response = cluster.standby.admin_post_response("/write/check", payload)
+        except requests.RequestException as err:
+            last_error = err
+            time.sleep(0.1)
+            continue
+        if response.ok:
+            return cluster.standby._check(response)
+        last_response = f"{response.status_code}: {response.text}"
+        if response.status_code not in {409, 503}:
+            return cluster.standby._check(response)
+        time.sleep(0.1)
+    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    raise AssertionError(
+        "promoted standby did not expose its write decision before the deadline; "
+        f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
+        f"{cluster.debug_logs()}"
+    )
+
+
 def _wait_for_standby_lookup(
     cluster: HACluster,
     table_name: str,
@@ -859,8 +891,8 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert promoted["fence_generation"] == fence["receipt"]["generation"]
     assert promoted["fence_token"] == fence["receipt"]["token"]
 
-    promoted_write_check = ha_cluster.standby.admin_post(
-        "/write/check",
+    promoted_write_check = _wait_for_promoted_write_check(
+        ha_cluster,
         {
             "role": "standby",
             "expected_identity": {

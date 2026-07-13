@@ -3345,7 +3345,7 @@ pub fn build(b: *std.Build) void {
     const lib_data_runtime_default_filters = [_][]const u8{
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
-        "data runtime status refresh budget reuses cached group status instead of opening db",
+        "data runtime status refresh budget preserves fresh cached group status for visible generation",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
         "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
