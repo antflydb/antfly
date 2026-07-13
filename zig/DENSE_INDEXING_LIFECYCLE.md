@@ -502,8 +502,10 @@ not authorize deleting or rebuilding an index root.
 
 ### Durable repair intent
 
-Before starting reconstruction, persist an index repair intent in the primary
-store:
+Before starting reconstruction, persist an index repair intent in the DB's
+replica-local system-metadata store. It must share the local durability and
+transaction boundary needed by replay pins, but it is not user data and is not
+emitted by logical table replication:
 
 ```zig
 pub const IndexRepairIntent = struct {
@@ -583,26 +585,39 @@ shadow namespace, and reconstruction starts with a new local identity. Status
 aggregation reports repair state per group/replica so a healthy replica cannot
 mask another replica's unavailable projection.
 
+Replica lifecycle handling is explicit:
+
+| Event | Required behavior |
+| --- | --- |
+| Restart with matching identity | Reload intent and pin before truncation; resume by phase |
+| Leadership/placement loss | Fence and stop local execution; retain local intent for possible return, but forbid activation |
+| Promotion of another existing replica | Discover that replica's own load state and intent; never open the former owner's candidate |
+| Replica replacement or root-generation change | Invalidate old candidates and create a new local repair identity |
+| Group move or split | Do not copy repair state or candidate files; fence source work and build destination/children from their durable logical state |
+| Logical backup/restore | Omit repair state and rebuild derived indexes under new identities |
+| Physical backup/restore | Resume only after exact identity, generation, config, checkpoint, and candidate validation |
+| Index/group deletion | Atomically make the pin non-authoritative with deletion, then clean local candidates asynchronously |
+
 The durable sequence is:
 
 ```text
 detect IncompleteBulkPublish
-    -> persist repair intent in the primary store
+    -> persist repair intent in replica-local system metadata
     -> mark the projection repair_required
-    -> preflight source artifacts, disk, ownership, and configuration
+    -> preflight source artifacts, reserve disk/resources, and verify ownership/configuration
     -> leave the poisoned root and load failure quarantined
     -> create and persist the candidate path
-    -> acquire a durable replay-retention pin at the snapshot floor
+    -> atomically acquire a pinned primary snapshot and its replay floor
     -> build a shadow replacement from a primary snapshot
     -> catch the shadow up to the current derived sequence
     -> durably mark the candidate ready
-    -> revalidate ownership and configuration under the final apply barrier
-    -> perform final catch-up
+    -> converge below the bounded activation thresholds
+    -> revalidate ownership and configuration under a time-bounded apply barrier
+    -> perform bounded final catch-up
     -> atomically swap the active-root pointer
     -> open and validate the replacement
     -> persist a clean projection checkpoint and clear the load failure
-    -> release the replay-retention pin
-    -> delete the repair intent
+    -> atomically release the replay-retention pin and delete the repair intent
     -> garbage-collect the poisoned root and unused candidates
 ```
 
@@ -687,7 +702,8 @@ It performs this protocol under the same exclusion used to calculate and
 advance the replay truncation floor:
 
 1. Persist a provisional pin with `retain_after_sequence = 0` for the bound
-   replica and root generation.
+   replica and root generation. Zero explicitly means retain the entire
+   available replay journal; it is not interpreted as "no pin."
 2. Make that pin visible to the in-memory truncation registry before releasing
    the metadata transaction.
 3. Open the primary snapshot and read its replay/build floor.
@@ -1385,22 +1401,22 @@ ordinary write
     -> durable primary document + derived replay record
     -> bounded dense streaming replay session
     -> structurally valid batch commits
-    -> durable HBC finish
+    -> backend-confirmed durable finish or explicit sync
     -> applied-sequence publication
     -> crash recovery by idempotent replay
 
 explicit import/rebuild
     -> bulk publication in an isolated candidate when prior service matters
-    -> final catch-up
+    -> bounded convergence and final catch-up
     -> atomic active-generation swap
     -> retired-generation cleanup
 
 legacy/interrupted in-place bulk publication
     -> quarantine
     -> allowlisted discovery + rebuildability preflight
-    -> durable repair intent + replay-retention pin
+    -> replica-bound durable repair intent + atomic pinned snapshot
     -> resource-admitted shadow reconstruction
-    -> final catch-up + fenced pointer activation
+    -> bounded convergence + time-bounded fenced pointer activation
     -> replacement validation
     -> pin/intent/candidate cleanup
 ```
