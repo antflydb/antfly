@@ -156,6 +156,8 @@ inference:
 ```
 
 `max_bytes_mb: 0` disables result retention while preserving singleflight.
+Likewise, `ttl_ms: 0` preserves singleflight without publishing entries that
+would be expired immediately.
 `enabled: false` bypasses retention and singleflight while preserving the
 `max_inflight` provider admission bound. This allows operators to disable
 cache reuse without removing overload protection.

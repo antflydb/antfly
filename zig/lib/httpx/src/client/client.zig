@@ -611,6 +611,78 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
+        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
+        if (timeout_ms == 0) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, writer, progress_cb, progress_ctx);
+
+        const Writer = @TypeOf(writer);
+        const RequestResult = anyerror!Response;
+        const TimeoutResult = anyerror!void;
+        const SelectResult = union(enum) {
+            request: RequestResult,
+            timeout: TimeoutResult,
+        };
+        const Task = struct {
+            fn requestTask(
+                client: *Self,
+                request_value: *Request,
+                socket_timeout_ms: ?u64,
+                output: Writer,
+                callback: ?WriterProgressCallback,
+                callback_context: ?*anyopaque,
+            ) RequestResult {
+                return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, output, callback, callback_context);
+            }
+
+            fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
+                return timeout.sleep(io);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .request => |request_result| {
+                        if (request_result) |response_value| {
+                            var response = response_value;
+                            response.deinit();
+                        } else |_| {}
+                    },
+                    .timeout => {},
+                }
+            }
+        };
+
+        var select_buffer: [2]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, writer, progress_cb, progress_ctx });
+        select.async(.timeout, Task.timeoutTask, .{
+            self.io,
+            Io.Timeout{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+                .clock = .awake,
+            } },
+        });
+
+        const first = try select.await();
+        switch (first) {
+            .request => |request_result| {
+                select.cancelDiscard();
+                return try request_result;
+            },
+            .timeout => |timeout_result| {
+                try timeout_result;
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                return error.Timeout;
+            },
+        }
+    }
+
+    fn executeRequestToWriterWithRetries(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
@@ -2819,6 +2891,44 @@ test "request timeout is absolute across a slow-drip response" {
     defer client.deinit();
 
     try std.testing.expectError(error.Timeout, getWithRetry(&client, io, url, 20));
+}
+
+test "request timeout is absolute when streaming a slow-drip response" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_slow_drip_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 120, .read_ms = 1_000, .write_ms = 1_000 },
+    });
+    defer client.deinit();
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    try std.testing.expectError(error.Timeout, client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null));
+    try std.testing.expect(out.items.len < 10);
 }
 
 test "HTTPS client round trip via local TLS server" {

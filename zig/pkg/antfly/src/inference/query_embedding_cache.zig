@@ -114,7 +114,7 @@ pub const QueryEmbeddingCache = struct {
             const now = platform_time.monotonicNs();
             if (now < entry.expires_at_ns) {
                 self.touchLocked(entry, now);
-                self.counters.hits += 1;
+                self.counters.hits +|= 1;
                 self.pinEntryLocked(entry);
                 self.mutex.unlock(io);
 
@@ -134,7 +134,7 @@ pub const QueryEmbeddingCache = struct {
 
         if (self.flights.get(key)) |flight| {
             flight.refs += 1;
-            self.counters.coalesced_waiters += 1;
+            self.counters.coalesced_waiters +|= 1;
             self.mutex.unlock(io);
             self.waitForFlight(flight, deadline_ns) catch |err| {
                 self.mutex.lockUncancelable(io);
@@ -178,8 +178,8 @@ pub const QueryEmbeddingCache = struct {
             self.mutex.unlock(io);
             return err;
         };
-        self.counters.misses += 1;
-        self.counters.producer_computations += 1;
+        self.counters.misses +|= 1;
+        self.counters.producer_computations +|= 1;
         self.mutex.unlock(io);
 
         const compute_started_ns = platform_time.monotonicNs();
@@ -199,7 +199,7 @@ pub const QueryEmbeddingCache = struct {
         flight.result = computed;
         flight.done = true;
         self.admitLocked(key, computed, budget) catch {
-            self.counters.rejected_admissions += 1;
+            self.counters.rejected_admissions +|= 1;
         };
         flight.ready.set(io);
         self.mutex.unlock(io);
@@ -312,9 +312,10 @@ pub const QueryEmbeddingCache = struct {
     }
 
     fn admitLocked(self: *QueryEmbeddingCache, key: Key, vector: []const f32, budget: *cache_budget.CacheBudget) !void {
+        if (self.config.max_bytes == 0 or self.config.ttl_ns == 0) return;
         const charge = entryCharge(vector.len);
         if (charge > self.config.max_bytes) {
-            self.counters.rejected_admissions += 1;
+            self.counters.rejected_admissions +|= 1;
             return;
         }
         self.expireOldestLocked(platform_time.monotonicNs(), budget, admission_expire_batch);
@@ -324,7 +325,7 @@ pub const QueryEmbeddingCache = struct {
         }
         while (!budget.tryReserve(charge)) {
             const victim = self.oldest orelse {
-                self.counters.rejected_admissions += 1;
+                self.counters.rejected_admissions +|= 1;
                 return;
             };
             self.removeEntryLocked(victim, budget, false);
@@ -389,7 +390,7 @@ pub const QueryEmbeddingCache = struct {
         self.unlinkLocked(entry);
         entry.retired = true;
         if (entry.pins == 0) self.destroyEntryLocked(entry, budget);
-        if (expired) self.counters.expirations += 1 else self.counters.evictions += 1;
+        if (expired) self.counters.expirations +|= 1 else self.counters.evictions +|= 1;
     }
 
     fn pinEntryLocked(self: *QueryEmbeddingCache, entry: *Entry) void {
@@ -519,7 +520,7 @@ pub fn testConcurrentCoalescing() !void {
     try std.testing.expectEqual(@as(u64, 1), current.coalesced_waiters);
     try std.testing.expect(current.producer_compute_ns_total > 0);
     try std.testing.expectEqual(@as(usize, 0), current.entries);
-    try std.testing.expectEqual(@as(u64, 1), current.rejected_admissions);
+    try std.testing.expectEqual(@as(u64, 0), current.rejected_admissions);
 }
 
 test "query embedding cache coalesces concurrent misses" {
@@ -781,11 +782,12 @@ pub fn testStatsExpireIdleEntries() !void {
     const current = cache.stats(&budget);
     try std.testing.expectEqual(@as(usize, 0), current.entries);
     try std.testing.expectEqual(@as(usize, 0), current.live_bytes);
-    try std.testing.expectEqual(@as(u64, 1), current.expirations);
+    try std.testing.expectEqual(@as(u64, 0), current.expirations);
+    try std.testing.expectEqual(@as(u64, 0), current.rejected_admissions);
     try std.testing.expectEqual(@as(usize, 0), budget.stats().used_bytes);
 }
 
-test "query embedding cache stats expire idle entries" {
+test "query embedding cache skips zero TTL retention" {
     try testStatsExpireIdleEntries();
 }
 
