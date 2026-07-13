@@ -78,6 +78,11 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        QueryEmbeddingInputTooLarge,
+        QueryEmbeddingOverloaded,
+        EmbedRateLimited,
+        EmbedTransientFailure,
+        EmbedUpstreamFailure,
         InternalFailure,
     };
 
@@ -613,6 +618,23 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+            },
+            error.QueryEmbeddingInputTooLarge => {
+                return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
+            },
+            error.QueryEmbeddingOverloaded => {
+                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding overloaded") };
+            },
+            error.EmbedRateLimited => {
+                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding rate limited") };
+            },
+            error.EmbedTransientFailure => {
+                std.log.warn("public table query embedding temporarily unavailable table={s}", .{table_name});
+                return .{ .status = 503, .body = try alloc.dupe(u8, "query embedding temporarily unavailable") };
+            },
+            error.EmbedUpstreamFailure => {
+                std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
+                return .{ .status = 502, .body = try alloc.dupe(u8, "query embedding provider failed") };
             },
             error.UnsupportedExactSort => {
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
@@ -1606,6 +1628,62 @@ test "public table query handler maps doc identity unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table query handler preserves embedding failure status" {
+    const Backend = struct {
+        err: TableApi.ExecuteQueryError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    const Case = struct {
+        err: TableApi.ExecuteQueryError,
+        status: u16,
+        body: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "query embedding input too large" },
+        .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "query embedding overloaded" },
+        .{ .err = error.EmbedRateLimited, .status = 429, .body = "query embedding rate limited" },
+        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
+        .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
+    };
+
+    for (cases) |tc| {
+        var backend = Backend{ .err = tc.err };
+        var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+            \\{"query":{"match_all":{}}}
+        , null, backend.iface());
+        defer resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(tc.status, resp.status);
+        try std.testing.expectEqualStrings(tc.body, resp.body);
+    }
 }
 
 test "public table query handler maps HA read gate errors" {

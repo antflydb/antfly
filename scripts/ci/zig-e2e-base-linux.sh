@@ -80,7 +80,15 @@ if [[ "$run_inference" == "1" ]]; then
     e2e/inference || inference_status=$?
 fi
 
-if (( antfly_status != 0 || inference_status != 0 )); then
-  printf 'E2E failures: antfly=%d inference=%d\n' "$antfly_status" "$inference_status" >&2
-  exit 1
+overall_status=0
+if [[ "$antfly_status" -ne 0 ]]; then
+  echo "Antfly E2E suite failed with exit code $antfly_status" >&2
+  overall_status=$antfly_status
 fi
+if [[ "$inference_status" -ne 0 ]]; then
+  echo "Inference E2E suite failed with exit code $inference_status" >&2
+  if [[ "$overall_status" -eq 0 ]]; then
+    overall_status=$inference_status
+  fi
+fi
+exit "$overall_status"
