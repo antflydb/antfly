@@ -226,7 +226,6 @@ export type {
   QueryOptions,
   QueryProfile,
   QueryRequest,
-  SortProfile,
   // Core types
   QueryResponses,
   QueryResult,
@@ -236,6 +235,7 @@ export type {
   ResourceType,
   // Utility type for response data
   ResponseData,
+  RestoreJob,
   RestoreRequest,
   // Retrieval Agent types
   RetrievalAgentRequest,
@@ -246,6 +246,7 @@ export type {
   SemanticQueryMode,
   ShardsProfile,
   SignificanceAlgorithm,
+  SortProfile,
   SparseEmbedding,
   SSEStepStarted,
   // Table types

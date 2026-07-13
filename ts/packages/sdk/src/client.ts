@@ -38,8 +38,8 @@ import type {
   QueryResponses,
   QueryResult,
   ResourceType,
+  RestoreJob,
   RestoreRequest,
-  RestoreTableResponse,
   RetrievalAgentRequest,
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
@@ -916,15 +916,13 @@ export class AntflyClient {
     /**
      * Restore a table from backup
      */
-    restore: async (
-      tableName: string,
-      request: RestoreRequest
-    ): Promise<RestoreTableResponse | undefined> => {
+    restore: async (tableName: string, request: RestoreRequest): Promise<RestoreJob> => {
       const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/restore", {
         params: { path: { tableName } },
         body: request,
       });
       if (error) throw new Error(`Restore failed: ${error.error}`);
+      if (!data) throw new Error("Restore failed: unexpected empty response");
       return data;
     },
 

@@ -247,6 +247,53 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("should return the durable table restore job", async () => {
+      const restoreJob = {
+        job_id: 42,
+        attempt_id: 0,
+        scope: "table" as const,
+        table_name: "products",
+        backup_id: "nightly",
+        phase: "queued" as const,
+        cancel_requested: false,
+        published_table_count: 0,
+        completed_table_count: 0,
+        total_table_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        expires_at_ms: Number.MAX_SAFE_INTEGER,
+      };
+      mockPost.mockResolvedValueOnce({ data: restoreJob, error: undefined });
+
+      const result = await client.tables.restore("products", {
+        backup_id: "nightly",
+        location: "s3://backups/nightly",
+        connection: "archive",
+      });
+
+      expect(result).toEqual(restoreJob);
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/restore", {
+        params: { path: { tableName: "products" } },
+        body: {
+          backup_id: "nightly",
+          location: "s3://backups/nightly",
+          connection: "archive",
+        },
+      });
+    });
+
+    it("should reject an invalid empty table restore response", async () => {
+      mockPost.mockResolvedValueOnce({ data: undefined, error: undefined });
+
+      await expect(
+        client.tables.restore("products", {
+          backup_id: "nightly",
+          location: "s3://backups/nightly",
+          connection: "archive",
+        })
+      ).rejects.toThrow("Restore failed: unexpected empty response");
+    });
+
     it("should perform bounded batch writes with fetch", async () => {
       const mockFetch = vi
         .spyOn(globalThis, "fetch")
