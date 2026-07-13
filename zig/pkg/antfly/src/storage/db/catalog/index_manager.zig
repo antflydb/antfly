@@ -29,6 +29,7 @@ const apply_state = @import("../derived/apply_state.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const coverage_identity = @import("../../coverage_identity.zig");
 const enrichment_catalog = @import("enrichment_catalog.zig");
 const resolver_catalog = @import("resolver_catalog.zig");
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
@@ -13116,17 +13117,19 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
 }
 
 fn newCoverageGeneration() !u64 {
-    var generation: u64 = 0;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    while (generation == 0) try io_impl.io().randomSecure(std.mem.asBytes(&generation));
-    return generation;
+    return try coverage_identity.generate(io_impl.io());
 }
 
 fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
     var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
     errdefer stored_cfg.deinit(alloc);
-    if (stored_cfg.coverage_generation == 0) stored_cfg.coverage_generation = try newCoverageGeneration();
+    if (stored_cfg.coverage_generation == 0) {
+        stored_cfg.coverage_generation = try newCoverageGeneration();
+    } else if (!coverage_identity.isValid(stored_cfg.coverage_generation)) {
+        return error.InvalidIndexConfig;
+    }
     stored_cfg.coverage_config_fingerprint = null;
     try populateCoverageConfigFingerprint(alloc, &stored_cfg);
     return stored_cfg;
@@ -13359,6 +13362,15 @@ test "index create preserves authoritative coverage generation" {
     try std.testing.expectEqual(@as(usize, 1), configs.len);
     try std.testing.expectEqual(caller_generation, configs[0].coverage_generation);
     try std.testing.expect(configs[0].coverage_config_fingerprint != null);
+}
+
+test "index create rejects coverage generation outside metadata persistence domain" {
+    try std.testing.expectError(error.InvalidIndexConfig, indexConfigWithCoverageGeneration(std.testing.allocator, .{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+        .coverage_generation = std.math.maxInt(u64),
+    }));
 }
 
 test "vector coverage and derived replay share one index apply lock" {

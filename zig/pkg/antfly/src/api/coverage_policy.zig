@@ -4,6 +4,7 @@
 // except in compliance with the Elastic License 2.0.
 
 const std = @import("std");
+const coverage_identity = @import("../storage/coverage_identity.zig");
 
 pub const incarnation_field = "_coverage_incarnation";
 
@@ -58,12 +59,7 @@ fn validateIndexConfigWithPrivateFields(value: std.json.Value, allow_incarnation
 }
 
 fn newIncarnation(io: std.Io) !i64 {
-    var value: u64 = 0;
-    while (value == 0) {
-        try io.randomSecure(std.mem.asBytes(&value));
-        value &= std.math.maxInt(i64);
-    }
-    return @intCast(value);
+    return @intCast(try coverage_identity.generate(io));
 }
 
 pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -80,7 +76,7 @@ pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value
 }
 
 pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, coverage_incarnation: u64) ![]u8 {
-    if (value != .object or coverage_incarnation == 0 or coverage_incarnation > std.math.maxInt(i64)) return error.InvalidIndexConfig;
+    if (value != .object or !coverage_identity.isValid(coverage_incarnation)) return error.InvalidIndexConfig;
     try validateIndexConfig(value);
 
     var arena_impl = std.heap.ArenaAllocator.init(alloc);

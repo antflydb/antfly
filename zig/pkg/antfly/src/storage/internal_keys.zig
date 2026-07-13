@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const coverage_identity = @import("coverage_identity.zig");
 const Allocator = std.mem.Allocator;
 
 pub const user_namespace: u8 = 0x01;
@@ -285,7 +286,7 @@ pub fn artifactNamedPrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_
 }
 
 pub fn derivedCoverageGeneration(config_json: []const u8) u64 {
-    return std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json);
+    return coverage_identity.fromHashBits(std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json));
 }
 
 /// Returns a versioned fingerprint of the fields that define generated output.

@@ -2512,10 +2512,16 @@ test "table provisioner reconcile does not replay pending derived batches" {
         try db.core.store.appendReplayOpaque(std.testing.allocator, sequence, encoded);
     }
 
+    const index_config_with_incarnation = try coverage_policy.withIncarnationAlloc(
+        std.testing.allocator,
+        parsed_public_index.value,
+        coverage_incarnation,
+    );
+    defer std.testing.allocator.free(index_config_with_incarnation);
     const indexes_json = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"embed_idx\":{{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"_coverage_incarnation\":{d}}}}}",
-        .{coverage_incarnation},
+        "{{\"embed_idx\":{s}}}",
+        .{index_config_with_incarnation},
     );
     defer std.testing.allocator.free(indexes_json);
 
@@ -2538,6 +2544,8 @@ test "table provisioner reconcile does not replay pending derived batches" {
     );
     try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
     try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_added);
 
     {
         var reopened_without_replay = try db_mod.DB.open(std.testing.allocator, db_path, .{
