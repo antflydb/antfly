@@ -14,6 +14,94 @@ import type React from "react";
 import { useMemo } from "react";
 import FieldValueDisplay from "./FieldValueDisplay";
 
+type UnknownRecord = Record<string, unknown>;
+
+const PREVIEW_TEXT_FIELDS = [
+  "text",
+  "content",
+  "chunk_text",
+  "body",
+  "description",
+  "title",
+  "name",
+];
+const SOURCE_LABEL_FIELDS = ["filename", "source_path", "url", "path", "title", "name", "id"];
+
+function asRecord(value: unknown): UnknownRecord | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as UnknownRecord)
+    : null;
+}
+
+function firstStringField(record: unknown, fields: string[]): string | null {
+  const object = asRecord(record);
+  if (!object) return null;
+  for (const field of fields) {
+    const value = object[field];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return null;
+}
+
+function nestedRecord(record: unknown, path: string[]): UnknownRecord | null {
+  let current: unknown = record;
+  for (const segment of path) {
+    const object = asRecord(current);
+    if (!object) return null;
+    current = object[segment];
+  }
+  return asRecord(current);
+}
+
+function firstHierarchyChunk(hierarchy: unknown): UnknownRecord | null {
+  const object = asRecord(hierarchy);
+  const chunks = object?.chunks;
+  return Array.isArray(chunks) ? asRecord(chunks[0]) : null;
+}
+
+function hierarchyPreviewText(hit: QueryHit): string | null {
+  const hierarchy = asRecord(hit.hierarchy);
+  if (!hierarchy) return null;
+  const chunk = firstHierarchyChunk(hierarchy);
+  return (
+    firstStringField(hit._source, PREVIEW_TEXT_FIELDS) ||
+    firstStringField(hierarchy.artifact, PREVIEW_TEXT_FIELDS) ||
+    firstStringField(chunk, PREVIEW_TEXT_FIELDS) ||
+    firstStringField(nestedRecord(chunk, ["_source"]), PREVIEW_TEXT_FIELDS) ||
+    firstStringField(nestedRecord(chunk, ["document"]), PREVIEW_TEXT_FIELDS) ||
+    firstStringField(
+      nestedRecord(hierarchy, ["ancestors", "unit", "document"]),
+      PREVIEW_TEXT_FIELDS
+    )
+  );
+}
+
+function hierarchySourceLabel(hit: QueryHit): string | null {
+  const hierarchy = asRecord(hit.hierarchy);
+  if (!hierarchy) return null;
+  const sourceDocument = nestedRecord(hierarchy, ["ancestors", "source", "document"]);
+  const source = nestedRecord(hierarchy, ["ancestors", "source"]);
+  return (
+    firstStringField(sourceDocument, SOURCE_LABEL_FIELDS) ||
+    firstStringField(source, SOURCE_LABEL_FIELDS) ||
+    firstStringField(hit._source, SOURCE_LABEL_FIELDS) ||
+    (typeof hierarchy.parent_doc_key === "string" ? hierarchy.parent_doc_key : null)
+  );
+}
+
+function truncatePreview(value: string, maxLength = 140): string {
+  return value.length > maxLength ? `${value.substring(0, maxLength)}...` : value;
+}
+
+function looksLikeLowQualityExtractedText(value: string): boolean {
+  const compact = value.replace(/\s+/g, "");
+  if (compact.length < 40) return false;
+  const alphaNumeric = (compact.match(/[\p{L}\p{N}]/gu) || []).length;
+  const controlsOrReplacement = (compact.match(/[\u0000-\u001f\ufffd]/gu) || []).length;
+  const symbolHeavy = alphaNumeric / compact.length < 0.35;
+  return controlsOrReplacement > 0 || symbolHeavy;
+}
+
 interface QueryResultItemProps {
   hit: QueryHit;
   index: number;
@@ -77,13 +165,16 @@ const QueryResultItem: React.FC<QueryResultItemProps> = ({
 
   // Get preview text
   const previewText = useMemo(() => {
+    const hierarchyText = hierarchyPreviewText(hit);
+    if (hierarchyText) return truncatePreview(hierarchyText);
+
     if (previewData.length === 0) return "No preview available";
 
     const firstField = previewData[0];
     const value = firstField.value;
 
     if (typeof value === "string") {
-      return value.length > 100 ? `${value.substring(0, 100)}...` : value;
+      return truncatePreview(value, 100);
     }
 
     if (Array.isArray(value)) {
@@ -95,7 +186,13 @@ const QueryResultItem: React.FC<QueryResultItemProps> = ({
     }
 
     return String(value);
-  }, [previewData]);
+  }, [hit, previewData]);
+
+  const sourceLabel = useMemo(() => hierarchySourceLabel(hit), [hit]);
+  const hasLowQualityExtractedText = useMemo(
+    () => looksLikeLowQualityExtractedText(previewText),
+    [previewText]
+  );
 
   return (
     <Collapsible
@@ -142,6 +239,14 @@ const QueryResultItem: React.FC<QueryResultItemProps> = ({
               </div>
 
               {/* Preview Text */}
+              {sourceLabel && (
+                <p className="text-xs text-muted-foreground truncate">Source: {sourceLabel}</p>
+              )}
+              {hasLowQualityExtractedText && (
+                <Badge variant="default" className="w-fit text-[11px]">
+                  Low-quality extracted text
+                </Badge>
+              )}
               {!isExpanded && (
                 <p className="text-sm text-muted-foreground line-clamp-2">{previewText}</p>
               )}

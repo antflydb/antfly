@@ -226,6 +226,16 @@ interface TableDetailsPageProps {
   currentSection?: string;
 }
 
+type QueryRequestWithHierarchy = QueryRequest & {
+  full_text_search?: unknown;
+  hierarchy?: {
+    return_level?: "source" | "unit" | "chunk" | "mention";
+    include?: string[];
+    rollup?: "source" | "none";
+    max_children_per_parent?: number;
+  };
+};
+
 const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "overview" }) => {
   const theme = localStorage.getItem("theme") || "light";
   const { tableName } = useParams<{ tableName: string }>();
@@ -261,22 +271,46 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [isEditingSchema, setIsEditingSchema] = useState(false);
 
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
+  const hasDocumentHierarchyIndexes = useMemo(
+    () =>
+      indexes.some((index) => {
+        const config = index.config as Record<string, unknown> | undefined;
+        const name = typeof config?.name === "string" ? config.name : "";
+        const artifactName = typeof config?.artifact_name === "string" ? config.artifact_name : "";
+        return (
+          name === "document_text" ||
+          name === "document_vectors" ||
+          artifactName === "document_chunks_v1" ||
+          artifactName === "document_units_v1"
+        );
+      }),
+    [indexes]
+  );
 
-  // Auto-select first vector index when indexes load
+  // Auto-select a vector index when indexes load, preferring DocsAF document_vectors.
   useEffect(() => {
     if (queryIndexes.length === 0) {
       const vectorIndexes = indexes.filter((idx) => idx.config.type === "embeddings");
       if (vectorIndexes.length > 0) {
-        setQueryIndexes([vectorIndexes[0].config.name]);
+        const documentVectorIndex = vectorIndexes.find(
+          (idx) => idx.config.name === "document_vectors"
+        );
+        setQueryIndexes([(documentVectorIndex || vectorIndexes[0]).config.name]);
       }
     }
   }, [indexes, queryIndexes.length]);
 
   const semanticQueryRequestString = useMemo(() => {
-    const queryRequest: QueryRequest = {};
+    const queryRequest: QueryRequestWithHierarchy = {};
     if (hasSemanticQuery) {
       queryRequest.indexes = queryIndexes;
       queryRequest.semantic_search = query || "";
+      if (hasDocumentHierarchyIndexes) {
+        queryRequest.hierarchy = {
+          return_level: "chunk",
+          include: ["source", "unit"],
+        };
+      }
     }
     if (selectedFields.length > 0) {
       queryRequest.fields = selectedFields;
@@ -297,7 +331,13 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     }
     if (hasFilterQuery) {
       try {
-        queryRequest.filter_query = JSON.parse(filterQuery);
+        queryRequest.full_text_search = JSON.parse(filterQuery);
+        if (hasDocumentHierarchyIndexes) {
+          queryRequest.hierarchy = {
+            return_level: "chunk",
+            include: ["source", "unit"],
+          };
+        }
       } catch (e) {
         // ignore invalid json
         console.error("Invalid filter query JSON:", e);
@@ -312,6 +352,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     semanticQuery,
     hasSemanticQuery,
     hasFilterQuery,
+    hasDocumentHierarchyIndexes,
     selectedFields,
     includeProfile,
   ]);
@@ -340,9 +381,12 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         // Set query content (search mode is auto-detected from content)
         setQuery(queryRequest.semantic_search || "");
 
-        // Set filter query content
-        if (queryRequest.filter_query) {
-          setFilterQuery(JSON.stringify(queryRequest.filter_query, null, 2));
+        // Set full-text query content. Older saved queries may still use
+        // filter_query for this builder panel, so keep reading both shapes.
+        if (queryRequest.full_text_search || queryRequest.filter_query) {
+          setFilterQuery(
+            JSON.stringify(queryRequest.full_text_search ?? queryRequest.filter_query, null, 2)
+          );
         } else {
           setFilterQuery(JSON.stringify({}, null, 2));
         }

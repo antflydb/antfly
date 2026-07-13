@@ -75,4 +75,51 @@ describe("QueryResultItem", () => {
     const scoreElement = screen.getByText("0.0000");
     expect(scoreElement).toBeTruthy();
   });
+
+  it("should display hierarchy chunk preview and source label for document search hits", () => {
+    const hierarchyHit = {
+      _id: "doc-chunk-1",
+      _score: 0.12,
+      _source: {},
+      hierarchy: {
+        level: "chunk" as const,
+        parent_doc_key: "source-doc-1",
+        artifact: { text: "This standup chunk discusses blockers, progress, and follow-up work." },
+        ancestors: {
+          source: {
+            document: { filename: "standup-june.docx", source_path: "standups/standup-june.docx" },
+          },
+        },
+      },
+    };
+
+    render(
+      <QueryResultItem hit={hierarchyHit} index={0} isExpanded={false} onToggle={() => undefined} />
+    );
+
+    expect(screen.getByText(/Source: standup-june\.docx/i)).toBeTruthy();
+    expect(screen.getByText(/standup chunk discusses blockers/i)).toBeTruthy();
+    expect(screen.queryByText(/No preview available/i)).toBeNull();
+  });
+
+  it("should flag symbol-heavy extracted text as low quality", () => {
+    const lowQualityHit = {
+      _id: "pdf-chunk-1",
+      _score: 0.2,
+      _source: {
+        text: "- --  $  $   $ $ $ $ $ - - - % $ - - - / / / / / / / / -- -- %% $$ //// ---- ",
+      },
+    };
+
+    render(
+      <QueryResultItem
+        hit={lowQualityHit}
+        index={0}
+        isExpanded={false}
+        onToggle={() => undefined}
+      />
+    );
+
+    expect(screen.getByText(/Low-quality extracted text/i)).toBeTruthy();
+  });
 });
