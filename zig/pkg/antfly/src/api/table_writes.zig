@@ -622,6 +622,15 @@ fn deleteGroupPathIfPresent(
 }
 
 pub const ProvisionedTableWriteCache = struct {
+    const TableEvictionHook = struct {
+        ptr: *anyopaque,
+        on_evict: *const fn (ptr: *anyopaque, cache: *ProvisionedTableWriteCache, table_name: []const u8) void,
+
+        fn notify(self: @This(), cache: *ProvisionedTableWriteCache, table_name: []const u8) void {
+            self.on_evict(self.ptr, cache, table_name);
+        }
+    };
+
     alloc: std.mem.Allocator,
     lsm_cache: ?*lsm_backend.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
@@ -649,6 +658,7 @@ pub const ProvisionedTableWriteCache = struct {
     /// DBs. Changing the mirror retires live cached DBs so already-open tables
     /// cannot silently continue without primary-side replication.
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
+    table_eviction_hook: ?TableEvictionHook = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -2246,6 +2256,7 @@ pub const ProvisionedTableWriteCache = struct {
     fn evictOldestTable(self: *ProvisionedTableWriteCache) void {
         if (self.table_metadata.items.len == 0) return;
         const table_name = self.table_metadata.items[0].table_name;
+        if (self.table_eviction_hook) |hook| hook.notify(self, table_name);
         self.removeDbEntriesForTable(table_name);
         var removed = self.table_metadata.orderedRemove(0);
         removed.deinit(self.alloc);
@@ -2320,6 +2331,14 @@ pub const ProvisionedTableWriteCache = struct {
             if (std.mem.eql(u8, metadata.table_name, table_name)) return metadata;
         }
         return null;
+    }
+
+    fn hasTableStateLocked(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
+        if (self.tableMetadataLocked(table_name) != null) return true;
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) return true;
+        }
+        return false;
     }
 
     fn tableHasOnlyInactiveAdoptableEntriesLocked(
@@ -4335,6 +4354,50 @@ pub const ProvisionedTableWriteSource = struct {
             .catalog = catalog,
             .table_activity_threaded = Io.Threaded.init(std.heap.page_allocator, .{}),
         };
+    }
+
+    pub fn bindWriteCaches(
+        self: *ProvisionedTableWriteSource,
+        write_cache: ?*ProvisionedTableWriteCache,
+        startup_write_cache: ?*ProvisionedTableWriteCache,
+    ) void {
+        self.write_cache = write_cache;
+        self.startup_write_cache = startup_write_cache;
+        const hook = ProvisionedTableWriteCache.TableEvictionHook{
+            .ptr = self,
+            .on_evict = onWriteCacheTableEvicted,
+        };
+        if (write_cache) |cache| cache.table_eviction_hook = hook;
+        if (startup_write_cache) |cache| cache.table_eviction_hook = hook;
+    }
+
+    fn onWriteCacheTableEvicted(
+        ptr: *anyopaque,
+        evicting_cache: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+    ) void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.local_write_owner) |owner| {
+            return onWriteCacheTableEvicted(owner, evicting_cache, table_name);
+        }
+        // The table-wide read epoch makes every mutation visible even when a
+        // retired entry still has a draining lease. A later mutation on that
+        // lease re-marks the table through its visibility hook.
+        self.invalidateReadCache(table_name);
+
+        const sibling_owns_table = if (self.write_cache != null and self.write_cache.? != evicting_cache and self.write_cache.?.hasTableStateLocked(table_name))
+            true
+        else if (self.startup_write_cache != null and self.startup_write_cache.? != evicting_cache and self.startup_write_cache.?.hasTableStateLocked(table_name))
+            true
+        else
+            false;
+        if (sibling_owns_table) return;
+
+        // No cached owner can provide a fresher status after this retirement.
+        // Remove cached observations instead of letting them masquerade as
+        // fresh, and let the next status request recover from durable storage.
+        self.invalidateRuntimeStatusCache(table_name);
+        self.clearDirtyWriteTable(table_name);
     }
 
     pub fn withAntflyProvider(
@@ -7731,6 +7794,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn isWriteCacheDirtyForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        if (self.local_write_owner) |owner| return owner.isWriteCacheDirtyForTable(table_name);
         if (self.dirty_write_table_count.load(.acquire) == 0) return false;
         lockAtomic(&self.dirty_write_tables_mutex);
         defer self.dirty_write_tables_mutex.unlock();
@@ -7751,6 +7815,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn clearDirtyWriteTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        if (self.local_write_owner) |owner| return owner.clearDirtyWriteTable(table_name);
         lockAtomic(&self.dirty_write_tables_mutex);
         defer self.dirty_write_tables_mutex.unlock();
         if (self.dirty_write_tables.fetchRemove(table_name)) |removed| {
@@ -7780,6 +7845,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn markWriteCacheDirty(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        if (self.local_write_owner) |owner| return owner.markWriteCacheDirty(table_name);
         if (self.write_cache == null) return;
         lockAtomic(&self.dirty_write_tables_mutex);
         if (self.hasDirtyWriteTableLocked(table_name)) {
@@ -17942,7 +18008,7 @@ test "provisioned native backup restore repeats through shared read and write ow
     }
 }
 
-test "dirty table tracking preserves exact identities beyond the cache bound" {
+test "dirty table tracking stays bounded to writer cache ownership" {
     const alloc = std.testing.allocator;
     var source = ProvisionedTableWriteSource.init(
         "/tmp/unused-antfly-dirty-table-overflow",
@@ -17951,7 +18017,7 @@ test "dirty table tracking preserves exact identities beyond the cache bound" {
     defer source.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    source.write_cache = &write_cache;
+    source.bindWriteCaches(&write_cache, null);
     var names: [max_cached_write_tables + 1][]u8 = undefined;
     var initialized: usize = 0;
     defer for (names[0..initialized]) |name| alloc.free(name);
@@ -17960,22 +18026,100 @@ test "dirty table tracking preserves exact identities beyond the cache bound" {
         initialized += 1;
     }
 
-    for (names[0..max_cached_write_tables]) |name| source.markWriteCacheDirty(name);
-    try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
+    for (names) |name| {
+        try write_cache.replaceTableMetadataLocked(name, "{}", "{}");
+        source.markWriteCacheDirty(name);
+    }
     try std.testing.expectEqual(@as(u32, max_cached_write_tables), source.dirty_write_table_count.load(.acquire));
-
-    source.markWriteCacheDirty(names[max_cached_write_tables]);
-    try std.testing.expectEqual(@as(u32, max_cached_write_tables + 1), source.dirty_write_table_count.load(.acquire));
-    try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
+    try std.testing.expect(!source.isWriteCacheDirtyForTable(names[0]));
     try std.testing.expect(source.isWriteCacheDirtyForTable(names[max_cached_write_tables]));
 
-    source.clearDirtyWriteTable(names[0]);
     source.clearDirtyWriteTable(names[max_cached_write_tables]);
-    try std.testing.expect(!source.isWriteCacheDirtyForTable(names[0]));
     try std.testing.expect(!source.isWriteCacheDirtyForTable(names[max_cached_write_tables]));
     try std.testing.expectEqual(@as(u32, max_cached_write_tables - 1), source.dirty_write_table_count.load(.acquire));
-    source.markWriteCacheDirty(names[0]);
-    try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
+}
+
+test "writer cache eviction retires dirty ownership after the last cache owner" {
+    const alloc = std.testing.allocator;
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-dirty-table-eviction",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    source.bindWriteCaches(&write_cache, &startup_cache);
+
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    source.read_cache = &read_cache;
+    const read_epoch_key = try alloc.dupe(u8, "docs");
+    read_cache.table_epochs.put(alloc, read_epoch_key, 7) catch |err| {
+        alloc.free(read_epoch_key);
+        return err;
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    try snapshot_cache.upsertGroupStatus("docs", .{ .group_id = 7001, .stats = .{} });
+
+    try write_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    try startup_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    source.markWriteCacheDirty("docs");
+
+    write_cache.evictOldestTable();
+    try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
+    var retained_snapshot = (try snapshot_cache.snapshot(alloc, "docs")) orelse return error.TestUnexpectedResult;
+    retained_snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("docs").?);
+
+    startup_cache.evictOldestTable();
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    try std.testing.expectEqual(@as(u64, 9), read_cache.table_epochs.get("docs").?);
+}
+
+test "forwarded write sources use the local writer owner dirty lifecycle" {
+    const alloc = std.testing.allocator;
+    var owner = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-dirty-table-owner",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer owner.deinit();
+    var owner_cache = ProvisionedTableWriteCache.init(alloc);
+    defer owner_cache.deinit();
+    owner.bindWriteCaches(&owner_cache, null);
+
+    var forwarding = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-dirty-table-forwarder",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer forwarding.deinit();
+    var forwarding_cache = ProvisionedTableWriteCache.init(alloc);
+    defer forwarding_cache.deinit();
+    forwarding.bindWriteCaches(&forwarding_cache, null);
+    _ = forwarding.withLocalWriteOwner(&owner);
+
+    try owner_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    try forwarding_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+
+    forwarding.markWriteCacheDirty("docs");
+    try std.testing.expectEqual(@as(u32, 0), forwarding.dirty_write_table_count.load(.acquire));
+    try std.testing.expect(owner.isWriteCacheDirtyForTable("docs"));
+    try std.testing.expect(forwarding.isWriteCacheDirtyForTable("docs"));
+
+    forwarding_cache.evictOldestTable();
+    try std.testing.expect(owner.isWriteCacheDirtyForTable("docs"));
+
+    owner_cache.evictOldestTable();
+    try std.testing.expect(!owner.isWriteCacheDirtyForTable("docs"));
+
+    forwarding.markWriteCacheDirty("docs");
+    forwarding.clearDirtyWriteTable("docs");
+    try std.testing.expect(!owner.isWriteCacheDirtyForTable("docs"));
 }
 
 test "provisioned read preparation invalidates readers without closing dirty writer cache" {
@@ -18536,7 +18680,7 @@ test "weak-sync group writes publish all docs after background dense catch-up" {
     try std.testing.expectEqual(replay_target, statuses.items[0].stats.indexes[0].replay_applied_sequence);
 }
 
-test "dirty auto bulk writer publishes runtime status before read invalidation closes it" {
+test "dirty auto bulk writer publishes runtime status without closing the cached writer" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -18593,9 +18737,10 @@ test "dirty auto bulk writer publishes runtime status before read invalidation c
     defer snapshot_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    source.write_cache = &write_cache;
+    source.bindWriteCaches(&write_cache, null);
     source.runtime_status_cache = &snapshot_cache;
 
     _ = try source.source().createTable(alloc, "docs", .{});
@@ -18623,7 +18768,7 @@ test "dirty auto bulk writer publishes runtime status before read invalidation c
 
     source.readPreparation().prepareForRead("docs", .general);
 
-    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
 
     var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;

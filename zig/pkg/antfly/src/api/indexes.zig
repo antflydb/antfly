@@ -1902,6 +1902,14 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
     const source_coverage_visible = coverage.source_visible;
     const dense_coverage_complete = coverage.complete;
+    // External indexes are query-ready once their published artifacts and
+    // replay are current. Their coverage remains independently observable and
+    // may be incomplete because callers are not required to supply a vector
+    // for every source document.
+    const policy_readiness_complete = if (coverage_policy == .external)
+        !coverage_incomplete and replay_current
+    else
+        dense_coverage_complete;
     if (enrichment) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
@@ -1929,7 +1937,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
     else
         false;
-    if (!coverage_incomplete and dense_coverage_complete and source_coverage_visible and !enrichment_pending) {
+    if (policy_readiness_complete and source_coverage_visible and !enrichment_pending) {
         view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
         view.replay_catch_up_required = false;
         view.backfill_active = false;
@@ -1945,7 +1953,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         view.backfill_progress = 0.0;
         return view;
     }
-    if (!coverage_incomplete and dense_coverage_complete and source_coverage_visible and !enrichment_pending) {
+    if (policy_readiness_complete and source_coverage_visible and !enrichment_pending) {
         view.backfill_active = false;
         view.backfill_progress = 1.0;
     } else if (!coverage_incomplete and replay_ready and source_coverage_visible and (!require_table_coverage or table_doc_count == 0) and !enrichment_pending) {
@@ -4321,6 +4329,10 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
 }
 
 test "external embeddings index readiness does not require table doc coverage" {
+    const config_json = "{\"type\":\"embeddings\",\"dimension\":1536,\"external\":true,\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "vec", parsed_config.value);
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4328,6 +4340,10 @@ test "external embeddings index readiness does not require table doc coverage" {
         .kind = .dense_vector,
         .doc_count = 50_000,
         .node_count = 24,
+        .coverage_produced_count = 50_000,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 502,
         .replay_target_sequence = 502,
         .replay_catch_up_required = false,
@@ -4340,7 +4356,9 @@ test "external embeddings index readiness does not require table doc coverage" {
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
+            .source_doc_count = 50_001,
             .doc_count = 50_001,
             .index_count = 1,
             .indexes = indexes,
@@ -4353,7 +4371,7 @@ test "external embeddings index readiness does not require table doc coverage" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":1536,\"external\":true}}",
+            .indexes_json = "{\"vec\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4371,6 +4389,9 @@ test "external embeddings index readiness does not require table doc coverage" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_indexed\":50000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_visible_doc_count\":50000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"published_doc_count\":50000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"external\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":false") != null);
 }
 
 test "embeddings index status reports dense catch-up phase separately from published visibility" {

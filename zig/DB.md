@@ -86,11 +86,14 @@ Queued structural reconciliation closes new write admission before draining
 current writers. This prevents continuous traffic from starving index/catalog
 convergence, while reads remain admitted against the currently published
 generation until the short publication transition begins.
-Per-table dirty visibility tracking is bounded to the write-cache working set.
-If that bound is exceeded, the source briefly treats every table as dirty,
-invalidates the bounded read cache and runtime-status cache once, then resumes
-exact tracking with the current table. Overflow therefore cannot create an
-unbounded map or a permanent cache-bypass mode.
+Per-table dirty visibility tracking uses owned exact table identities rather
+than collision-prone hashes. Its lifetime is tied to write-cache ownership:
+eviction advances the table's read-cache epoch, and the last cache owner also
+invalidates cached runtime status and retires the dirty identity. A sibling
+startup or serving cache keeps the identity alive until it also evicts the
+table. Memory therefore scales with the bounded union of cache working sets,
+not with historical writes, while a draining lease that mutates after eviction
+re-marks itself through the normal visibility hook.
 This includes the embedded
 `BoundTableWriteSource`: it closes its current owner, restores into a sibling
 generation, publishes atomically, and reopens either the unchanged live
@@ -497,6 +500,11 @@ marker values outside the status path. External embedding writes participate in
 the same accounting:
 only a durably applied `_embeddings` value is `produced`, and a source without an
 external vector remains pending rather than being assumed covered.
+That pending coverage remains visible in status but does not make a usable
+external index report that it is rebuilding. External query readiness depends
+on current replay and published artifact visibility because callers are not
+required to supply a vector for every source document; coverage completeness is
+an independent diagnostic contract.
 
 Public status reports physical vector or sparse-entry `doc_count` separately
 from source coverage. Readiness must never substitute physical cardinality for
