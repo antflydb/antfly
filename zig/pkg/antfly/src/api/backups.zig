@@ -912,41 +912,42 @@ pub fn backupLocationErrorMessage(err: anyerror) ?[]const u8 {
 }
 
 pub fn parseBackupRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(BackupRequest) {
-    return metadata_openapi.server.parseBackupTableBody(alloc, body);
+    return std.json.parseFromSlice(BackupRequest, alloc, body, .{});
 }
 
 pub fn parseRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(RestoreRequest) {
-    var envelope = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-    defer envelope.deinit();
-    const object = switch (envelope.value) {
-        .object => |object| object,
-        else => return error.InvalidRestoreRequest,
-    };
-    var fields = object.iterator();
-    while (fields.next()) |field| {
-        if (std.mem.eql(u8, field.key_ptr.*, "backup_id") or
-            std.mem.eql(u8, field.key_ptr.*, "location") or
-            std.mem.eql(u8, field.key_ptr.*, "connection")) continue;
-        return error.UnknownRestoreRequestField;
-    }
-    return metadata_openapi.server.parseRestoreTableBody(alloc, body);
+    return std.json.parseFromSlice(RestoreRequest, alloc, body, .{});
 }
 
-test "restore request rejects ignored format hints and unknown fields" {
+test "backup API requests reject unknown operational fields" {
+    var backup = try parseBackupRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-writer","format":"native"}
+    );
+    backup.deinit();
+    try std.testing.expectError(error.UnknownField, parseBackupRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-writer","formt":"native"}
+    ));
+
     var parsed = try parseRestoreRequest(std.testing.allocator,
         \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader"}
     );
     parsed.deinit();
-    try std.testing.expectError(error.UnknownRestoreRequestField, parseRestoreRequest(std.testing.allocator,
+    try std.testing.expectError(error.UnknownField, parseRestoreRequest(std.testing.allocator,
         \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","format":"portable"}
     ));
-    try std.testing.expectError(error.UnknownRestoreRequestField, parseRestoreRequest(std.testing.allocator,
+    try std.testing.expectError(error.UnknownField, parseRestoreRequest(std.testing.allocator,
         \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","conection":"typo"}
+    ));
+    try std.testing.expectError(error.UnknownField, parseClusterBackupRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-writer","formt":"native"}
+    ));
+    try std.testing.expectError(error.UnknownField, parseClusterRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","format":"portable"}
     ));
 }
 
 pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterBackupRequest {
-    var parsed = try metadata_openapi.server.parseBackupBody(alloc, body);
+    var parsed = try std.json.parseFromSlice(metadata_openapi.ClusterBackupRequest, alloc, body, .{});
     defer parsed.deinit();
     try validateBackupId(parsed.value.backup_id);
     const format = try parseBackupFormat(parsed.value.format);
@@ -999,7 +1000,7 @@ test "cluster backup and restore reject duplicate table selectors" {
 }
 
 pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterRestoreRequest {
-    var parsed = try metadata_openapi.server.parseRestoreBody(alloc, body);
+    var parsed = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreRequest, alloc, body, .{});
     defer parsed.deinit();
     try validateBackupId(parsed.value.backup_id);
     const backup_id = try alloc.dupe(u8, parsed.value.backup_id);

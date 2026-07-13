@@ -4508,6 +4508,7 @@ components:
           format: int64
     BackupRequest:
       type: object
+      additionalProperties: false
       required:
         - backup_id
         - location
@@ -4586,6 +4587,7 @@ components:
             paths resolve beneath the connection root.
     ClusterBackupRequest:
       type: object
+      additionalProperties: false
       required:
         - backup_id
         - location
@@ -4680,6 +4682,7 @@ components:
           description: Error message if backup failed
     ClusterRestoreRequest:
       type: object
+      additionalProperties: false
       required:
         - backup_id
         - location
