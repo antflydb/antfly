@@ -376,6 +376,8 @@ Status:
 - `/backup`, `/restore`, and `/backups` are implemented for stateful backups
   over `file://`, `s3://`, and `gs://`
 - cluster backup writes a cluster manifest plus per-table manifests under the same location
+- backup IDs are immutable publication keys: generation-scoped payloads are
+  committed by a conditional public manifest, and reuse returns `409`
 - restore modes follow the Go cluster contract
 - unsupported table layouts still fail per-table instead of restoring
 

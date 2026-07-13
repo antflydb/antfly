@@ -4055,9 +4055,13 @@ pub fn build(b: *std.Build) void {
         .root_module = api_storage_authority_test_mod,
         .filters = &.{
             "public table backup and restore require named connections",
+            "public table backup handler rejects an existing backup id",
             "cluster backup APIs require named connections",
             "cluster backup format defaults portable and preserves explicit native",
             "cluster backup and restore reject duplicate table selectors",
+            "backup manifest round trips through metadata path",
+            "backup manifest round trips through remote objectstore location",
+            "cluster backup list uses top-level remote manifests without recursing into payloads",
             "remote portable file transfer uses objectstore file paths",
             "remote backup directory download paginates and enforces segment prefix",
             "api http server lists cluster backups through public route",

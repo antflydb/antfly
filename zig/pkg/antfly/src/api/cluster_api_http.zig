@@ -30,6 +30,7 @@ pub const ClusterApi = struct {
 
     pub const ExecuteBackupError = error{
         NotLeader,
+        BackupAlreadyExists,
         MethodNotAllowed,
         InternalFailure,
     };
@@ -168,6 +169,7 @@ pub fn handleClusterBackup(
 
     const response_body = api.executeClusterBackup(alloc, req, &location) catch |err| switch (err) {
         error.NotLeader => return err,
+        error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
     };

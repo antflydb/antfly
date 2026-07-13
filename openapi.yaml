@@ -2803,6 +2803,11 @@ paths:
         and their individual backup locations.
 
 
+        Backup IDs are immutable. Reusing an ID that already has a published
+
+        cluster manifest returns `409` and leaves the existing backup unchanged.
+
+
         **Storage Locations:**
 
         - Local filesystem: `file:///path/to/backup`
@@ -2818,15 +2823,7 @@ paths:
 
         ├── {backup_id}-cluster-metadata.json   (cluster manifest)
 
-        ├── {table1}-{backup_id}-metadata.json  (table metadata)
-
-        ├── shard-1-{table1}-{backup_id}.tar.zst
-
-        ├── shard-2-{table1}-{backup_id}.tar.zst
-
-        ├── {table2}-{backup_id}-metadata.json
-
-        └── ...
+        └── generation-scoped table manifests and payloads
 
         ```
       operationId: backup
@@ -2845,6 +2842,8 @@ paths:
                 $ref: '#/components/schemas/ClusterBackupResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -3757,6 +3756,8 @@ paths:
           type: string
     post:
       summary: Backup a table
+      description: Backup IDs are immutable. Reusing an already published ID returns `409` without changing
+        the existing backup.
       tags:
         - data_operations
       operationId: backupTable
@@ -3781,6 +3782,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:

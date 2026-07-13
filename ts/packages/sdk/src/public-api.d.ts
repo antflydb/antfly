@@ -410,6 +410,9 @@ export interface paths {
          *     The backup creates a cluster-level manifest that tracks all included tables
          *     and their individual backup locations.
          *
+         *     Backup IDs are immutable. Reusing an ID that already has a published
+         *     cluster manifest returns `409` and leaves the existing backup unchanged.
+         *
          *     **Storage Locations:**
          *     - Local filesystem: `file:///path/to/backup`
          *     - Amazon S3: `s3://bucket-name/path/to/backup`
@@ -418,11 +421,7 @@ export interface paths {
          *     ```
          *     {location}/
          *     ├── {backup_id}-cluster-metadata.json   (cluster manifest)
-         *     ├── {table1}-{backup_id}-metadata.json  (table metadata)
-         *     ├── shard-1-{table1}-{backup_id}.tar.zst
-         *     ├── shard-2-{table1}-{backup_id}.tar.zst
-         *     ├── {table2}-{backup_id}-metadata.json
-         *     └── ...
+         *     └── generation-scoped table manifests and payloads
          *     ```
          */
         post: operations["backup"];
@@ -922,7 +921,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Backup a table */
+        /**
+         * Backup a table
+         * @description Backup IDs are immutable. Reusing an already published ID returns `409` without changing the existing backup.
+         */
         post: operations["backupTable"];
         delete?: never;
         options?: never;
@@ -12970,6 +12972,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -13498,6 +13501,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };

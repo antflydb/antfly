@@ -513,6 +513,20 @@ const RemoteBackupStore = struct {
         defer result.deinit(alloc);
     }
 
+    fn writeBytesIfAbsent(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, body: []const u8, content_type: []const u8) !void {
+        try self.ensureBucket();
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var result = self.client.putObject(self.bucket, key, body, .{
+            .content_type = content_type,
+            .if_none_match = true,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => return error.BackupAlreadyExists,
+            else => return err,
+        };
+        defer result.deinit(alloc);
+    }
+
     fn writeFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, src_path: []const u8, content_type: []const u8) !void {
         try self.ensureBucket();
         const key = try self.keyAlloc(alloc, suffix);
@@ -533,6 +547,17 @@ const RemoteBackupStore = struct {
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
         try self.client.getFileWithIo(self.io, self.bucket, key, dest_path, .{});
+    }
+
+    fn exists(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) !bool {
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var metadata = self.client.statObject(self.bucket, key) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        metadata.deinit(alloc);
+        return true;
     }
 
     fn listObjectsPage(
@@ -1086,7 +1111,7 @@ pub fn writeManifest(
 
     const encoded = try stringifyJsonAlloc(alloc, manifest.*);
     defer alloc.free(encoded);
-    try writeFileAbsolute(path, encoded);
+    try writeFileAbsoluteIfAbsent(alloc, path, encoded);
 }
 
 pub fn readManifest(
@@ -1114,7 +1139,7 @@ pub fn writeManifestToLocation(
             defer alloc.free(encoded);
             const suffix = try metadataPath(alloc, "", manifest.backup_id);
             defer alloc.free(suffix);
-            try store.writeBytes(alloc, trimLeftSlash(suffix), encoded, "application/json");
+            try store.writeBytesIfAbsent(alloc, trimLeftSlash(suffix), encoded, "application/json");
         },
     }
 }
@@ -1134,6 +1159,19 @@ pub fn readManifestFromLocation(
             return parseTableBackupManifestOrPortable(alloc, body, backup_id);
         },
     }
+}
+
+pub fn manifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
+    const suffix = try metadataPath(alloc, "", backup_id);
+    defer alloc.free(suffix);
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try metadataPath(alloc, backup_root, backup_id);
+            defer alloc.free(path);
+            break :blk try pathExists(path);
+        },
+        .remote => |*store| try store.exists(alloc, trimLeftSlash(suffix)),
+    };
 }
 
 fn parseTableBackupManifestOrPortable(
@@ -1422,33 +1460,6 @@ pub fn encodeRestoreTriggered(alloc: std.mem.Allocator) ![]u8 {
     return try alloc.dupe(u8, "{\"restore\":\"triggered\"}");
 }
 
-pub fn clusterTableBackupId(alloc: std.mem.Allocator, cluster_backup_id: []const u8, table_name: []const u8) ![]u8 {
-    try validateBackupId(cluster_backup_id);
-    if (table_name.len == 0) return error.InvalidBackupId;
-    // Table names are user-facing Unicode identifiers and are not safe path
-    // components. A domain-separated digest is fixed-size, portable, and
-    // collision-resistant even when the public backup ID is at its limit.
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-cluster-table-backup-v1\x00");
-    hash.update(cluster_backup_id);
-    hash.update("\x00");
-    hash.update(table_name);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hash.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return try std.fmt.allocPrint(alloc, "table-{s}", .{hex});
-}
-
-test "cluster table backup ids are fixed-size safe components" {
-    const first = try clusterTableBackupId(std.testing.allocator, "daily", "documents/日本語");
-    defer std.testing.allocator.free(first);
-    const second = try clusterTableBackupId(std.testing.allocator, "daily", "documents/日本語");
-    defer std.testing.allocator.free(second);
-    try std.testing.expectEqualStrings(first, second);
-    try std.testing.expectEqual(@as(usize, "table-".len + 64), first.len);
-    try validateBackupId(first);
-}
-
 pub fn createClusterManifest(
     alloc: std.mem.Allocator,
     backup_id: []const u8,
@@ -1510,7 +1521,7 @@ pub fn writeClusterManifest(
 
     const encoded = try stringifyJsonAlloc(alloc, manifest.*);
     defer alloc.free(encoded);
-    try writeFileAbsolute(path, encoded);
+    try writeFileAbsoluteIfAbsent(alloc, path, encoded);
 }
 
 pub fn readClusterManifest(
@@ -1542,7 +1553,7 @@ pub fn writeClusterManifestToLocation(
             defer alloc.free(encoded);
             const suffix = try clusterMetadataPath(alloc, "", manifest.backup_id);
             defer alloc.free(suffix);
-            try store.writeBytes(alloc, trimLeftSlash(suffix), encoded, "application/json");
+            try store.writeBytesIfAbsent(alloc, trimLeftSlash(suffix), encoded, "application/json");
         },
     }
 }
@@ -1566,6 +1577,19 @@ pub fn readClusterManifestFromLocation(
             return try cloneClusterBackupManifest(alloc, parsed.value);
         },
     }
+}
+
+pub fn clusterManifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
+    const suffix = try clusterMetadataPath(alloc, "", backup_id);
+    defer alloc.free(suffix);
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try clusterMetadataPath(alloc, backup_root, backup_id);
+            defer alloc.free(path);
+            break :blk try pathExists(path);
+        },
+        .remote => |*store| try store.exists(alloc, trimLeftSlash(suffix)),
+    };
 }
 
 fn validateClusterManifest(manifest: *const ClusterBackupManifest, requested_backup_id: []const u8) !void {
@@ -2127,6 +2151,62 @@ fn writeFileAbsolute(path: []const u8, data: []const u8) !void {
     try writer.end();
 }
 
+fn writeFileAbsoluteIfAbsent(alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir_name| try ensureDirPath(dir_name);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+    defer alloc.free(lock_path);
+    var lock_file = if (std.fs.path.isAbsolute(lock_path))
+        try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+    else
+        try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+    defer lock_file.close(io);
+    // Manifest publication is the backup commit point. Locking support is
+    // required so two Antfly processes sharing a filesystem cannot both pass
+    // the existence check and overwrite one another.
+    try lock_file.lock(io, .exclusive);
+    defer lock_file.unlock(io);
+    const exists = blk: {
+        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
+    if (exists) return error.BackupAlreadyExists;
+
+    var entropy: [8]u8 = undefined;
+    try io.randomSecure(&entropy);
+    const nonce = std.fmt.bytesToHex(entropy, .lower);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var file = if (std.fs.path.isAbsolute(tmp_path))
+        try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+    else
+        try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(data);
+    try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+}
+
 fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -2140,6 +2220,16 @@ fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: 
     const stat = try file.stat(io);
     var reader: std.Io.File.Reader = .initSize(file, io, &.{}, stat.size);
     return try reader.interface.allocRemaining(alloc, .limited(max_bytes));
+}
+
+fn pathExists(path: []const u8) !bool {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    _ = std.Io.Dir.cwd().statFile(io_impl.io(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
@@ -2310,6 +2400,10 @@ test "backup manifest round trips through metadata path" {
     defer manifest.deinit(std.testing.allocator);
 
     try writeManifest(std.testing.allocator, root, &manifest);
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        writeManifest(std.testing.allocator, root, &manifest),
+    );
 
     var loaded = try readManifest(std.testing.allocator, root, "snap");
     defer loaded.deinit(std.testing.allocator);
@@ -2437,6 +2531,10 @@ test "backup manifest round trips through remote objectstore location" {
     defer manifest.deinit(std.testing.allocator);
 
     try writeManifestToLocation(std.testing.allocator, &location, &manifest);
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        writeManifestToLocation(std.testing.allocator, &location, &manifest),
+    );
 
     var loaded = try readManifestFromLocation(std.testing.allocator, &location, "snap");
     defer loaded.deinit(std.testing.allocator);
@@ -2537,6 +2635,10 @@ test "cluster backup list uses top-level remote manifests without recursing into
     var manifest = try createClusterManifest(std.testing.allocator, "prod-snap", "s3://bucket/backups/prod", &entries);
     defer manifest.deinit(std.testing.allocator);
     try writeClusterManifestToLocation(std.testing.allocator, &location, &manifest);
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        writeClusterManifestToLocation(std.testing.allocator, &location, &manifest),
+    );
 
     var raw_client = memory.client();
     var nested = try raw_client.putObject(

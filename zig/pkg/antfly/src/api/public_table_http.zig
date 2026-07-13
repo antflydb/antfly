@@ -93,6 +93,7 @@ pub const TableApi = struct {
 
     pub const ExecuteBackupError = error{
         NotFound,
+        BackupAlreadyExists,
         MethodNotAllowed,
         UnsupportedBackupMigrationState,
         UnsupportedMultiRangeTable,
@@ -710,6 +711,7 @@ pub fn handleTableBackup(
 
     api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, &location) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support active schema migration") },
         error.UnsupportedMultiRangeTable => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support multi-range tables") },
@@ -2362,19 +2364,69 @@ test "public table backup handler maps unsupported multi-range error" {
         }
     };
 
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
     var resp = try handleTableBackup(
         std.testing.allocator,
         "docs",
-        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
         Backend.iface(),
         null,
-        null,
+        &node_config,
         null,
     );
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("backup does not support multi-range tables", resp.body);
+}
+
+test "public table backup handler rejects an existing backup id" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = executeTableBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBackup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: backups_api.BackupFormat,
+            _: []const u8,
+            _: *backups_api.BackupLocation,
+        ) TableApi.ExecuteBackupError!void {
+            return error.BackupAlreadyExists;
+        }
+    };
+
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
+    var resp = try handleTableBackup(
+        std.testing.allocator,
+        "docs",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
+        Backend.iface(),
+        null,
+        &node_config,
+        null,
+    );
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("backup id already exists", resp.body);
 }
 
 test "public table backup handler accepts portable format" {

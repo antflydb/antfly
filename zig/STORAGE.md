@@ -207,6 +207,14 @@ the requested page size even when the archive contains many more objects. Page
 sizes are capped at 10,000 keys to keep caller-controlled memory and sorting
 work predictable.
 
+Backup IDs are immutable publication keys. Payloads and per-table manifests use
+opaque generation-scoped paths; the public table or cluster manifest is created
+conditionally as the final commit point. Reusing a published ID returns `409`
+without changing the existing backup, and a failed pre-publication attempt can
+be retried safely. This prevents restores from observing an old manifest with
+partially overwritten payloads. Local manifest publication holds a fail-closed
+advisory lock and uses sync-plus-rename; object stores use conditional puts.
+
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the
 `s3://` location continues to identify the artifact:

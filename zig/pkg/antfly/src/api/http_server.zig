@@ -5605,12 +5605,16 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
     ) !void {
+        if (try backups_api.manifestExistsAtLocation(self.alloc, backup_location, backup_id))
+            return error.BackupAlreadyExists;
+        const artifact_backup_id = try self.backupGenerationIdAlloc();
+        defer self.alloc.free(artifact_backup_id);
         const table = (try self.loadOwnedTableRecord(table_name)) orelse return error.TableNotFound;
         defer metadata_table_manager.freeTable(self.alloc, table);
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, backup_id, format, location_uri, backup_location)) |shards| {
+        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, location_uri, backup_location)) |shards| {
             defer freeBackupShards(self.alloc, shards);
             var manifest = try backups_api.createManifest(self.alloc, backup_id, &table, shards);
             defer manifest.deinit(self.alloc);
@@ -5629,7 +5633,7 @@ pub const ApiHttpServer = struct {
 
         const shards = (try table_writes_source.backupTable(self.alloc, table_name, .{
             .backup_root = local_backup_root,
-            .backup_id = backup_id,
+            .backup_id = artifact_backup_id,
             .format = format,
             .io = self.sharedApiIo(),
         })) orelse return error.TableNotFound;
@@ -5651,7 +5655,7 @@ pub const ApiHttpServer = struct {
                         "application/vnd.antfly.backup",
                     )
                 else
-                    try backups_api.copyDirectoryToLocation(self.alloc, backup_location, backup_id, shard.group_id, snapshot_root);
+                    try backups_api.copyDirectoryToLocation(self.alloc, backup_location, artifact_backup_id, shard.group_id, snapshot_root);
             }
         }
 
@@ -5876,6 +5880,19 @@ pub const ApiHttpServer = struct {
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), path);
         return path;
+    }
+
+    fn backupGenerationIdAlloc(self: *ApiHttpServer) ![]u8 {
+        var entropy: [16]u8 = undefined;
+        if (self.sharedApiIo()) |io| {
+            try io.randomSecure(&entropy);
+        } else {
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            try io_impl.io().randomSecure(&entropy);
+        }
+        const hex = std.fmt.bytesToHex(entropy, .lower);
+        return try std.fmt.allocPrint(self.alloc, "afbg-{s}", .{&hex});
     }
 
     fn destroyBackupStagingRoot(alloc: std.mem.Allocator, path: []const u8) void {
@@ -6768,6 +6785,7 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
         self.backupOwnedTable(table_name, location, location_uri, backup_id, format) catch |err| switch (err) {
+            error.BackupAlreadyExists => return error.BackupAlreadyExists,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
@@ -7212,6 +7230,8 @@ pub const ApiHttpServer = struct {
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return error.InternalFailure;
         };
+        if (backups_api.clusterManifestExistsAtLocation(alloc, location, req.backup_id) catch return error.InternalFailure)
+            return error.BackupAlreadyExists;
 
         const owns_table_names = req.table_names == null;
         const table_names = if (req.table_names) |values|
@@ -7235,7 +7255,7 @@ pub const ApiHttpServer = struct {
 
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
-            const table_backup_id = backups_api.clusterTableBackupId(alloc, req.backup_id, table_name) catch return error.InternalFailure;
+            const table_backup_id = self.backupGenerationIdAlloc() catch return error.InternalFailure;
             self.backupOwnedTable(table_name, location, req.location, table_backup_id, req.format) catch |err| {
                 if (isRetryableMetadataLeadershipError(err)) {
                     alloc.free(table_backup_id);
@@ -7268,7 +7288,10 @@ pub const ApiHttpServer = struct {
         const extension_dependencies = if (extension_snapshot_opt) |*snapshot| snapshot.extension_dependencies else &.{};
         var manifest = backups_api.createClusterManifestWithExtensions(alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
         defer manifest.deinit(alloc);
-        backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch return error.InternalFailure;
+        backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch |err| switch (err) {
+            error.BackupAlreadyExists => return error.BackupAlreadyExists,
+            else => return error.InternalFailure,
+        };
 
         return backups_api.encodeClusterBackupResponse(alloc, req.backup_id, statuses) catch return error.InternalFailure;
     }
@@ -8309,7 +8332,7 @@ pub const ApiHttpServer = struct {
                 const parsed = try parseJsonResponseBody(BackupSuccess, arena_impl.allocator(), resp.body);
                 break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
             },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
         };
     }
 
@@ -8367,7 +8390,7 @@ pub const ApiHttpServer = struct {
                 const parsed = try parseJsonResponseBody(metadata_openapi.ClusterBackupResponse, arena_impl.allocator(), resp.body);
                 break :blk try jsonResponse(self.alloc, parsed);
             },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
         };
     }
 
@@ -24345,8 +24368,7 @@ test "api http server rejects destructive cluster overwrite restore" {
     const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
     defer alloc.free(location_uri);
 
-    const table_backup_id = try backups_api.clusterTableBackupId(alloc, "snap-cluster", "docs");
-    defer alloc.free(table_backup_id);
+    const table_backup_id = "afbg-0123456789abcdef0123456789abcdef";
 
     const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
     shards[0] = .{
