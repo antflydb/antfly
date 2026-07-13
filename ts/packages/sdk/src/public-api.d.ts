@@ -4681,7 +4681,25 @@ export interface components {
              */
             format?: "native" | "portable";
         };
-        RestoreRequest: components["schemas"]["BackupRequest"];
+        RestoreRequest: {
+            /**
+             * @description Identifier of the published backup to restore.
+             * @example backup-2025-01-15-v2
+             */
+            backup_id: string;
+            /**
+             * @description Storage location containing the backup. The server detects the
+             *     native or portable format from the published manifest and artifact.
+             * @example s3://mybucket/antfly-backups/users-table/2025-01-15
+             */
+            location: string;
+            /**
+             * @description ID of a configured `external_io` connection with `restore.read`.
+             *     Object locations enforce bucket and prefix scopes; filesystem URI
+             *     paths resolve beneath the connection root.
+             */
+            connection: string;
+        };
         ClusterBackupRequest: {
             /**
              * @description Unique identifier for this backup. Used to reference the backup for restore operations.

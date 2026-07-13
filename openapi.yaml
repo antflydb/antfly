@@ -10519,8 +10519,39 @@ components:
             On restore, the format is auto-detected from file magic bytes.
           example: portable
     RestoreRequest:
-      allOf:
-        - $ref: '#/components/schemas/BackupRequest'
+      type: object
+      additionalProperties: false
+      required:
+        - backup_id
+        - location
+        - connection
+      properties:
+        backup_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: ^[A-Za-z0-9][A-Za-z0-9._-]*$
+          description: Identifier of the published backup to restore.
+          example: backup-2025-01-15-v2
+        location:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: >
+            Storage location containing the backup. The server detects the
+
+            native or portable format from the published manifest and artifact.
+          example: s3://mybucket/antfly-backups/users-table/2025-01-15
+        connection:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: >
+            ID of a configured `external_io` connection with `restore.read`.
+
+            Object locations enforce bucket and prefix scopes; filesystem URI
+
+            paths resolve beneath the connection root.
     ClusterBackupRequest:
       type: object
       required:

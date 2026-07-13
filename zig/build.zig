@@ -4059,6 +4059,7 @@ pub fn build(b: *std.Build) void {
             "cluster backup APIs require named connections",
             "cluster backup format defaults portable and preserves explicit native",
             "cluster backup and restore reject duplicate table selectors",
+            "restore request rejects ignored format hints and unknown fields",
             "backup manifest round trips through metadata path",
             "backup manifest round trips through remote objectstore location",
             "cluster backup list uses top-level remote manifests without recursing into payloads",

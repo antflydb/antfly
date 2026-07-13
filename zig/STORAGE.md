@@ -231,6 +231,11 @@ format defaults to `portable` for both table and cluster backups. Use
 `--format native` explicitly when same-engine physical restore speed is more
 important than cross-engine portability.
 
+Restore does not accept a format selector. The published manifest and artifact
+magic are authoritative, so table restore, input restore, and Lite promotion
+all detect `native` versus `portable` rather than accepting an ignored or
+contradictory client hint.
+
 Cluster backup is a synchronous aggregate operation and always emits its
 per-table JSON result. An HTTP `200` means the aggregate attempt finished, not
 that every table succeeded. The CLI exits zero only when the result is

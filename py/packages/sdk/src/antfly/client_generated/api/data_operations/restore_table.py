@@ -6,16 +6,16 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.backup_request import BackupRequest
 from ...models.error import Error
 from ...models.restore_job import RestoreJob
+from ...models.restore_request import RestoreRequest
 from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     table_name: str,
     *,
-    body: BackupRequest,
+    body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
@@ -82,7 +82,7 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
 ) -> Response[Error | RestoreJob]:
     """Restore a table from backup
@@ -90,7 +90,7 @@ def sync_detailed(
     Args:
         table_name (str):
         idempotency_key (str | Unset):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -117,7 +117,7 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
 ) -> Error | RestoreJob | None:
     """Restore a table from backup
@@ -125,7 +125,7 @@ def sync(
     Args:
         table_name (str):
         idempotency_key (str | Unset):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -147,7 +147,7 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
 ) -> Response[Error | RestoreJob]:
     """Restore a table from backup
@@ -155,7 +155,7 @@ async def asyncio_detailed(
     Args:
         table_name (str):
         idempotency_key (str | Unset):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -180,7 +180,7 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: BackupRequest,
+    body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
 ) -> Error | RestoreJob | None:
     """Restore a table from backup
@@ -188,7 +188,7 @@ async def asyncio(
     Args:
         table_name (str):
         idempotency_key (str | Unset):
-        body (BackupRequest):
+        body (RestoreRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

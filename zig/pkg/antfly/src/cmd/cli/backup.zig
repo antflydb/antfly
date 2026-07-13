@@ -46,7 +46,6 @@ const RestoreArgs = struct {
     backup_id: ?[]const u8 = null,
     location: []const u8 = "",
     location_explicit: bool = false,
-    format: ?[]const u8 = null,
     restore_mode: ?[]const u8 = null,
     url: ?[]const u8 = null,
     input_path: ?[]const u8 = null,
@@ -171,12 +170,6 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     if (opts.input_path) |input| {
         if (opts.tables_str != null) cli.fatal("--input restore supports exactly one --table", .{});
         const tbl = opts.table_name orelse cli.fatal("--table is required with --input", .{});
-        if (opts.format) |value| {
-            if (!std.mem.eql(u8, value, "portable")) {
-                cli.fatal("--input restore is portable; omit --format or use --format portable", .{});
-            }
-        }
-
         const location = try restoreInputLocationAlloc(allocator, input, opts);
         defer allocator.free(location);
         var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location, connection);
@@ -190,7 +183,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
     if (opts.table_name) |tbl| {
-        var resp = try client.restoreTableWithOptions(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = opts.format }, .{ .idempotency_key = opts.idempotency_key });
+        var resp = try client.restoreTableWithOptions(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection }, .{ .idempotency_key = opts.idempotency_key });
         defer resp.deinit();
         try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
         return;
@@ -299,7 +292,6 @@ fn prepareInputRestorePlan(
             .backup_id = staged.backup_id,
             .location = staged.location,
             .connection = connection,
-            .format = "portable",
         },
     };
 }
@@ -351,8 +343,6 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
             out.location_explicit = true;
         } else if (std.mem.eql(u8, arg, "--connection")) {
             out.connection = try nextRequired(args);
-        } else if (std.mem.eql(u8, arg, "--format")) {
-            out.format = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--mode")) {
             out.restore_mode = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
@@ -443,7 +433,7 @@ fn printBackupUsage() void {
 fn printRestoreUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\
@@ -521,8 +511,6 @@ test "restore cli parser accepts aflite input shape" {
         "app.aflite",
         "--table",
         "docs",
-        "--format",
-        "portable",
         "--location",
         "file:///tmp/backups",
         "--backup-id",
@@ -532,10 +520,15 @@ test "restore cli parser accepts aflite input shape" {
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectEqualStrings("app.aflite", opts.input_path.?);
     try std.testing.expectEqualStrings("docs", opts.table_name.?);
-    try std.testing.expectEqualStrings("portable", opts.format.?);
     try std.testing.expectEqualStrings("file:///tmp/backups", opts.location);
     try std.testing.expect(opts.location_explicit);
     try std.testing.expectEqualStrings("lite-app", opts.backup_id.?);
+}
+
+test "restore CLI rejects ignored format selection" {
+    var argv = [_][*:0]const u8{ "--table", "docs", "--format", "portable" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&iter));
 }
 
 test "restore input location requires explicit shared staging" {
@@ -628,7 +621,6 @@ test "restore input plan stages aflite as portable table restore" {
     try std.testing.expectEqualStrings("docs", plan.tableName());
     try std.testing.expectEqualStrings("lite-restore-input-plan-src", plan.request.backup_id);
     try std.testing.expectEqualStrings(location, plan.request.location);
-    try std.testing.expectEqualStrings("portable", plan.request.format.?);
     try std.testing.expectEqualStrings("lite-restore-input-plan-src.afb", plan.staged.snapshot_path);
 
     var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);

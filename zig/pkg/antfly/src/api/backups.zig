@@ -916,7 +916,33 @@ pub fn parseBackupRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.
 }
 
 pub fn parseRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(RestoreRequest) {
+    var envelope = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer envelope.deinit();
+    const object = switch (envelope.value) {
+        .object => |object| object,
+        else => return error.InvalidRestoreRequest,
+    };
+    var fields = object.iterator();
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, "backup_id") or
+            std.mem.eql(u8, field.key_ptr.*, "location") or
+            std.mem.eql(u8, field.key_ptr.*, "connection")) continue;
+        return error.UnknownRestoreRequestField;
+    }
     return metadata_openapi.server.parseRestoreTableBody(alloc, body);
+}
+
+test "restore request rejects ignored format hints and unknown fields" {
+    var parsed = try parseRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader"}
+    );
+    parsed.deinit();
+    try std.testing.expectError(error.UnknownRestoreRequestField, parseRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","format":"portable"}
+    ));
+    try std.testing.expectError(error.UnknownRestoreRequestField, parseRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","conection":"typo"}
+    ));
 }
 
 pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterBackupRequest {

@@ -799,7 +799,6 @@ fn promoteWithRestore(
         .backup_id = staged.backup_id,
         .location = staged.location,
         .connection = opts.connection,
-        .format = "portable",
     }, opts.idempotency_key);
     errdefer allocator.free(accepted.encoded);
 
@@ -2898,7 +2897,6 @@ test "lite promote helper stages backup then submits normal restore request" {
         table: []const u8 = "",
         backup_id: []const u8 = "",
         location: []const u8 = "",
-        format: []const u8 = "",
         connection: []const u8 = "",
 
         fn restore(ctx: *anyopaque, allocator_inner: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, _: ?[]const u8) !PromoteRestoreAcceptance {
@@ -2907,7 +2905,6 @@ test "lite promote helper stages backup then submits normal restore request" {
             self.table = table;
             self.backup_id = request.backup_id;
             self.location = request.location;
-            self.format = request.format orelse "";
             self.connection = request.connection;
             return .{
                 .job_id = 42,
@@ -2927,7 +2924,6 @@ test "lite promote helper stages backup then submits normal restore request" {
     try std.testing.expectEqualStrings("docs", capture.table);
     try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
     try std.testing.expectEqualStrings(staged.location, capture.location);
-    try std.testing.expectEqualStrings("portable", capture.format);
     try std.testing.expectEqualStrings("local-reader", capture.connection);
     try std.testing.expectEqualStrings("lite-promote-command.afb", staged.snapshot_path);
 

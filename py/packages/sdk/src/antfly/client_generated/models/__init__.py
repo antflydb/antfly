@@ -528,6 +528,7 @@ from .restore_job import RestoreJob
 from .restore_job_phase import RestoreJobPhase
 from .restore_job_result import RestoreJobResult
 from .restore_job_scope import RestoreJobScope
+from .restore_request import RestoreRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
@@ -1179,6 +1180,7 @@ __all__ = (
     "RestoreJobPhase",
     "RestoreJobResult",
     "RestoreJobScope",
+    "RestoreRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",

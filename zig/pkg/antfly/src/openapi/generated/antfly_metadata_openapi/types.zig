@@ -2182,14 +2182,12 @@ pub const RestoreJob = struct {
 };
 
 pub const RestoreRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
+    /// Identifier of the published backup to restore.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location containing the backup. The server detects the native or portable format from the published manifest and artifact.
     location: []const u8,
-    /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    /// ID of a configured `external_io` connection with `restore.read`. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
     connection: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.

@@ -534,7 +534,7 @@ The flow:
 
 ```sh
 antfly lite backup app.aflite --out app.afb
-antfly restore --format portable --input app.afb --table docs \
+antfly restore --input app.afb --table docs \
   --location s3://archive/promotions/app --connection promotion-reader --wait
 ```
 
