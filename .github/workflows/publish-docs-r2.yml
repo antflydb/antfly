@@ -1,0 +1,111 @@
+name: Publish Docs to Cloudflare R2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'scripts/docs/build-r2-manifest.mjs'
+      - '.github/workflows/publish-docs-r2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# Serialize publications so --delete and the current pointer cannot race.
+concurrency:
+  group: antfly-docs-r2-production
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: docs-r2
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate R2 configuration
+        env:
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$R2_BUCKET_NAME"
+          test -n "$R2_ACCESS_KEY_ID"
+          test -n "$R2_SECRET_ACCESS_KEY"
+          [[ "$R2_BUCKET_NAME" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          [[ "$R2_ENDPOINT" =~ ^https://[a-zA-Z0-9.-]+\.r2\.cloudflarestorage\.com/?$ ]]
+
+      - name: Build publication manifests
+        run: |
+          node scripts/docs/build-r2-manifest.mjs \
+            --source docs \
+            --output "$RUNNER_TEMP/r2-publication" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA"
+
+      - name: Publish documentation
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_DEFAULT_REGION: auto
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="${R2_ENDPOINT%/}"
+          release_prefix="docs/releases/$GITHUB_SHA"
+
+          aws s3 sync docs "s3://$R2_BUCKET_NAME/$release_prefix/" \
+            --endpoint-url "$endpoint" \
+            --no-progress \
+            --only-show-errors
+
+          aws s3 cp "$RUNNER_TEMP/r2-publication/manifest.json" \
+            "s3://$R2_BUCKET_NAME/docs/manifests/$GITHUB_SHA.json" \
+            --endpoint-url "$endpoint" \
+            --content-type application/json \
+            --no-progress \
+            --only-show-errors
+
+          aws s3 sync docs "s3://$R2_BUCKET_NAME/docs/current/" \
+            --endpoint-url "$endpoint" \
+            --delete \
+            --no-progress \
+            --only-show-errors
+
+          aws s3 cp "$RUNNER_TEMP/r2-publication/current.json" \
+            "s3://$R2_BUCKET_NAME/docs/current.json" \
+            --endpoint-url "$endpoint" \
+            --content-type application/json \
+            --cache-control no-cache \
+            --no-progress \
+            --only-show-errors
+
+      - name: Verify publication pointer
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_DEFAULT_REGION: auto
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://$R2_BUCKET_NAME/docs/current.json" \
+            "$RUNNER_TEMP/current.remote.json" \
+            --endpoint-url "${R2_ENDPOINT%/}" \
+            --no-progress \
+            --only-show-errors
+          cmp "$RUNNER_TEMP/r2-publication/current.json" "$RUNNER_TEMP/current.remote.json"
