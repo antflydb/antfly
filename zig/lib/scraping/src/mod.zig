@@ -357,6 +357,8 @@ fn downloadHttpOutcomeAlloc(
         trimMimeParameters(value)
     else
         "application/octet-stream";
+    const owned_mime = try alloc.dupe(u8, mime);
+    errdefer alloc.free(owned_mime);
 
     const max_size: usize = if (security) |cfg|
         @intCast(cfg.max_download_size_bytes orelse (100 * 1024 * 1024))
@@ -368,7 +370,7 @@ fn downloadHttpOutcomeAlloc(
     errdefer alloc.free(body);
 
     return .{ .ok = .{
-        .content_type = try alloc.dupe(u8, mime),
+        .content_type = owned_mime,
         .data = body,
     } };
 }
