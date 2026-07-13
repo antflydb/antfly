@@ -573,6 +573,8 @@ jobs:
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly full E2E
+        id: antfly_e2e
+        continue-on-error: true
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -580,12 +582,25 @@ jobs:
           ANTFLY_FS_PATH_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          uv run --project e2e/antfly pytest -q -x e2e/antfly
+          uv run --project e2e/antfly pytest -q e2e/antfly
 
       - name: Run Antfly inference full E2E
+        id: inference_e2e
+        continue-on-error: true
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
-        run: uv run --project e2e/inference pytest -q -x e2e/inference
+        run: uv run --project e2e/inference pytest -q e2e/inference
+
+      - name: Report E2E failures
+        if: always()
+        env:
+          ANTFLY_E2E_OUTCOME: ${{ steps.antfly_e2e.outcome }}
+          INFERENCE_E2E_OUTCOME: ${{ steps.inference_e2e.outcome }}
+        run: |
+          if [[ "$ANTFLY_E2E_OUTCOME" != "success" || "$INFERENCE_E2E_OUTCOME" != "success" ]]; then
+            echo "E2E failures: antfly=$ANTFLY_E2E_OUTCOME inference=$INFERENCE_E2E_OUTCOME" >&2
+            exit 1
+          fi
