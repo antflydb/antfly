@@ -13,7 +13,7 @@ from ...types import UNSET, Response, Unset
 def _get_kwargs(
     *,
     location: str,
-    connection: str | Unset = UNSET,
+    connection: str,
     limit: int | Unset = 100,
     cursor: str | Unset = UNSET,
 ) -> dict[str, Any]:
@@ -78,7 +78,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     location: str,
-    connection: str | Unset = UNSET,
+    connection: str,
     limit: int | Unset = 100,
     cursor: str | Unset = UNSET,
 ) -> Response[BackupListResponse | Error]:
@@ -91,7 +91,7 @@ def sync_detailed(
 
     Args:
         location (str):
-        connection (str | Unset):
+        connection (str):
         limit (int | Unset):  Default: 100.
         cursor (str | Unset):
 
@@ -121,7 +121,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     location: str,
-    connection: str | Unset = UNSET,
+    connection: str,
     limit: int | Unset = 100,
     cursor: str | Unset = UNSET,
 ) -> BackupListResponse | Error | None:
@@ -134,7 +134,7 @@ def sync(
 
     Args:
         location (str):
-        connection (str | Unset):
+        connection (str):
         limit (int | Unset):  Default: 100.
         cursor (str | Unset):
 
@@ -159,7 +159,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     location: str,
-    connection: str | Unset = UNSET,
+    connection: str,
     limit: int | Unset = 100,
     cursor: str | Unset = UNSET,
 ) -> Response[BackupListResponse | Error]:
@@ -172,7 +172,7 @@ async def asyncio_detailed(
 
     Args:
         location (str):
-        connection (str | Unset):
+        connection (str):
         limit (int | Unset):  Default: 100.
         cursor (str | Unset):
 
@@ -200,7 +200,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     location: str,
-    connection: str | Unset = UNSET,
+    connection: str,
     limit: int | Unset = 100,
     cursor: str | Unset = UNSET,
 ) -> BackupListResponse | Error | None:
@@ -213,7 +213,7 @@ async def asyncio(
 
     Args:
         location (str):
-        connection (str | Unset):
+        connection (str):
         limit (int | Unset):  Default: 100.
         cursor (str | Unset):
 

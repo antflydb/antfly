@@ -2434,6 +2434,7 @@ pub fn build(b: *std.Build) void {
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",

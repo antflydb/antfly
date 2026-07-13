@@ -475,7 +475,7 @@ func BackupTestDatabase(t *testing.T, ctx context.Context, client *antfly.Antfly
 
 	t.Logf("Creating backup '%s' for table '%s' to location: %s", backupID, tableName, location)
 
-	err := client.Backup(ctx, tableName, backupID, location)
+	err := client.Backup(ctx, tableName, backupID, location, "e2e-backups")
 	if err != nil {
 		return fmt.Errorf("backup failed: %w", err)
 	}
@@ -497,7 +497,9 @@ func RestoreTestDatabase(t *testing.T, ctx context.Context, client *antfly.Antfl
 
 	t.Logf("Restoring table '%s' from backup '%s' at location: %s", tableName, backupID, location)
 
-	err := client.Restore(ctx, tableName, backupID, location)
+	_, err := client.Restore(ctx, tableName, antfly.TableRestoreOptions{
+		BackupID: backupID, Location: location, Connection: "e2e-backups",
+	})
 	if err != nil {
 		return fmt.Errorf("restore failed: %w", err)
 	}

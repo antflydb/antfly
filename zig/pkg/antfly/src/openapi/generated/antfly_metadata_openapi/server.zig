@@ -27,8 +27,8 @@ pub fn parseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json
 pub const ListBackupsParams = struct {
     /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
     location: []const u8,
-    /// Named `external_io` connection. Required for remote locations.
-    connection: ?[]const u8 = null,
+    /// Named `external_io` connection authorized for reading this backup location.
+    connection: []const u8,
     /// Maximum backups returned in one page.
     limit: ?[]const u8 = null,
     /// Continuation cursor returned by the preceding page.
@@ -772,7 +772,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = ListBackupsParams{
                 .location = ctx.query("location") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
-                .connection = ctx.query("connection"),
+                .connection = ctx.query("connection") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: connection" }),
                 .limit = ctx.query("limit"),
                 .cursor = ctx.query("cursor"),
             };

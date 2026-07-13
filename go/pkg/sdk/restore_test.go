@@ -57,7 +57,13 @@ func TestClusterRestoreCarriesConnectionAndExposesDurableJobLifecycle(t *testing
 	if err != nil {
 		t.Fatalf("NewAntflyClientWithOptions: %v", err)
 	}
-	started, err := client.ClusterRestore(context.Background(), "daily", "s3://archive/daily", "archive-reader", nil, "fail_if_exists", "restore-daily")
+	started, err := client.ClusterRestore(context.Background(), ClusterRestoreOptions{
+		BackupID:       "daily",
+		Location:       "s3://archive/daily",
+		Connection:     "archive-reader",
+		RestoreMode:    "fail_if_exists",
+		IdempotencyKey: "restore-daily",
+	})
 	if err != nil {
 		t.Fatalf("ClusterRestore: %v", err)
 	}
@@ -69,6 +75,32 @@ func TestClusterRestoreCarriesConnectionAndExposesDurableJobLifecycle(t *testing
 	}
 	if _, err := client.CancelRestoreJob(context.Background(), jobID); err != nil {
 		t.Fatalf("CancelRestoreJob: %v", err)
+	}
+}
+
+func TestTableRestoreOmitsEmptyIdempotencyHeader(t *testing.T) {
+	const job = `{"job_id":"42","attempt_id":0,"scope":"table","table_name":"docs","backup_id":"daily","phase":"queued","cancel_requested":false,"published_table_count":0,"completed_table_count":0,"created_at_ms":1,"updated_at_ms":1}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, present := r.Header[http.CanonicalHeaderKey("Idempotency-Key")]; present {
+			t.Errorf("Idempotency-Key must be absent when not configured")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(job))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	_, err = client.Restore(context.Background(), "docs", TableRestoreOptions{
+		BackupID:   "daily",
+		Location:   "file:///backups",
+		Connection: "local-backups",
+	})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
 	}
 }
 
@@ -111,6 +143,9 @@ func TestListBackupsPreservesAllResultsAcrossPages(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
+		if got := r.URL.Query().Get("connection"); got != "archive-reader" {
+			t.Errorf("connection = %q, want archive-reader", got)
+		}
 		if r.URL.Query().Get("cursor") == "" {
 			_, _ = w.Write([]byte(`{"backups":[{"backup_id":"a","timestamp":"2026-01-01T00:00:00Z","antfly_version":"1","tables":["docs"]}],"next_cursor":"page-2"}`))
 			return
@@ -123,7 +158,10 @@ func TestListBackupsPreservesAllResultsAcrossPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAntflyClientWithOptions: %v", err)
 	}
-	backups, err := client.ListBackups(context.Background(), "file:///backups")
+	backups, err := client.ListBackups(context.Background(), BackupListOptions{
+		Location:   "file:///backups",
+		Connection: "archive-reader",
+	})
 	if err != nil {
 		t.Fatalf("ListBackups: %v", err)
 	}

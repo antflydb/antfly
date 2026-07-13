@@ -2908,6 +2908,7 @@ paths:
             type: string
             minLength: 1
             maxLength: 256
+            x-go-type-skip-optional-pointer: false
           description: Stable key used to safely retry creation of this restore job. Keys are scoped to
             the authenticated principal and cluster restore target. Requests without this header create
             a new job.
@@ -3095,8 +3096,8 @@ paths:
           example: s3://mybucket/antfly-backups/
         - name: connection
           in: query
-          required: false
-          description: Named `external_io` connection. Required for remote locations.
+          required: true
+          description: Named `external_io` connection authorized for reading this backup location.
           schema:
             type: string
         - name: limit
@@ -3920,6 +3921,7 @@ paths:
             type: string
             minLength: 1
             maxLength: 256
+            x-go-type-skip-optional-pointer: false
           description: Stable key used to safely retry creation of this restore job. Keys are scoped to
             the authenticated principal and table. Requests without this header create a new job.
       requestBody:

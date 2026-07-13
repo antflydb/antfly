@@ -13285,8 +13285,8 @@ export interface operations {
                  * @example s3://mybucket/antfly-backups/
                  */
                 location: string;
-                /** @description Named `external_io` connection. Required for remote locations. */
-                connection?: string;
+                /** @description Named `external_io` connection authorized for reading this backup location. */
+                connection: string;
                 /** @description Maximum backups returned in one page. */
                 limit?: number;
                 /** @description Continuation cursor returned by the preceding page. */

@@ -213,8 +213,8 @@ pub fn parseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json
 pub const ListBackupsParams = struct {
     /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
     location: []const u8,
-    /// Named `external_io` connection. Required for remote locations.
-    connection: ?[]const u8 = null,
+    /// Named `external_io` connection authorized for reading this backup location.
+    connection: []const u8,
     /// Maximum backups returned in one page.
     limit: ?[]const u8 = null,
     /// Continuation cursor returned by the preceding page.

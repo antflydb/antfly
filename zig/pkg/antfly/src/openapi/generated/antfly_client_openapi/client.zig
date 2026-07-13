@@ -47,8 +47,8 @@ pub const RemoveRoleFromUserParams = struct {
 pub const ListBackupsParams = struct {
     /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
     location: []const u8,
-    /// Named `external_io` connection. Required for remote locations.
-    connection: ?[]const u8 = null,
+    /// Named `external_io` connection authorized for reading this backup location.
+    connection: []const u8,
     /// Maximum backups returned in one page.
     limit: ?[]const u8 = null,
     /// Continuation cursor returned by the preceding page.
@@ -643,14 +643,12 @@ pub const Client = struct {
         try query_buf.appendSlice(self.allocator, "location=");
         try query_buf.appendSlice(self.allocator, encoded_query_value_location);
         sep = '&';
-        if (params.connection) |v| {
-            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
-            defer self.allocator.free(encoded_query_value);
-            try query_buf.appendSlice(self.allocator, &.{sep});
-            try query_buf.appendSlice(self.allocator, "connection=");
-            try query_buf.appendSlice(self.allocator, encoded_query_value);
-            sep = '&';
-        }
+        const encoded_query_value_connection = try httpx.PercentEncoding.encode(self.allocator, params.connection);
+        defer self.allocator.free(encoded_query_value_connection);
+        try query_buf.appendSlice(self.allocator, &.{sep});
+        try query_buf.appendSlice(self.allocator, "connection=");
+        try query_buf.appendSlice(self.allocator, encoded_query_value_connection);
+        sep = '&';
         if (params.limit) |v| {
             const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
             defer self.allocator.free(encoded_query_value);

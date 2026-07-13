@@ -279,14 +279,16 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 	backupDir := GetBackupDir(t)
 	location := "file://" + backupDir
 
-	result, err := standalone.Client.ClusterBackup(ctx, backupID, location, nil) // nil means all tables
+	result, err := standalone.Client.ClusterBackup(ctx, backupID, location, "e2e-backups", nil) // nil means all tables
 	require.NoError(t, err, "Failed to create cluster backup")
 	require.Equal(t, "completed", result.Status, "Backup status should be completed")
 	t.Logf("Cluster backup completed with status: %s, tables: %d", result.Status, len(result.Tables))
 
 	// Step 6: List backups and verify
 	t.Log("Listing backups...")
-	backups, err := standalone.Client.ListBackups(ctx, location)
+	backups, err := standalone.Client.ListBackups(ctx, antfly.BackupListOptions{
+		Location: location, Connection: "e2e-backups",
+	})
 	require.NoError(t, err, "Failed to list backups")
 	require.NotEmpty(t, backups, "Expected at least one backup")
 
@@ -312,7 +314,9 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 
 	// Step 8: Restore from cluster backup
 	t.Log("Restoring from cluster backup...")
-	restoreResult, err := standalone.Client.ClusterRestore(ctx, backupID, location, nil, "fail_if_exists")
+	restoreResult, err := standalone.Client.ClusterRestore(ctx, antfly.ClusterRestoreOptions{
+		BackupID: backupID, Location: location, Connection: "e2e-backups", RestoreMode: "fail_if_exists",
+	})
 	require.NoError(t, err, "Failed to restore from cluster backup")
 	t.Logf("Cluster restore triggered with status: %s", restoreResult.Status)
 

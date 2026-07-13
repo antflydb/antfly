@@ -149,6 +149,8 @@ pub const Store = struct {
     io: ?std.Io = null,
     mutex: std.atomic.Mutex = .unlocked,
     jobs: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    job_revisions: std.AutoHashMapUnmanaged(u64, u128) = .empty,
+    next_mutation_revision: u128 = 1,
     idempotency: std.StringHashMapUnmanaged(u64) = .empty,
     pending: std.ArrayListUnmanaged(PendingJob) = .empty,
     pending_head: usize = 0,
@@ -172,6 +174,7 @@ pub const Store = struct {
         var jobs = self.jobs.iterator();
         while (jobs.next()) |entry| self.alloc.free(entry.value_ptr.*);
         self.jobs.deinit(self.alloc);
+        self.job_revisions.deinit(self.alloc);
         var keys = self.idempotency.iterator();
         while (keys.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.idempotency.deinit(self.alloc);
@@ -249,6 +252,8 @@ pub const Store = struct {
                 const next_bytes = std.math.add(usize, self.retained_bytes, encoded.len) catch return error.RestoreJobCapacityExceeded;
                 if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
                 try self.jobs.put(self.alloc, parsed.value.job_id, encoded);
+                try self.job_revisions.ensureUnusedCapacity(self.alloc, 1);
+                self.markJobMutationLocked(parsed.value.job_id);
                 try self.history.append(self.alloc, .{
                     .job_id = parsed.value.job_id,
                     .enqueue_sequence = parsed.value.enqueue_sequence,
@@ -349,6 +354,8 @@ pub const Store = struct {
         const next_bytes = std.math.add(usize, self.retained_bytes, encoded.len) catch return error.RestoreJobCapacityExceeded;
         if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
         try self.jobs.put(self.alloc, parsed.value.job_id, encoded);
+        try self.job_revisions.ensureUnusedCapacity(self.alloc, 1);
+        self.markJobMutationLocked(parsed.value.job_id);
         try self.history.append(self.alloc, .{
             .job_id = parsed.value.job_id,
             .enqueue_sequence = parsed.value.enqueue_sequence,
@@ -424,6 +431,8 @@ pub const Store = struct {
         var jobs = self.jobs.iterator();
         while (jobs.next()) |entry| self.alloc.free(entry.value_ptr.*);
         self.jobs.clearRetainingCapacity();
+        self.job_revisions.clearRetainingCapacity();
+        self.markStoreMutationLocked();
         var keys = self.idempotency.iterator();
         while (keys.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.idempotency.clearRetainingCapacity();
@@ -489,6 +498,8 @@ pub const Store = struct {
         const next_bytes = std.math.add(usize, self.retained_bytes, encoded.len) catch return error.RestoreJobCapacityExceeded;
         if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
         try self.jobs.put(self.alloc, parsed.value.job_id, encoded);
+        try self.job_revisions.ensureUnusedCapacity(self.alloc, 1);
+        self.markJobMutationLocked(parsed.value.job_id);
         try self.history.append(self.alloc, .{
             .job_id = parsed.value.job_id,
             .enqueue_sequence = parsed.value.enqueue_sequence,
@@ -734,12 +745,17 @@ pub const Store = struct {
 
     fn refreshReplicatedJob(self: *Store, alloc: std.mem.Allocator, job_id: u64) !void {
         const replicated = self.replicated orelse return;
+        self.lock();
+        const observation = self.observeRefreshLocked(job_id);
+        self.mutex.unlock();
+
         const key = try jobKey(alloc, job_id);
         defer alloc.free(key);
         const fresh = try replicated.vtable.get(replicated.ptr, alloc, key);
         defer if (fresh) |value| alloc.free(value);
         self.lock();
         defer self.mutex.unlock();
+        if (!self.refreshObservationMatchesLocked(job_id, observation)) return;
         if (fresh) |value| {
             var parsed = std.json.parseFromSlice(JobState, alloc, value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
             defer parsed.deinit();
@@ -754,6 +770,8 @@ pub const Store = struct {
                 if (self.jobs.fetchRemove(job_id)) |removed| {
                     self.retained_bytes -= removed.value.len;
                     self.alloc.free(removed.value);
+                    _ = self.job_revisions.remove(job_id);
+                    self.markStoreMutationLocked();
                     self.removeHistoryLocked(job_id);
                 }
                 if (map_key) |value_key| {
@@ -783,10 +801,12 @@ pub const Store = struct {
                 if (self.jobs.count() >= max_retained_restore_jobs or self.historySequenceExistsLocked(parsed.value.enqueue_sequence))
                     return error.CorruptRestoreJobStore;
                 try self.history.ensureUnusedCapacity(self.alloc, 1);
+                try self.job_revisions.ensureUnusedCapacity(self.alloc, 1);
             }
             const next_bytes = std.math.add(usize, self.retained_bytes - previous_len, owned.len) catch return error.RestoreJobCapacityExceeded;
             if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
             if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |previous| self.alloc.free(previous.value);
+            self.markJobMutationLocked(job_id);
             if (previous_len == 0) {
                 self.history.appendAssumeCapacity(.{ .job_id = job_id, .enqueue_sequence = parsed.value.enqueue_sequence });
                 self.sortHistoryLocked();
@@ -812,8 +832,33 @@ pub const Store = struct {
             }
             self.retained_bytes -= removed.value.len;
             self.alloc.free(removed.value);
+            _ = self.job_revisions.remove(job_id);
+            self.markStoreMutationLocked();
             self.removeHistoryLocked(job_id);
         }
+    }
+
+    const RefreshObservation = struct {
+        job_revision: ?u128,
+        store_revision: u128,
+    };
+
+    fn observeRefreshLocked(self: *Store, job_id: u64) RefreshObservation {
+        return .{
+            .job_revision = self.job_revisions.get(job_id),
+            .store_revision = self.next_mutation_revision,
+        };
+    }
+
+    fn refreshObservationMatchesLocked(self: *Store, job_id: u64, observation: RefreshObservation) bool {
+        if (observation.job_revision) |revision| {
+            return self.job_revisions.get(job_id) == revision;
+        }
+        // A missing job has no per-record revision. Conservatively reject the
+        // refresh if anything changed while the replicated read was in flight;
+        // this prevents a delayed not-found or old row from resurrecting an ID.
+        return self.next_mutation_revision == observation.store_revision and
+            !self.jobs.contains(job_id);
     }
 
     /// Removes up to `limit` runnable IDs from the FIFO queue. Job records stay
@@ -993,10 +1038,12 @@ pub const Store = struct {
         if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
         const owned = try self.alloc.dupe(u8, encoded);
         errdefer self.alloc.free(owned);
+        if (!self.job_revisions.contains(job_id)) try self.job_revisions.ensureUnusedCapacity(self.alloc, 1);
         const key = try jobKey(self.alloc, job_id);
         defer self.alloc.free(key);
         try self.persistPutLocked(key, encoded);
         if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |previous| self.alloc.free(previous.value);
+        self.markJobMutationLocked(job_id);
         self.retained_bytes = next_bytes;
     }
 
@@ -1042,6 +1089,8 @@ pub const Store = struct {
             }
             self.retained_bytes -= removed.value.len;
             self.alloc.free(removed.value);
+            _ = self.job_revisions.remove(job_id);
+            self.markStoreMutationLocked();
             self.removeHistoryLocked(job_id);
         }
         return more_expired;
@@ -1109,6 +1158,20 @@ pub const Store = struct {
 
     fn observeEnqueueSequenceLocked(self: *Store, sequence: u64) void {
         if (sequence >= self.next_enqueue_sequence) self.next_enqueue_sequence = sequence +| 1;
+    }
+
+    fn markJobMutationLocked(self: *Store, job_id: u64) void {
+        const revision = self.next_mutation_revision;
+        self.next_mutation_revision +%= 1;
+        if (self.job_revisions.getPtr(job_id)) |current| {
+            current.* = revision;
+        } else {
+            self.job_revisions.putAssumeCapacity(job_id, revision);
+        }
+    }
+
+    fn markStoreMutationLocked(self: *Store) void {
+        self.next_mutation_revision +%= 1;
     }
 
     fn compactPendingLocked(self: *Store) void {
@@ -1480,6 +1543,9 @@ fn nowMillis() u64 {
 const TestReplicatedPersistence = struct {
     alloc: std.mem.Allocator,
     rows: std.StringHashMapUnmanaged([]u8) = .empty,
+    // 0 = open, 1 = pause the next point read after snapshotting, 2 = paused,
+    // 3 = released. Tests use this to deterministically model a delayed read.
+    get_gate: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     fn init(alloc: std.mem.Allocator) TestReplicatedPersistence {
         return .{ .alloc = alloc };
@@ -1528,7 +1594,12 @@ const TestReplicatedPersistence = struct {
 
     fn get(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
-        return if (self.rows.get(key)) |value| try alloc.dupe(u8, value) else null;
+        const result = if (self.rows.get(key)) |value| try alloc.dupe(u8, value) else null;
+        if (self.get_gate.load(.acquire) == 1) {
+            self.get_gate.store(2, .release);
+            while (self.get_gate.load(.acquire) != 3) std.atomic.spinLoopHint();
+        }
+        return result;
     }
 
     fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
@@ -1557,6 +1628,68 @@ const TestReplicatedPersistence = struct {
         for (keys) |key| try delete(ptr, key);
     }
 };
+
+test "delayed replicated restore refresh cannot regress a running job" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const queued = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:cluster",
+    });
+    defer std.testing.allocator.free(queued);
+    var queued_parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, queued, .{});
+    defer queued_parsed.deinit();
+
+    const LoadWorker = struct {
+        store: *Store,
+        job_id: u64,
+        result: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.store.load(std.testing.allocator, self.job_id) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    persistence.get_gate.store(1, .release);
+    var worker: LoadWorker = .{ .store = &store, .job_id = queued_parsed.value.job_id };
+    const thread = try std.Thread.spawn(.{}, LoadWorker.run, .{&worker});
+    var joined = false;
+    defer {
+        persistence.get_gate.store(3, .release);
+        if (!joined) thread.join();
+    }
+    while (persistence.get_gate.load(.acquire) != 2) std.atomic.spinLoopHint();
+
+    const running = (try store.begin(std.testing.allocator, queued_parsed.value.job_id)).?;
+    defer std.testing.allocator.free(running);
+    persistence.get_gate.store(3, .release);
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(worker.err == null);
+    const loaded = worker.result.?;
+    defer std.testing.allocator.free(loaded);
+    var loaded_parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, loaded, .{});
+    defer loaded_parsed.deinit();
+    try std.testing.expectEqual(Phase.running, loaded_parsed.value.phase);
+
+    const finished = try store.finish(std.testing.allocator, loaded_parsed.value, "{}");
+    defer std.testing.allocator.free(finished);
+    var finished_parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, finished, .{});
+    defer finished_parsed.deinit();
+    try std.testing.expectEqual(Phase.succeeded, finished_parsed.value.phase);
+}
 
 test "restore job store is idempotent and fenced" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);

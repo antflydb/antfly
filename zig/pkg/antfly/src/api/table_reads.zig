@@ -205,6 +205,8 @@ pub const ProvisionedTableReadCache = struct {
     const max_cached_tables = 64;
     const pending_open_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
     const pending_open_wait_timeout_ns: u64 = 5 * std.time.ns_per_s;
+    const exclusive_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
+    const exclusive_wait_timeout_ns: u64 = 30 * std.time.ns_per_s;
 
     /// Current epoch for `table_name`, creating its slot on first use. The
     /// key is duped on insert and owned by the map. Must be called with the
@@ -344,6 +346,7 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         var stale_epoch_retries: u8 = 0;
         var pending_open_wait_started_ns: u64 = 0;
+        var exclusive_wait_started_ns: u64 = 0;
         while (true) {
             // Reloaded every attempt: a stale-epoch retry usually means the
             // table was dropped/recreated or moved mid-open, which changes
@@ -351,9 +354,16 @@ pub const ProvisionedTableReadCache = struct {
             // namespace would open (and cache) the wrong identity.
             const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
-            while (self.hasExclusiveTableAccessLocked(table_name)) {
-                self.ready.waitUncancelable(io, &self.mutex);
+            if (self.hasExclusiveTableAccessLocked(table_name)) {
+                self.mutex.unlock(io);
+                const now_ns = platform_time.monotonicNs();
+                if (exclusive_wait_started_ns == 0) exclusive_wait_started_ns = now_ns;
+                const waited_ns = now_ns -| exclusive_wait_started_ns;
+                if (waited_ns >= exclusive_wait_timeout_ns) return error.TableReadTransitionTimeout;
+                io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+                continue;
             }
+            exclusive_wait_started_ns = 0;
             const open_epoch = self.epochForTableLocked(table_name) catch |err| {
                 self.mutex.unlock(io);
                 return err;
@@ -533,11 +543,30 @@ pub const ProvisionedTableReadCache = struct {
         self.bumpEpochLocked(table_name);
         self.removeEntriesForTableLocked(table_name);
         self.ready.broadcast(io);
+        const drain_started_ns = platform_time.monotonicNs();
         while (self.hasPendingOpenForTableLocked(table_name) or
             self.hasTableLocked(table_name) or
             self.hasRetiredEntryForTableLocked(table_name))
         {
-            self.ready.waitUncancelable(io, &self.mutex);
+            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
+            if (waited_ns >= exclusive_wait_timeout_ns) {
+                const pending_opens = self.pendingOpenCountForTableLocked(table_name);
+                const retired_entries = self.retiredEntryCountForTableLocked(table_name);
+                const active_leases = self.activeLeaseCountForTableLocked(table_name);
+                self.releaseExclusiveTableAccessLocked(table_name);
+                self.ready.broadcast(io);
+                std.log.err("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
+                    table_name,
+                    pending_opens,
+                    retired_entries,
+                    active_leases,
+                    @divTrunc(waited_ns, std.time.ns_per_ms),
+                });
+                return error.TableReadDrainTimeout;
+            }
+            self.mutex.unlock(io);
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            self.mutex.lockUncancelable(io);
         }
         self.mutex.unlock(io);
 
@@ -700,6 +729,33 @@ pub const ProvisionedTableReadCache = struct {
         return false;
     }
 
+    fn pendingOpenCountForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) usize {
+        var count: usize = 0;
+        for (self.pending_opens.items) |pending| {
+            if (std.mem.eql(u8, pending.table_name, table_name)) count += 1;
+        }
+        return count;
+    }
+
+    fn retiredEntryCountForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) usize {
+        var count: usize = 0;
+        for (self.retired_entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) count += 1;
+        }
+        return count;
+    }
+
+    fn activeLeaseCountForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) usize {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) count +|= entry.active_leases;
+        }
+        for (self.retired_entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) count +|= entry.active_leases;
+        }
+        return count;
+    }
+
     fn cachedTableCountLocked(self: *ProvisionedTableReadCache) usize {
         var count: usize = 0;
         for (self.entries.items, 0..) |entry, i| {
@@ -788,6 +844,11 @@ pub const ProvisionedTableReadCache = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
+        self.releaseExclusiveTableAccessLocked(table_name);
+        self.ready.broadcast(io);
+    }
+
+    fn releaseExclusiveTableAccessLocked(self: *ProvisionedTableReadCache, table_name: []const u8) void {
         const count = self.exclusive_table_access.getPtr(table_name) orelse unreachable;
         if (count.* > 1) {
             count.* -= 1;
@@ -795,7 +856,6 @@ pub const ProvisionedTableReadCache = struct {
             const removed = self.exclusive_table_access.fetchRemove(table_name) orelse unreachable;
             self.alloc.free(removed.key);
         }
-        self.ready.broadcast(io);
     }
 
     fn retireEntryLocked(self: *ProvisionedTableReadCache, entry: *Entry) void {

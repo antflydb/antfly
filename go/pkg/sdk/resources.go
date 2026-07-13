@@ -385,19 +385,41 @@ func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location
 	return nil
 }
 
-// Restore restores a table from a backup
-func (c *AntflyClient) Restore(ctx context.Context, tableName, backupID, location, connection, idempotencyKey string) (*RestoreJob, error) {
+// TableRestoreOptions identifies a table backup and the connection authorized
+// to read it. IdempotencyKey is optional; an empty value omits the header.
+type TableRestoreOptions struct {
+	BackupID       string
+	Location       string
+	Connection     string
+	IdempotencyKey string
+}
+
+// Restore starts a durable asynchronous table restore.
+func (c *AntflyClient) Restore(ctx context.Context, tableName string, options TableRestoreOptions) (*RestoreJob, error) {
 	if tableName == "" {
 		return nil, fmt.Errorf("empty table name")
 	}
-
-	req := oapi.RestoreRequest{
-		BackupId:   backupID,
-		Location:   location,
-		Connection: connection,
+	if options.BackupID == "" {
+		return nil, fmt.Errorf("empty backup ID")
+	}
+	if options.Location == "" {
+		return nil, fmt.Errorf("empty backup location")
+	}
+	if options.Connection == "" {
+		return nil, fmt.Errorf("empty external I/O connection")
 	}
 
-	resp, err := c.client.RestoreTable(ctx, tableName, &oapi.RestoreTableParams{IdempotencyKey: idempotencyKey}, req)
+	req := oapi.RestoreRequest{
+		BackupId:   options.BackupID,
+		Location:   options.Location,
+		Connection: options.Connection,
+	}
+
+	var params *oapi.RestoreTableParams
+	if options.IdempotencyKey != "" {
+		params = &oapi.RestoreTableParams{IdempotencyKey: &options.IdempotencyKey}
+	}
+	resp, err := c.client.RestoreTable(ctx, tableName, params, req)
 	if err != nil {
 		return nil, fmt.Errorf("restore request failed: %w", err)
 	}
@@ -501,19 +523,42 @@ func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location, co
 	}, nil
 }
 
-// ClusterRestore restores multiple tables from a cluster backup
-func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location, connection string, tableNames []string, restoreMode, idempotencyKey string) (*RestoreJob, error) {
-	req := oapi.ClusterRestoreRequest{
-		BackupId:   backupID,
-		Location:   location,
-		Connection: connection,
-		TableNames: tableNames,
+// ClusterRestoreOptions configures a durable cluster restore job.
+type ClusterRestoreOptions struct {
+	BackupID       string
+	Location       string
+	Connection     string
+	TableNames     []string
+	RestoreMode    string
+	IdempotencyKey string
+}
+
+// ClusterRestore starts a durable asynchronous cluster restore.
+func (c *AntflyClient) ClusterRestore(ctx context.Context, options ClusterRestoreOptions) (*RestoreJob, error) {
+	if options.BackupID == "" {
+		return nil, fmt.Errorf("empty backup ID")
 	}
-	if restoreMode != "" {
-		req.RestoreMode = oapi.ClusterRestoreRequestRestoreMode(restoreMode)
+	if options.Location == "" {
+		return nil, fmt.Errorf("empty backup location")
+	}
+	if options.Connection == "" {
+		return nil, fmt.Errorf("empty external I/O connection")
+	}
+	req := oapi.ClusterRestoreRequest{
+		BackupId:   options.BackupID,
+		Location:   options.Location,
+		Connection: options.Connection,
+		TableNames: options.TableNames,
+	}
+	if options.RestoreMode != "" {
+		req.RestoreMode = oapi.ClusterRestoreRequestRestoreMode(options.RestoreMode)
 	}
 
-	resp, err := c.client.Restore(ctx, &oapi.RestoreParams{IdempotencyKey: idempotencyKey}, req)
+	var params *oapi.RestoreParams
+	if options.IdempotencyKey != "" {
+		params = &oapi.RestoreParams{IdempotencyKey: &options.IdempotencyKey}
+	}
+	resp, err := c.client.Restore(ctx, params, req)
 	if err != nil {
 		return nil, fmt.Errorf("cluster restore request failed: %w", err)
 	}
@@ -621,14 +666,21 @@ type BackupPage struct {
 
 // BackupListOptions configures one backup-list page.
 type BackupListOptions struct {
+	Location   string
 	Connection string
 	Cursor     string
 	Limit      int
 }
 
 // ListBackupsPage returns one page of cluster backups at the specified location.
-func (c *AntflyClient) ListBackupsPage(ctx context.Context, location string, options BackupListOptions) (*BackupPage, error) {
-	params := &oapi.ListBackupsParams{Location: location, Connection: options.Connection}
+func (c *AntflyClient) ListBackupsPage(ctx context.Context, options BackupListOptions) (*BackupPage, error) {
+	if options.Location == "" {
+		return nil, fmt.Errorf("empty backup location")
+	}
+	if options.Connection == "" {
+		return nil, fmt.Errorf("empty external I/O connection")
+	}
+	params := &oapi.ListBackupsParams{Location: options.Location, Connection: options.Connection}
 	if options.Cursor != "" {
 		params.Cursor = &options.Cursor
 	}
@@ -664,13 +716,8 @@ func (c *AntflyClient) ListBackupsPage(ctx context.Context, location string, opt
 	return &BackupPage{Backups: backups, NextCursor: result.NextCursor}, nil
 }
 
-// ListBackups lists all available cluster backups at the specified location.
-func (c *AntflyClient) ListBackups(ctx context.Context, location string) ([]BackupInfo, error) {
-	return c.ListBackupsWithOptions(ctx, location, BackupListOptions{})
-}
-
-// ListBackupsWithOptions lists all backups while preserving connection and page-size options.
-func (c *AntflyClient) ListBackupsWithOptions(ctx context.Context, location string, options BackupListOptions) ([]BackupInfo, error) {
+// ListBackups lists all backups while preserving connection and page-size options.
+func (c *AntflyClient) ListBackups(ctx context.Context, options BackupListOptions) ([]BackupInfo, error) {
 	var backups []BackupInfo
 	seen := make(map[string]struct{})
 	if options.Cursor != "" {
@@ -680,7 +727,7 @@ func (c *AntflyClient) ListBackupsWithOptions(ctx context.Context, location stri
 		options.Limit = 100
 	}
 	for {
-		page, err := c.ListBackupsPage(ctx, location, options)
+		page, err := c.ListBackupsPage(ctx, options)
 		if err != nil {
 			return nil, err
 		}
