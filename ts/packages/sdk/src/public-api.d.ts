@@ -11518,6 +11518,14 @@ export interface components {
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
              */
             cache_compaction_ratio?: number;
+            /**
+             * @description inference-native prompt prefix cache namespace key. Requests with the same key can
+             *     reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+             *     requests without a key are never cached.
+             */
+            prompt_cache_key?: string;
+            /** @description inference-native prompt prefix cache control. False bypasses prompt cache for this request. */
+            prompt_cache?: boolean;
             backend?: components["schemas"]["InferenceModelBackend"];
             /**
              * @description inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
@@ -11637,6 +11645,8 @@ export interface components {
             completion_tokens: number;
             /** @description Total tokens used (prompt + completion) */
             total_tokens: number;
+            /** @description Prompt tokens served from inference-native prefix KV cache */
+            cached_prompt_tokens?: number;
         };
         /** @description Streaming generation chunk (SSE event data) */
         InferenceGenerateChunk: {
@@ -11737,6 +11747,42 @@ export interface components {
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
         };
+        /** @description Native generator prompt KV cache configuration. */
+        InferencePromptCacheConfig: {
+            /**
+             * @description Enable inference-native prompt KV cache reuse for generator requests.
+             * @default false
+             */
+            enabled?: boolean;
+            /**
+             * @description Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+             *     full KV blocks under prompt_cache_key with O(1) block lookup and is the
+             *     scalable production mode. `simple` keeps the linear-scan retained-prefix
+             *     cache and is only suitable for small caches or debugging.
+             * @default block_hash
+             * @enum {string}
+             */
+            mode?: "simple" | "block_hash";
+            /**
+             * @description Node-wide target for live prompt-cache entries. The runtime divides it
+             *     across participating model caches and evicts using estimated metadata
+             *     and logical host/device KV bytes. Backend allocators may retain reusable
+             *     capacity, so this is not a hard cap on process or accelerator memory.
+             * @default 512
+             */
+            max_bytes_mb?: number;
+            /**
+             * @description Minimum prompt length eligible for prompt KV caching.
+             * @default 64
+             */
+            min_tokens?: number;
+            /**
+             * @description Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+             *     hit, so only entries left unused for this duration expire.
+             * @default 300000
+             */
+            ttl_ms?: number;
+        };
         InferenceConfig: {
             /**
              * Format: uri
@@ -11797,6 +11843,8 @@ export interface components {
              * @example 1
              */
             pool_size?: number;
+            /** @description Native generator prompt KV cache settings. */
+            prompt_cache?: components["schemas"]["InferencePromptCacheConfig"];
             /**
              * @description Backend priority order for model loading with optional device specifiers.
              *     Format: `backend` or `backend:device` where device defaults to `auto`.

@@ -271,6 +271,7 @@ pub const InferencePredictResponse = types.InferencePredictResponse;
 pub const InferencePredictorInfo = types.InferencePredictorInfo;
 pub const InferencePredictorTask = types.InferencePredictorTask;
 pub const InferencePredictorsResponse = types.InferencePredictorsResponse;
+pub const InferencePromptCacheConfig = types.InferencePromptCacheConfig;
 pub const InferenceProviderType = types.InferenceProviderType;
 pub const InferenceReadObject = types.InferenceReadObject;
 pub const InferenceReadRequest = types.InferenceReadRequest;

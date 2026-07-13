@@ -1062,6 +1062,8 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
         resource_manager_mod.Slice.lite_native_page_cache,
         resource_manager_mod.Slice.lite_native_link_cache,
+        resource_manager_mod.Slice.lite_docstore_snapshot_cache,
+        resource_manager_mod.Slice.inference_prompt_cache,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{

@@ -178,6 +178,8 @@ pub const GenerationConfig = struct {
     /// KV cache compaction ratio after prefill. null = no compaction.
     /// 0.02 = 50x compression, 0.1 = 10x compression.
     cache_compaction_ratio: ?f32 = null,
+    prompt_cache_enabled: bool = false,
+    prompt_cache_key: ?[]const u8 = null,
     /// Benchmark/compatibility mode: continue decoding when the model emits an
     /// EOS token. Defaults to production stop-on-EOS behavior.
     ignore_eos: bool = false,
@@ -257,6 +259,7 @@ pub const GenerationResult = struct {
     prompt_tokens: usize = 0,
     tokens_used: usize,
     finish_reason: []const u8,
+    cached_prompt_tokens: usize = 0,
     timing_ms: ?GenerationTimingMs = null,
     speculative: ?SpeculativeDecodeStats = null,
     allocator: std.mem.Allocator,
@@ -1304,6 +1307,20 @@ pub const NativeDecodeState = struct {
         }
     }
 
+    pub fn seedAttachedPrefix(self: *NativeDecodeState, sequence_id: runtime.kv.manager.SequenceId, token_count: usize) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (!self.isPaged()) return error.InvalidPagedKvState;
+        if (self.sequence_id != null) return error.InvalidPagedKvState;
+        if (self.kv_storage) |storage| {
+            if ((storage.tokenCount(sequence_id) orelse return error.InvalidPagedKvState) != token_count) return error.InvalidPagedKvState;
+        }
+        self.sequence_id = sequence_id;
+        self.total_tokens = token_count;
+        self.kv_compacted = false;
+        self.syncPagedKvViewForPrefill();
+    }
+
     pub fn ensureAttached(self: *NativeDecodeState) !void {
         const lock = self.lockPagedKv();
         defer if (lock) |mutex| mutex.unlock();
@@ -2101,6 +2118,7 @@ pub const NativeGenerationPipeline = struct {
     draft_cb: ?ComputeBackend = null,
     draft_gpt_config: ?gpt_mod.Config = null,
     draft_decode_state: ?*NativeDecodeState = null,
+    prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null,
     /// Optional graph cache for graph-mode execution. When non-null,
     /// the decode loop traces the forward pass once, caches the graph,
     /// and replays it through the interpreter on subsequent steps.
@@ -2435,13 +2453,39 @@ pub const NativeGenerationPipeline = struct {
             debugGenerationStage("prepared compiled generation runtime prompt_token_count={d}", .{prompt_token_count});
         }
 
+        var cached_prompt_tokens: usize = 0;
+        var prefill_ids = token_ids[0..seq_len];
+        if (self.prompt_cache) |cache| {
+            const cache_eligible =
+                config.prompt_cache_enabled and
+                config.prompt_cache_key != null and
+                prepared_multimodal_prompt == null and
+                !use_speculative and
+                config.cache_compaction_ratio == null and
+                self.compiled_partition_backend == null and
+                !NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config) and
+                !self.gpt_config.isQwen35() and
+                decode_state.isPaged() and
+                decode_state.kv_manager == cache.managerPtr();
+            if (cache_eligible) {
+                const page_size = cache.pageSize() orelse 0;
+                if (page_size > 0 and seq_len > page_size) {
+                    if (try cache.attachLongestPrefix(config.prompt_cache_key.?, token_ids[0..seq_len], seq_len - page_size)) |hit| {
+                        try decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count);
+                        cached_prompt_tokens = hit.token_count;
+                        prefill_ids = token_ids[cached_prompt_tokens..seq_len];
+                    }
+                }
+            }
+        }
+
         // Prefill
         const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         const prefill_output = if (prepared_multimodal_prompt) |*prepared|
             PrefillOutput{ .last_logits = try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state) }
         else
-            try self.executePrefill(token_ids[0..seq_len], seq_len, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
+            try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
         var prefill_last_logits = prefill_output.last_logits;
         var prefill_greedy_token = prefill_output.greedy_token;
         const prefill_last_hidden = prefill_output.last_hidden;
@@ -2453,6 +2497,16 @@ pub const NativeGenerationPipeline = struct {
             "finished prefill seq_len={d} cached_logits={} greedy_token={}",
             .{ seq_len, prefill_last_logits != null, prefill_greedy_token != null },
         );
+
+        if (self.prompt_cache) |cache| {
+            if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
+                if (config.prompt_cache_key) |cache_key| {
+                    if (decode_state.sequence_id) |sequence_id| {
+                        try cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id);
+                    }
+                }
+            }
+        }
 
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
@@ -3086,6 +3140,7 @@ pub const NativeGenerationPipeline = struct {
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
+            .cached_prompt_tokens = cached_prompt_tokens,
             .timing_ms = timing_ms,
             .speculative = if (use_speculative or draft_requested) speculative_stats else null,
             .allocator = allocator,
@@ -3165,6 +3220,7 @@ pub const NativeGenerationPipeline = struct {
         self: *NativeGenerationPipeline,
         prompt_ids: []const i64,
         seq_len: usize,
+        prefilled_tokens: usize,
         decode_state: *NativeDecodeState,
         config: GenerationConfig,
         allow_resident_greedy_token: bool,
@@ -3184,9 +3240,11 @@ pub const NativeGenerationPipeline = struct {
             enableCudaPrefillGreedyToken(),
         );
         debugGenerationStage(
-            "executePrefill enter seq_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
+            "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
                 seq_len,
+                prefilled_tokens,
+                prompt_ids.len,
                 decode_state.isPaged(),
                 self.scheduler != null,
                 self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null,
@@ -3201,11 +3259,12 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
-                scheduler.notePrefillProgress(lease, 0, seq_len);
+                scheduler.notePrefillProgress(lease, prefilled_tokens, seq_len);
             }
         }
 
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
+            if (prefilled_tokens != 0) return error.UnsupportedShape;
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
             if (allow_resident_greedy_token) {
@@ -3237,6 +3296,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         if (decode_state.isPaged() and seq_len > 1) {
+            const query_len = prompt_ids.len;
             var current_chunk_size = blk: {
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0;
                 if (config.prefill_chunk_size > 0 and scheduler_chunk > 0) {
@@ -3244,15 +3304,15 @@ pub const NativeGenerationPipeline = struct {
                 }
                 if (config.prefill_chunk_size > 0) break :blk config.prefill_chunk_size;
                 if (scheduler_chunk > 0) break :blk scheduler_chunk;
-                break :blk seq_len;
+                break :blk query_len;
             };
-            current_chunk_size = @max(@min(current_chunk_size, seq_len), 1);
+            current_chunk_size = @max(@min(current_chunk_size, query_len), 1);
             const coalesced_chunk_size = coalescedPrefillChunkSizeForFirstToken(
                 self.cb.kind(),
                 @intCast(@max(config.max_tokens, 1)),
                 !allow_resident_greedy_token,
                 enableCudaPrefillFirstToken(),
-                seq_len,
+                query_len,
                 current_chunk_size,
                 cudaPrefillFirstTokenCoalesceTokenLimit(),
             );
@@ -3260,26 +3320,27 @@ pub const NativeGenerationPipeline = struct {
             if (first_token_coalesced) {
                 debugFirstToken(
                     "prefill_first_token coalesced_prefill_chunk_size from={d} to={d} seq_len={d}",
-                    .{ current_chunk_size, coalesced_chunk_size, seq_len },
+                    .{ current_chunk_size, coalesced_chunk_size, query_len },
                 );
                 current_chunk_size = coalesced_chunk_size;
             }
             var processed: usize = 0;
-            while (processed < seq_len) {
+            while (processed < query_len) {
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
                 const iteration_chunk = schedulerChunkForPrefillIteration(scheduler_chunk, current_chunk_size, first_token_coalesced);
                 const chunk_size = @max(@min(current_chunk_size, iteration_chunk), 1);
-                const chunk_end = @min(seq_len, processed + chunk_size);
+                const chunk_end = @min(query_len, processed + chunk_size);
+                const total_chunk_end = prefilled_tokens + chunk_end;
                 const chunk = prompt_ids[processed..chunk_end];
                 debugGenerationStage(
-                    "executePrefill chunk start processed={d} chunk_len={d} chunk_end={d} current_chunk_size={d}",
-                    .{ processed, chunk.len, chunk_end, current_chunk_size },
+                    "executePrefill chunk start processed={d} chunk_len={d} total_chunk_end={d} current_chunk_size={d}",
+                    .{ processed, chunk.len, total_chunk_end, current_chunk_size },
                 );
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!(chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
-                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, chunk_end, chunk.len, chunk_end == seq_len) catch |err| {
+                            if (!(total_chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
+                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len) catch |err| {
                                     if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                         current_chunk_size = @max(chunk_size / 2, 1);
                                         continue;
@@ -3287,7 +3348,7 @@ pub const NativeGenerationPipeline = struct {
                                     return err;
                                 };
                                 processed = chunk_end;
-                                scheduler.notePrefillProgress(lease, processed, seq_len);
+                                scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
                                 continue;
                             }
                         }
@@ -3300,14 +3361,14 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
                 try decode_runtime.appendPrefillChunk(chunk.len);
-                const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
-                if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
-                    if (try self.tryCudaPreparedTailPrefillGreedy(chunk, chunk_end, &decode_context, capture_last_hidden)) |prepared| {
+                const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
+                if (total_chunk_end == seq_len and use_cuda_prefill_greedy_token) {
+                    if (try self.tryCudaPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)) |prepared| {
                         prefill_greedy_token = prepared.greedy_token;
                         prefill_last_hidden = prepared.last_hidden;
                         prefill_last_hidden_rows = prepared.last_hidden_rows;
                     } else if (capture_last_hidden) {
-                        var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
+                        var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
                             if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                 current_chunk_size = @max(chunk_size / 2, 1);
                                 continue;
@@ -3322,7 +3383,7 @@ pub const NativeGenerationPipeline = struct {
                         prefill_last_hidden = greedy_hidden.hidden;
                         prefill_last_hidden_rows = greedy_hidden.rows;
                     } else {
-                        prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
+                        prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
                             if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                 current_chunk_size = @max(chunk_size / 2, 1);
                                 continue;
@@ -3335,7 +3396,7 @@ pub const NativeGenerationPipeline = struct {
                         .{prefill_greedy_token.?},
                     );
                 } else {
-                    const logits = self.forwardAllLogits(chunk, 1, chunk_end, &decode_context) catch |err| {
+                    const logits = self.forwardAllLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
                         if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                             current_chunk_size = @max(chunk_size / 2, 1);
                             continue;
@@ -3344,10 +3405,10 @@ pub const NativeGenerationPipeline = struct {
                     };
                     defer allocator.free(logits);
                     debugGenerationStage(
-                        "executePrefill chunk complete processed={d} chunk_end={d} logits_len={d}",
-                        .{ processed, chunk_end, logits.len },
+                        "executePrefill chunk complete processed={d} total_chunk_end={d} logits_len={d}",
+                        .{ processed, total_chunk_end, logits.len },
                     );
-                    if (chunk_end == seq_len) {
+                    if (total_chunk_end == seq_len) {
                         prefill_last_logits = try allocator.dupe(f32, logits[(chunk.len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
                         debugGenerationStage(
                             "executePrefill captured last logits vocab_size={d}",
@@ -3358,12 +3419,13 @@ pub const NativeGenerationPipeline = struct {
                 processed = chunk_end;
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
-                        scheduler.notePrefillProgress(lease, processed, seq_len);
+                        scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
                         scheduler.finishTurn(lease, .prefill);
                     }
                 }
             }
         } else {
+            if (prefilled_tokens != 0) return error.UnsupportedShape;
             if (self.scheduler) |scheduler| {
                 if (self.scheduler_lease) |lease| {
                     if (self.io) |io| {
@@ -8679,11 +8741,12 @@ test "native decode state deinit releases paged sequence" {
     });
     var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
     try state.notePrefill(5);
-    try std.testing.expect(manager.tokenCount(state.sequence_id.?).? > 0);
+    const sequence_id = state.sequence_id.?;
+    try std.testing.expect(manager.tokenCount(sequence_id).? > 0);
 
     state.deinit();
     try std.testing.expectEqual(@as(?runtime.kv.manager.SequenceId, null), state.sequence_id);
-    try std.testing.expectEqual(@as(usize, 0), manager.tokenCount(1).?);
+    try std.testing.expectEqual(@as(?usize, null), manager.tokenCount(sequence_id));
 }
 
 test "native decode state reports retained kv window offsets after trim" {

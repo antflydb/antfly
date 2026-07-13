@@ -61,6 +61,12 @@ class InferenceGenerateRequest:
             Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+        prompt_cache_key (str | Unset): inference-native prompt prefix cache namespace key. Requests with the same key
+            can
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+            requests without a key are never cached.
+        prompt_cache (bool | Unset): inference-native prompt prefix cache control. False bypasses prompt cache for this
+            request.
         backend (InferenceModelBackend | Unset): Optional backend preference for model loading or request execution.
             `auto` keeps the node default behavior.
             `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
@@ -101,6 +107,8 @@ class InferenceGenerateRequest:
     speculative_k: int | Unset = 4
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
+    prompt_cache_key: str | Unset = UNSET
+    prompt_cache: bool | Unset = UNSET
     backend: InferenceModelBackend | Unset = UNSET
     mode: InferenceGenerateRequestMode | Unset = UNSET
     compiled_target: InferenceGenerateRequestCompiledTarget | Unset = UNSET
@@ -155,6 +163,10 @@ class InferenceGenerateRequest:
             cache_dtype = self.cache_dtype.value
 
         cache_compaction_ratio = self.cache_compaction_ratio
+
+        prompt_cache_key = self.prompt_cache_key
+
+        prompt_cache = self.prompt_cache
 
         backend: str | Unset = UNSET
         if not isinstance(self.backend, Unset):
@@ -216,6 +228,10 @@ class InferenceGenerateRequest:
             field_dict["cache_dtype"] = cache_dtype
         if cache_compaction_ratio is not UNSET:
             field_dict["cache_compaction_ratio"] = cache_compaction_ratio
+        if prompt_cache_key is not UNSET:
+            field_dict["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache is not UNSET:
+            field_dict["prompt_cache"] = prompt_cache
         if backend is not UNSET:
             field_dict["backend"] = backend
         if mode is not UNSET:
@@ -293,6 +309,10 @@ class InferenceGenerateRequest:
 
         cache_compaction_ratio = d.pop("cache_compaction_ratio", UNSET)
 
+        prompt_cache_key = d.pop("prompt_cache_key", UNSET)
+
+        prompt_cache = d.pop("prompt_cache", UNSET)
+
         _backend = d.pop("backend", UNSET)
         backend: InferenceModelBackend | Unset
         if isinstance(_backend, Unset):
@@ -352,6 +372,8 @@ class InferenceGenerateRequest:
             speculative_k=speculative_k,
             cache_dtype=cache_dtype,
             cache_compaction_ratio=cache_compaction_ratio,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache=prompt_cache,
             backend=backend,
             mode=mode,
             compiled_target=compiled_target,

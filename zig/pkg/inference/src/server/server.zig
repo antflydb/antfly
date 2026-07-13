@@ -102,6 +102,81 @@ pub const BudgetOverrides = struct {
     }
 };
 
+pub const PromptCacheConfig = struct {
+    enabled: bool = false,
+    mode: runtime.kv.prompt_cache.Mode = .block_hash,
+    max_bytes_mb: usize = 512,
+    min_tokens: usize = 64,
+    ttl_ms: u64 = 300_000,
+
+    /// max_bytes_mb is a node-wide accounting target. ModelManager divides it
+    /// across active caches and reconfigures them together.
+    pub fn runtimeConfig(
+        self: @This(),
+        resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver,
+    ) runtime.kv.prompt_cache.Config {
+        return .{
+            .enabled = self.enabled,
+            .mode = self.mode,
+            .max_bytes = self.max_bytes_mb * 1024 * 1024,
+            .min_tokens = self.min_tokens,
+            .ttl_ms = self.ttl_ms,
+            .resource_usage_observer = resource_usage_observer,
+        };
+    }
+};
+
+test "prompt cache config reports node target in bytes" {
+    const cfg = PromptCacheConfig{ .enabled = true, .max_bytes_mb = 512 };
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null).max_bytes);
+}
+
+test "model manager rebalances every active prompt cache" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
+
+    var first: model_manager_mod.LoadedModel = undefined;
+    first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer first.prompt_prefix_cache.deinit();
+    var second: model_manager_mod.LoadedModel = undefined;
+    second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer second.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "first", &first);
+    try manager.loaded.put(allocator, "second", &second);
+
+    first.prompt_prefix_cache.configure(.{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+    });
+    const first_pool_id = (try first.prompt_prefix_cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const first_sequence_id = try first.prompt_prefix_cache.manager.attachSequence(first_pool_id);
+    try first.prompt_prefix_cache.manager.appendTokens(first_sequence_id, 2);
+    try first.prompt_prefix_cache.storeFromSequence("", &.{ 1, 2 }, first_sequence_id);
+    try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.stats().live_entries);
+
+    manager.rebalancePromptCaches(&second, .{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 2,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), second.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 0), first.prompt_prefix_cache.stats().live_entries);
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -113,6 +188,8 @@ pub const NodeConfig = struct {
     max_concurrent_requests: usize = 32,
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
+    prompt_cache: PromptCacheConfig = .{},
+    prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
 };
 
 pub const WarmModelKind = enum {
@@ -582,6 +659,11 @@ pub const Node = struct {
         self.registry.deinit();
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
+    }
+
+    pub fn attachIo(self: *Node, io: std.Io) void {
+        self.session_manager.io = io;
+        self.model_manager.attachIo(io);
     }
 
     pub fn embedDenseTextsDirect(
@@ -1983,6 +2065,14 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.prompt_cache_key) |key| {
+            if (key.len > runtime.kv.prompt_cache.max_namespace_bytes) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt_cache_key is too long",
+                });
+            }
+        }
         self.metrics.incRequest("generate");
         defer self.metrics.decActive();
 
@@ -2190,6 +2280,12 @@ pub const Node = struct {
         const effective_draft_model_name: ?[]const u8 = if (same_named_draft_model) null else body.draft_model;
 
         const want_stream = body.stream orelse false;
+        // Caching requires an explicit non-empty key: keyless requests would all
+        // share one per-model namespace, leaking prompt presence across callers.
+        const prompt_cache_key: ?[]const u8 = if (body.prompt_cache_key) |key|
+            (if (key.len > 0) key else null)
+        else
+            null;
         const configured_max_tokens: i32 = if (body.max_tokens) |mt| @intCast(mt) else 256;
         const queue_units = self.estimateGenerateQueueUnits(messages.items, configured_max_tokens);
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
@@ -2212,6 +2308,8 @@ pub const Node = struct {
             .prefill_chunk_size = 256,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
+            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
+            .prompt_cache_key = prompt_cache_key,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
             return ctx.status(400).json(.{
@@ -2346,6 +2444,7 @@ pub const Node = struct {
                 if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                 result.prompt_tokens,
                 result.tokens_used,
+                0,
                 parsed_tool_calls,
             );
         }
@@ -2452,12 +2551,13 @@ pub const Node = struct {
                     if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                     result.prompt_tokens,
                     result.tokens_used,
+                    0,
                     parsed_tool_calls,
                 );
             }
         }
 
-        // Fall back to native generation (native/Metal with GPT arch forward pass)
+        // Fall back to native generation (CPU/GPU GPT arch forward pass).
         const model = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
@@ -2630,7 +2730,7 @@ pub const Node = struct {
             gpt_config.max_position_embeddings
         else
             null;
-        const pool_id = kv_manager.addPool(.{
+        const pool_config: runtime.kv.pool.KvPoolConfig = .{
             .backend = backend_kind,
             .dtype = kv_dtype,
             .page_size_tokens = 16,
@@ -2638,24 +2738,71 @@ pub const Node = struct {
             .num_kv_heads = gpt_config.maxKvHeads(),
             .head_dim = gpt_config.maxHeadDim(),
             .sliding_window_size = sliding_window_size,
-        }) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, .{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        }) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        defer kv_storage.deinit();
-        cb.provisionKvDeviceWriteHook(&kv_storage) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
-        decode_state.kv_storage = &kv_storage;
+        };
+
+        var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
+        var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
+        var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
+        var pool_id: runtime.kv.block.KvPoolId = undefined;
+        if (config.prompt_cache_enabled and (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
+            backend_selection.compiled_partition_backend == null and
+            effective_draft_model_name == null and
+            config.cache_compaction_ratio == null)
+        {
+            self.model_manager.rebalancePromptCaches(
+                model,
+                self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer),
+            );
+            const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
+                const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                const storage = if (ensured) |result| result.storage else break :blk false;
+                if (storage.device_write_hook == null) {
+                    cb.provisionKvDeviceWriteHook(storage) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                }
+                if (storage.device_write_hook == null) break :blk false;
+                active_kv_storage = storage;
+                break :blk true;
+            } else blk: {
+                const maybe_cache_pool_id = model.prompt_prefix_cache.ensurePool(pool_config) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                break :blk maybe_cache_pool_id != null;
+            };
+
+            if (cache_ready) {
+                active_kv_manager = model.prompt_prefix_cache.managerPtr();
+                pool_id = model.prompt_prefix_cache.pool_id.?;
+                prompt_cache = &model.prompt_prefix_cache;
+            } else {
+                pool_id = kv_manager.addPool(pool_config) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                config.prompt_cache_enabled = false;
+            }
+        } else {
+            config.prompt_cache_enabled = false;
+            pool_id = kv_manager.addPool(pool_config) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+        }
+
+        var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
+            runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, pool_config) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) })
+        else
+            null;
+        defer if (kv_storage) |*storage| storage.deinit();
+        if (kv_storage) |*storage| {
+            cb.provisionKvDeviceWriteHook(storage) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+        }
+        var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        if (active_kv_storage) |storage| {
+            decode_state.kv_storage = storage;
+        } else if (kv_storage) |*storage| {
+            decode_state.kv_storage = storage;
+        }
         defer decode_state.deinit();
+
         var draft_decode_state: ?generation.NativeDecodeState = null;
         defer if (draft_decode_state) |*state| state.deinit();
 
@@ -2750,6 +2897,7 @@ pub const Node = struct {
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
+            .prompt_cache = prompt_cache,
             .graph_cache = graph_cache,
             .compiled_partition_backend = effective_compiled_partition_backend,
             .compiled_attachment_target = effective_compiled_attachment_target,
@@ -2802,6 +2950,7 @@ pub const Node = struct {
             if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
             result.prompt_tokens,
             result.tokens_used,
+            result.cached_prompt_tokens,
             parsed_tool_calls,
         );
     }
@@ -3653,6 +3802,7 @@ pub const Node = struct {
         finish_reason: []const u8,
         prompt_tokens: usize,
         completion_tokens: usize,
+        cached_prompt_tokens: usize,
         tool_calls: ?[]const tool_parser_mod.ToolCall,
     ) !httpx.Response {
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -3696,6 +3846,7 @@ pub const Node = struct {
                 .prompt_tokens = @intCast(prompt_tokens),
                 .completion_tokens = @intCast(completion_tokens),
                 .total_tokens = @intCast(prompt_tokens + completion_tokens),
+                .cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens),
             },
         });
     }
@@ -5449,6 +5600,7 @@ pub const Node = struct {
     }
 
     pub fn serve(self: *Node, allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
+        self.attachIo(io);
         var server = httpx.Server.initWithConfig(allocator, io, .{
             .host = host,
             .port = port,
@@ -5499,6 +5651,7 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
         try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
+        try appendPromptCacheMetrics(&writer.writer, node.model_manager.loaded);
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return ctx.text(writer.writer.buffered());
@@ -6209,6 +6362,46 @@ fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_
     try appendPromMetric(writer, "inference_graph_executor_graph_plan_bytes_reserved_total", "counter", "Total graph executor planned buffer bytes reserved", stats.graph_plan_bytes_reserved);
 }
 
+fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
+    var hits: u64 = 0;
+    var misses: u64 = 0;
+    var evictions: u64 = 0;
+    var cached_tokens: u64 = 0;
+    var live_entries: u64 = 0;
+    var live_bytes: u64 = 0;
+    var block_hash_hits: u64 = 0;
+    var block_hash_misses: u64 = 0;
+    var block_hash_evictions: u64 = 0;
+    var block_hash_cached_blocks: u64 = 0;
+    var block_hash_collision_guards: u64 = 0;
+    var it = models.iterator();
+    while (it.next()) |entry| {
+        const stats = entry.value_ptr.*.prompt_prefix_cache.stats();
+        hits += stats.hits;
+        misses += stats.misses;
+        evictions += stats.evictions;
+        cached_tokens += stats.cached_tokens;
+        live_entries += @intCast(stats.live_entries);
+        live_bytes += @intCast(stats.live_bytes);
+        block_hash_hits += stats.block_hash_hits;
+        block_hash_misses += stats.block_hash_misses;
+        block_hash_evictions += stats.block_hash_evictions;
+        block_hash_cached_blocks += @intCast(stats.block_hash_cached_blocks);
+        block_hash_collision_guards += stats.block_hash_collision_guards;
+    }
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_hits_total", "counter", "Total prompt prefix cache hits", hits);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_misses_total", "counter", "Total prompt prefix cache misses", misses);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_evictions_total", "counter", "Total prompt prefix cache evictions", evictions);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_cached_tokens", "gauge", "Prompt prefix cache retained prompt tokens", cached_tokens);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_live_entries", "gauge", "Prompt prefix cache live entries", live_entries);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_live_bytes", "gauge", "Prompt prefix cache estimated logical bytes", live_bytes);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_hits_total", "counter", "Total block-hash prompt cache hits", block_hash_hits);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_misses_total", "counter", "Total block-hash prompt cache misses", block_hash_misses);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_evictions_total", "counter", "Total block-hash prompt cache evictions", block_hash_evictions);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_cached_blocks", "gauge", "Block-hash prompt cache retained KV blocks", block_hash_cached_blocks);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_collision_guards_total", "counter", "Total block-hash prompt cache collisions detected", block_hash_collision_guards);
+}
+
 fn aggregateResidentProjectionStats(models: anytype) embedding_mod.ResidentProjectionStats {
     var aggregate = embedding_mod.ResidentProjectionStats{};
     var it = models.iterator();
@@ -6546,6 +6739,16 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
+}
+
+test "node attachIo wires model session manager" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+
+    node.attachIo(std.testing.io);
+
+    try std.testing.expect(node.session_manager.io != null);
+    try std.testing.expect(node.model_manager.session_manager.io != null);
 }
 
 test "registerAiRoutesOn excludes Traditional ML predictor routes" {
