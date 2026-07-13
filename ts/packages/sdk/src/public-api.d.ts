@@ -12962,7 +12962,11 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Backup completed successfully */
+            /**
+             * @description Backup attempt completed. Inspect the response `status`: `completed`
+             *     is fully successful, while `partial` or `failed` reports per-table
+             *     failures even though the request itself was processed successfully.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;

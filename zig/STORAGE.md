@@ -231,6 +231,13 @@ format defaults to `portable` for both table and cluster backups. Use
 `--format native` explicitly when same-engine physical restore speed is more
 important than cross-engine portability.
 
+Cluster backup is a synchronous aggregate operation and always emits its
+per-table JSON result. An HTTP `200` means the aggregate attempt finished, not
+that every table succeeded. The CLI exits zero only when the result is
+`completed`; `partial`, `failed`, malformed, and internally inconsistent
+results exit non-zero so scheduled backups cannot silently accept incomplete
+artifacts.
+
 The server requires `backup.write` or `restore.read` respectively and verifies
 the object-store bucket and segment-bounded prefix, or resolves a logical
 `file:///...` path beneath an administrator-controlled filesystem root. This
@@ -239,6 +246,13 @@ process without promoting storage credentials to process-global environment
 variables. Every network backup and restore request requires a named connection;
 ambient process credentials are not exposed through the network API. Offline
 Lite tooling may still use environment credentials when explicitly requested.
+
+`backup.write` credentials may be genuinely write-only. Normal publication
+does not probe the bucket or read an existing manifest; it writes private
+generation objects and uses a conditional manifest create as the conflict
+check. `HeadBucket` is required only when the connection explicitly enables
+bucket provisioning. Listing and restore use a separate `restore.read`
+connection and its read credentials.
 
 GCS and filesystem authority are protocol-specific rather than accepting S3
 fields that would be silently ignored:

@@ -8065,7 +8065,10 @@ paths:
               $ref: "#/components/schemas/ClusterBackupRequest"
       responses:
         "200":
-          description: Backup completed successfully
+          description: |
+            Backup attempt completed. Inspect the response `status`: `completed`
+            is fully successful, while `partial` or `failed` reports per-table
+            failures even though the request itself was processed successfully.
           content:
             application/json:
               schema:

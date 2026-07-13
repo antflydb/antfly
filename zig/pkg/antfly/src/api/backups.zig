@@ -303,6 +303,7 @@ const RemoteBackupStore = struct {
     resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null,
     owns_client: bool = true,
     create_bucket_if_missing: bool = false,
+    bucket_ready: std.atomic.Value(bool) = .init(false),
     bucket: []u8,
     prefix: []u8,
 
@@ -492,9 +493,26 @@ const RemoteBackupStore = struct {
     }
 
     fn ensureBucket(self: *RemoteBackupStore) !void {
-        if (try self.client.bucketExists(self.bucket)) return;
-        if (!self.create_bucket_if_missing) return error.BucketNotFound;
-        try self.client.makeBucket(self.bucket);
+        // Normal backup writers may intentionally have PutObject without
+        // HeadBucket/ListBucket. Only provisioning connections need to probe
+        // and create buckets; ordinary writes let the object operation report
+        // a missing or unauthorized bucket directly.
+        if (!self.create_bucket_if_missing) return;
+        if (self.bucket_ready.load(.acquire)) return;
+        if (try self.client.bucketExists(self.bucket)) {
+            self.bucket_ready.store(true, .release);
+            return;
+        }
+        self.client.makeBucket(self.bucket) catch |err| {
+            // Another request may have created the bucket after our probe.
+            // Recheck rather than surfacing a harmless provider conflict.
+            if (self.client.bucketExists(self.bucket) catch false) {
+                self.bucket_ready.store(true, .release);
+                return;
+            }
+            return err;
+        };
+        self.bucket_ready.store(true, .release);
     }
 
     fn keyAlloc(self: *const RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
@@ -547,17 +565,6 @@ const RemoteBackupStore = struct {
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
         try self.client.getFileWithIo(self.io, self.bucket, key, dest_path, .{});
-    }
-
-    fn exists(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) !bool {
-        const key = try self.keyAlloc(alloc, suffix);
-        defer alloc.free(key);
-        var metadata = self.client.statObject(self.bucket, key) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        metadata.deinit(alloc);
-        return true;
     }
 
     fn listObjectsPage(
@@ -1162,15 +1169,16 @@ pub fn readManifestFromLocation(
 }
 
 pub fn manifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
-    const suffix = try metadataPath(alloc, "", backup_id);
-    defer alloc.free(suffix);
     return switch (location.*) {
         .file => |backup_root| blk: {
             const path = try metadataPath(alloc, backup_root, backup_id);
             defer alloc.free(path);
             break :blk try pathExists(path);
         },
-        .remote => |*store| try store.exists(alloc, trimLeftSlash(suffix)),
+        // Do not require restore.read/HeadObject authority from a write-only
+        // backup connection. The conditional manifest put is the authoritative
+        // conflict check for object storage.
+        .remote => false,
     };
 }
 
@@ -1580,15 +1588,13 @@ pub fn readClusterManifestFromLocation(
 }
 
 pub fn clusterManifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
-    const suffix = try clusterMetadataPath(alloc, "", backup_id);
-    defer alloc.free(suffix);
     return switch (location.*) {
         .file => |backup_root| blk: {
             const path = try clusterMetadataPath(alloc, backup_root, backup_id);
             defer alloc.free(path);
             break :blk try pathExists(path);
         },
-        .remote => |*store| try store.exists(alloc, trimLeftSlash(suffix)),
+        .remote => false,
     };
 }
 
@@ -2505,6 +2511,10 @@ test "backup manifest round trips through remote objectstore location" {
         .remote = try RemoteBackupStore.initWithClient(std.testing.allocator, client, "bucket", "backups/prod"),
     };
     defer location.deinit(std.testing.allocator);
+    // A backup.write connection does not imply HeadBucket/ListBucket. Verify
+    // publication goes directly through conditional PutObject when bucket
+    // provisioning is disabled.
+    location.remote.create_bucket_if_missing = false;
 
     const shards = [_]ShardSnapshot{
         .{

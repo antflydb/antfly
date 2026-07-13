@@ -92,9 +92,8 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         }
         var resp = try client.listBackups(.{ .location = opts.location, .connection = connection });
         defer resp.deinit();
-        if (resp.data) |data| {
-            try cli.writeJson(allocator, io, data.value);
-        }
+        const result = if (resp.data) |*data| data.value else cli.fatal("invalid backup-list response", .{});
+        try cli.writeJson(allocator, io, result);
         return;
     }
 
@@ -127,10 +126,30 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         .table_names = table_names,
     });
     defer resp.deinit();
-    if (resp.data) |data| {
-        try cli.writeJson(allocator, io, data.value);
-    }
+    const result = if (resp.data) |*data| data.value else cli.fatal("invalid cluster backup response", .{});
+    try cli.writeJson(allocator, io, result);
+    validateClusterBackupResult(result.status, result.tables) catch |err| switch (err) {
+        error.ClusterBackupIncomplete => cli.fatal("cluster backup incomplete; inspect the result above", .{}),
+        error.InvalidBackupResponse => cli.fatal("invalid or internally inconsistent cluster backup response", .{}),
+    };
     std.debug.print("Backup command successful.\n", .{});
+}
+
+fn validateClusterBackupResult(status: []const u8, tables: []const antfly_client.types.TableBackupStatus) !void {
+    var completed: usize = 0;
+    var incomplete: usize = 0;
+    for (tables) |table| {
+        if (std.mem.eql(u8, table.status, "completed")) {
+            completed += 1;
+        } else if (std.mem.eql(u8, table.status, "failed") or std.mem.eql(u8, table.status, "skipped")) {
+            incomplete += 1;
+        } else {
+            return error.InvalidBackupResponse;
+        }
+    }
+    const expected = if (completed == 0) "failed" else if (incomplete > 0) "partial" else "completed";
+    if (!std.mem.eql(u8, status, expected)) return error.InvalidBackupResponse;
+    if (!std.mem.eql(u8, expected, "completed")) return error.ClusterBackupIncomplete;
 }
 
 pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -446,6 +465,21 @@ test "backup cli parser accepts help flag" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseBackupArgs(&iter);
     try std.testing.expect(opts.help);
+}
+
+test "cluster backup CLI fails closed on incomplete and unknown results" {
+    const completed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "completed" }};
+    const failed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "failed" }};
+    const partial = [_]antfly_client.types.TableBackupStatus{
+        .{ .name = "docs", .status = "completed" },
+        .{ .name = "events", .status = "failed" },
+    };
+    const unknown = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "queued" }};
+    try validateClusterBackupResult("completed", &completed);
+    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult("partial", &partial));
+    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult("failed", &failed));
+    try std.testing.expectError(error.InvalidBackupResponse, validateClusterBackupResult("completed", &failed));
+    try std.testing.expectError(error.InvalidBackupResponse, validateClusterBackupResult("queued", &unknown));
 }
 
 test "backup cli parser rejects unknown arguments" {
