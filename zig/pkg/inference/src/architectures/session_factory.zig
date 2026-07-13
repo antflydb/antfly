@@ -4131,6 +4131,48 @@ test "attachIo reaches native compute backend" {
     try std.testing.expect(cb.getIo() != null);
 }
 
+test "attachIo leases the shared Metal provider" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var arch_session = ArchSession{
+        .allocator = allocator,
+        .arch_config = .{ .gpt = .{
+            .hidden_size = 4,
+            .num_hidden_layers = 1,
+            .num_attention_heads = 1,
+            .intermediate_size = 8,
+            .vocab_size = 16,
+        } },
+        .backend_type = .metal,
+        .backend_data = .{ .metal = .{
+            .allocator = allocator,
+            .prefix = "",
+            .lazy_weights = .empty,
+        } },
+    };
+    const metal_data = &arch_session.backend_data.metal;
+    defer metal_data.lazy_weights.deinit(allocator);
+    defer metal_compute_mod.deinitSharedNativeProvider(metal_data);
+    const session = Session{
+        .ptr = &arch_session,
+        .vtable = &arch_vtable,
+    };
+
+    attachIo(session, std.testing.io);
+    {
+        var cb = try makeComputeBackend(&arch_session, allocator, null);
+        const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        defer allocator.destroy(compute);
+        defer cb.deinit();
+        try std.testing.expect(cb.getIo() != null);
+        try std.testing.expect(!compute.owned_native_provider);
+        try std.testing.expectEqual(compute.provider_impl, metal_data.shared_metal_native_provider.?);
+        try std.testing.expect(!metal_data.shared_metal_native_provider_lock.tryLock());
+    }
+    try std.testing.expect(metal_data.shared_metal_native_provider_lock.tryLock());
+    metal_data.shared_metal_native_provider_lock.unlock(std.Io.failing);
+}
+
 fn gpuBackendData(self: *ArchSession) *GpuHostedData {
     return switch (self.backend_type) {
         .metal => if (comptime build_options.enable_metal) &self.backend_data.metal else unreachable,

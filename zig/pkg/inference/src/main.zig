@@ -331,9 +331,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
-    node.attachIo(io);
 
-    try node.warmConfiguredModels(allocator);
+    try node.warmConfiguredModels(allocator, io);
     print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 

@@ -967,12 +967,13 @@ pub const Node = struct {
         return try allocator.dupe(u8, result.text);
     }
 
-    pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
+    pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator, io: std.Io) !void {
+        self.attachIo(io);
         for (self.config.preload) |model| try self.warmModel(allocator, model);
     }
 
-    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
-        try self.warmConfiguredModels(allocator);
+    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator, io: std.Io) !void {
+        try self.warmConfiguredModels(allocator, io);
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
@@ -6707,11 +6708,15 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
 }
 
-test "node attachIo wires model session manager" {
-    var node = try Node.init(std.testing.allocator, .{});
+test "configured warmup attaches io before loading models" {
+    const preload = [_]WarmModel{.{ .name = "" }};
+    var node = try Node.init(std.testing.allocator, .{ .preload = &preload });
     defer node.deinit();
 
-    node.attachIo(std.testing.io);
+    try std.testing.expectError(
+        error.InvalidGenerationRequest,
+        node.warmConfiguredModels(std.testing.allocator, std.testing.io),
+    );
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const ml = @import("ml");
 const build_options = @import("build_options");
 const ops = @import("ops.zig");
@@ -538,33 +537,43 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         io: ?std.Io,
     ) !MetalCompute {
         _ = run_budget;
-        if (io == null and !builtin.is_test) {
-            const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
-            errdefer std.heap.c_allocator.destroy(provider_impl);
-            provider_impl.* = try MetalNativeProvider.create();
-            return .{
-                .allocator = allocator,
-                .data = data,
-                .provider_impl = provider_impl,
-                .owned_native_provider = true,
-                .io = io,
-            };
+        if (io) |lock_io| {
+            // ponytail: keep one warm provider lease per model; overlapping
+            // backends use a private provider instead of blocking nested Metal.
+            if (data.shared_metal_native_provider_lock.tryLock()) {
+                errdefer data.shared_metal_native_provider_lock.unlock(lock_io);
+                const provider_impl = data.shared_metal_native_provider orelse blk: {
+                    const created = try std.heap.c_allocator.create(MetalNativeProvider);
+                    errdefer std.heap.c_allocator.destroy(created);
+                    created.* = try MetalNativeProvider.create();
+                    data.shared_metal_native_provider = created;
+                    break :blk created;
+                };
+                return .{
+                    .allocator = allocator,
+                    .data = data,
+                    .provider_impl = provider_impl,
+                    .owned_native_provider = false,
+                    .io = io,
+                };
+            }
         }
-        const lock_io = metalComputeLockIo(io);
-        data.shared_metal_native_provider_lock.lockUncancelable(lock_io);
-        defer data.shared_metal_native_provider_lock.unlock(lock_io);
-        const provider_impl = data.shared_metal_native_provider orelse blk: {
-            const created = try std.heap.c_allocator.create(MetalNativeProvider);
-            errdefer std.heap.c_allocator.destroy(created);
-            created.* = try MetalNativeProvider.create();
-            data.shared_metal_native_provider = created;
-            break :blk created;
-        };
+        return initWithOwnedNativeProvider(allocator, data, io);
+    }
+
+    fn initWithOwnedNativeProvider(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        io: ?std.Io,
+    ) !MetalCompute {
+        const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
+        errdefer std.heap.c_allocator.destroy(provider_impl);
+        provider_impl.* = try MetalNativeProvider.create();
         return .{
             .allocator = allocator,
             .data = data,
             .provider_impl = provider_impl,
-            .owned_native_provider = false,
+            .owned_native_provider = true,
             .io = io,
         };
     }
@@ -2700,6 +2709,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (self.owned_native_provider) {
             self.provider_impl.deinitOwned();
             std.heap.c_allocator.destroy(self.provider_impl);
+        } else {
+            std.debug.assert(self.data.shared_metal_native_provider == self.provider_impl);
+            self.data.shared_metal_native_provider_lock.unlock(metalComputeLockIo(self.io));
         }
     }
 
@@ -7395,6 +7407,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .ids = ids,
                 .total = total,
                 .dim = dim,
+                .cache_key = if (weight_buf.lazy_entry) |entry| @intFromPtr(entry) else null,
             })) |tensor| {
                 return self.ctFromOwnedMetalTensor(tensor);
             }
@@ -15030,6 +15043,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .ids = token_ids,
             .total = token_ids.len,
             .dim = dim,
+            .cache_key = if (weight_buf.lazy_entry) |entry| @intFromPtr(entry) else null,
         })) orelse return null;
         errdefer embedding.deinit();
         return scaleDecodeTensor(self, embedding, scale);
@@ -19931,7 +19945,7 @@ pub fn deinitPackedExpertViews(data: *WeightStore, allocator: std.mem.Allocator)
 }
 
 fn metalComputeLockIo(io: ?std.Io) std.Io {
-    return io orelse if (builtin.is_test) std.testing.io else unreachable;
+    return io orelse unreachable;
 }
 
 pub fn deinitSharedNativeProvider(data: *WeightStore) void {
@@ -19955,7 +19969,7 @@ fn testMetalWeightStoreInit(allocator: std.mem.Allocator) WeightStore {
     };
 }
 
-test "metal_compute: native provider is shared across backend lifetimes" {
+test "metal_compute: warm provider is reused without sharing overlapping backends" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var metal_ws = testMetalWeightStoreInit(allocator);
@@ -19964,14 +19978,97 @@ test "metal_compute: native provider is shared across backend lifetimes" {
         metal_ws.lazy_weights.deinit(allocator);
     }
 
-    var first = try MetalCompute.init(allocator, &metal_ws, null);
-    const first_provider = first.provider_impl;
-    try std.testing.expect(metal_ws.shared_metal_native_provider != null);
-    first.deinit();
+    const shared_provider = first_lifetime: {
+        var first = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+        defer first.deinit();
+        try std.testing.expect(!first.owned_native_provider);
+        try std.testing.expect(!metal_ws.shared_metal_native_provider_lock.tryLock());
 
-    var second = try MetalCompute.init(allocator, &metal_ws, null);
+        var overlapping = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+        defer overlapping.deinit();
+        try std.testing.expect(overlapping.owned_native_provider);
+        try std.testing.expect(first.provider_impl != overlapping.provider_impl);
+        break :first_lifetime @intFromPtr(first.provider_impl);
+    };
+    try std.testing.expect(metal_ws.shared_metal_native_provider_lock.tryLock());
+    metal_ws.shared_metal_native_provider_lock.unlock(std.Io.failing);
+
+    var reused = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+    defer reused.deinit();
+    try std.testing.expect(!reused.owned_native_provider);
+    try std.testing.expectEqual(shared_provider, @intFromPtr(reused.provider_impl));
+}
+
+test "metal_compute: f32 embedding cache uses loaded weight identity" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime_mod = @import("../backends/metal_runtime.zig");
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+
+    const weight_data = [_]f32{
+        1.0, 2.0,  3.0,  4.0,
+        5.0, 6.0,  7.0,  8.0,
+        9.0, 10.0, 11.0, 12.0,
+    };
+    const shape = [_]i32{ 3, 4 };
+    const ids = [_]i64{ 2, 0 };
+    const expected = [_]f32{
+        9.0, 10.0, 11.0, 12.0,
+        1.0, 2.0,  3.0,  4.0,
+    };
+    var cache_identity: gpu_hosted_store_mod.LazyWeightEntry = .{
+        .tensor_ref = .{ .name = "test.embedding.weight" },
+    };
+
+    const first_data = try allocator.dupe(f32, &weight_data);
+    defer allocator.free(first_data);
+    var first_provider: usize = 0;
+    var first_snapshot: metal_runtime_mod.RawRuntimeMemoryStats = undefined;
+    {
+        var first = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
+        defer first.deinit();
+        first_provider = @intFromPtr(first.provider_impl);
+
+        const first_weight = try MetalCompute.denseBuf(allocator, first_data, false, &shape);
+        MetalCompute.toBuf(first_weight).lazy_entry = &cache_identity;
+        var first_cb = first.computeBackend();
+        defer first_cb.free(first_weight);
+        const first_output = try first_cb.embeddingLookup(first_weight, &ids, ids.len, 4);
+        defer first_cb.free(first_output);
+        const first_values = try first_cb.toFloat32(first_output, allocator);
+        defer allocator.free(first_values);
+        try std.testing.expectEqualSlices(f32, &expected, first_values);
+
+        const runtime = first.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+        first_snapshot = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    }
+    try std.testing.expect(first_snapshot.embedding_bytes > 0);
+
+    var second = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
     defer second.deinit();
-    try std.testing.expectEqual(first_provider, second.provider_impl);
+    try std.testing.expectEqual(first_provider, @intFromPtr(second.provider_impl));
+    const second_data = try allocator.dupe(f32, &weight_data);
+    const second_weight = try MetalCompute.denseBuf(allocator, second_data, true, &shape);
+    MetalCompute.toBuf(second_weight).lazy_entry = &cache_identity;
+    var second_cb = second.computeBackend();
+    defer second_cb.free(second_weight);
+    try std.testing.expect(@intFromPtr(first_data.ptr) != @intFromPtr(second_data.ptr));
+    const second_output = try second_cb.embeddingLookup(second_weight, &ids, ids.len, 4);
+    defer second_cb.free(second_output);
+    const second_values = try second_cb.toFloat32(second_output, allocator);
+    defer allocator.free(second_values);
+    try std.testing.expectEqualSlices(f32, &expected, second_values);
+
+    const runtime = second.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const second_snapshot = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(first_snapshot.embedding_bytes, second_snapshot.embedding_bytes);
+    try std.testing.expectEqual(first_snapshot.embedding_logical_bytes, second_snapshot.embedding_logical_bytes);
 }
 
 test "metal_compute: paged decode attention matches native on f32 cache" {

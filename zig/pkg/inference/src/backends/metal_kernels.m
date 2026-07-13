@@ -14473,16 +14473,16 @@ static void termite_metal_decode_runtime_store_embedding_cache(
     termite_metal_decode_runtime_trace_embedding_cache(runtime);
 }
 
-int termite_metal_decode_runtime_prepare_embedding_table(
+int termite_metal_decode_runtime_prepare_embedding_table_keyed(
     termite_metal_decode_runtime *runtime,
     const float *weight,
+    uintptr_t source_id,
     size_t rows,
     size_t dim
 ) {
     if (runtime == NULL || weight == NULL) return -1;
     if (runtime->device == nil || runtime->queue == nil) return -2;
     if (rows == 0 || dim == 0) return -3;
-    const uintptr_t source_id = (uintptr_t)weight;
     const size_t bytes = rows * dim * sizeof(float);
     if (termite_metal_decode_runtime_select_embedding_cache(runtime, source_id, 0, rows, dim, bytes)) return 0;
     @autoreleasepool {
@@ -14491,6 +14491,15 @@ int termite_metal_decode_runtime_prepare_embedding_table(
         termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, 0, source_id, 0, rows, dim, bytes);
         return 0;
     }
+}
+
+int termite_metal_decode_runtime_prepare_embedding_table(
+    termite_metal_decode_runtime *runtime,
+    const float *weight,
+    size_t rows,
+    size_t dim
+) {
+    return termite_metal_decode_runtime_prepare_embedding_table_keyed(runtime, weight, (uintptr_t)weight, rows, dim);
 }
 
 int termite_metal_decode_runtime_prepare_embedding_table_bf16(

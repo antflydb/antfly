@@ -1366,12 +1366,12 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
         }
     } else {
         var weight = request.weight;
-        const prep_rc = termite_metal_decode_runtime_prepare_embedding_table(
-            runtime,
-            try tensorHostConstPtr(&weight),
-            rows,
-            request.dim,
-        );
+        const weight_ptr = try tensorHostConstPtr(&weight);
+        const cache_key: ?usize = if (@hasField(@TypeOf(request), "cache_key")) request.cache_key else null;
+        const prep_rc = if (cache_key) |key|
+            termite_metal_decode_runtime_prepare_embedding_table_keyed(runtime, weight_ptr, key, rows, request.dim)
+        else
+            termite_metal_decode_runtime_prepare_embedding_table(runtime, weight_ptr, rows, request.dim);
         if (prep_rc == 0) {
             var output = try MetalTensor.deviceAllocate(runtime, request.total * request.dim * @sizeOf(f32), .private, &shape);
             errdefer output.deinit();
@@ -7193,6 +7193,13 @@ pub extern fn termite_metal_decode_runtime_embed_absolute_position(
 pub extern fn termite_metal_decode_runtime_prepare_embedding_table(
     runtime: ?*RawMetalDecodeRuntime,
     weight: [*c]const f32,
+    rows: usize,
+    dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_embedding_table_keyed(
+    runtime: ?*RawMetalDecodeRuntime,
+    weight: [*c]const f32,
+    source_id: usize,
     rows: usize,
     dim: usize,
 ) c_int;
