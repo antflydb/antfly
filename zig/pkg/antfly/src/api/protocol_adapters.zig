@@ -1239,10 +1239,10 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest) !http_common.HttpResponse {
+pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest, query_embedding_security_scope: anytype) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
     if (isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) {
         var sink = A2aSseSink{};
         defer sink.out.deinit(server_ptr.alloc);
@@ -1259,7 +1259,7 @@ pub fn isA2aStreamingRequest(alloc: std.mem.Allocator, req: http_common.HttpRequ
     return req.method == .POST and isJsonRpcMethod(alloc, req.body, "message/stream");
 }
 
-pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
+pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter, query_embedding_security_scope: anytype) !bool {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     if (!isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) return false;
@@ -1269,7 +1269,7 @@ pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpReque
         .content_type = "text/event-stream",
     });
 
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
     var sink = A2aLiveSseSink{ .writer = writer };
     try dispatcher.handleJsonRpcStream(server_ptr.alloc, req.body, sink.iface());
     try writer.writeAll("event: done\ndata: {}\n\n");
@@ -1304,22 +1304,28 @@ const A2aLiveSseSink = struct {
     }
 };
 
-pub fn handleA2aCard(server_ptr: anytype) !http_common.HttpResponse {
+pub fn handleA2aCard(server_ptr: anytype, query_embedding_security_scope: anytype) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null, query_embedding_security_scope);
     const card = try dispatcher.agentCard(arena_impl.allocator());
     const body = try stringifyJsonValue(server_ptr.alloc, card);
     defer server_ptr.alloc.free(body);
     return try jsonBodyResponseWithStatus(server_ptr.alloc, 200, body);
 }
 
-fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, authorization: ?[]const u8) !a2a.Dispatcher {
+fn buildA2aDispatcher(
+    server_ptr: anytype,
+    dispatcher_alloc: std.mem.Allocator,
+    authorization: ?[]const u8,
+    query_embedding_security_scope: anytype,
+) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval };
     const HandlerContext = struct {
         server: Server,
         authorization: ?[]const u8,
+        query_embedding_security_scope: @TypeOf(query_embedding_security_scope),
         kind: HandlerKind,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
@@ -1408,7 +1414,14 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            try ctx.server.executeA2aRetrieval(alloc, body_json, request_ctx.task_id, request_ctx.context_id, queue);
+            try ctx.server.executeA2aRetrieval(
+                alloc,
+                body_json,
+                request_ctx.task_id,
+                request_ctx.context_id,
+                queue,
+                ctx.query_embedding_security_scope,
+            );
         }
     };
 
@@ -1419,8 +1432,18 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
         .task_store = server_ptr.a2a_tasks.iface(),
     };
     const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
-    contexts[0] = .{ .server = server_ptr, .authorization = authorization, .kind = .query_builder };
-    contexts[1] = .{ .server = server_ptr, .authorization = authorization, .kind = .retrieval };
+    contexts[0] = .{
+        .server = server_ptr,
+        .authorization = authorization,
+        .query_embedding_security_scope = query_embedding_security_scope,
+        .kind = .query_builder,
+    };
+    contexts[1] = .{
+        .server = server_ptr,
+        .authorization = authorization,
+        .query_embedding_security_scope = query_embedding_security_scope,
+        .kind = .retrieval,
+    };
     try dispatcher.addHandler(dispatcher_alloc, contexts[0].iface());
     try dispatcher.addHandler(dispatcher_alloc, contexts[1].iface());
     return dispatcher;

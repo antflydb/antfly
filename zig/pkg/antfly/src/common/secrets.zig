@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const fs_paths = @import("fs_paths.zig");
+const platform_time = @import("../platform/time.zig");
 
 const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
     extern "c" var environ: [*:null]?[*:0]u8;
@@ -233,11 +234,13 @@ pub const FileStore = struct {
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
+    generation_snapshot: std.atomic.Value(u64) = .init(0),
     last_reload_failed: bool = false,
     reload_success_count: u64 = 0,
     reload_failure_count: u64 = 0,
     last_success_ns: u64 = 0,
     last_failure_ns: u64 = 0,
+    next_throttled_refresh_ns: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
         var store = FileStore{
@@ -287,6 +290,11 @@ pub const FileStore = struct {
         return self.generationLocked();
     }
 
+    pub fn generationFast(self: *FileStore) u64 {
+        if (self.fallbacks.len == 0) return self.generation_snapshot.load(.acquire);
+        return self.generation();
+    }
+
     pub fn reloadFailed(self: *FileStore) bool {
         self.lock();
         defer self.unlock();
@@ -321,6 +329,27 @@ pub const FileStore = struct {
         var changed = try self.refreshIfChangedLocked();
         for (self.fallbacks) |*fallback| {
             changed = (try fallback.refreshIfChanged()) or changed;
+        }
+        return changed;
+    }
+
+    /// Refresh at most once per interval. The atomic fast path avoids taking
+    /// the store lock or issuing a stat syscall on every cache lookup.
+    pub fn refreshIfChangedThrottled(self: *FileStore, interval_ns: u64) !bool {
+        if (interval_ns == 0) return try self.refreshIfChanged();
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
+
+        self.lock();
+        defer self.unlock();
+        const locked_now_ns = platform_time.monotonicNs();
+        if (locked_now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
+        self.next_throttled_refresh_ns.store(locked_now_ns +| interval_ns, .release);
+        errdefer self.next_throttled_refresh_ns.store(0, .release);
+
+        var changed = try self.refreshIfChangedLocked();
+        for (self.fallbacks) |*fallback| {
+            changed = (try fallback.refreshIfChangedThrottled(interval_ns)) or changed;
         }
         return changed;
     }
@@ -596,6 +625,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(&next);
         self.observed_metadata = metadata;
         self.generation_value +%= 1;
+        self.generation_snapshot.store(self.generation_value, .release);
         self.markReloadHealthyLocked(true);
         return true;
     }
@@ -631,6 +661,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(next);
         self.observed_metadata = try statFileMetadata(self.path);
         self.generation_value +%= 1;
+        self.generation_snapshot.store(self.generation_value, .release);
         self.markReloadHealthyLocked(true);
     }
 
@@ -1082,6 +1113,7 @@ test "file secret store reloads valid external replacements including deletions"
     var store = try FileStore.init(alloc, path);
     defer store.deinit();
     const initial_generation = store.generation();
+    try std.testing.expectEqual(initial_generation, store.generationFast());
 
     const first = try store.getOwned(alloc, "openai.api_key");
     defer if (first) |value| alloc.free(value);
@@ -1099,6 +1131,31 @@ test "file secret store reloads valid external replacements including deletions"
     const deleted = try store.getOwned(alloc, "deleted.dynamic_secret");
     defer if (deleted) |value| alloc.free(value);
     try std.testing.expectEqual(@as(?[]u8, null), deleted);
+}
+
+test "file secret store throttles cache-key freshness checks" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-throttle-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    );
+    var store = try FileStore.init(alloc, path);
+    defer store.deinit();
+    const initial_generation = store.generation();
+    try std.testing.expect(!(try store.refreshIfChangedThrottled(std.time.ns_per_hour)));
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"second-longer","created_at_ns":1,"updated_at_ns":2}]}
+    );
+    try std.testing.expect(!(try store.refreshIfChangedThrottled(std.time.ns_per_hour)));
+    try std.testing.expectEqual(initial_generation, store.generation());
+
+    try std.testing.expect(try store.refreshIfChanged());
+    try std.testing.expectEqual(initial_generation + 1, store.generation());
+    try std.testing.expectEqual(initial_generation + 1, store.generationFast());
 }
 
 test "file secret store keeps last known good snapshot for malformed and missing files" {

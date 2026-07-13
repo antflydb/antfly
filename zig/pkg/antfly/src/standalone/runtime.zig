@@ -1635,8 +1635,10 @@ fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_em
     return .{
         .ptr = node,
         .embed_dense_texts = localAntflyEmbedDenseTexts,
+        .embed_dense_texts_with_context = localAntflyEmbedDenseTextsWithContext,
         .embed_sparse_texts = localAntflyEmbedSparseTexts,
         .embed_dense_parts = localAntflyEmbedDenseParts,
+        .embed_dense_parts_with_context = localAntflyEmbedDensePartsWithContext,
         .rerank_texts = localAntflyRerankTexts,
         .generate_text = localAntflyGenerateText,
         .generate_messages = localAntflyGenerateMessages,
@@ -1664,11 +1666,35 @@ fn localAntflyEmbedDenseTexts(
     return try node.embedDenseTextsDirect(alloc, model, texts);
 }
 
+fn localAntflyEmbedDenseTextsWithContext(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
+}
+
 fn localAntflyEmbedDenseParts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
     parts: []const antfly.template.ContentPart,
+) anyerror![][]f32 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, io_impl.io(), null);
+}
+
+fn localAntflyEmbedDensePartsWithExecutionContext(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+    io: std.Io,
+    deadline_ns: ?u64,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     var values = std.json.Array.init(alloc);
@@ -1720,7 +1746,17 @@ fn localAntflyEmbedDenseParts(
         }
     }
 
-    return try node.embedDenseJsonInputDirect(alloc, model, .{ .array = values });
+    return try node.embedDenseJsonInputDirectWithContext(alloc, io, deadline_ns, model, .{ .array = values });
+}
+
+fn localAntflyEmbedDensePartsWithContext(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, context.io, context.deadline_ns);
 }
 
 fn localAntflyEmbedSparseTexts(

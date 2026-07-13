@@ -140,6 +140,22 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn respondQueryEmbeddingOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        const normalized = http_server_mod.normalizeQueryEmbeddingOperationalError(err) orelse return null;
+        const response = switch (normalized) {
+            error.QueryEmbeddingInputTooLarge => .{ @as(u16, 413), "query embedding input too large", false },
+            error.QueryEmbeddingOverloaded => .{ @as(u16, 429), "query embedding overloaded", true },
+            error.EmbedRateLimited => .{ @as(u16, 429), "query embedding rate limited", true },
+            error.EmbedTransientFailure => .{ @as(u16, 503), "query embedding temporarily unavailable", true },
+            error.EmbedUpstreamFailure => .{ @as(u16, 502), "query embedding provider failed", false },
+            error.Timeout => .{ @as(u16, 504), "query embedding timed out", false },
+            else => return null,
+        };
+        if (response[2]) try ctx.setHeader("Retry-After", "1");
+        _ = ctx.status(response[0]);
+        return try ctx.text(response[1]);
+    }
+
     const OffloadedTableBatch = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -1302,6 +1318,7 @@ pub const AntflyApiHandler = struct {
                     .server = self.api_server,
                     .source = reads,
                     .table_name = table_name,
+                    .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
                 };
                 table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
             }
@@ -1312,6 +1329,7 @@ pub const AntflyApiHandler = struct {
         const QueryBuilderGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            io: std.Io,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                 return .{
@@ -1327,14 +1345,16 @@ pub const AntflyApiHandler = struct {
                 messages: []const generating_runtime.ChatMessage,
             ) !generating_runtime.GenerateResult {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+                var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = QueryBuilderGenerationRunner{
+            .antfly_provider = self.api_server.antfly_provider,
+            .secret_store = self.api_server.cfg.secret_store,
+            .io = self.api_server.inferenceIo(),
+        };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
             error.InvalidQueryBuilderRequest => {
@@ -1345,7 +1365,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("doc identity unavailable");
             },
-            else => return err,
+            else => {
+                if (try respondQueryEmbeddingOperationalError(ctx, err)) |operational_response| return operational_response;
+                return err;
+            },
         };
         return ctx.json(response);
     }
@@ -1367,6 +1390,7 @@ pub const AntflyApiHandler = struct {
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
+            query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -1385,13 +1409,7 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var semantic_resolver = http_server_mod.SemanticStatusResolver{
-                    .source = runner.server.source,
-                    .antfly_provider = runner.server.antfly_provider,
-                    .remote_content = runner.server.cfg.remote_content,
-                    .inference_api_url = runner.server.configuredInferenceAPIURL(),
-                    .inference_api_key = runner.server.cfg.inference_api_key,
-                };
+                var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -1449,6 +1467,7 @@ pub const AntflyApiHandler = struct {
         const RetrievalGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            io: std.Io,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -1464,18 +1483,21 @@ pub const AntflyApiHandler = struct {
                 messages: []const generating_runtime.ChatMessage,
             ) !generating_runtime.GenerateResult {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+                var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{
+            .antfly_provider = self.api_server.antfly_provider,
+            .secret_store = self.api_server.cfg.secret_store,
+            .io = self.api_server.inferenceIo(),
+        };
 
         var query_runner = RetrievalQueryRunner{
             .server = self.api_server,
             .source = source,
+            .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
         };
         const retrieval_resp = retrieval_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body_data) catch |err| switch (err) {
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
@@ -1491,6 +1513,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("doc identity unavailable");
             },
             else => {
+                if (try respondQueryEmbeddingOperationalError(ctx, err)) |response| return response;
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
             },
@@ -1577,6 +1600,7 @@ pub const AntflyApiHandler = struct {
             create_req.indexes_json orelse tables_api.default_indexes_json,
             .{
                 .antfly_provider = self.api_server.antfly_provider,
+                .io = self.api_server.inferenceIo(),
                 .secret_store = self.api_server.cfg.secret_store,
                 .remote_content = self.api_server.cfg.remote_content,
                 .inference_api_url = self.api_server.configuredInferenceAPIURL(),

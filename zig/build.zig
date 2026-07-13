@@ -2916,6 +2916,14 @@ pub fn build(b: *std.Build) void {
         "restore filesystem scope containment handles filesystem roots and component boundaries",
         ".test_0",
         "module compiles",
+        "cache budget atomically enforces its hard limit",
+        "query embedding cache owns results and coalesces misses",
+        "query embedding cache keys isolate security domains",
+        "managed embedder deadlines bound provider pacing and transport",
+        "managed embedder rejects malformed provider vectors",
+        "api http retryable embedding failures provide retry guidance",
+        "api http server applies node query embedding cache policy",
+        "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
@@ -3317,6 +3325,7 @@ pub fn build(b: *std.Build) void {
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget reuses cached group status instead of opening db",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
@@ -4433,6 +4442,7 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps write unavailable errors",
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
+            "public table query handler preserves embedding failure status",
             "public table query handler maps HA read gate errors",
             "public table query handler maps unsupported exact sort",
             "public table query handler exposes stable count-only sort rejection reason",

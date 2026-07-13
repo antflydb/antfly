@@ -153,7 +153,8 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
-            _ = public_write_source.withBackendRuntime(try svc.ensureBackendRuntime());
+            const backend_runtime = try svc.ensureBackendRuntime();
+            _ = public_write_source.withBackendRuntime(backend_runtime);
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
@@ -162,7 +163,7 @@ pub const MetadataServer = struct {
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
-            api_server_cfg.backend_runtime = try svc.ensureBackendRuntime();
+            api_server_cfg.backend_runtime = backend_runtime;
             api_server_cfg.restore_execution_guard = .{
                 .ptr = svc,
                 .is_current = metadataRestoreLeadershipIsCurrent,
