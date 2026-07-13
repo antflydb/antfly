@@ -214,6 +214,11 @@ without changing the existing backup, and a failed pre-publication attempt can
 be retried safely. This prevents restores from observing an old manifest with
 partially overwritten payloads. Local manifest publication holds a fail-closed
 advisory lock and uses sync-plus-rename; object stores use conditional puts.
+Manifest publication and reads are limited to 16 MiB for both filesystem and
+object-store locations, so Antfly cannot commit a backup that it will later
+reject as oversized. Remote reads request at most the limit plus one sentinel
+byte, preventing an oversized or malformed control-plane object from causing an
+unbounded client allocation before validation.
 
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the

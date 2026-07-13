@@ -49,6 +49,8 @@ pub const cluster_format_version: u32 = 1;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
+pub const max_backup_manifest_bytes: usize = 16 * 1024 * 1024;
+pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
 
 pub const BackupFormat = enum {
     native,
@@ -553,11 +555,18 @@ const RemoteBackupStore = struct {
         defer result.deinit(alloc);
     }
 
-    fn readBytesAlloc(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
+    fn readBytesAllocLimited(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, max_bytes: usize) ![]u8 {
+        if (max_bytes == std.math.maxInt(usize)) return error.InvalidBackupManifestLimit;
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
-        var result = try self.client.getObject(self.bucket, key, .{});
+        var result = try self.client.getObject(self.bucket, key, .{
+            // Fetch one sentinel byte beyond the accepted limit. The range is
+            // authoritative for buffering even when a provider client also
+            // performs its own metadata request.
+            .range = .{ .offset = 0, .length = @intCast(max_bytes + 1) },
+        });
         defer result.deinit(alloc);
+        if (result.body.len > max_bytes) return error.BackupManifestTooLarge;
         return try alloc.dupe(u8, result.body);
     }
 
@@ -1038,6 +1047,10 @@ pub fn validateBackupId(value: []const u8) !void {
     if (std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return error.InvalidBackupId;
 }
 
+fn ensureManifestSize(encoded: []const u8, max_bytes: usize) !void {
+    if (encoded.len > max_bytes) return error.BackupManifestTooLarge;
+}
+
 pub fn validateArtifactRelativePath(path: []const u8) !void {
     if (path.len == 0 or path.len > 4096 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) {
         return error.InvalidBackupArtifactPath;
@@ -1145,6 +1158,7 @@ pub fn writeManifest(
 
     const encoded = try stringifyJsonAlloc(alloc, manifest.*);
     defer alloc.free(encoded);
+    try ensureManifestSize(encoded, max_backup_manifest_bytes);
     try writeFileAbsoluteIfAbsent(alloc, path, encoded);
 }
 
@@ -1155,7 +1169,7 @@ pub fn readManifest(
 ) !TableBackupManifest {
     const path = try metadataPath(alloc, backup_root, backup_id);
     defer alloc.free(path);
-    const body = try readFileAbsoluteAlloc(alloc, path, 16 * 1024 * 1024);
+    const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
     defer alloc.free(body);
 
     return parseTableBackupManifestOrPortable(alloc, body, backup_id);
@@ -1171,6 +1185,7 @@ pub fn writeManifestToLocation(
         .remote => |*store| {
             const encoded = try stringifyJsonAlloc(alloc, manifest.*);
             defer alloc.free(encoded);
+            try ensureManifestSize(encoded, max_backup_manifest_bytes);
             const suffix = try metadataPath(alloc, "", manifest.backup_id);
             defer alloc.free(suffix);
             try store.writeBytesIfAbsent(alloc, trimLeftSlash(suffix), encoded, "application/json");
@@ -1188,7 +1203,7 @@ pub fn readManifestFromLocation(
         .remote => |*store| {
             const suffix = try metadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
-            const body = try store.readBytesAlloc(alloc, trimLeftSlash(suffix));
+            const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
             defer alloc.free(body);
             return parseTableBackupManifestOrPortable(alloc, body, backup_id);
         },
@@ -1556,6 +1571,7 @@ pub fn writeClusterManifest(
 
     const encoded = try stringifyJsonAlloc(alloc, manifest.*);
     defer alloc.free(encoded);
+    try ensureManifestSize(encoded, max_backup_manifest_bytes);
     try writeFileAbsoluteIfAbsent(alloc, path, encoded);
 }
 
@@ -1566,7 +1582,7 @@ pub fn readClusterManifest(
 ) !ClusterBackupManifest {
     const path = try clusterMetadataPath(alloc, backup_root, backup_id);
     defer alloc.free(path);
-    const body = try readFileAbsoluteAlloc(alloc, path, 16 * 1024 * 1024);
+    const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
     defer alloc.free(body);
 
     var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
@@ -1586,6 +1602,7 @@ pub fn writeClusterManifestToLocation(
         .remote => |*store| {
             const encoded = try stringifyJsonAlloc(alloc, manifest.*);
             defer alloc.free(encoded);
+            try ensureManifestSize(encoded, max_backup_manifest_bytes);
             const suffix = try clusterMetadataPath(alloc, "", manifest.backup_id);
             defer alloc.free(suffix);
             try store.writeBytesIfAbsent(alloc, trimLeftSlash(suffix), encoded, "application/json");
@@ -1603,7 +1620,7 @@ pub fn readClusterManifestFromLocation(
         .remote => |*store| {
             const suffix = try clusterMetadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
-            const body = try store.readBytesAlloc(alloc, trimLeftSlash(suffix));
+            const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
             defer alloc.free(body);
             var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
             defer parsed.deinit();
@@ -2579,6 +2596,31 @@ test "backup manifest round trips through remote objectstore location" {
     try std.testing.expectEqualStrings("docs", loaded.table_name);
     try std.testing.expectEqual(@as(usize, 1), loaded.shards.len);
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
+}
+
+test "remote backup metadata reads are size bounded" {
+    const alloc = std.testing.allocator;
+    try ensureManifestSize("0123456789abcdef", 16);
+    try std.testing.expectError(error.BackupManifestTooLarge, ensureManifestSize("0123456789abcdefX", 16));
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    var put = try client.putObject("bucket", "backups/manifest.json", "0123456789abcdefX", .{});
+    put.deinit(alloc);
+
+    var store = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups");
+    defer store.deinit();
+    try std.testing.expectError(
+        error.BackupManifestTooLarge,
+        store.readBytesAllocLimited(alloc, "manifest.json", 16),
+    );
+
+    var replacement = try client.putObject("bucket", "backups/manifest.json", "0123456789abcdef", .{});
+    replacement.deinit(alloc);
+    const body = try store.readBytesAllocLimited(alloc, "manifest.json", 16);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("0123456789abcdef", body);
 }
 
 test "remote portable file transfer uses objectstore file paths" {

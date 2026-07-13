@@ -31,6 +31,7 @@ pub const ClusterApi = struct {
     pub const ExecuteBackupError = error{
         NotLeader,
         BackupAlreadyExists,
+        BackupManifestTooLarge,
         MethodNotAllowed,
         InternalFailure,
     };
@@ -38,6 +39,7 @@ pub const ClusterApi = struct {
     pub const ExecuteRestoreError = error{
         NotLeader,
         InvalidRequest,
+        BackupManifestTooLarge,
         TableAlreadyExists,
         MethodNotAllowed,
         Cancelled,
@@ -170,6 +172,7 @@ pub fn handleClusterBackup(
     const response_body = api.executeClusterBackup(alloc, req, &location) catch |err| switch (err) {
         error.NotLeader => return err,
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
+        error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
     };
@@ -213,6 +216,7 @@ pub fn handleClusterRestore(
     const response_body = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
+        error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Cancelled => return .{ .status = 409, .body = try alloc.dupe(u8, "restore cancelled") },

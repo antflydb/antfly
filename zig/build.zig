@@ -4062,6 +4062,7 @@ pub fn build(b: *std.Build) void {
             "backup API requests reject unknown operational fields",
             "backup manifest round trips through metadata path",
             "backup manifest round trips through remote objectstore location",
+            "remote backup metadata reads are size bounded",
             "cluster backup list uses top-level remote manifests without recursing into payloads",
             "remote portable file transfer uses objectstore file paths",
             "remote backup directory download paginates and enforces segment prefix",

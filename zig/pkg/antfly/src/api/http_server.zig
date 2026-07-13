@@ -757,7 +757,10 @@ fn loadRestoreMetadataSpec(
 ) !RestoreMetadataSpec {
     var location = try backups_api.openBackupLocationWithSecrets(alloc, location_uri, secret_store);
     defer location.deinit(alloc);
-    var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
+    var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch |err| switch (err) {
+        error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+        else => return error.InvalidBackupRequest,
+    };
     errdefer manifest.deinit(alloc);
     if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
     const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest) catch |err| switch (err) {
@@ -5668,7 +5671,10 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreOwnedTable(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
-        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
+        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch |err| switch (err) {
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => return error.InvalidBackupRequest,
+        };
         defer manifest.deinit(self.alloc);
 
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
@@ -5773,7 +5779,10 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreLocalTableDataFromManifest(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
-        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
+        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch |err| switch (err) {
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => return error.InvalidBackupRequest,
+        };
         defer manifest.deinit(self.alloc);
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
 
@@ -6810,6 +6819,7 @@ pub const ApiHttpServer = struct {
         };
         self.backupOwnedTable(table_name, location, location_uri, backup_id, format) catch |err| switch (err) {
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
@@ -6863,6 +6873,7 @@ pub const ApiHttpServer = struct {
             error.TableAlreadyExists => error.TableAlreadyExists,
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
+            error.BackupManifestTooLarge => error.BackupManifestTooLarge,
             error.InvalidBackupRequest => error.InvalidBackupRequest,
             else => error.InternalFailure,
         };
@@ -7290,6 +7301,7 @@ pub const ApiHttpServer = struct {
                     error.UnsupportedOperation => "method not allowed",
                     error.UnsupportedMultiRangeTable => "backup does not support multi-range tables",
                     error.UnsupportedBackupMigrationState => "backup does not support active schema migration",
+                    error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                     else => "backup failed",
                 };
                 alloc.free(table_backup_id);
@@ -7314,6 +7326,7 @@ pub const ApiHttpServer = struct {
         defer manifest.deinit(alloc);
         backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch |err| switch (err) {
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             else => return error.InternalFailure,
         };
 
@@ -7345,7 +7358,10 @@ pub const ApiHttpServer = struct {
 
         if (self.restoreCancelled(cancellation)) return error.Cancelled;
 
-        var manifest = backups_api.readClusterManifestFromLocation(alloc, location, req.backup_id) catch return error.InvalidRequest;
+        var manifest = backups_api.readClusterManifestFromLocation(alloc, location, req.backup_id) catch |err| switch (err) {
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => return error.InvalidRequest,
+        };
         defer manifest.deinit(alloc);
 
         preflightClusterRestoreExtensions(self, &manifest) catch |err| switch (err) {
@@ -7416,6 +7432,7 @@ pub const ApiHttpServer = struct {
                             error.TableAlreadyExists => "table already exists",
                             error.TableNotFound => "not found",
                             error.InvalidBackupRequest => "invalid restore request",
+                            error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                             else => "restore failed",
                         };
                         continue;
@@ -7442,6 +7459,7 @@ pub const ApiHttpServer = struct {
                     error.TableAlreadyExists => "table already exists",
                     error.TableNotFound => "not found",
                     error.InvalidBackupRequest => "invalid restore request",
+                    error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                     else => "restore failed",
                 };
                 continue;

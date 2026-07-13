@@ -90,18 +90,32 @@ pub const MemoryClient = struct {
         const etag = try sha256HexAlloc(alloc, body);
         errdefer alloc.free(etag);
 
-        if (existing) |value| {
-            value.deinit(self.alloc);
-            _ = object_map.remove(key);
-        }
+        const owned_body = try self.alloc.dupe(u8, body);
+        errdefer self.alloc.free(owned_body);
+        const owned_etag = try self.alloc.dupe(u8, etag);
+        errdefer self.alloc.free(owned_etag);
+        const owned_content_type = if (opts.content_type) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_content_type) |value| self.alloc.free(value);
+        const replacement = StoredObject{
+            .body = owned_body,
+            .etag = owned_etag,
+            .content_type = owned_content_type,
+        };
 
+        // Fully construct before swapping the published value. Allocation
+        // failure therefore leaves the old object intact and cannot leak a
+        // partially built replacement. Reuse the existing owned map key and
+        // capacity on overwrite.
+        if (existing) |value| {
+            var previous = value.*;
+            value.* = replacement;
+            previous.deinit(self.alloc);
+            return .{ .etag = etag };
+        }
         const owned_key = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(owned_key);
-        try object_map.put(self.alloc, owned_key, .{
-            .body = try self.alloc.dupe(u8, body),
-            .etag = try self.alloc.dupe(u8, etag),
-            .content_type = if (opts.content_type) |value| try self.alloc.dupe(u8, value) else null,
-        });
+        try object_map.ensureUnusedCapacity(self.alloc, 1);
+        object_map.putAssumeCapacity(owned_key, replacement);
 
         return .{ .etag = etag };
     }
