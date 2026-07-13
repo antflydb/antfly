@@ -4199,8 +4199,11 @@ pub const ApiHttpServer = struct {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
             defer query_arena_impl.deinit();
-            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
-            return try self.handlePublicClusterBackupList(params.location, params.connection);
+            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "invalid backup list parameters");
+            return try self.handlePublicClusterBackupList(params.location, params.connection, .{
+                .limit = params.limit,
+                .cursor = params.cursor,
+            });
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.tables)) {
             var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
@@ -7242,14 +7245,16 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         location_uri: []const u8,
         location: *backups_api.BackupLocation,
+        options: backups_api.BackupListOptions,
     ) cluster_api_http.ClusterApi.ExecuteListError![]u8 {
         _ = ptr;
-        const infos = backups_api.listClusterBackupsFromOpenedLocation(alloc, location, location_uri) catch |err| {
+        var page = backups_api.listClusterBackupsFromOpenedLocation(alloc, location, location_uri, options) catch |err| {
             if (backups_api.backupLocationErrorMessage(err) != null) return error.UnsupportedBackupLocation;
+            if (err == error.InvalidBackupListLimit or err == error.InvalidBackupId) return error.InvalidRequest;
             return error.InternalFailure;
         };
-        defer backups_api.freeBackupInfos(alloc, infos);
-        return backups_api.encodeBackupListResponse(alloc, infos) catch return error.InternalFailure;
+        defer page.deinit(alloc);
+        return backups_api.encodeBackupListResponse(alloc, &page) catch return error.InternalFailure;
     }
 
     fn executePublicClusterBackup(
@@ -8408,8 +8413,8 @@ pub const ApiHttpServer = struct {
         return try self.restoreJobResponse(202, encoded);
     }
 
-    pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8, connection: ?[]const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, connection, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
+    pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8, connection: ?[]const u8, options: backups_api.BackupListOptions) !http_common.HttpResponse {
+        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, connection, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo(), options);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => blk: {
@@ -10877,10 +10882,24 @@ fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !u
     return .{ .role = role };
 }
 
-fn parseListBackupsParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListBackupsParams {
+const ListBackupsParams = struct {
+    location: []const u8,
+    connection: ?[]const u8,
+    limit: usize,
+    cursor: ?[]const u8,
+};
+
+fn parseListBackupsParams(alloc: std.mem.Allocator, query: []const u8) !ListBackupsParams {
+    const raw_limit = try parseSimpleQueryParamDecodedAlloc(alloc, query, "limit");
+    const limit = if (raw_limit) |value| try std.fmt.parseInt(usize, value, 10) else backups_api.default_backup_list_limit;
+    if (limit == 0 or limit > backups_api.max_backup_list_limit) return error.InvalidBackupListLimit;
+    const cursor = try parseSimpleQueryParamDecodedAlloc(alloc, query, "cursor");
+    if (cursor) |value| try backups_api.validateBackupId(value);
     return .{
         .location = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "location")) orelse return error.MissingLocation,
         .connection = try parseSimpleQueryParamDecodedAlloc(alloc, query, "connection"),
+        .limit = limit,
+        .cursor = cursor,
     };
 }
 
@@ -11886,9 +11905,13 @@ test "generated client query params decode for metadata parsers" {
     try std.testing.expectEqualStrings("tenant/docs v1", tables.prefix.?);
     try std.testing.expectEqualStrings("docs*", tables.pattern.?);
 
-    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one&connection=archive-reader");
+    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one&connection=archive-reader&limit=25&cursor=snap-024");
     try std.testing.expectEqualStrings("s3://bucket/path one", backups.location);
     try std.testing.expectEqualStrings("archive-reader", backups.connection.?);
+    try std.testing.expectEqual(@as(usize, 25), backups.limit);
+    try std.testing.expectEqualStrings("snap-024", backups.cursor.?);
+    try std.testing.expectError(error.InvalidBackupListLimit, parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket&limit=0"));
+    try std.testing.expectError(error.InvalidBackupId, parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket&cursor=.."));
 
     const permission = try parseRemovePermissionFromUserParams(arena, "resource=docs%2Ftenant&resourceType=table");
     try std.testing.expectEqualStrings("docs/tenant", permission.resource);

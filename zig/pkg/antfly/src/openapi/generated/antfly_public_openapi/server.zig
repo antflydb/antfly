@@ -215,6 +215,10 @@ pub const ListBackupsParams = struct {
     location: []const u8,
     /// Named `external_io` connection. Required for remote locations.
     connection: ?[]const u8 = null,
+    /// Maximum backups returned in one page.
+    limit: ?[]const u8 = null,
+    /// Continuation cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for multiBatchWrite.

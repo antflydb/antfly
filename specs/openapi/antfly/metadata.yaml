@@ -4838,7 +4838,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BackupInfo"
-          description: List of available backups
+          maxItems: 1000
+          description: One page of available backups in stable manifest-key order.
+        next_cursor:
+          type: string
+          description: Opaque continuation cursor. Omitted when no additional backups remain.
     QueryBuilderRequest:
       type: object
       required:
@@ -8204,9 +8208,10 @@ paths:
       tags:
         - cluster_management
       description: |
-        Lists all cluster-level backups available at the specified location.
-        Returns metadata about each backup including the tables included,
-        timestamp, and Antfly version.
+        Lists one bounded page of cluster-level backups in stable manifest-key
+        order at the specified location. Returns metadata about each backup
+        including the tables included, timestamp, and Antfly version. Pass the
+        returned `next_cursor` unchanged to retrieve the next page.
       operationId: listBackups
       parameters:
         - name: location
@@ -8225,6 +8230,26 @@ paths:
           description: Named `external_io` connection. Required for remote locations.
           schema:
             type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum backups returned in one page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+            x-go-type-skip-optional-pointer: false
+        - name: cursor
+          in: query
+          required: false
+          description: Continuation cursor returned by the preceding page.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+            x-go-type-skip-optional-pointer: false
       responses:
         "200":
           description: List of available backups

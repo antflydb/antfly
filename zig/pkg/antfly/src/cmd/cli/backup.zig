@@ -24,6 +24,8 @@ const portable_backup = antfly.portable_backup;
 const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
 const restore_poll_interval_ms: u64 = 1000;
 const max_restore_tables: usize = 256;
+const default_backup_list_limit: usize = 100;
+const max_backup_list_limit: usize = 1000;
 
 const BackupArgs = struct {
     help: bool = false,
@@ -37,6 +39,9 @@ const BackupArgs = struct {
     connection: ?[]const u8 = null,
     location_explicit: bool = false,
     list_backups: bool = false,
+    list_limit: usize = default_backup_list_limit,
+    list_limit_explicit: bool = false,
+    list_cursor: ?[]const u8 = null,
 };
 
 const RestoreArgs = struct {
@@ -78,6 +83,9 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     const connection = opts.connection orelse cli.fatal("--connection is required", .{});
     validateBackupArgs(opts) catch |err| switch (err) {
         error.BackupLocationRequired => cli.fatal("--location is required", .{}),
+        error.InvalidBackupListLimit => cli.fatal("--limit must be between 1 and {d}", .{max_backup_list_limit}),
+        error.InvalidBackupCursor => cli.fatal("--cursor is invalid", .{}),
+        error.BackupPaginationRequiresList => cli.fatal("--limit and --cursor require --list", .{}),
         else => cli.fatal("invalid backup arguments", .{}),
     };
 
@@ -89,7 +97,14 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
                 cli.fatal("only JSON output is supported for backup --list", .{});
             }
         }
-        var resp = try client.listBackups(.{ .location = opts.location, .connection = connection });
+        var limit_buf: [20]u8 = undefined;
+        const limit = try std.fmt.bufPrint(&limit_buf, "{d}", .{opts.list_limit});
+        var resp = try client.listBackups(.{
+            .location = opts.location,
+            .connection = connection,
+            .limit = limit,
+            .cursor = opts.list_cursor,
+        });
         defer resp.deinit();
         const result = if (resp.data) |*data| data.value else cli.fatal("invalid backup-list response", .{});
         try cli.writeJson(allocator, io, result);
@@ -320,6 +335,11 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
             out.output = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--list")) {
             out.list_backups = true;
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            out.list_limit = try std.fmt.parseUnsigned(usize, try nextRequired(args), 10);
+            out.list_limit_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--cursor")) {
+            out.list_cursor = try nextRequired(args);
         } else {
             return error.UnknownArgument;
         }
@@ -369,9 +389,17 @@ fn validateBackupArgs(opts: BackupArgs) !void {
     if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
     if (opts.list_backups and (opts.table_name != null or opts.tables_str != null or opts.backup_id != null or opts.format != null))
         return error.ConflictingBackupListArguments;
+    if (!opts.list_backups and (opts.list_limit_explicit or opts.list_cursor != null)) return error.BackupPaginationRequiresList;
+    if (opts.list_limit == 0 or opts.list_limit > max_backup_list_limit) return error.InvalidBackupListLimit;
+    if (opts.list_cursor) |cursor| try validateBackupCursor(cursor);
     if (opts.format) |format| {
         if (!std.mem.eql(u8, format, "native") and !std.mem.eql(u8, format, "portable")) return error.UnsupportedBackupFormat;
     }
+}
+
+fn validateBackupCursor(cursor: []const u8) !void {
+    if (cursor.len == 0 or cursor.len > 128 or std.mem.eql(u8, cursor, ".") or std.mem.eql(u8, cursor, "..")) return error.InvalidBackupCursor;
+    for (cursor) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return error.InvalidBackupCursor;
 }
 
 fn validateRestoreArgs(opts: RestoreArgs) !void {
@@ -420,11 +448,12 @@ fn printBackupUsage() void {
         \\usage:
         \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
         \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
-        \\  antfly backup --list --connection <id> --location <uri> [--output json] [--url <url>]
+        \\  antfly backup --list --connection <id> --location <uri> [--limit <1-1000>] [--cursor <cursor>] [--output json] [--url <url>]
         \\
         \\notes:
         \\  Network backups are written by the server through the named connection.
         \\  Table and cluster backups default to the portable format.
+        \\  Backup listing returns one page and includes next_cursor when more results remain.
         \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local AFB artifact.
         \\
     , .{});
@@ -503,6 +532,19 @@ test "backup rejects conflicting table selectors" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseBackupArgs(&iter);
     try std.testing.expectError(error.ConflictingTableSelection, validateBackupArgs(opts));
+}
+
+test "backup list CLI exposes bounded cursor pagination" {
+    var argv = [_][*:0]const u8{ "--list", "--location", "s3://archive/backups", "--limit", "250", "--cursor", "snap-024" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseBackupArgs(&iter);
+    try validateBackupArgs(opts);
+    try std.testing.expectEqual(@as(usize, 250), opts.list_limit);
+    try std.testing.expectEqualStrings("snap-024", opts.list_cursor.?);
+
+    var invalid_argv = [_][*:0]const u8{ "--location", "s3://archive/backups", "--limit", "10" };
+    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid_argv[0..] });
+    try std.testing.expectError(error.BackupPaginationRequiresList, validateBackupArgs(try parseBackupArgs(&invalid_iter)));
 }
 
 test "restore cli parser accepts aflite input shape" {

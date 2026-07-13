@@ -207,6 +207,13 @@ the requested page size even when the archive contains many more objects. Page
 sizes are capped at 10,000 keys to keep caller-controlled memory and sorting
 work predictable.
 
+Backup catalog listing is cursor-paginated in stable manifest-key order. The
+API and CLI default to 100 backups per page and reject limits above 1,000.
+Remote locations resume with provider-native object cursors; filesystem
+locations scan the directory once while retaining only the smallest `limit +
+1` eligible manifest names in a bounded heap. Responses include `next_cursor`
+only when another page exists.
+
 Backup IDs are immutable publication keys. Payloads and per-table manifests use
 opaque generation-scoped paths; the public table or cluster manifest is created
 conditionally as the final commit point. Reusing a published ID returns `409`
@@ -262,7 +269,9 @@ does not probe the bucket or read an existing manifest; it writes private
 generation objects and uses a conditional manifest create as the conflict
 check. `HeadBucket` is required only when the connection explicitly enables
 bucket provisioning. Listing and restore use a separate `restore.read`
-connection and its read credentials.
+connection and its read credentials. Read paths issue only the required
+list/get operations and do not add a bucket-existence probe, preserving
+least-privilege object-reader configurations.
 
 When a backend cannot stream a snapshot directly to object storage, Antfly
 stages the generation beneath the configured local storage root (or the Lite

@@ -30,6 +30,7 @@ const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 const common_secrets = @import("../common/secrets.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
+const backups_api = @import("backups.zig");
 const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
@@ -1193,7 +1194,16 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
+        const limit = if (params.limit) |value|
+            std.fmt.parseInt(usize, value, 10) catch return try textResponse(ctx, 400, "invalid backup list limit")
+        else
+            backups_api.default_backup_list_limit;
+        if (limit == 0 or limit > backups_api.max_backup_list_limit) return try textResponse(ctx, 400, "invalid backup list limit");
+        if (params.cursor) |cursor| backups_api.validateBackupId(cursor) catch return try textResponse(ctx, 400, "invalid backup list cursor");
+        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo(), .{
+            .limit = limit,
+            .cursor = params.cursor,
+        });
         return respondOwnedApiResponse(ctx, &resp);
     }
 

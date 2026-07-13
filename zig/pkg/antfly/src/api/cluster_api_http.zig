@@ -52,6 +52,7 @@ pub const ClusterApi = struct {
             alloc: std.mem.Allocator,
             location_uri: []const u8,
             location: *backups_api.BackupLocation,
+            options: backups_api.BackupListOptions,
         ) ExecuteListError![]u8,
         execute_cluster_backup: *const fn (
             ptr: *anyopaque,
@@ -73,8 +74,9 @@ pub const ClusterApi = struct {
         alloc: std.mem.Allocator,
         location_uri: []const u8,
         location: *backups_api.BackupLocation,
+        options: backups_api.BackupListOptions,
     ) ExecuteListError![]u8 {
-        return try self.vtable.execute_cluster_backup_list(self.ptr, alloc, location_uri, location);
+        return try self.vtable.execute_cluster_backup_list(self.ptr, alloc, location_uri, location, options);
     }
 
     pub fn executeClusterBackup(
@@ -115,6 +117,7 @@ pub fn handleClusterBackupList(
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
     io: ?std.Io,
+    options: backups_api.BackupListOptions,
 ) !OwnedResponse {
     if (connection == null) {
         return .{ .status = 400, .body = try alloc.dupe(u8, "backup listing requires a named external_io connection") };
@@ -130,7 +133,7 @@ pub fn handleClusterBackupList(
         return err;
     };
     defer location.deinit(alloc);
-    const body = api.executeClusterBackupList(alloc, location_uri, &location) catch |err| switch (err) {
+    const body = api.executeClusterBackupList(alloc, location_uri, &location, options) catch |err| switch (err) {
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
         error.UnsupportedBackupLocation => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup location") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -226,7 +229,7 @@ pub fn handleClusterRestore(
 }
 
 test "cluster backup APIs require named connections" {
-    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null, null);
+    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null, null, .{});
     defer list.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), list.status);
 

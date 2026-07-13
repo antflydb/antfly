@@ -29,6 +29,10 @@ pub const ListBackupsParams = struct {
     location: []const u8,
     /// Named `external_io` connection. Required for remote locations.
     connection: ?[]const u8 = null,
+    /// Maximum backups returned in one page.
+    limit: ?[]const u8 = null,
+    /// Continuation cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for multiBatchWrite.
@@ -758,6 +762,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             const query_params = ListBackupsParams{
                 .location = ctx.query("location") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
                 .connection = ctx.query("connection"),
+                .limit = ctx.query("limit"),
+                .cursor = ctx.query("cursor"),
             };
             return impl.listBackups(ctx, query_params);
         }

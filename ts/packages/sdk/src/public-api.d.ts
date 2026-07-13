@@ -499,9 +499,10 @@ export interface paths {
         };
         /**
          * List available backups
-         * @description Lists all cluster-level backups available at the specified location.
-         *     Returns metadata about each backup including the tables included,
-         *     timestamp, and Antfly version.
+         * @description Lists one bounded page of cluster-level backups in stable manifest-key
+         *     order at the specified location. Returns metadata about each backup
+         *     including the tables included, timestamp, and Antfly version. Pass the
+         *     returned `next_cursor` unchanged to retrieve the next page.
          */
         get: operations["listBackups"];
         put?: never;
@@ -4899,8 +4900,10 @@ export interface components {
             format?: "native" | "portable";
         };
         BackupListResponse: {
-            /** @description List of available backups */
+            /** @description One page of available backups in stable manifest-key order. */
             backups: components["schemas"]["BackupInfo"][];
+            /** @description Opaque continuation cursor. Omitted when no additional backups remain. */
+            next_cursor?: string;
         };
         QueryBuilderRequest: {
             /** @description Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence. */
@@ -13091,6 +13094,10 @@ export interface operations {
                 location: string;
                 /** @description Named `external_io` connection. Required for remote locations. */
                 connection?: string;
+                /** @description Maximum backups returned in one page. */
+                limit?: number;
+                /** @description Continuation cursor returned by the preceding page. */
+                cursor?: string;
             };
             header?: never;
             path?: never;

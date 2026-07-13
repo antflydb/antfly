@@ -521,8 +521,10 @@ pub const BackupInfo = struct {
 };
 
 pub const BackupListResponse = struct {
-    /// List of available backups
+    /// One page of available backups in stable manifest-key order.
     backups: []const BackupInfo,
+    /// Opaque continuation cursor. Omitted when no additional backups remain.
+    next_cursor: ?[]const u8 = null,
 };
 
 pub const BackupRequest = struct {

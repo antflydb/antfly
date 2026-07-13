@@ -49,6 +49,10 @@ pub const ListBackupsParams = struct {
     location: []const u8,
     /// Named `external_io` connection. Required for remote locations.
     connection: ?[]const u8 = null,
+    /// Maximum backups returned in one page.
+    limit: ?[]const u8 = null,
+    /// Continuation cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
 };
 
 pub const ListConnectionsParams = struct {
@@ -636,6 +640,22 @@ pub const Client = struct {
             defer self.allocator.free(encoded_query_value);
             try query_buf.appendSlice(self.allocator, &.{sep});
             try query_buf.appendSlice(self.allocator, "connection=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
             try query_buf.appendSlice(self.allocator, encoded_query_value);
             sep = '&';
         }

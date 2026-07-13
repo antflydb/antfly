@@ -51,6 +51,24 @@ pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
 pub const max_backup_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
+pub const default_backup_list_limit: usize = 100;
+pub const max_backup_list_limit: usize = 1000;
+
+pub const BackupListOptions = struct {
+    limit: usize = default_backup_list_limit,
+    cursor: ?[]const u8 = null,
+};
+
+pub const BackupListPage = struct {
+    backups: []BackupInfo,
+    next_cursor: ?[]u8 = null,
+
+    pub fn deinit(self: *BackupListPage, alloc: std.mem.Allocator) void {
+        freeBackupInfos(alloc, self.backups);
+        if (self.next_cursor) |cursor| alloc.free(cursor);
+        self.* = undefined;
+    }
+};
 
 pub const BackupFormat = enum {
     native,
@@ -582,14 +600,9 @@ const RemoteBackupStore = struct {
         suffix: []const u8,
         recursive: bool,
         max_keys: u32,
+        start_after: ?[]const u8,
         continuation_token: ?[]const u8,
     ) !object_storage.ListResult {
-        if (!(try self.client.bucketExists(self.bucket))) {
-            return .{
-                .entries = try alloc.alloc(object_storage.ListEntry, 0),
-                .common_prefixes = try alloc.alloc([]u8, 0),
-            };
-        }
         var key_prefix = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key_prefix);
         if (!recursive and key_prefix.len > 0 and !std.mem.endsWith(u8, key_prefix, "/")) {
@@ -601,6 +614,7 @@ const RemoteBackupStore = struct {
             .prefix = key_prefix,
             .recursive = recursive,
             .max_keys = max_keys,
+            .start_after = start_after,
             .continuation_token = continuation_token,
         });
     }
@@ -608,9 +622,10 @@ const RemoteBackupStore = struct {
     fn listTopLevelObjectsPage(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        start_after: ?[]const u8,
         continuation_token: ?[]const u8,
     ) !object_storage.ListResult {
-        return try self.listObjectsPage(alloc, "", false, 1000, continuation_token);
+        return try self.listObjectsPage(alloc, "", false, 1000, start_after, continuation_token);
     }
 
     fn uploadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_path: []const u8, dest_suffix: []const u8) !void {
@@ -649,7 +664,6 @@ const RemoteBackupStore = struct {
 
     fn downloadDirectoryRecursiveWithPageSize(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8, page_size: u32) !void {
         if (page_size == 0) return error.InvalidPageSize;
-        if (!(try self.client.bucketExists(self.bucket))) return error.FileNotFound;
         const base_key = try self.keyAlloc(alloc, src_suffix);
         defer alloc.free(base_key);
         const key_prefix = if (base_key.len == 0)
@@ -1669,79 +1683,161 @@ pub fn encodeClusterRestoreResponse(
     });
 }
 
-pub fn encodeBackupListResponse(alloc: std.mem.Allocator, infos: []const BackupInfo) ![]u8 {
-    return try stringifyJsonAlloc(alloc, .{ .backups = infos });
+pub fn encodeBackupListResponse(alloc: std.mem.Allocator, page: *const BackupListPage) ![]u8 {
+    if (page.next_cursor) |cursor| return try stringifyJsonAlloc(alloc, .{
+        .backups = page.backups,
+        .next_cursor = cursor,
+    });
+    return try stringifyJsonAlloc(alloc, .{ .backups = page.backups });
 }
 
-pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, location: []const u8) ![]BackupInfo {
+fn validateBackupListOptions(options: BackupListOptions) !void {
+    if (options.limit == 0 or options.limit > max_backup_list_limit) return error.InvalidBackupListLimit;
+    if (options.cursor) |cursor| try validateBackupId(cursor);
+}
+
+fn maxHeapSiftUp(ids: [][]u8, start_index: usize) void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (std.mem.order(u8, ids[parent], ids[index]) != .lt) break;
+        std.mem.swap([]u8, &ids[parent], &ids[index]);
+        index = parent;
+    }
+}
+
+fn maxHeapSiftDown(ids: [][]u8, start_index: usize) void {
+    var index = start_index;
+    while (true) {
+        const left = index * 2 + 1;
+        if (left >= ids.len) return;
+        const right = left + 1;
+        const greatest = if (right < ids.len and std.mem.order(u8, ids[left], ids[right]) == .lt) right else left;
+        if (std.mem.order(u8, ids[index], ids[greatest]) != .lt) return;
+        std.mem.swap([]u8, &ids[index], &ids[greatest]);
+        index = greatest;
+    }
+}
+
+fn retainSmallestBackupId(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged([]u8), capacity: usize, backup_id: []const u8) !void {
+    if (ids.items.len == capacity and std.mem.order(u8, backup_id, ids.items[0]) != .lt) return;
+    const owned = try alloc.dupe(u8, backup_id);
+    errdefer alloc.free(owned);
+    if (ids.items.len < capacity) {
+        try ids.append(alloc, owned);
+        maxHeapSiftUp(ids.items, ids.items.len - 1);
+        return;
+    }
+    alloc.free(ids.items[0]);
+    ids.items[0] = owned;
+    maxHeapSiftDown(ids.items, 0);
+}
+
+fn backupIdLessThan(_: void, lhs: []u8, rhs: []u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
+}
+
+fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBackupManifest, location: []const u8) !BackupInfo {
+    const tables = try alloc.alloc([]const u8, manifest.tables.len);
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (tables[0..initialized_tables]) |value| alloc.free(@constCast(value));
+        alloc.free(tables);
+    }
+    for (manifest.tables, 0..) |table, i| {
+        tables[i] = try alloc.dupe(u8, table.name);
+        initialized_tables += 1;
+    }
+    const backup_id = try alloc.dupe(u8, manifest.backup_id);
+    errdefer alloc.free(backup_id);
+    const timestamp = try alloc.dupe(u8, manifest.timestamp);
+    errdefer alloc.free(timestamp);
+    const owned_location = try alloc.dupe(u8, location);
+    errdefer alloc.free(owned_location);
+    const version = try alloc.dupe(u8, manifest.antfly_version);
+    return .{
+        .backup_id = backup_id,
+        .timestamp = timestamp,
+        .tables = tables,
+        .location = owned_location,
+        .antfly_version = version,
+    };
+}
+
+pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, location: []const u8, options: BackupListOptions) !BackupListPage {
+    try validateBackupListOptions(options);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
     var dir = std.Io.Dir.cwd().openDir(io, backup_root, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return try alloc.alloc(BackupInfo, 0),
+        error.FileNotFound => return .{ .backups = try alloc.alloc(BackupInfo, 0) },
         else => return err,
     };
     defer dir.close(io);
 
     var it = dir.iterate();
+    var backup_ids = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (backup_ids.items) |backup_id| alloc.free(backup_id);
+        backup_ids.deinit(alloc);
+    }
+    const cursor_key = if (options.cursor) |cursor| try clusterMetadataPath(alloc, "", cursor) else null;
+    defer if (cursor_key) |value| alloc.free(value);
+    const cursor_name = if (cursor_key) |value| std.fs.path.basename(value) else null;
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, "-cluster-metadata.json")) continue;
+        const backup_id = entry.name[0 .. entry.name.len - "-cluster-metadata.json".len];
+        validateBackupId(backup_id) catch continue;
+        if (cursor_name) |cursor| if (std.mem.order(u8, entry.name, cursor) != .gt) continue;
+        try retainSmallestBackupId(alloc, &backup_ids, options.limit + 1, entry.name);
+    }
+    std.mem.sort([]u8, backup_ids.items, {}, backupIdLessThan);
+    const has_more = backup_ids.items.len > options.limit;
+    if (has_more) alloc.free(backup_ids.pop().?);
+
     var infos = std.ArrayListUnmanaged(BackupInfo).empty;
     errdefer {
         for (infos.items) |info| freeBackupInfo(alloc, info);
         infos.deinit(alloc);
     }
-
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, "-cluster-metadata.json")) continue;
-        const backup_id = entry.name[0 .. entry.name.len - "-cluster-metadata.json".len];
+    try infos.ensureTotalCapacity(alloc, backup_ids.items.len);
+    for (backup_ids.items) |manifest_name| {
+        const backup_id = backupIdFromClusterMetadataKey(manifest_name);
         var manifest = try readClusterManifest(alloc, backup_root, backup_id);
         defer manifest.deinit(alloc);
-
-        const tables = try alloc.alloc([]const u8, manifest.tables.len);
-        var initialized_tables: usize = 0;
-        errdefer {
-            for (tables[0..initialized_tables]) |value| alloc.free(@constCast(value));
-            alloc.free(tables);
-        }
-        for (manifest.tables, 0..) |table, i| {
-            tables[i] = try alloc.dupe(u8, table.name);
-            initialized_tables += 1;
-        }
-
-        try infos.append(alloc, .{
-            .backup_id = try alloc.dupe(u8, manifest.backup_id),
-            .timestamp = try alloc.dupe(u8, manifest.timestamp),
-            .tables = tables,
-            .location = try alloc.dupe(u8, location),
-            .antfly_version = try alloc.dupe(u8, manifest.antfly_version),
-        });
+        infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location));
     }
-
-    return try infos.toOwnedSlice(alloc);
+    const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
+    errdefer if (next_cursor) |cursor| alloc.free(cursor);
+    return .{ .backups = try infos.toOwnedSlice(alloc), .next_cursor = next_cursor };
 }
 
 pub fn listClusterBackupsFromLocation(
     alloc: std.mem.Allocator,
     location_uri: []const u8,
-) ![]BackupInfo {
+    options: BackupListOptions,
+) !BackupListPage {
     var location = try openBackupLocation(alloc, location_uri);
     defer location.deinit(alloc);
 
     if (location == .file) {
-        return try listClusterBackups(alloc, location.file, location_uri);
+        return try listClusterBackups(alloc, location.file, location_uri, options);
     }
 
-    return try listClusterBackupsFromOpenedLocation(alloc, &location, location_uri);
+    return try listClusterBackupsFromOpenedLocation(alloc, &location, location_uri, options);
 }
 
 pub fn listClusterBackupsFromOpenedLocation(
     alloc: std.mem.Allocator,
     location: *BackupLocation,
     location_uri: []const u8,
-) ![]BackupInfo {
+    options: BackupListOptions,
+) !BackupListPage {
+    try validateBackupListOptions(options);
     switch (location.*) {
-        .file => |path| return try listClusterBackups(alloc, path, location_uri),
+        .file => |path| return try listClusterBackups(alloc, path, location_uri, options),
         .remote => {},
     }
 
@@ -1750,39 +1846,37 @@ pub fn listClusterBackupsFromOpenedLocation(
         for (infos.items) |info| freeBackupInfo(alloc, info);
         infos.deinit(alloc);
     }
+    try infos.ensureTotalCapacity(alloc, options.limit);
 
     var continuation_token: ?[]u8 = null;
     defer if (continuation_token) |token| alloc.free(token);
+    const start_after = if (options.cursor) |cursor| blk: {
+        const suffix = try clusterMetadataPath(alloc, "", cursor);
+        defer alloc.free(suffix);
+        break :blk try location.remote.keyAlloc(alloc, trimLeftSlash(suffix));
+    } else null;
+    defer if (start_after) |value| alloc.free(value);
+    var has_more = false;
     while (true) {
-        var listed = try location.remote.listTopLevelObjectsPage(alloc, continuation_token);
+        var listed = try location.remote.listTopLevelObjectsPage(alloc, if (continuation_token == null) start_after else null, continuation_token);
         defer listed.deinit(alloc);
         var next_token: ?[]u8 = null;
         defer if (next_token) |token| alloc.free(token);
 
         for (listed.entries) |entry| {
             if (!std.mem.endsWith(u8, entry.key, "-cluster-metadata.json")) continue;
-            var manifest = try readClusterManifestFromLocation(alloc, location, backupIdFromClusterMetadataKey(entry.key));
+            const backup_id = backupIdFromClusterMetadataKey(entry.key);
+            validateBackupId(backup_id) catch continue;
+            if (infos.items.len == options.limit) {
+                has_more = true;
+                break;
+            }
+            var manifest = try readClusterManifestFromLocation(alloc, location, backup_id);
             defer manifest.deinit(alloc);
-
-            const tables = try alloc.alloc([]const u8, manifest.tables.len);
-            var initialized_tables: usize = 0;
-            errdefer {
-                for (tables[0..initialized_tables]) |value| alloc.free(@constCast(value));
-                alloc.free(tables);
-            }
-            for (manifest.tables, 0..) |table, i| {
-                tables[i] = try alloc.dupe(u8, table.name);
-                initialized_tables += 1;
-            }
-
-            try infos.append(alloc, .{
-                .backup_id = try alloc.dupe(u8, manifest.backup_id),
-                .timestamp = try alloc.dupe(u8, manifest.timestamp),
-                .tables = tables,
-                .location = try alloc.dupe(u8, location_uri),
-                .antfly_version = try alloc.dupe(u8, manifest.antfly_version),
-            });
+            infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location_uri));
         }
+
+        if (has_more) break;
 
         if (listed.next_continuation_token) |token| {
             next_token = try alloc.dupe(u8, token);
@@ -1793,8 +1887,9 @@ pub fn listClusterBackupsFromOpenedLocation(
         next_token = null;
         if (continuation_token == null) break;
     }
-
-    return try infos.toOwnedSlice(alloc);
+    const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
+    errdefer if (next_cursor) |cursor| alloc.free(cursor);
+    return .{ .backups = try infos.toOwnedSlice(alloc), .next_cursor = next_cursor };
 }
 
 pub fn findClusterTable(
@@ -2718,6 +2813,11 @@ test "cluster backup list uses top-level remote manifests without recursing into
         error.BackupAlreadyExists,
         writeClusterManifestToLocation(std.testing.allocator, &location, &manifest),
     );
+    inline for (&.{ "prod-snap-2", "prod-snap-3" }) |backup_id| {
+        var extra = try createClusterManifest(std.testing.allocator, backup_id, "s3://bucket/backups/prod", &entries);
+        defer extra.deinit(std.testing.allocator);
+        try writeClusterManifestToLocation(std.testing.allocator, &location, &extra);
+    }
 
     var raw_client = memory.client();
     var nested = try raw_client.putObject(
@@ -2728,16 +2828,59 @@ test "cluster backup list uses top-level remote manifests without recursing into
     );
     defer nested.deinit(std.testing.allocator);
 
-    const listed = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod");
-    defer {
-        for (listed) |info| freeBackupInfo(std.testing.allocator, info);
-        std.testing.allocator.free(listed);
+    var first = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod", .{ .limit = 2 });
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), first.backups.len);
+    try std.testing.expectEqualStrings("prod-snap-2", first.backups[0].backup_id);
+    try std.testing.expectEqualStrings("prod-snap-3", first.backups[1].backup_id);
+    try std.testing.expectEqual(@as(usize, 1), first.backups[0].tables.len);
+    try std.testing.expectEqualStrings("docs", first.backups[0].tables[0]);
+    try std.testing.expectEqualStrings("prod-snap-3", first.next_cursor.?);
+    const first_json = try encodeBackupListResponse(std.testing.allocator, &first);
+    defer std.testing.allocator.free(first_json);
+    try std.testing.expect(std.mem.indexOf(u8, first_json, "\"next_cursor\":\"prod-snap-3\"") != null);
+
+    var second = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod", .{
+        .limit = 2,
+        .cursor = first.next_cursor,
+    });
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), second.backups.len);
+    try std.testing.expectEqualStrings("prod-snap", second.backups[0].backup_id);
+    try std.testing.expectEqual(@as(?[]u8, null), second.next_cursor);
+    const second_json = try encodeBackupListResponse(std.testing.allocator, &second);
+    defer std.testing.allocator.free(second_json);
+    try std.testing.expect(std.mem.indexOf(u8, second_json, "next_cursor") == null);
+}
+
+test "filesystem backup listing is bounded and cursor stable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-list", .{tmp.sub_path});
+    defer alloc.free(root);
+    const entries = [_]ClusterTableBackupEntry{.{ .name = "docs", .table_backup_id = "docs-snapshot" }};
+    inline for (&.{ "prod-snap", "prod-snap-3", "prod-snap-2" }) |backup_id| {
+        var manifest = try createClusterManifest(alloc, backup_id, "file:///backups", &entries);
+        defer manifest.deinit(alloc);
+        try writeClusterManifest(alloc, root, &manifest);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), listed.len);
-    try std.testing.expectEqualStrings("prod-snap", listed[0].backup_id);
-    try std.testing.expectEqual(@as(usize, 1), listed[0].tables.len);
-    try std.testing.expectEqualStrings("docs", listed[0].tables[0]);
+    var first = try listClusterBackups(alloc, root, "file:///backups", .{ .limit = 2 });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), first.backups.len);
+    try std.testing.expectEqualStrings("prod-snap-2", first.backups[0].backup_id);
+    try std.testing.expectEqualStrings("prod-snap-3", first.backups[1].backup_id);
+    try std.testing.expectEqualStrings("prod-snap-3", first.next_cursor.?);
+
+    var second = try listClusterBackups(alloc, root, "file:///backups", .{
+        .limit = 2,
+        .cursor = first.next_cursor,
+    });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second.backups.len);
+    try std.testing.expectEqualStrings("prod-snap", second.backups[0].backup_id);
+    try std.testing.expectEqual(@as(?[]u8, null), second.next_cursor);
 }
 
 test "go portable metadata parses as table backup manifest" {
