@@ -182,19 +182,30 @@ detects local media corruption without adding whole-object memory or repeated
 open/stat overhead. Recursive filesystem restores use a native prefix transfer,
 walking the selected archive once instead of rescanning the namespace for every
 logical page; S3 and GCS continue using their service-native continuation
-tokens.
+tokens. Portable AFB restore validation and import use three positional file
+passes—validation, primary records, then derived indexes—rather than loading the
+archive into heap memory. Each payload and compressed expansion is capped at
+128 MiB, so peak parser memory is independent of archive size and malformed
+block lengths fail before allocation. A shared advisory lock and size/mtime
+fence pin all passes to one archive generation; unsupported locking and
+concurrent rewrites fail closed.
 
 Backup uploads are bounded as well. Filesystem connections stream directly
 into their staged object envelope; S3 multipart parts and GCS resumable chunks
 start at 16 MiB and grow for very large objects to keep request counts bounded.
+Portable export walks a pinned ordered storage cursor and emits bounded AFB
+batches directly into a synced temporary file, then atomically publishes it;
+neither the logical database nor completed archive is materialized in heap.
 Failed sessions are aborted or cancelled, and source size and modification time
-are fenced throughout upload so concurrent rewrites fail before completion.
-Providers without a streaming upload
-capability reject files above 64 MiB instead of attempting an unbounded heap
-allocation. Filesystem listing retains only the smallest requested page plus
-one continuation candidate, so page memory is bounded by the requested page
-size even when the archive contains many more objects. Page sizes are capped at
-10,000 keys to keep caller-controlled memory and sorting work predictable.
+are fenced throughout upload so concurrent rewrites fail before completion. The
+backup API preserves file paths through upload and download instead of
+rematerializing portable archives at the location boundary. Providers without a
+streaming upload capability reject files above 64 MiB instead of attempting an
+unbounded heap allocation. Filesystem listing retains only the smallest
+requested page plus one continuation candidate, so page memory is bounded by
+the requested page size even when the archive contains many more objects. Page
+sizes are capped at 10,000 keys to keep caller-controlled memory and sorting
+work predictable.
 
 Backup and restore select credentials independently from primary storage and
 remote-content reads. Network requests must name an `external_io` connection while the
@@ -269,6 +280,10 @@ are durably checkpointed and are not repeated after restart. An ambiguous
 publication/checkpoint interruption fails closed for operator inspection rather
 than modifying an existing table. Destructive overwrite is intentionally not a
 restore mode until the catalog supports an atomic staged-generation swap.
+Cancellation is cooperative and best-effort: queued work becomes cancelled,
+running work stops at a safe boundary, and a successful irreversible publication
+that races cancellation remains `succeeded` with `cancel_requested: true` for
+auditability. The API never reports restored data as cancelled.
 Terminal job state and explicit idempotency keys are retained for seven days;
 the history is bounded by 10,000 jobs and 64 KiB per encoded job, and rejects
 new work instead of silently evicting an unexpired key. Job IDs are random

@@ -2433,6 +2433,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
             "restore job store is idempotent and fenced",
+            "successful restore completion wins a racing cancellation",
             "restore job runnable queue drains incrementally and preserves insertion order",
             "replicated restore leadership rebuild preserves FIFO and recovers running attempts",
             "restore requests without idempotency keys create independent opaque jobs",
@@ -2447,6 +2448,27 @@ pub fn build(b: *std.Build) void {
     const run_api_restore_jobs_tests = b.addRunArtifact(api_restore_jobs_tests);
     const lib_api_restore_jobs_test_step = b.step("lib-api-restore-jobs-test", "Run durable restore job store tests");
     lib_api_restore_jobs_test_step.dependOn(&run_api_restore_jobs_tests.step);
+
+    const portable_backup_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/portable_backup_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, portable_backup_test_mod, true, true);
+    const portable_backup_tests = b.addTest(.{
+        .root_module = portable_backup_test_mod,
+        .filters = &.{
+            "export and import documents round trip",
+            "file import rejects oversized portable blocks before allocation",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_portable_backup_tests = b.addRunArtifact(portable_backup_tests);
+    const lib_portable_backup_test_step = b.step("lib-portable-backup-test", "Run bounded portable backup tests");
+    lib_portable_backup_test_step.dependOn(&run_portable_backup_tests.step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -4036,6 +4058,7 @@ pub fn build(b: *std.Build) void {
             "cluster backup APIs require named connections",
             "cluster backup format defaults portable and preserves explicit native",
             "cluster backup and restore reject duplicate table selectors",
+            "remote portable file transfer uses objectstore file paths",
             "remote backup directory download paginates and enforces segment prefix",
             "api http server lists cluster backups through public route",
         },
@@ -4937,6 +4960,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
+    unit_test_step.dependOn(&run_portable_backup_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_toon_tests.step);

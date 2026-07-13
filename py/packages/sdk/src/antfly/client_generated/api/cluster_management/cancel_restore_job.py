@@ -58,6 +58,11 @@ def sync_detailed(
 ) -> Response[Error | RestoreJob]:
     """Request cooperative restore cancellation
 
+     Requests best-effort cancellation. Queued work is cancelled immediately
+    and running work stops at its next safe boundary. If irreversible restore
+    publication completes before cancellation is observed, the job remains
+    `succeeded` with `cancel_requested: true`.
+
     Args:
         job_id (int):
 
@@ -87,6 +92,11 @@ def sync(
 ) -> Error | RestoreJob | None:
     """Request cooperative restore cancellation
 
+     Requests best-effort cancellation. Queued work is cancelled immediately
+    and running work stops at its next safe boundary. If irreversible restore
+    publication completes before cancellation is observed, the job remains
+    `succeeded` with `cancel_requested: true`.
+
     Args:
         job_id (int):
 
@@ -110,6 +120,11 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
 ) -> Response[Error | RestoreJob]:
     """Request cooperative restore cancellation
+
+     Requests best-effort cancellation. Queued work is cancelled immediately
+    and running work stops at its next safe boundary. If irreversible restore
+    publication completes before cancellation is observed, the job remains
+    `succeeded` with `cancel_requested: true`.
 
     Args:
         job_id (int):
@@ -137,6 +152,11 @@ async def asyncio(
     client: AuthenticatedClient,
 ) -> Error | RestoreJob | None:
     """Request cooperative restore cancellation
+
+     Requests best-effort cancellation. Queued work is cancelled immediately
+    and running work stops at its next safe boundary. If irreversible restore
+    publication completes before cancellation is observed, the job remains
+    `succeeded` with `cancel_requested: true`.
 
     Args:
         job_id (int):

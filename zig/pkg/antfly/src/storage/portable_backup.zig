@@ -46,33 +46,38 @@ const ResolutionArtifactRef = struct {
 // Export
 // ============================================================================
 
+const PortableOutput = struct {
+    writer: *std.Io.Writer,
+    bytes_written: u64 = 0,
+
+    fn writeHeader(self: *PortableOutput, header: backup_codec.FileHeader) !void {
+        try backup_codec.writeHeaderTo(self.writer, header);
+        self.bytes_written += backup_codec.header_size;
+    }
+
+    fn writeBlock(self: *PortableOutput, block_type: backup_codec.BlockType, payload: []const u8) !void {
+        try backup_codec.writeBlockTo(self.writer, block_type, payload);
+        self.bytes_written += backup_codec.block_envelope_overhead + payload.len;
+    }
+};
+
 /// Export all portable data from the DocStore into AFB format.
 /// The caller provides an allocator for temporary buffers. The output is
 /// appended to `out`.
 pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !void {
-    const pairs = try store.scanRange(alloc, "", "");
-    defer DocStore.freeResults(alloc, pairs);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = allocating.toArrayList();
+    try exportPortableToWriter(alloc, store, &allocating.writer);
+}
 
-    var document_timestamps = std.StringHashMapUnmanaged(u64).empty;
-    defer {
-        var it = document_timestamps.iterator();
-        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
-        document_timestamps.deinit(alloc);
-    }
-    for (pairs) |kv| {
-        if (!internal_keys.isTtlKey(kv.key) or kv.value.len < 8) continue;
-        const doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, kv.key)) orelse continue;
-        errdefer alloc.free(doc_key);
-        const gop = try document_timestamps.getOrPut(alloc, doc_key);
-        if (gop.found_existing) {
-            alloc.free(doc_key);
-        }
-        gop.value_ptr.* = std.mem.readInt(u64, kv.value[0..8], .little);
-    }
+pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *std.Io.Writer) !void {
+    var out: PortableOutput = .{ .writer = sink_writer };
+    var scan = try store.beginReadTxn();
+    defer scan.abort();
 
     // Write file header
     const backup_id = [_]u8{0} ** 16; // zero UUID for now
-    try backup_codec.writeHeader(out, alloc, .{
+    try out.writeHeader(.{
         .format_version = backup_codec.format_version,
         .flags = 0,
         .created_at_ns = 0, // timestamp filled by caller if needed
@@ -82,10 +87,10 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     });
 
     // Cluster manifest
-    try backup_codec.writeBlock(out, alloc, .cluster_manifest, "{}");
+    try out.writeBlock(.cluster_manifest, "{}");
 
     // Table manifest
-    try backup_codec.writeBlock(out, alloc, .table_manifest, "{}");
+    try out.writeBlock(.table_manifest, "{}");
 
     // Shard header
     const shard_hdr = try backup_codec.encodeShardHeader(alloc, .{
@@ -95,31 +100,37 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
         .end_key = "",
     });
     defer alloc.free(shard_hdr);
-    try backup_codec.writeBlock(out, alloc, .shard_header, shard_hdr);
+    try out.writeBlock(.shard_header, shard_hdr);
 
     // Classify and batch all keys
     var doc_batch = std.ArrayListUnmanaged(backup_codec.DocumentEntry).empty;
-    defer doc_batch.deinit(alloc);
+    defer {
+        for (doc_batch.items) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        }
+        doc_batch.deinit(alloc);
+    }
     var doc_batch_bytes: usize = 0;
 
     var identity_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
-    defer identity_batch.deinit(alloc);
+    defer deinitKeyValueBatch(alloc, &identity_batch);
     var identity_batch_bytes: usize = 0;
 
     var metadata_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
-    defer metadata_batch.deinit(alloc);
+    defer deinitKeyValueBatch(alloc, &metadata_batch);
     var metadata_batch_bytes: usize = 0;
 
     var chunk_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
-    defer chunk_batch.deinit(alloc);
+    defer deinitKeyValueBatch(alloc, &chunk_batch);
     var chunk_batch_bytes: usize = 0;
 
     var artifact_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
-    defer artifact_batch.deinit(alloc);
+    defer deinitKeyValueBatch(alloc, &artifact_batch);
     var artifact_batch_bytes: usize = 0;
 
     var resolution_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
-    defer resolution_batch.deinit(alloc);
+    defer deinitKeyValueBatch(alloc, &resolution_batch);
     var resolution_batch_bytes: usize = 0;
 
     // Embeddings keyed by index name
@@ -154,10 +165,14 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
         }
         edge_batches.deinit(alloc);
     }
+    var derived_batch_bytes: usize = 0;
 
     var counts = Counts{};
 
-    for (pairs) |kv| {
+    var cursor = try scan.openCursor();
+    defer cursor.close();
+    var scan_entry = try cursor.first();
+    while (scan_entry) |kv| : (scan_entry = try cursor.next()) {
         if (isPortableMetadataKey(kv.key)) {
             try metadata_batch.append(alloc, .{
                 .key = try alloc.dupe(u8, kv.key),
@@ -165,7 +180,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             });
             metadata_batch_bytes += kv.key.len + kv.value.len;
             if (metadata_batch_bytes >= batch_target_bytes) {
-                try flushMetadataBatch(alloc, out, &metadata_batch);
+                try flushMetadataBatch(alloc, &out, &metadata_batch);
                 metadata_batch_bytes = 0;
             }
             continue;
@@ -178,7 +193,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             });
             identity_batch_bytes += kv.key.len + kv.value.len;
             if (identity_batch_bytes >= batch_target_bytes) {
-                try flushIdentityBatch(alloc, out, &identity_batch);
+                try flushIdentityBatch(alloc, &out, &identity_batch);
                 identity_batch_bytes = 0;
             }
             continue;
@@ -189,45 +204,69 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             if (internal_keys.isPrimaryDocumentKey(kv.key)) {
                 const user_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
                 defer alloc.free(user_key);
+                const owned_value = try alloc.dupe(u8, kv.value);
+                var owned_value_pending = true;
+                errdefer if (owned_value_pending) alloc.free(owned_value);
+                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, user_key);
+                defer alloc.free(timestamp_key);
+                const timestamp_value = scan.get(timestamp_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
 
+                const owned_key = try alloc.dupe(u8, user_key);
+                var owned_key_pending = true;
+                errdefer if (owned_key_pending) alloc.free(owned_key);
                 try doc_batch.append(alloc, .{
-                    .key = try alloc.dupe(u8, user_key),
+                    .key = owned_key,
                     .value_flags = 0,
-                    .value = try alloc.dupe(u8, kv.value),
-                    .timestamp_ns = document_timestamps.get(user_key) orelse 0,
+                    .value = owned_value,
+                    .timestamp_ns = if (timestamp_value) |value|
+                        if (value.len >= 8) std.mem.readInt(u64, value[0..8], .little) else 0
+                    else
+                        0,
                 });
-                doc_batch_bytes += user_key.len + kv.value.len;
+                owned_key_pending = false;
+                owned_value_pending = false;
+                doc_batch_bytes += user_key.len + owned_value.len;
 
                 if (doc_batch_bytes >= batch_target_bytes) {
-                    try flushDocBatch(alloc, out, &doc_batch, &counts);
+                    try flushDocBatch(alloc, &out, &doc_batch, &counts);
                     doc_batch_bytes = 0;
                 }
             } else if (internal_keys.isChunkArtifactRecordKey(kv.key)) {
                 try appendChunkArtifactEntry(alloc, &chunk_batch, kv.key, kv.value);
                 chunk_batch_bytes += kv.key.len + kv.value.len;
                 if (chunk_batch_bytes >= batch_target_bytes) {
-                    try flushChunkBatch(alloc, out, &chunk_batch);
+                    try flushChunkBatch(alloc, &out, &chunk_batch);
                     chunk_batch_bytes = 0;
                 }
             } else if (internal_keys.isEmbeddingArtifactKey(kv.key)) {
                 try collectEmbedding(alloc, &emb_batches, &sparse_batches, kv.key, kv.value);
+                derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
                 try collectGraphEdgeArtifact(alloc, &edge_batches, kv.key, kv.value);
+                derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (try parseStandaloneGraphIndexEdgeKeyAlloc(alloc, kv.key)) |parsed| {
                 defer parsed.deinit(alloc);
                 try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
+                derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (try appendResolutionArtifactEntry(alloc, &resolution_batch, kv.key, kv.value)) {
                 resolution_batch_bytes += kv.key.len + kv.value.len;
                 if (resolution_batch_bytes >= batch_target_bytes) {
-                    try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
+                    try flushKeyValueBlock(alloc, &out, &resolution_batch, .resolution_batch);
                     resolution_batch_bytes = 0;
                 }
             } else if (try appendPortableArtifactEntry(alloc, &artifact_batch, kv.key, kv.value, .asset)) {
                 artifact_batch_bytes += kv.key.len + kv.value.len;
                 if (artifact_batch_bytes >= batch_target_bytes) {
-                    try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
+                    try flushKeyValueBlock(alloc, &out, &artifact_batch, .artifact_batch);
                     artifact_batch_bytes = 0;
                 }
+            }
+            if (derived_batch_bytes >= batch_target_bytes) {
+                try flushDerivedBatches(alloc, &out, &emb_batches, &sparse_batches, &edge_batches, &counts);
+                derived_batch_bytes = 0;
             }
             // Skip: TTL, summary, and derived embedding keys
             continue;
@@ -239,6 +278,11 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             if (kv.key.len >= 2 and kv.key[kv.key.len - 1] == 'o' and kv.key[kv.key.len - 2] == ':') {
                 const parsed = KeyEncoder.parseEdgeKey(kv.key) orelse continue;
                 try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
+                derived_batch_bytes += kv.key.len + kv.value.len;
+                if (derived_batch_bytes >= batch_target_bytes) {
+                    try flushDerivedBatches(alloc, &out, &emb_batches, &sparse_batches, &edge_batches, &counts);
+                    derived_batch_bytes = 0;
+                }
             }
             // Skip incoming edges (":i" suffix)
         }
@@ -247,63 +291,25 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
 
     // Flush remaining documents
     if (doc_batch.items.len > 0) {
-        try flushDocBatch(alloc, out, &doc_batch, &counts);
+        try flushDocBatch(alloc, &out, &doc_batch, &counts);
     }
     if (identity_batch.items.len > 0) {
-        try flushIdentityBatch(alloc, out, &identity_batch);
+        try flushIdentityBatch(alloc, &out, &identity_batch);
     }
     if (metadata_batch.items.len > 0) {
-        try flushMetadataBatch(alloc, out, &metadata_batch);
+        try flushMetadataBatch(alloc, &out, &metadata_batch);
     }
     if (chunk_batch.items.len > 0) {
-        try flushChunkBatch(alloc, out, &chunk_batch);
+        try flushChunkBatch(alloc, &out, &chunk_batch);
     }
     if (artifact_batch.items.len > 0) {
-        try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
+        try flushKeyValueBlock(alloc, &out, &artifact_batch, .artifact_batch);
     }
     if (resolution_batch.items.len > 0) {
-        try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
+        try flushKeyValueBlock(alloc, &out, &resolution_batch, .resolution_batch);
     }
 
-    // Flush embedding batches
-    {
-        var it = emb_batches.iterator();
-        while (it.next()) |entry| {
-            const batch = entry.value_ptr;
-            if (batch.entries.items.len == 0) continue;
-            const dim: u16 = if (batch.entries.items.len > 0) batch.dimension else 0;
-            const encoded = try backup_codec.encodeEmbeddingBatch(alloc, entry.key_ptr.*, dim, batch.entries.items);
-            defer alloc.free(encoded);
-            try backup_codec.writeBlock(out, alloc, .embedding_batch, encoded);
-            counts.embeddings += batch.entries.items.len;
-        }
-    }
-
-    // Flush sparse embedding batches
-    {
-        var it = sparse_batches.iterator();
-        while (it.next()) |entry| {
-            const batch = entry.value_ptr;
-            if (batch.entries.items.len == 0) continue;
-            const encoded = try backup_codec.encodeSparseBatch(alloc, entry.key_ptr.*, batch.entries.items);
-            defer alloc.free(encoded);
-            try backup_codec.writeBlock(out, alloc, .sparse_batch, encoded);
-            counts.embeddings += batch.entries.items.len;
-        }
-    }
-
-    // Flush edge batches
-    {
-        var eit = edge_batches.iterator();
-        while (eit.next()) |entry| {
-            const batch = entry.value_ptr;
-            if (batch.entries.items.len == 0) continue;
-            const encoded = try backup_codec.encodeEdgeBatch(alloc, entry.key_ptr.*, batch.entries.items);
-            defer alloc.free(encoded);
-            try backup_codec.writeBlock(out, alloc, .edge_batch, encoded);
-            counts.edges += batch.entries.items.len;
-        }
-    }
+    try flushDerivedBatches(alloc, &out, &emb_batches, &sparse_batches, &edge_batches, &counts);
 
     // Shard footer
     const shard_footer = backup_codec.encodeShardFooter(.{
@@ -313,16 +319,16 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
         .edge_count = counts.edges,
         .transaction_count = 0,
     });
-    try backup_codec.writeBlock(out, alloc, .shard_footer, &shard_footer);
+    try out.writeBlock(.shard_footer, &shard_footer);
 
     // File footer
     const file_footer = backup_codec.encodeFileFooter(.{
         .table_count = 1,
         .shard_count = 1,
         .total_documents = counts.documents,
-        .total_bytes = out.items.len,
+        .total_bytes = out.bytes_written,
     });
-    try backup_codec.writeBlock(out, alloc, .file_footer, &file_footer);
+    try out.writeBlock(.file_footer, &file_footer);
 }
 
 const Counts = struct {
@@ -386,6 +392,63 @@ const EdgeBatch = struct {
     }
 };
 
+fn flushDerivedBatches(
+    alloc: Allocator,
+    out: *PortableOutput,
+    dense: *std.StringHashMapUnmanaged(EmbeddingBatch),
+    sparse: *std.StringHashMapUnmanaged(SparseBatch),
+    edges: *std.StringHashMapUnmanaged(EdgeBatch),
+    counts: *Counts,
+) !void {
+    var dense_it = dense.iterator();
+    while (dense_it.next()) |entry| {
+        const batch = entry.value_ptr;
+        if (batch.entries.items.len == 0) continue;
+        const encoded = try backup_codec.encodeEmbeddingBatch(alloc, entry.key_ptr.*, batch.dimension, batch.entries.items);
+        defer alloc.free(encoded);
+        try out.writeBlock(.embedding_batch, encoded);
+        counts.embeddings += batch.entries.items.len;
+        for (batch.entries.items) |item| {
+            alloc.free(item.doc_key);
+            alloc.free(item.vector);
+        }
+        batch.entries.clearRetainingCapacity();
+    }
+
+    var sparse_it = sparse.iterator();
+    while (sparse_it.next()) |entry| {
+        const batch = entry.value_ptr;
+        if (batch.entries.items.len == 0) continue;
+        const encoded = try backup_codec.encodeSparseBatch(alloc, entry.key_ptr.*, batch.entries.items);
+        defer alloc.free(encoded);
+        try out.writeBlock(.sparse_batch, encoded);
+        counts.embeddings += batch.entries.items.len;
+        for (batch.entries.items) |item| {
+            alloc.free(item.doc_key);
+            alloc.free(item.indices);
+            alloc.free(item.values);
+        }
+        batch.entries.clearRetainingCapacity();
+    }
+
+    var edge_it = edges.iterator();
+    while (edge_it.next()) |entry| {
+        const batch = entry.value_ptr;
+        if (batch.entries.items.len == 0) continue;
+        const encoded = try backup_codec.encodeEdgeBatch(alloc, entry.key_ptr.*, batch.entries.items);
+        defer alloc.free(encoded);
+        try out.writeBlock(.edge_batch, encoded);
+        counts.edges += batch.entries.items.len;
+        for (batch.entries.items) |item| {
+            alloc.free(item.source_key);
+            alloc.free(item.target_key);
+            alloc.free(item.edge_type);
+            alloc.free(item.value);
+        }
+        batch.entries.clearRetainingCapacity();
+    }
+}
+
 const ParsedStandaloneGraphEdgeKey = struct {
     source: []u8,
     index_name: []u8,
@@ -448,13 +511,13 @@ fn parseStandaloneGraphIndexEdgeKeyAlloc(alloc: Allocator, key: []const u8) !?Pa
 
 fn flushDocBatch(
     alloc: Allocator,
-    out: *ArrayList(u8),
+    out: *PortableOutput,
     batch: *std.ArrayListUnmanaged(backup_codec.DocumentEntry),
     counts: *Counts,
 ) !void {
     const encoded = try backup_codec.encodeDocumentBatch(alloc, batch.items);
     defer alloc.free(encoded);
-    try backup_codec.writeBlock(out, alloc, .document_batch, encoded);
+    try out.writeBlock(.document_batch, encoded);
     counts.documents += batch.items.len;
 
     // Free owned entry data
@@ -473,12 +536,12 @@ fn timestampValueAlloc(alloc: Allocator, timestamp_ns: u64) ![]u8 {
 
 fn flushIdentityBatch(
     alloc: Allocator,
-    out: *ArrayList(u8),
+    out: *PortableOutput,
     batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
 ) !void {
     const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
     defer alloc.free(encoded);
-    try backup_codec.writeBlock(out, alloc, .doc_identity_batch, encoded);
+    try out.writeBlock(.doc_identity_batch, encoded);
 
     for (batch.items) |e| {
         alloc.free(e.key);
@@ -489,12 +552,12 @@ fn flushIdentityBatch(
 
 fn flushMetadataBatch(
     alloc: Allocator,
-    out: *ArrayList(u8),
+    out: *PortableOutput,
     batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
 ) !void {
     const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
     defer alloc.free(encoded);
-    try backup_codec.writeBlock(out, alloc, .metadata_batch, encoded);
+    try out.writeBlock(.metadata_batch, encoded);
 
     for (batch.items) |e| {
         alloc.free(e.key);
@@ -505,12 +568,12 @@ fn flushMetadataBatch(
 
 fn flushChunkBatch(
     alloc: Allocator,
-    out: *ArrayList(u8),
+    out: *PortableOutput,
     batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
 ) !void {
     const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
     defer alloc.free(encoded);
-    try backup_codec.writeBlock(out, alloc, .chunk_batch, encoded);
+    try out.writeBlock(.chunk_batch, encoded);
 
     for (batch.items) |e| {
         alloc.free(e.key);
@@ -521,19 +584,27 @@ fn flushChunkBatch(
 
 fn flushKeyValueBlock(
     alloc: Allocator,
-    out: *ArrayList(u8),
+    out: *PortableOutput,
     batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
     block_type: backup_codec.BlockType,
 ) !void {
     const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
     defer alloc.free(encoded);
-    try backup_codec.writeBlock(out, alloc, block_type, encoded);
+    try out.writeBlock(block_type, encoded);
 
     for (batch.items) |e| {
         alloc.free(e.key);
         alloc.free(e.value);
     }
     batch.clearRetainingCapacity();
+}
+
+fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry)) void {
+    for (batch.items) |entry| {
+        alloc.free(entry.key);
+        alloc.free(entry.value);
+    }
+    batch.deinit(alloc);
 }
 
 fn isPortableMetadataKey(key: []const u8) bool {
@@ -815,13 +886,62 @@ pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
 }
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
-    try validatePortableImportBlocks(alloc, data, opts);
+    var validation_reader = backup_codec.SliceReader.init(data);
+    try validatePortableImportReader(alloc, &validation_reader, opts);
 
     var reader = backup_codec.SliceReader.init(data);
+    const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
+
+    try finishPortableIdentityImport(alloc, store, opts, imported_identity);
+    if (opts.import_derived_indexes) {
+        var derived_reader = backup_codec.SliceReader.init(data);
+        try importPortableDerivedBlocks(alloc, store, &derived_reader, opts);
+    }
+}
+
+/// Imports a portable archive without materializing the file. Validation and
+/// the two dependency-ordered import passes use positional reads over the same
+/// borrowed descriptor, keeping peak archive memory bounded to one block.
+pub fn importPortableFileWithOptions(
+    alloc: Allocator,
+    store: *DocStore,
+    io: std.Io,
+    file: std.Io.File,
+    file_size: u64,
+    opts: ImportOptions,
+) !void {
+    // The three passes must observe one immutable archive generation. Locking
+    // is fail-closed; the final stat also detects writers that ignore advisory
+    // locks on a shared filesystem.
+    try file.lock(io, .shared);
+    defer file.unlock(io);
+    const initial_stat = try file.stat(io);
+    if (initial_stat.size != file_size) return error.SourceFileChanged;
+
+    var validation_reader = backup_codec.FileReader.init(io, file, file_size);
+    try validatePortableImportReader(alloc, &validation_reader, opts);
+
+    var reader = backup_codec.FileReader.init(io, file, file_size);
+    const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
+    try finishPortableIdentityImport(alloc, store, opts, imported_identity);
+    if (opts.import_derived_indexes) {
+        var derived_reader = backup_codec.FileReader.init(io, file, file_size);
+        try importPortableDerivedBlocks(alloc, store, &derived_reader, opts);
+    }
+    const final_stat = try file.stat(io);
+    if (final_stat.size != initial_stat.size or !std.meta.eql(final_stat.mtime, initial_stat.mtime))
+        return error.SourceFileChanged;
+}
+
+pub fn importPortableFile(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, file_size: u64) !void {
+    return try importPortableFileWithOptions(alloc, store, io, file, file_size, .{});
+}
+
+fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anytype) !bool {
     _ = try reader.readHeader();
     var imported_identity = false;
 
-    while (reader.pos < reader.data.len) {
+    while (reader.hasRemaining()) {
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
 
@@ -837,36 +957,42 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
             else => {},
         }
     }
+    return imported_identity;
+}
 
+fn finishPortableIdentityImport(alloc: Allocator, store: *DocStore, opts: ImportOptions, imported_identity: bool) !void {
     if (imported_identity) {
         try doc_identity.validateStoreAlloc(alloc, store);
         try validateImportedIdentityNamespace(store, opts);
     }
+}
 
-    if (opts.import_derived_indexes) {
-        var derived_reader = backup_codec.SliceReader.init(data);
-        _ = try derived_reader.readHeader();
-        while (derived_reader.pos < derived_reader.data.len) {
-            const block = try derived_reader.readBlock(alloc);
-            defer alloc.free(block.payload);
+fn importPortableDerivedBlocks(alloc: Allocator, store: *DocStore, reader: anytype, opts: ImportOptions) !void {
+    _ = try reader.readHeader();
+    while (reader.hasRemaining()) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
 
-            switch (block.block_type) {
-                .chunk_batch => try importChunkBatch(alloc, store, block.payload),
-                .artifact_batch => try importPublicArtifactBatch(alloc, store, block.payload, .asset),
-                .resolution_batch => try importResolutionArtifactBatch(alloc, store, block.payload),
-                .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
-                .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
-                .edge_batch => try importEdgeBatch(alloc, store, block.payload),
-                else => {},
-            }
+        switch (block.block_type) {
+            .chunk_batch => try importChunkBatch(alloc, store, block.payload),
+            .artifact_batch => try importPublicArtifactBatch(alloc, store, block.payload, .asset),
+            .resolution_batch => try importResolutionArtifactBatch(alloc, store, block.payload),
+            .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
+            .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
+            .edge_batch => try importEdgeBatch(alloc, store, block.payload),
+            else => {},
         }
     }
 }
 
 fn validatePortableImportBlocks(alloc: Allocator, data: []const u8, opts: ImportOptions) !void {
     var reader = backup_codec.SliceReader.init(data);
+    return try validatePortableImportReader(alloc, &reader, opts);
+}
+
+fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportOptions) !void {
     _ = try reader.readHeader();
-    while (reader.pos < reader.data.len) {
+    while (reader.hasRemaining()) {
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
         try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts);
@@ -1568,6 +1694,77 @@ test "export and import documents round trip" {
         defer alloc.free(val);
         try std.testing.expectEqualStrings(expected, val);
     }
+
+    // The server restore path reads the same format positionally from disk and
+    // must produce an identical store without allocating the whole archive.
+    const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/roundtrip.afb", .{tmp_src.sub_path});
+    defer alloc.free(archive_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .truncate = true });
+    var writer_buffer: [4096]u8 = undefined;
+    var archive_writer = archive.writer(io, &writer_buffer);
+    try exportPortableToWriter(alloc, &src, &archive_writer.interface);
+    try archive_writer.end();
+    try archive.sync(io);
+    const archive_size = (try archive.stat(io)).size;
+    archive.close(io);
+    archive = try std.Io.Dir.cwd().openFile(io, archive_path, .{});
+    defer archive.close(io);
+
+    var tmp_file_dst = std.testing.tmpDir(.{});
+    defer tmp_file_dst.cleanup();
+    var file_dst = try openTestStore(alloc, &tmp_file_dst);
+    defer file_dst.close();
+    try importPortableFile(alloc, &file_dst, io, archive, archive_size);
+    for (doc_keys, doc_vals) |dk, expected| {
+        const store_key = try internal_keys.documentKeyAlloc(alloc, dk);
+        defer alloc.free(store_key);
+        const val = try file_dst.get(alloc, store_key);
+        defer alloc.free(val);
+        try std.testing.expectEqualStrings(expected, val);
+    }
+}
+
+test "file import rejects oversized portable blocks before allocation" {
+    const alloc = std.testing.allocator;
+    var encoded: ArrayList(u8) = .empty;
+    defer encoded.deinit(alloc);
+    try backup_codec.writeHeader(&encoded, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = @splat(0),
+        .table_count = 1,
+        .shard_count = 1,
+    });
+    var env: [6]u8 = undefined;
+    env[0] = @intFromEnum(backup_codec.BlockType.document_batch);
+    env[1] = 0;
+    std.mem.writeInt(u32, env[2..6], backup_codec.max_block_payload_bytes + 1, .little);
+    try encoded.appendSlice(alloc, &env);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/oversized.afb", .{tmp.sub_path});
+    defer alloc.free(archive_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .truncate = true });
+    try archive.writePositionalAll(io, encoded.items, 0);
+    try archive.sync(io);
+    archive.close(io);
+    archive = try std.Io.Dir.cwd().openFile(io, archive_path, .{});
+    defer archive.close(io);
+
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    try std.testing.expectError(
+        error.BackupBlockTooLarge,
+        importPortableFile(alloc, &store, io, archive, encoded.items.len),
+    );
 }
 
 test "import preflights full portable envelope before mutating destination" {

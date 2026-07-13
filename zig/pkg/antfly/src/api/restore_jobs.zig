@@ -640,10 +640,15 @@ pub const Store = struct {
         var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (parsed.value.attempt_id != expected.attempt_id or parsed.value.phase != .running) return try alloc.dupe(u8, current);
+        // Cancellation is cooperative and may race the final irreversible
+        // restore boundary. Once the worker reports successful completion, the
+        // restored data is authoritative: retain cancel_requested for audit,
+        // but never claim that successfully published data was cancelled.
+        const cancellation_wins = parsed.value.cancel_requested and phase != .succeeded;
         return try self.updateLocked(alloc, parsed.value, .{
-            .phase = if (parsed.value.cancel_requested) .cancelled else phase,
+            .phase = if (cancellation_wins) .cancelled else phase,
             .result_json = result_json,
-            .last_error = if (parsed.value.cancel_requested) "cancel_requested" else last_error,
+            .last_error = if (cancellation_wins) "cancel_requested" else last_error,
         });
     }
 
@@ -1014,6 +1019,42 @@ test "restore job store is idempotent and fenced" {
     var parsed_done = try std.json.parseFromSlice(JobState, std.testing.allocator, done, .{});
     defer parsed_done.deinit();
     try std.testing.expectEqual(Phase.succeeded, parsed_done.value.phase);
+}
+
+test "successful restore completion wins a racing cancellation" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const started = try store.start(std.testing.allocator, .{
+        .scope = .table,
+        .table_name = "docs",
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive-reader",
+    });
+    defer std.testing.allocator.free(started);
+    var parsed_started = try std.json.parseFromSlice(JobState, std.testing.allocator, started, .{});
+    defer parsed_started.deinit();
+
+    const running = (try store.begin(std.testing.allocator, parsed_started.value.job_id)).?;
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
+    defer parsed_running.deinit();
+
+    const cancelling = (try store.cancel(std.testing.allocator, parsed_started.value.job_id)).?;
+    defer std.testing.allocator.free(cancelling);
+    const completed = try store.finish(std.testing.allocator, parsed_running.value, "{\"restored\":true}");
+    defer std.testing.allocator.free(completed);
+    var parsed_completed = try std.json.parseFromSlice(JobState, std.testing.allocator, completed, .{});
+    defer parsed_completed.deinit();
+
+    try std.testing.expectEqual(Phase.succeeded, parsed_completed.value.phase);
+    try std.testing.expect(parsed_completed.value.cancel_requested);
+    try std.testing.expectEqualStrings("{\"restored\":true}", parsed_completed.value.result_json.?);
+    try std.testing.expect(parsed_completed.value.last_error == null);
 }
 
 test "restore job runnable queue drains incrementally and preserves insertion order" {

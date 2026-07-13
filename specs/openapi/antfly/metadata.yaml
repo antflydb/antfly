@@ -8149,6 +8149,11 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
     delete:
       summary: Request cooperative restore cancellation
+      description: |
+        Requests best-effort cancellation. Queued work is cancelled immediately
+        and running work stops at its next safe boundary. If irreversible restore
+        publication completes before cancellation is observed, the job remains
+        `succeeded` with `cancel_requested: true`.
       operationId: cancelRestoreJob
       tags: [cluster_management]
       responses:

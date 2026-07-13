@@ -478,7 +478,13 @@ export interface paths {
         get: operations["getRestoreJob"];
         put?: never;
         post?: never;
-        /** Request cooperative restore cancellation */
+        /**
+         * Request cooperative restore cancellation
+         * @description Requests best-effort cancellation. Queued work is cancelled immediately
+         *     and running work stops at its next safe boundary. If irreversible restore
+         *     publication completes before cancellation is observed, the job remains
+         *     `succeeded` with `cancel_requested: true`.
+         */
         delete: operations["cancelRestoreJob"];
         options?: never;
         head?: never;

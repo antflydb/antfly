@@ -97,11 +97,15 @@ pub const TableBackupPlan = struct {
     backup_root: []const u8,
     backup_id: []const u8,
     format: BackupFormat = .native,
+    io: ?std.Io = null,
 };
 
 pub const TableRestorePlan = struct {
     backup_root: []const u8,
     manifest: *const TableBackupManifest,
+    /// Borrowed server/backend runtime for positional archive I/O. Embedded
+    /// callers may omit this and use the bounded threaded fallback.
+    io: ?std.Io = null,
 };
 
 pub const BackupLocation = union(enum) {
@@ -509,12 +513,26 @@ const RemoteBackupStore = struct {
         defer result.deinit(alloc);
     }
 
+    fn writeFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, src_path: []const u8, content_type: []const u8) !void {
+        try self.ensureBucket();
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var result = try self.client.putFileWithIo(self.io, self.bucket, key, src_path, .{ .content_type = content_type });
+        defer result.deinit(alloc);
+    }
+
     fn readBytesAlloc(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
         var result = try self.client.getObject(self.bucket, key, .{});
         defer result.deinit(alloc);
         return try alloc.dupe(u8, result.body);
+    }
+
+    fn readFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, dest_path: []const u8) !void {
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        try self.client.getFileWithIo(self.io, self.bucket, key, dest_path, .{});
     }
 
     fn listObjectsPage(
@@ -1827,9 +1845,7 @@ pub fn copyFileFromLocation(
             try copyFileAbsolute(src_path, dest_path);
         },
         .remote => |*store| {
-            const body = try store.readBytesAlloc(alloc, trimLeftSlash(snapshot_path));
-            defer alloc.free(body);
-            try writeFileAbsolute(dest_path, body);
+            try store.readFile(alloc, trimLeftSlash(snapshot_path), dest_path);
         },
     }
 }
@@ -1849,9 +1865,7 @@ pub fn copyFileToLocation(
             try copyFileAbsolute(src_path, dest_path);
         },
         .remote => |*store| {
-            const body = try readFileAbsoluteAlloc(alloc, src_path, max_portable_backup_file_bytes);
-            defer alloc.free(body);
-            try store.writeBytes(alloc, trimLeftSlash(snapshot_path), body, content_type);
+            try store.writeFile(alloc, trimLeftSlash(snapshot_path), src_path, content_type);
         },
     }
 }
@@ -2430,6 +2444,40 @@ test "backup manifest round trips through remote objectstore location" {
     try std.testing.expectEqualStrings("docs", loaded.table_name);
     try std.testing.expectEqual(@as(usize, 1), loaded.shards.len);
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
+}
+
+test "remote portable file transfer uses objectstore file paths" {
+    const alloc = std.testing.allocator;
+    const root = ".zig-cache/test-backup-file-transfer-store";
+    const source_path = ".zig-cache/test-backup-file-transfer-source.afb";
+    const restored_path = ".zig-cache/test-backup-file-transfer-restored.afb";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, restored_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, restored_path) catch {};
+
+    var source = try std.Io.Dir.cwd().createFile(io, source_path, .{ .truncate = true });
+    try source.writePositionalAll(io, "portable-file-body", 0);
+    try source.sync(io);
+    source.close(io);
+
+    var filesystem = try object_storage.FilesystemObjectStorage.initWithIo(alloc, root, io);
+    defer filesystem.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, filesystem.client(), "bucket", "backups/prod"),
+    };
+    defer location.deinit(alloc);
+
+    try copyFileToLocation(alloc, &location, "snap/data.afb", source_path, "application/vnd.antfly.backup");
+    try copyFileFromLocation(alloc, &location, "snap/data.afb", restored_path);
+    const restored = try std.Io.Dir.cwd().readFileAlloc(io, restored_path, alloc, .limited(1024));
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("portable-file-body", restored);
 }
 
 test "remote backup directory download paginates and enforces segment prefix" {

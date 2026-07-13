@@ -5631,6 +5631,7 @@ pub const ApiHttpServer = struct {
             .backup_root = local_backup_root,
             .backup_id = backup_id,
             .format = format,
+            .io = self.sharedApiIo(),
         })) orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
 
@@ -5723,6 +5724,7 @@ pub const ApiHttpServer = struct {
                 if ((table_writes_source.restoreTable(self.alloc, table_name, .{
                     .backup_root = local_backup_root,
                     .manifest = &manifest,
+                    .io = self.sharedApiIo(),
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
                     error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
@@ -5803,6 +5805,7 @@ pub const ApiHttpServer = struct {
             if ((table_writes_source.restoreTable(self.alloc, table_name, .{
                 .backup_root = local_backup_root,
                 .manifest = &manifest,
+                .io = self.sharedApiIo(),
             }) catch |err| switch (err) {
                 error.UnsupportedOperation => return error.UnsupportedOperation,
                 error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
