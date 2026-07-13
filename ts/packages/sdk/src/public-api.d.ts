@@ -4825,19 +4825,47 @@ export interface components {
              * Format: int64
              * @description Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
              */
-            published_table_count?: number;
+            published_table_count: number;
             /**
              * Format: int64
              * @description Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
              */
-            completed_table_count?: number;
+            completed_table_count: number;
             /**
              * Format: int64
              * @description Requested table count when known before execution.
              */
             total_table_count?: number;
+            /**
+             * @description Bounded terminal result. Cluster restores report aggregate triggered, skipped, and failed table counts plus
+             *     a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part
+             *     of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for partial
+             *     progress and use a new idempotency key when retrying a changed request.
+             */
             result?: {
-                [key: string]: unknown;
+                /**
+                 * @description Present for a successful single-table restore.
+                 * @enum {string}
+                 */
+                restore?: "triggered";
+                /**
+                 * @description Aggregate terminal status for a cluster restore.
+                 * @enum {string}
+                 */
+                status?: "completed" | "partial" | "failed";
+                /** Format: int64 */
+                triggered_table_count?: number;
+                /** Format: int64 */
+                skipped_table_count?: number;
+                /** Format: int64 */
+                failed_table_count?: number;
+                failure_details?: {
+                    table_name: string;
+                    error: string;
+                    table_name_truncated: boolean;
+                }[];
+                /** @description True when additional failed tables or part of a long table name or error were omitted. */
+                failure_details_truncated?: boolean;
             };
             error?: string;
             /** Format: int64 */

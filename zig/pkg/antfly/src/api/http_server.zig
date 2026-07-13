@@ -6041,11 +6041,12 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         location_uri: []const u8,
         backup_id: []const u8,
+        cancellation: ?RestoreCancellation,
     ) !void {
         const io = self.sharedApiIo() orelse return error.AsyncRestoreUnavailable;
         var poll_ms: u64 = 250;
         while (true) {
-            if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
+            try self.ensureRestoreActive(cancellation);
             switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id)) {
                 .completed => return,
                 .pending => {},
@@ -7648,8 +7649,9 @@ pub const ApiHttpServer = struct {
             // restore intent to drain instead.
             if (restore_jobs.containsTableIndex(published_table_indexes, @intCast(i))) {
                 if (!self.cfg.deployment_mode.isStandalone()) {
-                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id) catch |err| switch (err) {
-                        error.RestoreJobFenced => return error.NotLeader,
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, cancellation) catch |err| switch (err) {
+                        error.NotLeader => return error.NotLeader,
+                        error.Cancelled => return error.Cancelled,
                         else => {
                             std.log.err("cluster restore completion wait failed table={s} backup_id={s} err={s}", .{ table_name, table_backup_id, @errorName(err) });
                             return error.InternalFailure;
@@ -7692,8 +7694,9 @@ pub const ApiHttpServer = struct {
                         if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                         return error.InternalFailure;
                     };
-                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id) catch |err| switch (err) {
-                        error.RestoreJobFenced => return error.NotLeader,
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, cancellation) catch |err| switch (err) {
+                        error.NotLeader => return error.NotLeader,
+                        error.Cancelled => return error.Cancelled,
                         else => {
                             std.log.err("cluster restore completion wait failed table={s} backup_id={s} err={s}", .{ table_name, table_backup_id, @errorName(err) });
                             return error.InternalFailure;
@@ -7769,11 +7772,16 @@ pub const ApiHttpServer = struct {
         self.alloc.free(encoded);
     }
 
-    fn ensureRestoreActive(self: *ApiHttpServer, cancellation: ?RestoreCancellation) !void {
+    fn ensureRestoreActive(self: *ApiHttpServer, cancellation: ?RestoreCancellation) error{ NotLeader, Cancelled, InternalFailure }!void {
         if (!self.restoreExecutionPermitted()) return error.NotLeader;
         const token = cancellation orelse return;
-        if (self.restore_job_store.cancellationRequested(self.alloc, token.job_id, token.attempt_id) catch true)
-            return error.Cancelled;
+        const attempt_state = self.restore_job_store.attemptState(self.alloc, token.job_id, token.attempt_id) catch
+            return error.InternalFailure;
+        switch (attempt_state) {
+            .active => {},
+            .cancelled => return error.Cancelled,
+            .fenced => return error.NotLeader,
+        }
     }
 
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
@@ -8886,8 +8894,8 @@ pub const ApiHttpServer = struct {
                     };
                 }
                 if (!self.cfg.deployment_mode.isStandalone()) {
-                    self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id) catch |err| {
-                        if (err == error.RestoreJobFenced) return err;
+                    self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
+                        if (isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
@@ -8916,7 +8924,17 @@ pub const ApiHttpServer = struct {
             },
         };
         defer self.alloc.free(result);
-        const finished = try self.restore_job_store.finish(self.alloc, state, result);
+        var cluster_summary: ?restore_jobs.ClusterResultSummary = null;
+        if (state.scope == .cluster) cluster_summary = try restore_jobs.summarizeClusterResultAlloc(self.alloc, result);
+        defer if (cluster_summary) |*summary| summary.deinit(self.alloc);
+        const terminal_result = if (cluster_summary) |summary| summary.encoded else result;
+        const finished = if (cluster_summary) |summary|
+            if (summary.succeeded)
+                try self.restore_job_store.finish(self.alloc, state, terminal_result)
+            else
+                try self.restore_job_store.failWithResult(self.alloc, state, terminal_result, "ClusterRestorePartialFailure")
+        else
+            try self.restore_job_store.finish(self.alloc, state, terminal_result);
         self.alloc.free(finished);
     }
 
@@ -8952,7 +8970,7 @@ pub const ApiHttpServer = struct {
         } else null;
         const published_table_count: usize = if (parsed.value.published_table_indexes) |indexes| indexes.len else 0;
         const completed_table_count: usize = if (parsed.value.completed_table_indexes) |indexes| indexes.len else 0;
-        var response = try jsonResponseWithStatus(self.alloc, status, .{
+        var response = try jsonResponseWithStatusOmitNullOptionals(self.alloc, status, .{
             .job_id = parsed.value.job_id,
             .attempt_id = parsed.value.attempt_id,
             .scope = parsed.value.scope,

@@ -18,11 +18,29 @@ const restore_job_prune_interval_ms: u64 = 60 * 1000;
 const restore_job_prune_batch_size: usize = 1024;
 pub const max_tables_per_job: usize = 256;
 const max_restore_string_bytes: usize = 4096;
+const max_initial_restore_job_bytes: usize = 56 * 1024;
+const max_cluster_result_bytes: usize = 4 * 1024;
+const max_cluster_failure_details: usize = 8;
+const max_cluster_failure_table_name_bytes: usize = 256;
+const max_cluster_failure_error_bytes: usize = 256;
+const restore_job_format_version: u32 = 1;
 
 pub const Scope = enum { table, cluster };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
+pub const AttemptState = enum { active, cancelled, fenced };
+
+pub const ClusterResultSummary = struct {
+    encoded: []u8,
+    succeeded: bool,
+
+    pub fn deinit(self: *ClusterResultSummary, alloc: std.mem.Allocator) void {
+        alloc.free(self.encoded);
+        self.* = undefined;
+    }
+};
 
 pub const JobState = struct {
+    format_version: u32,
     job_id: u64,
     enqueue_sequence: u64,
     attempt_id: u64 = 0,
@@ -158,6 +176,7 @@ pub const Store = struct {
         if (self.opened != null or self.runtime != null or self.replicated != null or self.jobs.count() != 0) return error.RestoreJobStoreAlreadyAttached;
         self.opened = opened;
         errdefer self.opened = null;
+        errdefer self.clearInMemoryLocked();
         var after_key: ?[]u8 = null;
         defer if (after_key) |key| self.alloc.free(key);
         while (true) {
@@ -177,6 +196,7 @@ pub const Store = struct {
                 if (self.jobs.count() >= max_retained_restore_jobs) return error.RestoreJobCapacityExceeded;
                 const encoded = if (parsed.value.phase == .running) blk: {
                     const recovered = try encode(self.alloc, .{
+                        .format_version = restore_job_format_version,
                         .job_id = parsed.value.job_id,
                         .enqueue_sequence = parsed.value.enqueue_sequence,
                         .attempt_id = parsed.value.attempt_id,
@@ -236,6 +256,7 @@ pub const Store = struct {
         if (self.opened != null or self.runtime != null or self.replicated != null or self.jobs.count() != 0) return error.RestoreJobStoreAlreadyAttached;
         self.runtime = runtime;
         errdefer self.runtime = null;
+        errdefer self.clearInMemoryLocked();
 
         var rows = std.ArrayListUnmanaged(struct { key: []u8, value: []u8 }).empty;
         defer {
@@ -245,6 +266,7 @@ pub const Store = struct {
             }
             rows.deinit(self.alloc);
         }
+        var retained_bytes: usize = 0;
         {
             var txn = try runtime.beginCurrentScan();
             defer txn.abort();
@@ -253,6 +275,10 @@ pub const Store = struct {
             var entry = try cursor.seekAtOrAfter(key_prefix);
             while (entry) |row| : (entry = try cursor.next()) {
                 if (!std.mem.startsWith(u8, row.key, key_prefix)) break;
+                if (row.value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+                if (rows.items.len >= max_retained_restore_jobs) return error.RestoreJobCapacityExceeded;
+                retained_bytes = std.math.add(usize, retained_bytes, row.value.len) catch return error.RestoreJobCapacityExceeded;
+                if (retained_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
                 try rows.append(self.alloc, .{
                     .key = try self.alloc.dupe(u8, row.key),
                     .value = try self.alloc.dupe(u8, row.value),
@@ -269,6 +295,7 @@ pub const Store = struct {
         if (self.opened != null or self.runtime != null or self.replicated != null or self.jobs.count() != 0) return error.RestoreJobStoreAlreadyAttached;
         self.replicated = persistence;
         errdefer self.replicated = null;
+        errdefer self.clearInMemoryLocked();
         const rows = try persistence.vtable.load(persistence.ptr, self.alloc);
         defer ReplicatedPersistence.freeRows(self.alloc, rows);
         for (rows) |row| try self.attachReplicatedRowLocked(row.key, row.value);
@@ -372,6 +399,7 @@ pub const Store = struct {
         var parsed = std.json.parseFromSlice(JobState, alloc, value, .{ .ignore_unknown_fields = true }) catch
             return error.CorruptRestoreJobStore;
         defer parsed.deinit();
+        try validateProgressState(parsed.value);
         return isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= nowMillis();
     }
 
@@ -379,6 +407,7 @@ pub const Store = struct {
         if (value.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
         var parsed = std.json.parseFromSlice(JobState, self.alloc, value, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
         defer parsed.deinit();
+        try validateProgressState(parsed.value);
         try self.validateRowKeyLocked(key, parsed.value.job_id);
         if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= nowMillis()) {
             try self.persistDeleteLocked(key);
@@ -387,6 +416,7 @@ pub const Store = struct {
         if (self.jobs.count() >= max_retained_restore_jobs) return error.RestoreJobCapacityExceeded;
         const encoded = if (parsed.value.phase == .running) blk: {
             const recovered = try encode(self.alloc, .{
+                .format_version = restore_job_format_version,
                 .job_id = parsed.value.job_id,
                 .enqueue_sequence = parsed.value.enqueue_sequence,
                 .attempt_id = parsed.value.attempt_id,
@@ -477,6 +507,7 @@ pub const Store = struct {
         if (enqueue_sequence == 0 or enqueue_sequence == std.math.maxInt(u64)) return error.RestoreJobCapacityExceeded;
         self.next_enqueue_sequence = enqueue_sequence + 1;
         const encoded = try encode(alloc, .{
+            .format_version = restore_job_format_version,
             .job_id = job_id,
             .enqueue_sequence = enqueue_sequence,
             .scope = req.scope,
@@ -494,7 +525,10 @@ pub const Store = struct {
             .expires_at_ms = std.math.maxInt(i64),
         });
         errdefer alloc.free(encoded);
-        if (encoded.len > max_restore_job_record_bytes) return error.RestoreJobRecordTooLarge;
+        // Leave room for bounded progress checkpoints and the compact terminal
+        // result. Admission must fail before work starts rather than discover
+        // after an irreversible restore that the terminal record cannot fit.
+        if (encoded.len > max_initial_restore_job_bytes) return error.RestoreJobRecordTooLarge;
         try self.jobs.ensureUnusedCapacity(self.alloc, 1);
         try self.pending.ensureUnusedCapacity(self.alloc, 1);
         if (explicit_idempotency_key != null) try self.idempotency.ensureUnusedCapacity(self.alloc, 1);
@@ -644,6 +678,10 @@ pub const Store = struct {
         return try self.finishAs(alloc, expected, .failed, null, err_name);
     }
 
+    pub fn failWithResult(self: *Store, alloc: std.mem.Allocator, expected: JobState, result_json: []const u8, err_name: []const u8) ![]u8 {
+        return try self.finishAs(alloc, expected, .failed, result_json, err_name);
+    }
+
     pub fn failRunningById(self: *Store, alloc: std.mem.Allocator, job_id: u64, err_name: []const u8) !void {
         self.lock();
         defer self.mutex.unlock();
@@ -688,13 +726,14 @@ pub const Store = struct {
         });
     }
 
-    pub fn cancellationRequested(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64) !bool {
+    pub fn attemptState(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64) !AttemptState {
         self.lock();
         defer self.mutex.unlock();
-        const current = self.jobs.get(job_id) orelse return true;
+        const current = self.jobs.get(job_id) orelse return .fenced;
         var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        return parsed.value.attempt_id != attempt_id or parsed.value.cancel_requested or parsed.value.phase != .running;
+        if (parsed.value.attempt_id != attempt_id or parsed.value.phase != .running) return .fenced;
+        return if (parsed.value.cancel_requested) .cancelled else .active;
     }
 
     const Update = struct {
@@ -709,6 +748,7 @@ pub const Store = struct {
 
     fn updateLocked(self: *Store, alloc: std.mem.Allocator, current: JobState, update: Update) ![]u8 {
         const next: JobState = .{
+            .format_version = restore_job_format_version,
             .job_id = current.job_id,
             .enqueue_sequence = current.enqueue_sequence,
             .attempt_id = update.attempt_id orelse current.attempt_id,
@@ -903,6 +943,7 @@ pub fn containsTableIndex(values: []const u16, needle: u16) bool {
 }
 
 fn validateProgressState(state: JobState) !void {
+    if (state.format_version != restore_job_format_version) return error.UnsupportedRestoreJobFormat;
     const published = state.published_table_indexes orelse &.{};
     const completed = state.completed_table_indexes orelse &.{};
     if (published.len > max_tables_per_job or completed.len > published.len) return error.CorruptRestoreJobStore;
@@ -918,6 +959,92 @@ fn validateProgressState(state: JobState) !void {
         if (!containsTableIndex(published, table_index) or containsTableIndex(completed[0..i], table_index))
             return error.CorruptRestoreJobStore;
     }
+}
+
+const ClusterRestoreTableResult = struct {
+    name: []const u8,
+    status: []const u8,
+    @"error": ?[]const u8 = null,
+};
+
+const ClusterRestoreResult = struct {
+    tables: []const ClusterRestoreTableResult,
+};
+
+const ClusterFailureDetail = struct {
+    table_name: []const u8,
+    @"error": []const u8,
+    table_name_truncated: bool = false,
+};
+
+/// Converts the detailed execution response into the bounded durable result
+/// stored with a restore job. The public job phase is derived from the same
+/// table statuses, so a partial restore can never be reported as succeeded.
+pub fn summarizeClusterResultAlloc(alloc: std.mem.Allocator, raw: []const u8) !ClusterResultSummary {
+    var parsed = std.json.parseFromSlice(ClusterRestoreResult, alloc, raw, .{ .ignore_unknown_fields = true }) catch
+        return error.InvalidClusterRestoreResult;
+    defer parsed.deinit();
+    if (parsed.value.tables.len > max_tables_per_job) return error.InvalidClusterRestoreResult;
+
+    var triggered: usize = 0;
+    var skipped: usize = 0;
+    var failed: usize = 0;
+    for (parsed.value.tables) |table| {
+        if (std.mem.eql(u8, table.status, "triggered")) {
+            triggered += 1;
+        } else if (std.mem.eql(u8, table.status, "skipped")) {
+            skipped += 1;
+        } else if (std.mem.eql(u8, table.status, "failed")) {
+            failed += 1;
+        } else {
+            return error.InvalidClusterRestoreResult;
+        }
+    }
+
+    const failure_capacity = @min(failed, max_cluster_failure_details);
+    const failures = try alloc.alloc(ClusterFailureDetail, failure_capacity);
+    defer alloc.free(failures);
+    var failure_count: usize = 0;
+    var details_truncated = failed > failure_capacity;
+    for (parsed.value.tables) |table| {
+        if (!std.mem.eql(u8, table.status, "failed") or failure_count == failures.len) continue;
+        const bounded_name = boundedUtf8Prefix(table.name, max_cluster_failure_table_name_bytes);
+        const name_truncated = bounded_name.len != table.name.len;
+        const raw_error = table.@"error" orelse "restore failed";
+        const bounded_error = boundedUtf8Prefix(raw_error, max_cluster_failure_error_bytes);
+        details_truncated = details_truncated or name_truncated or bounded_error.len != raw_error.len;
+        failures[failure_count] = .{
+            .table_name = bounded_name,
+            .@"error" = bounded_error,
+            .table_name_truncated = name_truncated,
+        };
+        failure_count += 1;
+    }
+
+    const status: []const u8 = if (failed == 0)
+        "completed"
+    else if (triggered == 0)
+        "failed"
+    else
+        "partial";
+    const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+        .status = status,
+        .triggered_table_count = triggered,
+        .skipped_table_count = skipped,
+        .failed_table_count = failed,
+        .failure_details = failures[0..failure_count],
+        .failure_details_truncated = details_truncated,
+    }, .{});
+    errdefer alloc.free(encoded);
+    if (encoded.len > max_cluster_result_bytes) return error.ClusterRestoreResultTooLarge;
+    return .{ .encoded = encoded, .succeeded = failed == 0 };
+}
+
+fn boundedUtf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
+    if (value.len <= max_bytes) return value;
+    var end = max_bytes;
+    while (end > 0 and value[end] & 0xc0 == 0x80) end -= 1;
+    return value[0..end];
 }
 
 pub fn isTerminal(phase: Phase) bool {
@@ -1088,8 +1215,12 @@ test "successful restore completion wins a racing cancellation" {
     var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
     defer parsed_running.deinit();
 
+    try std.testing.expectEqual(AttemptState.active, try store.attemptState(std.testing.allocator, parsed_started.value.job_id, parsed_running.value.attempt_id));
+    try std.testing.expectEqual(AttemptState.fenced, try store.attemptState(std.testing.allocator, parsed_started.value.job_id, parsed_running.value.attempt_id + 1));
+
     const cancelling = (try store.cancel(std.testing.allocator, parsed_started.value.job_id)).?;
     defer std.testing.allocator.free(cancelling);
+    try std.testing.expectEqual(AttemptState.cancelled, try store.attemptState(std.testing.allocator, parsed_started.value.job_id, parsed_running.value.attempt_id));
     const completed = try store.finish(std.testing.allocator, parsed_running.value, "{\"restored\":true}");
     defer std.testing.allocator.free(completed);
     var parsed_completed = try std.json.parseFromSlice(JobState, std.testing.allocator, completed, .{});
@@ -1166,6 +1297,7 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
     const expired_key = try jobKey(std.testing.allocator, 999);
     defer std.testing.allocator.free(expired_key);
     const expired = try encode(std.testing.allocator, .{
+        .format_version = restore_job_format_version,
         .job_id = 999,
         .enqueue_sequence = 999,
         .scope = .cluster,
@@ -1274,11 +1406,20 @@ test "restore progress ordinals remain bounded at maximum table count" {
     var store = Store.initWithIo(alloc, std.testing.io);
     defer store.deinit();
     try store.attachRuntime(&runtime);
+    var table_name_storage: [max_tables_per_job][200]u8 = undefined;
+    var table_names: [max_tables_per_job][]const u8 = undefined;
+    for (&table_name_storage, 0..) |*name, i| {
+        @memset(name, 'x');
+        name[0] = @intCast('a' + i / 26);
+        name[1] = @intCast('a' + i % 26);
+        table_names[i] = name;
+    }
     const started = try store.start(alloc, .{
         .scope = .cluster,
         .backup_id = "large-cluster",
         .location = "s3://archive/large-cluster",
         .connection = "archive-reader",
+        .table_names = &table_names,
     });
     defer alloc.free(started);
     var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{});
@@ -1302,6 +1443,51 @@ test "restore progress ordinals remain bounded at maximum table count" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, max_tables_per_job), parsed.value.published_table_indexes.?.len);
     try std.testing.expectEqual(@as(usize, max_tables_per_job), parsed.value.completed_table_indexes.?.len);
+
+    var long_failure_name: [1024]u8 = undefined;
+    @memset(&long_failure_name, 'f');
+    var failure_tables: [10]ClusterRestoreTableResult = undefined;
+    for (&failure_tables) |*table| table.* = .{ .name = &long_failure_name, .status = "failed", .@"error" = "restore failed" };
+    const detailed = try std.json.Stringify.valueAlloc(alloc, .{ .tables = &failure_tables }, .{});
+    defer alloc.free(detailed);
+    var summary = try summarizeClusterResultAlloc(alloc, detailed);
+    defer summary.deinit(alloc);
+    const terminal = try store.failWithResult(alloc, parsed_running.value, summary.encoded, "ClusterRestorePartialFailure");
+    defer alloc.free(terminal);
+    try std.testing.expect(terminal.len <= max_restore_job_record_bytes);
+    var parsed_terminal = try std.json.parseFromSlice(JobState, alloc, terminal, .{});
+    defer parsed_terminal.deinit();
+    try std.testing.expectEqual(Phase.failed, parsed_terminal.value.phase);
+}
+
+test "cluster restore summaries are truthful and bounded" {
+    const alloc = std.testing.allocator;
+    var long_name: [1024]u8 = undefined;
+    @memset(&long_name, 'x');
+    var tables: [10]ClusterRestoreTableResult = undefined;
+    for (&tables) |*table| table.* = .{
+        .name = &long_name,
+        .status = "failed",
+        .@"error" = "restore failed",
+    };
+    const detailed = try std.json.Stringify.valueAlloc(alloc, .{ .tables = &tables, .status = "failed" }, .{});
+    defer alloc.free(detailed);
+    var summary = try summarizeClusterResultAlloc(alloc, detailed);
+    defer summary.deinit(alloc);
+    try std.testing.expect(!summary.succeeded);
+    try std.testing.expect(summary.encoded.len <= max_cluster_result_bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, summary.encoded, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("failed", object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 10), object.get("failed_table_count").?.integer);
+    try std.testing.expectEqual(@as(usize, max_cluster_failure_details), object.get("failure_details").?.array.items.len);
+    try std.testing.expect(object.get("failure_details_truncated").?.bool);
+    try std.testing.expect(object.get("failure_details").?.array.items[0].object.get("table_name").?.string.len <= max_cluster_failure_table_name_bytes);
+
+    var successful = try summarizeClusterResultAlloc(alloc, "{\"status\":\"triggered\",\"tables\":[{\"name\":\"docs\",\"status\":\"triggered\"},{\"name\":\"existing\",\"status\":\"skipped\"}]}");
+    defer successful.deinit(alloc);
+    try std.testing.expect(successful.succeeded);
 }
 
 test "restore job store rejects oversized request state" {
@@ -1315,6 +1501,20 @@ test "restore job store rejects oversized request state" {
         .backup_id = "daily",
         .location = oversized,
         .connection = "archive-reader",
+    }));
+    var large_names_storage: [15][4000]u8 = undefined;
+    var large_names: [large_names_storage.len][]const u8 = undefined;
+    for (&large_names_storage, 0..) |*name, i| {
+        @memset(name, 'x');
+        name[0] = @intCast('a' + i);
+        large_names[i] = name;
+    }
+    try std.testing.expectError(error.RestoreJobRecordTooLarge, store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/backups",
+        .connection = "archive-reader",
+        .table_names = &large_names,
     }));
     try std.testing.expectError(error.DuplicateRestoreTableName, store.start(std.testing.allocator, .{
         .scope = .cluster,

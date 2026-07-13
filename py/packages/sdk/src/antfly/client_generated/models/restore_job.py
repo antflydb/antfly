@@ -27,17 +27,22 @@ class RestoreJob:
         backup_id (str):
         phase (RestoreJobPhase):
         cancel_requested (bool):
+        published_table_count (int): Number of table restore intents durably published. Published tables are adopted,
+            not republished, after failover.
+        completed_table_count (int): Number of published tables whose placement replicas completed restore and whose
+            completion checkpoint is durable.
         created_at_ms (int):
         updated_at_ms (int):
         expires_at_ms (int): Unix epoch milliseconds after which this terminal job record and its idempotency key may be
             removed.
         table_name (str | Unset):
-        published_table_count (int | Unset): Number of table restore intents durably published. Published tables are
-            adopted, not republished, after failover.
-        completed_table_count (int | Unset): Number of published tables whose placement replicas completed restore and
-            whose completion checkpoint is durable.
         total_table_count (int | Unset): Requested table count when known before execution.
-        result (RestoreJobResult | Unset):
+        result (RestoreJobResult | Unset): Bounded terminal result. Cluster restores report aggregate triggered,
+            skipped, and failed table counts plus
+            a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part
+            of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for
+            partial
+            progress and use a new idempotency key when retrying a changed request.
         error (str | Unset):
     """
 
@@ -47,12 +52,12 @@ class RestoreJob:
     backup_id: str
     phase: RestoreJobPhase
     cancel_requested: bool
+    published_table_count: int
+    completed_table_count: int
     created_at_ms: int
     updated_at_ms: int
     expires_at_ms: int
     table_name: str | Unset = UNSET
-    published_table_count: int | Unset = UNSET
-    completed_table_count: int | Unset = UNSET
     total_table_count: int | Unset = UNSET
     result: RestoreJobResult | Unset = UNSET
     error: str | Unset = UNSET
@@ -71,6 +76,10 @@ class RestoreJob:
 
         cancel_requested = self.cancel_requested
 
+        published_table_count = self.published_table_count
+
+        completed_table_count = self.completed_table_count
+
         created_at_ms = self.created_at_ms
 
         updated_at_ms = self.updated_at_ms
@@ -78,10 +87,6 @@ class RestoreJob:
         expires_at_ms = self.expires_at_ms
 
         table_name = self.table_name
-
-        published_table_count = self.published_table_count
-
-        completed_table_count = self.completed_table_count
 
         total_table_count = self.total_table_count
 
@@ -101,6 +106,8 @@ class RestoreJob:
                 "backup_id": backup_id,
                 "phase": phase,
                 "cancel_requested": cancel_requested,
+                "published_table_count": published_table_count,
+                "completed_table_count": completed_table_count,
                 "created_at_ms": created_at_ms,
                 "updated_at_ms": updated_at_ms,
                 "expires_at_ms": expires_at_ms,
@@ -108,10 +115,6 @@ class RestoreJob:
         )
         if table_name is not UNSET:
             field_dict["table_name"] = table_name
-        if published_table_count is not UNSET:
-            field_dict["published_table_count"] = published_table_count
-        if completed_table_count is not UNSET:
-            field_dict["completed_table_count"] = completed_table_count
         if total_table_count is not UNSET:
             field_dict["total_table_count"] = total_table_count
         if result is not UNSET:
@@ -138,6 +141,10 @@ class RestoreJob:
 
         cancel_requested = d.pop("cancel_requested")
 
+        published_table_count = d.pop("published_table_count")
+
+        completed_table_count = d.pop("completed_table_count")
+
         created_at_ms = d.pop("created_at_ms")
 
         updated_at_ms = d.pop("updated_at_ms")
@@ -145,10 +152,6 @@ class RestoreJob:
         expires_at_ms = d.pop("expires_at_ms")
 
         table_name = d.pop("table_name", UNSET)
-
-        published_table_count = d.pop("published_table_count", UNSET)
-
-        completed_table_count = d.pop("completed_table_count", UNSET)
 
         total_table_count = d.pop("total_table_count", UNSET)
 
@@ -168,12 +171,12 @@ class RestoreJob:
             backup_id=backup_id,
             phase=phase,
             cancel_requested=cancel_requested,
+            published_table_count=published_table_count,
+            completed_table_count=completed_table_count,
             created_at_ms=created_at_ms,
             updated_at_ms=updated_at_ms,
             expires_at_ms=expires_at_ms,
             table_name=table_name,
-            published_table_count=published_table_count,
-            completed_table_count=completed_table_count,
             total_table_count=total_table_count,
             result=result,
             error=error,

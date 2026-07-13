@@ -6758,11 +6758,12 @@ pub const RestoreJob = struct {
     phase: []const u8,
     cancel_requested: bool,
     /// Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
-    published_table_count: ?i64 = null,
+    published_table_count: i64,
     /// Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
-    completed_table_count: ?i64 = null,
+    completed_table_count: i64,
     /// Requested table count when known before execution.
     total_table_count: ?i64 = null,
+    /// Bounded terminal result. Cluster restores report aggregate triggered, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
     result: ?std.json.Value = null,
     @"error": ?[]const u8 = null,
     created_at_ms: i64,

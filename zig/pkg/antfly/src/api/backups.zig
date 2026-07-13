@@ -2255,11 +2255,13 @@ fn trimRightSlash(value: []const u8) []const u8 {
 }
 
 pub fn copyDirectoryRecursive(alloc: std.mem.Allocator, src_path: []const u8, dest_path: []const u8) !void {
-    try ensureDirPath(dest_path);
-
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
+    return copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_path, dest_path);
+}
+
+fn copyDirectoryRecursiveWithIo(alloc: std.mem.Allocator, io: std.Io, src_path: []const u8, dest_path: []const u8) !void {
+    try ensureDirPathWithIo(io, dest_path);
 
     var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
     defer src_dir.close(io);
@@ -2274,8 +2276,8 @@ pub fn copyDirectoryRecursive(alloc: std.mem.Allocator, src_path: []const u8, de
         defer alloc.free(dest_entry_path);
 
         switch (entry.kind) {
-            .directory => try ensureDirPath(dest_entry_path),
-            .file => try copyFileAbsolute(src_entry_path, dest_entry_path),
+            .directory => try ensureDirPathWithIo(io, dest_entry_path),
+            .file => try copyFileAbsoluteWithIo(io, src_entry_path, dest_entry_path),
             else => return error.UnsupportedBackupArtifact,
         }
     }
@@ -2378,11 +2380,13 @@ fn pathExists(path: []const u8) !bool {
 }
 
 fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
-    if (std.fs.path.dirname(dest_path)) |dir_name| try ensureDirPath(dir_name);
-
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
+    return copyFileAbsoluteWithIo(io_impl.io(), src_path, dest_path);
+}
+
+fn copyFileAbsoluteWithIo(io: std.Io, src_path: []const u8, dest_path: []const u8) !void {
+    if (std.fs.path.dirname(dest_path)) |dir_name| try ensureDirPathWithIo(io, dir_name);
 
     var src = if (std.fs.path.isAbsolute(src_path))
         try std.Io.Dir.openFileAbsolute(io, src_path, .{})
@@ -2407,7 +2411,11 @@ fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
 fn ensureDirPath(path: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    try fs_paths.createDirPathPortable(io_impl.io(), path);
+    return ensureDirPathWithIo(io_impl.io(), path);
+}
+
+fn ensureDirPathWithIo(io: std.Io, path: []const u8) !void {
+    try fs_paths.createDirPathPortable(io, path);
 }
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
@@ -2881,6 +2889,35 @@ test "filesystem backup listing is bounded and cursor stable" {
     try std.testing.expectEqual(@as(usize, 1), second.backups.len);
     try std.testing.expectEqualStrings("prod-snap", second.backups[0].backup_id);
     try std.testing.expectEqual(@as(?[]u8, null), second.next_cursor);
+}
+
+test "native backup directory copy preserves nested files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copy-src", .{tmp.sub_path});
+    defer alloc.free(src);
+    const dst = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copy-dst", .{tmp.sub_path});
+    defer alloc.free(dst);
+    const top = try std.fmt.allocPrint(alloc, "{s}/top.sst", .{src});
+    defer alloc.free(top);
+    const nested = try std.fmt.allocPrint(alloc, "{s}/nested/data.sst", .{src});
+    defer alloc.free(nested);
+    try writeFileAbsolute(top, "top");
+    try writeFileAbsolute(nested, "nested");
+
+    try copyDirectoryRecursive(alloc, src, dst);
+
+    const copied_top_path = try std.fmt.allocPrint(alloc, "{s}/top.sst", .{dst});
+    defer alloc.free(copied_top_path);
+    const copied_nested_path = try std.fmt.allocPrint(alloc, "{s}/nested/data.sst", .{dst});
+    defer alloc.free(copied_nested_path);
+    const copied_top = try readFileAbsoluteAlloc(alloc, copied_top_path, 16);
+    defer alloc.free(copied_top);
+    const copied_nested = try readFileAbsoluteAlloc(alloc, copied_nested_path, 16);
+    defer alloc.free(copied_nested);
+    try std.testing.expectEqualStrings("top", copied_top);
+    try std.testing.expectEqualStrings("nested", copied_nested);
 }
 
 test "go portable metadata parses as table backup manifest" {

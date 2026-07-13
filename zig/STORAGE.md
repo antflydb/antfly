@@ -334,19 +334,28 @@ the catalog clears the table's restore intents, and the completion checkpoint is
 durable. Job status exposes separate published and completed table counts so
 operators can distinguish accepted work from readable restored data. Progress
 is stored as bounded manifest ordinals rather than repeated table-name strings,
-so its durable footprint remains O(table count). Destructive overwrite is
+so its durable footprint remains O(table count). Cluster jobs persist a bounded
+terminal summary instead of duplicating every table name: aggregate counts are
+complete, up to eight failure details are retained, and a truncation flag is
+explicit. A partial cluster restore has phase `failed`, so CLI and automation
+cannot mistake partial data for complete success. Destructive overwrite is
 intentionally not a restore mode until the catalog supports an atomic
 staged-generation swap.
 Cancellation is cooperative and best-effort: queued work becomes cancelled,
-running work stops at a safe boundary, and a successful irreversible publication
-that races cancellation remains `succeeded` with `cancel_requested: true` for
+running work stops at a safe boundary, including while the metadata leader is
+waiting for placement replicas, and a successful irreversible publication that
+races cancellation remains `succeeded` with `cancel_requested: true` for
 auditability. The API never reports restored data as cancelled.
 Terminal job state and explicit idempotency keys are retained for seven days;
-the history is bounded by 10,000 jobs and 64 KiB per encoded job, and rejects
-new work instead of silently evicting an unexpired key. Job IDs are random
+the history is bounded by 10,000 jobs, 64 MiB total, and 64 KiB per encoded job.
+Admission reserves space for progress and the bounded terminal summary and
+rejects new work instead of discovering a record-size failure after restoring
+data. Job IDs are random
 opaque 63-bit values. In distributed deployments, job records, idempotency
 fences, published/completed table checkpoints, and the runnable queue are metadata-Raft
-state. Followers may serve locally applied job state for scalable polling; if a
+state. Durable job records carry an explicit internal format version and fail
+closed if a future binary cannot interpret them. Followers may serve locally
+applied job state for scalable polling; if a
 new job has not applied there yet, they return a retryable `503` with
 `Retry-After` instead of a false `404`. The Antfly CLI retries this response
 until its wait deadline, so polling works behind non-sticky load balancers.

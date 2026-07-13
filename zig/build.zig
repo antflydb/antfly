@@ -2439,6 +2439,7 @@ pub fn build(b: *std.Build) void {
             "restore requests without idempotency keys create independent opaque jobs",
             "restore runtime store persists checkpoints and requeues interrupted work",
             "restore progress ordinals remain bounded at maximum table count",
+            "cluster restore summaries are truthful and bounded",
             "restore job store rejects oversized request state",
         },
         .test_runner = .{
@@ -4075,6 +4076,7 @@ pub fn build(b: *std.Build) void {
             "remote backup metadata reads are size bounded",
             "cluster backup list uses top-level remote manifests without recursing into payloads",
             "filesystem backup listing is bounded and cursor stable",
+            "native backup directory copy preserves nested files",
             "remote portable file transfer uses objectstore file paths",
             "remote backup directory download paginates and enforces segment prefix",
             "api http server lists cluster backups through public route",

@@ -4730,7 +4730,7 @@ components:
           example: "skip_if_exists"
     RestoreJob:
       type: object
-      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, created_at_ms, updated_at_ms, expires_at_ms]
+      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, published_table_count, completed_table_count, created_at_ms, updated_at_ms, expires_at_ms]
       properties:
         job_id: { type: integer, format: int64 }
         attempt_id: { type: integer, format: int64 }
@@ -4756,7 +4756,38 @@ components:
           description: Requested table count when known before execution.
         result:
           type: object
-          additionalProperties: true
+          additionalProperties: false
+          description: |
+            Bounded terminal result. Cluster restores report aggregate triggered, skipped, and failed table counts plus
+            a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part
+            of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for partial
+            progress and use a new idempotency key when retrying a changed request.
+          properties:
+            restore:
+              type: string
+              enum: [triggered]
+              description: Present for a successful single-table restore.
+            status:
+              type: string
+              enum: [completed, partial, failed]
+              description: Aggregate terminal status for a cluster restore.
+            triggered_table_count: { type: integer, format: int64, minimum: 0 }
+            skipped_table_count: { type: integer, format: int64, minimum: 0 }
+            failed_table_count: { type: integer, format: int64, minimum: 0 }
+            failure_details:
+              type: array
+              maxItems: 8
+              items:
+                type: object
+                additionalProperties: false
+                required: [table_name, error, table_name_truncated]
+                properties:
+                  table_name: { type: string, maxLength: 256 }
+                  error: { type: string, maxLength: 256 }
+                  table_name_truncated: { type: boolean }
+            failure_details_truncated:
+              type: boolean
+              description: True when additional failed tables or part of a long table name or error were omitted.
         error: { type: string }
         created_at_ms: { type: integer, format: int64 }
         updated_at_ms: { type: integer, format: int64 }

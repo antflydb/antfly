@@ -191,9 +191,11 @@ An ambiguous publication/checkpoint interruption fails closed for operator
 inspection. Destructive overwrite is not exposed until
 table generations can be staged and atomically swapped. Terminal state and
 explicit idempotency keys are retained for seven days in a history bounded by
-10,000 jobs and 64 KiB per encoded job. Cancellation is checked at safe table
-publication boundaries. A standalone process executes at most two restore jobs
-concurrently; the remainder stay durably queued inside the `.aflite` file.
+10,000 jobs, 64 MiB total, and 64 KiB per encoded job. Admission reserves room
+for progress and terminal state before work begins. Cancellation is checked at
+safe table publication boundaries. A standalone process executes at most two
+restore jobs concurrently; the remainder stay durably queued inside the
+`.aflite` file.
 `antfly restore` always prints the accepted or terminal job document. Use
 `--idempotency-key` for retry-safe submission and `--wait` (optionally
 `--wait-timeout <seconds>`) for a terminal exit status. Failed and cancelled
