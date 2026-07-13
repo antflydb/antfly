@@ -166,10 +166,14 @@ files when an archive is modified concurrently. The filesystem provider keeps
 metadata and bytes in one versioned object envelope published by an atomic
 rename after syncing the staged file, performs range requests with positional
 `std.Io` reads, and serializes mutations with bounded striped advisory locks.
-Filesystems without lock
-support fail closed rather than weakening conditional writes. Upload staging
-lives outside the enumerable key namespace, so concurrent pagination cannot
-observe partial objects or internal temporary keys.
+Filesystems without lock support fail closed rather than weakening conditional
+writes. Upload staging lives outside the enumerable key namespace, so
+concurrent pagination cannot observe partial objects or internal temporary
+keys. Staged files retain an exclusive advisory lock for the lifetime of an
+upload. At startup, the provider removes only unlocked staging files older than
+24 hours; cleanup scans bucket staging directories rather than stored objects,
+so crash recovery is bounded by bucket count and abandoned uploads instead of
+database size.
 
 Whole-file filesystem restores use a provider-native streaming path: the
 object is opened once, SHA-256 is recomputed while copying, and the destination

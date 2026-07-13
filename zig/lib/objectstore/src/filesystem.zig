@@ -21,6 +21,7 @@ const multipart_part_size: usize = 5 * 1024 * 1024;
 const max_content_type_bytes: usize = 16 * 1024;
 const object_magic = "AFOBJ001";
 const object_header_len = object_magic.len + @sizeOf(u64) + @sizeOf(u32) + 64;
+const stale_staging_age_ns: i96 = 24 * 60 * 60 * std.time.ns_per_s;
 const ObjectRange = struct { start: usize, end: usize };
 
 pub const FilesystemClient = struct {
@@ -43,6 +44,7 @@ pub const FilesystemClient = struct {
 
     fn initWithIoOwned(alloc: Allocator, root_dir: []const u8, io: std.Io, io_impl: ?*std.Io.Threaded) !FilesystemClient {
         try std.Io.Dir.cwd().createDirPath(io, root_dir);
+        try cleanupStaleStagingFiles(alloc, io, root_dir, stale_staging_age_ns);
         return .{
             .alloc = alloc,
             .root_dir = try alloc.dupe(u8, root_dir),
@@ -490,6 +492,73 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, parent);
 }
 
+fn cleanupStaleStagingFiles(alloc: Allocator, io: std.Io, root_dir: []const u8, minimum_age_ns: i96) !void {
+    const buckets_root = try std.fs.path.join(alloc, &.{ root_dir, "buckets" });
+    defer alloc.free(buckets_root);
+    var buckets_dir = std.Io.Dir.cwd().openDir(io, buckets_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer buckets_dir.close(io);
+    const now = std.Io.Timestamp.now(io, .real);
+    const cutoff_ns = now.toNanoseconds() - minimum_age_ns;
+
+    var buckets = buckets_dir.iterate();
+    while (try buckets.next(io)) |bucket| {
+        if (bucket.kind != .directory) continue;
+        const staging_path = try std.fs.path.join(alloc, &.{ buckets_root, bucket.name, "staging" });
+        defer alloc.free(staging_path);
+        var staging_dir = std.Io.Dir.cwd().openDir(io, staging_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer staging_dir.close(io);
+        var staging = staging_dir.iterate();
+        while (try staging.next(io)) |entry| {
+            if (entry.kind != .file or
+                !std.mem.startsWith(u8, entry.name, "upload-") or
+                !std.mem.endsWith(u8, entry.name, ".tmp")) continue;
+            const stat = staging_dir.statFile(io, entry.name, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            if (stat.mtime.toNanoseconds() > cutoff_ns) continue;
+            var file = staging_dir.openFile(io, entry.name, .{ .mode = .read_write }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            const locked = file.tryLock(io, .exclusive) catch |err| {
+                file.close(io);
+                return err;
+            };
+            if (!locked) {
+                file.close(io);
+                continue;
+            }
+            const locked_stat = file.stat(io) catch |err| {
+                file.unlock(io);
+                file.close(io);
+                return err;
+            };
+            if (locked_stat.mtime.toNanoseconds() > cutoff_ns) {
+                file.unlock(io);
+                file.close(io);
+                continue;
+            }
+            staging_dir.deleteFile(io, entry.name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => {
+                    file.unlock(io);
+                    file.close(io);
+                    return err;
+                },
+            };
+            file.unlock(io);
+            file.close(io);
+        }
+    }
+}
+
 const ObjectLock = struct {
     io: std.Io,
     file: std.Io.File,
@@ -581,6 +650,8 @@ fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, bod
         else
             try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
         defer file.close(io);
+        try file.lock(io, .exclusive);
+        defer file.unlock(io);
 
         var fixed: [object_header_len]u8 = undefined;
         encodeObjectHeader(&fixed, @intCast(body.len), content_type.len, etag);
@@ -625,6 +696,9 @@ fn writeObjectFileAtomically(
         try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
     var output_open = true;
     defer if (output_open) output.close(io);
+    try output.lock(io, .exclusive);
+    var output_locked = true;
+    defer if (output_locked) output.unlock(io);
 
     var placeholder: [object_header_len]u8 = @splat(0);
     var writer_buf: [64 * 1024]u8 = undefined;
@@ -657,6 +731,8 @@ fn writeObjectFileAtomically(
     encodeObjectHeader(&placeholder, source_stat.size, content_type.len, etag);
     try output.writePositionalAll(io, &placeholder, 0);
     try output.sync(io);
+    output.unlock(io);
+    output_locked = false;
     output.close(io);
     output_open = false;
 
@@ -1115,4 +1191,35 @@ test "filesystem native prefix download walks once and confines descendants" {
     const sibling_path = try std.fs.path.join(alloc, &.{ destination, "c" });
     defer alloc.free(sibling_path);
     try std.testing.expect(!fileExists(fs.io, sibling_path));
+}
+
+test "filesystem staging cleanup removes abandoned files and preserves locked uploads" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "staging-cleanup");
+    defer cleanupTmp(path);
+
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    defer fs.deinit();
+    try fs.makeBucket("bucket");
+    const staging_path = try stagingPathAlloc(alloc, fs.root_dir, "bucket");
+    defer alloc.free(staging_path);
+    const object_lookalike = try objectPathAlloc(alloc, fs.root_dir, "bucket", "staging/upload-user-object.tmp");
+    defer alloc.free(object_lookalike);
+    try ensureParentDir(fs.io, object_lookalike);
+    var object_file = try std.Io.Dir.createFileAbsolute(fs.io, object_lookalike, .{ .truncate = true });
+    object_file.close(fs.io);
+    var staged = try std.Io.Dir.createFileAbsolute(fs.io, staging_path, .{ .truncate = true });
+    try staged.writePositionalAll(fs.io, "partial", 0);
+    try staged.sync(fs.io);
+    try staged.lock(fs.io, .exclusive);
+
+    try cleanupStaleStagingFiles(alloc, fs.io, fs.root_dir, -std.time.ns_per_s);
+    try std.testing.expect(fileExists(fs.io, staging_path));
+    staged.unlock(fs.io);
+    staged.close(fs.io);
+
+    try cleanupStaleStagingFiles(alloc, fs.io, fs.root_dir, -std.time.ns_per_s);
+    try std.testing.expect(!fileExists(fs.io, staging_path));
+    try std.testing.expect(fileExists(fs.io, object_lookalike));
 }
