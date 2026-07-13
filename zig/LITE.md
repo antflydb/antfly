@@ -183,8 +183,10 @@ contains a job ID; status and cooperative
 cancellation use `/db/v1/restore/jobs/{job_id}`. Idempotency keys make retries
 safe; requests without a key create independent jobs. Restore state lives inside
 the `.aflite` file, and completed table boundaries are durably checkpointed and
-not repeated after restart. An ambiguous publication/checkpoint interruption
-fails closed for operator inspection. Destructive overwrite is not exposed until
+not repeated after restart. Standalone restore is synchronous inside the worker,
+so terminal success means the restored table is readable, not merely accepted.
+An ambiguous publication/checkpoint interruption fails closed for operator
+inspection. Destructive overwrite is not exposed until
 table generations can be staged and atomically swapped. Terminal state and
 explicit idempotency keys are retained for seven days in a history bounded by
 10,000 jobs and 64 KiB per encoded job. Cancellation is checked at safe table

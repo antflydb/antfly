@@ -2877,13 +2877,17 @@ paths:
 
         worker are available. Poll the restore job resource for progress.
 
-        Completed table boundaries are durably checkpointed and are not repeated
+        Catalog publication is durably checkpointed per table and is not
 
-        after restart. If a process stops between table publication and its
+        repeated after restart. If leadership changes before that checkpoint,
 
-        completion checkpoint, recovery fails closed for operator inspection
+        recovery adopts only an exact, still-active restore intent for the same
 
-        instead of replacing or modifying an existing table. Cancellation is
+        backup and location; unrelated or ambiguous existing tables fail closed.
+
+        A job reaches `succeeded` only after all placement replicas report the
+
+        restore complete and metadata clears the restore intent. Cancellation is
 
         cooperative between table publication boundaries.
       operationId: restore
@@ -2905,7 +2909,7 @@ paths:
               $ref: '#/components/schemas/ClusterRestoreRequest'
       responses:
         '202':
-          description: Restore triggered successfully
+          description: Restore job durably accepted
           headers:
             Location:
               description: Relative URL of the durable restore job resource.

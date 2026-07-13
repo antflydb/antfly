@@ -27,6 +27,8 @@ const max_restore_tables: usize = 256;
 const default_backup_list_limit: usize = 100;
 const max_backup_list_limit: usize = 1000;
 
+const RestorePollDisposition = enum { use_data, retry, invalid };
+
 const BackupArgs = struct {
     help: bool = false,
     table_name: ?[]const u8 = null,
@@ -258,9 +260,15 @@ pub fn waitForRestoreJob(
         var response = try client.getRestoreJob(job_id_text);
         if (response.data) |*data| {
             if (isTerminalRestorePhase(data.value.phase)) return response;
-        } else {
+        } else if (classifyRestorePollResponse(response.status_code, false) == .invalid) {
             response.deinit();
             return error.InvalidRestoreResponse;
+        } else {
+            // A distributed metadata follower can legitimately lag the
+            // replicated restore catalog for a short period. The endpoint's
+            // 503 contract is explicitly retryable; keep the canonical CLI
+            // usable behind a non-sticky load balancer instead of turning
+            // normal Raft propagation into a terminal restore failure.
         }
         response.deinit();
         const elapsed_ns = platform_time.monotonicNs() -| started_ns;
@@ -269,6 +277,11 @@ pub fn waitForRestoreJob(
         const delay_ns = @min(poll_ns, timeout_ns - elapsed_ns);
         io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch return error.RestoreWaitInterrupted;
     }
+}
+
+fn classifyRestorePollResponse(status_code: u16, has_data: bool) RestorePollDisposition {
+    if (has_data) return .use_data;
+    return if (status_code == 503) .retry else .invalid;
 }
 
 pub fn isTerminalRestorePhase(phase: []const u8) bool {
@@ -753,6 +766,13 @@ test "restore cli validation rejects unsupported input extension" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectError(error.InvalidRestoreInputPath, validateRestoreArgs(opts));
+}
+
+test "restore polling response classification retries only service unavailable" {
+    try std.testing.expectEqual(RestorePollDisposition.use_data, classifyRestorePollResponse(200, true));
+    try std.testing.expectEqual(RestorePollDisposition.retry, classifyRestorePollResponse(503, false));
+    try std.testing.expectEqual(RestorePollDisposition.invalid, classifyRestorePollResponse(404, false));
+    try std.testing.expectEqual(RestorePollDisposition.invalid, classifyRestorePollResponse(500, false));
 }
 
 test "restore cli parser rejects unknown arguments" {

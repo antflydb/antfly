@@ -91,10 +91,12 @@ def sync_detailed(
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted and both a durable job store and asynchronous
     worker are available. Poll the restore job resource for progress.
-    Completed table boundaries are durably checkpointed and are not repeated
-    after restart. If a process stops between table publication and its
-    completion checkpoint, recovery fails closed for operator inspection
-    instead of replacing or modifying an existing table. Cancellation is
+    Catalog publication is durably checkpointed per table and is not
+    repeated after restart. If leadership changes before that checkpoint,
+    recovery adopts only an exact, still-active restore intent for the same
+    backup and location; unrelated or ambiguous existing tables fail closed.
+    A job reaches `succeeded` only after all placement replicas report the
+    restore complete and metadata clears the restore intent. Cancellation is
     cooperative between table publication boundaries.
 
     Args:
@@ -138,10 +140,12 @@ def sync(
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted and both a durable job store and asynchronous
     worker are available. Poll the restore job resource for progress.
-    Completed table boundaries are durably checkpointed and are not repeated
-    after restart. If a process stops between table publication and its
-    completion checkpoint, recovery fails closed for operator inspection
-    instead of replacing or modifying an existing table. Cancellation is
+    Catalog publication is durably checkpointed per table and is not
+    repeated after restart. If leadership changes before that checkpoint,
+    recovery adopts only an exact, still-active restore intent for the same
+    backup and location; unrelated or ambiguous existing tables fail closed.
+    A job reaches `succeeded` only after all placement replicas report the
+    restore complete and metadata clears the restore intent. Cancellation is
     cooperative between table publication boundaries.
 
     Args:
@@ -180,10 +184,12 @@ async def asyncio_detailed(
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted and both a durable job store and asynchronous
     worker are available. Poll the restore job resource for progress.
-    Completed table boundaries are durably checkpointed and are not repeated
-    after restart. If a process stops between table publication and its
-    completion checkpoint, recovery fails closed for operator inspection
-    instead of replacing or modifying an existing table. Cancellation is
+    Catalog publication is durably checkpointed per table and is not
+    repeated after restart. If leadership changes before that checkpoint,
+    recovery adopts only an exact, still-active restore intent for the same
+    backup and location; unrelated or ambiguous existing tables fail closed.
+    A job reaches `succeeded` only after all placement replicas report the
+    restore complete and metadata clears the restore intent. Cancellation is
     cooperative between table publication boundaries.
 
     Args:
@@ -225,10 +231,12 @@ async def asyncio(
     The restore is a durable asynchronous job. The request returns after the
     job record is persisted and both a durable job store and asynchronous
     worker are available. Poll the restore job resource for progress.
-    Completed table boundaries are durably checkpointed and are not repeated
-    after restart. If a process stops between table publication and its
-    completion checkpoint, recovery fails closed for operator inspection
-    instead of replacing or modifying an existing table. Cancellation is
+    Catalog publication is durably checkpointed per table and is not
+    repeated after restart. If leadership changes before that checkpoint,
+    recovery adopts only an exact, still-active restore intent for the same
+    backup and location; unrelated or ambiguous existing tables fail closed.
+    A job reaches `succeeded` only after all placement replicas report the
+    restore complete and metadata clears the restore intent. Cancellation is
     cooperative between table publication boundaries.
 
     Args:
