@@ -82,7 +82,8 @@ def sync_detailed(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
+    - `overwrite`: Stage and validate replacement generations, then atomically publish them over
+    existing tables. Readers already holding the previous generation may finish before it is retired.
 
     The endpoint stages and publishes locally owned table generations before
     returning. It returns `200` when every requested operation has reached a
@@ -123,7 +124,8 @@ def sync(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
+    - `overwrite`: Stage and validate replacement generations, then atomically publish them over
+    existing tables. Readers already holding the previous generation may finish before it is retired.
 
     The endpoint stages and publishes locally owned table generations before
     returning. It returns `200` when every requested operation has reached a
@@ -159,7 +161,8 @@ async def asyncio_detailed(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
+    - `overwrite`: Stage and validate replacement generations, then atomically publish them over
+    existing tables. Readers already holding the previous generation may finish before it is retired.
 
     The endpoint stages and publishes locally owned table generations before
     returning. It returns `200` when every requested operation has reached a
@@ -198,7 +201,8 @@ async def asyncio(
     **Restore Modes:**
     - `fail_if_exists`: Abort if any target table already exists (default)
     - `skip_if_exists`: Skip existing tables and restore the rest
-    - `overwrite`: Drop existing tables and restore from backup
+    - `overwrite`: Stage and validate replacement generations, then atomically publish them over
+    existing tables. Readers already holding the previous generation may finish before it is retired.
 
     The endpoint stages and publishes locally owned table generations before
     returning. It returns `200` when every requested operation has reached a

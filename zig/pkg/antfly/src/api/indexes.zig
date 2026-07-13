@@ -1649,6 +1649,17 @@ const CoverageEvaluation = struct {
     counters_valid: bool,
 };
 
+const CoverageIncompleteReason = enum {
+    runtime_unavailable,
+    missing_group,
+    unknown_group,
+    remote_unknown_group,
+    stale_group,
+    summary_unavailable,
+    config_mismatch,
+    counter_mismatch,
+};
+
 fn coverageOutcomeTotal(produced: u64, skipped: u64, terminal_failed: u64) ?u64 {
     const produced_and_skipped = std.math.add(u64, produced, skipped) catch return null;
     return std.math.add(u64, produced_and_skipped, terminal_failed) catch null;
@@ -2000,41 +2011,42 @@ fn appendCoverageIncompleteReasons(
 ) !void {
     const Item = @TypeOf(item);
     const observation_current = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
-    try out.append(alloc, '[');
-    var emitted = false;
-    const ReasonWriter = struct {
-        fn append(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), wrote: *bool, reason: []const u8) !void {
-            if (wrote.*) try list.append(a, ',');
-            wrote.* = true;
-            try appendJsonString(a, list, reason);
-        }
-    };
+    var reasons = std.EnumSet(CoverageIncompleteReason).initEmpty();
 
-    if (!runtime_present) try ReasonWriter.append(alloc, out, &emitted, "runtime_unavailable");
+    if (!runtime_present) reasons.insert(.runtime_unavailable);
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0)
-        try ReasonWriter.append(alloc, out, &emitted, "missing_group");
+        reasons.insert(.missing_group);
     if ((@hasField(Item, "unknown_group_count") and item.unknown_group_count > 0) or
         (metadata != null and metadata.?.freshness == .unknown))
-        try ReasonWriter.append(alloc, out, &emitted, "unknown_group");
+        reasons.insert(.unknown_group);
     if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0)
-        try ReasonWriter.append(alloc, out, &emitted, "remote_unknown_group");
+        reasons.insert(.remote_unknown_group);
     if (metadata != null and metadata.?.freshness == .remote_unknown)
-        try ReasonWriter.append(alloc, out, &emitted, "remote_unknown_group");
+        reasons.insert(.remote_unknown_group);
     if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0)
-        try ReasonWriter.append(alloc, out, &emitted, "stale_group");
+        reasons.insert(.stale_group);
     if (metadata != null and metadata.?.freshness != .fresh and metadata.?.freshness != .unknown and metadata.?.freshness != .remote_unknown)
-        try ReasonWriter.append(alloc, out, &emitted, "stale_group");
+        reasons.insert(.stale_group);
     if (@hasField(Item, "coverage_summary_ready") and !item.coverage_summary_ready)
-        try ReasonWriter.append(alloc, out, &emitted, "summary_unavailable");
+        reasons.insert(.summary_unavailable);
     const config_mismatch = (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) or
         (observation_current and !coverageIdentityMatches(item, expected_generation, expected_config_hash));
-    if (config_mismatch) try ReasonWriter.append(alloc, out, &emitted, "config_mismatch");
+    if (config_mismatch) reasons.insert(.config_mismatch);
     const summary_ready = if (@hasField(Item, "coverage_summary_ready")) item.coverage_summary_ready else false;
     const produced = if (@hasField(Item, "coverage_produced_count")) item.coverage_produced_count else 0;
     const skipped = if (@hasField(Item, "coverage_skipped_count")) item.coverage_skipped_count else 0;
     const terminal_failed = if (@hasField(Item, "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
     if (observation_current and !config_mismatch and summary_ready and !coverageCountersValid(source_total, produced, skipped, terminal_failed))
-        try ReasonWriter.append(alloc, out, &emitted, "counter_mismatch");
+        reasons.insert(.counter_mismatch);
+
+    try out.append(alloc, '[');
+    var emitted = false;
+    for (std.meta.tags(CoverageIncompleteReason)) |reason| {
+        if (!reasons.contains(reason)) continue;
+        if (emitted) try out.append(alloc, ',');
+        emitted = true;
+        try appendJsonString(alloc, out, @tagName(reason));
+    }
     try out.append(alloc, ']');
 }
 
@@ -2049,6 +2061,20 @@ test "derived coverage reasons expose counter mismatch" {
     defer reasons.deinit(std.testing.allocator);
     try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 0, 41, true, null, 2);
     try std.testing.expectEqualStrings("[\"counter_mismatch\"]", reasons.items);
+}
+
+test "derived coverage reasons deduplicate overlapping freshness signals" {
+    const aggregate = AggregatedIndexStatus{
+        .coverage_config_hash = 41,
+        .coverage_summary_ready = true,
+        .remote_unknown_group_count = 1,
+    };
+    var reasons = std.ArrayListUnmanaged(u8).empty;
+    defer reasons.deinit(std.testing.allocator);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 0, 41, true, .{
+        .freshness = .remote_unknown,
+    }, 0);
+    try std.testing.expectEqualStrings("[\"remote_unknown_group\"]", reasons.items);
 }
 
 fn appendCoverageFingerprint(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), fingerprint: u64) !void {

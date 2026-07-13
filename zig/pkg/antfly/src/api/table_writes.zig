@@ -4344,6 +4344,7 @@ pub const ProvisionedTableWriteSource = struct {
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
     startup_catch_up_backoff_epoch: std.atomic.Value(u64) = .init(1),
+    startup_catch_up_backoff_alloc: std.mem.Allocator = std.heap.page_allocator,
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
 
@@ -4745,7 +4746,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.freeStructuralReconcileTables();
         self.freeWriteCoalesceQueues();
         lockAtomic(&self.startup_catch_up_backoff_mutex);
-        self.startup_catch_up_backoffs.deinit(std.heap.page_allocator);
+        self.startup_catch_up_backoffs.deinit(self.startup_catch_up_backoff_alloc);
         self.startup_catch_up_backoffs = .empty;
         self.startup_catch_up_backoff_mutex.unlock();
         lockAtomic(&self.dirty_write_tables_mutex);
@@ -6830,7 +6831,7 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.startup_catch_up_backoff_mutex);
         defer self.startup_catch_up_backoff_mutex.unlock();
         _ = self.startup_catch_up_backoff_epoch.fetchAdd(1, .release);
-        self.startup_catch_up_backoffs.deinit(std.heap.page_allocator);
+        self.startup_catch_up_backoffs.deinit(self.startup_catch_up_backoff_alloc);
         self.startup_catch_up_backoffs = .empty;
     }
 
@@ -6850,7 +6851,20 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         }
 
-        const entry = self.startup_catch_up_backoffs.getOrPut(std.heap.page_allocator, group_id) catch return;
+        const entry = self.startup_catch_up_backoffs.getOrPut(self.startup_catch_up_backoff_alloc, group_id) catch |err| {
+            // Allocation pressure must not disable the anti-spin invariant.
+            // The scheduler consumes this result and parks the whole catch-up
+            // pass even though no per-group state could be stored.
+            result.quarantined = true;
+            result.quarantine_retry_scheduled = true;
+            result.retry_at_ms = now_ms +| startup_catch_up_quarantine_base_ms;
+            std.log.warn("startup catch-up backoff allocation failed group={} retry_at_ms={} err={s}", .{
+                group_id,
+                result.retry_at_ms,
+                @errorName(err),
+            });
+            return;
+        };
         if (!entry.found_existing) entry.value_ptr.* = .{};
         entry.value_ptr.consecutive_no_progress +|= 1;
         if (entry.value_ptr.consecutive_no_progress < startup_catch_up_no_progress_threshold) return;
@@ -27336,6 +27350,24 @@ test "managed startup catch-up quarantines repeated zero progress with bounded b
 
     var stale = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
     source.updateStartupCatchUpBackoff(7003, 60_000, epoch, &stale);
+    try std.testing.expectEqual(@as(usize, 0), source.startup_catch_up_backoffs.count());
+}
+
+test "managed startup catch-up allocation failure preserves bounded retry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = 0;
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-startup-catch-up-allocation-fallback", table_catalog.emptyCatalogSource());
+    source.startup_catch_up_backoff_alloc = failing.allocator();
+    defer source.deinit();
+    const epoch = source.startup_catch_up_backoff_epoch.load(.acquire);
+
+    var result = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7001, 1_000, epoch, &result);
+
+    try std.testing.expect(result.quarantined);
+    try std.testing.expect(result.quarantine_retry_scheduled);
+    try std.testing.expectEqual(@as(u64, 31_000), result.retry_at_ms);
     try std.testing.expectEqual(@as(usize, 0), source.startup_catch_up_backoffs.count());
 }
 

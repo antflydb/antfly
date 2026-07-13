@@ -448,7 +448,7 @@ export interface paths {
          *     **Restore Modes:**
          *     - `fail_if_exists`: Abort if any target table already exists (default)
          *     - `skip_if_exists`: Skip existing tables and restore the rest
-         *     - `overwrite`: Drop existing tables and restore from backup
+         *     - `overwrite`: Stage and validate replacement generations, then atomically publish them over existing tables. Readers already holding the previous generation may finish before it is retired.
          *
          *     The endpoint stages and publishes locally owned table generations before
          *     returning. It returns `200` when every requested operation has reached a
@@ -5581,13 +5581,16 @@ export interface components {
              *     to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
              *
              *     The semantic_search string is automatically embedded using the configured embedding model
-             *     for the specified indexes. Use `embedding_template` for multimodal queries.
+             *     for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for
+             *     multimodal queries.
              * @example artificial intelligence and machine learning applications
              */
             semantic_search?: string;
             /**
              * @description Optional Handlebars template for multimodal embedding of the semantic_search query.
              *     The template has access to `this` which contains the semantic_search string value.
+             *
+             *     UTF-8 template input is limited to 64 KiB.
              *
              *     Use this when you want to embed multimodal content (images, PDFs, etc.) instead of
              *     just text. The template is rendered using dotprompt with access to remote content helpers.
@@ -5744,7 +5747,8 @@ export interface components {
              * @description Optional query execution deadline in milliseconds. The server applies this as a
              *     cooperative deadline across query planning, search execution, aggregation reruns,
              *     sorting, and response post-processing. If the deadline expires before the query
-             *     completes, the HTTP API returns 504.
+             *     completes, the HTTP API returns 504. When omitted, semantic query embedding planning
+             *     and provider I/O use a 30-second default deadline.
              * @example 5000
              */
             timeout_ms?: number;
