@@ -20183,6 +20183,19 @@ components:
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
 
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+        prompt_cache_key:
+          type: string
+          maxLength: 256
+          description: >
+            inference-native prompt prefix cache namespace key. Requests with the same key can
+
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+
+            requests without a key are never cached.
+        prompt_cache:
+          type: boolean
+          description: >
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         backend:
           $ref: '#/components/schemas/InferenceModelBackend'
         mode:
@@ -20408,6 +20421,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
     InferenceGenerateChunk:
       type: object
       description: Streaming generation chunk (SSE event data)
@@ -20593,6 +20609,50 @@ components:
           $ref: '#/components/schemas/InferenceModelFormat'
         quantization:
           $ref: '#/components/schemas/InferenceModelQuantization'
+    InferencePromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: >
+            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+
+            full KV blocks under prompt_cache_key with O(1) block lookup and is the
+
+            scalable production mode. `simple` keeps the linear-scan retained-prefix
+
+            cache and is only suitable for small caches or debugging.
+          enum:
+            - simple
+            - block_hash
+          default: block_hash
+        max_bytes_mb:
+          type: integer
+          description: >
+            Node-wide target for live prompt-cache entries. The runtime divides it
+
+            across participating model caches and evicts using estimated metadata
+
+            and logical host/device KV bytes. Backend allocators may retain reusable
+
+            capacity, so this is not a hard cap on process or accelerator memory.
+          default: 512
+        min_tokens:
+          type: integer
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          description: >
+            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+
+            hit, so only entries left unused for this duration expire.
+          default: 300000
     InferenceConfig:
       type: object
       required:
@@ -20678,6 +20738,9 @@ components:
             independently of max_loaded_models.
           default: 1
           example: 1
+        prompt_cache:
+          $ref: '#/components/schemas/InferencePromptCacheConfig'
+          description: Native generator prompt KV cache settings.
         backend_priority:
           type: array
           items:

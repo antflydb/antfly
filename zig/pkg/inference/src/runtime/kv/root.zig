@@ -21,6 +21,7 @@ pub const storage_runtime = @import("storage_runtime.zig");
 pub const linalg = @import("linalg.zig");
 pub const compaction = @import("compaction.zig");
 pub const turboquant = @import("turboquant.zig");
+pub const prompt_cache = @import("prompt_cache.zig");
 
 test {
     _ = block;
@@ -32,4 +33,5 @@ test {
     _ = linalg;
     _ = compaction;
     _ = turboquant;
+    _ = prompt_cache;
 }
