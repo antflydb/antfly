@@ -276,8 +276,8 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
 
 def _wait_for_restore_job(get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0) -> dict[str, Any]:
     job_id = accepted.get("job_id")
-    if not isinstance(job_id, int):
-        return accepted
+    if not isinstance(job_id, str) or not job_id:
+        raise AssertionError(f"restore admission did not return an opaque job id: {accepted}")
     deadline = time.monotonic() + timeout_s
     while True:
         job = get_job(f"/restore/jobs/{job_id}")

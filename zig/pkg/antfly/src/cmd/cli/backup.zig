@@ -250,15 +250,13 @@ fn writeRestoreResponse(
 pub fn waitForRestoreJob(
     client: *antfly_client.AntflyClient,
     io: std.Io,
-    job_id: i64,
+    job_id: []const u8,
     timeout_ms: u64,
 ) !antfly_client.openapi.ApiResponse(antfly_client.types.RestoreJob) {
-    var job_id_buf: [32]u8 = undefined;
-    const job_id_text = try std.fmt.bufPrint(&job_id_buf, "{d}", .{job_id});
     const started_ns = platform_time.monotonicNs();
     const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
     while (true) {
-        var response = try client.getRestoreJob(job_id_text);
+        var response = try client.getRestoreJob(job_id);
         if (response.data) |*data| {
             if (isTerminalRestorePhase(data.value.phase)) return response;
         } else if (classifyRestorePollResponse(response.status_code, false) == .invalid) {

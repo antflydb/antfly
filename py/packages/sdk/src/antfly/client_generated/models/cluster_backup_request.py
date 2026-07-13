@@ -33,7 +33,9 @@ class ClusterBackupRequest:
 
             On restore, the format is auto-detected from file magic bytes.
              Default: ClusterBackupRequestFormat.PORTABLE. Example: portable.
-        table_names (list[str] | Unset): Optional list of tables to backup. If omitted, all tables are backed up.
+        table_names (list[str] | Unset): Optional list of tables to backup. If omitted, all tables are backed up,
+            up to the cluster backup limit of 4096 tables. Requests above that limit
+            fail before any table backup is created.
              Example: ['users', 'products'].
     """
 

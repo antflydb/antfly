@@ -93,6 +93,24 @@ Definition publication and rollback are full-definition compare-and-swap
 mutations. A concurrent schema, index, placement, or restore-intent update
 therefore makes the transition fail closed instead of being overwritten by a
 stale publish or rollback.
+
+The API lifecycle above the generation manager is a bounded durable job. Public
+job identifiers are opaque strings even though the local scheduler uses integer
+keys; this prevents JavaScript and JSON consumers from rounding a storage
+identity. Nonterminal jobs do not publish an expiry. Explicit idempotency keys
+are indexed by a hash of authenticated principal, operation scope, and target
+resource, so retries deduplicate within one authority boundary without causing
+cross-user or cross-table conflicts.
+
+Cluster-wide restore progress is represented by canonical inclusive ranges of
+table ordinals. The common sequential path updates one range regardless of
+table count, while sparse failures add only the required disjoint ranges. Antfly
+supports 4096 tables in one cluster backup/restore and verifies that limit before
+backup artifacts are emitted; explicit request lists remain bounded at 256.
+These limits keep request memory, response aggregation, and the replicated job
+record bounded while allowing large operational restores without the former
+256-table recovery ceiling.
+
 Queued structural reconciliation closes new write admission before draining
 current writers. This prevents continuous traffic from starving index/catalog
 convergence, while reads remain admitted against the currently published

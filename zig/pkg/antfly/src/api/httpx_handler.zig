@@ -1179,7 +1179,11 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try self.api_server.handlePublicClusterRestore(body_data, ctx.header("idempotency-key"));
+        var resp = try self.api_server.handlePublicClusterRestore(
+            body_data,
+            ctx.header("idempotency-key"),
+            if (authenticated_identity) |identity| identity.username else null,
+        );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
@@ -1885,7 +1889,12 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try self.api_server.handlePublicTableRestore(decoded_table_name, body_data, ctx.header("idempotency-key"));
+        var resp = try self.api_server.handlePublicTableRestore(
+            decoded_table_name,
+            body_data,
+            ctx.header("idempotency-key"),
+            if (authenticated_identity) |identity| identity.username else null,
+        );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 

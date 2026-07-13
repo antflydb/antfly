@@ -495,7 +495,7 @@ func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location, c
 }
 
 // GetRestoreJob returns durable restore progress and terminal results.
-func (c *AntflyClient) GetRestoreJob(ctx context.Context, jobID int64) (*RestoreJob, error) {
+func (c *AntflyClient) GetRestoreJob(ctx context.Context, jobID string) (*RestoreJob, error) {
 	resp, err := c.client.GetRestoreJob(ctx, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("get restore job request failed: %w", err)
@@ -508,7 +508,7 @@ func (c *AntflyClient) GetRestoreJob(ctx context.Context, jobID int64) (*Restore
 }
 
 // CancelRestoreJob requests cancellation at the next safe restore boundary.
-func (c *AntflyClient) CancelRestoreJob(ctx context.Context, jobID int64) (*RestoreJob, error) {
+func (c *AntflyClient) CancelRestoreJob(ctx context.Context, jobID string) (*RestoreJob, error) {
 	resp, err := c.client.CancelRestoreJob(ctx, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("cancel restore job request failed: %w", err)

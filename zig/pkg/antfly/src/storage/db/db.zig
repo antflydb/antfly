@@ -12545,7 +12545,27 @@ pub const DB = struct {
                 item.backfill_active = false;
                 if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
             }
+            normalizeReplayStatusFromDurableCheckpoint(item);
             item.checkpoint_replay_tail_sequence_count = item.replay_target_sequence -| item.projection_checkpoint_applied_sequence;
+        }
+    }
+
+    fn normalizeReplayStatusFromDurableCheckpoint(item: *types.DBIndexStats) void {
+        const durable_applied = item.projection_checkpoint_applied_sequence;
+        if (durable_applied <= item.replay_applied_sequence) return;
+
+        // Projection checkpoints are persisted only after the index publication
+        // boundary. A worker snapshot can briefly lag that durable write while
+        // it updates its in-memory sequence, but status must not expose the
+        // transient ordering as durable replay debt.
+        item.replay_applied_sequence = durable_applied;
+        item.replay_target_sequence = @max(item.replay_target_sequence, durable_applied);
+        item.catch_up_applied_sequence = @max(item.catch_up_applied_sequence, durable_applied);
+        item.catch_up_target_sequence = @max(item.catch_up_target_sequence, item.replay_target_sequence);
+        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+        if (!item.catch_up_active and !item.replay_catch_up_required) {
+            item.backfill_active = false;
+            if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
         }
     }
 
@@ -52699,6 +52719,30 @@ test "derived coverage stats require validated config identity" {
     try std.testing.expect(ready.coverage_summary_ready);
     try std.testing.expectEqual(@as(u64, 42), ready.coverage_generation);
     try std.testing.expectEqual(@as(u64, 0), ready.coverage_config_hash);
+}
+
+test "runtime status never regresses below durable projection checkpoint" {
+    var item = types.DBIndexStats{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .replay_applied_sequence = 7,
+        .replay_target_sequence = 8,
+        .replay_catch_up_required = true,
+        .catch_up_applied_sequence = 7,
+        .catch_up_target_sequence = 8,
+        .backfill_active = true,
+        .backfill_progress = 0.875,
+        .projection_checkpoint_applied_sequence = 8,
+    };
+
+    DB.normalizeReplayStatusFromDurableCheckpoint(&item);
+
+    try std.testing.expectEqual(@as(u64, 8), item.replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 8), item.replay_target_sequence);
+    try std.testing.expectEqual(@as(u64, 8), item.catch_up_applied_sequence);
+    try std.testing.expect(!item.replay_catch_up_required);
+    try std.testing.expect(!item.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), item.backfill_progress);
 }
 
 test "runtime status overlay hydrates cached derived coverage identity" {

@@ -2943,6 +2943,7 @@ pub const TableWriteSource = struct {
             backup_id: []const u8,
             format: backups_api.BackupFormat,
             location_uri: []const u8,
+            connection: []const u8,
             location: *backups_api.BackupLocation,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
         restore_table: ?*const fn (
@@ -3285,10 +3286,11 @@ pub const TableWriteSource = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         location_uri: []const u8,
+        connection: []const u8,
         location: *backups_api.BackupLocation,
     ) !?[]backups_api.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, location);
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location);
     }
 
     pub fn restoreTable(
@@ -11297,6 +11299,49 @@ fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
     try configured.check();
 }
 
+fn forwardedTableBackupRequestAlloc(
+    alloc: std.mem.Allocator,
+    backup_id: []const u8,
+    location_uri: []const u8,
+    connection: []const u8,
+    format: backups_api.BackupFormat,
+) ![]u8 {
+    const format_name = switch (format) {
+        .native => "native",
+        .portable => "portable",
+    };
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+        .backup_id = backup_id,
+        .location = location_uri,
+        .connection = connection,
+        .format = format_name,
+    }, .{})});
+}
+
+test "hosted backup forwarding preserves external io authority" {
+    const alloc = std.testing.allocator;
+    const body = try forwardedTableBackupRequestAlloc(
+        alloc,
+        "snap-1",
+        "file:///backups",
+        "archive-writer",
+        .portable,
+    );
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(struct {
+        backup_id: []const u8,
+        location: []const u8,
+        connection: []const u8,
+        format: []const u8,
+    }, alloc, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("snap-1", parsed.value.backup_id);
+    try std.testing.expectEqualStrings("file:///backups", parsed.value.location);
+    try std.testing.expectEqualStrings("archive-writer", parsed.value.connection);
+    try std.testing.expectEqualStrings("portable", parsed.value.format);
+}
+
 pub const HostedProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -11936,6 +11981,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         location_uri: []const u8,
+        connection: []const u8,
         location: *backups_api.BackupLocation,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -11946,15 +11992,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         switch (route) {
             .local => return error.UnsupportedOperation,
             .remote => |remote| {
-                const format_name = switch (format) {
-                    .native => "native",
-                    .portable => "portable",
-                };
-                const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
-                    .backup_id = backup_id,
-                    .location = location_uri,
-                    .format = format_name,
-                }, .{})});
+                const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
                 defer alloc.free(body);
 
                 var client = http_client.ApiHttpClient.init(alloc, self.executor);
@@ -13768,20 +13806,72 @@ fn catchUpManagedIndexCreate(
     }
 
     try db.runUntilIdle();
-    try db.catchUpPendingDerivedReplay();
-    try db.runUntilIdle();
 
     if (try db.hasPendingDenseArtifactRebuild(alloc)) {
         _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
-        try db.runUntilIdle();
-        try db.catchUpPendingDerivedReplay();
         try db.runUntilIdle();
     }
     if (requires_enrichment_replay) {
         const debt_remaining = try repairManagedEmbeddingArtifactsForIndex(alloc, db, index_name);
         if (debt_remaining) try markManagedIndexRepairRequired(alloc, db, index_name);
     }
+    try drainManagedIndexReplayUntilConverged(alloc, db, index_name);
     try db.core.index_manager.syncAll(true);
+}
+
+const ManagedIndexReplayPosition = struct {
+    applied_sequence: u64,
+    target_sequence: u64,
+
+    fn caughtUp(self: @This()) bool {
+        return self.applied_sequence >= self.target_sequence;
+    }
+};
+
+fn managedIndexReplayPosition(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !ManagedIndexReplayPosition {
+    const replay_debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (replay_debt) |*status| status.deinit(alloc);
+        alloc.free(replay_debt);
+    }
+    for (replay_debt) |status| {
+        if (!std.mem.eql(u8, status.index_name, index_name)) continue;
+        return .{
+            .applied_sequence = status.applied_sequence,
+            .target_sequence = status.target_sequence,
+        };
+    }
+    return error.IndexNotFound;
+}
+
+fn drainManagedIndexReplayUntilConverged(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+) !void {
+    const max_passes: usize = 16;
+    var previous: ?ManagedIndexReplayPosition = null;
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        try db.runUntilIdle();
+        const current = try managedIndexReplayPosition(alloc, db, index_name);
+        if (current.caughtUp()) return;
+
+        if (previous) |last| {
+            if (current.applied_sequence <= last.applied_sequence and
+                current.target_sequence <= last.target_sequence)
+            {
+                return error.ManagedIndexReplayDidNotConverge;
+            }
+        }
+        previous = current;
+        try db.catchUpPendingDerivedReplay();
+    }
+    return error.ManagedIndexReplayDidNotConverge;
 }
 
 fn managedIndexEmbeddingArtifactName(db: *db_mod.DB, index_name: []const u8) ?[]const u8 {
@@ -14895,7 +14985,16 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     db: *db_mod.DB,
 ) !void {
     const snapshot_cache = source.runtime_status_cache orelse return;
-    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(snapshot_cache, alloc, table_name, group_id, phase, mode, db);
+    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
+        snapshot_cache,
+        alloc,
+        table_name,
+        group_id,
+        source.visibleRootGeneration(group_id),
+        phase,
+        mode,
+        db,
+    );
 }
 
 fn publishRuntimeStatusSnapshotToCacheConsistent(
@@ -14905,7 +15004,16 @@ fn publishRuntimeStatusSnapshotToCacheConsistent(
     group_id: u64,
     db: *db_mod.DB,
 ) !void {
-    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(snapshot_cache, alloc, table_name, group_id, .idle, .consistent, db);
+    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
+        snapshot_cache,
+        alloc,
+        table_name,
+        group_id,
+        table_reads.backend_current_root_generation,
+        .idle,
+        .consistent,
+        db,
+    );
 }
 
 fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
@@ -14913,6 +15021,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     group_id: u64,
+    lsm_root_generation: u64,
     phase: db_mod.types.StartupCatchUpPhase,
     mode: RuntimeStatusSnapshotMode,
     db: *db_mod.DB,
@@ -14925,6 +15034,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             const startup = startupCatchUpStatsForPhase(phase, db);
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
+            status.metadata.lsm_root_generation = lsm_root_generation;
             try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
@@ -14935,6 +15045,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             const startup = startupCatchUpStatsForPhase(phase, db);
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
+            status.metadata.lsm_root_generation = lsm_root_generation;
             try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
         }
         return;
@@ -15018,6 +15129,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
     } else {
         markRuntimeStatusFromDb(&status, phase);
+        status.metadata.lsm_root_generation = lsm_root_generation;
         try snapshot_cache.upsertGroupStatus(table_name, status);
     }
 }
@@ -15466,6 +15578,12 @@ fn clearStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) vo
 
 fn markClearedStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) void {
     clearStartupRuntimeStatus(status);
+    if (status.metadata.freshness == .fresh) {
+        switch (status.metadata.source) {
+            .cached_snapshot, .live_writer_publish, .background_refresh, .remote_store => return,
+            .unknown, .synthetic_config, .startup_catch_up => {},
+        }
+    }
     var runtime_fact_probe = status.*;
     runtime_fact_probe.metadata.source = .cached_snapshot;
     const source: runtime_status.RuntimeStatusSource = if (runtime_status.statusHasRuntimeFacts(runtime_fact_probe))
@@ -27215,6 +27333,77 @@ test "idle startup runtime status preserves live empty cached status" {
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
+}
+
+test "idle startup completion cannot downgrade a superseding live index status" {
+    const alloc = std.testing.allocator;
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-startup-superseded", NoCatalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    try publishStartupCatchUpRuntimeStatusSnapshot(&source, alloc, "docs", 7001, .{
+        .active = true,
+        .phase = .opening_db,
+    }, null, null);
+
+    var indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    indexes[0] = .{
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .coverage_identity_ready = true,
+        .coverage_produced_count = 3,
+    };
+    var live = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 123,
+        },
+        .stats = .{
+            .source_doc_count = 3,
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = indexes,
+        },
+    };
+    defer live.deinit(alloc);
+    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", live);
+
+    try publishStartupCatchUpRuntimeStatusSnapshot(&source, alloc, "docs", 7001, .{}, null, null);
+
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 123), statuses.items[0].metadata.updated_at_ns);
+    try std.testing.expectEqual(@as(u64, 3), statuses.items[0].stats.indexes[0].coverage_produced_count);
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
 }
 

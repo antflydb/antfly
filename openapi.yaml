@@ -2908,8 +2908,9 @@ paths:
             type: string
             minLength: 1
             maxLength: 256
-          description: Stable key used to safely retry creation of this restore job. Requests without
-            this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to
+            the authenticated principal and cluster restore target. Requests without this header create
+            a new job.
       requestBody:
         required: true
         content:
@@ -2951,8 +2952,10 @@ paths:
         in: path
         required: true
         schema:
-          type: integer
-          format: int64
+          type: string
+          minLength: 1
+          maxLength: 19
+          pattern: ^[1-9][0-9]{0,18}$
     get:
       summary: Get durable restore job status
       description: >
@@ -3861,8 +3864,8 @@ paths:
             type: string
             minLength: 1
             maxLength: 256
-          description: Stable key used to safely retry creation of this restore job. Requests without
-            this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to
+            the authenticated principal and table. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -10663,7 +10666,11 @@ components:
             minLength: 1
             maxLength: 4096
           description: >
-            Optional list of tables to backup. If omitted, all tables are backed up.
+            Optional list of tables to backup. If omitted, all tables are backed up,
+
+            up to the cluster backup limit of 4096 tables. Requests above that limit
+
+            fail before any table backup is created.
           example:
             - users
             - products
@@ -10749,7 +10756,11 @@ components:
             minLength: 1
             maxLength: 4096
           description: >
-            Optional list of tables to restore. If omitted, all tables in the backup are restored.
+            Optional list of tables to restore. If omitted, all tables in the backup are restored,
+
+            up to the cluster restore limit of 4096 tables. Larger backups must be restored
+
+            in explicit batches of at most 256 tables.
           example:
             - users
             - products
@@ -10782,11 +10793,13 @@ components:
         - completed_table_count
         - created_at_ms
         - updated_at_ms
-        - expires_at_ms
       properties:
         job_id:
-          type: integer
-          format: int64
+          type: string
+          minLength: 1
+          maxLength: 19
+          pattern: ^[1-9][0-9]{0,18}$
+          description: Opaque durable restore-job identifier. Clients must not parse it as a number.
         attempt_id:
           type: integer
           format: int64
@@ -10904,7 +10917,7 @@ components:
           type: integer
           format: int64
           description: Unix epoch milliseconds after which this terminal job record and its idempotency
-            key may be removed.
+            key may be removed. Omitted while the job is nonterminal.
     ClusterRestoreResponse:
       type: object
       required:

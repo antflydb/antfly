@@ -4639,7 +4639,9 @@ components:
             minLength: 1
             maxLength: 4096
           description: |
-            Optional list of tables to backup. If omitted, all tables are backed up.
+            Optional list of tables to backup. If omitted, all tables are backed up,
+            up to the cluster backup limit of 4096 tables. Requests above that limit
+            fail before any table backup is created.
           example: ["users", "products"]
     ClusterBackupResponse:
       type: object
@@ -4717,7 +4719,9 @@ components:
             minLength: 1
             maxLength: 4096
           description: |
-            Optional list of tables to restore. If omitted, all tables in the backup are restored.
+            Optional list of tables to restore. If omitted, all tables in the backup are restored,
+            up to the cluster restore limit of 4096 tables. Larger backups must be restored
+            in explicit batches of at most 256 tables.
           example: ["users", "products"]
         restore_mode:
           type: string
@@ -4731,9 +4735,14 @@ components:
           example: "skip_if_exists"
     RestoreJob:
       type: object
-      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, published_table_count, completed_table_count, created_at_ms, updated_at_ms, expires_at_ms]
+      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, published_table_count, completed_table_count, created_at_ms, updated_at_ms]
       properties:
-        job_id: { type: integer, format: int64 }
+        job_id:
+          type: string
+          minLength: 1
+          maxLength: 19
+          pattern: '^[1-9][0-9]{0,18}$'
+          description: Opaque durable restore-job identifier. Clients must not parse it as a number.
         attempt_id: { type: integer, format: int64 }
         scope: { type: string, enum: [table, cluster] }
         table_name: { type: string }
@@ -4796,7 +4805,7 @@ components:
         expires_at_ms:
           type: integer
           format: int64
-          description: Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed.
+          description: Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
     ClusterRestoreResponse:
       type: object
       required:
@@ -8190,7 +8199,7 @@ paths:
           in: header
           required: false
           schema: { type: string, minLength: 1, maxLength: 256 }
-          description: Stable key used to safely retry creation of this restore job. Requests without this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -8224,7 +8233,11 @@ paths:
       - name: job_id
         in: path
         required: true
-        schema: { type: integer, format: int64 }
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 19
+          pattern: '^[1-9][0-9]{0,18}$'
     get:
       summary: Get durable restore job status
       description: |
@@ -8958,7 +8971,7 @@ paths:
           in: header
           required: false
           schema: { type: string, minLength: 1, maxLength: 256 }
-          description: Stable key used to safely retry creation of this restore job. Requests without this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job.
       requestBody:
         required: true
         content:

@@ -38,6 +38,7 @@ export {
   AntflyClient,
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
+  type RestoreOptions,
 } from "./client.js";
 export { InferenceClient } from "./inference-client.js";
 export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
@@ -140,6 +141,7 @@ export type {
   // Chat types (used by retrieval agent)
   // Retrieval Agent result types
   ClassificationTransformationResult,
+  ClusterRestoreRequest,
   // Connection types
   ConnectedModel,
   ConnectedModelType,

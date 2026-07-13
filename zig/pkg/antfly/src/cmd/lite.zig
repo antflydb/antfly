@@ -729,7 +729,7 @@ const PromoteOptions = struct {
 };
 
 const PromoteRestoreAcceptance = struct {
-    job_id: i64,
+    job_id: []u8,
     encoded: []u8,
 };
 
@@ -737,11 +737,12 @@ const PromoteRestoreFn = *const fn (ctx: *anyopaque, allocator: Allocator, table
 
 const PromoteSubmission = struct {
     staged: lite_restore_staging.StagedRestore,
-    restore_job_id: i64,
+    restore_job_id: []u8,
     accepted_json: []u8,
 
     fn deinit(self: *PromoteSubmission, allocator: Allocator) void {
         self.staged.deinit(allocator);
+        allocator.free(self.restore_job_id);
         allocator.free(self.accepted_json);
         self.* = undefined;
     }
@@ -800,7 +801,10 @@ fn promoteWithRestore(
         .location = staged.location,
         .connection = opts.connection,
     }, opts.idempotency_key);
-    errdefer allocator.free(accepted.encoded);
+    errdefer {
+        allocator.free(accepted.job_id);
+        allocator.free(accepted.encoded);
+    }
 
     return .{ .staged = staged, .restore_job_id = accepted.job_id, .accepted_json = accepted.encoded };
 }
@@ -811,10 +815,10 @@ fn promoteRestoreWithClient(ctx: *anyopaque, allocator: Allocator, table: []cons
     defer resp.deinit();
     cli.expectHttpSuccess(resp);
     const job = if (resp.data) |*data| data.value else return error.InvalidRestoreResponse;
-    return .{
-        .job_id = job.job_id,
-        .encoded = try std.json.Stringify.valueAlloc(allocator, job, .{}),
-    };
+    const job_id = try allocator.dupe(u8, job.job_id);
+    errdefer allocator.free(job_id);
+    const encoded = try std.json.Stringify.valueAlloc(allocator, job, .{});
+    return .{ .job_id = job_id, .encoded = encoded };
 }
 
 fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.process.Args.Iterator) !PromoteOptions {
@@ -2907,10 +2911,10 @@ test "lite promote helper stages backup then submits normal restore request" {
             self.backup_id = request.backup_id;
             self.location = request.location;
             self.connection = request.connection;
-            return .{
-                .job_id = 42,
-                .encoded = try allocator_inner.dupe(u8, "{\"job_id\":42,\"phase\":\"queued\"}"),
-            };
+            const job_id = try allocator_inner.dupe(u8, "9223372036854775807");
+            errdefer allocator_inner.free(job_id);
+            const encoded = try allocator_inner.dupe(u8, "{\"job_id\":\"9223372036854775807\",\"phase\":\"queued\"}");
+            return .{ .job_id = job_id, .encoded = encoded };
         }
     };
 
@@ -2920,8 +2924,8 @@ test "lite promote helper stages backup then submits normal restore request" {
     const staged = submission.staged;
 
     try std.testing.expect(capture.called);
-    try std.testing.expectEqual(@as(i64, 42), submission.restore_job_id);
-    try std.testing.expectEqualStrings("{\"job_id\":42,\"phase\":\"queued\"}", submission.accepted_json);
+    try std.testing.expectEqualStrings("9223372036854775807", submission.restore_job_id);
+    try std.testing.expectEqualStrings("{\"job_id\":\"9223372036854775807\",\"phase\":\"queued\"}", submission.accepted_json);
     try std.testing.expectEqualStrings("docs", capture.table);
     try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
     try std.testing.expectEqualStrings(staged.location, capture.location);

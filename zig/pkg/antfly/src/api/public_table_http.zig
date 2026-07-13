@@ -234,6 +234,7 @@ pub const TableApi = struct {
             backup_id: []const u8,
             format: backups_api.BackupFormat,
             location_uri: []const u8,
+            connection: []const u8,
             location: *backups_api.BackupLocation,
         ) ExecuteBackupError!void,
         execute_table_restore: *const fn (
@@ -350,9 +351,10 @@ pub const TableApi = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         location_uri: []const u8,
+        connection: []const u8,
         location: *backups_api.BackupLocation,
     ) ExecuteBackupError!void {
-        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, location_uri, location);
+        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location);
     }
 
     pub fn executeTableRestore(
@@ -736,7 +738,7 @@ pub fn handleTableBackup(
     };
     defer location.deinit(alloc);
 
-    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, &location) catch |err| switch (err) {
+    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, parsed_req.value.connection, &location) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
@@ -1350,6 +1352,7 @@ fn unsupportedBackup(
     _: []const u8,
     _: []const u8,
     _: backups_api.BackupFormat,
+    _: []const u8,
     _: []const u8,
     _: *backups_api.BackupLocation,
 ) TableApi.ExecuteBackupError!void {
@@ -2446,6 +2449,7 @@ test "public table backup handler maps unsupported multi-range error" {
             _: []const u8,
             _: backups_api.BackupFormat,
             _: []const u8,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteBackupError!void {
             return error.UnsupportedMultiRangeTable;
@@ -2495,6 +2499,7 @@ test "public table backup handler rejects an existing backup id" {
             _: []const u8,
             _: backups_api.BackupFormat,
             _: []const u8,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteBackupError!void {
             return error.BackupAlreadyExists;
@@ -2520,6 +2525,7 @@ test "public table backup handler rejects an existing backup id" {
 test "public table backup handler accepts portable format" {
     const Backend = struct {
         seen_portable: bool = false,
+        seen_connection: bool = false,
 
         fn iface(self: *@This()) TableApi {
             return .{
@@ -2545,10 +2551,12 @@ test "public table backup handler accepts portable format" {
             _: []const u8,
             format: backups_api.BackupFormat,
             _: []const u8,
+            connection: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteBackupError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.seen_portable = format == .portable;
+            self.seen_connection = std.mem.eql(u8, connection, "test-backups");
         }
     };
 
@@ -2568,6 +2576,7 @@ test "public table backup handler accepts portable format" {
 
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expect(backend.seen_portable);
+    try std.testing.expect(backend.seen_connection);
 }
 
 test "public table restore handler maps target already exists" {
@@ -2609,6 +2618,8 @@ test "public table restore handler maps target already exists" {
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
         Backend.iface(),
         null,
+        null,
+        null,
         &node_config,
         null,
     );
@@ -2649,11 +2660,15 @@ test "public table restore handler maps unsupported multi-range error" {
         }
     };
 
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
     var resp = try handleTableRestore(
         std.testing.allocator,
         "docs",
-        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
         Backend.iface(),
+        null,
+        &node_config,
         null,
     );
     defer resp.deinit(std.testing.allocator);
@@ -2693,11 +2708,15 @@ test "public table restore handler reports committed durability pending" {
         }
     };
 
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
     var resp = try handleTableRestore(
         std.testing.allocator,
         "docs",
-        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
         Backend.iface(),
+        null,
+        &node_config,
         null,
     );
     defer resp.deinit(std.testing.allocator);
@@ -2737,11 +2756,15 @@ test "public table restore handler reports confirmed durability" {
         }
     };
 
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
     var resp = try handleTableRestore(
         std.testing.allocator,
         "docs",
-        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\"}",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
         Backend.iface(),
+        null,
+        &node_config,
         null,
     );
     defer resp.deinit(std.testing.allocator);

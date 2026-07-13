@@ -27,7 +27,8 @@ import (
 )
 
 func TestClusterRestoreCarriesConnectionAndExposesDurableJobLifecycle(t *testing.T) {
-	const job = `{"job_id":42,"attempt_id":0,"scope":"cluster","backup_id":"daily","phase":"queued","cancel_requested":false,"created_at_ms":1,"updated_at_ms":1,"expires_at_ms":9223372036854775807}`
+	const jobID = "9223372036854775807"
+	const job = `{"job_id":"` + jobID + `","attempt_id":0,"scope":"cluster","backup_id":"daily","phase":"queued","cancel_requested":false,"published_table_count":0,"completed_table_count":0,"created_at_ms":1,"updated_at_ms":1}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -42,8 +43,8 @@ func TestClusterRestoreCarriesConnectionAndExposesDurableJobLifecycle(t *testing
 				t.Errorf("connection = %q, want archive-reader", body.Connection)
 			}
 			w.WriteHeader(http.StatusAccepted)
-		case r.Method == http.MethodGet && r.URL.Path == "/db/v1/restore/jobs/42":
-		case r.Method == http.MethodDelete && r.URL.Path == "/db/v1/restore/jobs/42":
+		case r.Method == http.MethodGet && r.URL.Path == "/db/v1/restore/jobs/"+jobID:
+		case r.Method == http.MethodDelete && r.URL.Path == "/db/v1/restore/jobs/"+jobID:
 		default:
 			http.NotFound(w, r)
 			return
@@ -60,13 +61,13 @@ func TestClusterRestoreCarriesConnectionAndExposesDurableJobLifecycle(t *testing
 	if err != nil {
 		t.Fatalf("ClusterRestore: %v", err)
 	}
-	if started.JobId != 42 {
-		t.Fatalf("started job ID = %d, want 42", started.JobId)
+	if started.JobId != jobID {
+		t.Fatalf("started job ID = %q, want %q", started.JobId, jobID)
 	}
-	if _, err := client.GetRestoreJob(context.Background(), 42); err != nil {
+	if _, err := client.GetRestoreJob(context.Background(), jobID); err != nil {
 		t.Fatalf("GetRestoreJob: %v", err)
 	}
-	if _, err := client.CancelRestoreJob(context.Background(), 42); err != nil {
+	if _, err := client.CancelRestoreJob(context.Background(), jobID); err != nil {
 		t.Fatalf("CancelRestoreJob: %v", err)
 	}
 }

@@ -21,7 +21,9 @@ class ClusterRestoreRequest:
              Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
         connection (str): Required configured `external_io` connection with the `restore.read` capability.
         table_names (list[str] | Unset): Optional list of tables to restore. If omitted, all tables in the backup are
-            restored.
+            restored,
+            up to the cluster restore limit of 4096 tables. Larger backups must be restored
+            in explicit batches of at most 256 tables.
              Example: ['users', 'products'].
         restore_mode (ClusterRestoreRequestRestoreMode | Unset): How to handle existing tables:
             - `fail_if_exists`: Abort if any table already exists (default)

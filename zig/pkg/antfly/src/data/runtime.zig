@@ -1836,6 +1836,53 @@ test "data runtime store status scheduler keeps clean periodic reports tick gate
     );
 }
 
+test "idle cached runtime status stays fresh only for the published root generation" {
+    const fresh = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .lsm_root_generation = 3,
+        },
+        .stats = .{},
+    };
+    try std.testing.expect(DataServer.cachedRuntimeStatusRemainsFresh(fresh, 3));
+    try std.testing.expect(!DataServer.cachedRuntimeStatusRemainsFresh(fresh, 4));
+
+    var pending = fresh;
+    pending.stats.enrichment.target_sequence = 9;
+    pending.stats.enrichment.applied_sequence = 8;
+    try std.testing.expect(!DataServer.cachedRuntimeStatusRemainsFresh(pending, 3));
+}
+
+test "data runtime stamps one producer generation on every reported group" {
+    const alloc = std.testing.allocator;
+    const statuses = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 2);
+    statuses[0] = .{ .group_id = 7, .stats = .{} };
+    statuses[1] = .{
+        .group_id = 8,
+        .metadata = .{ .store_id = 99, .node_id = 100, .status_generation = 1 },
+        .stats = .{},
+    };
+    var snapshot = runtime_status.TableRuntimeSnapshot{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = statuses },
+    };
+    defer snapshot.deinit(alloc);
+
+    DataServer.annotateRuntimeSnapshotOwner(&snapshot, .{
+        .store_id = 11,
+        .node_id = 13,
+    }, 17);
+
+    try std.testing.expectEqual(@as(u64, 11), statuses[0].metadata.store_id);
+    try std.testing.expectEqual(@as(u64, 13), statuses[0].metadata.node_id);
+    try std.testing.expectEqual(@as(u64, 17), statuses[0].metadata.status_generation);
+    try std.testing.expectEqual(@as(u64, 99), statuses[1].metadata.store_id);
+    try std.testing.expectEqual(@as(u64, 100), statuses[1].metadata.node_id);
+    try std.testing.expectEqual(@as(u64, 17), statuses[1].metadata.status_generation);
+}
+
 pub const StoreRegistrationConfig = struct {
     node_id: u64,
     store_id: u64,
@@ -2099,6 +2146,7 @@ pub const DataServer = struct {
     runtime_status_refresh_active: std.atomic.Value(bool) = .init(false),
     runtime_status_refresh_started: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_completed: std.atomic.Value(u64) = .init(0),
+    runtime_status_generation: std.atomic.Value(u64) = .init(1),
     runtime_status_refresh_failed: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_last_table_count: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_last_group_count: std.atomic.Value(u64) = .init(0),
@@ -2498,7 +2546,7 @@ pub const DataServer = struct {
         // used by DB internals (c_allocator when libc is linked): search hits
         // adopt index-owned metadata buffers, so a distinct request allocator
         // identity turns those adoptions into cross-allocator frees.
-        self.http_server = antfly.public_api.ApiHttpServer.initWithProcessRequestAllocator(
+        self.http_server = try antfly.public_api.ApiHttpServer.initWithConfig(
             self.alloc,
             api_server_cfg,
             self.status_source,
@@ -6327,7 +6375,8 @@ pub const DataServer = struct {
         var active_target_owned = active_target;
         defer if (active_target_owned) |*target| target.deinit(self.alloc);
 
-        const snapshots = self.collectOwnedRuntimeSnapshots(active_target_owned, &budget) catch |err| {
+        const status_generation = self.runtime_status_generation.fetchAdd(1, .monotonic);
+        const snapshots = self.collectOwnedRuntimeSnapshots(active_target_owned, &budget, status_generation) catch |err| {
             _ = self.runtime_status_refresh_failed.fetchAdd(1, .monotonic);
             logRuntimeStatusRefreshFailure("runtime status refresh failed err={}", err);
             return stats;
@@ -6421,6 +6470,7 @@ pub const DataServer = struct {
         self: *DataServer,
         active_target: ?ActiveStartupCatchUpTarget,
         budget: *RuntimeStatusRefreshBudget,
+        status_generation: u64,
     ) ![]runtime_status.TableRuntimeSnapshot {
         const registration = self.store_registration orelse return error.UnsupportedOperation;
         var snapshot = (try self.status_source.adminSnapshot()) orelse return error.UnsupportedOperation;
@@ -6443,7 +6493,7 @@ pub const DataServer = struct {
         for (snapshot.tables) |table| {
             if (try self.collectOwnedRuntimeSnapshotForTable(snapshot.tables, snapshot.ranges, local_group_ids, table, active_target, budget)) |entry| {
                 var owned_entry = entry;
-                annotateRuntimeSnapshotOwner(&owned_entry, registration);
+                annotateRuntimeSnapshotOwner(&owned_entry, registration, status_generation);
                 try snapshots.append(self.alloc, owned_entry);
             }
         }
@@ -6454,10 +6504,12 @@ pub const DataServer = struct {
     fn annotateRuntimeSnapshotOwner(
         snapshot: *runtime_status.TableRuntimeSnapshot,
         registration: StoreRegistrationConfig,
+        status_generation: u64,
     ) void {
         for (snapshot.statuses.items) |*status| {
             if (status.metadata.store_id == 0) status.metadata.store_id = registration.store_id;
             if (status.metadata.node_id == 0) status.metadata.node_id = registration.node_id;
+            status.metadata.status_generation = status_generation;
         }
     }
 
@@ -6546,7 +6598,14 @@ pub const DataServer = struct {
             if (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table.name, group_id)) |cached| {
                 var status = cached;
                 if (runtime_status.statusHasRuntimeFacts(status)) {
-                    setRuntimeStatusMetadata(&status, .cached_snapshot, .stale);
+                    if (cachedRuntimeStatusRemainsFresh(
+                        status,
+                        self.provisioned_storage.visibleRootGenerationForGroup(group_id),
+                    )) {
+                        status.metadata.source = .cached_snapshot;
+                    } else {
+                        setRuntimeStatusMetadata(&status, .cached_snapshot, .stale);
+                    }
                     self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                     try items.append(self.alloc, status);
                     continue;
@@ -6585,6 +6644,15 @@ pub const DataServer = struct {
             if (index.replay_target_sequence > index.replay_applied_sequence) return true;
         }
         return false;
+    }
+
+    fn cachedRuntimeStatusRemainsFresh(
+        status: runtime_status.LocalTableRuntimeStatus,
+        visible_root_generation: u64,
+    ) bool {
+        return status.metadata.freshness == .fresh and
+            status.metadata.lsm_root_generation == visible_root_generation and
+            !runtimeStatusHasActiveBackgroundWork(status);
     }
 
     fn appendCachedOrSyntheticRuntimeStatus(

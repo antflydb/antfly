@@ -200,6 +200,7 @@ export type PermissionType = components["schemas"]["PermissionType"];
 // Backup/Restore types
 export type BackupRequest = components["schemas"]["BackupRequest"];
 export type RestoreRequest = components["schemas"]["RestoreRequest"];
+export type ClusterRestoreRequest = components["schemas"]["ClusterRestoreRequest"];
 export type RestoreJob = components["schemas"]["RestoreJob"];
 
 // Lookup/Scan types

@@ -12,7 +12,7 @@ from ...types import Response
 
 
 def _get_kwargs(
-    job_id: int,
+    job_id: str,
 ) -> dict[str, Any]:
 
     _kwargs: dict[str, Any] = {
@@ -57,7 +57,7 @@ def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
 
 def sync_detailed(
-    job_id: int,
+    job_id: str,
     *,
     client: AuthenticatedClient,
 ) -> Response[Error | RestoreJob]:
@@ -69,7 +69,7 @@ def sync_detailed(
     as job absence.
 
     Args:
-        job_id (int):
+        job_id (str):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -91,7 +91,7 @@ def sync_detailed(
 
 
 def sync(
-    job_id: int,
+    job_id: str,
     *,
     client: AuthenticatedClient,
 ) -> Error | RestoreJob | None:
@@ -103,7 +103,7 @@ def sync(
     as job absence.
 
     Args:
-        job_id (int):
+        job_id (str):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -120,7 +120,7 @@ def sync(
 
 
 async def asyncio_detailed(
-    job_id: int,
+    job_id: str,
     *,
     client: AuthenticatedClient,
 ) -> Response[Error | RestoreJob]:
@@ -132,7 +132,7 @@ async def asyncio_detailed(
     as job absence.
 
     Args:
-        job_id (int):
+        job_id (str):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -152,7 +152,7 @@ async def asyncio_detailed(
 
 
 async def asyncio(
-    job_id: int,
+    job_id: str,
     *,
     client: AuthenticatedClient,
 ) -> Error | RestoreJob | None:
@@ -164,7 +164,7 @@ async def asyncio(
     as job absence.
 
     Args:
-        job_id (int):
+        job_id (str):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

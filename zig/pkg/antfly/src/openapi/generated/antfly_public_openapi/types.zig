@@ -683,7 +683,7 @@ pub const ClusterBackupRequest = struct {
     connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
-    /// Optional list of tables to backup. If omitted, all tables are backed up.
+    /// Optional list of tables to backup. If omitted, all tables are backed up, up to the cluster backup limit of 4096 tables. Requests above that limit fail before any table backup is created.
     table_names: ?[]const []const u8 = null,
 };
 
@@ -809,7 +809,7 @@ pub const ClusterRestoreRequest = struct {
     location: []const u8,
     /// Required configured `external_io` connection with the `restore.read` capability.
     connection: []const u8,
-    /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
+    /// Optional list of tables to restore. If omitted, all tables in the backup are restored, up to the cluster restore limit of 4096 tables. Larger backups must be restored in explicit batches of at most 256 tables.
     table_names: ?[]const []const u8 = null,
     /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
     restore_mode: ?[]const u8 = null,
@@ -2299,7 +2299,8 @@ pub const ResourceType = enum {
 };
 
 pub const RestoreJob = struct {
-    job_id: i64,
+    /// Opaque durable restore-job identifier. Clients must not parse it as a number.
+    job_id: []const u8,
     attempt_id: i64,
     scope: []const u8,
     table_name: ?[]const u8 = null,
@@ -2317,8 +2318,8 @@ pub const RestoreJob = struct {
     @"error": ?[]const u8 = null,
     created_at_ms: i64,
     updated_at_ms: i64,
-    /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed.
-    expires_at_ms: i64,
+    /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+    expires_at_ms: ?i64 = null,
 };
 
 pub const RestoreRequest = struct {

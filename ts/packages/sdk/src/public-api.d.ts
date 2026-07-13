@@ -475,7 +475,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
-                job_id: number;
+                job_id: string;
             };
             cookie?: never;
         };
@@ -4744,7 +4744,9 @@ export interface components {
              */
             format?: "native" | "portable";
             /**
-             * @description Optional list of tables to backup. If omitted, all tables are backed up.
+             * @description Optional list of tables to backup. If omitted, all tables are backed up,
+             *     up to the cluster backup limit of 4096 tables. Requests above that limit
+             *     fail before any table backup is created.
              * @example [
              *       "users",
              *       "products"
@@ -4796,7 +4798,9 @@ export interface components {
             /** @description Required configured `external_io` connection with the `restore.read` capability. */
             connection: string;
             /**
-             * @description Optional list of tables to restore. If omitted, all tables in the backup are restored.
+             * @description Optional list of tables to restore. If omitted, all tables in the backup are restored,
+             *     up to the cluster restore limit of 4096 tables. Larger backups must be restored
+             *     in explicit batches of at most 256 tables.
              * @example [
              *       "users",
              *       "products"
@@ -4815,8 +4819,8 @@ export interface components {
             restore_mode?: "fail_if_exists" | "skip_if_exists" | "overwrite";
         };
         RestoreJob: {
-            /** Format: int64 */
-            job_id: number;
+            /** @description Opaque durable restore-job identifier. Clients must not parse it as a number. */
+            job_id: string;
             /** Format: int64 */
             attempt_id: number;
             /** @enum {string} */
@@ -4881,9 +4885,9 @@ export interface components {
             updated_at_ms: number;
             /**
              * Format: int64
-             * @description Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed.
+             * @description Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
              */
-            expires_at_ms: number;
+            expires_at_ms?: number;
         };
         ClusterRestoreResponse: {
             /** @description Status of each table restore */
@@ -13126,7 +13130,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Stable key used to safely retry creation of this restore job. Requests without this header create a new job. */
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job. */
                 "Idempotency-Key"?: string;
             };
             path?: never;
@@ -13162,7 +13166,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                job_id: number;
+                job_id: string;
             };
             cookie?: never;
         };
@@ -13186,7 +13190,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                job_id: number;
+                job_id: string;
             };
             cookie?: never;
         };
@@ -13660,7 +13664,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Stable key used to safely retry creation of this restore job. Requests without this header create a new job. */
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job. */
                 "Idempotency-Key"?: string;
             };
             path: {
