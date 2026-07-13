@@ -102,7 +102,7 @@ pub const Config = struct {
             enabled: bool = true,
             max_bytes_mb: usize = 64,
             ttl_ms: u64 = 300_000,
-            max_inflight: usize = 1024,
+            max_inflight: usize = 16,
         };
 
         pub const WarmModelConfig = struct {
@@ -1019,7 +1019,7 @@ fn queryEmbeddingCacheFromOpenApi(
     const config = value orelse return .{};
     const max_bytes_mb = std.math.cast(usize, config.max_bytes_mb orelse 64) orelse return error.InvalidConfig;
     const ttl_ms = std.math.cast(u64, config.ttl_ms orelse 300_000) orelse return error.InvalidConfig;
-    const max_inflight = std.math.cast(usize, config.max_inflight orelse 1024) orelse return error.InvalidConfig;
+    const max_inflight = std.math.cast(usize, config.max_inflight orelse 16) orelse return error.InvalidConfig;
     if (max_bytes_mb > 1_048_576 or ttl_ms > 86_400_000 or max_inflight == 0 or max_inflight > 65_536) return error.InvalidConfig;
     return .{
         .enabled = config.enabled orelse true,
@@ -1926,6 +1926,7 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+    try std.testing.expectEqual(@as(usize, 16), cfg.inference.query_embedding_cache.max_inflight);
 }
 
 test "common config can disable health server" {

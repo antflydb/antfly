@@ -152,7 +152,7 @@ inference:
     enabled: true
     max_bytes_mb: 64
     ttl_ms: 300000
-    max_inflight: 1024
+    max_inflight: 16
 ```
 
 `max_bytes_mb: 0` disables result retention while preserving singleflight.
@@ -171,6 +171,12 @@ bypass provider protection by selecting an uncached request shape. Public
 overload, provider rate-limit, and transient provider responses include a short
 `Retry-After` hint so clients can back off instead of immediately amplifying
 pressure.
+
+The default of 16 is deliberately conservative: remote provider responses are
+accepted up to 4 MiB before decoding, so the default bounds that transient
+response envelope to 64 MiB before allocator and caller-owned copies. Operators
+can raise the count after load testing the configured providers, dimensions,
+and node memory budget.
 
 Internal group query and preflight routes use the same server-owned planning
 context as public queries: backend-runtime I/O, cache and singleflight,

@@ -665,7 +665,7 @@ pub const QueryEmbeddingCacheConfig = struct {
     max_bytes_mb: ?i64 = null,
     /// Idle expiration in milliseconds. Cache hits refresh the expiry time.
     ttl_ms: ?i64 = null,
-    /// Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached.
+    /// Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached. The conservative default bounds transient memory before provider responses are decoded; raise it only after measuring provider and node capacity.
     max_inflight: ?i64 = null,
 };
 

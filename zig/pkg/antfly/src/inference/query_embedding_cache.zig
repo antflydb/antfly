@@ -16,7 +16,7 @@ pub const Config = struct {
     enabled: bool = true,
     max_bytes: usize = 64 * 1024 * 1024,
     ttl_ns: u64 = 5 * std.time.ns_per_min,
-    max_inflight: usize = 1024,
+    max_inflight: usize = 16,
 };
 
 pub const Stats = struct {
