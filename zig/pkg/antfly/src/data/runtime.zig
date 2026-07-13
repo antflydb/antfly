@@ -15537,7 +15537,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_rejections_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_waiter_timeouts_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);

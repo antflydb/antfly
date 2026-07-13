@@ -422,7 +422,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
 }
 
 const SemanticStatusResolver = struct {
-    planning: QueryPlanningContext,
+    planning: ?QueryPlanningContext,
 
     fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -443,7 +443,7 @@ const SemanticStatusResolver = struct {
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
-        return try planSemanticQuery(self.planning, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        return try planSemanticQuery(self.planning orelse return error.UnsupportedQueryRequest, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
 };
 
@@ -715,7 +715,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
         }
         if (routes.Routes.matchGroupQuery(path)) |query_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() orelse return try http_route_helpers.textResponse(alloc, 400, "UnsupportedQueryRequest") };
+            var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() };
             var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), query_route.table_name, req.body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 else => {
@@ -793,7 +793,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             const preflight_req = try parseQueryPreflightRequest(alloc, req.body);
             defer alloc.free(preflight_req.query_request_body);
-            var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() orelse return try http_route_helpers.textResponse(alloc, 400, "UnsupportedQueryRequest") };
+            var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() };
             var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), query_route.table_name, preflight_req.query_request_body) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 else => {

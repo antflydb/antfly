@@ -102,6 +102,17 @@ pub const WriterProgress = struct {
 
 pub const WriterProgressCallback = *const fn (progress: WriterProgress, context: ?*anyopaque) void;
 
+fn requestDeadlineMs(io: Io, timeout_ms: u64) ?i64 {
+    if (timeout_ms == 0) return null;
+    const bounded_timeout = std.math.cast(i64, timeout_ms) orelse std.math.maxInt(i64);
+    return common.milliTimestamp(io) +| bounded_timeout;
+}
+
+fn ensureRequestDeadline(io: Io, deadline_ms: ?i64) !void {
+    const deadline = deadline_ms orelse return;
+    if (common.milliTimestamp(io) >= deadline) return error.Timeout;
+}
+
 /// Request interceptor function type.
 pub const RequestInterceptor = *const fn (*Request, ?*anyopaque) anyerror!void;
 
@@ -512,7 +523,8 @@ pub const Client = struct {
     /// Executes the actual HTTP request.
     fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
-        if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms);
+        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms);
 
         const RequestResult = anyerror!Response;
         const TimeoutResult = anyerror!void;
@@ -521,8 +533,8 @@ pub const Client = struct {
             timeout: TimeoutResult,
         };
         const Task = struct {
-            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64) RequestResult {
-                return client.executeRequestWithRetries(request_value, socket_timeout_ms);
+            fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64) RequestResult {
+                return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms);
             }
 
             fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
@@ -544,7 +556,7 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms });
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms });
         select.async(.timeout, Task.timeoutTask, .{
             self.io,
             Io.Timeout{ .duration = .{
@@ -567,13 +579,14 @@ pub const Client = struct {
         }
     }
 
-    fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
+    fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64) !Response {
         const policy = self.config.retry_policy;
         const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
         var attempt: u32 = 0;
         while (true) {
-            var res = self.executeRequestOnce(req, timeout_override_ms) catch |err| {
+            var res = self.executeRequestOnce(req, timeout_override_ms, deadline_ms) catch |err| {
+                ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
                 // RFC 7540 §6.8: Streams refused via GOAWAY were never
                 // processed and are always safe to retry on a new connection.
                 const is_goaway_refused = (err == error.GoawayRefused);
@@ -612,7 +625,8 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
     ) !Response {
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
-        if (timeout_ms == 0) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, writer, progress_cb, progress_ctx);
+        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        if (timeout_ms == 0) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx);
 
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
@@ -626,11 +640,12 @@ pub const Client = struct {
                 client: *Self,
                 request_value: *Request,
                 socket_timeout_ms: ?u64,
+                request_deadline_ms: ?i64,
                 output: Writer,
                 callback: ?WriterProgressCallback,
                 callback_context: ?*anyopaque,
             ) RequestResult {
-                return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, output, callback, callback_context);
+                return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context);
             }
 
             fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
@@ -652,7 +667,7 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, writer, progress_cb, progress_ctx });
+        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx });
         select.async(.timeout, Task.timeoutTask, .{
             self.io,
             Io.Timeout{ .duration = .{
@@ -679,6 +694,7 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         timeout_override_ms: ?u64,
+        deadline_ms: ?i64,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
@@ -688,7 +704,8 @@ pub const Client = struct {
 
         var attempt: u32 = 0;
         while (true) {
-            var res = self.executeRequestToWriterOnce(req, timeout_override_ms, writer, progress_cb, progress_ctx) catch |err| {
+            var res = self.executeRequestToWriterOnce(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx) catch |err| {
+                ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
                 const is_goaway_refused = (err == error.GoawayRefused);
                 const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
                 if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
@@ -716,12 +733,16 @@ pub const Client = struct {
         }
     }
 
-    fn applyTimeouts(socket: *Socket, recv_ms: u64, send_ms: u64) !void {
-        if (recv_ms > 0) try socket.setRecvTimeout(recv_ms);
-        if (send_ms > 0) try socket.setSendTimeout(send_ms);
+    fn applyTimeouts(socket: *Socket, recv_ms: u64, send_ms: u64, deadline_ms: ?i64) !void {
+        // Always reset pooled sockets so a prior request's shorter absolute
+        // deadline cannot leak into the next request.
+        try socket.setRecvTimeout(recv_ms);
+        try socket.setSendTimeout(send_ms);
+        socket.setRequestDeadline(deadline_ms);
     }
 
-    fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
+    fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64) !Response {
+        try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
         // Use request_ms as a fallback ceiling for socket timeouts when the
@@ -767,7 +788,7 @@ pub const Client = struct {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
                 }
 
-                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms);
+                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 return self.executeOnTls(&tls_conn.session, req, &ok);
             }
 
@@ -775,7 +796,7 @@ pub const Client = struct {
             const addr = try resolveAddress(self.io, host, port);
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
-            try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+            try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             return self.executeOnNewTls(&socket, host, req);
         }
 
@@ -786,14 +807,14 @@ pub const Client = struct {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
             }
 
-            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms);
+            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
         const addr = try resolveAddress(self.io, host, port);
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
-        try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+        try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         return self.executeOnSocket(&socket, req, null);
     }
 
@@ -801,6 +822,7 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         timeout_override_ms: ?u64,
+        deadline_ms: ?i64,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
@@ -817,7 +839,7 @@ pub const Client = struct {
         };
 
         if (self.config.http2_enabled or self.config.force_http2) {
-            var res = try self.executeRequestOnce(req, timeout_override_ms);
+            var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms);
             errdefer res.deinit();
             try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
             return res;
@@ -831,14 +853,14 @@ pub const Client = struct {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
                 }
 
-                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms);
+                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
             const addr = try resolveAddress(self.io, host, port);
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
-            try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+            try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
         }
 
@@ -849,14 +871,14 @@ pub const Client = struct {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
             }
 
-            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms);
+            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
         const addr = try resolveAddress(self.io, host, port);
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
-        try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+        try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         return self.executeOnSocketToWriter(&socket, req, writer, progress_cb, progress_ctx, null);
     }
 
@@ -2834,7 +2856,7 @@ const python_slow_drip_server_script =
     "    try:\n" ++
     "        for _ in range(10):\n" ++
     "            conn.sendall(b'x')\n" ++
-    "            time.sleep(0.05)\n" ++
+    "            time.sleep(0.1)\n" ++
     "    except (BrokenPipeError, ConnectionResetError):\n" ++
     "        pass\n" ++
     "listener.close()\n";
@@ -2927,8 +2949,10 @@ test "request timeout is absolute when streaming a slow-drip response" {
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
+    const started_ms = common.milliTimestamp(io);
     try std.testing.expectError(error.Timeout, client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null));
-    try std.testing.expect(out.items.len < 10);
+    const elapsed_ms = common.milliTimestamp(io) - started_ms;
+    try std.testing.expect(elapsed_ms < 750);
 }
 
 test "HTTPS client round trip via local TLS server" {
