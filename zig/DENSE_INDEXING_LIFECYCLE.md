@@ -964,6 +964,7 @@ index_repair_applied_sequence
 index_repair_target_sequence
 index_repair_next_retry_at
 index_repair_last_error
+index_repair_wait_reason = none | backoff | resource | convergence | paused
 index_repair_queue_age
 index_repair_estimated_completion
 index_repair_replay_bytes_retained
@@ -979,13 +980,16 @@ unbounded metric labels.
 
 While rebuilding:
 
-- primary document reads and ordinary writes remain available
+- primary document reads and ordinary writes remain available, subject to the
+  explicit hard-pressure contract below
 - unrelated indexes remain searchable
 - the affected index returns a stable `index_rebuilding` error mapped to the
   existing `IndexUnavailable` class
-- startup status reports `artifact_rebuild`, not terminal degradation
+- runnable or retryable startup status reports `artifact_rebuild`, not terminal
+  degradation; a paused or terminal intent is reported distinctly
 - process and node readiness remain healthy unless primary storage itself is
-  unavailable
+  unavailable. Table/index health still reports degradation, and deployments
+  that require every configured index may opt into a strict readiness policy
 
 Only a completed clean checkpoint and cleared load failure return the index to
 service.
