@@ -4066,6 +4066,7 @@ pub fn build(b: *std.Build) void {
             "remote portable file transfer uses objectstore file paths",
             "remote backup directory download paginates and enforces segment prefix",
             "api http server lists cluster backups through public route",
+            "backup staging uses configured storage authority and exclusive generations",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

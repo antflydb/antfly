@@ -259,6 +259,13 @@ check. `HeadBucket` is required only when the connection explicitly enables
 bucket provisioning. Listing and restore use a separate `restore.read`
 connection and its read credentials.
 
+When a backend cannot stream a snapshot directly to object storage, Antfly
+stages the generation beneath the configured local storage root (or the Lite
+file directory), rather than a hard-coded repository cache path. The staging
+directory is keyed by the cryptographically random artifact generation and is
+created exclusively. Deployments without local staging authority fail closed
+instead of writing to an implicit container path.
+
 GCS and filesystem authority are protocol-specific rather than accepting S3
 fields that would be silently ignored:
 

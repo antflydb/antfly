@@ -312,6 +312,9 @@ pub const ApiHttpServerConfig = struct {
     repair_job_retention_ms: ?u64 = null,
     restore_job_store_path: ?[]const u8 = null,
     restore_execution_guard: ?RestoreExecutionGuard = null,
+    /// Local scratch root for remote backup upload staging. When omitted, the
+    /// configured local storage root (or Lite file directory) is used.
+    backup_staging_root: ?[]const u8 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -5624,11 +5627,11 @@ pub const ApiHttpServer = struct {
 
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
-            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+            .remote => try self.createBackupStagingRoot(artifact_backup_id),
         };
         defer switch (backup_location.*) {
             .file => {},
-            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+            .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
 
         const shards = (try table_writes_source.backupTable(self.alloc, table_name, .{
@@ -5692,11 +5695,11 @@ pub const ApiHttpServer = struct {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
-            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+            .remote => try self.createBackupStagingRoot(backup_id),
         };
         defer switch (backup_location.*) {
             .file => {},
-            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+            .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
         if (switch (backup_location.*) {
             .remote => true,
@@ -5777,11 +5780,11 @@ pub const ApiHttpServer = struct {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
-            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+            .remote => try self.createBackupStagingRoot(backup_id),
         };
         defer switch (backup_location.*) {
             .file => {},
-            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+            .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
         if (switch (backup_location.*) {
             .remote => true,
@@ -5870,15 +5873,31 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    fn createBackupStagingRoot(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {
-        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/api-backup-staging/{s}-{d}", .{
-            backup_id,
-            platform_time.monotonicNs(),
-        });
-        errdefer alloc.free(path);
+    fn createBackupStagingRoot(self: *ApiHttpServer, generation_id: []const u8) ![]u8 {
+        const configured_root = self.cfg.backup_staging_root orelse blk: {
+            const node_config = self.cfg.node_config orelse return error.BackupStagingUnavailable;
+            if (node_config.storage.local_base_dir) |root| break :blk root;
+            if (node_config.storage.lite_path) |path| break :blk std.fs.path.dirname(path) orelse ".";
+            return error.BackupStagingUnavailable;
+        };
+        if (self.sharedApiIo()) |io| return try createBackupStagingRootAt(self.alloc, io, configured_root, generation_id);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
+        return try createBackupStagingRootAt(self.alloc, io_impl.io(), configured_root, generation_id);
+    }
+
+    fn createBackupStagingRootAt(alloc: std.mem.Allocator, io: std.Io, configured_root: []const u8, generation_id: []const u8) ![]u8 {
+        if (configured_root.len == 0) return error.BackupStagingUnavailable;
+        try backups_api.validateBackupId(generation_id);
+        const parent = try std.fs.path.join(alloc, &.{ configured_root, ".antfly-tmp", "backup-staging" });
+        defer alloc.free(parent);
+        const path = try std.fs.path.join(alloc, &.{ parent, generation_id });
+        errdefer alloc.free(path);
+        try fs_paths.createDirPathPortable(io, parent);
+        if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.createDirAbsolute(io, path, .default_dir)
+        else
+            try std.Io.Dir.cwd().createDir(io, path, .default_dir);
         return path;
     }
 
@@ -5895,10 +5914,15 @@ pub const ApiHttpServer = struct {
         return try std.fmt.allocPrint(self.alloc, "afbg-{s}", .{&hex});
     }
 
-    fn destroyBackupStagingRoot(alloc: std.mem.Allocator, path: []const u8) void {
+    fn destroyBackupStagingRoot(self: *ApiHttpServer, path: []const u8) void {
+        if (self.sharedApiIo()) |io| return destroyBackupStagingRootAt(self.alloc, io, path);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+        destroyBackupStagingRootAt(self.alloc, io_impl.io(), path);
+    }
+
+    fn destroyBackupStagingRootAt(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io, path) catch {};
         alloc.free(@constCast(path));
     }
 
@@ -8700,6 +8724,27 @@ fn attachTestRestoreJobStore(alloc: std.mem.Allocator, server: *ApiHttpServer, t
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp_sub_path, name });
     defer alloc.free(path);
     try server.attachRestoreJobStorePath(path);
+}
+
+test "backup staging uses configured storage authority and exclusive generations" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const configured_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/storage-root", .{tmp.sub_path});
+    defer alloc.free(configured_root);
+    const generation = "afbg-0123456789abcdef0123456789abcdef";
+
+    const path = try ApiHttpServer.createBackupStagingRootAt(alloc, io, configured_root, generation);
+    defer ApiHttpServer.destroyBackupStagingRootAt(alloc, io, path);
+    try std.testing.expect(std.mem.startsWith(u8, path, configured_root));
+    try std.testing.expect(std.mem.endsWith(u8, path, generation));
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        ApiHttpServer.createBackupStagingRootAt(alloc, io, configured_root, generation),
+    );
 }
 
 fn waitForTerminalRestoreJobAlloc(alloc: std.mem.Allocator, server: *ApiHttpServer, response_body: []const u8) ![]u8 {
