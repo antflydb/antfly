@@ -310,6 +310,16 @@ fn embedTimingNowNs() u128 {
     };
 }
 
+fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
+    const deadline = deadline_ns orelse return;
+    if (embedTimingNowNs() >= deadline) return error.Timeout;
+}
+
+fn freeDirectDenseVectors(allocator: std.mem.Allocator, vectors: [][]f32) void {
+    for (vectors) |vector| allocator.free(vector);
+    allocator.free(vectors);
+}
+
 fn embedTimingStart() u128 {
     if (!embedTimingEnabled()) return 0;
     return embedTimingNowNs();
@@ -643,23 +653,40 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        return try self.embedDenseTextsDirectWithContext(allocator, io_impl.io(), null, model_name, texts);
+    }
+
+    pub fn embedDenseTextsDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        texts: []const []const u8,
+    ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         try self.request_queue.acquire();
         self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         const model = try self.model_manager.loadFromDir(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try model.ensureEmbeddingAssets(true, false, false);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
 
         var pipeline = model.embeddingPipeline(allocator);
-        return try pipeline.embed(texts);
+        const vectors = try pipeline.embed(texts);
+        errdefer freeDirectDenseVectors(allocator, vectors);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return vectors;
     }
 
     pub fn embedSparseTextsDirect(
@@ -1073,17 +1100,30 @@ pub const Node = struct {
         model_name: []const u8,
         input: std.json.Value,
     ) ![][]f32 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        return try self.embedDenseJsonInputDirectWithContext(allocator, io_impl.io(), null, model_name, input);
+    }
+
+    pub fn embedDenseJsonInputDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        input: std.json.Value,
+    ) ![][]f32 {
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         try self.request_queue.acquire();
         self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         const model = try self.model_manager.loadFromDir(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
         var parsed = try parseDenseEmbedInputs(self, allocator, &model.manifest, input);
@@ -1091,8 +1131,12 @@ pub const Node = struct {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
 
         try model.ensureEmbeddingAssets(parsed.texts.items.len > 0, parsed.images.items.len > 0, parsed.audio.items.len > 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         var pipeline = model.embeddingPipeline(allocator);
-        return try embedDenseInputs(allocator, &pipeline, &parsed);
+        const vectors = try embedDenseInputs(allocator, &pipeline, &parsed);
+        errdefer freeDirectDenseVectors(allocator, vectors);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return vectors;
     }
 
     pub fn readImagesDirect(

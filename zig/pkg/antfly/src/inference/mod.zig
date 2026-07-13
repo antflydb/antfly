@@ -26,6 +26,7 @@ pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
 pub const list_models = @import("list_models.zig");
+pub const query_embedding_cache = @import("query_embedding_cache.zig");
 
 pub const Embedder = types.Embedder;
 pub const Generator = types.Generator;
@@ -46,6 +47,7 @@ test "inference module compiles" {
     _ = vertex;
     _ = managed_embedder;
     _ = list_models;
+    _ = query_embedding_cache;
 }
 
 test "bedrock provider request helpers" {
@@ -76,6 +78,30 @@ test "managed embedder configured inference api url precedence" {
     try managed_embedder.testConfiguredInferenceAPIURLPrecedence();
 }
 
+test "managed embedder deadlines bound provider pacing and transport" {
+    try managed_embedder.testEmbeddingProviderDeadlines();
+}
+
+test "managed embedder rejects malformed provider vectors" {
+    try managed_embedder.testEmbeddingProviderResultValidation();
+}
+
 test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
+}
+
+test "query embedding cache owns results and coalesces misses" {
+    try query_embedding_cache.testOwnedValuesAndHits();
+    try query_embedding_cache.testConcurrentCoalescing();
+    try query_embedding_cache.testInflightAdmissionBound();
+    try query_embedding_cache.testDisabledCacheRetainsAdmissionBound();
+    try query_embedding_cache.testFlightBookkeepingOOMFailsClosed();
+    try query_embedding_cache.testByteBudgetEviction();
+    try query_embedding_cache.testPinnedHitRetainsBudgetUntilCopyCompletes();
+    try query_embedding_cache.testStatsExpireIdleEntries();
+    try query_embedding_cache.testStatsBoundExpirationWork();
+}
+
+test "query embedding cache keys isolate security domains" {
+    try managed_embedder.testQueryEmbeddingCacheKeys();
 }

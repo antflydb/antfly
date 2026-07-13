@@ -50,6 +50,7 @@ pub const ModelQuantization = types.ModelQuantization;
 pub const ModelRef = types.ModelRef;
 pub const ModelsResponse = types.ModelsResponse;
 pub const PromptCacheConfig = types.PromptCacheConfig;
+pub const QueryEmbeddingCacheConfig = types.QueryEmbeddingCacheConfig;
 pub const ReadRequest = types.ReadRequest;
 pub const ReadResponse = types.ReadResponse;
 pub const ReadResult = types.ReadResult;
