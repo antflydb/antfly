@@ -86,6 +86,11 @@ Queued structural reconciliation closes new write admission before draining
 current writers. This prevents continuous traffic from starving index/catalog
 convergence, while reads remain admitted against the currently published
 generation until the short publication transition begins.
+Per-table dirty visibility tracking is bounded to the write-cache working set.
+If that bound is exceeded, the source briefly treats every table as dirty,
+invalidates the bounded read cache and runtime-status cache once, then resumes
+exact tracking with the current table. Overflow therefore cannot create an
+unbounded map or a permanent cache-bypass mode.
 This includes the embedded
 `BoundTableWriteSource`: it closes its current owner, restores into a sibling
 generation, publishes atomically, and reopens either the unchanged live
@@ -117,6 +122,11 @@ Reconciliation is cached only while a local reader retains the shared
 publication lock. The final reader invalidates the cache entry, so a later open
 must observe publication debt created by another process. The persistent sibling
 lock file also excludes overlapping restore publishers across processes.
+Cached read admission acquires the shared filesystem lock before registering
+the reader, then revalidates the process reconciliation evidence under the
+manager mutex. If the final prior reader drained while the lock was acquired,
+the opener releases the shared lock and retries through exclusive
+reconciliation; no process-local reader count can bridge a filesystem-lock gap.
 Stale-stage GC only considers names with
 Antfly's complete generated-stage grammar while holding that exclusive lock;
 it schedules marked abandoned candidates and markerless retired roots left by a

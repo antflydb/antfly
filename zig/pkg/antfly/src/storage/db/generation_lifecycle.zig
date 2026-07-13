@@ -334,6 +334,48 @@ const Manager = struct {
         return .{ .manager = self, .path = owned_path, .path_key = path_key, .id = id };
     }
 
+    /// Commits a cached read only after its caller holds the shared
+    /// publication lock. Returning null means the reconciliation evidence
+    /// disappeared while that lock was being acquired, so the caller must
+    /// release it and retry through reconciliation.
+    fn beginReadIfReconciled(self: *Manager, path: []const u8) !?ReadLease {
+        const path_key = try canonicalPathAlloc(self.allocator, path);
+        defer self.allocator.free(path_key);
+        return try self.beginReadIfReconciledCanonical(path, path_key);
+    }
+
+    fn beginReadIfReconciledCanonical(self: *Manager, path: []const u8, path_key: []const u8) !?ReadLease {
+        const active_path_key = try self.allocator.dupe(u8, path_key);
+        errdefer self.allocator.free(active_path_key);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const existing_state = self.path_states.get(path_key);
+        if (existing_state) |state| {
+            if (state.exclusive or state.reconciliation) return error.GenerationTransitionActive;
+        }
+        const protected_by_local_reader = if (existing_state) |state| state.readers != 0 else false;
+        if (!protected_by_local_reader and !self.reconciled_paths.contains(path_key)) {
+            self.allocator.free(owned_path);
+            self.allocator.free(active_path_key);
+            return null;
+        }
+
+        const id = self.next_id;
+        self.next_id +%= 1;
+        if (self.next_id == 0) self.next_id = 1;
+        const state = try self.getOrPutPathStateLocked(path_key);
+        state.readers += 1;
+        errdefer {
+            state.readers -= 1;
+            self.removeEmptyPathStateLocked(path_key);
+        }
+        try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = active_path_key, .id = id, .kind = .read });
+        return .{ .manager = self, .path = owned_path, .path_key = active_path_key, .id = id };
+    }
+
     fn hasReaders(self: *Manager, path: []const u8) !bool {
         const path_key = try canonicalPathAlloc(self.allocator, path);
         defer self.allocator.free(path_key);
@@ -1024,11 +1066,22 @@ pub fn acquirePublishedGenerationRead(alloc: Allocator, path: []const u8) !?Read
 }
 
 pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const u8, runtime: ?*background_runtime.BackendRuntime) !?ReadLease {
-    var reconciliation = (try process_manager.beginReconciliation(path)) orelse {
-        var read_lease = try process_manager.beginRead(path);
-        errdefer read_lease.deinit();
-        read_lease.publication_lock = try openPublicationLock(process_manager_allocator, read_lease.path_key, .shared);
-        return read_lease;
+    var reconciliation = reconcile: while (true) {
+        if (try process_manager.beginReconciliation(path)) |value| break :reconcile value;
+
+        const path_key = try canonicalPathAlloc(process_manager_allocator, path);
+        defer process_manager_allocator.free(path_key);
+        const publication_lock = try openPublicationLock(process_manager_allocator, path_key, .shared);
+        var lock_owned = true;
+        errdefer if (lock_owned) closePublicationLock(publication_lock);
+        if (try process_manager.beginReadIfReconciledCanonical(path, path_key)) |read_value| {
+            var read_lease = read_value;
+            read_lease.publication_lock = publication_lock;
+            lock_owned = false;
+            return read_lease;
+        }
+        closePublicationLock(publication_lock);
+        lock_owned = false;
     };
     defer reconciliation.deinit();
     var publication_lock = try openPublicationLock(process_manager_allocator, reconciliation.path_key, .exclusive);
@@ -1293,6 +1346,59 @@ test "reconciliation cache expires when the final reader drains" {
 
     manager.finishRead(path, reconciliation.id);
     try std.testing.expect(!manager.reconciled_paths.contains(path));
+    try std.testing.expect((try manager.beginReadIfReconciled(path)) == null);
+}
+
+test "cached read admission revalidates after filesystem lock acquisition" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cached-read-revalidation", .{tmp.sub_path});
+    defer alloc.free(path);
+    try fs_paths.createDirPathPortable(std.testing.io, path);
+
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    var reconciliation = (try manager.beginReconciliation(path)) orelse return error.TestUnexpectedResult;
+    try manager.promoteReconciliationToRead(path, reconciliation.id, true);
+    reconciliation.active = false;
+
+    // This is the optimistic decision made before the next reader acquires its
+    // filesystem lock. The final old reader then drains during that interval.
+    try std.testing.expect((try manager.beginReconciliation(path)) == null);
+    manager.finishRead(path, reconciliation.id);
+
+    const path_key = try canonicalPathAlloc(alloc, path);
+    defer alloc.free(path_key);
+    const publication_lock = try openPublicationLock(alloc, path_key, .shared);
+    defer closePublicationLock(publication_lock);
+    try std.testing.expect((try manager.beginReadIfReconciledCanonical(path, path_key)) == null);
+}
+
+test "process cached read admission retains shared publication locks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/process-cached-read", .{tmp.sub_path});
+    defer alloc.free(path);
+    try fs_paths.createDirPathPortable(std.testing.io, path);
+
+    var first = (try acquirePublishedGenerationRead(alloc, path)) orelse return error.TestUnexpectedResult;
+    var first_active = true;
+    defer if (first_active) first.deinit();
+    var second = (try acquirePublishedGenerationRead(alloc, path)) orelse return error.TestUnexpectedResult;
+    var second_active = true;
+    defer if (second_active) second.deinit();
+
+    try std.testing.expectError(error.GenerationTransitionActive, beginProcessExclusive(path));
+    first.deinit();
+    first_active = false;
+    try std.testing.expectError(error.GenerationTransitionActive, beginProcessExclusive(path));
+    second.deinit();
+    second_active = false;
+
+    var transition = try beginProcessExclusive(path);
+    transition.deinit();
 }
 
 test "staged generation cannot publish after its exclusive capability is released" {

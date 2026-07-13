@@ -7803,8 +7803,18 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.dirty_write_table_hashes_len >= self.dirty_write_table_hashes.len) {
+            // Preserve bounded, allocation-free tracking without making the
+            // conservative fallback permanent. While `all_tables` is true,
+            // readers treat every table as dirty. Clearing both dependent
+            // caches makes all previously tracked entries clean at once; the
+            // current mutation then becomes the sole exact dirty entry.
             self.dirty_write_all_tables.store(true, .release);
-            self.dirty_write_table_count.store(@intCast(self.dirty_write_table_hashes_len), .release);
+            if (self.read_cache) |cache| cache.clear();
+            if (self.runtime_status_cache) |cache| cache.clear();
+            self.dirty_write_table_hashes[0] = table_hash;
+            self.dirty_write_table_hashes_len = 1;
+            self.dirty_write_table_count.store(1, .release);
+            self.dirty_write_all_tables.store(false, .release);
             self.dirty_write_tables_mutex.unlock();
             return;
         }
@@ -17959,6 +17969,55 @@ test "provisioned native backup restore repeats through shared read and write ow
         try std.testing.expect(std.mem.indexOf(u8, public_query.body, "alpha") != null);
         try std.testing.expect(std.mem.indexOf(u8, public_query.body, "beta") == null);
     }
+}
+
+test "dirty table tracking recovers after bounded overflow" {
+    const alloc = std.testing.allocator;
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-dirty-table-overflow",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    source.write_cache = &write_cache;
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    source.read_cache = &read_cache;
+    const read_epoch_key = try alloc.dupe(u8, "table-0");
+    read_cache.table_epochs.put(alloc, read_epoch_key, 7) catch |err| {
+        alloc.free(read_epoch_key);
+        return err;
+    };
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    try snapshot_cache.upsertGroupStatus("table-0", .{ .group_id = 7001, .stats = .{} });
+
+    var names: [max_cached_write_tables + 1][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (names[0..initialized]) |name| alloc.free(name);
+    for (&names, 0..) |*name, i| {
+        name.* = try std.fmt.allocPrint(alloc, "table-{d}", .{i});
+        initialized += 1;
+    }
+
+    for (names[0..max_cached_write_tables]) |name| source.markWriteCacheDirty(name);
+    try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
+    try std.testing.expectEqual(max_cached_write_tables, source.dirty_write_table_hashes_len);
+
+    source.markWriteCacheDirty(names[max_cached_write_tables]);
+    try std.testing.expect(!source.dirty_write_all_tables.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), source.dirty_write_table_hashes_len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable(names[0]));
+    try std.testing.expect(source.isWriteCacheDirtyForTable(names[max_cached_write_tables]));
+    try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("table-0").?);
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "table-0")) == null);
+
+    source.clearDirtyWriteTable(names[max_cached_write_tables]);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable(names[max_cached_write_tables]));
+    source.markWriteCacheDirty(names[0]);
+    try std.testing.expect(source.isWriteCacheDirtyForTable(names[0]));
 }
 
 test "provisioned read preparation invalidates readers without closing dirty writer cache" {
