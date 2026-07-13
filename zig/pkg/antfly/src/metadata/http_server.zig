@@ -2745,9 +2745,9 @@ fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     not_leader_value = null;
     initialized_headers += 1;
 
-    const content_type = try alloc.dupe(u8, "text/plain");
+    const content_type = try alloc.dupe(u8, "application/json");
     errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    const body = try alloc.dupe(u8, "{\"error\":\"metadata leader unavailable\"}");
     errdefer alloc.free(body);
     return .{
         .status = 503,

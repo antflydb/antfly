@@ -36,6 +36,11 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
         return response_404
 
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -57,6 +62,11 @@ def sync_detailed(
     client: AuthenticatedClient,
 ) -> Response[Error | RestoreJob]:
     """Get durable restore job status
+
+     Returns replicated restore-job state. A metadata follower may return
+    the retryable metadata-not-leader `503` until a newly committed job has
+    applied locally; clients should retry instead of treating that response
+    as job absence.
 
     Args:
         job_id (int):
@@ -87,6 +97,11 @@ def sync(
 ) -> Error | RestoreJob | None:
     """Get durable restore job status
 
+     Returns replicated restore-job state. A metadata follower may return
+    the retryable metadata-not-leader `503` until a newly committed job has
+    applied locally; clients should retry instead of treating that response
+    as job absence.
+
     Args:
         job_id (int):
 
@@ -110,6 +125,11 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
 ) -> Response[Error | RestoreJob]:
     """Get durable restore job status
+
+     Returns replicated restore-job state. A metadata follower may return
+    the retryable metadata-not-leader `503` until a newly committed job has
+    applied locally; clients should retry instead of treating that response
+    as job absence.
 
     Args:
         job_id (int):
@@ -137,6 +157,11 @@ async def asyncio(
     client: AuthenticatedClient,
 ) -> Error | RestoreJob | None:
     """Get durable restore job status
+
+     Returns replicated restore-job state. A metadata follower may return
+    the retryable metadata-not-leader `503` until a newly committed job has
+    applied locally; clients should retry instead of treating that response
+    as job absence.
 
     Args:
         job_id (int):

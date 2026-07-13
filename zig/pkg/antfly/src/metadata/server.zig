@@ -417,6 +417,10 @@ const MetadataAdminMux = struct {
                     },
                     else => return err,
                 };
+                // Mutations stay leader-serialized. GET polling may use the
+                // follower's locally applied replicated record; the
+                // persistence adapter returns NotLeader instead of a false
+                // NotFound until a newly committed job reaches this replica.
                 if (!local_leader and req.method != .GET)
                     return try public_api_http_server.metadataNotLeaderResponse(alloc);
             }
@@ -469,9 +473,18 @@ fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs
 
 fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    try svc.ensureLinearizableRead();
-    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
+    const local_leader = svc.localMetadataLeadershipTerm() != null;
+    if (local_leader) try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse {
+        if (!local_leader) return error.NotLeader;
+        return error.MissingMetadataStore;
+    };
+    const value = try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
+    // A follower cannot distinguish "not committed here yet" from "does not
+    // exist". Fail retryably until the record is visible instead of leaking a
+    // load-balancer-dependent 404 for a durable job accepted by the leader.
+    if (value == null and !local_leader) return error.NotLeader;
+    return value;
 }
 
 fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
@@ -1289,4 +1302,9 @@ test "metadata admin mux routes public db v1 requests through public api server"
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), response.status);
+
+    try std.testing.expectError(
+        error.NotLeader,
+        metadataRestoreJobGet(server.svc, std.testing.allocator, "\x00\x00__api_restore_jobs__:0000000000000001"),
+    );
 }

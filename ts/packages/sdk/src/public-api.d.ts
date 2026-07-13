@@ -473,7 +473,13 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Get durable restore job status */
+        /**
+         * Get durable restore job status
+         * @description Returns replicated restore-job state. A metadata follower may return
+         *     the retryable metadata-not-leader `503` until a newly committed job has
+         *     applied locally; clients should retry instead of treating that response
+         *     as job absence.
+         */
         get: operations["getRestoreJob"];
         put?: never;
         post?: never;
@@ -13061,6 +13067,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     cancelRestoreJob: {

@@ -337,8 +337,10 @@ the history is bounded by 10,000 jobs and 64 KiB per encoded job, and rejects
 new work instead of silently evicting an unexpired key. Job IDs are random
 opaque 63-bit values. In distributed deployments, job records, idempotency
 fences, completed-table checkpoints, and the runnable queue are metadata-Raft
-state. Followers serve job reads after a linearizable read barrier; creation,
-cancellation, and execution are metadata-leader operations. A leadership-term
+state. Followers may serve locally applied job state for scalable polling; if a
+new job has not applied there yet, they return the retryable metadata-not-leader
+response instead of a false `404`. Creation, cancellation, and execution remain
+metadata-leader operations. A leadership-term
 change is detected by a backend-runtime maintenance supervisor, without
 requiring client traffic. It reloads replicated state, fences the old worker
 owner, and returns incomplete attempts to their original FIFO positions with a

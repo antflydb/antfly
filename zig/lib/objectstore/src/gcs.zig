@@ -552,7 +552,19 @@ pub const JsonApiClient = struct {
         defer response.deinit(alloc);
 
         switch (response.status) {
-            200 => return try parseListResponse(alloc, response.body),
+            200 => {
+                var result = try parseListResponse(alloc, response.body);
+                errdefer result.deinit(alloc);
+                // GCS JSON API's `startOffset` is inclusive, while the shared
+                // object-store contract deliberately models S3's exclusive
+                // `start-after`. Normalize the first GCS page here so callers
+                // cannot repeat a cursor forever. Page tokens are already
+                // exclusive and must not be filtered against start_after.
+                if (opts.start_after != null and opts.continuation_token == null) {
+                    try enforceExclusiveStartAfter(alloc, &result, opts.start_after.?);
+                }
+                return result;
+            },
             404 => return .{
                 .entries = try alloc.alloc(types.ListEntry, 0),
                 .common_prefixes = try alloc.alloc([]u8, 0),
@@ -666,6 +678,46 @@ pub fn s3CompatibleConfigAlloc(
             .addressing_style = .path,
         },
     };
+}
+
+fn enforceExclusiveStartAfter(alloc: Allocator, result: *types.ListResult, start_after: []const u8) !void {
+    var entry_count: usize = 0;
+    for (result.entries) |entry| {
+        if (std.mem.order(u8, entry.key, start_after) == .gt) entry_count += 1;
+    }
+    var prefix_count: usize = 0;
+    for (result.common_prefixes) |prefix| {
+        if (std.mem.order(u8, prefix, start_after) == .gt) prefix_count += 1;
+    }
+
+    const entries = try alloc.alloc(types.ListEntry, entry_count);
+    errdefer alloc.free(entries);
+    const prefixes = try alloc.alloc([]u8, prefix_count);
+    errdefer alloc.free(prefixes);
+
+    var entry_index: usize = 0;
+    for (result.entries) |*entry| {
+        if (std.mem.order(u8, entry.key, start_after) == .gt) {
+            entries[entry_index] = entry.*;
+            entry_index += 1;
+        } else {
+            entry.deinit(alloc);
+        }
+    }
+    alloc.free(result.entries);
+    result.entries = entries;
+
+    var prefix_index: usize = 0;
+    for (result.common_prefixes) |prefix| {
+        if (std.mem.order(u8, prefix, start_after) == .gt) {
+            prefixes[prefix_index] = prefix;
+            prefix_index += 1;
+        } else {
+            alloc.free(prefix);
+        }
+    }
+    alloc.free(result.common_prefixes);
+    result.common_prefixes = prefixes;
 }
 
 pub fn jsonApiConfigAlloc(alloc: Allocator, bucket: []const u8) !Config {
@@ -1352,7 +1404,7 @@ test "json api client lists objects and prefixes" {
             return .{
                 .status = 200,
                 .body = try request_alloc.dupe(u8,
-                    \\{"items":[{"name":"docs/a.txt","etag":"e1","size":"5"}],"prefixes":["docs/sub/"],"nextPageToken":"next-1"}
+                    \\{"items":[{"name":"docs/a","etag":"cursor","size":"1"},{"name":"docs/a.txt","etag":"e1","size":"5"}],"prefixes":["docs/a","docs/sub/"],"nextPageToken":"next-1"}
                 ),
             };
         }

@@ -8801,7 +8801,7 @@ pub const ApiHttpServer = struct {
         const encoded = if (cancel)
             (try self.restore_job_store.cancel(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found")
         else
-            (try self.restore_job_store.loadCached(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+            (try self.restore_job_store.load(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         return try self.restoreJobResponse(200, encoded);
     }
@@ -12024,9 +12024,9 @@ pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResp
     not_leader_value = null;
     initialized_headers += 1;
 
-    const content_type = try alloc.dupe(u8, "text/plain");
+    const content_type = try alloc.dupe(u8, "application/json");
     errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    const body = try alloc.dupe(u8, "{\"error\":\"metadata leader unavailable\"}");
     errdefer alloc.free(body);
     return .{
         .status = 503,
@@ -24145,8 +24145,8 @@ test "api http server lists cluster backups through public route" {
 
 fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
-    try std.testing.expectEqualStrings("metadata leader unavailable", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"metadata leader unavailable\"}", resp.body);
 
     var retry_after = false;
     var metadata_not_leader = false;

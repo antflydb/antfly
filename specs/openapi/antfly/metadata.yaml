@@ -8183,6 +8183,11 @@ paths:
         schema: { type: integer, format: int64 }
     get:
       summary: Get durable restore job status
+      description: |
+        Returns replicated restore-job state. A metadata follower may return
+        the retryable metadata-not-leader `503` until a newly committed job has
+        applied locally; clients should retry instead of treating that response
+        as job absence.
       operationId: getRestoreJob
       tags: [cluster_management]
       responses:
@@ -8192,6 +8197,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/RestoreJob" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
     delete:
       summary: Request cooperative restore cancellation
       description: |
