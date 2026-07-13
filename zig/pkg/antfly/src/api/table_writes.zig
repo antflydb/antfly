@@ -2262,6 +2262,11 @@ pub const ProvisionedTableWriteCache = struct {
         removed.deinit(self.alloc);
     }
 
+    fn notifyTableEvictions(self: *ProvisionedTableWriteCache) void {
+        const hook = self.table_eviction_hook orelse return;
+        for (self.table_metadata.items) |metadata| hook.notify(self, metadata.table_name);
+    }
+
     fn reserveDbEntryRetirementsForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         var matching_entries: usize = 0;
         for (self.entries.items) |entry| {
@@ -4483,9 +4488,11 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         gate: ?db_mod.HAWriteGate,
     ) *ProvisionedTableWriteSource {
+        const changed = !ProvisionedTableWriteCache.haWriteGatesEqual(self.ha_write_gate, gate);
         self.ha_write_gate = gate;
         if (self.write_cache) |cache| cache.setHAWriteGate(gate);
         if (self.startup_write_cache) |cache| cache.setHAWriteGate(gate);
+        if (changed) self.resetCachedVisibilityAfterOwnershipChange();
         return self;
     }
 
@@ -4493,10 +4500,21 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         mirror: ?db_mod.HAAsyncEffectMirror,
     ) *ProvisionedTableWriteSource {
+        const changed = !ProvisionedTableWriteCache.haAsyncMirrorsEqual(self.ha_async_mirror, mirror);
         self.ha_async_mirror = mirror;
         if (self.write_cache) |cache| cache.setHAMirror(mirror);
         if (self.startup_write_cache) |cache| cache.setHAMirror(mirror);
+        if (changed) self.resetCachedVisibilityAfterOwnershipChange();
         return self;
+    }
+
+    fn resetCachedVisibilityAfterOwnershipChange(self: *ProvisionedTableWriteSource) void {
+        // A role/mirror transition retires every local writer authority at
+        // once. Invalidate both observation planes only after the caches have
+        // drained so no pre-transition status can be served as current.
+        if (self.read_cache) |cache| cache.clear();
+        if (self.runtime_status_cache) |cache| cache.clear();
+        self.clearAllDirtyWriteTables();
     }
 
     fn syncRuntimeHooksToCaches(self: *ProvisionedTableWriteSource) void {
@@ -6331,7 +6349,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn clearStartupWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
-        if (self.startup_write_cache) |cache| cache.clear();
+        if (self.startup_write_cache) |cache| {
+            cache.notifyTableEvictions();
+            cache.clear();
+        }
     }
 
     pub fn clearStartupWriteCache(self: *ProvisionedTableWriteSource) void {
@@ -6342,7 +6363,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn clearWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
-        if (self.write_cache) |cache| cache.clear();
+        if (self.write_cache) |cache| {
+            cache.notifyTableEvictions();
+            cache.clear();
+        }
         self.clearStartupWriteCacheLocked();
         self.clearAllDirtyWriteTables();
     }
@@ -18120,6 +18144,87 @@ test "forwarded write sources use the local writer owner dirty lifecycle" {
     forwarding.markWriteCacheDirty("docs");
     forwarding.clearDirtyWriteTable("docs");
     try std.testing.expect(!owner.isWriteCacheDirtyForTable("docs"));
+}
+
+test "HA ownership transition invalidates cached visibility and dirty identities" {
+    const alloc = std.testing.allocator;
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-ha-visibility-reset",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    source.bindWriteCaches(&write_cache, &startup_cache);
+
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    source.read_cache = &read_cache;
+    const epoch_key = try alloc.dupe(u8, "docs");
+    read_cache.table_epochs.put(alloc, epoch_key, 7) catch |err| {
+        alloc.free(epoch_key);
+        return err;
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    try snapshot_cache.upsertGroupStatus("docs", .{ .group_id = 7001, .stats = .{} });
+    try write_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    try startup_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    source.markWriteCacheDirty("docs");
+
+    var gate_state = ha_public_gate_state_mod.State{};
+    const gate: db_mod.HAWriteGate = .{ .shared = .{ .state = &gate_state } };
+    _ = source.withHAWriteGate(gate);
+
+    try std.testing.expectEqual(@as(usize, 0), write_cache.table_metadata.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_cache.table_metadata.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("docs").?);
+
+    _ = source.withHAWriteGate(gate);
+    try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("docs").?);
+}
+
+test "startup cache clear retires dirty identity without a serving owner" {
+    const alloc = std.testing.allocator;
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-startup-visibility-reset",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    source.bindWriteCaches(&write_cache, &startup_cache);
+
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    source.read_cache = &read_cache;
+    const epoch_key = try alloc.dupe(u8, "docs");
+    read_cache.table_epochs.put(alloc, epoch_key, 11) catch |err| {
+        alloc.free(epoch_key);
+        return err;
+    };
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    try snapshot_cache.upsertGroupStatus("docs", .{ .group_id = 7001, .stats = .{} });
+    try startup_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    source.markWriteCacheDirty("docs");
+
+    source.clearStartupWriteCache();
+
+    try std.testing.expectEqual(@as(usize, 0), startup_cache.table_metadata.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    try std.testing.expectEqual(@as(u64, 12), read_cache.table_epochs.get("docs").?);
 }
 
 test "provisioned read preparation invalidates readers without closing dirty writer cache" {

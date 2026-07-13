@@ -4370,7 +4370,7 @@ pub fn build(b: *std.Build) void {
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    const api_table_writes_restore_repeat_tests = b.addTest(.{
+    const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "table write source restore acquires lifecycle unless caller reserves it",
@@ -4381,23 +4381,21 @@ pub fn build(b: *std.Build) void {
             "provisioned structural reconcile blocks table write admission",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
-        },
-    });
-    const run_api_table_writes_restore_repeat_tests = b.addRunArtifact(api_table_writes_restore_repeat_tests);
-    const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
-    api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
-    const api_table_writes_cache_lifecycle_tests = b.addTest(.{
-        .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
             "forwarded write sources use the local writer owner dirty lifecycle",
+            "HA ownership transition invalidates cached visibility and dirty identities",
+            "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
         },
     });
-    const run_api_table_writes_cache_lifecycle_tests = b.addRunArtifact(api_table_writes_cache_lifecycle_tests);
+    const run_api_table_writes_production_regression_tests = b.addRunArtifact(api_table_writes_production_regression_tests);
+    const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
+    api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
+    const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
+    api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_writes_cache_lifecycle_step = b.step("api-table-writes-cache-lifecycle-test", "Run focused writer-cache dirty ownership regressions");
-    api_table_writes_cache_lifecycle_step.dependOn(&run_api_table_writes_cache_lifecycle_tests.step);
+    api_table_writes_cache_lifecycle_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
     api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
@@ -5264,10 +5262,7 @@ pub fn build(b: *std.Build) void {
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
     unit_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
-    unit_test_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
-    unit_test_step.dependOn(&run_api_table_writes_cache_lifecycle_tests.step);
-    unit_test_step.dependOn(&run_persistent_delete_regression_tests.step);
-    unit_test_step.dependOn(&run_db_restore_identity_tests.step);
+    unit_test_step.dependOn(&run_api_table_writes_production_regression_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
         .root_module = db_test_mod,
