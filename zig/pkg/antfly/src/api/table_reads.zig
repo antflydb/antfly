@@ -5574,7 +5574,27 @@ fn lookupProvisionedLocal(
     opts: db_mod.types.LookupOptions,
     consistency: raft_mod.ReadConsistency,
 ) !?LookupResponse {
-    _ = primary_lookup_db;
+    // Point lookups need only the primary document store. Prefer the existing
+    // generation-matched writer/apply DB so a lookup does not open and retire a
+    // second full index catalog over a path that is concurrently compacting.
+    // The source returns null when no matching writer generation is resident;
+    // query-only runtimes and cold groups then use the read cache below.
+    if (primary_lookup_db) |source| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
+            var lease = lease_value;
+            defer lease.release(alloc);
+            try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
+
+            var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+            var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
+            defer result.deinit(alloc);
+            const version = try lease.db.getTimestamp(alloc, key);
+            return .{
+                .json = try alloc.dupe(u8, result.json),
+                .version = version,
+            };
+        }
+    }
 
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);

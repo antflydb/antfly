@@ -542,10 +542,12 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
+            var version_buf: [20]u8 = undefined;
+            const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
             return try http_route_helpers.jsonWithHeadersResponse(alloc, 200, result.json, &.{
                 .{
                     .name = "X-Antfly-Version",
-                    .value = try std.fmt.allocPrint(alloc, "{d}", .{result.version}),
+                    .value = version,
                 },
             });
         }

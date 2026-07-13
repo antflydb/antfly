@@ -2966,7 +2966,10 @@ pub const DataServer = struct {
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
         }
         if (self.listener == null) {
-            const request_alloc = std.heap.smp_allocator;
+            // ApiHttpServer owns responses with its request allocator. Keep the
+            // listener on that exact allocator identity; using smp_allocator
+            // here while the API uses c_allocator causes cross-allocator frees.
+            const request_alloc = self.http_server.?.alloc;
             self.listener = if (self.backend_runtime) |runtime|
                 if (runtime.apiIoImpl()) |io_impl|
                     antfly.raft.transport.std_http_listener.StdHttpListener.initShared(
@@ -14366,12 +14369,16 @@ test "data runtime structural changes preserve writer-published runtime status a
         .alloc = alloc,
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = undefined,
-        .write_source = undefined,
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            "unused",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
         .status_source = undefined,
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
+    defer server.write_source.deinit();
     defer server.provisioned_storage.deinit();
 
     try server.provisioned_storage.runtime_status_cache.upsertGroupStatus("docs", .{

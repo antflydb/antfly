@@ -1831,7 +1831,7 @@ fn parseMergeRequest(alloc: std.mem.Allocator, body: []const u8) !MergeRequest {
 }
 
 fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
-    return try tables_api.parseCreateTableRequest(alloc, body);
+    return try tables_api.parseStoredCreateTableRequest(alloc, body);
 }
 
 const RestoreMetadataSpec = struct {

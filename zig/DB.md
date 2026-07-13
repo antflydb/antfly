@@ -31,6 +31,16 @@ same path duplicate index/cache/runtime state and make restore, drop, and schema
 mutation correctness depend on every caller remembering the same invalidation
 sequence.
 
+A point lookup is the narrow exception to routing all reads through the cached
+read owner: when the generation-matched writer/apply DB is already resident, the
+lookup leases that owner and reads its primary document store directly. It must
+not open the cached query DB merely to load one document, because doing so loads
+the complete index catalog and creates an additional backend generation over a
+path undergoing WAL publication and compaction. Query-only processes and cold
+groups fall back to the generation-owned read cache. The lookup source must
+return `null`, rather than adopt a mismatched owner, when its visible root
+generation or identity namespace does not match.
+
 Restore preparation and generation publication use separate capabilities.
 Preparation allows existing and new readers to continue against the live
 generation while Antfly imports, repairs, validates, and syncs an isolated

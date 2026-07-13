@@ -2872,6 +2872,8 @@ pub fn build(b: *std.Build) void {
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
+        "http response uses its owning allocator",
+        "api http server serves table lookup with version header",
         "public index contract exposes runtime status metadata",
         "public openapi documents stable exact sort diagnostics",
         "api query contract serializes sort profile diagnostics",
@@ -2893,6 +2895,11 @@ pub fn build(b: *std.Build) void {
         "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
+        "create table raw parser merges default full text with quickstart embedding index",
+        "create table raw parser accepts its canonical full text output",
+        "provisioned primary lookup lease fails on identity namespace mismatch",
+        "inference pull recognizes help before model resolution",
+        "inference pull classifies order independent value flags",
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "metadata.table generated field capabilities include schema dynamic templates",
@@ -3065,7 +3072,7 @@ pub fn build(b: *std.Build) void {
     lite_cli_test_mod.addOptions("build_options", build_options);
     const lite_cli_tests = b.addTest(.{
         .root_module = lite_cli_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup" },
+        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

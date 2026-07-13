@@ -64,12 +64,17 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table",  "index",  "artifact", "query",
-        "lookup", "load",   "insert",   "delete",
-        "agents", "backup", "restore",  "internal",
+        "table",    "index",  "artifact", "query",
+        "lookup",   "load",   "insert",   "delete",
+        "agents",   "backup", "restore",  "auth",
+        "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
+            if (cliHelpRequested(&args)) {
+                cmd.cli.printCommandUsage(cli_cmd);
+                return;
+            }
             return runCliCommand(init.gpa, cli_cmd, &args) catch |err| switch (err) {
                 error.ApiError => std.process.exit(1),
                 else => return err,
@@ -80,6 +85,17 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+fn cliHelpRequested(args: *std.process.Args.Iterator) bool {
+    var probe = args.*;
+    var first = true;
+    while (probe.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+        if (first and std.mem.eql(u8, arg, "help")) return true;
+        first = false;
+    }
+    return false;
 }
 
 fn runAntflyCloud(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u8 {
@@ -218,6 +234,19 @@ fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
 
 test "main cmd compiles" {
     _ = main;
+}
+
+test "client help is recognized before command execution" {
+    var argv = [_][*:0]const u8{ "--table", "docs", "--help" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expect(cliHelpRequested(&args));
+    try std.testing.expectEqualStrings("--table", args.next().?);
+    try std.testing.expect(cmd.cli.commandUsage("query") != null);
+    try std.testing.expect(cmd.cli.commandUsage("load") != null);
+
+    var value_argv = [_][*:0]const u8{ "--key", "help" };
+    var value_args = std.process.Args.Iterator.init(.{ .vector = value_argv[0..] });
+    try std.testing.expect(!cliHelpRequested(&value_args));
 }
 
 test "cloud shim argv starts with antfly-cloud and preserves args" {

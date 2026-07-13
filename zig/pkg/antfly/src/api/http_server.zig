@@ -4605,10 +4605,12 @@ pub const ApiHttpServer = struct {
                         return try textResponse(self.alloc, 404, "not found");
                     }
                 }
+                var version_buf: [20]u8 = undefined;
+                const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
                 return try http_route_helpers.jsonWithHeadersResponse(self.alloc, 200, result.json, &.{
                     .{
                         .name = "X-Antfly-Version",
-                        .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
+                        .value = version,
                     },
                 });
             }
@@ -6161,7 +6163,9 @@ pub const ApiHttpServer = struct {
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.handle(req);
+        var response = try self.handle(req);
+        if (response.owner_allocator == null) response.owner_allocator = self.alloc;
+        return response;
     }
 
     fn executeStreaming(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
@@ -16406,8 +16410,8 @@ test "api http server serves table lookup with version header" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?fields=title" });
-    defer resp.deinit(std.testing.allocator);
+    var resp = try server.executor().execute(std.heap.page_allocator, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?fields=title" });
+    defer resp.deinit(std.heap.page_allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
