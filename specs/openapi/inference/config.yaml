@@ -1433,6 +1433,38 @@ components:
         quantization:
           $ref: "#/components/schemas/ModelQuantization"
 
+    QueryEmbeddingCacheConfig:
+      type: object
+      description: |
+        Process-local cache for dense query embeddings. Cache lookup and
+        singleflight happen before provider pacing and local inference queueing.
+        Entries are isolated by the server-derived security domain and effective
+        embedding operation. Templated and multimodal queries bypass retention
+        and singleflight but share the max_inflight provider admission bound.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
+        max_bytes_mb:
+          type: integer
+          minimum: 0
+          maximum: 1048576
+          default: 64
+          description: Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
+        ttl_ms:
+          type: integer
+          minimum: 0
+          maximum: 86400000
+          default: 300000
+          description: Idle expiration in milliseconds. Cache hits refresh the expiry time.
+        max_inflight:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 16
+          description: Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached. The conservative default bounds transient memory before provider responses are decoded; raise it only after measuring provider and node capacity.
+
     Config:
       type: object
       required:
@@ -1472,6 +1504,8 @@ components:
         s3_credentials:
           $ref: "../shared/s3.yaml#/components/schemas/Credentials"
           description: "S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail."
+        query_embedding_cache:
+          $ref: "#/components/schemas/QueryEmbeddingCacheConfig"
         keep_alive:
           type: string
           description: |
