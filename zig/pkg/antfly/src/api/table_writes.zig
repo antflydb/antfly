@@ -1054,21 +1054,33 @@ pub const ProvisionedTableWriteCache = struct {
         self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) void {
+    fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) !void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
         if (haWriteGatesEqual(self.ha_write_gate, gate)) return;
+        lockAtomic(&self.entry_lifecycle_mutex);
+        self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
+            self.entry_lifecycle_mutex.unlock();
+            return err;
+        };
         self.ha_write_gate = gate;
-        self.clear();
+        self.clearAssumeLifecycleLocked();
+        self.entry_lifecycle_mutex.unlock();
         self.drainPendingClosesAssumeOpenMutexHeld();
     }
 
-    pub fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) void {
+    fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) !void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
         if (haAsyncMirrorsEqual(self.ha_async_mirror, mirror)) return;
+        lockAtomic(&self.entry_lifecycle_mutex);
+        self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
+            self.entry_lifecycle_mutex.unlock();
+            return err;
+        };
         self.ha_async_mirror = mirror;
-        self.clear();
+        self.clearAssumeLifecycleLocked();
+        self.entry_lifecycle_mutex.unlock();
         self.drainPendingClosesAssumeOpenMutexHeld();
     }
 
@@ -1141,12 +1153,12 @@ pub const ProvisionedTableWriteCache = struct {
         self.* = undefined;
     }
 
-    pub fn clear(self: *ProvisionedTableWriteCache) void {
-        lockAtomic(@constCast(&self.entry_lifecycle_mutex));
-        defer @constCast(&self.entry_lifecycle_mutex).unlock();
-        self.retired_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len) catch return;
-        self.closing_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len) catch return;
+    fn reserveClearCapacityAssumeLifecycleLocked(self: *ProvisionedTableWriteCache) !void {
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len);
+        try self.closing_entries.ensureUnusedCapacity(self.alloc, self.entries.items.len);
+    }
 
+    fn clearAssumeLifecycleLocked(self: *ProvisionedTableWriteCache) void {
         for (self.entries.items) |entry| self.retireEntryAssumeLifecycleLocked(entry);
         self.entries.clearRetainingCapacity();
         for (self.table_metadata.items) |*metadata| metadata.deinit(self.alloc);
@@ -1420,7 +1432,7 @@ pub const ProvisionedTableWriteCache = struct {
             try opened.db.beginBulkIngestSession();
             errdefer opened.db.abortBulkIngestSession();
         }
-        try self.reserveRetiredEntriesCapacityLocked(1);
+        try self.reserveInstalledEntryLifecycleCapacityLocked(1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
@@ -1649,7 +1661,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_table_name);
-        try self.reserveRetiredEntriesCapacityLocked(1);
+        try self.reserveInstalledEntryLifecycleCapacityLocked(1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
@@ -1704,7 +1716,7 @@ pub const ProvisionedTableWriteCache = struct {
         errdefer self.alloc.free(owned_table_name);
         const owned_schema_json = try self.alloc.dupe(u8, schema_json);
         errdefer self.alloc.free(owned_schema_json);
-        try self.reserveRetiredEntriesCapacityLocked(1);
+        try self.reserveInstalledEntryLifecycleCapacityLocked(1);
         const owned_entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(owned_entry);
         owned_entry.* = .{
@@ -2406,9 +2418,11 @@ pub const ProvisionedTableWriteCache = struct {
                 dest.retireEntryLocked(removed);
             }
 
+            try dest.reserveInstalledEntryLifecycleCapacityLocked(1);
+            try dest.entries.ensureUnusedCapacity(dest.alloc, 1);
             _ = self.entries.orderedRemove(i);
             entry.lsm_root_generation = dest_generation;
-            try dest.entries.append(dest.alloc, entry);
+            dest.entries.appendAssumeCapacity(entry);
             moved += 1;
         }
         return moved;
@@ -2500,6 +2514,19 @@ pub const ProvisionedTableWriteCache = struct {
         defer self.entry_lifecycle_mutex.unlock();
         try self.retired_entries.ensureUnusedCapacity(self.alloc, count);
         try self.closing_entries.ensureUnusedCapacity(self.alloc, count);
+    }
+
+    /// Every installed entry owns one preallocated slot in each retirement
+    /// queue. Queue-to-queue moves preserve the total, so cache-wide retirement
+    /// never allocates and HA ownership changes cannot fail after publication.
+    fn reserveInstalledEntryLifecycleCapacityLocked(self: *ProvisionedTableWriteCache, additional_entries: usize) !void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        const queued = try std.math.add(usize, self.retired_entries.items.len, self.closing_entries.items.len);
+        const installed = try std.math.add(usize, self.entries.items.len, additional_entries);
+        const required = try std.math.add(usize, queued, installed);
+        try self.retired_entries.ensureTotalCapacity(self.alloc, required);
+        try self.closing_entries.ensureTotalCapacity(self.alloc, required);
     }
 
     fn retireEntryAssumeLifecycleLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -4353,6 +4380,96 @@ pub const ProvisionedTableWriteSource = struct {
         err: ?anyerror = null,
     };
 
+    /// Serializes source configuration with every cache container it can
+    /// mutate. The order matches request-time cache opens: cache-open locks by
+    /// address, then the source lock, then cache lifecycle locks by address.
+    const WriteCacheTransitionLocks = struct {
+        source: *ProvisionedTableWriteSource,
+        first: ?*ProvisionedTableWriteCache,
+        second: ?*ProvisionedTableWriteCache,
+        state_locked: bool = true,
+        open_locked: bool = true,
+
+        fn init(
+            owner: *ProvisionedTableWriteSource,
+            include_write: bool,
+            include_startup: bool,
+        ) WriteCacheTransitionLocks {
+            var first: ?*ProvisionedTableWriteCache = if (include_write) owner.write_cache else null;
+            var second: ?*ProvisionedTableWriteCache = if (include_startup) owner.startup_write_cache else null;
+            if (first == second) second = null;
+            if (first == null) {
+                first = second;
+                second = null;
+            } else if (second != null and @intFromPtr(first.?) > @intFromPtr(second.?)) {
+                const swap = first;
+                first = second;
+                second = swap;
+            }
+
+            if (first) |cache| lockAtomic(&cache.open_mutex);
+            if (second) |cache| lockAtomic(&cache.open_mutex);
+            lockAtomic(&owner.local_db_mutex);
+            if (first) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
+            if (second) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
+            return .{ .source = owner, .first = first, .second = second };
+        }
+
+        fn reserveClearCapacity(self: *WriteCacheTransitionLocks) !void {
+            if (self.first) |cache| try cache.reserveClearCapacityAssumeLifecycleLocked();
+            if (self.second) |cache| try cache.reserveClearCapacityAssumeLifecycleLocked();
+        }
+
+        fn assertClearCapacity(self: *const WriteCacheTransitionLocks) void {
+            const assertCache = struct {
+                fn run(cache: *const ProvisionedTableWriteCache) void {
+                    std.debug.assert(cache.retired_entries.capacity - cache.retired_entries.items.len >= cache.entries.items.len);
+                    std.debug.assert(cache.closing_entries.capacity - cache.closing_entries.items.len >= cache.entries.items.len);
+                }
+            }.run;
+            if (self.first) |cache| assertCache(cache);
+            if (self.second) |cache| assertCache(cache);
+        }
+
+        fn clearCaches(self: *WriteCacheTransitionLocks, notify_evictions: bool) void {
+            if (self.first) |cache| {
+                if (notify_evictions) cache.notifyTableEvictions();
+                cache.clearAssumeLifecycleLocked();
+            }
+            if (self.second) |cache| {
+                if (notify_evictions) cache.notifyTableEvictions();
+                cache.clearAssumeLifecycleLocked();
+            }
+        }
+
+        fn releaseStateLocks(self: *WriteCacheTransitionLocks) void {
+            if (!self.state_locked) return;
+            if (self.second) |cache| cache.entry_lifecycle_mutex.unlock();
+            if (self.first) |cache| cache.entry_lifecycle_mutex.unlock();
+            self.source.local_db_mutex.unlock();
+            self.state_locked = false;
+        }
+
+        fn drainAndRelease(self: *WriteCacheTransitionLocks) void {
+            self.releaseStateLocks();
+            if (self.first) |cache| cache.drainPendingClosesAssumeOpenMutexHeld();
+            if (self.second) |cache| cache.drainPendingClosesAssumeOpenMutexHeld();
+            self.releaseOpenLocks();
+        }
+
+        fn releaseOpenLocks(self: *WriteCacheTransitionLocks) void {
+            if (!self.open_locked) return;
+            if (self.second) |cache| cache.open_mutex.unlock();
+            if (self.first) |cache| cache.open_mutex.unlock();
+            self.open_locked = false;
+        }
+
+        fn deinit(self: *WriteCacheTransitionLocks) void {
+            self.releaseStateLocks();
+            self.releaseOpenLocks();
+        }
+    };
+
     pub fn init(replica_root_dir: []const u8, catalog: table_catalog.CatalogSource) ProvisionedTableWriteSource {
         return .{
             .replica_root_dir = replica_root_dir,
@@ -4487,24 +4604,68 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn withHAWriteGate(
         self: *ProvisionedTableWriteSource,
         gate: ?db_mod.HAWriteGate,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
         const changed = !ProvisionedTableWriteCache.haWriteGatesEqual(self.ha_write_gate, gate);
+        if (!changed) return self;
+        try locks.reserveClearCapacity();
         self.ha_write_gate = gate;
-        if (self.write_cache) |cache| cache.setHAWriteGate(gate);
-        if (self.startup_write_cache) |cache| cache.setHAWriteGate(gate);
-        if (changed) self.resetCachedVisibilityAfterOwnershipChange();
+        if (locks.first) |cache| cache.ha_write_gate = gate;
+        if (locks.second) |cache| cache.ha_write_gate = gate;
+        locks.clearCaches(false);
+        self.resetCachedVisibilityAfterOwnershipChange();
+        locks.drainAndRelease();
         return self;
+    }
+
+    /// Reserves every queue slot an ownership change can consume without
+    /// publishing configuration. Promotion uses this before consuming the
+    /// standby, so even a manually assembled cache that predates the normal
+    /// entry-install invariant fails before any irreversible HA mutation.
+    pub fn prepareHAConfigTransition(self: *ProvisionedTableWriteSource) !void {
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
+        try locks.reserveClearCapacity();
     }
 
     pub fn withHAMirror(
         self: *ProvisionedTableWriteSource,
         mirror: ?db_mod.HAAsyncEffectMirror,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
         const changed = !ProvisionedTableWriteCache.haAsyncMirrorsEqual(self.ha_async_mirror, mirror);
+        if (!changed) return self;
+        try locks.reserveClearCapacity();
         self.ha_async_mirror = mirror;
-        if (self.write_cache) |cache| cache.setHAMirror(mirror);
-        if (self.startup_write_cache) |cache| cache.setHAMirror(mirror);
-        if (changed) self.resetCachedVisibilityAfterOwnershipChange();
+        if (locks.first) |cache| cache.ha_async_mirror = mirror;
+        if (locks.second) |cache| cache.ha_async_mirror = mirror;
+        locks.clearCaches(false);
+        self.resetCachedVisibilityAfterOwnershipChange();
+        locks.drainAndRelease();
+        return self;
+    }
+
+    /// Publishes a mirror after `prepareHAConfigTransition` has succeeded.
+    /// Entry installation preserves the retirement-capacity invariant while
+    /// the preflight lock is released, so this path cannot allocate after an
+    /// irreversible HA ownership handoff.
+    pub fn withPreparedHAMirror(
+        self: *ProvisionedTableWriteSource,
+        mirror: ?db_mod.HAAsyncEffectMirror,
+    ) *ProvisionedTableWriteSource {
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
+        const changed = !ProvisionedTableWriteCache.haAsyncMirrorsEqual(self.ha_async_mirror, mirror);
+        if (!changed) return self;
+        locks.assertClearCapacity();
+        self.ha_async_mirror = mirror;
+        if (locks.first) |cache| cache.ha_async_mirror = mirror;
+        if (locks.second) |cache| cache.ha_async_mirror = mirror;
+        locks.clearCaches(false);
+        self.resetCachedVisibilityAfterOwnershipChange();
+        locks.drainAndRelease();
         return self;
     }
 
@@ -6348,34 +6509,21 @@ pub const ProvisionedTableWriteSource = struct {
         return try source_cache.transferAdoptableEntriesForTableLocked(dest_cache, table_name, dest.groupVisibleRootGenerationSource());
     }
 
-    pub fn clearStartupWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
-        if (self.startup_write_cache) |cache| {
-            cache.notifyTableEvictions();
-            cache.clear();
-        }
+    pub fn clearStartupWriteCache(self: *ProvisionedTableWriteSource) !void {
+        var locks = WriteCacheTransitionLocks.init(self, false, true);
+        defer locks.deinit();
+        try locks.reserveClearCapacity();
+        locks.clearCaches(true);
+        locks.drainAndRelease();
     }
 
-    pub fn clearStartupWriteCache(self: *ProvisionedTableWriteSource) void {
-        lockAtomic(&self.local_db_mutex);
-        self.clearStartupWriteCacheLocked();
-        self.local_db_mutex.unlock();
-        self.drainWriteCachePendingCloses();
-    }
-
-    pub fn clearWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
-        if (self.write_cache) |cache| {
-            cache.notifyTableEvictions();
-            cache.clear();
-        }
-        self.clearStartupWriteCacheLocked();
+    pub fn clearWriteCache(self: *ProvisionedTableWriteSource) !void {
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
+        try locks.reserveClearCapacity();
+        locks.clearCaches(true);
         self.clearAllDirtyWriteTables();
-    }
-
-    pub fn clearWriteCache(self: *ProvisionedTableWriteSource) void {
-        lockAtomic(&self.local_db_mutex);
-        self.clearWriteCacheLocked();
-        self.local_db_mutex.unlock();
-        self.drainWriteCachePendingCloses();
+        locks.drainAndRelease();
     }
 
     pub fn warmTableGroup(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
@@ -6525,9 +6673,13 @@ pub const ProvisionedTableWriteSource = struct {
             self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &failed_result);
         }
         defer {
-            lockAtomic(&self.local_db_mutex);
-            if (!preserve_startup_cache) self.clearStartupWriteCacheLocked();
-            self.local_db_mutex.unlock();
+            if (!preserve_startup_cache) self.clearStartupWriteCache() catch |err| {
+                std.log.warn("startup writer cache retirement deferred table={s} group_id={} err={s}", .{
+                    table_name,
+                    group_id,
+                    @errorName(err),
+                });
+            };
             self.endGroupOperation(table_name, group_id);
         }
         self.startup_catch_up_active.store(true, .monotonic);
@@ -18178,7 +18330,7 @@ test "HA ownership transition invalidates cached visibility and dirty identities
 
     var gate_state = ha_public_gate_state_mod.State{};
     const gate: db_mod.HAWriteGate = .{ .shared = .{ .state = &gate_state } };
-    _ = source.withHAWriteGate(gate);
+    _ = try source.withHAWriteGate(gate);
 
     try std.testing.expectEqual(@as(usize, 0), write_cache.table_metadata.items.len);
     try std.testing.expectEqual(@as(usize, 0), startup_cache.table_metadata.items.len);
@@ -18186,8 +18338,61 @@ test "HA ownership transition invalidates cached visibility and dirty identities
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
     try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("docs").?);
 
-    _ = source.withHAWriteGate(gate);
+    _ = try source.withHAWriteGate(gate);
     try std.testing.expectEqual(@as(u64, 8), read_cache.table_epochs.get("docs").?);
+}
+
+test "HA ownership transition serializes with active writer cache mutation" {
+    const alloc = std.testing.allocator;
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-ha-transition-serialization",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    source.bindWriteCaches(&write_cache, null);
+    try write_cache.replaceTableMetadataLocked("docs", "{}", "{}");
+    source.markWriteCacheDirty("docs");
+
+    var gate_state = ha_public_gate_state_mod.State{};
+    const Worker = struct {
+        source: *ProvisionedTableWriteSource,
+        gate_state: *ha_public_gate_state_mod.State,
+        started: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            _ = self.source.withHAWriteGate(.{ .shared = .{ .state = self.gate_state } }) catch |err| {
+                self.err = err;
+                return;
+            };
+            self.completed.store(true, .release);
+        }
+    };
+    var worker = Worker{ .source = &source, .gate_state = &gate_state };
+
+    lockAtomic(&source.local_db_mutex);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    var attempts: usize = 0;
+    while (attempts < 1_000) : (attempts += 1) std.Thread.yield() catch {};
+    const completed_while_locked = worker.completed.load(.acquire);
+    const gate_changed_while_locked = source.ha_write_gate != null;
+    const metadata_count_while_locked = write_cache.table_metadata.items.len;
+    source.local_db_mutex.unlock();
+    thread.join();
+
+    try std.testing.expect(!completed_while_locked);
+    try std.testing.expect(!gate_changed_while_locked);
+    try std.testing.expectEqual(@as(usize, 1), metadata_count_while_locked);
+    try std.testing.expect(worker.err == null);
+    try std.testing.expect(worker.completed.load(.acquire));
+    try std.testing.expect(source.ha_write_gate != null);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.table_metadata.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
 }
 
 test "startup cache clear retires dirty identity without a serving owner" {
@@ -18219,7 +18424,7 @@ test "startup cache clear retires dirty identity without a serving owner" {
     try startup_cache.replaceTableMetadataLocked("docs", "{}", "{}");
     source.markWriteCacheDirty("docs");
 
-    source.clearStartupWriteCache();
+    try source.clearStartupWriteCache();
 
     try std.testing.expectEqual(@as(usize, 0), startup_cache.table_metadata.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
@@ -28109,7 +28314,7 @@ test "write cache blocks same-root generation replacement while stale lease stay
     adopted_gen2.deinit(alloc);
 }
 
-test "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
+test "write cache retirement is allocation-free after entry installation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
 
@@ -28159,22 +28364,32 @@ test "write cache keeps leased entry cleanup reachable when retirement bookkeepi
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&write_cache, null);
 
     var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 
+    source.markWriteCacheDirty("docs");
+    var gate_state = ha_public_gate_state_mod.State{};
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
-    write_cache.removeDbEntriesForTable("docs");
-
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len + write_cache.retired_entries.items.len);
+    _ = try source.withHAWriteGate(.{ .shared = .{ .state = &gate_state } });
+    try std.testing.expect(source.ha_write_gate != null);
+    try std.testing.expect(write_cache.ha_write_gate != null);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
 
     cached.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    write_cache.drainPendingCloses();
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 }
 
 test "provisioned table write source group batch does not hold local db mutex during db batch" {
@@ -29723,7 +29938,7 @@ test "write cache HA gate clear drains inactive pending closes before returning"
     }, .{});
     defer primary.close();
 
-    write_cache.setHAWriteGate(.{ .primary = &primary });
+    try write_cache.setHAWriteGate(.{ .primary = &primary });
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 }
@@ -29801,7 +30016,7 @@ test "write cache retires shared HA generation stale entries before reuse" {
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    write_cache.setHAWriteGate(.{ .shared = .{ .state = &state } });
+    try write_cache.setHAWriteGate(.{ .shared = .{ .state = &state } });
 
     var standby_cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
     standby_cached.deinit(alloc);

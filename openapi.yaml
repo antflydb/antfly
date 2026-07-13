@@ -2860,7 +2860,8 @@ paths:
 
         - `skip_if_exists`: Skip existing tables and restore the rest
 
-        - `overwrite`: Drop existing tables and restore from backup
+        - `overwrite`: Stage and validate replacement generations, then atomically publish them over existing
+        tables. Readers already holding the previous generation may finish before it is retired.
 
 
         The endpoint stages and publishes locally owned table generations before

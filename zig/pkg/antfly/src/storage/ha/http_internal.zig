@@ -61,6 +61,10 @@ pub const Server = struct {
     }
 
     pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        return try self.handleWithAllocator(self.alloc, req);
+    }
+
+    fn handleWithAllocator(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         if (self.state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
             defer mutex.unlock();
@@ -69,74 +73,74 @@ pub const Server = struct {
         switch (req.method) {
             .GET => {
                 if (std.mem.eql(u8, path, internal_api.routes.ha_replication_identify)) {
-                    return try self.handleIdentify();
+                    return try self.handleIdentify(response_alloc);
                 }
-                if (knownFixedRoute(path)) return try textResponse(self.alloc, 405, "method not allowed");
-                return try textResponse(self.alloc, 404, "not found");
+                if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
+                return try textResponse(response_alloc, 404, "not found");
             },
             .POST => {
                 if (std.mem.eql(u8, path, internal_api.routes.ha_replication_slots)) {
-                    return try self.handleCreateReplicationSlot(req);
+                    return try self.handleCreateReplicationSlot(response_alloc, req);
                 }
                 if (std.mem.eql(u8, path, internal_api.routes.ha_replication_start)) {
-                    return try self.handleStartReplication(req);
+                    return try self.handleStartReplication(response_alloc, req);
                 }
                 if (std.mem.eql(u8, path, internal_api.routes.ha_replication_status)) {
-                    return try self.handleStandbyStatusUpdate(req);
+                    return try self.handleStandbyStatusUpdate(response_alloc, req);
                 }
-                if (knownFixedRoute(path)) return try textResponse(self.alloc, 405, "method not allowed");
-                return try textResponse(self.alloc, 404, "not found");
+                if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
+                return try textResponse(response_alloc, 404, "not found");
             },
             .PUT, .DELETE => {
-                if (knownFixedRoute(path)) return try textResponse(self.alloc, 405, "method not allowed");
-                return try textResponse(self.alloc, 404, "not found");
+                if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
+                return try textResponse(response_alloc, 404, "not found");
             },
         }
     }
 
-    fn handleIdentify(self: *Server) !http_common.HttpResponse {
-        const primary = self.primary orelse return try textResponse(self.alloc, 409, "primary unavailable");
-        return try jsonResponse(self.alloc, replication_api.identifySystem(primary));
+    fn handleIdentify(self: *Server, response_alloc: Allocator) !http_common.HttpResponse {
+        const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
+        return try jsonResponse(response_alloc, replication_api.identifySystem(primary));
     }
 
-    fn handleCreateReplicationSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const primary = self.primary orelse return try textResponse(self.alloc, 409, "primary unavailable");
-        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA replication slot request");
+    fn handleCreateReplicationSlot(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
+        if (req.body.len == 0) return try textResponse(response_alloc, 400, "empty HA replication slot request");
         var parsed = internal_api.openapi.server.parseCreateHAReplicationStreamingSlotBody(
             self.alloc,
             req.body,
-        ) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request");
+        ) catch return try textResponse(response_alloc, 400, "invalid HA replication slot request");
         defer parsed.deinit();
 
         const initial_lsn = if (parsed.value.initial_lsn) |value|
-            uint64FromJson(value) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request")
+            uint64FromJson(value) catch return try textResponse(response_alloc, 400, "invalid HA replication slot request")
         else
             null;
 
         const response = replication_api.createReplicationSlot(primary, .{
             .slot_name = parsed.value.slot_name,
             .initial_lsn = initial_lsn,
-        }) catch |err| return try commandErrorResponse(self.alloc, err);
-        return try jsonResponse(self.alloc, response);
+        }) catch |err| return try commandErrorResponse(response_alloc, err);
+        return try jsonResponse(response_alloc, response);
     }
 
-    fn handleStartReplication(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const primary = self.primary orelse return try textResponse(self.alloc, 409, "primary unavailable");
-        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA start replication request");
+    fn handleStartReplication(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
+        if (req.body.len == 0) return try textResponse(response_alloc, 400, "empty HA start replication request");
         var parsed = internal_api.openapi.server.parseStartHAReplicationBody(
             self.alloc,
             req.body,
-        ) catch return try textResponse(self.alloc, 400, "invalid HA start replication request");
+        ) catch return try textResponse(response_alloc, 400, "invalid HA start replication request");
         defer parsed.deinit();
 
         const from_lsn = positiveUint64FromJson(parsed.value.from_lsn) catch
-            return try textResponse(self.alloc, 400, "invalid HA start replication request");
+            return try textResponse(response_alloc, 400, "invalid HA start replication request");
         const max_records = if (parsed.value.max_records) |value|
-            usizeFromJson(value) catch return try textResponse(self.alloc, 400, "invalid HA start replication request")
+            usizeFromJson(value) catch return try textResponse(response_alloc, 400, "invalid HA start replication request")
         else
             0;
         const max_encoded_bytes = if (parsed.value.max_encoded_bytes) |value|
-            usizeFromJson(value) catch return try textResponse(self.alloc, 400, "invalid HA start replication request")
+            usizeFromJson(value) catch return try textResponse(response_alloc, 400, "invalid HA start replication request")
         else
             0;
 
@@ -145,31 +149,31 @@ pub const Server = struct {
             .from_lsn = from_lsn,
             .max_records = max_records,
             .max_encoded_bytes = max_encoded_bytes,
-        }) catch |err| return try commandErrorResponse(self.alloc, err);
+        }) catch |err| return try commandErrorResponse(response_alloc, err);
         defer response.deinit(self.alloc);
 
         var document = try startReplicationDocument(self.alloc, response);
         defer document.deinit(self.alloc);
-        return try jsonResponse(self.alloc, document);
+        return try jsonResponse(response_alloc, document);
     }
 
-    fn handleStandbyStatusUpdate(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const primary = self.primary orelse return try textResponse(self.alloc, 409, "primary unavailable");
-        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA standby status update request");
+    fn handleStandbyStatusUpdate(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
+        if (req.body.len == 0) return try textResponse(response_alloc, 400, "empty HA standby status update request");
         var parsed = internal_api.openapi.server.parseUpdateHAStandbyStatusBody(
             self.alloc,
             req.body,
-        ) catch return try textResponse(self.alloc, 400, "invalid HA standby status update request");
+        ) catch return try textResponse(response_alloc, 400, "invalid HA standby status update request");
         defer parsed.deinit();
 
         const timeline_id = positiveUint64FromJson(parsed.value.timeline_id) catch
-            return try textResponse(self.alloc, 400, "invalid HA standby status update request");
+            return try textResponse(response_alloc, 400, "invalid HA standby status update request");
         const received_lsn = uint64FromJson(parsed.value.received_lsn) catch
-            return try textResponse(self.alloc, 400, "invalid HA standby status update request");
+            return try textResponse(response_alloc, 400, "invalid HA standby status update request");
         const applied_lsn = uint64FromJson(parsed.value.applied_lsn) catch
-            return try textResponse(self.alloc, 400, "invalid HA standby status update request");
+            return try textResponse(response_alloc, 400, "invalid HA standby status update request");
         const safe_read_lsn = if (parsed.value.safe_read_lsn) |value|
-            uint64FromJson(value) catch return try textResponse(self.alloc, 400, "invalid HA standby status update request")
+            uint64FromJson(value) catch return try textResponse(response_alloc, 400, "invalid HA standby status update request")
         else
             null;
 
@@ -179,13 +183,13 @@ pub const Server = struct {
             .received_lsn = received_lsn,
             .applied_lsn = applied_lsn,
             .safe_read_lsn = safe_read_lsn,
-        }) catch |err| return try commandErrorResponse(self.alloc, err);
-        return try jsonResponse(self.alloc, response);
+        }) catch |err| return try commandErrorResponse(response_alloc, err);
+        return try jsonResponse(response_alloc, response);
     }
 
-    fn execute(ptr: *anyopaque, _: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *Server = @ptrCast(@alignCast(ptr));
-        return self.handle(req);
+        return self.handleWithAllocator(alloc, req);
     }
 };
 

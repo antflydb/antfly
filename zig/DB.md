@@ -94,6 +94,20 @@ startup or serving cache keeps the identity alive until it also evicts the
 table. Memory therefore scales with the bounded union of cache working sets,
 not with historical writes, while a draining lease that mutates after eviction
 re-marks itself through the normal visibility hook.
+Writer ownership configuration is published under one ordered transition lock
+set: cache-open locks by address, then the source mutation lock, then cache
+lifecycle locks by address. Gate or mirror changes reserve both serving and
+startup cache retirement before changing any source field, retire both caches,
+and only then invalidate read/status observations and dirty identities. Every
+read and write cache entry reserves its retirement queue slot when installed,
+so the transition and final lease release are allocation-free. HA promotion
+also preflights both live and raft-apply write sources before consuming standby
+ownership; allocation pressure therefore fails promotion before irreversible
+state changes instead of leaving a partially rewired primary.
+Standby promotion transfers the already-open receive-log owner into the new
+primary after validating the configured paths, durable timeline-switch record,
+and slot store. It never opens a second writer over the same WAL root and does
+not introduce a close/reopen window between standby and primary ownership.
 This includes the embedded
 `BoundTableWriteSource`: it closes its current owner, restores into a sibling
 generation, publishes atomically, and reopens either the unchanged live
@@ -138,6 +152,12 @@ manual runtime admits the reconciled read generation and downgrades the
 publication lock before recursively reclaiming the exact stale paths identified
 under exclusivity. This preserves bounded disk use without holding publication
 downtime across potentially large directory deletion.
+Retired-root deletion additionally holds one persistent cleanup lock per parent
+directory. Duplicate workers and separate processes therefore serialize only
+for the same table-group parent, while unrelated shards reclaim in parallel.
+After acquiring that lock each worker rechecks path existence, making an
+already reclaimed generation a successful idempotent outcome rather than a
+failed durable job.
 
 A restore whose namespace exchange committed but whose parent sync failed is
 reported as durability pending. Retrying the same backup is idempotent: Antfly

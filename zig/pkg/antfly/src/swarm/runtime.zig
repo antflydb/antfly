@@ -1089,7 +1089,7 @@ pub fn runFromIterator(
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
-    data_server.initApiServer();
+    try data_server.initApiServer();
     data_server.registerNodeIfConfigured() catch |err| {
         std.log.err("swarm startup failed step=register_node err={}", .{err});
         return err;

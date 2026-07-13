@@ -453,7 +453,12 @@ pub const ProvisionedTableReadCache = struct {
             if (!self.hasTableLocked(table_name) and self.cachedTableCountLocked() >= max_cached_tables) self.evictOldestTableLocked();
             const owned_table_name = try self.alloc.dupe(u8, table_name);
             errdefer self.alloc.free(owned_table_name);
-            try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
+            const retirement_capacity = try std.math.add(
+                usize,
+                try std.math.add(usize, self.entries.items.len, self.retired_entries.items.len),
+                1,
+            );
+            try self.retired_entries.ensureTotalCapacity(self.alloc, retirement_capacity);
             const owned_entry = try self.alloc.create(Entry);
             errdefer self.alloc.destroy(owned_entry);
             owned_entry.* = .{
@@ -20597,7 +20602,7 @@ test "provisioned read cache exclusive access drains active read leases" {
     try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
 }
 
-test "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
+test "provisioned read cache retirement is allocation-free after entry installation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
     const path = "/tmp/antfly-api-provisioned-read-cache-retire-oom";
@@ -20660,10 +20665,11 @@ test "provisioned read cache keeps leased entry cleanup reachable when retiremen
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
     cache.invalidateTable("docs");
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.retired_entries.items.len);
 
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len + cache.retired_entries.items.len);
 
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);

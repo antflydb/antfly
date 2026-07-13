@@ -123,6 +123,8 @@ pub const ApplyFn = *const fn (ctx: *anyopaque, record: replication_record.Recor
 pub const Standby = struct {
     alloc: Allocator,
     identity: Identity,
+    receive_log_path: [:0]u8,
+    progress_wal_path: [:0]u8,
     receive_log: replication_log.ReplicationLog,
     progress_wal: wal_mod.WAL,
     progress: Progress,
@@ -136,18 +138,28 @@ pub const Standby = struct {
     ) !Standby {
         try validateIdentity(identity);
 
-        var receive_log = try replication_log.ReplicationLog.open(receive_log_path, options.receive_log_options);
-        const progress_wal = wal_mod.WAL.open(progress_wal_path, options.progress_wal_options) catch |err| {
+        const owned_receive_log_path = try alloc.dupeZ(u8, std.mem.span(receive_log_path));
+        var receive_path_owned_locally = true;
+        errdefer if (receive_path_owned_locally) alloc.free(owned_receive_log_path);
+        const owned_progress_wal_path = try alloc.dupeZ(u8, std.mem.span(progress_wal_path));
+        var progress_path_owned_locally = true;
+        errdefer if (progress_path_owned_locally) alloc.free(owned_progress_wal_path);
+        var receive_log = try replication_log.ReplicationLog.open(owned_receive_log_path.ptr, options.receive_log_options);
+        const progress_wal = wal_mod.WAL.open(owned_progress_wal_path.ptr, options.progress_wal_options) catch |err| {
             receive_log.close();
             return err;
         };
         var standby = Standby{
             .alloc = alloc,
             .identity = identity,
+            .receive_log_path = owned_receive_log_path,
+            .progress_wal_path = owned_progress_wal_path,
             .receive_log = receive_log,
             .progress_wal = progress_wal,
             .progress = .{},
         };
+        receive_path_owned_locally = false;
+        progress_path_owned_locally = false;
         errdefer standby.close();
 
         const replayed = try standby.replayProgress();
@@ -192,9 +204,20 @@ pub const Standby = struct {
     }
 
     pub fn close(self: *Standby) void {
+        const alloc = self.alloc;
         self.progress_wal.close();
         self.receive_log.close();
+        alloc.free(self.progress_wal_path);
+        alloc.free(self.receive_log_path);
         self.* = undefined;
+    }
+
+    pub fn receiveLogPath(self: *const Standby) []const u8 {
+        return self.receive_log_path;
+    }
+
+    pub fn progressWalPath(self: *const Standby) []const u8 {
+        return self.progress_wal_path;
     }
 
     pub fn currentProgress(self: *const Standby) Progress {

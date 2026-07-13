@@ -17,6 +17,7 @@ const publication_marker_name = ".antfly-generation-publication-v1";
 const publication_marker_data = "antfly_generation_publication_v1\n";
 const publication_lock_suffix = ".antfly-generation.lock";
 const preparation_lock_suffix = ".antfly-generation-prepare.lock";
+const retired_cleanup_lock_name = ".antfly-generation-cleanup.lock";
 const max_reconciled_paths = 8192;
 
 fn publicationLockPathAlloc(alloc: Allocator, canonical_path: []const u8) ![]u8 {
@@ -891,7 +892,7 @@ const RetiredGenerationCleanupBatch = struct {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        try deleteRetiredGenerationPaths(io, self.paths, self.parent);
+        try deleteRetiredGenerationPaths(self.alloc, io, self.paths, self.parent);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -904,9 +905,25 @@ const RetiredGenerationCleanupBatch = struct {
     }
 };
 
-fn deleteRetiredGenerationPaths(io: std.Io, paths: []const []const u8, parent: []const u8) !void {
+fn deleteRetiredGenerationPaths(alloc: Allocator, io: std.Io, paths: []const []const u8, parent: []const u8) !void {
+    const lock_path = try std.fs.path.join(alloc, &.{ parent, retired_cleanup_lock_name });
+    defer alloc.free(lock_path);
+    const cleanup_lock = std.Io.Dir.cwd().createFile(io, lock_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = false,
+    }) catch |err| switch (err) {
+        // The parent was concurrently retired, so every target below it is
+        // already unreachable and cleanup is complete.
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer cleanup_lock.close(io);
+
     var first_error: ?anyerror = null;
     for (paths) |path| {
+        if (!pathExists(io, path)) continue;
         std.Io.Dir.cwd().deleteTree(io, path) catch |err| switch (err) {
             error.NotDir => {},
             else => if (first_error == null) {
@@ -914,7 +931,10 @@ fn deleteRetiredGenerationPaths(io: std.Io, paths: []const []const u8, parent: [
             },
         };
     }
-    try fs_paths.syncDirPortable(io, parent);
+    fs_paths.syncDirPortable(io, parent) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
     if (first_error) |err| return err;
 }
 
@@ -1056,7 +1076,7 @@ fn reconcilePublishedGenerationExclusive(
     const reconciled = try reconcilePublishedGeneration(alloc, io, live_path, scheduler, &deferred_cleanup);
     if (deferred_cleanup.items.len > 0) {
         const parent = std.fs.path.dirname(live_path) orelse if (std.fs.path.isAbsolute(live_path)) "/" else ".";
-        try deleteRetiredGenerationPaths(io, deferred_cleanup.items, parent);
+        try deleteRetiredGenerationPaths(alloc, io, deferred_cleanup.items, parent);
     }
     return reconciled;
 }
@@ -1100,7 +1120,7 @@ pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const
     errdefer read_lease.deinit();
     if (deferred_cleanup.items.len > 0) {
         const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
-        deleteRetiredGenerationPaths(io_impl.io(), deferred_cleanup.items, parent) catch |err| {
+        deleteRetiredGenerationPaths(alloc, io_impl.io(), deferred_cleanup.items, parent) catch |err| {
             std.log.warn("stale generation cleanup remains retryable after read admission path={s} count={} err={s}", .{ path, deferred_cleanup.items.len, @errorName(err) });
         };
     }
@@ -1622,6 +1642,45 @@ test "generation reconciliation reclaims stale roots after read admission withou
     var lease = (try acquirePublishedGenerationRead(alloc, live_path)) orelse return error.TestUnexpectedResult;
     lease.deinit();
     try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+}
+
+test "retired generation cleanup is idempotent across concurrent workers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(parent);
+    const retired = try std.fmt.allocPrint(alloc, "{s}/table.restore-stage-a-b", .{parent});
+    defer alloc.free(retired);
+    try fs_paths.createDirPathPortable(std.testing.io, retired);
+    const value_path = try std.fs.path.join(alloc, &.{ retired, "value" });
+    defer alloc.free(value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = value_path, .data = "retired" });
+
+    const Worker = struct {
+        path: []const u8,
+        parent: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            deleteRetiredGenerationPaths(std.heap.page_allocator, io_impl.io(), &.{self.path}, self.parent) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var first = Worker{ .path = retired, .parent = parent };
+    var second = Worker{ .path = retired, .parent = parent };
+    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expect(first.err == null);
+    try std.testing.expect(second.err == null);
+    try std.testing.expect(!pathExists(std.testing.io, retired));
 }
 
 test "atomic exchange failure leaves live and staged generations unchanged" {
