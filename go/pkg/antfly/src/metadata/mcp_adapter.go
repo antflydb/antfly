@@ -434,7 +434,7 @@ func (a *mcpAdapter) Backup(ctx context.Context, tableName, backupID, location s
 	}
 
 	// Write backup metadata
-	if err := newBackupStore(location, &a.t.ln.config.Storage.S3).WriteMetadata(ctx, backupID, table); err != nil {
+	if err := newBackupStore(location, &a.t.ln.config.Storage.Local.S3).WriteMetadata(ctx, backupID, table); err != nil {
 		return fmt.Errorf("writing backup metadata: %w", err)
 	}
 
@@ -443,7 +443,7 @@ func (a *mcpAdapter) Backup(ctx context.Context, tableName, backupID, location s
 
 // Restore implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) Restore(ctx context.Context, tableName, backupID, location string) error {
-	tableMetadata, err := newBackupStore(location, &a.t.ln.config.Storage.S3).ReadMetadata(ctx, backupID)
+	tableMetadata, err := newBackupStore(location, &a.t.ln.config.Storage.Local.S3).ReadMetadata(ctx, backupID)
 	if err != nil {
 		return fmt.Errorf("reading backup metadata: %w", err)
 	}

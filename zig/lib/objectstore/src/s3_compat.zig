@@ -120,6 +120,8 @@ pub fn credentialsFromEnvAlloc(
     session_token_override: ?[]const u8,
     region_override: ?[]const u8,
 ) !Credentials {
+    const region = try firstValueOwned(alloc, region_override, "AWS_REGION", "us-east-1");
+    errdefer alloc.free(region);
     const endpoint = try firstValueOwned(alloc, endpoint_override, "AWS_ENDPOINT_URL", null);
     errdefer if (endpoint.len > 0) alloc.free(endpoint);
     const access_key_id = try firstValueOwned(alloc, access_key_id_override, "AWS_ACCESS_KEY_ID", null);
@@ -128,14 +130,15 @@ pub fn credentialsFromEnvAlloc(
     errdefer alloc.free(secret_access_key);
     const session_token = try optionalValueOwned(alloc, session_token_override, "AWS_SESSION_TOKEN");
     errdefer if (session_token) |value| alloc.free(value);
-    const region = try firstValueOwned(alloc, region_override, "AWS_REGION", "us-east-1");
-    errdefer alloc.free(region);
-
-    if (endpoint.len == 0) return error.MissingEndpoint;
     if (access_key_id.len == 0) return error.MissingAccessKeyId;
     if (secret_access_key.len == 0) return error.MissingSecretAccessKey;
 
-    var resolved = try resolveEndpointAlloc(alloc, endpoint, use_ssl);
+    const effective_endpoint = if (endpoint.len == 0)
+        try std.fmt.allocPrint(alloc, "s3.{s}.amazonaws.com", .{region})
+    else
+        try alloc.dupe(u8, endpoint);
+    defer alloc.free(effective_endpoint);
+    var resolved = try resolveEndpointAlloc(alloc, effective_endpoint, use_ssl);
     defer resolved.deinit(alloc);
     alloc.free(endpoint);
 
@@ -284,17 +287,19 @@ test "s3 compat builds path-style object uri" {
     try std.testing.expectEqualStrings("http://127.0.0.1:9000/bucket/a/b.txt", shape.uri);
 }
 
-test "credentials from env rejects missing endpoint" {
+test "credentials from env derives the regional AWS endpoint" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.MissingEndpoint, credentialsFromEnvAlloc(
+    var credentials = try credentialsFromEnvAlloc(
         alloc,
         "",
-        false,
+        true,
         "access",
         "secret",
         null,
-        "us-east-1",
-    ));
+        "us-west-2",
+    );
+    defer credentials.deinit(alloc);
+    try std.testing.expectEqualStrings("s3.us-west-2.amazonaws.com", credentials.endpoint);
 }
 
 test "credentials from env rejects missing access key id" {

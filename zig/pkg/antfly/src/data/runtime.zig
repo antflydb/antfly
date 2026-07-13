@@ -1062,7 +1062,6 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
         resource_manager_mod.Slice.lite_native_page_cache,
         resource_manager_mod.Slice.lite_native_link_cache,
-        resource_manager_mod.Slice.lite_docstore_snapshot_cache,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
@@ -2413,6 +2412,19 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        var owned_restore_job_store_path: ?[]u8 = null;
+        defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
+        // Filesystem-backed runtimes keep API job state beside their shard
+        // catalog by default. Lite overrides this after construction with an
+        // engine namespace so its artifact remains genuinely single-file.
+        if (api_server_cfg.restore_job_store_path == null and
+            api_server_cfg.session_store_path == null and
+            api_server_cfg.session_store == null and
+            api_server_cfg.deployment_mode != .serverless)
+        {
+            owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
+            api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+        }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
         api_server_cfg.backend_runtime = self.backend_runtime;
@@ -2961,6 +2973,7 @@ pub const DataServer = struct {
         _ = try self.ensureBackendRuntime();
         self.registerMetadataLocalProviders();
         try self.initApiServer();
+        try self.http_server.?.resumeRestoreJobsOnce();
         if (self.data_raft) |raft| {
             try raft.start();
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
@@ -3164,6 +3177,17 @@ pub const DataServer = struct {
         }
         try self.maybeRequestRuntimeStatusRefresh();
         try self.maybeRequestProvisionedStartupCatchUp();
+        // Session cleanup and lease renewal may touch durable storage. Keep
+        // that work off HTTP request fibers; this runtime loop is the sole
+        // opportunistic scheduler for the API server.
+        if (self.http_server) |*http_server| {
+            http_server.scheduleSessionMaintenance() catch |err| {
+                // Session maintenance is periodic and retryable. A transient
+                // allocation, queue, or storage error must not terminate the
+                // data runtime's availability loop.
+                std.log.warn("failed to schedule session maintenance err={s}", .{@errorName(err)});
+            };
+        }
     }
 
     pub fn deinit(self: *DataServer) void {
@@ -4374,12 +4398,10 @@ pub const DataServer = struct {
         defer self.alloc.free(dest_root_dir);
         var dest_db_options = antfly.db.OpenOptions{};
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
-        const dest_lease = try self.leaseTransitionDbForTableGroup(source_group_id, destination_group_id);
+        const destination_namespace = try self.identityNamespaceForSplitDestination(source_group_id, destination_group_id);
+        const dest_lease = try self.leaseTransitionDbForTableGroup(source_group_id, destination_group_id, destination_namespace);
         errdefer if (dest_lease) |lease| lease.release();
-        dest_db_options.identity_namespace = if (dest_lease) |lease|
-            lease.db.core.identity_namespace
-        else
-            try self.identityNamespaceForSplitDestination(source_group_id, destination_group_id);
+        dest_db_options.identity_namespace = destination_namespace;
         return try antfly.raft.SplitCoordinatorRuntime.init(self.alloc, .{
             .source_root_dir = source_root_dir,
             .dest_root_dir = dest_root_dir,
@@ -4398,12 +4420,10 @@ pub const DataServer = struct {
         defer self.alloc.free(dest_root_dir);
         var dest_db_options = antfly.db.OpenOptions{};
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
-        const dest_lease = try self.leaseTransitionDbForTableGroup(source_group_id, destination_group_id);
+        const destination_namespace = try self.identityNamespaceForSplitDestination(source_group_id, destination_group_id);
+        const dest_lease = try self.leaseTransitionDbForTableGroup(source_group_id, destination_group_id, destination_namespace);
         defer if (dest_lease) |lease| lease.release();
-        dest_db_options.identity_namespace = if (dest_lease) |lease|
-            lease.db.core.identity_namespace
-        else
-            try self.identityNamespaceForSplitDestination(source_group_id, destination_group_id);
+        dest_db_options.identity_namespace = destination_namespace;
         return try antfly.data.storage.observeSplitStatus(self.alloc, .{
             .source_root_dir = source_root_dir,
             .dest_root_dir = dest_root_dir,
@@ -4428,7 +4448,7 @@ pub const DataServer = struct {
             receiver_db_options.prefer_existing_identity_namespace = true;
         }
         try self.ensureSplitSourceApplyStoreSeeded(donor_root_dir, donor_group_id);
-        const receiver_lease = try self.leaseTransitionDbForTableGroup(receiver_group_id, receiver_group_id);
+        const receiver_lease = try self.leaseTransitionDbForTableGroup(receiver_group_id, receiver_group_id, receiver_namespace);
         errdefer if (receiver_lease) |lease| lease.release();
         return try antfly.raft.MergeCoordinatorRuntime.init(self.alloc, .{
             .donor_root_dir = donor_root_dir,
@@ -4446,13 +4466,27 @@ pub const DataServer = struct {
         self: *DataServer,
         table_group_id: u64,
         db_group_id: u64,
+        expected_identity_namespace: ?antfly.db.DocIdentityNamespace,
     ) !?antfly.data.storage.db_split_handoff.BorrowedDestinationDb {
-        if (try self.leaseExistingTransitionDb(db_group_id)) |cached| {
-            return try self.wrapTransitionDbLease(cached);
+        if (try self.leaseExistingTransitionDb(db_group_id)) |cached_value| {
+            var cached = cached_value;
+            const namespace_matches = if (expected_identity_namespace) |expected|
+                cached.db.core.identity_namespace.eql(expected)
+            else
+                true;
+            if (namespace_matches) {
+                return try self.wrapTransitionDbLease(cached);
+            }
+            // Release the stale generation before the explicit transition
+            // open below retires it and installs the source namespace.
+            cached.deinit(self.alloc);
         }
         const table_name = (try self.tableNameForLocalGroupAlloc(table_group_id)) orelse return null;
         defer self.alloc.free(table_name);
-        const cached = (try self.liveRuntimeWriteSource().leaseCachedGroupWriter(self.alloc, db_group_id, table_name)) orelse return null;
+        const cached = if (expected_identity_namespace) |namespace|
+            (try self.liveRuntimeWriteSource().leaseCachedTransitionGroupWriter(self.alloc, db_group_id, table_name, namespace)) orelse return null
+        else
+            (try self.liveRuntimeWriteSource().leaseCachedGroupWriter(self.alloc, db_group_id, table_name)) orelse return null;
         return try self.wrapTransitionDbLease(cached);
     }
 
@@ -10970,6 +11004,11 @@ test "data runtime split apply store seeding reuses cached source writer" {
 
     const namespace = (try server.identityNamespaceForSplitDestination(180, 181)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(namespace.eql(source_namespace));
+
+    const transition_lease = (try server.leaseTransitionDbForTableGroup(180, 181, namespace)) orelse return error.TestUnexpectedResult;
+    defer transition_lease.release();
+    try std.testing.expect(transition_lease.db.core.identity_namespace.eql(source_namespace));
+
     try server.ensureSplitSourceApplyStoreSeeded(source_db_path, 180);
 
     var source_store = try antfly.data.RaftApplyStore.init(alloc, .{ .root_dir = source_db_path });
@@ -16842,10 +16881,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     defer fence_response.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), fence_response.status);
     try std.testing.expectError(error.HAFencedPrimary, source_gate.check());
-    try std.testing.expectError(
-        error.HAReadRequiresPrimary,
-        server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .stale),
-    );
+    try std.testing.expect((try server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .stale)) == null);
     try std.testing.expectError(
         error.HAReadRequiresPrimary,
         server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .read_index),

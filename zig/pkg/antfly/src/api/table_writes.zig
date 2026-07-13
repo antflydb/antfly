@@ -1474,8 +1474,10 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         lsm_root_generation: u64,
         table_name: []const u8,
+        expected_identity_namespace: ?doc_identity.Namespace,
     ) !GetOrPrepareOpen {
         try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        try self.pruneIdentityMismatchedEntriesForGroupTableLocked(group_id, table_name, expected_identity_namespace);
         if (self.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name)) {
             return error.LsmRootWriterAlreadyOpen;
         }
@@ -1485,6 +1487,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 if (!self.entryHAWriteGateCurrent(entry)) continue;
+                if (!entryMatchesExpectedIdentityNamespace(entry, expected_identity_namespace)) continue;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
@@ -1503,6 +1506,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (!entryMatchesExpectedIdentityNamespace(entry, expected_identity_namespace)) continue;
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             _ = self.hit_count.fetchAdd(1, .monotonic);
             lockAtomic(&self.entry_lifecycle_mutex);
@@ -1525,6 +1529,44 @@ pub const ProvisionedTableWriteCache = struct {
 
         _ = self.miss_count.fetchAdd(1, .monotonic);
         return .{ .prepared = .{} };
+    }
+
+    fn pruneIdentityMismatchedEntriesForGroupTableLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+        expected: ?doc_identity.Namespace,
+    ) !void {
+        const namespace = expected orelse return;
+        var mismatch_count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!entry.db.core.identity_namespace.eql(namespace)) mismatch_count += 1;
+        }
+        try self.reserveLifecycleRetireCapacityLocked(mismatch_count);
+
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id or
+                !std.mem.eql(u8, entry.table_name, table_name) or
+                entry.db.core.identity_namespace.eql(namespace))
+            {
+                i += 1;
+                continue;
+            }
+            if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) {
+                i += 1;
+                continue;
+            }
+            if (try self.retireInactiveEntryAtIndexForCloseLocked(i)) continue;
+            i += 1;
+        }
+    }
+
+    fn entryMatchesExpectedIdentityNamespace(entry: *const Entry, expected: ?doc_identity.Namespace) bool {
+        const namespace = expected orelse return true;
+        return entry.db.core.identity_namespace.eql(namespace);
     }
 
     fn snapshotLeaseLocked(
@@ -3957,7 +3999,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
         if (plan.format == .portable) {
-            return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0);
+            return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
         }
 
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
@@ -4022,6 +4064,7 @@ pub const BoundTableWriteSource = struct {
             db_path,
             std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb"),
             open_options,
+            plan.io,
         ) catch |restore_err| {
             self.db.* = db_mod.DB.open(alloc, db_path, open_options) catch |reopen_err| {
                 std.log.err("bound restore failed and live generation could not be reopened path={s} restore_err={s} reopen_err={s}", .{
@@ -4050,6 +4093,7 @@ pub const BoundTableWriteSource = struct {
         live_path: []const u8,
         portable: bool,
         open_options: db_mod.OpenOptions,
+        shared_io: ?std.Io,
     ) !db_mod.generation_lifecycle.PublicationOutcome {
         var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(live_path, open_options.backend_runtime);
         defer transition.deinit();
@@ -4057,14 +4101,12 @@ pub const BoundTableWriteSource = struct {
         defer staged.deinit();
 
         if (portable) {
-            const body = try readBackupFileAlloc(alloc, snapshot_root);
-            defer alloc.free(body);
             {
                 var staged_open_options = open_options;
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
-                try portable_backup.importPortable(alloc, restored.core.store, body);
+                try importPortableBackupFile(alloc, restored.core.store, snapshot_root, shared_io);
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
                 _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
                 try restored.rebuildGraphIndexesForTargetCoverage(alloc);
@@ -5821,11 +5863,12 @@ pub const ProvisionedTableWriteSource = struct {
                         return err;
                     };
                 }
-                const cached = self.getOrOpenCachedDbModeAlreadyLocked(cache, path, group_id, lsm_root_generation, table_name, .status_only) catch |err| {
+                var cached = self.getOrOpenCachedDbModeAlreadyLocked(cache, path, group_id, lsm_root_generation, table_name, .status_only) catch |err| {
                     self.local_db_mutex.unlock();
                     return err;
                 };
                 self.local_db_mutex.unlock();
+                errdefer cached.deinit(cache.alloc);
                 try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                 return cached;
             }
@@ -5848,19 +5891,22 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 };
             }
-            const open_state = cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+            const open_state = cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name, expected_identity_namespace) catch |err| {
                 self.local_db_mutex.unlock();
                 return err;
             };
             switch (open_state) {
-                .cached => |cached| {
+                .cached => |cached_value| {
+                    var cached = cached_value;
                     if (ensure_auto_bulk_now_ns) |now_ns| {
                         cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns) catch |err| {
                             self.local_db_mutex.unlock();
+                            cached.deinit(cache.alloc);
                             return err;
                         };
                     }
                     self.local_db_mutex.unlock();
+                    errdefer cached.deinit(cache.alloc);
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     if (mode == .default or mode == .default_async) {
                         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
@@ -5885,19 +5931,22 @@ pub const ProvisionedTableWriteSource = struct {
 
         while (true) {
             lockAtomic(&self.local_db_mutex);
-            const open_state = cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+            const open_state = cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name, expected_identity_namespace) catch |err| {
                 self.local_db_mutex.unlock();
                 return err;
             };
             switch (open_state) {
-                .cached => |cached| {
+                .cached => |cached_value| {
+                    var cached = cached_value;
                     if (ensure_auto_bulk_now_ns) |now_ns| {
                         cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns) catch |err| {
                             self.local_db_mutex.unlock();
+                            cached.deinit(cache.alloc);
                             return err;
                         };
                     }
                     self.local_db_mutex.unlock();
+                    errdefer cached.deinit(cache.alloc);
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     prepared_open.?.deinit(cache.alloc);
                     prepared_open = null;
@@ -6554,6 +6603,43 @@ pub const ProvisionedTableWriteSource = struct {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         return try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
+    }
+
+    /// Opens a transition destination before it is published in the catalog.
+    /// The caller supplies the identity namespace inherited from the source
+    /// range; ordinary catalog-derived opens cannot discover it yet.
+    pub fn leaseCachedTransitionGroupWriter(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity_namespace: doc_identity.Namespace,
+    ) !?ProvisionedTableWriteCache.CachedDb {
+        const cache = self.write_cache orelse return null;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        const loaded_metadata = (try loadTableManagedMetadata(cache.alloc, self.catalog, table_name)) orelse return null;
+        defer {
+            if (loaded_metadata.indexes_json) |value| cache.alloc.free(value);
+            if (loaded_metadata.schema_json) |value| cache.alloc.free(value);
+        }
+        return try self.getOrOpenCachedDbModeAtGeneration(
+            alloc,
+            cache,
+            path,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            table_name,
+            .default_async,
+            null,
+            null,
+            .{
+                .indexes_json = loaded_metadata.indexes_json,
+                .schema_json = loaded_metadata.schema_json,
+                .identity_namespace = identity_namespace,
+            },
+        );
     }
 
     pub fn findMedianKeyForGroup(
@@ -9586,12 +9672,12 @@ pub const ProvisionedTableWriteSource = struct {
                     true,
                 );
                 defer cached.deinit(alloc);
-                return try exportPortableBackupShard(alloc, cached.db, plan.backup_root, plan.backup_id, group_id);
+                return try exportPortableBackupShard(alloc, cached.db, plan.backup_root, plan.backup_id, group_id, plan.io);
             }
 
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
-            return try exportPortableBackupShard(alloc, &db, plan.backup_root, plan.backup_id, group_id);
+            return try exportPortableBackupShard(alloc, &db, plan.backup_root, plan.backup_id, group_id, plan.io);
         }
 
         if (self.write_cache) |cache| {
@@ -11339,7 +11425,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         if (mode == .status_only) {
             while (true) {
                 lockAtomic(&cache.mutex);
-                const cached = cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only) catch |err| switch (err) {
+                var cached = cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only) catch |err| switch (err) {
                     error.LsmRootWriterAlreadyOpen => {
                         if (!cache.write_cache.hasPendingCloseForGroupTableLocked(group_id, table_name)) {
                             cache.mutex.unlock();
@@ -11355,6 +11441,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     },
                 };
                 cache.mutex.unlock();
+                errdefer cached.deinit(cache.write_cache.alloc);
                 try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                 return cached;
             }
@@ -11365,13 +11452,15 @@ pub const HostedProvisionedTableWriteSource = struct {
 
         while (true) {
             lockAtomic(&cache.mutex);
-            const open_state = cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+            const open_state = cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name, expected_identity_namespace) catch |err| {
                 cache.mutex.unlock();
                 return err;
             };
             switch (open_state) {
-                .cached => |cached| {
+                .cached => |cached_value| {
+                    var cached = cached_value;
                     cache.mutex.unlock();
+                    errdefer cached.deinit(cache.write_cache.alloc);
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     return cached;
                 },
@@ -11393,13 +11482,15 @@ pub const HostedProvisionedTableWriteSource = struct {
 
         while (true) {
             lockAtomic(&cache.mutex);
-            const open_state = cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name) catch |err| {
+            const open_state = cache.write_cache.getOrPrepareOpenLocked(group_id, lsm_root_generation, table_name, expected_identity_namespace) catch |err| {
                 cache.mutex.unlock();
                 return err;
             };
             switch (open_state) {
-                .cached => |cached| {
+                .cached => |cached_value| {
+                    var cached = cached_value;
                     cache.mutex.unlock();
+                    errdefer cached.deinit(cache.write_cache.alloc);
                     try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
                     return cached;
                 },
@@ -16057,17 +16148,14 @@ fn exportPortableBackupShard(
     backup_root: []const u8,
     backup_id: []const u8,
     group_id: u64,
+    shared_io: ?std.Io,
 ) ![]backups_api.ShardSnapshot {
     const rel_path = try portableBackupShardRelPath(alloc, backup_id);
     errdefer alloc.free(rel_path);
 
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(alloc);
-    try portable_backup.exportPortable(alloc, db.core.store, &out);
-
     const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
     defer alloc.free(dest_path);
-    try writeBackupFile(dest_path, out.items);
+    try exportPortableBackupFile(alloc, db.core.store, dest_path, shared_io);
 
     const byte_range = db.getRange();
     const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
@@ -16080,22 +16168,35 @@ fn exportPortableBackupShard(
     return shards;
 }
 
-fn writeBackupFile(path: []const u8, body: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        var io_parent = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_parent.deinit();
-        try fs_paths.createDirPathPortable(io_parent.io(), parent);
-    }
-
+fn exportPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, shared_io: ?std.Io) !void {
+    if (shared_io) |io| return try exportPortableBackupFileWithIo(alloc, store, path, io);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
-    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [8192]u8 = undefined;
+    return try exportPortableBackupFileWithIo(alloc, store, path, io_impl.io());
+}
+
+fn exportPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io) !void {
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(body);
+    try portable_backup.exportPortableToWriter(alloc, store, &writer.interface);
     try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
 }
 
 fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -16107,6 +16208,23 @@ fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
         alloc,
         .limited(backups_api.max_portable_backup_file_bytes),
     );
+}
+
+fn importPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, shared_io: ?std.Io) !void {
+    if (shared_io) |io| return try importPortableBackupFileWithIo(alloc, store, path, io);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return try importPortableBackupFileWithIo(alloc, store, path, io_impl.io());
+}
+
+fn importPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io) !void {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    try portable_backup.importPortableFile(alloc, store, io, file, stat.size);
 }
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {

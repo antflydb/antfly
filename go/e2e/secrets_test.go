@@ -49,28 +49,28 @@ func TestE2E_SecretsAPI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Start swarm — no Antfly inference needed, secrets are metadata-only.
-	t.Log("Starting Antfly swarm (no Antfly inference)...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	defer swarm.Cleanup()
+	// Start standalone — no Antfly inference needed, secrets are metadata-only.
+	t.Log("Starting Antfly standalone (no Antfly inference)...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	defer standalone.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/db/v1"
+	baseURL := standalone.MetadataAPIURL + "/db/v1"
 
 	// ---- 1. GET /secrets — initially empty (or env-var-only) ----
 	t.Log("Step 1: List secrets (expect empty)")
 	list := listSecrets(t, ctx, baseURL)
 	t.Logf("  Got %d secrets", len(list.Secrets))
-	// No keystore secrets should exist in a fresh swarm.
+	// No keystore secrets should exist in a fresh standalone.
 	for _, s := range list.Secrets {
-		assert.NotEqual(t, "configured_keystore", s.Status,
-			"fresh swarm should not have keystore secrets")
+		assert.NotEqual(t, "configured_file", s.Status,
+			"fresh standalone should not have keystore secrets")
 	}
 
 	// ---- 2. PUT /secrets/test.api_key — store a secret ----
 	t.Log("Step 2: Store secret test.api_key")
 	entry := putSecret(t, ctx, baseURL, "test.api_key", "sk-test-12345")
 	assert.Equal(t, "test.api_key", entry.Key)
-	assert.Equal(t, "configured_keystore", entry.Status)
+	assert.Equal(t, "configured_file", entry.Status)
 	assert.Equal(t, "TEST_API_KEY", entry.EnvVar)
 	assert.NotEmpty(t, entry.CreatedAt, "expected created_at timestamp")
 	t.Logf("  Stored: key=%s status=%s env_var=%s", entry.Key, entry.Status, entry.EnvVar)
@@ -80,13 +80,13 @@ func TestE2E_SecretsAPI(t *testing.T) {
 	list = listSecrets(t, ctx, baseURL)
 	found := findSecret(list, "test.api_key")
 	require.NotNil(t, found, "test.api_key should appear in list")
-	assert.Equal(t, "configured_keystore", found.Status)
+	assert.Equal(t, "configured_file", found.Status)
 	t.Logf("  Found: key=%s status=%s", found.Key, found.Status)
 
 	// ---- 4. PUT again — update the same key ----
 	t.Log("Step 4: Update secret test.api_key")
 	entry2 := putSecret(t, ctx, baseURL, "test.api_key", "sk-test-67890-updated")
-	assert.Equal(t, "configured_keystore", entry2.Status)
+	assert.Equal(t, "configured_file", entry2.Status)
 	assert.NotEmpty(t, entry2.UpdatedAt, "expected updated_at timestamp after update")
 	t.Logf("  Updated: updated_at=%s", entry2.UpdatedAt)
 
@@ -116,7 +116,7 @@ func TestE2E_SecretsAPI(t *testing.T) {
 
 	list = listSecrets(t, ctx, baseURL)
 	for _, s := range list.Secrets {
-		assert.NotEqual(t, "configured_keystore", s.Status,
+		assert.NotEqual(t, "configured_file", s.Status,
 			"all keystore secrets should be deleted")
 	}
 	t.Logf("  Final secrets: %d (env-only or none)", len(list.Secrets))

@@ -21,6 +21,7 @@ const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
 const backups_api = @import("backups.zig");
+const restore_jobs = @import("restore_jobs.zig");
 const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
@@ -43,6 +44,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const backend_erased = @import("../storage/backend_erased.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
@@ -73,6 +75,7 @@ const routes = @import("http_routes.zig");
 const runtime_status = @import("runtime_status.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("../platform/time.zig");
+const platform_sync = @import("antfly_platform").sync;
 const foreign_mod = @import("../foreign/mod.zig");
 const foreign_sources_api = @import("foreign_sources.zig");
 const json_helpers = @import("json_helpers.zig");
@@ -251,10 +254,16 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
 }
 
 pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
+const max_concurrent_restore_jobs: usize = 2;
 
 test "public API request body limit matches Go linear merge contract" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
 }
+
+pub const RestoreExecutionGuard = struct {
+    ptr: *anyopaque,
+    is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
+};
 
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
@@ -264,8 +273,13 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
-    swarm_mode: bool = false,
+    deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
+    /// Dedicated bearer token for /admin/v1 operations when public API
+    /// authentication is disabled. Admin routes fail closed when neither this
+    /// token nor normal authenticated admin identity is available.
+    admin_bearer_token: ?[]const u8 = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -290,11 +304,18 @@ pub const ApiHttpServerConfig = struct {
     artifact_reprocess_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
+    restore_job_store_path: ?[]const u8 = null,
+    restore_execution_guard: ?RestoreExecutionGuard = null,
+    /// Local scratch root for remote backup upload staging. When omitted, the
+    /// configured local storage root (or Lite file directory) is used.
+    backup_staging_root: ?[]const u8 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
+    session_max_count: ?usize = null,
+    session_max_record_bytes: ?usize = null,
     /// Explicit override for query embedding caching. When null, values come
     /// from node_config.inference.query_embedding_cache or built-in defaults.
     query_embedding_cache: ?query_embedding_cache.Config = null,
@@ -760,7 +781,10 @@ fn loadRestoreMetadataSpec(
 ) !RestoreMetadataSpec {
     var location = try backups_api.openBackupLocationWithSecrets(alloc, location_uri, secret_store);
     defer location.deinit(alloc);
-    var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
+    var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch |err| switch (err) {
+        error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+        else => return error.InvalidBackupRequest,
+    };
     errdefer manifest.deinit(alloc);
     if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
     const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest) catch |err| switch (err) {
@@ -1097,9 +1121,10 @@ pub const ApiHttpServer = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
-    txn_sessions: transactions_api.SessionRegistry,
-    last_session_cleanup_ns: u64 = 0,
-    last_session_lease_renew_ns: u64 = 0,
+    txn_sessions: transactions_api.SessionRegistry = .{},
+    last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
+    last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
+    last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     created_at_ns: u64 = 0,
     request_count: std.atomic.Value(u64) = .init(0),
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
@@ -1107,7 +1132,16 @@ pub const ApiHttpServer = struct {
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    restore_job_store: restore_jobs.Store = .{ .alloc = undefined },
+    restore_schedule_mutex: std.atomic.Mutex = .unlocked,
+    scheduled_restore_jobs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     repair_job_owner_id: u64 = 0,
+    restore_job_owner_id: u64 = 0,
+    restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
+    restore_jobs_closing: std.atomic.Value(bool) = .init(false),
+    restore_leadership_term: std.atomic.Value(u64) = .init(0),
+    session_maintenance_owner_id: u64 = 0,
+    session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -1189,14 +1223,15 @@ pub const ApiHttpServer = struct {
             .foreign_registry = cfg.foreign_registry,
             .created_at_ns = platform_time.monotonicNs(),
             .txn_sessions = transactions_api.SessionRegistry.initWithOptions(
-                owner_alloc,
                 cfg.session_store,
                 if (cfg.session_store != null and cfg.session_owner_lease_ttl_ns != null)
-                    transactions_api.SessionLeaseStore.init(owner_alloc, cfg.session_store.?.store)
+                    transactions_api.SessionLeaseStore.initFromDurable(cfg.session_store.?)
                 else
                     null,
                 cfg.session_owner_lease_ttl_ns,
                 cfg.session_savepoint_limit,
+                cfg.session_max_count,
+                cfg.session_max_record_bytes,
             ),
             .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
                 .join_job_store_path = cfg.join_job_store_path,
@@ -1211,7 +1246,13 @@ pub const ApiHttpServer = struct {
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
             }),
+            .restore_job_store = if (cfg.backend_runtime) |runtime|
+                if (runtime.io()) |io| restore_jobs.Store.initWithIo(owner_alloc, io) else restore_jobs.Store.init(owner_alloc)
+            else
+                restore_jobs.Store.init(owner_alloc),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
+            .restore_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
+            .session_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(owner_alloc),
             .local_inference_cache_budget = cache_budget.CacheBudget.init(effective_query_embedding_cache.max_bytes),
             .shared_inference_cache_budget = cfg.inference_cache_budget,
@@ -1268,6 +1309,11 @@ pub const ApiHttpServer = struct {
         return node_config.inference.api_url;
     }
 
+    pub fn currentStorageRuntimeStatus(self: *const ApiHttpServer) ?metadata_openapi.StorageRuntimeStatus {
+        const maintenance = self.cfg.storage_maintenance orelse return null;
+        return storageRuntimeStatus(maintenance.status());
+    }
+
     pub fn initWithConfig(
         alloc: std.mem.Allocator,
         cfg: ApiHttpServerConfig,
@@ -1291,6 +1337,8 @@ pub const ApiHttpServer = struct {
                 opened.leaseStore().*,
                 effective_cfg.session_owner_lease_ttl_ns,
                 effective_cfg.session_savepoint_limit,
+                effective_cfg.session_max_count,
+                effective_cfg.session_max_record_bytes,
             );
         }
         if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
@@ -1328,6 +1376,18 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.repair_job_store.attachOpenedStore(opened);
         }
+        if (cfg.restore_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.restore_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.restore_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(restore_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try restore_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.restore_job_store.attach(opened);
+        }
         return server;
     }
 
@@ -1350,12 +1410,15 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        self.restore_jobs_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
+            if (self.restore_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.restore_job_owner_id);
+            if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
         }
         self.mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
-        self.txn_sessions.deinit();
+        self.txn_sessions.deinit(self.alloc);
         if (self.opened_session_store) |opened| {
             opened.deinit();
             self.owner_alloc.destroy(opened);
@@ -1363,6 +1426,8 @@ pub const ApiHttpServer = struct {
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
         self.repair_job_store.deinit();
+        self.restore_job_store.deinit();
+        self.scheduled_restore_jobs.deinit(self.alloc);
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.owner_alloc);
             self.owner_alloc.destroy(registry);
@@ -1370,6 +1435,37 @@ pub const ApiHttpServer = struct {
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.* = undefined;
+    }
+
+    pub fn attachRestoreJobRuntimeStore(self: *ApiHttpServer, store: *backend_erased.Store) !void {
+        try self.restore_job_store.attachRuntime(store);
+    }
+
+    pub fn attachReplicatedRestoreJobStore(self: *ApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
+        try self.restore_job_store.attachReplicated(persistence);
+    }
+
+    /// Rotates worker ownership and rebuilds the runnable queue from replicated
+    /// state at a metadata Raft leadership boundary.
+    pub fn prepareRestoreLeadership(self: *ApiHttpServer, leadership_term: u64) !void {
+        const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
+        if (self.restore_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.restore_job_owner_id);
+        self.restore_job_owner_id = runtime.allocOwnerId();
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        self.scheduled_restore_jobs.clearRetainingCapacity();
+        self.restore_schedule_mutex.unlock();
+        self.restore_jobs_resumed.store(false, .release);
+        try self.restore_job_store.prepareReplicatedLeadership(self.alloc);
+        self.restore_leadership_term.store(leadership_term, .release);
+        if (runtime.threaded_jobs != null) try self.resumeRestoreJobsOnce();
+    }
+
+    pub fn attachRestoreJobStorePath(self: *ApiHttpServer, path: []const u8) !void {
+        const opened = try self.alloc.create(restore_jobs.OpenedStore);
+        errdefer self.alloc.destroy(opened);
+        opened.* = try restore_jobs.OpenedStore.open(self.alloc, path);
+        errdefer opened.deinit();
+        try self.restore_job_store.attach(opened);
     }
 
     pub fn queryEmbeddingCacheStats(self: *ApiHttpServer) query_embedding_cache.Stats {
@@ -1425,12 +1521,26 @@ pub const ApiHttpServer = struct {
             .antfly_provider = self.antfly_provider,
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
+            .secret_store = self.cfg.secret_store,
+            .io = if (self.cfg.backend_runtime) |runtime|
+                if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
+            else
+                null,
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
+            .probe = connections_api.includeHasStatus(include_param),
             .refresh = if (refresh_param) |value| std.mem.eql(u8, value, "true") else false,
             .types_filter = types_param,
         });
         return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(response, .{})});
+    }
+
+    /// Shared asynchronous I/O runtime for short-lived API helpers. Borrowers
+    /// must not retain it beyond the server lifetime.
+    pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return null;
+        return io_impl.io();
     }
 
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
@@ -1526,6 +1636,57 @@ pub const ApiHttpServer = struct {
                 std.log.warn("failed to reap table repair background jobs err={s}", .{@errorName(err)});
             };
         }
+    }
+
+    const SessionMaintenanceWork = struct {
+        server: *ApiHttpServer,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.server.runSessionMaintenanceOnce();
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.server.session_maintenance_in_flight.store(false, .release);
+            self.server.alloc.destroy(self);
+        }
+    };
+
+    pub fn scheduleSessionMaintenance(self: *ApiHttpServer) !void {
+        // The data runtime can complete many rounds per second. Rate-limit
+        // submission before allocating work so an idle server does not churn
+        // cleanup jobs. The worker's per-task clocks retain the configured
+        // cleanup and lease-renewal cadence.
+        const now_ns = platform_time.monotonicNs();
+        const min_schedule_interval_ns = std.time.ns_per_s;
+        const previous_ns = self.last_session_maintenance_schedule_ns.load(.acquire);
+        if (previous_ns != 0 and now_ns -| previous_ns < min_schedule_interval_ns) return;
+        if (self.last_session_maintenance_schedule_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        const runtime = self.cfg.backend_runtime orelse return self.runSessionMaintenanceOnce();
+        if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return self.runSessionMaintenanceOnce();
+        if (self.session_maintenance_in_flight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        const work = self.alloc.create(SessionMaintenanceWork) catch |err| {
+            self.session_maintenance_in_flight.store(false, .release);
+            return err;
+        };
+        work.* = .{ .server = self };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.session_maintenance_owner_id,
+            .class = .cleanup,
+            .ptr = work,
+            .run = SessionMaintenanceWork.run,
+            .deinit = SessionMaintenanceWork.deinit,
+        }) catch |err| {
+            self.alloc.destroy(work);
+            self.session_maintenance_in_flight.store(false, .release);
+            return err;
+        };
+    }
+
+    pub fn storageMaintenanceExclusiveActive(self: *const ApiHttpServer) bool {
+        const coordinator = self.cfg.storage_maintenance orelse return false;
+        return coordinator.isExclusiveActive();
     }
 
     fn localTableRuntimeStatuses(
@@ -2051,7 +2212,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn cleanupExpiredSessions(self: *ApiHttpServer, cutoff_ns: u64) !usize {
-        return try self.txn_sessions.cleanupExpired(cutoff_ns);
+        return try self.txn_sessions.cleanupExpired(self.alloc, cutoff_ns);
     }
 
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
@@ -2189,7 +2350,6 @@ pub const ApiHttpServer = struct {
         {
             return null;
         }
-        try self.runSessionMaintenanceOnce();
         return try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req);
     }
 
@@ -2244,13 +2404,28 @@ pub const ApiHttpServer = struct {
             }
         }
 
+        if (try self.dispatchStorageMaintenanceRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
+        try self.resumeRestoreJobsOnce();
+        if (restoreJobIdFromPath(uri_parts.path)) |job_id| {
+            if (authenticated_identity) |identity| {
+                if (!(try self.restoreJobAllowed(self.alloc, identity, job_id))) return try textResponse(self.alloc, 404, "not found");
+            }
+            return switch (req.method) {
+                .GET => try self.handlePublicRestoreJob(job_id, false),
+                .DELETE => try self.handlePublicRestoreJob(job_id, true),
+                else => try textResponse(self.alloc, 405, "method not allowed"),
+            };
+        }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
             const metadata_status = try self.source.status();
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
             defer public_status.deinit(self.alloc);
             public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.swarm_mode = self.cfg.swarm_mode;
+            public_status.deployment_mode = self.cfg.deployment_mode;
+            if (self.cfg.storage_maintenance) |maintenance| {
+                public_status.storage = storageRuntimeStatus(maintenance.status());
+            }
             if (self.cfg.secret_store) |secret_store| {
                 _ = secret_store.refreshIfChanged() catch |err| {
                     std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -2264,7 +2439,10 @@ pub const ApiHttpServer = struct {
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
             defer public_status.deinit(self.alloc);
             public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.swarm_mode = self.cfg.swarm_mode;
+            public_status.deployment_mode = self.cfg.deployment_mode;
+            if (self.cfg.storage_maintenance) |maintenance| {
+                public_status.storage = storageRuntimeStatus(maintenance.status());
+            }
             if (self.cfg.secret_store) |secret_store| {
                 _ = secret_store.refreshIfChanged() catch |err| {
                     std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -2318,7 +2496,6 @@ pub const ApiHttpServer = struct {
         };
         if (extension_resp) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        try self.runSessionMaintenanceOnce();
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchTransactionRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
@@ -2346,6 +2523,53 @@ pub const ApiHttpServer = struct {
             return try ha_exec.execute(self.alloc, req);
         }
         return null;
+    }
+
+    fn dispatchStorageMaintenanceRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
+        if (!isStorageMaintenancePath(uri_parts.path)) return null;
+        if (!self.requiresAuthentication(uri_parts.path)) {
+            const expected = self.cfg.admin_bearer_token orelse return try textResponse(self.alloc, 403, "admin API disabled without authentication");
+            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
+            if (!std.mem.startsWith(u8, authorization, "Bearer ") or
+                !constantTimeEql(expected, authorization["Bearer ".len..]))
+            {
+                return try unauthorizedResponse(self.alloc);
+            }
+        }
+        const coordinator = self.cfg.storage_maintenance orelse return try textResponse(self.alloc, 422, "storage maintenance unsupported");
+        if (std.mem.startsWith(u8, uri_parts.path, admin_routes.maintenance_jobs_prefix)) {
+            if (req.method != .GET and req.method != .DELETE) return try textResponse(self.alloc, 405, "method not allowed");
+            const raw_id = uri_parts.path[admin_routes.maintenance_jobs_prefix.len..];
+            if (raw_id.len == 0 or std.mem.indexOfScalar(u8, raw_id, '/') != null) return try textResponse(self.alloc, 404, "not found");
+            const job_id = std.fmt.parseUnsigned(u64, raw_id, 10) catch return try textResponse(self.alloc, 404, "not found");
+            const snapshot = if (req.method == .DELETE) coordinator.cancel(job_id) else coordinator.get(job_id);
+            return try storageMaintenanceJobResponse(self.alloc, if (req.method == .DELETE) 202 else 200, snapshot orelse return try textResponse(self.alloc, 404, "not found"));
+        }
+        if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
+        const operation: @import("../storage/maintenance.zig").Operation = if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_check))
+            .check
+        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_compact))
+            .compact
+        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_vacuum))
+            .vacuum
+        else
+            return try textResponse(self.alloc, 404, "not found");
+        const capabilities = coordinator.status().maintenance;
+        const supported = switch (operation) {
+            .check => capabilities.check,
+            .compact => capabilities.compact,
+            .vacuum => capabilities.vacuum,
+        };
+        if (!supported) return try textResponse(self.alloc, 422, "storage maintenance operation unsupported");
+        const snapshot = coordinator.start(operation, req.header("Idempotency-Key")) catch |err| switch (err) {
+            error.MaintenanceBusy => return try textResponse(self.alloc, 409, "storage maintenance already running"),
+            error.IdempotencyConflict => return try textResponse(self.alloc, 409, "idempotency key reused for another operation"),
+            error.InvalidIdempotencyKey => return try textResponse(self.alloc, 400, "invalid idempotency key"),
+            error.MaintenanceHistoryFull => return try textResponse(self.alloc, 429, "maintenance job history is full; retry after retained job records expire"),
+            error.MaintenanceJobIdExhausted => return try textResponse(self.alloc, 503, "maintenance job namespace exhausted; restart the server before submitting more maintenance work"),
+            else => return err,
+        };
+        return try storageMaintenanceJobResponse(self.alloc, 202, snapshot);
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
@@ -3384,7 +3608,11 @@ pub const ApiHttpServer = struct {
                 const begin_req = transactions_api.parseBeginRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid transaction begin request");
                 };
-                const session = try self.txn_sessions.begin(begin_req, self.localSessionNodeId());
+                const session = self.txn_sessions.begin(self.alloc, begin_req, self.localSessionNodeId()) catch |err| switch (err) {
+                    error.SessionLimitExceeded => return try textResponse(self.alloc, 429, "transaction session limit exceeded"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
+                    else => return err,
+                };
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
@@ -3544,8 +3772,9 @@ pub const ApiHttpServer = struct {
                 var stage_req = try transactions_api.ownedRequestFromStageReadRequest(self.alloc, read_req);
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stageRead(txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
+                const session = (self.txn_sessions.stageRead(self.alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3563,8 +3792,9 @@ pub const ApiHttpServer = struct {
                 };
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
+                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3582,8 +3812,9 @@ pub const ApiHttpServer = struct {
                 };
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
+                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3596,9 +3827,10 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionSavepoints(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                const info = (self.txn_sessions.createSavepoint(txn_id) catch |err| switch (err) {
+                const info = (self.txn_sessions.createSavepoint(self.alloc, txn_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     error.SavepointLimitExceeded => return try textResponse(self.alloc, 409, "savepoint limit exceeded"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3611,8 +3843,9 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionRollback(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                const info = (self.txn_sessions.rollbackToSavepoint(txn_id, session_route.savepoint_id) catch |err| switch (err) {
+                const info = (self.txn_sessions.rollbackToSavepoint(self.alloc, txn_id, session_route.savepoint_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3633,8 +3866,9 @@ pub const ApiHttpServer = struct {
                 };
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
+                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -3686,7 +3920,7 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 if (try self.validateCommitReadSet(commit_req)) |conflict| {
-                    _ = self.txn_sessions.remove(txn_id);
+                    _ = self.txn_sessions.remove(self.alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -3756,14 +3990,14 @@ pub const ApiHttpServer = struct {
 
                 switch (outcome) {
                     .committed => {
-                        _ = self.txn_sessions.remove(txn_id);
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
                         const response = try transactions_api.buildSessionCommitResponse(arena_impl.allocator(), txn_id, "committed", null, commit_req.tables);
                         return try jsonResponseOmitNullOptionals(self.alloc, response);
                     },
                     .conflict => |conflict| {
-                        _ = self.txn_sessions.remove(txn_id);
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         const enriched_conflict = try self.enrichCommitConflict(commit_req, conflict);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -3783,7 +4017,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionAbort(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!self.txn_sessions.remove(txn_id)) return try textResponse(self.alloc, 404, "not found");
+                if (!self.txn_sessions.remove(self.alloc, txn_id)) return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildAbortResponse(arena_impl.allocator(), txn_id);
@@ -4210,8 +4444,11 @@ pub const ApiHttpServer = struct {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
             defer query_arena_impl.deinit();
-            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
-            return try self.handlePublicClusterBackupList(params.location);
+            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "invalid backup list parameters");
+            return try self.handlePublicClusterBackupList(params.location, params.connection, .{
+                .limit = params.limit,
+                .cursor = params.cursor,
+            });
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.tables)) {
             var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
@@ -4276,7 +4513,7 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
-                return try self.handlePublicClusterRestore(req.body);
+                return try self.handlePublicClusterRestore(req.body, req.header("idempotency-key"));
             }
         }
         if (req.method == .POST) {
@@ -4290,7 +4527,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableRestore(uri_parts.path)) |table_restore| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_restore.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicTableRestore(table_name, req.body);
+                return try self.handlePublicTableRestore(table_name, req.body, req.header("idempotency-key"));
             }
         }
         if (req.method == .POST) {
@@ -4398,6 +4635,7 @@ pub const ApiHttpServer = struct {
                 while (true) {
                     self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
                         error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
+                        error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid table configuration"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
                         error.UnexpectedHttpStatus => {
@@ -4819,9 +5057,10 @@ pub const ApiHttpServer = struct {
         const ttl_ns = self.cfg.session_ttl_ns orelse return;
         const now_ns = platform_time.realtimeNs();
         const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
-        if (self.last_session_cleanup_ns != 0 and now_ns -| self.last_session_cleanup_ns < interval_ns) return;
-        self.last_session_cleanup_ns = now_ns;
-        _ = try self.txn_sessions.cleanupExpired(now_ns -| ttl_ns);
+        const previous_ns = self.last_session_cleanup_ns.load(.acquire);
+        if (previous_ns != 0 and now_ns -| previous_ns < interval_ns) return;
+        self.last_session_cleanup_ns.store(now_ns, .release);
+        _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
@@ -5664,12 +5903,16 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
     ) !void {
+        if (try backups_api.manifestExistsAtLocation(self.alloc, backup_location, backup_id))
+            return error.BackupAlreadyExists;
+        const artifact_backup_id = try self.backupGenerationIdAlloc();
+        defer self.alloc.free(artifact_backup_id);
         const table = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
         defer metadata_table_manager.freeTable(self.alloc, table);
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, backup_id, format, location_uri, backup_location)) |shards| {
+        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, location_uri, backup_location)) |shards| {
             defer freeBackupShards(self.alloc, shards);
             var manifest = try backups_api.createManifest(self.alloc, backup_id, &table, shards);
             defer manifest.deinit(self.alloc);
@@ -5679,17 +5922,18 @@ pub const ApiHttpServer = struct {
 
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
-            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+            .remote => try self.createBackupStagingRoot(artifact_backup_id),
         };
         defer switch (backup_location.*) {
             .file => {},
-            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+            .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
 
         const shards = (try table_writes_source.backupTable(self.alloc, table_name, .{
             .backup_root = local_backup_root,
-            .backup_id = backup_id,
+            .backup_id = artifact_backup_id,
             .format = format,
+            .io = self.sharedApiIo(),
         })) orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
 
@@ -5709,7 +5953,7 @@ pub const ApiHttpServer = struct {
                         "application/vnd.antfly.backup",
                     )
                 else
-                    try backups_api.copyDirectoryToLocation(self.alloc, backup_location, backup_id, shard.group_id, snapshot_root);
+                    try backups_api.copyDirectoryToLocation(self.alloc, backup_location, artifact_backup_id, shard.group_id, snapshot_root);
             }
         }
 
@@ -5772,7 +6016,10 @@ pub const ApiHttpServer = struct {
         restore_lifecycle_already_active: bool,
         replace_existing: bool,
     ) !OwnedRestoreOutcome {
-        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
+        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch |err| switch (err) {
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => return error.InvalidBackupRequest,
+        };
         defer manifest.deinit(self.alloc);
 
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
@@ -5781,9 +6028,41 @@ pub const ApiHttpServer = struct {
         const target_exists = try self.tableExists(table_name);
         if (replace_existing and !target_exists) return error.TableNotFound;
 
+        const materialize_snapshot = !target_exists or replace_existing;
+
+        const local_backup_root = switch (backup_location.*) {
+            .file => |value| value,
+            .remote => if (materialize_snapshot) try self.createBackupStagingRoot(backup_id) else "",
+        };
+        defer switch (backup_location.*) {
+            .file => {},
+            .remote => if (materialize_snapshot) self.destroyBackupStagingRoot(local_backup_root),
+        };
+        if (materialize_snapshot and switch (backup_location.*) {
+            .remote => true,
+            .file => false,
+        }) {
+            for (manifest.shards) |shard| {
+                const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
+                defer self.alloc.free(dest_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
+                else
+                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+            }
+        }
+
+        // Remote transfer and validation do not require exclusive table
+        // admission. Fence only the publication window so unrelated tables and
+        // the current generation remain writable while the replacement stages.
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const restore_lifecycle_active = if (restore_lifecycle_already_active) false else try table_writes_source.beginRestoreLifecycle(table_name);
         defer if (restore_lifecycle_active) table_writes_source.finishRestoreLifecycle(table_name);
+
+        const target_exists_at_publication = try self.tableExists(table_name);
+        if (target_exists_at_publication != target_exists) {
+            return if (target_exists_at_publication) error.TableAlreadyExists else error.TableNotFound;
+        }
 
         var created_metadata = false;
         var storage_committed = false;
@@ -5828,30 +6107,6 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        const materialize_snapshot = !target_exists or replace_existing;
-
-        const local_backup_root = switch (backup_location.*) {
-            .file => |value| value,
-            .remote => if (materialize_snapshot) try createBackupStagingRoot(self.alloc, backup_id) else "",
-        };
-        defer switch (backup_location.*) {
-            .file => {},
-            .remote => if (materialize_snapshot) destroyBackupStagingRoot(self.alloc, local_backup_root),
-        };
-        if (materialize_snapshot and switch (backup_location.*) {
-            .remote => true,
-            .file => false,
-        }) {
-            for (manifest.shards) |shard| {
-                const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
-                defer self.alloc.free(dest_root);
-                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
-                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
-                else
-                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
-            }
-        }
-
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ns = 50 * std.time.ns_per_ms;
         var restore_attempt: usize = 0;
@@ -5865,6 +6120,7 @@ pub const ApiHttpServer = struct {
                     .reconcile_only = target_exists and !replace_existing,
                     .replace_existing = replace_existing,
                     .publication_hook = publication_hook,
+                    .io = self.sharedApiIo(),
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
                     error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
@@ -5889,7 +6145,10 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreLocalTableDataFromManifest(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
-        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
+        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch |err| switch (err) {
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => return error.InvalidBackupRequest,
+        };
         defer manifest.deinit(self.alloc);
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
         try backups_api.validateRestorableManifestLayout(&manifest);
@@ -5897,11 +6156,11 @@ pub const ApiHttpServer = struct {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
-            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+            .remote => try self.createBackupStagingRoot(backup_id),
         };
         defer switch (backup_location.*) {
             .file => {},
-            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+            .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
         if (switch (backup_location.*) {
             .remote => true,
@@ -5929,6 +6188,7 @@ pub const ApiHttpServer = struct {
             if ((table_writes_source.restoreTable(self.alloc, table_name, .{
                 .backup_root = local_backup_root,
                 .manifest = &manifest,
+                .io = self.sharedApiIo(),
             }) catch |err| switch (err) {
                 error.UnsupportedOperation => return error.UnsupportedOperation,
                 error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
@@ -5954,6 +6214,12 @@ pub const ApiHttpServer = struct {
         while (attempt < 3) : (attempt += 1) {
             return self.source.restoreTable(alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
                 error.TableAlreadyExists => {
+                    // A leader can fail after atomically publishing the
+                    // catalog restore intent but before checkpointing the
+                    // durable public job. Adopt only an exact, still-active
+                    // intent; an unrelated existing table remains a hard
+                    // conflict and a fully-cleared intent remains ambiguous.
+                    if ((self.distributedRestoreIntentState(table_name, location_uri, backup_id) catch return err) == .pending) return true;
                     if (self.tableExists(table_name) catch true) return err;
                     if (attempt + 1 >= 3) return err;
                     self.waitForTableVisibility(table_name, .absent) catch {};
@@ -5964,6 +6230,53 @@ pub const ApiHttpServer = struct {
             };
         }
         return false;
+    }
+
+    const DistributedRestoreIntentState = enum { missing, pending, completed, conflicting };
+
+    fn distributedRestoreIntentState(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        location_uri: []const u8,
+        backup_id: []const u8,
+    ) !DistributedRestoreIntentState {
+        var snapshot = (try self.source.adminSnapshot()) orelse return .missing;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return .missing;
+        var found_range = false;
+        var found_pending = false;
+        for (snapshot.ranges) |range| {
+            if (range.table_id != table.table_id) continue;
+            found_range = true;
+            if (range.restore_backup_id.len == 0 and range.restore_location.len == 0) continue;
+            if (!std.mem.eql(u8, range.restore_backup_id, backup_id) or
+                !std.mem.eql(u8, range.restore_location, location_uri)) return .conflicting;
+            found_pending = true;
+        }
+        if (!found_range) return .conflicting;
+        return if (found_pending) .pending else .completed;
+    }
+
+    fn waitForDistributedRestoreCompletion(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        location_uri: []const u8,
+        backup_id: []const u8,
+        cancellation: ?RestoreCancellation,
+    ) !void {
+        const io = self.sharedApiIo() orelse return error.AsyncRestoreUnavailable;
+        var poll_ms: u64 = 250;
+        while (true) {
+            try self.ensureRestoreActive(cancellation);
+            switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id)) {
+                .completed => return,
+                .pending => {},
+                .missing => return error.TableNotFound,
+                .conflicting => return error.RestoreIntentConflict,
+            }
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(poll_ms)), .awake) catch return error.RestoreWaitInterrupted;
+            poll_ms = @min(poll_ms * 2, 5000);
+        }
     }
 
     fn restoreOwnedTableWithRetry(
@@ -5996,6 +6309,11 @@ pub const ApiHttpServer = struct {
                     sleepNs(500 * std.time.ns_per_ms);
                     continue;
                 },
+                error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => {
+                    if (attempt + 1 >= 3) return error.RestoreDurabilityPending;
+                    sleepNs(100 * std.time.ns_per_ms);
+                    continue;
+                },
                 else => return err,
             };
             return outcome;
@@ -6003,22 +6321,56 @@ pub const ApiHttpServer = struct {
         unreachable;
     }
 
-    fn createBackupStagingRoot(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {
-        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/api-backup-staging/{s}-{d}", .{
-            backup_id,
-            platform_time.monotonicNs(),
-        });
-        errdefer alloc.free(path);
+    fn createBackupStagingRoot(self: *ApiHttpServer, generation_id: []const u8) ![]u8 {
+        const configured_root = self.cfg.backup_staging_root orelse blk: {
+            const node_config = self.cfg.node_config orelse return error.BackupStagingUnavailable;
+            if (node_config.storage.local_base_dir) |root| break :blk root;
+            if (node_config.storage.lite_path) |path| break :blk std.fs.path.dirname(path) orelse ".";
+            return error.BackupStagingUnavailable;
+        };
+        if (self.sharedApiIo()) |io| return try createBackupStagingRootAt(self.alloc, io, configured_root, generation_id);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
+        return try createBackupStagingRootAt(self.alloc, io_impl.io(), configured_root, generation_id);
+    }
+
+    fn createBackupStagingRootAt(alloc: std.mem.Allocator, io: std.Io, configured_root: []const u8, generation_id: []const u8) ![]u8 {
+        if (configured_root.len == 0) return error.BackupStagingUnavailable;
+        try backups_api.validateBackupId(generation_id);
+        const parent = try std.fs.path.join(alloc, &.{ configured_root, ".antfly-tmp", "backup-staging" });
+        defer alloc.free(parent);
+        const path = try std.fs.path.join(alloc, &.{ parent, generation_id });
+        errdefer alloc.free(path);
+        try fs_paths.createDirPathPortable(io, parent);
+        if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.createDirAbsolute(io, path, .default_dir)
+        else
+            try std.Io.Dir.cwd().createDir(io, path, .default_dir);
         return path;
     }
 
-    fn destroyBackupStagingRoot(alloc: std.mem.Allocator, path: []const u8) void {
+    fn backupGenerationIdAlloc(self: *ApiHttpServer) ![]u8 {
+        var entropy: [16]u8 = undefined;
+        if (self.sharedApiIo()) |io| {
+            try io.randomSecure(&entropy);
+        } else {
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            try io_impl.io().randomSecure(&entropy);
+        }
+        const hex = std.fmt.bytesToHex(entropy, .lower);
+        return try std.fmt.allocPrint(self.alloc, "afbg-{s}", .{&hex});
+    }
+
+    fn destroyBackupStagingRoot(self: *ApiHttpServer, path: []const u8) void {
+        if (self.sharedApiIo()) |io| return destroyBackupStagingRootAt(self.alloc, io, path);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+        destroyBackupStagingRootAt(self.alloc, io_impl.io(), path);
+    }
+
+    fn destroyBackupStagingRootAt(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io, path) catch {};
         alloc.free(@constCast(path));
     }
 
@@ -6028,17 +6380,21 @@ pub const ApiHttpServer = struct {
         const interval_ns = self.cfg.session_owner_lease_renew_interval_ns orelse return;
         const owner_node_id = self.localSessionNodeId();
         if (owner_node_id == 0) return;
-        const now_ns = platform_time.monotonicNs();
-        if (self.last_session_lease_renew_ns != 0 and now_ns -| self.last_session_lease_renew_ns < interval_ns) return;
-        self.last_session_lease_renew_ns = now_ns;
-        _ = self.txn_sessions.renewOwnedLeases(owner_node_id, now_ns) catch |err| switch (err) {
+        const schedule_now_ns = platform_time.monotonicNs();
+        const previous_ns = self.last_session_lease_renew_ns.load(.acquire);
+        if (previous_ns != 0 and schedule_now_ns -| previous_ns < interval_ns) return;
+        self.last_session_lease_renew_ns.store(schedule_now_ns, .release);
+        // Lease expirations are durable and compared across processes, so they
+        // must use the Unix realtime epoch. Monotonic time is only valid for
+        // deciding when this process should run another renewal pass.
+        _ = self.txn_sessions.renewOwnedLeases(owner_node_id, platform_time.realtimeNs()) catch |err| switch (err) {
             error.SessionLeaseLost => return,
             else => return err,
         };
     }
 
     pub fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const owner_node_id = (try self.txn_sessions.getOwnerNodeId(txn_id)) orelse transactions_api.sessionOwnerNodeId(txn_id);
+        const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse transactions_api.sessionOwnerNodeId(txn_id);
         if (owner_node_id == 0) return null;
         const router = self.cfg.session_router orelse return null;
         const session_executor = self.cfg.session_executor orelse return null;
@@ -6094,7 +6450,7 @@ pub const ApiHttpServer = struct {
     fn tryAdoptSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {
         const local_node_id = self.localSessionNodeId();
         if (local_node_id == 0) return false;
-        return try self.txn_sessions.adoptIfLeaseExpired(txn_id, local_node_id, null);
+        return try self.txn_sessions.adoptIfLeaseExpired(self.alloc, txn_id, local_node_id, null);
     }
 
     pub fn lookupStageReadSnapshot(
@@ -6930,6 +7286,8 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
         self.backupOwnedTable(table_name, location, location_uri, backup_id, format) catch |err| switch (err) {
+            error.BackupAlreadyExists => return error.BackupAlreadyExists,
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
@@ -6951,8 +7309,9 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const target_exists = self.tableExists(table_name) catch |err| return metadataAccessFailure(err);
+        if (target_exists) return error.TableAlreadyExists;
 
-        if (!target_exists and !self.cfg.swarm_mode) {
+        if (!self.cfg.deployment_mode.isStandalone()) {
             if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
@@ -6987,6 +7346,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
             error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => error.RestoreDurabilityPending,
             error.RestoreDurabilityConfirmed => error.RestoreDurabilityConfirmed,
+            error.BackupManifestTooLarge => error.BackupManifestTooLarge,
             error.InvalidBackupRequest => error.InvalidBackupRequest,
             else => error.InternalFailure,
         };
@@ -7369,14 +7729,17 @@ pub const ApiHttpServer = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         location_uri: []const u8,
+        location: *backups_api.BackupLocation,
+        options: backups_api.BackupListOptions,
     ) cluster_api_http.ClusterApi.ExecuteListError![]u8 {
         _ = ptr;
-        const infos = backups_api.listClusterBackupsFromLocation(alloc, location_uri) catch |err| {
+        var page = backups_api.listClusterBackupsFromOpenedLocation(alloc, location, location_uri, options) catch |err| {
             if (backups_api.backupLocationErrorMessage(err) != null) return error.UnsupportedBackupLocation;
+            if (err == error.InvalidBackupListLimit or err == error.InvalidBackupId) return error.InvalidRequest;
             return error.InternalFailure;
         };
-        defer backups_api.freeBackupInfos(alloc, infos);
-        return backups_api.encodeBackupListResponse(alloc, infos) catch return error.InternalFailure;
+        defer page.deinit(alloc);
+        return backups_api.encodeBackupListResponse(alloc, &page) catch return error.InternalFailure;
     }
 
     fn executePublicClusterBackup(
@@ -7393,6 +7756,8 @@ pub const ApiHttpServer = struct {
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return error.InternalFailure;
         };
+        if (backups_api.clusterManifestExistsAtLocation(alloc, location, req.backup_id) catch return error.InternalFailure)
+            return error.BackupAlreadyExists;
 
         const table_names: [][]u8 = if (req.table_names) |values|
             cloneTableNamesAlloc(op_alloc, values) catch return error.InternalFailure
@@ -7433,8 +7798,8 @@ pub const ApiHttpServer = struct {
             status_name_count += 1;
             statuses[i] = .{ .name = status_name, .status = "failed", .@"error" = null };
 
-            const table_backup_id = backups_api.clusterTableBackupId(op_alloc, req.backup_id, table_name) catch return error.InternalFailure;
-            self.backupOwnedTable(table_name, location, req.location, table_backup_id, .native) catch |err| {
+            const table_backup_id = self.backupGenerationIdAlloc() catch return error.InternalFailure;
+            self.backupOwnedTable(table_name, location, req.location, table_backup_id, req.format) catch |err| {
                 if (isRetryableMetadataLeadershipError(err)) {
                     op_alloc.free(table_backup_id);
                     return error.NotLeader;
@@ -7444,6 +7809,7 @@ pub const ApiHttpServer = struct {
                     error.UnsupportedOperation => "method not allowed",
                     error.UnsupportedMultiRangeTable => "backup does not support multi-range tables",
                     error.UnsupportedBackupMigrationState => "backup does not support active schema migration",
+                    error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                     else => "backup failed",
                 };
                 op_alloc.free(table_backup_id);
@@ -7470,7 +7836,11 @@ pub const ApiHttpServer = struct {
         const extension_dependencies = if (extension_snapshot) |snapshot| snapshot.extension_dependencies else &.{};
         var manifest = backups_api.createClusterManifestWithExtensions(op_alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
         defer manifest.deinit(op_alloc);
-        backups_api.writeClusterManifestToLocation(op_alloc, location, &manifest) catch return error.InternalFailure;
+        backups_api.writeClusterManifestToLocation(op_alloc, location, &manifest) catch |err| switch (err) {
+            error.BackupAlreadyExists => return error.BackupAlreadyExists,
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => return error.InternalFailure,
+        };
 
         return backups_api.encodeClusterBackupResponse(alloc, req.backup_id, statuses) catch return error.InternalFailure;
     }
@@ -7482,10 +7852,32 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError!cluster_api_http.ClusterApi.RestoreExecution {
+        return .{
+            .status = 200,
+            .body = try executePublicClusterRestoreWithCancellation(ptr, alloc, req, location, restore_mode, null, &.{}),
+        };
+    }
+
+    const RestoreCancellation = struct { job_id: u64, attempt_id: u64 };
+
+    fn executePublicClusterRestoreWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        req: backups_api.ClusterRestoreRequest,
+        location: *backups_api.BackupLocation,
+        restore_mode: []const u8,
+        cancellation: ?RestoreCancellation,
+        published_table_indexes: []const u16,
+    ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const op_alloc = self.alloc;
 
-        var manifest = backups_api.readClusterManifestFromLocation(op_alloc, location, req.backup_id) catch return error.InvalidRequest;
+        try self.ensureRestoreActive(cancellation);
+
+        var manifest = backups_api.readClusterManifestFromLocation(op_alloc, location, req.backup_id) catch |err| switch (err) {
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => return error.InvalidRequest,
+        };
         defer manifest.deinit(op_alloc);
 
         preflightClusterRestoreExtensions(self, &manifest) catch |err| switch (err) {
@@ -7493,15 +7885,21 @@ pub const ApiHttpServer = struct {
             else => return error.InvalidRequest,
         };
 
-        const table_names: [][]u8 = if (req.table_names) |values|
-            cloneTableNamesAlloc(op_alloc, values) catch return error.InternalFailure
+        var owned_table_names: ?[][]u8 = null;
+        defer if (owned_table_names) |names| freeOwnedTableNames(op_alloc, names);
+        const table_names: []const []const u8 = if (req.table_names) |values|
+            values
         else blk: {
-            break :blk tableNamesFromClusterManifestAlloc(op_alloc, &manifest) catch return error.InternalFailure;
+            const names = tableNamesFromClusterManifestAlloc(op_alloc, &manifest) catch return error.InternalFailure;
+            owned_table_names = names;
+            break :blk names;
         };
-        defer freeOwnedTableNames(op_alloc, table_names);
+        if (table_names.len > restore_jobs.max_tables_per_job) return error.InvalidRequest;
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
-            for (table_names) |table_name| {
+            for (table_names, 0..) |table_name, table_index| {
+                if (restore_jobs.containsTableIndex(published_table_indexes, @intCast(table_index))) continue;
+                try self.ensureRestoreActive(cancellation);
                 if (self.tableExists(table_name) catch |err| return metadataAccessFailure(err)) {
                     return error.TableAlreadyExists;
                 }
@@ -7519,17 +7917,6 @@ pub const ApiHttpServer = struct {
             op_alloc.free(status_names);
             op_alloc.free(statuses);
         }
-        const restore_lifecycle_active = op_alloc.alloc(bool, table_names.len) catch return error.InternalFailure;
-        @memset(restore_lifecycle_active, false);
-        defer {
-            if (self.table_writes) |write_source| {
-                for (table_names, restore_lifecycle_active) |table_name, active| {
-                    if (active) write_source.finishRestoreLifecycle(table_name);
-                }
-            }
-            op_alloc.free(restore_lifecycle_active);
-        }
-
         for (table_names, 0..) |table_name, i| {
             const status_name = op_alloc.dupe(u8, table_name) catch return error.InternalFailure;
             status_names[status_name_count] = status_name;
@@ -7542,37 +7929,46 @@ pub const ApiHttpServer = struct {
             }
 
             const exists = self.tableExists(table_name) catch |err| return metadataAccessFailure(err);
-            if (std.mem.eql(u8, restore_mode, "skip_if_exists") and exists) {
+            const published = restore_jobs.containsTableIndex(published_table_indexes, @intCast(i));
+            if (!published and std.mem.eql(u8, restore_mode, "skip_if_exists") and exists) {
                 statuses[i].status = "skipped";
                 continue;
             }
         }
 
-        // Preparation fences writes but keeps the currently published
-        // generation readable until each replacement has been fully staged.
-        if (self.table_writes) |write_source| {
-            for (table_names, 0..) |table_name, i| {
-                if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
-                const active = write_source.beginRestoreLifecycle(table_name) catch |err| {
-                    statuses[i].@"error" = switch (err) {
-                        error.UnsupportedOperation => "method not allowed",
-                        else => "restore failed",
-                    };
-                    continue;
-                };
-                restore_lifecycle_active[i] = active;
-            }
-        }
-
         const is_overwrite = std.mem.eql(u8, restore_mode, "overwrite");
         for (table_names, 0..) |table_name, i| {
+            try self.ensureRestoreActive(cancellation);
             if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
 
             const table_backup_id = backups_api.findClusterTable(&manifest, table_name).?.table_backup_id;
 
-            // Overwrite uses the owned-table generation transition so the old
-            // table remains readable until staged storage and metadata publish.
-            if (!is_overwrite and !self.cfg.swarm_mode) {
+            // published_table_indexes is a durable publication checkpoint. On a
+            // resumed attempt, do not republish or reject the table merely
+            // because it now exists; wait for the already-published replica
+            // restore intent to drain instead.
+            if (restore_jobs.containsTableIndex(published_table_indexes, @intCast(i))) {
+                if (!self.cfg.deployment_mode.isStandalone()) {
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, cancellation) catch |err| switch (err) {
+                        error.NotLeader => return error.NotLeader,
+                        error.Cancelled => return error.Cancelled,
+                        else => {
+                            std.log.err("cluster restore completion wait failed table={s} backup_id={s} err={s}", .{ table_name, table_backup_id, @errorName(err) });
+                            return error.InternalFailure;
+                        },
+                    };
+                }
+                self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
+                    if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                    return error.InternalFailure;
+                };
+                statuses[i].status = "committed";
+                continue;
+            }
+
+            // Overwrite publication is local and generation-aware. New-table
+            // restores may delegate to metadata in distributed deployments.
+            if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     error.UnsupportedOperation => false,
@@ -7589,19 +7985,36 @@ pub const ApiHttpServer = struct {
                             error.TableAlreadyExists => "table already exists",
                             error.TableNotFound => "not found",
                             error.InvalidBackupRequest => "invalid restore request",
+                            error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                             else => "restore failed",
                         };
                         continue;
                     },
                 };
                 if (restored_via_metadata) {
-                    statuses[i].status = "triggered";
+                    self.checkpointRestoreTablePublished(cancellation, @intCast(i)) catch |err| {
+                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                        return error.InternalFailure;
+                    };
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, cancellation) catch |err| switch (err) {
+                        error.NotLeader => return error.NotLeader,
+                        error.Cancelled => return error.Cancelled,
+                        else => {
+                            std.log.err("cluster restore completion wait failed table={s} backup_id={s} err={s}", .{ table_name, table_backup_id, @errorName(err) });
+                            return error.InternalFailure;
+                        },
+                    };
+                    self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
+                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                        return error.InternalFailure;
+                    };
+                    statuses[i].status = "committed";
                     continue;
                 }
             }
 
             const replace_existing = is_overwrite and (self.tableExists(table_name) catch |err| return metadataAccessFailure(err));
-            const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, restore_lifecycle_active[i], replace_existing) catch |err| {
+            const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, false, replace_existing) catch |err| {
                 if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                 std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
                     table_name,
@@ -7617,6 +8030,7 @@ pub const ApiHttpServer = struct {
                     error.TableAlreadyExists => "table already exists",
                     error.TableNotFound => "not found",
                     error.InvalidBackupRequest => "invalid restore request",
+                    error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                     else => "restore failed",
                 };
                 if (err == error.RestoreDurabilityPending or err == error.GenerationDurabilityUncertain) {
@@ -7627,9 +8041,18 @@ pub const ApiHttpServer = struct {
             statuses[i].status = switch (outcome) {
                 .committed_durable => "committed",
             };
+            self.checkpointRestoreTablePublished(cancellation, @intCast(i)) catch |err| {
+                if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                return error.InternalFailure;
+            };
+            self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
+                if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                return error.InternalFailure;
+            };
         }
 
-        if (req.table_names == null and clusterRestoreStatusesHaveNoErrors(statuses)) {
+        if (req.table_names == null and clusterRestoreStatusesComplete(statuses)) {
+            try self.ensureRestoreActive(cancellation);
             self.source.restoreExtensions(
                 alloc,
                 manifest.installed_extensions,
@@ -7645,11 +8068,37 @@ pub const ApiHttpServer = struct {
             };
         }
 
-        const body = backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
-        return .{
-            .status = clusterRestoreHttpStatus(statuses),
-            .body = body,
-        };
+        return backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
+    }
+
+    fn checkpointRestoreTablePublished(self: *ApiHttpServer, cancellation: ?RestoreCancellation, table_index: u16) !void {
+        const token = cancellation orelse return;
+        const encoded = try self.restore_job_store.recordTablePublished(self.alloc, token.job_id, token.attempt_id, table_index);
+        self.alloc.free(encoded);
+    }
+
+    fn checkpointRestoreTableCompleted(self: *ApiHttpServer, cancellation: ?RestoreCancellation, table_index: u16) !void {
+        const token = cancellation orelse return;
+        const encoded = try self.restore_job_store.recordTableCompleted(self.alloc, token.job_id, token.attempt_id, table_index);
+        self.alloc.free(encoded);
+    }
+
+    fn ensureRestoreActive(self: *ApiHttpServer, cancellation: ?RestoreCancellation) error{ NotLeader, Cancelled, InternalFailure }!void {
+        if (!self.restoreExecutionPermitted()) return error.NotLeader;
+        const token = cancellation orelse return;
+        const attempt_state = self.restore_job_store.attemptState(self.alloc, token.job_id, token.attempt_id) catch
+            return error.InternalFailure;
+        switch (attempt_state) {
+            .active => {},
+            .cancelled => return error.Cancelled,
+            .fenced => return error.NotLeader,
+        }
+    }
+
+    fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
+        const guard = self.cfg.restore_execution_guard orelse return true;
+        const term = self.restore_leadership_term.load(.acquire);
+        return term != 0 and guard.is_current(guard.ptr, term);
     }
 
     pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -8518,7 +8967,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
+        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -8530,21 +8979,42 @@ pub const ApiHttpServer = struct {
                 const parsed = try parseJsonResponseBody(BackupSuccess, arena_impl.allocator(), resp.body);
                 break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
             },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
         };
     }
 
-    pub fn handlePublicTableRestore(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableRestore(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200, 202 => try jsonBodyResponseWithStatus(self.alloc, resp.status, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+    pub fn handlePublicTableRestore(self: *ApiHttpServer, table_name: []const u8, body: []const u8, idempotency_key: ?[]const u8) !http_common.HttpResponse {
+        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
+        defer parsed.deinit();
+        backups_api.validateBackupId(parsed.value.backup_id) catch return try jsonErrorResponse(self.alloc, 400, "invalid backup id");
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        const connection = parsed.value.connection;
+        var location = backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{
+            .secret_store = self.cfg.secret_store,
+            .node_config = self.cfg.node_config,
+            .connection = connection,
+            .required_capability = "restore.read",
+            .io = self.sharedApiIo(),
+        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        location.deinit(self.alloc);
+        const encoded = self.restore_job_store.start(self.alloc, .{
+            .scope = .table,
+            .table_name = table_name,
+            .backup_id = parsed.value.backup_id,
+            .location = parsed.value.location,
+            .connection = connection,
+            .idempotency_key = idempotency_key,
+        }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        defer self.alloc.free(encoded);
+        var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer state.deinit();
+        if (!restore_jobs.isTerminal(state.value.phase)) self.schedulePendingRestoreJobs() catch |err|
+            std.log.err("accepted table restore job scheduling deferred job_id={d} err={s}", .{ state.value.job_id, @errorName(err) });
+        return try self.restoreJobResponse(202, encoded);
     }
 
-    pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, self.clusterApi());
+    pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8, connection: ?[]const u8, options: backups_api.BackupListOptions) !http_common.HttpResponse {
+        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, connection, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo(), options);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
@@ -8553,28 +9023,406 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicClusterBackup(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
+        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
+            200 => blk: {
+                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_impl.deinit();
+                const parsed = try parseJsonResponseBody(metadata_openapi.ClusterBackupResponse, arena_impl.allocator(), resp.body);
+                break :blk try jsonResponse(self.alloc, parsed);
+            },
+            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
         };
     }
 
-    pub fn handlePublicClusterRestore(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
+    pub fn handlePublicClusterRestore(self: *ApiHttpServer, body: []const u8, idempotency_key: ?[]const u8) !http_common.HttpResponse {
+        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
+        defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
+        const connection = req.connection orelse return try jsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
+        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore mode");
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
+            .secret_store = self.cfg.secret_store,
+            .node_config = self.cfg.node_config,
+            .connection = connection,
+            .required_capability = "restore.read",
+            .io = self.sharedApiIo(),
+        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        location.deinit(self.alloc);
+        const encoded = self.restore_job_store.start(self.alloc, .{
+            .scope = .cluster,
+            .backup_id = req.backup_id,
+            .location = req.location,
+            .connection = connection,
+            .restore_mode = restore_mode,
+            .table_names = req.table_names,
+            .idempotency_key = idempotency_key,
+        }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        defer self.alloc.free(encoded);
+        var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer state.deinit();
+        if (!restore_jobs.isTerminal(state.value.phase)) self.schedulePendingRestoreJobs() catch |err|
+            std.log.err("accepted cluster restore job scheduling deferred job_id={d} err={s}", .{ state.value.job_id, @errorName(err) });
+        return try self.restoreJobResponse(202, encoded);
+    }
+
+    pub fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
+        if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        self.schedulePendingRestoreJobs() catch |err| {
+            self.restore_jobs_resumed.store(false, .release);
+            return err;
         };
     }
+
+    /// Cheap supervisor tick: the durable FIFO makes this O(available slots),
+    /// not O(retained history). It retries transient dispatch failures without
+    /// requiring another client request.
+    pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
+        try self.schedulePendingRestoreJobs();
+    }
+
+    fn ensureAsyncRestoreWorker(self: *ApiHttpServer) !void {
+        if (self.restore_jobs_closing.load(.acquire)) return error.AsyncRestoreUnavailable;
+        const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
+        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return error.AsyncRestoreUnavailable;
+        if (!self.restore_job_store.hasPersistence()) return error.RestoreJobPersistenceUnavailable;
+    }
+
+    fn schedulePendingRestoreJobs(self: *ApiHttpServer) !void {
+        if (self.restore_jobs_closing.load(.acquire)) return;
+        if (!self.restoreExecutionPermitted()) return;
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return;
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        const scheduled_count = self.scheduled_restore_jobs.count();
+        self.restore_schedule_mutex.unlock();
+        if (scheduled_count >= max_concurrent_restore_jobs) return;
+        const ids = try self.restore_job_store.takePendingIds(self.alloc, max_concurrent_restore_jobs - scheduled_count);
+        defer self.alloc.free(ids);
+        for (ids) |job_id| {
+            self.submitRestoreJob(job_id) catch |err| {
+                self.restore_job_store.requeuePending(job_id) catch |requeue_err| {
+                    std.log.err("failed to requeue restore job job_id={d} err={s}", .{ job_id, @errorName(requeue_err) });
+                };
+                std.log.err("failed to schedule restore job job_id={d} err={s}", .{ job_id, @errorName(err) });
+            };
+        }
+    }
+
+    fn submitRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
+        const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
+        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return error.AsyncRestoreUnavailable;
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        if (self.scheduled_restore_jobs.contains(job_id)) {
+            self.restore_schedule_mutex.unlock();
+            return;
+        }
+        if (self.scheduled_restore_jobs.count() >= max_concurrent_restore_jobs) {
+            self.restore_schedule_mutex.unlock();
+            // Another concurrent scheduler filled the last slot after this
+            // caller removed the job from the runnable queue. Surface that
+            // race so the caller puts the job back instead of losing it until
+            // the next process restart/leadership rebuild.
+            return error.RestoreSchedulingCapacity;
+        }
+        self.scheduled_restore_jobs.put(self.alloc, job_id, {}) catch |err| {
+            self.restore_schedule_mutex.unlock();
+            return err;
+        };
+        self.restore_schedule_mutex.unlock();
+        errdefer self.unmarkScheduledRestoreJob(job_id);
+        const work = try self.alloc.create(RestoreJobWork);
+        work.* = .{ .server = self, .job_id = job_id };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.restore_job_owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = RestoreJobWork.run,
+            .deinit = RestoreJobWork.deinit,
+        }) catch |err| {
+            self.alloc.destroy(work);
+            return err;
+        };
+    }
+
+    fn restoreJobWorkCompleted(self: *ApiHttpServer, job_id: u64) void {
+        self.unmarkScheduledRestoreJob(job_id);
+        if (!self.restore_jobs_closing.load(.acquire)) self.schedulePendingRestoreJobs() catch |err| {
+            std.log.err("failed to schedule pending restore jobs err={s}", .{@errorName(err)});
+        };
+    }
+
+    fn unmarkScheduledRestoreJob(self: *ApiHttpServer, job_id: u64) void {
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        _ = self.scheduled_restore_jobs.remove(job_id);
+        self.restore_schedule_mutex.unlock();
+    }
+
+    fn runRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
+        if (!self.restoreExecutionPermitted()) {
+            try self.restore_job_store.requeuePending(job_id);
+            return;
+        }
+        const running_encoded = (try self.restore_job_store.begin(self.alloc, job_id)) orelse return;
+        defer self.alloc.free(running_encoded);
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const state = parsed.value;
+        if (state.phase != .running) return;
+        var location = backups_api.openBackupLocationWithOptions(self.alloc, state.location, .{
+            .secret_store = self.cfg.secret_store,
+            .node_config = self.cfg.node_config,
+            .connection = state.connection,
+            .required_capability = "restore.read",
+            .io = self.sharedApiIo(),
+        }) catch |err| {
+            const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+            self.alloc.free(failed);
+            return;
+        };
+        defer location.deinit(self.alloc);
+        const result = switch (state.scope) {
+            .table => blk: {
+                if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
+                const table_name = state.table_name orelse return error.CorruptRestoreJobStore;
+                if (!restore_jobs.containsTableIndex(state.published_table_indexes orelse &.{}, 0)) {
+                    executePublicTableRestore(self, self.alloc, table_name, state.backup_id, state.location, &location) catch |err| {
+                        const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                        self.alloc.free(failed);
+                        return;
+                    };
+                    self.checkpointRestoreTablePublished(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
+                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                        const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                        self.alloc.free(failed);
+                        return;
+                    };
+                }
+                if (!self.cfg.deployment_mode.isStandalone()) {
+                    self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
+                        if (isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                        const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                        self.alloc.free(failed);
+                        return;
+                    };
+                }
+                self.checkpointRestoreTableCompleted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
+                    if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                    const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                    self.alloc.free(failed);
+                    return;
+                };
+                if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
+                break :blk try backups_api.encodeRestoreTriggered(self.alloc);
+            },
+            .cluster => executePublicClusterRestoreWithCancellation(self, self.alloc, .{
+                .backup_id = state.backup_id,
+                .location = state.location,
+                .connection = state.connection,
+                .table_names = state.table_names,
+                .restore_mode = state.restore_mode,
+            }, &location, state.restore_mode, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.published_table_indexes orelse &.{}) catch |err| {
+                if (err == error.NotLeader or err == error.RestoreJobFenced) return error.RestoreJobFenced;
+                const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                self.alloc.free(failed);
+                return;
+            },
+        };
+        defer self.alloc.free(result);
+        var cluster_summary: ?restore_jobs.ClusterResultSummary = null;
+        if (state.scope == .cluster) cluster_summary = try restore_jobs.summarizeClusterResultAlloc(self.alloc, result);
+        defer if (cluster_summary) |*summary| summary.deinit(self.alloc);
+        const terminal_result = if (cluster_summary) |summary| summary.encoded else result;
+        const finished = if (cluster_summary) |summary|
+            if (summary.succeeded)
+                try self.restore_job_store.finish(self.alloc, state, terminal_result)
+            else
+                try self.restore_job_store.failWithResult(self.alloc, state, terminal_result, "ClusterRestorePartialFailure")
+        else
+            try self.restore_job_store.finish(self.alloc, state, terminal_result);
+        self.alloc.free(finished);
+    }
+
+    pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !http_common.HttpResponse {
+        const encoded = if (cancel)
+            (try self.restore_job_store.cancel(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found")
+        else
+            (try self.restore_job_store.load(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        return try self.restoreJobResponse(200, encoded);
+    }
+
+    pub fn restoreJobAllowed(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: AuthenticatedIdentity, job_id: u64) !bool {
+        const encoded = (try self.restore_job_store.load(alloc, job_id)) orelse return false;
+        defer alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return switch (parsed.value.scope) {
+            .cluster => permissionsAllow(identity.permissions, .@"*", "*", .admin),
+            .table => permissionsAllow(identity.permissions, .table, parsed.value.table_name orelse return false, .admin),
+        };
+    }
+
+    fn restoreJobResponse(self: *ApiHttpServer, status: u16, encoded: []const u8) !http_common.HttpResponse {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, arena, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const result: ?std.json.Value = if (parsed.value.result_json) |raw| blk: {
+            const value = try std.json.parseFromSlice(std.json.Value, arena, raw, .{});
+            break :blk value.value;
+        } else null;
+        const published_table_count: usize = if (parsed.value.published_table_indexes) |indexes| indexes.len else 0;
+        const completed_table_count: usize = if (parsed.value.completed_table_indexes) |indexes| indexes.len else 0;
+        var response = try jsonResponseWithStatusOmitNullOptionals(self.alloc, status, .{
+            .job_id = parsed.value.job_id,
+            .attempt_id = parsed.value.attempt_id,
+            .scope = parsed.value.scope,
+            .table_name = parsed.value.table_name,
+            .backup_id = parsed.value.backup_id,
+            .phase = parsed.value.phase,
+            .cancel_requested = parsed.value.cancel_requested,
+            .published_table_count = published_table_count,
+            .completed_table_count = completed_table_count,
+            .total_table_count = if (parsed.value.scope == .table) @as(usize, 1) else if (parsed.value.table_names) |names| names.len else null,
+            .result = result,
+            .@"error" = parsed.value.last_error,
+            .created_at_ms = parsed.value.created_at_ms,
+            .updated_at_ms = parsed.value.updated_at_ms,
+            .expires_at_ms = parsed.value.expires_at_ms,
+        });
+        if (status == 202) {
+            response.headers = try self.alloc.alloc(http_common.Header, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (response.headers[0..initialized]) |*header| header.deinit(self.alloc);
+                self.alloc.free(response.headers);
+                response.headers = &.{};
+                response.deinit(self.alloc);
+            }
+            const location_value = try std.fmt.allocPrint(self.alloc, "/db/v1/restore/jobs/{d}", .{parsed.value.job_id});
+            defer self.alloc.free(location_value);
+            response.headers[0] = try ownedHeader(self.alloc, "Location", location_value);
+            initialized += 1;
+            response.headers[1] = try ownedHeader(self.alloc, "Retry-After", "1");
+        }
+        return response;
+    }
 };
+
+const RestoreJobWork = struct {
+    server: *ApiHttpServer,
+    job_id: u64,
+
+    fn run(ptr: *anyopaque) !void {
+        const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
+        self.server.runRestoreJob(self.job_id) catch |err| {
+            // Leadership rebuilds recover running attempts into the durable
+            // FIFO. The old owner must never turn a correctly fenced attempt
+            // into a terminal failure while leadership is moving.
+            if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return;
+            std.log.err("restore job execution failed job_id={d} err={s}", .{ self.job_id, @errorName(err) });
+            self.server.restore_job_store.failRunningById(self.server.alloc, self.job_id, @errorName(err)) catch |persist_err| {
+                std.log.err("failed to persist restore job failure job_id={d} err={s}", .{ self.job_id, @errorName(persist_err) });
+            };
+        };
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
+        self.server.restoreJobWorkCompleted(self.job_id);
+        self.server.alloc.destroy(self);
+    }
+};
+
+fn restoreJobIdFromPath(path: []const u8) ?u64 {
+    const prefix = routes.Routes.restore ++ "/jobs/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const raw = path[prefix.len..];
+    if (raw.len == 0 or std.mem.indexOfScalar(u8, raw, '/') != null) return null;
+    return std.fmt.parseUnsigned(u64, raw, 10) catch null;
+}
+
+fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    if (isRetryableMetadataLeadershipError(err)) return try metadataNotLeaderResponse(alloc);
+    return switch (err) {
+        error.InvalidIdempotencyKey => try jsonErrorResponse(alloc, 400, "invalid idempotency key"),
+        error.IdempotencyConflict => try jsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
+        error.AsyncRestoreUnavailable => try jsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
+        error.RestoreJobPersistenceUnavailable => try jsonErrorResponse(alloc, 503, "durable restore store unavailable"),
+        error.RestoreJobCapacityExceeded => try jsonErrorResponse(alloc, 503, "restore job history is at capacity"),
+        error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try jsonErrorResponse(alloc, 400, "restore request is too large"),
+        error.DuplicateRestoreTableName => try jsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
+        else => try jsonErrorResponse(alloc, 500, "failed to create restore job"),
+    };
+}
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(alloc);
     alloc.free(@constCast(shards));
+}
+
+fn testBackupNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
+    return common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write", "restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
+fn attachTestRestoreJobStore(alloc: std.mem.Allocator, server: *ApiHttpServer, tmp_sub_path: []const u8, name: []const u8) !void {
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp_sub_path, name });
+    defer alloc.free(path);
+    try server.attachRestoreJobStorePath(path);
+}
+
+test "backup staging uses configured storage authority and exclusive generations" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const configured_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/storage-root", .{tmp.sub_path});
+    defer alloc.free(configured_root);
+    const generation = "afbg-0123456789abcdef0123456789abcdef";
+
+    const path = try ApiHttpServer.createBackupStagingRootAt(alloc, io, configured_root, generation);
+    defer ApiHttpServer.destroyBackupStagingRootAt(alloc, io, path);
+    try std.testing.expect(std.mem.startsWith(u8, path, configured_root));
+    try std.testing.expect(std.mem.endsWith(u8, path, generation));
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        ApiHttpServer.createBackupStagingRootAt(alloc, io, configured_root, generation),
+    );
+}
+
+fn waitForTerminalRestoreJobAlloc(alloc: std.mem.Allocator, server: *ApiHttpServer, response_body: []const u8) ![]u8 {
+    var response = try std.json.parseFromSlice(struct { job_id: u64 }, alloc, response_body, .{ .ignore_unknown_fields = true });
+    defer response.deinit();
+
+    var attempts: usize = 0;
+    while (attempts < 5000) : (attempts += 1) {
+        const encoded = (try server.restore_job_store.load(alloc, response.value.job_id)) orelse return error.TestUnexpectedResult;
+        var state = std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true }) catch |err| {
+            alloc.free(encoded);
+            return err;
+        };
+        const terminal = restore_jobs.isTerminal(state.value.phase);
+        state.deinit();
+        if (terminal) return encoded;
+        alloc.free(encoded);
+        sleepNs(std.time.ns_per_ms);
+    }
+    return error.TestUnexpectedResult;
 }
 
 fn sleepNs(duration_ns: u64) void {
@@ -9400,9 +10248,11 @@ fn preflightClusterRestoreExtensions(self: *ApiHttpServer, manifest: *const back
     }
 }
 
-fn clusterRestoreStatusesHaveNoErrors(statuses: []const backups_api.ClusterTableRestoreStatus) bool {
+fn clusterRestoreStatusesComplete(statuses: []const backups_api.ClusterTableRestoreStatus) bool {
     for (statuses) |status| {
         if (status.@"error" != null) return false;
+        if (!std.mem.eql(u8, status.status, "committed") and
+            !std.mem.eql(u8, status.status, "skipped")) return false;
     }
     return true;
 }
@@ -9822,6 +10672,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 
 pub fn requiresAdminPermission(path: []const u8) bool {
     if (isHaAdminPath(path)) return true;
+    if (isStorageMaintenancePath(path)) return true;
     if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
@@ -9833,6 +10684,42 @@ pub fn requiresAdminPermission(path: []const u8) bool {
 
 fn isHaAdminPath(path: []const u8) bool {
     return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+}
+
+fn isStorageMaintenancePath(path: []const u8) bool {
+    return std.mem.eql(u8, path, admin_routes.maintenance) or std.mem.startsWith(u8, path, admin_routes.maintenance ++ "/");
+}
+
+fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) metadata_openapi.StorageRuntimeStatus {
+    return .{
+        .engine = status.engine,
+        .format = status.format,
+        .fsync = status.fsync,
+        .maintenance = .{
+            .check = status.maintenance.check,
+            .compact = status.maintenance.compact,
+            .vacuum = status.maintenance.vacuum,
+            .online = status.maintenance.online,
+            .asynchronous = status.maintenance.asynchronous,
+        },
+    };
+}
+
+fn storageMaintenanceJobResponse(
+    alloc: std.mem.Allocator,
+    status_code: u16,
+    snapshot: @import("../storage/maintenance.zig").Coordinator.Snapshot,
+) !http_common.HttpResponse {
+    return try jsonResponseWithStatus(alloc, status_code, .{
+        .job_id = snapshot.job_id,
+        .operation = snapshot.operation,
+        .state = snapshot.state,
+        .created_at_ms = snapshot.created_at_ms,
+        .started_at_ms = snapshot.started_at_ms,
+        .completed_at_ms = snapshot.completed_at_ms,
+        .result = snapshot.result,
+        .@"error" = snapshot.error_name,
+    });
 }
 
 fn isHaInternalPath(path: []const u8) bool {
@@ -10550,7 +11437,7 @@ pub fn makeSecretList(alloc: std.mem.Allocator, listed: []const common_secrets.L
 
 fn mapSecretStatus(status: common_secrets.SecretStatus) metadata_openapi.SecretStatus {
     return switch (status) {
-        .configured_keystore => .configured_keystore,
+        .configured_file => .configured_file,
         .configured_env => .configured_env,
         .configured_both => .configured_both,
     };
@@ -10725,9 +11612,24 @@ fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !u
     return .{ .role = role };
 }
 
-fn parseListBackupsParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListBackupsParams {
+const ListBackupsParams = struct {
+    location: []const u8,
+    connection: ?[]const u8,
+    limit: usize,
+    cursor: ?[]const u8,
+};
+
+fn parseListBackupsParams(alloc: std.mem.Allocator, query: []const u8) !ListBackupsParams {
+    const raw_limit = try parseSimpleQueryParamDecodedAlloc(alloc, query, "limit");
+    const limit = if (raw_limit) |value| try std.fmt.parseInt(usize, value, 10) else backups_api.default_backup_list_limit;
+    if (limit == 0 or limit > backups_api.max_backup_list_limit) return error.InvalidBackupListLimit;
+    const cursor = try parseSimpleQueryParamDecodedAlloc(alloc, query, "cursor");
+    if (cursor) |value| try backups_api.validateBackupId(value);
     return .{
         .location = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "location")) orelse return error.MissingLocation,
+        .connection = try parseSimpleQueryParamDecodedAlloc(alloc, query, "connection"),
+        .limit = limit,
+        .cursor = cursor,
     };
 }
 
@@ -11627,6 +12529,12 @@ fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_c
     };
 }
 
+fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    return .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
+}
+
 fn retryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
     const headers = try alloc.alloc(http_common.Header, 1);
     errdefer alloc.free(headers);
@@ -11663,7 +12571,7 @@ fn queryEmbeddingOperationalResponse(alloc: std.mem.Allocator, err: anyerror) !?
     };
 }
 
-fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     const headers = try alloc.alloc(http_common.Header, 2);
     var initialized_headers: usize = 0;
     errdefer {
@@ -11689,9 +12597,9 @@ fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse
     not_leader_value = null;
     initialized_headers += 1;
 
-    const content_type = try alloc.dupe(u8, "text/plain");
+    const content_type = try alloc.dupe(u8, "application/json");
     errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    const body = try alloc.dupe(u8, "{\"error\":\"metadata leader unavailable\"}");
     errdefer alloc.free(body);
     return .{
         .status = 503,
@@ -11820,8 +12728,13 @@ test "generated client query params decode for metadata parsers" {
     try std.testing.expectEqualStrings("tenant/docs v1", tables.prefix.?);
     try std.testing.expectEqualStrings("docs*", tables.pattern.?);
 
-    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one");
+    const backups = try parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket%2Fpath%20one&connection=archive-reader&limit=25&cursor=snap-024");
     try std.testing.expectEqualStrings("s3://bucket/path one", backups.location);
+    try std.testing.expectEqualStrings("archive-reader", backups.connection.?);
+    try std.testing.expectEqual(@as(usize, 25), backups.limit);
+    try std.testing.expectEqualStrings("snap-024", backups.cursor.?);
+    try std.testing.expectError(error.InvalidBackupListLimit, parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket&limit=0"));
+    try std.testing.expectError(error.InvalidBackupId, parseListBackupsParams(arena, "location=s3%3A%2F%2Fbucket&cursor=.."));
 
     const permission = try parseRemovePermissionFromUserParams(arena, "resource=docs%2Ftenant&resourceType=table");
     try std.testing.expectEqualStrings("docs/tenant", permission.resource);
@@ -12921,6 +13834,103 @@ test "api http server validates writes against extension data shape members" {
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
 }
 
+test "api http server exposes storage status and asynchronous maintenance jobs" {
+    const maintenance_mod = @import("../storage/maintenance.zig");
+    const FakeStatus = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const FakeMaintenance = struct {
+        fn source(self: *@This()) maintenance_mod.Source {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
+        }
+        fn status(_: *anyopaque) maintenance_mod.Status {
+            return .{ .engine = "lite", .format = "aflite", .fsync = true, .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = true } };
+        }
+        fn run(_: *anyopaque, operation: maintenance_mod.Operation, cancel: *const maintenance_mod.CancelToken) anyerror!maintenance_mod.Result {
+            try cancel.check();
+            return switch (operation) {
+                .check => .{ .valid = true, .file_size = 4096 },
+                .compact, .vacuum => .{ .before_size = 8192, .after_size = 4096, .reclaimed_bytes = 4096 },
+            };
+        }
+    };
+
+    var status_source = FakeStatus{};
+    var maintenance_source = FakeMaintenance{};
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var coordinator = try maintenance_mod.Coordinator.init(std.testing.allocator, maintenance_source.source(), backend_runtime.ptr());
+    defer coordinator.deinit();
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .storage_maintenance = &coordinator,
+        .admin_bearer_token = "maintenance-secret",
+    }, status_source.iface(), null, null);
+    defer server.deinit();
+
+    var status_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
+    defer status_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), status_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"engine\":\"lite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"vacuum\":true") != null);
+
+    const headers = [_]http_common.RequestHeader{.{ .name = "Idempotency-Key", .value = "check-1" }};
+    var unauthorized_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
+    defer unauthorized_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized_resp.status);
+
+    var start_resp = try server.handle(.{
+        .method = .POST,
+        .uri = admin_routes.maintenance_check,
+        .headers = &headers,
+        .authorization = "Bearer maintenance-secret",
+    });
+    defer start_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), start_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, start_resp.body, "\"operation\":\"check\"") != null);
+    const MaintenanceStart = struct { job_id: u64 };
+    var parsed_start = try std.json.parseFromSlice(MaintenanceStart, std.testing.allocator, start_resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+    const maintenance_job_id = parsed_start.value.job_id;
+    const maintenance_job_path = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}", .{ admin_routes.maintenance_jobs_prefix, maintenance_job_id });
+    defer std.testing.allocator.free(maintenance_job_path);
+
+    var replay_resp = try server.handle(.{
+        .method = .POST,
+        .uri = admin_routes.maintenance_check,
+        .headers = &headers,
+        .authorization = "Bearer maintenance-secret",
+    });
+    defer replay_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), replay_resp.status);
+    const expected_job_id = try std.fmt.allocPrint(std.testing.allocator, "\"job_id\":{d}", .{maintenance_job_id});
+    defer std.testing.allocator.free(expected_job_id);
+    try std.testing.expect(std.mem.indexOf(u8, replay_resp.body, expected_job_id) != null);
+
+    while (coordinator.get(maintenance_job_id).?.state != .succeeded) std.Thread.yield() catch {};
+    var get_resp = try server.handle(.{
+        .method = .GET,
+        .uri = maintenance_job_path,
+        .authorization = "Bearer maintenance-secret",
+    });
+    defer get_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), get_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "\"valid\":true") != null);
+
+    var cancel_resp = try server.handle(.{
+        .method = .DELETE,
+        .uri = maintenance_job_path,
+        .authorization = "Bearer maintenance-secret",
+    });
+    defer cancel_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"succeeded\"") != null);
+}
+
 test "api http server dispatches extension lifecycle mutations" {
     const FakeSource = struct {
         install_called: bool = false,
@@ -13508,9 +14518,11 @@ test "api http server serves connections with partial provider failures" {
     defer node_config.deinit();
 
     var source = FakeSource{};
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var server = ApiHttpServer.init(
         std.testing.allocator,
-        .{ .node_config = &node_config },
+        .{ .node_config = &node_config, .backend_runtime = backend_runtime.ptr() },
         source.iface(),
         null,
         null,
@@ -15378,7 +16390,7 @@ test "api http server serves secrets crud when backed by a local store" {
     defer store.deinit();
 
     var server = ApiHttpServer.init(alloc, .{
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &store,
     }, source.iface(), null, null);
 
@@ -15393,7 +16405,7 @@ test "api http server serves secrets crud when backed by a local store" {
     var put_entry = try std.json.parseFromSlice(metadata_openapi.SecretEntry, alloc, put_resp.body, .{});
     defer put_entry.deinit();
     try std.testing.expectEqualStrings("openai.api_key", put_entry.value.key);
-    try std.testing.expectEqual(metadata_openapi.SecretStatus.configured_keystore, put_entry.value.status);
+    try std.testing.expectEqual(metadata_openapi.SecretStatus.configured_file, put_entry.value.status);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", put_entry.value.env_var.?);
     try std.testing.expect(put_entry.value.created_at != null);
     try std.testing.expect(put_entry.value.updated_at != null);
@@ -15486,7 +16498,7 @@ test "api http server status includes secret store reload health" {
     defer store.deinit();
 
     var server = ApiHttpServer.init(alloc, .{
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &store,
     }, source.iface(), null, null);
 
@@ -15597,7 +16609,7 @@ test "api http server forbids non-admin secret access when auth is enabled" {
 
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &store,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
@@ -19496,11 +20508,12 @@ test "api http server reloads durable transaction sessions after restart" {
 
     var updated = (try db.lookup(alloc, "doc:a", .{})).?;
     defer updated.deinit(alloc);
-    const stored = try std.json.parseFromSliceLeaky(StoredTitle, alloc, updated.json, .{
+    var stored = try std.json.parseFromSlice(StoredTitle, alloc, updated.json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
-    try std.testing.expectEqualStrings("after restart", stored.title);
+    defer stored.deinit();
+    try std.testing.expectEqualStrings("after restart", stored.value.title);
 }
 
 test "api http server enforces configured savepoint limits and exposes remaining capacity" {
@@ -19571,7 +20584,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
         .uri = info_uri,
     });
     defer info_before.deinit(alloc);
-    var parsed_info_before = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_before.body, .{});
+    var parsed_info_before = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_before.body, .{ .ignore_unknown_fields = true });
     defer parsed_info_before.deinit();
     try std.testing.expectEqual(@as(?usize, 1), parsed_info_before.value.savepoint_limit);
     try std.testing.expectEqual(@as(?usize, 1), parsed_info_before.value.remaining_savepoints);
@@ -19595,7 +20608,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
         .uri = info_uri,
     });
     defer info_after.deinit(alloc);
-    var parsed_info_after = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_after.body, .{});
+    var parsed_info_after = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_after.body, .{ .ignore_unknown_fields = true });
     defer parsed_info_after.deinit();
     try std.testing.expectEqual(@as(?usize, 1), parsed_info_after.value.savepoint_limit);
     try std.testing.expectEqual(@as(?usize, 0), parsed_info_after.value.remaining_savepoints);
@@ -19706,7 +20719,7 @@ test "api http server enforces session adoption timeout when configured" {
     try std.testing.expect(!(try server.tryAdoptSession(session.txn_id)));
 }
 
-test "api http server renews owned session leases on request cadence" {
+test "api http server keeps session maintenance off public request paths" {
     const alloc = std.testing.allocator;
     const session_path = "/tmp/antfly-api-http-session-renew-cadence";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -19784,9 +20797,8 @@ test "api http server renews owned session leases on request cadence" {
     var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin_resp.body, .{});
     defer parsed_begin.deinit();
     const txn_id_hex = parsed_begin.value.transaction_id;
-    const txn_id = try distributed_txn.parseTxnIdHex(txn_id_hex);
-
-    std.Thread.yield() catch {};
+    _ = try distributed_txn.parseTxnIdHex(txn_id_hex);
+    owner.last_session_lease_renew_ns.store(0, .release);
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
     defer alloc.free(info_uri);
     var info_resp = try owner.handle(.{
@@ -19795,25 +20807,10 @@ test "api http server renews owned session leases on request cadence" {
     });
     defer info_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), info_resp.status);
-    var parsed_info = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_resp.body, .{});
+    var parsed_info = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_resp.body, .{ .ignore_unknown_fields = true });
     defer parsed_info.deinit();
     try std.testing.expectEqualStrings("held", parsed_info.value.lease_state);
-
-    var adopter_router = FakeRouter{ .local_node_id = 8 };
-    var adopter = try ApiHttpServer.initWithConfig(
-        alloc,
-        .{
-            .session_store_path = session_path,
-            .session_router = adopter_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
-        },
-        source.iface(),
-        null,
-        null,
-    );
-    defer adopter.deinit();
-
-    try std.testing.expect(!(try adopter.tryAdoptSession(txn_id)));
+    try std.testing.expectEqual(@as(u64, 0), owner.last_session_lease_renew_ns.load(.acquire));
 }
 
 test "api http server can renew owned session leases via explicit maintenance hook" {
@@ -19895,7 +20892,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
     const txn_id_hex = parsed_begin.value.transaction_id;
     const txn_id = try distributed_txn.parseTxnIdHex(txn_id_hex);
 
-    std.Thread.yield() catch {};
+    owner.last_session_lease_renew_ns.store(0, .release);
     try owner.runSessionMaintenanceOnce();
 
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
@@ -19906,7 +20903,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
     });
     defer info_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), info_resp.status);
-    var parsed_info = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_resp.body, .{});
+    var parsed_info = try std.json.parseFromSlice(transactions_api.SessionStatusResponse, alloc, info_resp.body, .{ .ignore_unknown_fields = true });
     defer parsed_info.deinit();
     try std.testing.expectEqualStrings("held", parsed_info.value.lease_state);
 
@@ -19927,7 +20924,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
     try std.testing.expect(!(try adopter.tryAdoptSession(txn_id)));
 }
 
-test "api http server runs session maintenance for internal group routes" {
+test "api http server keeps session maintenance off internal request paths" {
     const alloc = std.testing.allocator;
     const session_path = "/tmp/antfly-api-http-session-renew-internal-route";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -20003,9 +21000,8 @@ test "api http server runs session maintenance for internal group routes" {
     defer begin_resp.deinit(alloc);
     var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin_resp.body, .{});
     defer parsed_begin.deinit();
-    const txn_id = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
-
-    std.Thread.yield() catch {};
+    _ = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
+    owner.last_session_lease_renew_ns.store(0, .release);
     var internal_resp = (try owner.handleInternalRoute(.{
         .method = .GET,
         .uri = "/internal/v1/groups/7/db/median-key",
@@ -20013,22 +21009,7 @@ test "api http server runs session maintenance for internal group routes" {
     })).?;
     defer internal_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 404), internal_resp.status);
-
-    var adopter_router = FakeRouter{ .local_node_id = 8 };
-    var adopter = try ApiHttpServer.initWithConfig(
-        alloc,
-        .{
-            .session_store_path = session_path,
-            .session_router = adopter_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
-        },
-        source.iface(),
-        null,
-        null,
-    );
-    defer adopter.deinit();
-
-    try std.testing.expect(!(try adopter.tryAdoptSession(txn_id)));
+    try std.testing.expectEqual(@as(u64, 0), owner.last_session_lease_renew_ns.load(.acquire));
 }
 
 test "api http server handleInternalRoute matches handle for internal group lookups" {
@@ -23803,8 +24784,10 @@ test "api http server lists cluster backups through public route" {
     try backups_api.writeClusterManifest(alloc, backup_root, &manifest);
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
-    const uri = try std.fmt.allocPrint(alloc, "/backups?location={s}", .{location_uri});
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
+    const uri = try std.fmt.allocPrint(alloc, "/backups?location={s}&connection=test-backups", .{location_uri});
     defer alloc.free(uri);
 
     var resp = try server.handle(.{
@@ -23827,8 +24810,8 @@ test "api http server lists cluster backups through public route" {
 
 fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
-    try std.testing.expectEqualStrings("metadata leader unavailable", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"metadata leader unavailable\"}", resp.body);
 
     var retry_after = false;
     var metadata_not_leader = false;
@@ -24033,18 +25016,66 @@ test "api http server returns retryable not leader through public cluster adapte
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
 
     var resp = try server.handle(.{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"table_names\":[\"docs\"]}",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\",\"table_names\":[\"docs\"]}",
     });
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
+}
+
+test "api http server rejects restore before persistence without an asynchronous worker" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .node_config = &node_config }, source.iface(), null, null);
+    defer server.deinit();
+
+    var response = try server.handlePublicTableRestore(
+        "docs",
+        "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\"}",
+        "restore-without-worker",
+    );
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"asynchronous restore worker unavailable\"}", response.body);
+    try std.testing.expectEqual(@as(usize, 0), server.restore_job_store.jobs.count());
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var storeless_server = ApiHttpServer.init(std.testing.allocator, .{
+        .node_config = &node_config,
+        .backend_runtime = backend_runtime.ptr(),
+    }, source.iface(), null, null);
+    defer storeless_server.deinit();
+    var storeless_response = try storeless_server.handlePublicTableRestore(
+        "docs",
+        "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\"}",
+        "restore-without-store",
+    );
+    defer storeless_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), storeless_response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"durable restore store unavailable\"}", storeless_response.body);
+    try std.testing.expectEqual(@as(usize, 0), storeless_server.restore_job_store.jobs.count());
 }
 
 test "api http server backs up and restores a table through public routes" {
@@ -24059,6 +25090,8 @@ test "api http server backs up and restores a table through public routes" {
     defer alloc.free(path);
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-out", .{tmp.sub_path});
     defer alloc.free(backup_root);
+    const restore_job_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-jobs", .{tmp.sub_path});
+    defer alloc.free(restore_job_path);
 
     var db = try db_mod.DB.open(alloc, path, .{});
     defer db.close();
@@ -24138,14 +25171,20 @@ test "api http server backs up and restores a table through public routes" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+    try server.attachRestoreJobStorePath(restore_job_path);
 
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
 
-    const backup_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\"}}", .{backup_root_abs});
+    const backup_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\",\"connection\":\"test-backups\"}}", .{backup_root_abs});
     defer alloc.free(backup_body);
     var backup_resp = try server.handle(.{
         .method = .POST,
@@ -24169,7 +25208,7 @@ test "api http server backs up and restores a table through public routes" {
     });
     source.created = false;
 
-    const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\"}}", .{backup_root_abs});
+    const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\",\"connection\":\"test-backups\"}}", .{backup_root_abs});
     defer alloc.free(restore_body);
     var restore_resp = try server.handle(.{
         .method = .POST,
@@ -24180,12 +25219,12 @@ test "api http server backs up and restores a table through public routes" {
     defer restore_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     try std.testing.expectEqualStrings("application/json", restore_resp.content_type.?);
-    var parsed_restore = try std.json.parseFromSlice(std.json.Value, alloc, restore_resp.body, .{
-        .allocate = .alloc_always,
-    });
+    const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
+    defer alloc.free(terminal_restore);
+    var parsed_restore = try std.json.parseFromSlice(restore_jobs.JobState, alloc, terminal_restore, .{ .ignore_unknown_fields = true });
     defer parsed_restore.deinit();
-    const restore_status = parsed_restore.value.object.get("restore") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("triggered", restore_status.string);
+    try std.testing.expectEqual(restore_jobs.Phase.succeeded, parsed_restore.value.phase);
+    try std.testing.expect(std.mem.indexOf(u8, parsed_restore.value.result_json orelse "", "\"triggered\"") != null);
 
     var lookup = (try read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer lookup.deinit(alloc);
@@ -24317,7 +25356,13 @@ test "api http server durability-pending restore preserves committed metadata" {
         }
     };
 
+    const State = struct {
+        restored: std.atomic.Value(bool) = .init(false),
+    };
+
     const EmptyReadSource = struct {
+        state: *State,
+
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
                 .ptr = self,
@@ -24333,9 +25378,10 @@ test "api http server durability-pending restore preserves committed metadata" {
             return error.UnsupportedOperation;
         }
 
-        fn scan(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+        fn scan(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            return .{ .ndjson = try inner_alloc.dupe(u8, "") };
+            return .{ .ndjson = try inner_alloc.dupe(u8, if (self.state.restored.load(.acquire)) "{\"_id\":\"doc:a\"}\n" else "") };
         }
 
         fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
@@ -24344,7 +25390,7 @@ test "api http server durability-pending restore preserves committed metadata" {
     };
 
     const RestoreWrites = struct {
-        restored: bool = false,
+        state: *State,
         restore_calls: usize = 0,
         expected_location: []const u8,
 
@@ -24368,18 +25414,25 @@ test "api http server durability-pending restore preserves committed metadata" {
             try std.testing.expectEqualStrings("snap1", plan.manifest.backup_id);
             try std.testing.expectEqualStrings(self.expected_location, plan.source_location orelse return error.TestUnexpectedResult);
             self.restore_calls += 1;
-            self.restored = true;
+            self.state.restored.store(true, .release);
             if (plan.reconcile_only) return;
             return error.GenerationDurabilityUncertain;
         }
     };
 
+    var state = State{};
     var source = FakeSource{};
-    var read_source = EmptyReadSource{};
-    var write_source = RestoreWrites{ .expected_location = location_uri };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    var read_source = EmptyReadSource{ .state = &state };
+    var write_source = RestoreWrites{ .state = &state, .expected_location = location_uri };
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
 
-    const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\"}}", .{location_uri});
+    const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}", .{location_uri});
     defer alloc.free(restore_body);
     {
         var unsupported_resp = try server.handle(.{
@@ -24392,7 +25445,7 @@ test "api http server durability-pending restore preserves committed metadata" {
         try std.testing.expectEqual(@as(u16, 400), unsupported_resp.status);
         try std.testing.expect(!source.created);
         try std.testing.expect(!source.dropped);
-        try std.testing.expect(!write_source.restored);
+        try std.testing.expect(!state.restored.load(.acquire));
     }
 
     try backups_api.writeManifest(alloc, backup_root_abs, &manifest);
@@ -24405,26 +25458,13 @@ test "api http server durability-pending restore preserves committed metadata" {
     defer restore_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
-    try std.testing.expect(write_source.restored);
+    const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
+    defer alloc.free(terminal_restore);
+    try std.testing.expect(state.restored.load(.acquire));
     try std.testing.expect(source.created);
     try std.testing.expect(!source.dropped);
-    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"committed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"pending\"") != null);
-
-    var retry_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/docs/restore",
-        .content_type = "application/json",
-        .body = restore_body,
-    });
-    defer retry_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), retry_resp.status);
-    try std.testing.expectEqualStrings("application/json", retry_resp.content_type.?);
     try std.testing.expectEqual(@as(usize, 2), write_source.restore_calls);
-    try std.testing.expect(source.created);
-    try std.testing.expect(!source.dropped);
-    try std.testing.expect(std.mem.indexOf(u8, retry_resp.body, "\"committed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, retry_resp.body, "\"durable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_restore, "\"succeeded\"") != null);
 }
 
 test "api restore rollback preserves a concurrently replaced table definition" {
@@ -24480,8 +25520,7 @@ test "api http server cluster overwrite stages before replacing metadata without
     const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
     defer alloc.free(location_uri);
 
-    const table_backup_id = try backups_api.clusterTableBackupId(alloc, "snap-cluster", "docs");
-    defer alloc.free(table_backup_id);
+    const table_backup_id = "afbg-0123456789abcdef0123456789abcdef";
 
     const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
     shards[0] = .{
@@ -24521,6 +25560,7 @@ test "api http server cluster overwrite stages before replacing metadata without
         local_drop_called: bool = false,
         restore_lifecycle_active: bool = false,
         restore_lifecycle_finished: bool = false,
+        expected_backup_id: []const u8,
     };
 
     const FakeSource = struct {
@@ -24673,7 +25713,7 @@ test "api http server cluster overwrite stages before replacing metadata without
         fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("docs-snap-cluster", plan.manifest.backup_id);
+            try std.testing.expectEqualStrings(self.state.expected_backup_id, plan.manifest.backup_id);
             try std.testing.expect(self.state.restore_lifecycle_active);
             try std.testing.expect(plan.replace_existing);
             try std.testing.expect(!plan.reconcile_only);
@@ -24684,15 +25724,21 @@ test "api http server cluster overwrite stages before replacing metadata without
         }
     };
 
-    var state = State{};
+    var state = State{ .expected_backup_id = table_backup_id };
     var source = FakeSource{ .state = &state };
     var read_source = FakeReads{ .state = &state };
     var write_source = FakeWrites{ .state = &state };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "cluster-restore-jobs");
 
     const restore_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\",\"restore_mode\":\"overwrite\"}}",
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\",\"connection\":\"test-backups\",\"restore_mode\":\"overwrite\"}}",
         .{location_uri},
     );
     defer alloc.free(restore_body);
@@ -24704,7 +25750,9 @@ test "api http server cluster overwrite stages before replacing metadata without
     });
     defer restore_resp.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u16, 200), restore_resp.status);
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
+    defer alloc.free(terminal_restore);
     try std.testing.expect(state.restored);
     try std.testing.expect(state.present);
     try std.testing.expect(state.definition_replaced);
@@ -24712,7 +25760,12 @@ test "api http server cluster overwrite stages before replacing metadata without
     try std.testing.expect(!state.local_drop_called);
     try std.testing.expect(!state.restore_lifecycle_active);
     try std.testing.expect(state.restore_lifecycle_finished);
-    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"status\":\"committed\"") != null);
+    var parsed_terminal = try std.json.parseFromSlice(restore_jobs.JobState, alloc, terminal_restore, .{ .ignore_unknown_fields = true });
+    defer parsed_terminal.deinit();
+    try std.testing.expectEqual(restore_jobs.Phase.succeeded, parsed_terminal.value.phase);
+    var parsed_result = try std.json.parseFromSlice(std.json.Value, alloc, parsed_terminal.value.result_json orelse return error.TestUnexpectedResult, .{});
+    defer parsed_result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_result.value.object.get("committed_table_count").?.integer);
 }
 
 test "api http server cluster restore rejects missing extension package digest" {
@@ -24824,11 +25877,17 @@ test "api http server cluster restore rejects missing extension package digest" 
     var state = State{};
     var source = FakeSource{ .state = &state };
     var write_source = FakeWrites{ .state = &state };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, write_source.source());
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), null, write_source.source());
+    defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
 
     const restore_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\"}}",
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}",
         .{location_uri},
     );
     defer alloc.free(restore_body);
@@ -24840,8 +25899,13 @@ test "api http server cluster restore rejects missing extension package digest" 
     });
     defer restore_resp.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u16, 400), restore_resp.status);
-    try std.testing.expectEqualStrings("invalid restore request", restore_resp.body);
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
+    defer alloc.free(terminal_restore);
+    var parsed_restore = try std.json.parseFromSlice(restore_jobs.JobState, alloc, terminal_restore, .{ .ignore_unknown_fields = true });
+    defer parsed_restore.deinit();
+    try std.testing.expectEqual(restore_jobs.Phase.failed, parsed_restore.value.phase);
+    try std.testing.expectEqualStrings("InvalidRequest", parsed_restore.value.last_error orelse "");
     try std.testing.expect(!state.restored);
 }
 
@@ -24966,12 +26030,17 @@ test "api http server cluster restore rehydrates extension metadata" {
 
     var state = State{};
     var source = FakeSource{ .state = &state };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, source.iface(), null, null);
     defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
 
     const restore_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\"}}",
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}",
         .{location_uri},
     );
     defer alloc.free(restore_body);
@@ -24984,6 +26053,8 @@ test "api http server cluster restore rehydrates extension metadata" {
     defer restore_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
+    defer alloc.free(terminal_restore);
     try std.testing.expect(state.table_restored);
     try std.testing.expectEqual(@as(usize, 1), state.installed_count);
     try std.testing.expectEqual(@as(usize, 1), state.member_count);
@@ -24992,6 +26063,8 @@ test "api http server cluster restore rehydrates extension metadata" {
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     const RestoreSource = struct {
         restored: bool = false,
@@ -25084,27 +26157,31 @@ test "api http server prefers metadata-owned restore over inline write-source re
     };
 
     var restore_source = RestoreSource{};
-    var server = ApiHttpServer.init(alloc, .{}, restore_source.iface(), null, FailingWrites.source());
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, restore_source.iface(), null, FailingWrites.source());
+    defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
     var restore_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\"}",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
     });
     defer restore_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     try std.testing.expectEqualStrings("application/json", restore_resp.content_type.?);
-    var parsed_restore = try std.json.parseFromSlice(std.json.Value, alloc, restore_resp.body, .{
-        .allocate = .alloc_always,
-    });
-    defer parsed_restore.deinit();
-    const restore_status = parsed_restore.value.object.get("restore") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("triggered", restore_status.string);
+    const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
+    defer alloc.free(terminal_restore);
     try std.testing.expect(restore_source.restored);
 }
 
 test "api http server retries stale metadata table-exists restore race" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     const RestoreSource = struct {
         attempts: usize = 0,
@@ -25136,16 +26213,24 @@ test "api http server retries stale metadata table-exists restore race" {
     };
 
     var restore_source = RestoreSource{};
-    var server = ApiHttpServer.init(alloc, .{}, restore_source.iface(), null, null);
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, restore_source.iface(), null, null);
+    defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
     var restore_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\"}",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
     });
     defer restore_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
+    defer alloc.free(terminal_restore);
     try std.testing.expectEqual(@as(usize, 2), restore_source.attempts);
     try std.testing.expect(restore_source.restored);
 }

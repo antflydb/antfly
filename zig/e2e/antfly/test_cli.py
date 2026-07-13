@@ -14,7 +14,7 @@
 
 """E2E tests for the antfly CLI client commands.
 
-These tests start an antfly swarm server, then exercise the CLI binary
+These tests start an antfly standalone server, then exercise the CLI binary
 (table, insert, lookup, query, delete, internal) by shelling out via
 subprocess and verifying stdout JSON and exit codes.
 """
@@ -32,7 +32,7 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
-    SwarmAntflyServer,
+    StandaloneAntflyServer,
     find_free_port,
     resolve_binary_path,
     wait_for_server,
@@ -47,7 +47,7 @@ def cli_server():
         pytest.skip(f"antfly binary not found: {binary}")
 
     port = find_free_port()
-    server = SwarmAntflyServer(binary, "127.0.0.1", port)
+    server = StandaloneAntflyServer(binary, "127.0.0.1", port)
     yield server
     server.stop()
 

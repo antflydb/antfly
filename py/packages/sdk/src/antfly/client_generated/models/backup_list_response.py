@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.backup_info import BackupInfo
 
@@ -17,10 +19,12 @@ T = TypeVar("T", bound="BackupListResponse")
 class BackupListResponse:
     """
     Attributes:
-        backups (list[BackupInfo]): List of available backups
+        backups (list[BackupInfo]): One page of available backups in stable manifest-key order.
+        next_cursor (str | Unset): Opaque continuation cursor. Omitted when no additional backups remain.
     """
 
     backups: list[BackupInfo]
+    next_cursor: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -29,6 +33,8 @@ class BackupListResponse:
             backups_item = backups_item_data.to_dict()
             backups.append(backups_item)
 
+        next_cursor = self.next_cursor
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -36,6 +42,8 @@ class BackupListResponse:
                 "backups": backups,
             }
         )
+        if next_cursor is not UNSET:
+            field_dict["next_cursor"] = next_cursor
 
         return field_dict
 
@@ -51,8 +59,11 @@ class BackupListResponse:
 
             backups.append(backups_item)
 
+        next_cursor = d.pop("next_cursor", UNSET)
+
         backup_list_response = cls(
             backups=backups,
+            next_cursor=next_cursor,
         )
 
         backup_list_response.additional_properties = d

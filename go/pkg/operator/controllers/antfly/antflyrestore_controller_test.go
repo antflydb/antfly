@@ -7,24 +7,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestBuildRestoreJob_SwarmStillUsesPublicAPIService(t *testing.T) {
+func TestBuildRestoreJob_StandaloneStillUsesPublicAPIService(t *testing.T) {
 	r := &AntflyRestoreReconciler{}
 	restore := &antflyv1.AntflyRestore{
-		ObjectMeta: metav1.ObjectMeta{Name: "swarm-restore", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone-restore", Namespace: "default"},
 		Spec: antflyv1.AntflyRestoreSpec{
-			ClusterRef: antflyv1.ClusterReference{Name: "swarm-cluster"},
+			ClusterRef: antflyv1.ClusterReference{Name: "standalone-cluster"},
 			Source: antflyv1.RestoreSource{
-				BackupID: "backup-123",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-123",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 	}
 	cluster := &antflyv1.AntflyCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "swarm-cluster", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone-cluster", Namespace: "default"},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode:  antflyv1.ClusterModeSwarm,
+			Mode:  antflyv1.ClusterModeStandalone,
 			Image: "antfly:latest",
-			Swarm: &antflyv1.SwarmSpec{
+			Standalone: &antflyv1.StandaloneSpec{
 				Replicas:     1,
 				NodeID:       1,
 				MetadataAPI:  antflyv1.APISpec{Port: 8080},
@@ -34,8 +35,8 @@ func TestBuildRestoreJob_SwarmStillUsesPublicAPIService(t *testing.T) {
 				Health:       antflyv1.APISpec{Port: 4200},
 			},
 			Storage: antflyv1.StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 		},
 	}
@@ -53,7 +54,16 @@ func TestBuildRestoreJob_SwarmStillUsesPublicAPIService(t *testing.T) {
 			t.Fatalf("expected restore job to use ANTFLY_URL instead of --url, got args: %#v", args)
 		}
 	}
-	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://swarm-cluster-public-api.default.svc.cluster.local" {
-		t.Fatalf("expected restore URL to continue using public-api service in swarm mode, got: %q", got)
+	foundConnection := false
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--connection" && args[i+1] == "archive-reader" {
+			foundConnection = true
+		}
+	}
+	if !foundConnection {
+		t.Fatalf("expected named restore connection in args: %#v", args)
+	}
+	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://standalone-cluster-public-api.default.svc.cluster.local" {
+		t.Fatalf("expected restore URL to continue using public-api service in standalone mode, got: %q", got)
 	}
 }

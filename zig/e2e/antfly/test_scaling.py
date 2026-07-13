@@ -465,7 +465,10 @@ class MultiNodeScalingCluster:
             "max_shard_size_bytes": self.max_shard_size_bytes,
             "max_shards_per_table": 64,
             "default_shards_per_table": 1,
-            "storage": {"local": {"base_dir": str(self.root / "config-storage")}},
+            "storage": {
+                "engine": "local",
+                "local": {"base_dir": str(self.root / "config-storage")},
+            },
         }
         self.config_path.write_text(json.dumps(config), encoding="utf-8")
 

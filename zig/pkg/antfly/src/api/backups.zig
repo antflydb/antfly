@@ -21,18 +21,25 @@ const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
 const tables_api = @import("tables.zig");
 const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("../common/config.zig");
+const bedrock = @import("../inference/bedrock.zig");
+const httpx = @import("httpx");
 const extension_domain = @import("../extensions/mod.zig");
+const google_auth = @import("antfly_google").auth;
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
 pub const ClusterBackupRequest = struct {
     backup_id: []const u8,
     location: []const u8,
+    connection: ?[]const u8 = null,
+    format: BackupFormat = .portable,
     table_names: ?[]const []const u8 = null,
 };
 pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
     location: []const u8,
+    connection: ?[]const u8 = null,
     table_names: ?[]const []const u8 = null,
     restore_mode: ?[]const u8 = null,
 };
@@ -42,6 +49,26 @@ pub const cluster_format_version: u32 = 1;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
+pub const max_backup_manifest_bytes: usize = 16 * 1024 * 1024;
+pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
+pub const default_backup_list_limit: usize = 100;
+pub const max_backup_list_limit: usize = 1000;
+
+pub const BackupListOptions = struct {
+    limit: usize = default_backup_list_limit,
+    cursor: ?[]const u8 = null,
+};
+
+pub const BackupListPage = struct {
+    backups: []BackupInfo,
+    next_cursor: ?[]u8 = null,
+
+    pub fn deinit(self: *BackupListPage, alloc: std.mem.Allocator) void {
+        freeBackupInfos(alloc, self.backups);
+        if (self.next_cursor) |cursor| alloc.free(cursor);
+        self.* = undefined;
+    }
+};
 
 pub const BackupFormat = enum {
     native,
@@ -90,6 +117,7 @@ pub const TableBackupPlan = struct {
     backup_root: []const u8,
     backup_id: []const u8,
     format: BackupFormat = .native,
+    io: ?std.Io = null,
 };
 
 pub const TableRestorePlan = struct {
@@ -99,6 +127,9 @@ pub const TableRestorePlan = struct {
     reconcile_only: bool = false,
     replace_existing: bool = false,
     publication_hook: ?RestorePublicationHook = null,
+    /// Borrowed server/backend runtime for positional archive I/O. Embedded
+    /// callers may omit this and use the bounded threaded fallback.
+    io: ?std.Io = null,
 };
 
 pub const RestorePublicationHook = struct {
@@ -133,16 +164,193 @@ pub const BackupLocation = union(enum) {
     }
 };
 
+pub const OpenOptions = struct {
+    secret_store: ?*common_secrets.FileStore = null,
+    node_config: ?*const common_config.Config = null,
+    connection: ?[]const u8 = null,
+    required_capability: []const u8 = "",
+    /// Borrow the server's shared backend runtime for dynamic credential HTTP
+    /// refresh. CLI and embedded callers may omit it and receive an owned
+    /// threaded fallback.
+    io: ?std.Io = null,
+};
+
+const AwsCredentialContext = struct {
+    alloc: std.mem.Allocator,
+    io_impl: ?*std.Io.Threaded,
+    http: httpx.Client,
+    cache: bedrock.CredentialCache = .{},
+    region: []u8,
+    source: bedrock.CredentialSource,
+
+    fn init(alloc: std.mem.Allocator, region: []const u8, source: bedrock.CredentialSource, shared_io: ?std.Io) !AwsCredentialContext {
+        const owned_region = try alloc.dupe(u8, region);
+        errdefer alloc.free(owned_region);
+        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
+        return .{
+            .alloc = alloc,
+            .io_impl = io_impl,
+            .http = httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
+            .region = owned_region,
+            .source = source,
+        };
+    }
+
+    fn deinit(self: *AwsCredentialContext) void {
+        self.cache.deinit(self.alloc);
+        self.http.deinit();
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
+        self.alloc.free(self.region);
+        self.* = undefined;
+    }
+
+    fn provider(self: *AwsCredentialContext) object_storage.S3.CredentialProvider {
+        return .{ .ptr = self, .get_fn = get };
+    }
+
+    fn get(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!object_storage.S3.DynamicCredentials {
+        const self: *AwsCredentialContext = @ptrCast(@alignCast(ptr));
+        _ = alloc;
+        const lease = try self.cache.getLeaseForSource(self.alloc, &self.http, self.region, self.source);
+        const credentials = lease.credentials();
+        return .{
+            .access_key_id = @constCast(credentials.access_key_id),
+            .secret_access_key = @constCast(credentials.secret_access_key),
+            .session_token = if (credentials.session_token) |value| @constCast(value) else null,
+            .ownership = .{ .borrowed = .{
+                .ctx = lease.releaseContext(),
+                .release = bedrock.CredentialCache.Lease.releaseOpaque,
+            } },
+        };
+    }
+};
+
+fn authorizedObjectConnection(
+    config: *const common_config.Config,
+    connection_id: []const u8,
+    protocol: common_config.Config.ExternalIoProtocol,
+    bucket: []const u8,
+    raw_prefix: []const u8,
+    required_capability: []const u8,
+) !common_config.Config.ExternalIoConnectionConfig {
+    const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .external_io) return error.ConnectionKindMismatch;
+    const external = connection.external_io orelse return error.ConnectionKindMismatch;
+    if (external.protocol != protocol) return error.ConnectionProtocolMismatch;
+    var capability_allowed = false;
+    for (connection.capabilities) |capability| {
+        if (std.mem.eql(u8, capability, required_capability)) {
+            capability_allowed = true;
+            break;
+        }
+    }
+    if (!capability_allowed) return error.ConnectionCapabilityDenied;
+    if (external.buckets.len == 0) return error.ConnectionBucketDenied;
+    var bucket_allowed = false;
+    for (external.buckets) |allowed| {
+        if (std.mem.eql(u8, allowed, bucket)) {
+            bucket_allowed = true;
+            break;
+        }
+    }
+    if (!bucket_allowed) return error.ConnectionBucketDenied;
+    if (external.prefix) |scope_raw| {
+        const scope = std.mem.trim(u8, scope_raw, "/");
+        const prefix = std.mem.trim(u8, raw_prefix, "/");
+        if (scope.len > 0 and !(std.mem.eql(u8, scope, prefix) or (prefix.len > scope.len and std.mem.startsWith(u8, prefix, scope) and prefix[scope.len] == '/'))) {
+            return error.ConnectionPrefixDenied;
+        }
+    }
+    return external;
+}
+
+fn authorizedFilesystemConnection(
+    config: *const common_config.Config,
+    connection_id: []const u8,
+    required_capability: []const u8,
+) !common_config.Config.ExternalIoConnectionConfig {
+    const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .external_io) return error.ConnectionKindMismatch;
+    const external = connection.external_io orelse return error.ConnectionKindMismatch;
+    if (external.protocol != .filesystem or external.root == null) return error.ConnectionProtocolMismatch;
+    for (connection.capabilities) |capability| {
+        if (std.mem.eql(u8, capability, required_capability)) return external;
+    }
+    return error.ConnectionCapabilityDenied;
+}
+
+fn s3ConfigForConnection(
+    alloc: std.mem.Allocator,
+    external: common_config.Config.ExternalIoConnectionConfig,
+    credential_context: *?*AwsCredentialContext,
+    io: ?std.Io,
+) !object_storage.S3.Config {
+    const static = external.credentials.source == .static;
+    var cfg = try object_storage.S3.fromEnvAlloc(
+        alloc,
+        external.endpoint,
+        external.use_ssl orelse true,
+        if (static) external.credentials.access_key_id else "dynamic-provider",
+        if (static) external.credentials.secret_access_key else "dynamic-provider",
+        if (static) external.credentials.session_token else null,
+        external.region,
+        switch (external.addressing_style) {
+            .path => .path,
+            .virtual_hosted => .virtual_hosted,
+        },
+    );
+    errdefer cfg.deinit(alloc);
+    if (static) return cfg;
+
+    const source: bedrock.CredentialSource = switch (external.credentials.source) {
+        .default => .default,
+        .static => unreachable,
+        .profile => .{ .profile = .{
+            .name = external.credentials.profile orelse return error.InvalidConnectionCredentials,
+            .shared_credentials_file = external.credentials.shared_credentials_file,
+        } },
+        .web_identity => .{ .web_identity = .{
+            .role_arn = external.credentials.role_arn orelse return error.InvalidConnectionCredentials,
+            .token_file = external.credentials.token_file orelse return error.InvalidConnectionCredentials,
+            .session_name = external.credentials.session_name orelse "antfly-backup",
+            .sts_endpoint = external.credentials.sts_endpoint,
+        } },
+    };
+    const context = try alloc.create(AwsCredentialContext);
+    errdefer alloc.destroy(context);
+    context.* = try AwsCredentialContext.init(alloc, cfg.credentials.region, source, io);
+    credential_context.* = context;
+    cfg.credential_provider = context.provider();
+    return cfg;
+}
+
 const RemoteBackupStore = struct {
     alloc: std.mem.Allocator,
+    io_impl: ?*std.Io.Threaded = null,
+    io: std.Io,
     client: object_storage.ObjectStorage,
     gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
     s3_client: ?*object_storage.S3.Client = null,
+    credential_context: ?*AwsCredentialContext = null,
+    resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null,
     owns_client: bool = true,
+    create_bucket_if_missing: bool = false,
+    bucket_ready: std.atomic.Value(bool) = .init(false),
     bucket: []u8,
     prefix: []u8,
 
-    fn initRemoteUri(alloc: std.mem.Allocator, location: []const u8, secret_store: ?*common_secrets.FileStore) !RemoteBackupStore {
+    fn initRemoteUri(alloc: std.mem.Allocator, location: []const u8, options: OpenOptions) !RemoteBackupStore {
         const normalized = try normalizeRemoteLocationAlloc(alloc, location);
         defer alloc.free(normalized);
 
@@ -155,23 +363,63 @@ const RemoteBackupStore = struct {
 
         return switch (parsed) {
             .file => error.UnsupportedBackupLocation,
-            .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix),
-            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix, secret_store),
+            .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix, options),
+            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix, options),
         };
     }
 
-    fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8) !RemoteBackupStore {
+    fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8, options: OpenOptions) !RemoteBackupStore {
+        const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
+        const io = options.io orelse io_impl.?.io();
         const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
-        const cfg = try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var create_bucket_if_missing = false;
+        var resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null;
+        errdefer if (resolved_credentials) |*credentials| credentials.deinit(alloc);
+        const cfg = if (options.connection) |connection_id| blk: {
+            const external = try authorizedObjectConnection(
+                options.node_config orelse return error.ConnectionConfigUnavailable,
+                connection_id,
+                .gcs,
+                bucket,
+                prefix,
+                options.required_capability,
+            );
+            create_bucket_if_missing = external.bucket_provisioning == .create_if_missing;
+            resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, external, options.secret_store);
+            break :blk try gcsConfigForConnection(alloc, resolved_credentials.?.apply(external), io);
+        } else blk: {
+            var env_cfg = try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+            env_cfg.io = io;
+            break :blk env_cfg;
+        };
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
+        errdefer {
+            var client = gcs.client();
+            client.deinit();
+        }
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
 
         return .{
             .alloc = alloc,
+            .io_impl = io_impl,
+            .io = io,
             .client = gcs.client(),
             .gcs_client = gcs,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .resolved_credentials = resolved_credentials,
+            .create_bucket_if_missing = create_bucket_if_missing,
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -179,30 +427,68 @@ const RemoteBackupStore = struct {
         alloc: std.mem.Allocator,
         bucket: []const u8,
         prefix: []const u8,
-        secret_store: ?*common_secrets.FileStore,
+        options: OpenOptions,
     ) !RemoteBackupStore {
+        const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
+        const io = options.io orelse io_impl.?.io();
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
-        var overrides = try loadS3SecretOverrides(alloc, secret_store);
-        defer overrides.deinit(alloc);
-        const cfg = try object_storage.S3.fromEnvAlloc(
-            alloc,
-            overrides.endpoint,
-            true,
-            overrides.access_key_id,
-            overrides.secret_access_key,
-            overrides.session_token,
-            overrides.region,
-            .path,
-        );
+        var credential_context: ?*AwsCredentialContext = null;
+        errdefer if (credential_context) |context| {
+            context.deinit();
+            alloc.destroy(context);
+        };
+        var create_bucket_if_missing = false;
+        var resolved_credentials: ?common_config.Config.ResolvedExternalIoCredentials = null;
+        errdefer if (resolved_credentials) |*credentials| credentials.deinit(alloc);
+        var cfg = if (options.connection) |connection_id| blk: {
+            const connection = try authorizedObjectConnection(options.node_config orelse return error.ConnectionConfigUnavailable, connection_id, .s3, bucket, prefix, options.required_capability);
+            create_bucket_if_missing = connection.bucket_provisioning == .create_if_missing;
+            resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, connection, options.secret_store);
+            break :blk try s3ConfigForConnection(alloc, resolved_credentials.?.apply(connection), &credential_context, io);
+        } else blk: {
+            var overrides = try loadS3SecretOverrides(alloc, options.secret_store);
+            defer overrides.deinit(alloc);
+            break :blk try object_storage.S3.fromEnvAlloc(
+                alloc,
+                overrides.endpoint,
+                true,
+                overrides.access_key_id,
+                overrides.secret_access_key,
+                overrides.session_token,
+                overrides.region,
+                .path,
+            );
+        };
+        cfg.io = io;
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
+        errdefer {
+            var client = s3.client();
+            client.deinit();
+        }
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
 
         return .{
             .alloc = alloc,
+            .io_impl = io_impl,
+            .io = io,
             .client = s3.client(),
             .s3_client = s3,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .credential_context = credential_context,
+            .resolved_credentials = resolved_credentials,
+            .create_bucket_if_missing = create_bucket_if_missing,
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -212,12 +498,22 @@ const RemoteBackupStore = struct {
         bucket: []const u8,
         prefix: []const u8,
     ) !RemoteBackupStore {
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
         return .{
             .alloc = alloc,
+            .io_impl = io_impl,
+            .io = io_impl.io(),
             .client = client,
             .owns_client = false,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .create_bucket_if_missing = true,
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -225,17 +521,46 @@ const RemoteBackupStore = struct {
         if (self.owns_client) self.client.deinit();
         if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
         if (self.s3_client) |s3| self.alloc.destroy(s3);
+        if (self.credential_context) |context| {
+            context.deinit();
+            self.alloc.destroy(context);
+        }
+        if (self.resolved_credentials) |*credentials| credentials.deinit(self.alloc);
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;
     }
 
     fn ensureBucket(self: *RemoteBackupStore) !void {
-        if (!(try self.client.bucketExists(self.bucket))) try self.client.makeBucket(self.bucket);
+        // Normal backup writers may intentionally have PutObject without
+        // HeadBucket/ListBucket. Only provisioning connections need to probe
+        // and create buckets; ordinary writes let the object operation report
+        // a missing or unauthorized bucket directly.
+        if (!self.create_bucket_if_missing) return;
+        if (self.bucket_ready.load(.acquire)) return;
+        if (try self.client.bucketExists(self.bucket)) {
+            self.bucket_ready.store(true, .release);
+            return;
+        }
+        self.client.makeBucket(self.bucket) catch |err| {
+            // Another request may have created the bucket after our probe.
+            // Recheck rather than surfacing a harmless provider conflict.
+            if (self.client.bucketExists(self.bucket) catch false) {
+                self.bucket_ready.store(true, .release);
+                return;
+            }
+            return err;
+        };
+        self.bucket_ready.store(true, .release);
     }
 
     fn keyAlloc(self: *const RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
         const trimmed_suffix = trimLeftSlash(suffix);
+        if (trimmed_suffix.len > 0) try validateArtifactRelativePath(trimmed_suffix);
         if (self.prefix.len == 0) return try alloc.dupe(u8, trimmed_suffix);
         if (trimmed_suffix.len == 0) return try alloc.dupe(u8, self.prefix);
         return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.prefix, trimmed_suffix });
@@ -249,12 +574,47 @@ const RemoteBackupStore = struct {
         defer result.deinit(alloc);
     }
 
-    fn readBytesAlloc(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
+    fn writeBytesIfAbsent(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, body: []const u8, content_type: []const u8) !void {
+        try self.ensureBucket();
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
-        var result = try self.client.getObject(self.bucket, key, .{});
+        var result = self.client.putObject(self.bucket, key, body, .{
+            .content_type = content_type,
+            .if_none_match = true,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => return error.BackupAlreadyExists,
+            else => return err,
+        };
         defer result.deinit(alloc);
+    }
+
+    fn writeFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, src_path: []const u8, content_type: []const u8) !void {
+        try self.ensureBucket();
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var result = try self.client.putFileWithIo(self.io, self.bucket, key, src_path, .{ .content_type = content_type });
+        defer result.deinit(alloc);
+    }
+
+    fn readBytesAllocLimited(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, max_bytes: usize) ![]u8 {
+        if (max_bytes == std.math.maxInt(usize)) return error.InvalidBackupManifestLimit;
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var result = try self.client.getObject(self.bucket, key, .{
+            // Fetch one sentinel byte beyond the accepted limit. The range is
+            // authoritative for buffering even when a provider client also
+            // performs its own metadata request.
+            .range = .{ .offset = 0, .length = @intCast(max_bytes + 1) },
+        });
+        defer result.deinit(alloc);
+        if (result.body.len > max_bytes) return error.BackupManifestTooLarge;
         return try alloc.dupe(u8, result.body);
+    }
+
+    fn readFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, dest_path: []const u8) !void {
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        try self.client.getFileWithIo(self.io, self.bucket, key, dest_path, .{});
     }
 
     fn listObjectsPage(
@@ -263,14 +623,9 @@ const RemoteBackupStore = struct {
         suffix: []const u8,
         recursive: bool,
         max_keys: u32,
+        start_after: ?[]const u8,
         continuation_token: ?[]const u8,
     ) !object_storage.ListResult {
-        if (!(try self.client.bucketExists(self.bucket))) {
-            return .{
-                .entries = try alloc.alloc(object_storage.ListEntry, 0),
-                .common_prefixes = try alloc.alloc([]u8, 0),
-            };
-        }
         var key_prefix = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key_prefix);
         if (!recursive and key_prefix.len > 0 and !std.mem.endsWith(u8, key_prefix, "/")) {
@@ -282,28 +637,24 @@ const RemoteBackupStore = struct {
             .prefix = key_prefix,
             .recursive = recursive,
             .max_keys = max_keys,
+            .start_after = start_after,
             .continuation_token = continuation_token,
         });
-    }
-
-    fn listObjects(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) !object_storage.ListResult {
-        return try self.listObjectsPage(alloc, suffix, true, 10_000, null);
     }
 
     fn listTopLevelObjectsPage(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        start_after: ?[]const u8,
         continuation_token: ?[]const u8,
     ) !object_storage.ListResult {
-        return try self.listObjectsPage(alloc, "", false, 1000, continuation_token);
+        return try self.listObjectsPage(alloc, "", false, 1000, start_after, continuation_token);
     }
 
     fn uploadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_path: []const u8, dest_suffix: []const u8) !void {
         try self.ensureBucket();
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        const io = self.io;
 
         var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
         defer src_dir.close(io);
@@ -323,7 +674,7 @@ const RemoteBackupStore = struct {
             defer alloc.free(key_suffix);
             const key = try self.keyAlloc(alloc, key_suffix);
             defer alloc.free(key);
-            var result = try self.client.putFile(self.bucket, key, local_path, .{
+            var result = try self.client.putFileWithIo(io, self.bucket, key, local_path, .{
                 .content_type = "application/octet-stream",
             });
             defer result.deinit(alloc);
@@ -331,22 +682,114 @@ const RemoteBackupStore = struct {
     }
 
     fn downloadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8) !void {
-        const key_prefix = try self.keyAlloc(alloc, src_suffix);
+        return try self.downloadDirectoryRecursiveWithPageSize(alloc, src_suffix, dest_path, 1000);
+    }
+
+    fn downloadDirectoryRecursiveWithPageSize(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8, page_size: u32) !void {
+        if (page_size == 0) return error.InvalidPageSize;
+        const base_key = try self.keyAlloc(alloc, src_suffix);
+        defer alloc.free(base_key);
+        const key_prefix = if (base_key.len == 0)
+            try alloc.alloc(u8, 0)
+        else
+            try std.fmt.allocPrint(alloc, "{s}/", .{base_key});
         defer alloc.free(key_prefix);
 
-        var listed = try self.listObjects(alloc, src_suffix);
-        defer listed.deinit(alloc);
-        if (listed.entries.len == 0) return error.FileNotFound;
-
-        for (listed.entries) |entry| {
-            const rel = trimLeftSlash(entry.key[key_prefix.len..]);
-            if (rel.len == 0) continue;
-            const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
-            defer alloc.free(dest_file);
-            try self.client.getFile(self.bucket, entry.key, dest_file, .{});
+        if (try self.client.getPrefixWithIo(self.io, self.bucket, key_prefix, dest_path)) |downloaded| {
+            if (downloaded == 0) return error.FileNotFound;
+            return;
         }
+
+        var found = false;
+        var continuation_token: ?[]u8 = null;
+        defer if (continuation_token) |token| alloc.free(token);
+        while (true) {
+            var listed = try self.client.listObjects(self.bucket, .{
+                .prefix = key_prefix,
+                .recursive = true,
+                .max_keys = page_size,
+                .continuation_token = continuation_token,
+            });
+            defer listed.deinit(alloc);
+            var next_token = if (listed.next_continuation_token) |token| try alloc.dupe(u8, token) else null;
+            errdefer if (next_token) |token| alloc.free(token);
+
+            for (listed.entries) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, key_prefix)) return error.InvalidBackupArtifactPath;
+                const rel = entry.key[key_prefix.len..];
+                if (rel.len == 0) continue;
+                try validateArtifactRelativePath(rel);
+                const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
+                defer alloc.free(dest_file);
+                try self.client.getFileWithIo(self.io, self.bucket, entry.key, dest_file, .{});
+                found = true;
+            }
+
+            if (continuation_token != null and next_token != null and std.mem.eql(u8, continuation_token.?, next_token.?)) {
+                return error.InvalidContinuationToken;
+            }
+            if (continuation_token) |token| alloc.free(token);
+            continuation_token = next_token;
+            next_token = null;
+            if (continuation_token == null) break;
+        }
+        if (!found) return error.FileNotFound;
     }
 };
+
+pub fn gcsConfigForConnection(
+    alloc: std.mem.Allocator,
+    external: common_config.Config.ExternalIoConnectionConfig,
+    io: ?std.Io,
+) !object_storage.Gcs.JsonApiConfig {
+    var cfg = switch (external.gcs_credentials.source) {
+        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc),
+        .bearer_token => try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(
+            alloc,
+            external.gcs_credentials.bearer_token orelse return error.InvalidConnectionCredentials,
+            external.project_id,
+        ),
+        .service_account => blk: {
+            var account = if (external.gcs_credentials.service_account_json) |raw|
+                try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
+            else
+                try google_auth.serviceAccountFromFileAllocWithIo(alloc, external.gcs_credentials.credentials_path orelse return error.InvalidConnectionCredentials, io);
+            var account_owned = true;
+            errdefer if (account_owned) account.deinit(alloc);
+            const account_project_id = if (account.project_id) |value| try alloc.dupe(u8, value) else null;
+            defer if (account_project_id) |value| alloc.free(value);
+            var auth_cfg = try google_auth.configFromServiceAccountAlloc(
+                alloc,
+                account,
+                external.gcs_credentials.scope orelse google_auth.default_scope,
+            );
+            account_owned = false;
+            errdefer auth_cfg.deinit(alloc);
+            const source = try alloc.create(google_auth.CachedTokenSource);
+            errdefer alloc.destroy(source);
+            source.* = try google_auth.CachedTokenSource.initWithIo(alloc, auth_cfg, io);
+            var value = try object_storage.Gcs.jsonApiClientConfigAlloc(alloc);
+            value.auth = .{ .google_token_source = source };
+            if (external.project_id orelse account_project_id) |project_id| value.project_id = try alloc.dupe(u8, project_id);
+            break :blk value;
+        },
+    };
+    errdefer cfg.deinit(alloc);
+    cfg.io = io;
+    if (external.endpoint) |endpoint| {
+        alloc.free(cfg.endpoint);
+        cfg.endpoint = try alloc.dupe(u8, endpoint);
+    }
+    if (external.upload_endpoint) |endpoint| {
+        alloc.free(cfg.upload_endpoint);
+        cfg.upload_endpoint = try alloc.dupe(u8, endpoint);
+    }
+    if (external.project_id) |project_id| {
+        if (cfg.project_id) |previous| alloc.free(previous);
+        cfg.project_id = try alloc.dupe(u8, project_id);
+    }
+    return cfg;
+}
 
 const S3SecretOverrides = struct {
     endpoint: ?[]u8 = null,
@@ -467,11 +910,27 @@ pub fn openBackupLocationWithSecrets(
     location: []const u8,
     secret_store: ?*common_secrets.FileStore,
 ) !BackupLocation {
+    return try openBackupLocationWithOptions(alloc, location, .{ .secret_store = secret_store });
+}
+
+pub fn openBackupLocationWithOptions(
+    alloc: std.mem.Allocator,
+    location: []const u8,
+    options: OpenOptions,
+) !BackupLocation {
     if (std.mem.startsWith(u8, location, "file://")) {
+        if (options.connection) |connection_id| {
+            const external = try authorizedFilesystemConnection(
+                options.node_config orelse return error.ConnectionConfigUnavailable,
+                connection_id,
+                options.required_capability,
+            );
+            return .{ .file = try resolveFilesystemLocationAlloc(alloc, external.root.?, location, options.io) };
+        }
         return .{ .file = try alloc.dupe(u8, try parseFileLocation(location)) };
     }
     if (std.mem.startsWith(u8, location, "s3://") or std.mem.startsWith(u8, location, "gs://") or std.mem.startsWith(u8, location, "gcs://")) {
-        return .{ .remote = try RemoteBackupStore.initRemoteUri(alloc, location, secret_store) };
+        return .{ .remote = try RemoteBackupStore.initRemoteUri(alloc, location, options) };
     }
     return error.UnsupportedBackupLocation;
 }
@@ -485,36 +944,128 @@ pub fn backupLocationErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingSecretAccessKey => "missing S3-compatible secret; set AWS_SECRET_ACCESS_KEY for s3:// backups",
         error.MissingServiceAccount => "missing GCS auth; set GCS_BEARER_TOKEN, GOOGLE_OAUTH_ACCESS_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, or GOOGLE_APPLICATION_CREDENTIALS for gs:// backups",
         error.MissingProjectId => "missing GCS project id; set GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT for gs:// backups",
+        error.ConnectionConfigUnavailable => "named backup connection is unavailable on this server",
+        error.ConnectionNotFound => "backup connection was not found",
+        error.ConnectionKindMismatch, error.ConnectionProtocolMismatch => "backup connection protocol does not match the location",
+        error.ConnectionCapabilityDenied => "backup connection does not grant the required capability",
+        error.ConnectionBucketDenied => "backup location bucket is outside the connection allowlist",
+        error.ConnectionPrefixDenied => "backup location prefix is outside the connection scope",
+        error.InvalidConnectionCredentials => "backup connection credential configuration is invalid",
+        error.SecretNotFound => "a secret referenced by the backup connection was not found",
+        error.BucketNotFound => "backup bucket does not exist and the connection does not allow provisioning",
         else => null,
     };
 }
 
 pub fn parseBackupRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(BackupRequest) {
-    return metadata_openapi.server.parseBackupTableBody(alloc, body);
+    return std.json.parseFromSlice(BackupRequest, alloc, body, .{});
 }
 
 pub fn parseRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(RestoreRequest) {
-    return metadata_openapi.server.parseRestoreTableBody(alloc, body);
+    return std.json.parseFromSlice(RestoreRequest, alloc, body, .{});
+}
+
+test "backup API requests reject unknown operational fields" {
+    var backup = try parseBackupRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-writer","format":"native"}
+    );
+    backup.deinit();
+    try std.testing.expectError(error.UnknownField, parseBackupRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-writer","formt":"native"}
+    ));
+
+    var parsed = try parseRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader"}
+    );
+    parsed.deinit();
+    try std.testing.expectError(error.UnknownField, parseRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","format":"portable"}
+    ));
+    try std.testing.expectError(error.UnknownField, parseRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","conection":"typo"}
+    ));
+    try std.testing.expectError(error.UnknownField, parseClusterBackupRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-writer","formt":"native"}
+    ));
+    try std.testing.expectError(error.UnknownField, parseClusterRestoreRequest(std.testing.allocator,
+        \\{"backup_id":"daily","location":"s3://archive/daily","connection":"archive-reader","format":"portable"}
+    ));
 }
 
 pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterBackupRequest {
-    var parsed = try metadata_openapi.server.parseBackupBody(alloc, body);
+    var parsed = try std.json.parseFromSlice(metadata_openapi.ClusterBackupRequest, alloc, body, .{});
     defer parsed.deinit();
+    try validateBackupId(parsed.value.backup_id);
+    const format = try parseBackupFormat(parsed.value.format);
+    const backup_id = try alloc.dupe(u8, parsed.value.backup_id);
+    errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, parsed.value.location);
+    errdefer alloc.free(location);
+    const connection = try alloc.dupe(u8, parsed.value.connection);
+    errdefer alloc.free(connection);
+    try validateSelectedTableNames(parsed.value.table_names);
+    const table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names);
+    errdefer if (table_names) |values| freeStringSlice(alloc, values);
     return .{
-        .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
-        .location = try alloc.dupe(u8, parsed.value.location),
-        .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
+        .backup_id = backup_id,
+        .location = location,
+        .connection = connection,
+        .format = format,
+        .table_names = table_names,
     };
 }
 
+pub fn parseBackupFormat(value: ?[]const u8) !BackupFormat {
+    const format = value orelse return .portable;
+    return std.meta.stringToEnum(BackupFormat, format) orelse error.UnsupportedBackupFormat;
+}
+
+test "cluster backup format defaults portable and preserves explicit native" {
+    const alloc = std.testing.allocator;
+    var default_req = try parseClusterBackupRequest(alloc,
+        \\{"backup_id":"daily","location":"s3://archive/backups","connection":"archive-writer"}
+    );
+    defer freeClusterBackupRequest(alloc, &default_req);
+    try std.testing.expectEqual(BackupFormat.portable, default_req.format);
+
+    var native_req = try parseClusterBackupRequest(alloc,
+        \\{"backup_id":"daily-native","location":"s3://archive/backups","connection":"archive-writer","format":"native"}
+    );
+    defer freeClusterBackupRequest(alloc, &native_req);
+    try std.testing.expectEqual(BackupFormat.native, native_req.format);
+}
+
+test "cluster backup and restore reject duplicate table selectors" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.DuplicateBackupTableName, parseClusterBackupRequest(alloc,
+        \\{"backup_id":"daily","location":"s3://archive/backups","connection":"archive-writer","table_names":["docs","docs"]}
+    ));
+    try std.testing.expectError(error.DuplicateBackupTableName, parseClusterRestoreRequest(alloc,
+        \\{"backup_id":"daily","location":"s3://archive/backups","connection":"archive-reader","table_names":["docs","docs"]}
+    ));
+}
+
 pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterRestoreRequest {
-    var parsed = try metadata_openapi.server.parseRestoreBody(alloc, body);
+    var parsed = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreRequest, alloc, body, .{});
     defer parsed.deinit();
+    try validateBackupId(parsed.value.backup_id);
+    const backup_id = try alloc.dupe(u8, parsed.value.backup_id);
+    errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, parsed.value.location);
+    errdefer alloc.free(location);
+    const connection = try alloc.dupe(u8, parsed.value.connection);
+    errdefer alloc.free(connection);
+    try validateSelectedTableNames(parsed.value.table_names);
+    const table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names);
+    errdefer if (table_names) |values| freeStringSlice(alloc, values);
+    const restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (restore_mode) |value| alloc.free(value);
     return .{
-        .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
-        .location = try alloc.dupe(u8, parsed.value.location),
-        .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
-        .restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null,
+        .backup_id = backup_id,
+        .location = location,
+        .connection = connection,
+        .table_names = table_names,
+        .restore_mode = restore_mode,
     };
 }
 
@@ -523,6 +1074,79 @@ pub fn parseFileLocation(location: []const u8) ![]const u8 {
     const path = location["file://".len..];
     if (path.len == 0 or path[0] != '/') return error.InvalidBackupLocation;
     return path;
+}
+
+pub fn validateBackupId(value: []const u8) !void {
+    if (value.len == 0 or value.len > 128) return error.InvalidBackupId;
+    for (value) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return error.InvalidBackupId;
+    }
+    if (std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return error.InvalidBackupId;
+}
+
+fn ensureManifestSize(encoded: []const u8, max_bytes: usize) !void {
+    if (encoded.len > max_bytes) return error.BackupManifestTooLarge;
+}
+
+pub fn validateArtifactRelativePath(path: []const u8) !void {
+    if (path.len == 0 or path.len > 4096 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidBackupArtifactPath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidBackupArtifactPath;
+    }
+}
+
+fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []const u8, location: []const u8, shared_io: ?std.Io) ![]u8 {
+    const uri_path = try parseFileLocation(location);
+    const relative = std.mem.trimStart(u8, uri_path, "/");
+    if (relative.len > 0) try validateArtifactRelativePath(relative);
+
+    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = shared_io orelse io_impl.?.io();
+    const canonical_root = try std.Io.Dir.realPathFileAbsoluteAlloc(io, configured_root, alloc);
+    defer alloc.free(canonical_root);
+    const candidate = if (relative.len == 0)
+        try alloc.dupe(u8, canonical_root)
+    else
+        try std.fs.path.join(alloc, &.{ canonical_root, relative });
+    errdefer alloc.free(candidate);
+
+    // Resolve the nearest existing ancestor. This rejects pre-existing symlinks
+    // that leave the configured root while still allowing backup directories to
+    // be created below it.
+    var ancestor: []const u8 = candidate;
+    while (true) {
+        const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io, ancestor, alloc) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                ancestor = std.fs.path.dirname(ancestor) orelse return error.InvalidBackupLocation;
+                continue;
+            },
+            else => return err,
+        };
+        defer alloc.free(canonical);
+        if (!pathIsWithin(canonical_root, canonical)) return error.ConnectionPrefixDenied;
+        break;
+    }
+    return candidate;
+}
+
+fn pathIsWithin(root: []const u8, candidate: []const u8) bool {
+    if (std.mem.eql(u8, root, candidate)) return true;
+    if (candidate.len <= root.len or !std.mem.startsWith(u8, candidate, root)) return false;
+
+    // Canonical filesystem roots already end in the platform separator (for
+    // example `/`). Requiring another separator after that root incorrectly
+    // rejects every descendant of a root-scoped administrative connection.
+    return root[root.len - 1] == std.fs.path.sep or candidate[root.len] == std.fs.path.sep;
+}
+
+test "restore filesystem scope containment handles filesystem roots and component boundaries" {
+    try std.testing.expect(pathIsWithin("/", "/private/tmp/backup"));
+    try std.testing.expect(pathIsWithin("/var/backups", "/var/backups/tenant-a"));
+    try std.testing.expect(!pathIsWithin("/var/backups", "/var/backups-evil"));
 }
 
 pub fn createManifest(
@@ -571,7 +1195,8 @@ pub fn writeManifest(
 
     const encoded = try stringifyJsonAlloc(alloc, manifest.*);
     defer alloc.free(encoded);
-    try writeFileAbsolute(path, encoded);
+    try ensureManifestSize(encoded, max_backup_manifest_bytes);
+    try writeFileAbsoluteIfAbsent(alloc, path, encoded);
 }
 
 pub fn readManifest(
@@ -581,7 +1206,7 @@ pub fn readManifest(
 ) !TableBackupManifest {
     const path = try metadataPath(alloc, backup_root, backup_id);
     defer alloc.free(path);
-    const body = try readFileAbsoluteAlloc(alloc, path, 16 * 1024 * 1024);
+    const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
     defer alloc.free(body);
 
     return parseTableBackupManifestOrPortable(alloc, body, backup_id);
@@ -597,9 +1222,10 @@ pub fn writeManifestToLocation(
         .remote => |*store| {
             const encoded = try stringifyJsonAlloc(alloc, manifest.*);
             defer alloc.free(encoded);
+            try ensureManifestSize(encoded, max_backup_manifest_bytes);
             const suffix = try metadataPath(alloc, "", manifest.backup_id);
             defer alloc.free(suffix);
-            try store.writeBytes(alloc, trimLeftSlash(suffix), encoded, "application/json");
+            try store.writeBytesIfAbsent(alloc, trimLeftSlash(suffix), encoded, "application/json");
         },
     }
 }
@@ -614,11 +1240,25 @@ pub fn readManifestFromLocation(
         .remote => |*store| {
             const suffix = try metadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
-            const body = try store.readBytesAlloc(alloc, trimLeftSlash(suffix));
+            const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
             defer alloc.free(body);
             return parseTableBackupManifestOrPortable(alloc, body, backup_id);
         },
     }
+}
+
+pub fn manifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try metadataPath(alloc, backup_root, backup_id);
+            defer alloc.free(path);
+            break :blk try pathExists(path);
+        },
+        // Do not require restore.read/HeadObject authority from a write-only
+        // backup connection. The conditional manifest put is the authoritative
+        // conflict check for object storage.
+        .remote => false,
+    };
 }
 
 fn parseTableBackupManifestOrPortable(
@@ -629,10 +1269,16 @@ fn parseTableBackupManifestOrPortable(
     if (std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always })) |parsed| {
         defer parsed.deinit();
         if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
+        try validateTableManifest(&parsed.value, backup_id);
         return try cloneTableBackupManifest(alloc, parsed.value);
     } else |_| {
         return try parseGoPortableTableManifest(alloc, body, backup_id);
     }
+}
+
+fn validateTableManifest(manifest: *const TableBackupManifest, requested_backup_id: []const u8) !void {
+    if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
+    for (manifest.shards) |shard| try validateArtifactRelativePath(shard.snapshot_path);
 }
 
 const PortableShard = struct {
@@ -874,18 +1520,22 @@ fn decodePortableByteRangeBoundary(alloc: std.mem.Allocator, encoded: []const u8
 }
 
 pub fn metadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/{s}-metadata.json", .{ backup_root, backup_id });
 }
 
 pub fn clusterMetadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/{s}-cluster-metadata.json", .{ backup_root, backup_id });
 }
 
 pub fn shardSnapshotPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8, group_id: u64) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/{s}/groups/{d}", .{ backup_root, backup_id, group_id });
 }
 
 pub fn shardSnapshotRelPath(alloc: std.mem.Allocator, backup_id: []const u8, group_id: u64) ![]u8 {
+    try validateBackupId(backup_id);
     return try std.fmt.allocPrint(alloc, "{s}/groups/{d}", .{ backup_id, group_id });
 }
 
@@ -908,7 +1558,6 @@ pub fn encodeRestoreDurabilityConfirmed(alloc: std.mem.Allocator) ![]u8 {
 pub fn clusterTableBackupId(alloc: std.mem.Allocator, cluster_backup_id: []const u8, table_name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}-{s}", .{ table_name, cluster_backup_id });
 }
-
 pub fn createClusterManifest(
     alloc: std.mem.Allocator,
     backup_id: []const u8,
@@ -970,7 +1619,8 @@ pub fn writeClusterManifest(
 
     const encoded = try stringifyJsonAlloc(alloc, manifest.*);
     defer alloc.free(encoded);
-    try writeFileAbsolute(path, encoded);
+    try ensureManifestSize(encoded, max_backup_manifest_bytes);
+    try writeFileAbsoluteIfAbsent(alloc, path, encoded);
 }
 
 pub fn readClusterManifest(
@@ -980,12 +1630,13 @@ pub fn readClusterManifest(
 ) !ClusterBackupManifest {
     const path = try clusterMetadataPath(alloc, backup_root, backup_id);
     defer alloc.free(path);
-    const body = try readFileAbsoluteAlloc(alloc, path, 16 * 1024 * 1024);
+    const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
     defer alloc.free(body);
 
     var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value.format_version != cluster_format_version) return error.UnsupportedBackupFormat;
+    try validateClusterManifest(&parsed.value, backup_id);
     return try cloneClusterBackupManifest(alloc, parsed.value);
 }
 
@@ -999,9 +1650,10 @@ pub fn writeClusterManifestToLocation(
         .remote => |*store| {
             const encoded = try stringifyJsonAlloc(alloc, manifest.*);
             defer alloc.free(encoded);
+            try ensureManifestSize(encoded, max_backup_manifest_bytes);
             const suffix = try clusterMetadataPath(alloc, "", manifest.backup_id);
             defer alloc.free(suffix);
-            try store.writeBytes(alloc, trimLeftSlash(suffix), encoded, "application/json");
+            try store.writeBytesIfAbsent(alloc, trimLeftSlash(suffix), encoded, "application/json");
         },
     }
 }
@@ -1016,14 +1668,31 @@ pub fn readClusterManifestFromLocation(
         .remote => |*store| {
             const suffix = try clusterMetadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
-            const body = try store.readBytesAlloc(alloc, trimLeftSlash(suffix));
+            const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
             defer alloc.free(body);
             var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             if (parsed.value.format_version != cluster_format_version) return error.UnsupportedBackupFormat;
+            try validateClusterManifest(&parsed.value, backup_id);
             return try cloneClusterBackupManifest(alloc, parsed.value);
         },
     }
+}
+
+pub fn clusterManifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try clusterMetadataPath(alloc, backup_root, backup_id);
+            defer alloc.free(path);
+            break :blk try pathExists(path);
+        },
+        .remote => false,
+    };
+}
+
+fn validateClusterManifest(manifest: *const ClusterBackupManifest, requested_backup_id: []const u8) !void {
+    if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
+    for (manifest.tables) |table| try validateBackupId(table.table_backup_id);
 }
 
 pub fn encodeClusterBackupResponse(
@@ -1048,80 +1717,162 @@ pub fn encodeClusterRestoreResponse(
     });
 }
 
-pub fn encodeBackupListResponse(alloc: std.mem.Allocator, infos: []const BackupInfo) ![]u8 {
-    return try stringifyJsonAlloc(alloc, .{ .backups = infos });
+pub fn encodeBackupListResponse(alloc: std.mem.Allocator, page: *const BackupListPage) ![]u8 {
+    if (page.next_cursor) |cursor| return try stringifyJsonAlloc(alloc, .{
+        .backups = page.backups,
+        .next_cursor = cursor,
+    });
+    return try stringifyJsonAlloc(alloc, .{ .backups = page.backups });
 }
 
-pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, location: []const u8) ![]BackupInfo {
+fn validateBackupListOptions(options: BackupListOptions) !void {
+    if (options.limit == 0 or options.limit > max_backup_list_limit) return error.InvalidBackupListLimit;
+    if (options.cursor) |cursor| try validateBackupId(cursor);
+}
+
+fn maxHeapSiftUp(ids: [][]u8, start_index: usize) void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (std.mem.order(u8, ids[parent], ids[index]) != .lt) break;
+        std.mem.swap([]u8, &ids[parent], &ids[index]);
+        index = parent;
+    }
+}
+
+fn maxHeapSiftDown(ids: [][]u8, start_index: usize) void {
+    var index = start_index;
+    while (true) {
+        const left = index * 2 + 1;
+        if (left >= ids.len) return;
+        const right = left + 1;
+        const greatest = if (right < ids.len and std.mem.order(u8, ids[left], ids[right]) == .lt) right else left;
+        if (std.mem.order(u8, ids[index], ids[greatest]) != .lt) return;
+        std.mem.swap([]u8, &ids[index], &ids[greatest]);
+        index = greatest;
+    }
+}
+
+fn retainSmallestBackupId(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged([]u8), capacity: usize, backup_id: []const u8) !void {
+    if (ids.items.len == capacity and std.mem.order(u8, backup_id, ids.items[0]) != .lt) return;
+    const owned = try alloc.dupe(u8, backup_id);
+    errdefer alloc.free(owned);
+    if (ids.items.len < capacity) {
+        try ids.append(alloc, owned);
+        maxHeapSiftUp(ids.items, ids.items.len - 1);
+        return;
+    }
+    alloc.free(ids.items[0]);
+    ids.items[0] = owned;
+    maxHeapSiftDown(ids.items, 0);
+}
+
+fn backupIdLessThan(_: void, lhs: []u8, rhs: []u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
+}
+
+fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBackupManifest, location: []const u8) !BackupInfo {
+    const tables = try alloc.alloc([]const u8, manifest.tables.len);
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (tables[0..initialized_tables]) |value| alloc.free(@constCast(value));
+        alloc.free(tables);
+    }
+    for (manifest.tables, 0..) |table, i| {
+        tables[i] = try alloc.dupe(u8, table.name);
+        initialized_tables += 1;
+    }
+    const backup_id = try alloc.dupe(u8, manifest.backup_id);
+    errdefer alloc.free(backup_id);
+    const timestamp = try alloc.dupe(u8, manifest.timestamp);
+    errdefer alloc.free(timestamp);
+    const owned_location = try alloc.dupe(u8, location);
+    errdefer alloc.free(owned_location);
+    const version = try alloc.dupe(u8, manifest.antfly_version);
+    return .{
+        .backup_id = backup_id,
+        .timestamp = timestamp,
+        .tables = tables,
+        .location = owned_location,
+        .antfly_version = version,
+    };
+}
+
+pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, location: []const u8, options: BackupListOptions) !BackupListPage {
+    try validateBackupListOptions(options);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
     var dir = std.Io.Dir.cwd().openDir(io, backup_root, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return try alloc.alloc(BackupInfo, 0),
+        error.FileNotFound => return .{ .backups = try alloc.alloc(BackupInfo, 0) },
         else => return err,
     };
     defer dir.close(io);
 
     var it = dir.iterate();
+    var backup_ids = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (backup_ids.items) |backup_id| alloc.free(backup_id);
+        backup_ids.deinit(alloc);
+    }
+    const cursor_key = if (options.cursor) |cursor| try clusterMetadataPath(alloc, "", cursor) else null;
+    defer if (cursor_key) |value| alloc.free(value);
+    const cursor_name = if (cursor_key) |value| std.fs.path.basename(value) else null;
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, "-cluster-metadata.json")) continue;
+        const backup_id = entry.name[0 .. entry.name.len - "-cluster-metadata.json".len];
+        validateBackupId(backup_id) catch continue;
+        if (cursor_name) |cursor| if (std.mem.order(u8, entry.name, cursor) != .gt) continue;
+        try retainSmallestBackupId(alloc, &backup_ids, options.limit + 1, entry.name);
+    }
+    std.mem.sort([]u8, backup_ids.items, {}, backupIdLessThan);
+    const has_more = backup_ids.items.len > options.limit;
+    if (has_more) alloc.free(backup_ids.pop().?);
+
     var infos = std.ArrayListUnmanaged(BackupInfo).empty;
     errdefer {
         for (infos.items) |info| freeBackupInfo(alloc, info);
         infos.deinit(alloc);
     }
-
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, "-cluster-metadata.json")) continue;
-        const backup_id = entry.name[0 .. entry.name.len - "-cluster-metadata.json".len];
+    try infos.ensureTotalCapacity(alloc, backup_ids.items.len);
+    for (backup_ids.items) |manifest_name| {
+        const backup_id = backupIdFromClusterMetadataKey(manifest_name);
         var manifest = try readClusterManifest(alloc, backup_root, backup_id);
         defer manifest.deinit(alloc);
-
-        const tables = try alloc.alloc([]const u8, manifest.tables.len);
-        var initialized_tables: usize = 0;
-        errdefer {
-            for (tables[0..initialized_tables]) |value| alloc.free(@constCast(value));
-            alloc.free(tables);
-        }
-        for (manifest.tables, 0..) |table, i| {
-            tables[i] = try alloc.dupe(u8, table.name);
-            initialized_tables += 1;
-        }
-
-        try infos.append(alloc, .{
-            .backup_id = try alloc.dupe(u8, manifest.backup_id),
-            .timestamp = try alloc.dupe(u8, manifest.timestamp),
-            .tables = tables,
-            .location = try alloc.dupe(u8, location),
-            .antfly_version = try alloc.dupe(u8, manifest.antfly_version),
-        });
+        infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location));
     }
-
-    return try infos.toOwnedSlice(alloc);
+    const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
+    errdefer if (next_cursor) |cursor| alloc.free(cursor);
+    return .{ .backups = try infos.toOwnedSlice(alloc), .next_cursor = next_cursor };
 }
 
 pub fn listClusterBackupsFromLocation(
     alloc: std.mem.Allocator,
     location_uri: []const u8,
-) ![]BackupInfo {
+    options: BackupListOptions,
+) !BackupListPage {
     var location = try openBackupLocation(alloc, location_uri);
     defer location.deinit(alloc);
 
     if (location == .file) {
-        return try listClusterBackups(alloc, location.file, location_uri);
+        return try listClusterBackups(alloc, location.file, location_uri, options);
     }
 
-    return try listClusterBackupsFromOpenedLocation(alloc, &location, location_uri);
+    return try listClusterBackupsFromOpenedLocation(alloc, &location, location_uri, options);
 }
 
-fn listClusterBackupsFromOpenedLocation(
+pub fn listClusterBackupsFromOpenedLocation(
     alloc: std.mem.Allocator,
     location: *BackupLocation,
     location_uri: []const u8,
-) ![]BackupInfo {
+    options: BackupListOptions,
+) !BackupListPage {
+    try validateBackupListOptions(options);
     switch (location.*) {
+        .file => |path| return try listClusterBackups(alloc, path, location_uri, options),
         .remote => {},
-        .file => unreachable,
     }
 
     var infos = std.ArrayListUnmanaged(BackupInfo).empty;
@@ -1129,39 +1880,37 @@ fn listClusterBackupsFromOpenedLocation(
         for (infos.items) |info| freeBackupInfo(alloc, info);
         infos.deinit(alloc);
     }
+    try infos.ensureTotalCapacity(alloc, options.limit);
 
     var continuation_token: ?[]u8 = null;
     defer if (continuation_token) |token| alloc.free(token);
+    const start_after = if (options.cursor) |cursor| blk: {
+        const suffix = try clusterMetadataPath(alloc, "", cursor);
+        defer alloc.free(suffix);
+        break :blk try location.remote.keyAlloc(alloc, trimLeftSlash(suffix));
+    } else null;
+    defer if (start_after) |value| alloc.free(value);
+    var has_more = false;
     while (true) {
-        var listed = try location.remote.listTopLevelObjectsPage(alloc, continuation_token);
+        var listed = try location.remote.listTopLevelObjectsPage(alloc, if (continuation_token == null) start_after else null, continuation_token);
         defer listed.deinit(alloc);
         var next_token: ?[]u8 = null;
         defer if (next_token) |token| alloc.free(token);
 
         for (listed.entries) |entry| {
             if (!std.mem.endsWith(u8, entry.key, "-cluster-metadata.json")) continue;
-            var manifest = try readClusterManifestFromLocation(alloc, location, backupIdFromClusterMetadataKey(entry.key));
+            const backup_id = backupIdFromClusterMetadataKey(entry.key);
+            validateBackupId(backup_id) catch continue;
+            if (infos.items.len == options.limit) {
+                has_more = true;
+                break;
+            }
+            var manifest = try readClusterManifestFromLocation(alloc, location, backup_id);
             defer manifest.deinit(alloc);
-
-            const tables = try alloc.alloc([]const u8, manifest.tables.len);
-            var initialized_tables: usize = 0;
-            errdefer {
-                for (tables[0..initialized_tables]) |value| alloc.free(@constCast(value));
-                alloc.free(tables);
-            }
-            for (manifest.tables, 0..) |table, i| {
-                tables[i] = try alloc.dupe(u8, table.name);
-                initialized_tables += 1;
-            }
-
-            try infos.append(alloc, .{
-                .backup_id = try alloc.dupe(u8, manifest.backup_id),
-                .timestamp = try alloc.dupe(u8, manifest.timestamp),
-                .tables = tables,
-                .location = try alloc.dupe(u8, location_uri),
-                .antfly_version = try alloc.dupe(u8, manifest.antfly_version),
-            });
+            infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location_uri));
         }
+
+        if (has_more) break;
 
         if (listed.next_continuation_token) |token| {
             next_token = try alloc.dupe(u8, token);
@@ -1172,8 +1921,9 @@ fn listClusterBackupsFromOpenedLocation(
         next_token = null;
         if (continuation_token == null) break;
     }
-
-    return try infos.toOwnedSlice(alloc);
+    const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
+    errdefer if (next_cursor) |cursor| alloc.free(cursor);
+    return .{ .backups = try infos.toOwnedSlice(alloc), .next_cursor = next_cursor };
 }
 
 pub fn findClusterTable(
@@ -1274,6 +2024,7 @@ pub fn copyDirectoryFromLocation(
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const src_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -1290,6 +2041,7 @@ pub fn copyFileFromLocation(
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const src_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -1297,9 +2049,7 @@ pub fn copyFileFromLocation(
             try copyFileAbsolute(src_path, dest_path);
         },
         .remote => |*store| {
-            const body = try store.readBytesAlloc(alloc, trimLeftSlash(snapshot_path));
-            defer alloc.free(body);
-            try writeFileAbsolute(dest_path, body);
+            try store.readFile(alloc, trimLeftSlash(snapshot_path), dest_path);
         },
     }
 }
@@ -1311,6 +2061,7 @@ pub fn copyFileToLocation(
     src_path: []const u8,
     content_type: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -1318,9 +2069,7 @@ pub fn copyFileToLocation(
             try copyFileAbsolute(src_path, dest_path);
         },
         .remote => |*store| {
-            const body = try readFileAbsoluteAlloc(alloc, src_path, max_portable_backup_file_bytes);
-            defer alloc.free(body);
-            try store.writeBytes(alloc, trimLeftSlash(snapshot_path), body, content_type);
+            try store.writeFile(alloc, trimLeftSlash(snapshot_path), src_path, content_type);
         },
     }
 }
@@ -1332,6 +2081,7 @@ pub fn writeFileToLocation(
     body: []const u8,
     content_type: []const u8,
 ) !void {
+    try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
@@ -1540,11 +2290,13 @@ fn trimRightSlash(value: []const u8) []const u8 {
 }
 
 pub fn copyDirectoryRecursive(alloc: std.mem.Allocator, src_path: []const u8, dest_path: []const u8) !void {
-    try ensureDirPath(dest_path);
-
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
+    return copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_path, dest_path);
+}
+
+fn copyDirectoryRecursiveWithIo(alloc: std.mem.Allocator, io: std.Io, src_path: []const u8, dest_path: []const u8) !void {
+    try ensureDirPathWithIo(io, dest_path);
 
     var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
     defer src_dir.close(io);
@@ -1559,8 +2311,8 @@ pub fn copyDirectoryRecursive(alloc: std.mem.Allocator, src_path: []const u8, de
         defer alloc.free(dest_entry_path);
 
         switch (entry.kind) {
-            .directory => try ensureDirPath(dest_entry_path),
-            .file => try copyFileAbsolute(src_entry_path, dest_entry_path),
+            .directory => try ensureDirPathWithIo(io, dest_entry_path),
+            .file => try copyFileAbsoluteWithIo(io, src_entry_path, dest_entry_path),
             else => return error.UnsupportedBackupArtifact,
         }
     }
@@ -1581,6 +2333,62 @@ fn writeFileAbsolute(path: []const u8, data: []const u8) !void {
     try writer.end();
 }
 
+fn writeFileAbsoluteIfAbsent(alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir_name| try ensureDirPath(dir_name);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+    defer alloc.free(lock_path);
+    var lock_file = if (std.fs.path.isAbsolute(lock_path))
+        try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+    else
+        try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+    defer lock_file.close(io);
+    // Manifest publication is the backup commit point. Locking support is
+    // required so two Antfly processes sharing a filesystem cannot both pass
+    // the existence check and overwrite one another.
+    try lock_file.lock(io, .exclusive);
+    defer lock_file.unlock(io);
+    const exists = blk: {
+        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
+    if (exists) return error.BackupAlreadyExists;
+
+    var entropy: [8]u8 = undefined;
+    try io.randomSecure(&entropy);
+    const nonce = std.fmt.bytesToHex(entropy, .lower);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var file = if (std.fs.path.isAbsolute(tmp_path))
+        try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+    else
+        try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(data);
+    try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+}
+
 fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1596,12 +2404,24 @@ fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: 
     return try reader.interface.allocRemaining(alloc, .limited(max_bytes));
 }
 
-fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
-    if (std.fs.path.dirname(dest_path)) |dir_name| try ensureDirPath(dir_name);
-
+fn pathExists(path: []const u8) !bool {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
+    _ = std.Io.Dir.cwd().statFile(io_impl.io(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return copyFileAbsoluteWithIo(io_impl.io(), src_path, dest_path);
+}
+
+fn copyFileAbsoluteWithIo(io: std.Io, src_path: []const u8, dest_path: []const u8) !void {
+    if (std.fs.path.dirname(dest_path)) |dir_name| try ensureDirPathWithIo(io, dir_name);
 
     var src = if (std.fs.path.isAbsolute(src_path))
         try std.Io.Dir.openFileAbsolute(io, src_path, .{})
@@ -1626,11 +2446,15 @@ fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
 fn ensureDirPath(path: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    try fs_paths.createDirPathPortable(io_impl.io(), path);
+    return ensureDirPathWithIo(io_impl.io(), path);
+}
+
+fn ensureDirPathWithIo(io: std.Io, path: []const u8) !void {
+    try fs_paths.createDirPathPortable(io, path);
 }
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    return try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
 }
 
 fn cloneOptionalStringSlice(alloc: std.mem.Allocator, values: ?[]const []const u8) !?[]const []const u8 {
@@ -1648,9 +2472,21 @@ fn cloneOptionalStringSlice(alloc: std.mem.Allocator, values: ?[]const []const u
     return result;
 }
 
+fn validateSelectedTableNames(values: ?[]const []const u8) !void {
+    const names = values orelse return;
+    if (names.len > 256) return error.TooManyBackupTables;
+    for (names, 0..) |name, i| {
+        if (name.len == 0 or name.len > 4096) return error.InvalidBackupTableName;
+        for (names[0..i]) |previous| {
+            if (std.mem.eql(u8, previous, name)) return error.DuplicateBackupTableName;
+        }
+    }
+}
+
 pub fn freeClusterBackupRequest(alloc: std.mem.Allocator, req: *ClusterBackupRequest) void {
     alloc.free(req.backup_id);
     alloc.free(req.location);
+    if (req.connection) |value| alloc.free(value);
     if (req.table_names) |values| freeStringSlice(alloc, values);
     req.* = undefined;
 }
@@ -1658,6 +2494,7 @@ pub fn freeClusterBackupRequest(alloc: std.mem.Allocator, req: *ClusterBackupReq
 pub fn freeClusterRestoreRequest(alloc: std.mem.Allocator, req: *ClusterRestoreRequest) void {
     alloc.free(req.backup_id);
     alloc.free(req.location);
+    if (req.connection) |value| alloc.free(value);
     if (req.table_names) |values| freeStringSlice(alloc, values);
     if (req.restore_mode) |value| alloc.free(value);
     req.* = undefined;
@@ -1786,6 +2623,10 @@ test "backup manifest round trips through metadata path" {
     defer manifest.deinit(std.testing.allocator);
 
     try writeManifest(std.testing.allocator, root, &manifest);
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        writeManifest(std.testing.allocator, root, &manifest),
+    );
 
     var loaded = try readManifest(std.testing.allocator, root, "snap");
     defer loaded.deinit(std.testing.allocator);
@@ -1887,6 +2728,10 @@ test "backup manifest round trips through remote objectstore location" {
         .remote = try RemoteBackupStore.initWithClient(std.testing.allocator, client, "bucket", "backups/prod"),
     };
     defer location.deinit(std.testing.allocator);
+    // A backup.write connection does not imply HeadBucket/ListBucket. Verify
+    // publication goes directly through conditional PutObject when bucket
+    // provisioning is disabled.
+    location.remote.create_bucket_if_missing = false;
 
     const shards = [_]ShardSnapshot{
         .{
@@ -1913,6 +2758,10 @@ test "backup manifest round trips through remote objectstore location" {
     defer manifest.deinit(std.testing.allocator);
 
     try writeManifestToLocation(std.testing.allocator, &location, &manifest);
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        writeManifestToLocation(std.testing.allocator, &location, &manifest),
+    );
 
     var loaded = try readManifestFromLocation(std.testing.allocator, &location, "snap");
     defer loaded.deinit(std.testing.allocator);
@@ -1920,6 +2769,107 @@ test "backup manifest round trips through remote objectstore location" {
     try std.testing.expectEqualStrings("docs", loaded.table_name);
     try std.testing.expectEqual(@as(usize, 1), loaded.shards.len);
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
+}
+
+test "remote backup metadata reads are size bounded" {
+    const alloc = std.testing.allocator;
+    try ensureManifestSize("0123456789abcdef", 16);
+    try std.testing.expectError(error.BackupManifestTooLarge, ensureManifestSize("0123456789abcdefX", 16));
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    var put = try client.putObject("bucket", "backups/manifest.json", "0123456789abcdefX", .{});
+    put.deinit(alloc);
+
+    var store = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups");
+    defer store.deinit();
+    try std.testing.expectError(
+        error.BackupManifestTooLarge,
+        store.readBytesAllocLimited(alloc, "manifest.json", 16),
+    );
+
+    var replacement = try client.putObject("bucket", "backups/manifest.json", "0123456789abcdef", .{});
+    replacement.deinit(alloc);
+    const body = try store.readBytesAllocLimited(alloc, "manifest.json", 16);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("0123456789abcdef", body);
+}
+
+test "remote portable file transfer uses objectstore file paths" {
+    const alloc = std.testing.allocator;
+    const root = ".zig-cache/test-backup-file-transfer-store";
+    const source_path = ".zig-cache/test-backup-file-transfer-source.afb";
+    const restored_path = ".zig-cache/test-backup-file-transfer-restored.afb";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, restored_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, restored_path) catch {};
+
+    var source = try std.Io.Dir.cwd().createFile(io, source_path, .{ .truncate = true });
+    try source.writePositionalAll(io, "portable-file-body", 0);
+    try source.sync(io);
+    source.close(io);
+
+    var filesystem = try object_storage.FilesystemObjectStorage.initWithIo(alloc, root, io);
+    defer filesystem.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, filesystem.client(), "bucket", "backups/prod"),
+    };
+    defer location.deinit(alloc);
+
+    try copyFileToLocation(alloc, &location, "snap/data.afb", source_path, "application/vnd.antfly.backup");
+    try copyFileFromLocation(alloc, &location, "snap/data.afb", restored_path);
+    const restored = try std.Io.Dir.cwd().readFileAlloc(io, restored_path, alloc, .limited(1024));
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("portable-file-body", restored);
+}
+
+test "remote backup directory download paginates and enforces segment prefix" {
+    const alloc = std.testing.allocator;
+    const dest_root = ".zig-cache/test-paginated-backup-download";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    std.Io.Dir.cwd().deleteTree(io, dest_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dest_root) catch {};
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var raw_client = memory.client();
+    inline for (&.{
+        .{ "backups/prod/snap/a/one", "one" },
+        .{ "backups/prod/snap/a/nested/two", "two" },
+        .{ "backups/prod/snap/a/three", "three" },
+        .{ "backups/prod/snap/ab/evil", "evil" },
+    }) |entry| {
+        var put = try raw_client.putObject("bucket", entry[0], entry[1], .{});
+        put.deinit(alloc);
+    }
+
+    var store = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups/prod");
+    defer store.deinit();
+    try store.downloadDirectoryRecursiveWithPageSize(alloc, "snap/a", dest_root, 2);
+
+    inline for (&.{
+        .{ "one", "one" },
+        .{ "nested/two", "two" },
+        .{ "three", "three" },
+    }) |expected| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_root, expected[0] });
+        defer alloc.free(path);
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16));
+        defer alloc.free(body);
+        try std.testing.expectEqualStrings(expected[1], body);
+    }
+    const escaped_path = try std.fmt.allocPrint(alloc, "{s}/b/evil", .{dest_root});
+    defer alloc.free(escaped_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(io, escaped_path, alloc, .limited(16)));
 }
 
 test "cluster backup list uses top-level remote manifests without recursing into payloads" {
@@ -1937,6 +2887,15 @@ test "cluster backup list uses top-level remote manifests without recursing into
     var manifest = try createClusterManifest(std.testing.allocator, "prod-snap", "s3://bucket/backups/prod", &entries);
     defer manifest.deinit(std.testing.allocator);
     try writeClusterManifestToLocation(std.testing.allocator, &location, &manifest);
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        writeClusterManifestToLocation(std.testing.allocator, &location, &manifest),
+    );
+    inline for (&.{ "prod-snap-2", "prod-snap-3" }) |backup_id| {
+        var extra = try createClusterManifest(std.testing.allocator, backup_id, "s3://bucket/backups/prod", &entries);
+        defer extra.deinit(std.testing.allocator);
+        try writeClusterManifestToLocation(std.testing.allocator, &location, &extra);
+    }
 
     var raw_client = memory.client();
     var nested = try raw_client.putObject(
@@ -1947,16 +2906,88 @@ test "cluster backup list uses top-level remote manifests without recursing into
     );
     defer nested.deinit(std.testing.allocator);
 
-    const listed = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod");
-    defer {
-        for (listed) |info| freeBackupInfo(std.testing.allocator, info);
-        std.testing.allocator.free(listed);
+    var first = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod", .{ .limit = 2 });
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), first.backups.len);
+    try std.testing.expectEqualStrings("prod-snap-2", first.backups[0].backup_id);
+    try std.testing.expectEqualStrings("prod-snap-3", first.backups[1].backup_id);
+    try std.testing.expectEqual(@as(usize, 1), first.backups[0].tables.len);
+    try std.testing.expectEqualStrings("docs", first.backups[0].tables[0]);
+    try std.testing.expectEqualStrings("prod-snap-3", first.next_cursor.?);
+    const first_json = try encodeBackupListResponse(std.testing.allocator, &first);
+    defer std.testing.allocator.free(first_json);
+    try std.testing.expect(std.mem.indexOf(u8, first_json, "\"next_cursor\":\"prod-snap-3\"") != null);
+
+    var second = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod", .{
+        .limit = 2,
+        .cursor = first.next_cursor,
+    });
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), second.backups.len);
+    try std.testing.expectEqualStrings("prod-snap", second.backups[0].backup_id);
+    try std.testing.expectEqual(@as(?[]u8, null), second.next_cursor);
+    const second_json = try encodeBackupListResponse(std.testing.allocator, &second);
+    defer std.testing.allocator.free(second_json);
+    try std.testing.expect(std.mem.indexOf(u8, second_json, "next_cursor") == null);
+}
+
+test "filesystem backup listing is bounded and cursor stable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-list", .{tmp.sub_path});
+    defer alloc.free(root);
+    const entries = [_]ClusterTableBackupEntry{.{ .name = "docs", .table_backup_id = "docs-snapshot" }};
+    inline for (&.{ "prod-snap", "prod-snap-3", "prod-snap-2" }) |backup_id| {
+        var manifest = try createClusterManifest(alloc, backup_id, "file:///backups", &entries);
+        defer manifest.deinit(alloc);
+        try writeClusterManifest(alloc, root, &manifest);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), listed.len);
-    try std.testing.expectEqualStrings("prod-snap", listed[0].backup_id);
-    try std.testing.expectEqual(@as(usize, 1), listed[0].tables.len);
-    try std.testing.expectEqualStrings("docs", listed[0].tables[0]);
+    var first = try listClusterBackups(alloc, root, "file:///backups", .{ .limit = 2 });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), first.backups.len);
+    try std.testing.expectEqualStrings("prod-snap-2", first.backups[0].backup_id);
+    try std.testing.expectEqualStrings("prod-snap-3", first.backups[1].backup_id);
+    try std.testing.expectEqualStrings("prod-snap-3", first.next_cursor.?);
+
+    var second = try listClusterBackups(alloc, root, "file:///backups", .{
+        .limit = 2,
+        .cursor = first.next_cursor,
+    });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second.backups.len);
+    try std.testing.expectEqualStrings("prod-snap", second.backups[0].backup_id);
+    try std.testing.expectEqual(@as(?[]u8, null), second.next_cursor);
+}
+
+test "native backup directory copy preserves nested files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copy-src", .{tmp.sub_path});
+    defer alloc.free(src);
+    const dst = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copy-dst", .{tmp.sub_path});
+    defer alloc.free(dst);
+    const top = try std.fmt.allocPrint(alloc, "{s}/top.sst", .{src});
+    defer alloc.free(top);
+    const nested = try std.fmt.allocPrint(alloc, "{s}/nested/data.sst", .{src});
+    defer alloc.free(nested);
+    try writeFileAbsolute(top, "top");
+    try writeFileAbsolute(nested, "nested");
+
+    try copyDirectoryRecursive(alloc, src, dst);
+
+    const copied_top_path = try std.fmt.allocPrint(alloc, "{s}/top.sst", .{dst});
+    defer alloc.free(copied_top_path);
+    const copied_nested_path = try std.fmt.allocPrint(alloc, "{s}/nested/data.sst", .{dst});
+    defer alloc.free(copied_nested_path);
+    const copied_top = try readFileAbsoluteAlloc(alloc, copied_top_path, 16);
+    defer alloc.free(copied_top);
+    const copied_nested = try readFileAbsoluteAlloc(alloc, copied_nested_path, 16);
+    defer alloc.free(copied_nested);
+    try std.testing.expectEqualStrings("top", copied_top);
+    try std.testing.expectEqualStrings("nested", copied_nested);
 }
 
 test "go portable metadata parses as table backup manifest" {
@@ -1998,6 +3029,41 @@ test "backup remote location normalizes gcs alias" {
     const normalized = try normalizeRemoteLocationAlloc(std.testing.allocator, "gcs://bucket/path");
     defer std.testing.allocator.free(normalized);
     try std.testing.expectEqualStrings("gs://bucket/path", normalized);
+}
+
+test "backup connections enforce capability bucket and segment bounded prefix" {
+    const json =
+        \\{
+        \\  "connections": {
+        \\    "archive": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write", "restore.read"],
+        \\      "external_io": {
+        \\        "protocol": "s3",
+        \\        "buckets": ["prod-archive"],
+        \\        "prefix": "tenant-a/backups"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var config = try common_config.Config.parseFromSlice(std.testing.allocator, json);
+    defer config.deinit();
+
+    _ = try authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups/daily", "backup.write");
+    _ = try authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups/daily", "restore.read");
+    try std.testing.expectError(error.ConnectionCapabilityDenied, authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups/daily", "objects.delete"));
+    try std.testing.expectError(error.ConnectionBucketDenied, authorizedObjectConnection(&config, "archive", .s3, "other", "tenant-a/backups/daily", "backup.write"));
+    try std.testing.expectError(error.ConnectionPrefixDenied, authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups-evil", "backup.write"));
+}
+
+test "backup identifiers and artifact paths reject traversal" {
+    try validateBackupId("daily-2026.07.11");
+    try std.testing.expectError(error.InvalidBackupId, validateBackupId("../escape"));
+    try std.testing.expectError(error.InvalidBackupId, validateBackupId("nested/name"));
+    try validateArtifactRelativePath("daily/groups/7/data.bin");
+    try std.testing.expectError(error.InvalidBackupArtifactPath, validateArtifactRelativePath("daily/../secrets"));
+    try std.testing.expectError(error.InvalidBackupArtifactPath, validateArtifactRelativePath("/etc/passwd"));
 }
 
 test "derive restore table record returns owned table metadata" {

@@ -40,6 +40,22 @@ from conftest import (
 )
 from helpers import wait_until
 
+BACKUP_CONNECTION = "e2e-backups"
+
+
+def _wait_for_terminal_restore_job(backup_api, response: requests.Response, *, timeout_s: float = 30.0) -> dict:
+    assert response.status_code == 202
+    accepted = response.json()
+    job_id = accepted["job_id"]
+
+    def terminal() -> dict | None:
+        job = backup_api.get(f"/restore/jobs/{job_id}")
+        return job if job.get("phase") in {"succeeded", "failed", "cancelled"} else None
+
+    job = wait_until(terminal, timeout_s=timeout_s, interval_s=0.1)
+    assert job is not None
+    return job
+
 
 def _lookup_doc(stateful_api, table_name: str, key: str) -> dict | None:
     try:
@@ -924,11 +940,13 @@ def test_cluster_restore_modes(backup_api):
             {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": BACKUP_CONNECTION,
                 "restore_mode": "fail_if_exists",
             },
         )
-        assert fail_resp.status_code == 400
-        assert "already exists" in fail_resp.text
+        failed_job = _wait_for_terminal_restore_job(backup_api, fail_resp)
+        assert failed_job["phase"] == "failed"
+        assert failed_job["error"] == "TableAlreadyExists"
 
         _write_single_doc(backup_api, table_a, "doc:1", title="Mutated Alpha", content="mutated alpha")
         _write_single_doc(backup_api, table_b, "doc:1", title="Mutated Beta", content="mutated beta")
@@ -1048,32 +1066,32 @@ def test_backup_restore_request_validation(backup_api):
             (
                 "POST",
                 f"/tables/{table_name}/backup",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 f"/tables/{table_name}/restore",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/backup",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/restore",
-                {"backup_id": "snap", "location": "ftp://bucket/path"},
+                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/restore",
-                {"backup_id": "snap", "location": location, "restore_mode": "bogus"},
-                "invalid restore request",
+                {"backup_id": "snap", "location": location, "connection": BACKUP_CONNECTION, "restore_mode": "bogus"},
+                "invalid restore mode",
             ),
         )
 
@@ -1087,7 +1105,7 @@ def test_backup_restore_request_validation(backup_api):
         assert "Missing required query parameter: location" in missing_location.text
 
         unsupported_location = backup_api.s.get(
-            f"{backup_api.url}/backups?location=ftp://bucket/path",
+            f"{backup_api.url}/backups?location=ftp://bucket/path&connection={BACKUP_CONNECTION}",
             timeout=30,
         )
         assert unsupported_location.status_code == 400
@@ -1117,10 +1135,12 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
             {
                 "backup_id": missing_backup_id,
                 "location": location,
+                "connection": BACKUP_CONNECTION,
             },
         )
-        assert table_restore.status_code == 400
-        assert "restore target already exists" in table_restore.text
+        table_job = _wait_for_terminal_restore_job(backup_api, table_restore)
+        assert table_job["phase"] == "failed"
+        assert table_job["error"] == "TableAlreadyExists"
 
         cluster_restore = backup_api._request(
             "POST",
@@ -1128,8 +1148,10 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
             {
                 "backup_id": missing_backup_id,
                 "location": location,
+                "connection": BACKUP_CONNECTION,
                 "restore_mode": "fail_if_exists",
             },
         )
-        assert cluster_restore.status_code == 400
-        assert "invalid restore request" in cluster_restore.text
+        cluster_job = _wait_for_terminal_restore_job(backup_api, cluster_restore)
+        assert cluster_job["phase"] == "failed"
+        assert cluster_job["error"] == "InvalidRequest"

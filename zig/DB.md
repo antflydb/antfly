@@ -61,9 +61,10 @@ Restore never reconstructs the live root in place. It acquires a process-wide
 preparation capability for the exact shard root, creates a unique sibling
 staging generation, imports and validates the primary store there, runs
 foreground derived/runtime repair against that staged path, closes and
-recursively syncs and seals the staged generation, and only then drains serving leases and
-promotes preparation to the exclusive publication capability. A prepare or repair failure
-destroys staging and leaves the live generation untouched. macOS and Linux use
+recursively syncs and seals the staged generation, and only then drains serving
+leases and promotes preparation to the exclusive publication capability. A
+prepare or repair failure destroys staging and leaves the live generation
+untouched. macOS and Linux use
 atomic directory exchange when a live generation exists. Platforms or
 filesystems without atomic exchange reject replacement before mutating the live
 namespace. After durable publication, the exchanged old root is submitted to
@@ -281,7 +282,11 @@ writer behind a stale table label. A process-local transition admission lock
 serializes fallback coordinators while a destination is not yet published.
 Destination identity comes from its projected range when available, with the
 source range used only for pre-publication bootstrap; identity reassignment is
-never performed against a live managed DB.
+never performed against a live managed DB. Writer-cache admission validates the
+expected namespace before returning a lease. An idle mismatched owner is
+retired and closed before replacement; an active mismatch blocks the new open
+until its existing lease drains. This prevents a pre-publication destination
+open from becoming the serving writer for a differently namespaced range.
 
 Allocator ownership is part of the same lifetime contract. APIs that return
 owned storage/index buffers accept the allocator that must later free them, or
@@ -782,7 +787,7 @@ Runtime-backed work follows these boundaries:
 Current status:
 
 - `BackendRuntime` is heap-owned at node/server construction sites and borrowed
-  through DataServer, provisioned, hosted, metadata, and swarm DB open paths
+  through DataServer, provisioned, hosted, metadata, and standalone DB open paths
 - derived replay, full-text merge, enrichment replay, TTL cleanup, transaction
   recovery, and LSM background flush are under the shared runtime model
 - `DurableJobLane` has inline and threaded implementations

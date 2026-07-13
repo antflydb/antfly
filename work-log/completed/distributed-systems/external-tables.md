@@ -477,7 +477,7 @@ Create `ReplicationManager` with `ln` (as MetadataTransformer), `metadataStore` 
 2. **Unit tests**: `GOEXPERIMENT=simd go test ./src/metadata/foreign/...`
 3. **Manual single-source test** (requires PostgreSQL with `wal_level=logical`):
    - Create PG table: `CREATE TABLE products (id TEXT PRIMARY KEY, name TEXT, price FLOAT, metadata JSONB, internal_notes TEXT)`
-   - Start Antfly: `go run ./cmd/antfly swarm`
+   - Start Antfly: `go run ./cmd/antfly standalone`
    - Create table with replication + on_update transforms:
      ```bash
      curl -X POST localhost:8080/api/v1/tables/products -d '{

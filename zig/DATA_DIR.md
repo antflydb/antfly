@@ -32,8 +32,8 @@ marker applies to the whole directory tree, not to an individual node mode.
 ## Design
 
 The top-level directories are durable storage domains, not process modes.
-`swarm` is a way to run Antfly locally, so it must not create a durable
-`<data-dir>/swarm` namespace by default. Swarm should use the same domain
+`standalone` is a way to run Antfly locally, so it must not create a durable
+`<data-dir>/standalone` namespace by default. Standalone should use the same domain
 directories as standalone metadata, data, and inference nodes.
 
 `metadata/` owns metadata raft state:
@@ -42,7 +42,7 @@ directories as standalone metadata, data, and inference nodes.
 - `metadata/catalog.txt` stores the metadata replica catalog.
 - `metadata/snapshots/` stores metadata raft snapshot transport payloads.
 - `metadata/auth/` stores local auth users, roles, and policy state.
-- `metadata/local-metadata.json` is used by local swarm mode when metadata raft
+- `metadata/local-metadata.json` is used by local standalone mode when metadata raft
   is disabled.
 
 `data/` owns data-node state:

@@ -581,7 +581,7 @@ jobs:
           ANTFLY_LSM_OPEN_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          uv run --project e2e/antfly pytest -q e2e/antfly
+          uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
 
       - name: Run Antfly inference full E2E
         id: inference_full_e2e
@@ -592,15 +592,16 @@ jobs:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
-        run: uv run --project e2e/inference pytest -q e2e/inference
+        run: uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
-      - name: Report E2E failures
+      - name: Report full E2E result
         if: always()
         env:
           ANTFLY_E2E_OUTCOME: ${{ steps.antfly_full_e2e.outcome }}
           INFERENCE_E2E_OUTCOME: ${{ steps.inference_full_e2e.outcome }}
         run: |
           if [[ "$ANTFLY_E2E_OUTCOME" != "success" || "$INFERENCE_E2E_OUTCOME" != "success" ]]; then
-            echo "E2E failures: antfly=$ANTFLY_E2E_OUTCOME inference=$INFERENCE_E2E_OUTCOME" >&2
+            echo "Antfly E2E: $ANTFLY_E2E_OUTCOME" >&2
+            echo "Inference E2E: $INFERENCE_E2E_OUTCOME" >&2
             exit 1
           fi

@@ -30,15 +30,15 @@ const (
 	fieldEdgeTestTable = "graph_field_edge_test"
 )
 
-// setupFieldEdgeSwarm creates a swarm with a graph-indexed table that uses
+// setupFieldEdgeStandalone creates a standalone with a graph-indexed table that uses
 // field-based edges, tree topology, and a summarizer (via Antfly inference).
-func setupFieldEdgeSwarm(t *testing.T) *SwarmInstance {
+func setupFieldEdgeStandalone(t *testing.T) *StandaloneInstance {
 	t.Helper()
 
 	ctx := testContext(t, 5*time.Minute)
 
-	swarm := startAntflySwarm(t, ctx)
-	t.Cleanup(swarm.Cleanup)
+	standalone := startAntflyStandalone(t, ctx)
+	t.Cleanup(standalone.Cleanup)
 
 	// Build graph index config with:
 	//   - "child_of" edge type: field-based (parent_id), tree topology
@@ -66,7 +66,7 @@ func setupFieldEdgeSwarm(t *testing.T) *SwarmInstance {
 		},
 	})
 
-	err := swarm.Client.CreateTable(ctx, fieldEdgeTestTable, antfly.CreateTableRequest{
+	err := standalone.Client.CreateTable(ctx, fieldEdgeTestTable, antfly.CreateTableRequest{
 		NumShards: 1,
 		Indexes: map[string]oapi.IndexConfig{
 			"hierarchy": graphConfig,
@@ -74,9 +74,9 @@ func setupFieldEdgeSwarm(t *testing.T) *SwarmInstance {
 	})
 	require.NoError(t, err, "Failed to create table with field-based graph index")
 
-	waitForShardsReady(t, ctx, swarm.Client, fieldEdgeTestTable, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, fieldEdgeTestTable, 30*time.Second)
 
-	return swarm
+	return standalone
 }
 
 // waitForFieldEdge polls until a field-based edge is queryable in both
@@ -148,7 +148,7 @@ func TestE2E_GraphFieldEdges_BasicFieldExtraction(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
-	swarm := setupFieldEdgeSwarm(t)
+	standalone := setupFieldEdgeStandalone(t)
 
 	// Insert documents with parent_id field.
 	// The enricher should automatically create child_of edges and generate summaries.
@@ -181,7 +181,7 @@ func TestE2E_GraphFieldEdges_BasicFieldExtraction(t *testing.T) {
 	}
 
 	t.Log("Inserting documents with parent_id fields...")
-	_, err := swarm.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
+	_, err := standalone.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
 		Inserts:   testDocs,
 		SyncLevel: antfly.SyncLevelWrite,
 	})
@@ -190,13 +190,13 @@ func TestE2E_GraphFieldEdges_BasicFieldExtraction(t *testing.T) {
 	// Wait for enricher to create field-based edges for ALL documents.
 	// The enricher processes documents sequentially, so we must wait for each.
 	t.Log("Waiting for enricher to create child_of edges...")
-	waitForFieldEdge(t, swarm.Client, "4_child1", "0_root", "child_of", 60*time.Second)
-	waitForFieldEdge(t, swarm.Client, "8_child2", "0_root", "child_of", 60*time.Second)
-	waitForFieldEdge(t, swarm.Client, "c_grandchild1", "4_child1", "child_of", 60*time.Second)
+	waitForFieldEdge(t, standalone.Client, "4_child1", "0_root", "child_of", 60*time.Second)
+	waitForFieldEdge(t, standalone.Client, "8_child2", "0_root", "child_of", 60*time.Second)
+	waitForFieldEdge(t, standalone.Client, "c_grandchild1", "4_child1", "child_of", 60*time.Second)
 
 	// Query: find all direct children of root using reverse edge traversal
 	t.Log("Querying for children of root...")
-	result, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	result, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: fieldEdgeTestTable,
 		GraphSearches: map[string]oapi.GraphQuery{
 			"children_of_root": {
@@ -234,7 +234,7 @@ func TestE2E_GraphFieldEdges_BasicFieldExtraction(t *testing.T) {
 
 	// Query: 2-hop traversal — find grandchildren
 	t.Log("Querying for grandchildren of root...")
-	result, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	result, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: fieldEdgeTestTable,
 		GraphSearches: map[string]oapi.GraphQuery{
 			"grandchildren": {
@@ -287,7 +287,7 @@ func TestE2E_GraphFieldEdges_TreeTopologyRejectsMultiParent(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
-	swarm := setupFieldEdgeSwarm(t)
+	standalone := setupFieldEdgeStandalone(t)
 
 	// Insert initial tree: child -> parent1 via explicit _edges
 	testDocs := map[string]any{
@@ -313,7 +313,7 @@ func TestE2E_GraphFieldEdges_TreeTopologyRejectsMultiParent(t *testing.T) {
 	}
 
 	t.Log("Inserting initial tree...")
-	_, err := swarm.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
+	_, err := standalone.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
 		Inserts:   testDocs,
 		SyncLevel: antfly.SyncLevelWrite,
 	})
@@ -338,7 +338,7 @@ func TestE2E_GraphFieldEdges_TreeTopologyRejectsMultiParent(t *testing.T) {
 		},
 	}
 
-	_, err = swarm.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
 		Inserts:   reparentDoc,
 		SyncLevel: antfly.SyncLevelWrite,
 	})
@@ -348,7 +348,7 @@ func TestE2E_GraphFieldEdges_TreeTopologyRejectsMultiParent(t *testing.T) {
 
 	// Verify: child now points to parent2 (not parent1)
 	b64Parent2 := base64.StdEncoding.EncodeToString([]byte("4_parent2"))
-	result, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	result, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: fieldEdgeTestTable,
 		GraphSearches: map[string]oapi.GraphQuery{
 			"check": {
@@ -386,7 +386,7 @@ func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
-	swarm := setupFieldEdgeSwarm(t)
+	standalone := setupFieldEdgeStandalone(t)
 
 	// Insert: child -> parent1
 	testDocs := map[string]any{
@@ -406,7 +406,7 @@ func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
 	}
 
 	t.Log("Inserting initial documents (child -> parent1)...")
-	_, err := swarm.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
+	_, err := standalone.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
 		Inserts:   testDocs,
 		SyncLevel: antfly.SyncLevelWrite,
 	})
@@ -414,10 +414,10 @@ func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
 
 	// Wait for enricher to create initial edge
 	t.Log("Waiting for initial child_of edge...")
-	waitForFieldEdge(t, swarm.Client, "8_child", "0_parent1", "child_of", 60*time.Second)
+	waitForFieldEdge(t, standalone.Client, "8_child", "0_parent1", "child_of", 60*time.Second)
 
 	// Verify: child -> parent1
-	result, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	result, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: fieldEdgeTestTable,
 		GraphSearches: map[string]oapi.GraphQuery{
 			"check": {
@@ -452,7 +452,7 @@ func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
 
 	// Update: change parent_id to parent2
 	t.Log("Updating child's parent_id to parent2...")
-	_, err = swarm.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
 		Inserts: map[string]any{
 			"8_child": map[string]any{
 				"title":     "Child Updated",
@@ -468,7 +468,7 @@ func TestE2E_GraphFieldEdges_FieldEdgeUpdate(t *testing.T) {
 	t.Log("Waiting for enricher to update edges...")
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		result, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+		result, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 			Table: fieldEdgeTestTable,
 			GraphSearches: map[string]oapi.GraphQuery{
 				"check": {
@@ -511,7 +511,7 @@ func TestE2E_GraphFieldEdges_MixedExplicitAndFieldEdges(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
-	swarm := setupFieldEdgeSwarm(t)
+	standalone := setupFieldEdgeStandalone(t)
 
 	// Insert documents with both field-based (parent_id -> child_of)
 	// and explicit (_edges -> related_to) edges
@@ -539,7 +539,7 @@ func TestE2E_GraphFieldEdges_MixedExplicitAndFieldEdges(t *testing.T) {
 	}
 
 	t.Log("Inserting documents with mixed edge types...")
-	_, err := swarm.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
+	_, err := standalone.Client.Batch(ctx, fieldEdgeTestTable, antfly.BatchRequest{
 		Inserts:   testDocs,
 		SyncLevel: antfly.SyncLevelWrite,
 	})
@@ -547,10 +547,10 @@ func TestE2E_GraphFieldEdges_MixedExplicitAndFieldEdges(t *testing.T) {
 
 	// Wait for enricher to create child_of edge
 	t.Log("Waiting for enricher to create child_of edge...")
-	waitForFieldEdge(t, swarm.Client, "4_page", "0_root", "child_of", 60*time.Second)
+	waitForFieldEdge(t, standalone.Client, "4_page", "0_root", "child_of", 60*time.Second)
 
 	// Verify both edge types
-	result, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	result, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table: fieldEdgeTestTable,
 		GraphSearches: map[string]oapi.GraphQuery{
 			"field_edge": {

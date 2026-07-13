@@ -66,6 +66,8 @@ spec:
                 properties:
                   backupId:
                     type: string
+                  connection:
+                    type: string
                   credentialsSecret:
                     properties:
                       name:

@@ -154,11 +154,11 @@ pub const ContainerStorage = struct {
         defer io_impl.deinit();
         const io = io_impl.io();
 
-        const lock_file = try openLockFile(io, path, true);
-        defer if (lock_file) |file| {
-            file.unlock(io);
-            file.close(io);
-        };
+        var lock_file = try openLockFile(io, path, true);
+        defer {
+            lock_file.unlock(io);
+            lock_file.close(io);
+        }
 
         const raw = try readFile(io, allocator, path, std.math.maxInt(usize));
         defer allocator.free(raw);
@@ -797,14 +797,12 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
     try fs_paths.createDirPathPortable(io, parent);
 }
 
-fn openLockFile(io: std.Io, path: []const u8, read_only: bool) !?std.Io.File {
-    return openLockedFile(io, path, read_only) catch |err| switch (err) {
-        error.FileLocksUnsupported => {
-            try prepareUnlockedFile(io, path, read_only);
-            return null;
-        },
-        else => return err,
-    };
+fn openLockFile(io: std.Io, path: []const u8, read_only: bool) !std.Io.File {
+    // The bridge is internal, but it shares Lite's file-safety contract:
+    // never open a writable container or maintenance/check handle without an
+    // OS-enforced lease. There is no safe process-local substitute for a
+    // filesystem that does not implement advisory locks.
+    return try openLockedFile(io, path, read_only);
 }
 
 fn openLockedFile(io: std.Io, path: []const u8, read_only: bool) !std.Io.File {
@@ -827,20 +825,6 @@ fn openLockedFile(io: std.Io, path: []const u8, read_only: bool) !std.Io.File {
     });
     errdefer file.close(io);
     return file;
-}
-
-fn prepareUnlockedFile(io: std.Io, path: []const u8, read_only: bool) !void {
-    if (read_only) {
-        var file = try openFilePortable(io, path, .{ .mode = .read_only });
-        defer file.close(io);
-        return;
-    }
-
-    var file = try fs_paths.createFilePortable(io, path, .{
-        .read = true,
-        .truncate = false,
-    });
-    defer file.close(io);
 }
 
 fn openFilePortable(io: std.Io, path: []const u8, flags: std.Io.Dir.OpenFileOptions) !std.Io.File {

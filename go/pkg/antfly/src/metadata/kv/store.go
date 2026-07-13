@@ -248,12 +248,12 @@ func (m *MetadataStore) StartRaftGroup(peers []common.Peer, join bool) error {
 	var errorC <-chan error
 	var raftNode raft.RaftNode
 
-	// Check if we're running in swarm mode (single node, no Raft needed)
+	// Check if we're running in standalone mode (single node, no Raft needed)
 	// This is determined by having exactly one peer and that peer being ourselves
-	swarmMode := len(peers) == 1 && peers[0].ID == m.config.ID
+	standaloneMode := len(peers) == 1 && peers[0].ID == m.config.ID
 
-	if swarmMode {
-		m.logger.Info("Starting metadata in swarm mode (bypassing Raft)")
+	if standaloneMode {
+		m.logger.Info("Starting metadata in standalone mode (bypassing Raft)")
 		commitC, errorC = m.createPassThroughChannels(proposeC)
 	} else {
 		raftConf := raft.RaftNodeConfig{
@@ -281,7 +281,7 @@ func (m *MetadataStore) StartRaftGroup(peers []common.Peer, join bool) error {
 
 	dbDir := common.MetadataStorageDir(dataDir, m.config.ID)
 
-	// In swarm mode without Raft, provide a stub function that returns an empty snapshot ID
+	// In standalone mode without Raft, provide a stub function that returns an empty snapshot ID
 	var getSnapshotID func(ctx context.Context) (string, error)
 	if raftNode != nil {
 		getSnapshotID = raftNode.GetSnapshotID

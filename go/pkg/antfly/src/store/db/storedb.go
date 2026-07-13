@@ -1150,7 +1150,7 @@ func (s *StoreDB) applyOpBackup(_ context.Context, backup *BackupOp) error {
 			)
 			blobTime := time.Now()
 			// Don't timeout the blob store write if the client times out, it might take a while
-			err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.S3)
+			err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.Local.S3)
 			s.logger.Info("Blob store write completed",
 				zap.String("backupID", backupID),
 				zap.Duration("blobWriteDuration", time.Since(blobTime)),
@@ -1196,7 +1196,7 @@ func (s *StoreDB) applyOpBackup(_ context.Context, backup *BackupOp) error {
 			zap.String("location", location),
 		)
 		// Don't timeout the blob store write if the client times out, it might take a while
-		err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.S3)
+		err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.Local.S3)
 		blobDuration := time.Since(blobTime)
 		s.logger.Info("Backup operation completed",
 			zap.String("backupID", backupID),
@@ -2181,7 +2181,7 @@ func (s *StoreDB) loadPersistentSnapshot(ctx context.Context) error {
 	} else if err != nil {
 		return fmt.Errorf("loading snapshot: %w", err)
 	}
-	// In swarm mode, snapID will be empty (no Raft snapshots)
+	// In standalone mode, snapID will be empty (no Raft snapshots)
 	if snapID == "" {
 		return nil
 	}

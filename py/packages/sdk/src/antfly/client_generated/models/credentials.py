@@ -19,12 +19,12 @@ class Credentials:
             s3.amazonaws.com.
         use_ssl (bool | Unset): Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
             Default: True.
-        access_key_id (str | Unset): AWS access key ID. Supports keystore syntax for secret lookup. Falls back to
-            AWS_ACCESS_KEY_ID environment variable if not set. Example: your-access-key-id.
-        secret_access_key (str | Unset): AWS secret access key. Supports keystore syntax for secret lookup. Falls back
-            to AWS_SECRET_ACCESS_KEY environment variable if not set. Example: your-secret-access-key.
-        session_token (str | Unset): Optional AWS session token for temporary credentials. Supports keystore syntax for
-            secret lookup. Example: your-session-token.
+        access_key_id (str | Unset): AWS access key ID. Supports secret-store references. Falls back to
+            AWS_ACCESS_KEY_ID when not set. Example: your-access-key-id.
+        secret_access_key (str | Unset): AWS secret access key. Supports secret-store references. Falls back to
+            AWS_SECRET_ACCESS_KEY when not set. Example: your-secret-access-key.
+        session_token (str | Unset): Optional AWS session token for temporary credentials. Supports secret-store
+            references. Example: your-session-token.
     """
 
     endpoint: str | Unset = UNSET

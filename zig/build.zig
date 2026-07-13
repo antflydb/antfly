@@ -1147,7 +1147,7 @@ pub fn build(b: *std.Build) void {
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, antfly_version);
-    const swarm_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, antfly_version);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, antfly_version);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -1517,6 +1517,7 @@ pub fn build(b: *std.Build) void {
     });
     termite_onnx_graph_mod.addImport("protobuf", protobuf_mod);
     termite_onnx_graph_mod.addImport("ml", termite_ml_mod);
+    termite_onnx_graph_mod.addImport("structlog", structlog_mod);
     const termite_pjrt_xla_proto_mod = b.createModule(.{
         .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
         .target = target,
@@ -2256,6 +2257,10 @@ pub fn build(b: *std.Build) void {
 
     const lib_onnx_tests = b.addTest(.{
         .root_module = termite_onnx_graph_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_onnx_tests = b.addRunArtifact(lib_onnx_tests);
     run_lib_onnx_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
@@ -2419,6 +2424,55 @@ pub fn build(b: *std.Build) void {
     const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
     const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
     lib_api_artifact_reprocess_jobs_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
+
+    const api_restore_jobs_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_restore_jobs_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_restore_jobs_test_mod, true, true);
+    const api_restore_jobs_tests = b.addTest(.{
+        .root_module = api_restore_jobs_test_mod,
+        .filters = &.{
+            "restore job store is idempotent and fenced",
+            "successful restore completion wins a racing cancellation",
+            "restore job runnable queue drains incrementally and preserves insertion order",
+            "replicated restore leadership rebuild preserves FIFO and recovers running attempts",
+            "restore requests without idempotency keys create independent opaque jobs",
+            "restore runtime store persists checkpoints and requeues interrupted work",
+            "restore progress ordinals remain bounded at maximum table count",
+            "cluster restore summaries are truthful and bounded",
+            "restore job store rejects oversized request state",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_api_restore_jobs_tests = b.addRunArtifact(api_restore_jobs_tests);
+    const lib_api_restore_jobs_test_step = b.step("lib-api-restore-jobs-test", "Run durable restore job store tests");
+    lib_api_restore_jobs_test_step.dependOn(&run_api_restore_jobs_tests.step);
+
+    const portable_backup_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/portable_backup_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, portable_backup_test_mod, true, true);
+    const portable_backup_tests = b.addTest(.{
+        .root_module = portable_backup_test_mod,
+        .filters = &.{
+            "export and import documents round trip",
+            "file import rejects oversized portable blocks before allocation",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_portable_backup_tests = b.addRunArtifact(portable_backup_tests);
+    const lib_portable_backup_test_step = b.step("lib-portable-backup-test", "Run bounded portable backup tests");
+    lib_portable_backup_test_step.dependOn(&run_portable_backup_tests.step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -2859,6 +2913,11 @@ pub fn build(b: *std.Build) void {
         "lsm backend compaction chaos campaign",
     };
     const lib_unit_default_filters = [_][]const u8{
+        "restore job store is idempotent and fenced",
+        "restore requests without idempotency keys create independent opaque jobs",
+        "restore runtime store persists checkpoints and requeues interrupted work",
+        "restore job store rejects oversized request state",
+        "restore filesystem scope containment handles filesystem roots and component boundaries",
         ".test_0",
         "module compiles",
         "cache budget atomically enforces its hard limit",
@@ -2900,6 +2959,7 @@ pub fn build(b: *std.Build) void {
         "provisioned primary lookup lease fails on identity namespace mismatch",
         "inference pull recognizes help before model resolution",
         "inference pull classifies order independent value flags",
+        "inference pull rejects flags from the other model domain",
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "metadata.table generated field capabilities include schema dynamic templates",
@@ -3263,6 +3323,21 @@ pub fn build(b: *std.Build) void {
     const run_serverless_tests = b.addRunArtifact(serverless_tests);
     const serverless_test_step = b.step("serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
+
+    const serverless_manifest_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, serverless_manifest_test_mod, true, true);
+    const serverless_manifest_tests = b.addTest(.{
+        .root_module = serverless_manifest_test_mod,
+        .filters = &.{"objectstore-backed manifest store supports publish and list"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_serverless_manifest_tests = b.addRunArtifact(serverless_manifest_tests);
+    const serverless_manifest_test_step = b.step("lib-serverless-manifest-test", "Run focused serverless manifest object-store tests");
+    serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
         "data runtime health metrics include replay debt and provisioned warmup counters",
@@ -3844,6 +3919,7 @@ pub fn build(b: *std.Build) void {
         "api http server surfaces structured torn-state conflicts when txn record is corrupted",
         "api http server serves transaction session cleanup route",
         "api http server serves table metadata list and detail",
+        "api http server exposes storage status and asynchronous maintenance jobs",
         "api http server serves runtime schema debug on table and index detail",
         "api http server serves table index metadata routes",
         "api runtime status upsert keeps one authoritative observation per group",
@@ -3861,6 +3937,7 @@ pub fn build(b: *std.Build) void {
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
         "api http server returns retryable not leader through public cluster adapter mutation",
+        "api http server rejects restore before persistence without an asynchronous worker",
         "api http server backs up and restores a table through public routes",
         "api http server cluster overwrite restore tolerates already absent metadata drop",
         "api http server durability-pending restore preserves committed metadata",
@@ -3951,6 +4028,116 @@ pub fn build(b: *std.Build) void {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+
+    const lib_storage_maintenance_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "storage maintenance requires an asynchronous backend runtime",
+            "storage maintenance coordinator is idempotent and single flight",
+            "storage maintenance job ids are namespaced by server boot",
+            "storage maintenance cancellation reaches a cooperative engine",
+            "storage maintenance shutdown fences and drains its backend runtime owner",
+            "storage maintenance snapshots remain valid after retention pruning",
+            "storage maintenance append allocation failure does not wedge coordinator",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_storage_maintenance_tests = b.addRunArtifact(lib_storage_maintenance_tests);
+    const lib_storage_maintenance_test_step = b.step("lib-storage-maintenance-test", "Run storage maintenance coordinator ownership and concurrency tests");
+    lib_storage_maintenance_test_step.dependOn(&run_lib_storage_maintenance_tests.step);
+    unit_test_step.dependOn(lib_storage_maintenance_test_step);
+
+    const api_connections_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_connections_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_connections_test_mod, true, true);
+    const lib_api_connections_tests = b.addTest(.{
+        .root_module = api_connections_test_mod,
+        .filters = &.{
+            "object probe cache identity covers every bucket and credential source",
+            "connection cache remains valid across every allocation failure",
+            "build response reports mock connected and types filter",
+            "build response reports configured external io connections",
+            "build response reports configured web search connections",
+            "build response includes cdc replication sources with generic cdc kind",
+            "include param parsing",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_connections_tests = b.addRunArtifact(lib_api_connections_tests);
+    const lib_api_connections_test_step = b.step("lib-api-connections-test", "Run connection inventory and probe-admission tests");
+    lib_api_connections_test_step.dependOn(&run_lib_api_connections_tests.step);
+
+    const api_storage_authority_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_storage_authority_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_storage_authority_test_mod, true, true);
+    const lib_api_storage_authority_tests = b.addTest(.{
+        .root_module = api_storage_authority_test_mod,
+        .filters = &.{
+            "public table backup and restore require named connections",
+            "public table backup handler rejects an existing backup id",
+            "cluster backup APIs require named connections",
+            "cluster backup format defaults portable and preserves explicit native",
+            "cluster backup and restore reject duplicate table selectors",
+            "backup API requests reject unknown operational fields",
+            "backup manifest round trips through metadata path",
+            "backup manifest round trips through remote objectstore location",
+            "remote backup metadata reads are size bounded",
+            "cluster backup list uses top-level remote manifests without recursing into payloads",
+            "filesystem backup listing is bounded and cursor stable",
+            "native backup directory copy preserves nested files",
+            "remote portable file transfer uses objectstore file paths",
+            "remote backup directory download paginates and enforces segment prefix",
+            "api http server lists cluster backups through public route",
+            "backup staging uses configured storage authority and exclusive generations",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_storage_authority_tests = b.addRunArtifact(lib_api_storage_authority_tests);
+    const lib_api_storage_authority_test_step = b.step("lib-api-storage-authority-test", "Run remote backup credential-boundary tests");
+    lib_api_storage_authority_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
+
+    const api_session_maintenance_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_session_maintenance_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_session_maintenance_test_mod, true, true);
+    const lib_api_session_maintenance_tests = b.addTest(.{
+        .root_module = api_session_maintenance_test_mod,
+        .filters = &.{
+            "durable session mutations publish only after persistence succeeds",
+            "transaction session registry adopts durable session ownership",
+            "transaction session registry only adopts durable sessions after lease expiry",
+            "transaction session registry reports status and cleans expired durable sessions",
+            "transaction session registry enforces savepoint limits and reports remaining capacity",
+            "transaction session registry can renew owned leases opportunistically",
+            "api http server keeps session maintenance off public request paths",
+            "api http server can renew owned session leases via explicit maintenance hook",
+            "api http server keeps session maintenance off internal request paths",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_session_maintenance_tests = b.addRunArtifact(lib_api_session_maintenance_tests);
+    const lib_api_session_maintenance_test_step = b.step("lib-api-session-maintenance-test", "Run durable session concurrency and background-maintenance tests");
+    lib_api_session_maintenance_test_step.dependOn(&run_lib_api_session_maintenance_tests.step);
 
     const lib_api_docid_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4502,17 +4689,17 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
     lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
 
-    const lib_api_swarm_backup_restore_tests = b.addTest(.{
+    const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "public api swarm-like e2e backs up drops and restores a table",
+            "public api standalone-like e2e backs up drops and restores a table",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite stages before replacing metadata without dropping live table",
         },
     });
-    const run_lib_api_swarm_backup_restore_tests = b.addRunArtifact(lib_api_swarm_backup_restore_tests);
-    const lib_api_swarm_backup_restore_test_step = b.step("lib-api-swarm-backup-restore-test", "Run the focused swarm-like backup/restore e2e test");
-    lib_api_swarm_backup_restore_test_step.dependOn(&run_lib_api_swarm_backup_restore_tests.step);
+    const run_lib_api_standalone_backup_restore_tests = b.addRunArtifact(lib_api_standalone_backup_restore_tests);
+    const lib_api_standalone_backup_restore_test_step = b.step("lib-api-standalone-backup-restore-test", "Run the focused standalone-like backup/restore e2e test");
+    lib_api_standalone_backup_restore_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
 
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
@@ -4809,29 +4996,30 @@ pub fn build(b: *std.Build) void {
     conformance_test_step.dependOn(run_lib_audio_xiph_conformance_after_fetch_quiet_step);
     conformance_test_step.dependOn(run_lib_audio_misc_conformance_after_fetch_quiet_step);
 
-    const swarm_runtime_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/swarm_runtime_test_root.zig"),
+    const standalone_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    var swarm_runtime_imports = antfly_imports;
-    swarm_runtime_imports.build_options = swarm_runtime_build_options;
-    swarm_runtime_imports.configure(b, swarm_runtime_test_mod, true, true);
-    const usermgr_storage_swarm_runtime_test_mod = b.createModule(.{
+    var standalone_runtime_imports = antfly_imports;
+    standalone_runtime_imports.build_options = standalone_runtime_build_options;
+    standalone_runtime_imports.configure(b, standalone_runtime_test_mod, true, true);
+    const usermgr_storage_standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
         .optimize = optimize,
     });
-    usermgr_storage_swarm_runtime_test_mod.addImport("antfly_root", swarm_runtime_test_mod);
-    usermgr_storage_swarm_runtime_test_mod.addImport("antfly_platform", platform_mod);
-    swarm_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_swarm_runtime_test_mod);
-    const lib_swarm_runtime_tests = b.addTest(.{
-        .root_module = swarm_runtime_test_mod,
+    usermgr_storage_standalone_runtime_test_mod.addImport("antfly_root", standalone_runtime_test_mod);
+    usermgr_storage_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
+    const lib_standalone_runtime_tests = b.addTest(.{
+        .root_module = standalone_runtime_test_mod,
         .filters = &.{
-            "swarm runtime module compiles",
-            "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
-            "swarm runtime registers internal group routes explicitly",
-            "swarm runtime registers mcp routes before antfarm catch-all",
+            "standalone runtime module compiles",
+            "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved",
+            "standalone runtime registers internal group routes explicitly",
+            "standalone runtime registers mcp routes before antfarm catch-all",
+            "standalone runtime antfarm path guards keep api routes reserved",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -4839,26 +5027,37 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
             "parse cli accepts HA standby runtime flags",
-            "swarm HA standby replication flags require upstream and slot",
-            "swarm HA string classifier distinguishes missing padded and valid values",
-            "swarm HA runtime rejects ambiguous role flags",
+            "standalone HA standby replication flags require upstream and slot",
+            "standalone HA string classifier distinguishes missing padded and valid values",
+            "standalone HA runtime rejects ambiguous role flags",
             "antfly config uses cli override before common config",
-            "swarm public api caps keep alive request reuse",
-            "swarm public api body limit matches common http listener",
-            "swarm public HTTP server uses public API request body limit",
+            "standalone public api caps keep alive request reuse",
+            "standalone public api body limit matches common http listener",
+            "standalone public HTTP server is restart-safe and uses public API request body limit",
+            "standalone Lite transaction sessions survive file reopen",
+            "durable session mutations publish only after persistence succeeds",
+            "durable session limits bound count and encoded record size",
+            "common config rejects removed top-level storage backend fields",
+            "common config parses bounded transaction session policy",
+            "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
-            "swarm runtime resolves paths from common storage base dir",
-            "swarm runtime resolves extension package store env before local default",
+            "standalone runtime resolves paths from common storage base dir",
+            "standalone runtime resolves extension package store env before local default",
+            "standalone Lite enforces one shard and one replica",
+            "standalone Lite adoption preserves deterministic embedded document identity",
+            "standalone validates effective Lite CLI and config settings",
+            "standalone metadata rolls back an undurable catalog mutation",
+            "standalone unified server lifecycle propagates startup failure",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
-    const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
-    lib_swarm_runtime_test_step.dependOn(&run_lib_swarm_runtime_tests.step);
+    const lib_standalone_runtime_test_step = b.step("lib-standalone-runtime-test", "Run focused standalone runtime tests");
+    const run_lib_standalone_runtime_tests = b.addRunArtifact(lib_standalone_runtime_tests);
+    lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
 
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
@@ -4897,6 +5096,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
+    unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
+    unit_test_step.dependOn(&run_portable_backup_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_toon_tests.step);
@@ -4906,7 +5107,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
-    unit_test_step.dependOn(lib_swarm_runtime_test_step);
+    unit_test_step.dependOn(lib_standalone_runtime_test_step);
     unit_test_step.dependOn(ha_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
@@ -6369,7 +6570,7 @@ pub fn build(b: *std.Build) void {
     replay_bench_build_options.addOption(bool, "storage_sim_soak", false);
     replay_bench_build_options.addOption(bool, "with_tla", with_tla);
     replay_bench_build_options.addOption(bool, "link_libc", true);
-    replay_bench_build_options.addOption(bool, "swarm_runtime_focused_test", false);
+    replay_bench_build_options.addOption(bool, "standalone_runtime_focused_test", false);
     replay_bench_build_options.addOption(bool, "bench_minimal_deps", true);
 
     const replay_bench_mod = b.createModule(.{
@@ -7069,6 +7270,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
+    addRuntimeTestFilters(run_antfly_main_tests, selectTestFilters(b, &.{}));
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
     antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);

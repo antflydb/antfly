@@ -1238,7 +1238,7 @@ pub const MetadataHttpServer = struct {
                     return try textResponse(alloc, 201, "created");
                 }
                 if (routes.Routes.matchInternalTableRestore(req.uri)) |table| {
-                    var restore_req = backups_api.parseRestoreRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid restore request");
+                    var restore_req = parseInternalTableRestoreRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid restore request");
                     defer restore_req.deinit();
                     self.source.restoreTable(alloc, table.table_name, restore_req.value.location, restore_req.value.backup_id) catch |err| {
                         if (backups_api.backupLocationErrorMessage(err)) |msg| {
@@ -1653,6 +1653,22 @@ fn cloneValues(
         out[i] = record.*;
     }
     return out;
+}
+
+const InternalTableRestoreRequest = struct {
+    backup_id: []const u8,
+    location: []const u8,
+};
+
+/// Metadata-to-metadata restore dispatch is an internal control-plane request.
+/// It deliberately does not carry a public named connection: the data node
+/// resolves the location using its own configured storage authority.
+fn parseInternalTableRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(InternalTableRestoreRequest) {
+    const parsed = try std.json.parseFromSlice(InternalTableRestoreRequest, alloc, body, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    try backups_api.validateBackupId(parsed.value.backup_id);
+    if (parsed.value.location.len == 0 or parsed.value.location.len > 4096) return error.InvalidBackupRequest;
+    return parsed;
 }
 
 fn buildNodeShutdownStatus(
@@ -2809,9 +2825,9 @@ fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     not_leader_value = null;
     initialized_headers += 1;
 
-    const content_type = try alloc.dupe(u8, "text/plain");
+    const content_type = try alloc.dupe(u8, "application/json");
     errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    const body = try alloc.dupe(u8, "{\"error\":\"metadata leader unavailable\"}");
     errdefer alloc.free(body);
     return .{
         .status = 503,
@@ -3102,6 +3118,7 @@ test "metadata http server replaces a table definition through compare-and-swap"
                 .stores = &.{},
                 .placement_intents = &.{},
                 .split_transitions = &.{},
+                .merge_transitions = &.{},
             };
         }
 

@@ -783,9 +783,9 @@ func TestComputeIndexOperations(t *testing.T) {
 
 	// Regression: during schema migration, table.Indexes gains full_text_index_v1
 	// but the shard only has full_text_index_v0. The reconciler must detect the
-	// missing v1 and generate an IndexOpAdd. In swarm mode RaftStatus is nil
+	// missing v1 and generate an IndexOpAdd. In standalone mode RaftStatus is nil
 	// because raft is bypassed entirely.
-	t.Run("schema migration adds versioned full text index in swarm mode", func(t *testing.T) {
+	t.Run("schema migration adds versioned full text index in standalone mode", func(t *testing.T) {
 		v0Config := indexes.IndexConfig{
 			Name: "full_text_index_v0",
 			Type: indexes.IndexTypeFullTextV0,
@@ -821,7 +821,7 @@ func TestComputeIndexOperations(t *testing.T) {
 			Shards: map[types.ID]*store.ShardStatus{
 				1: {
 					ShardInfo: store.ShardInfo{
-						RaftStatus: nil, // swarm mode: no raft
+						RaftStatus: nil, // standalone mode: no raft
 					},
 					Table: "test",
 				},

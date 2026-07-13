@@ -47,14 +47,20 @@ pub const RemoveRoleFromUserParams = struct {
 pub const ListBackupsParams = struct {
     /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
     location: []const u8,
+    /// Named `external_io` connection. Required for remote locations.
+    connection: ?[]const u8 = null,
+    /// Maximum backups returned in one page.
+    limit: ?[]const u8 = null,
+    /// Continuation cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
 };
 
 pub const ListConnectionsParams = struct {
     /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
-    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
+    /// Comma-separated list of expansions. Supported values: `models` to live-query inference model listings and `status` to live-probe external connections. Live work is opt-in and single-flight per server.
     include: ?[]const u8 = null,
-    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
+    /// Set to "true" to bypass the short server-side cache for requested live expansions. Live expansion passes are serialized to prevent concurrent refresh amplification. This does not force a node config or metadata reload.
     refresh: ?[]const u8 = null,
 };
 
@@ -629,6 +635,30 @@ pub const Client = struct {
         try query_buf.appendSlice(self.allocator, "location=");
         try query_buf.appendSlice(self.allocator, encoded_query_value_location);
         sep = '&';
+        if (params.connection) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "connection=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
             self.allocator.free(url);
@@ -723,13 +753,39 @@ pub const Client = struct {
 
     /// Restore multiple tables from a backup
     /// POST /db/v1/restore
-    pub fn restore(self: *@This(), body: types.ClusterRestoreRequest) !ApiResponse(types.ClusterRestoreResponse) {
+    pub fn restore(self: *@This(), body: types.ClusterRestoreRequest, idempotency_key: ?[]const u8) !ApiResponse(types.RestoreJob) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.ClusterRestoreResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get durable restore job status
+    /// GET /db/v1/restore/jobs/{job_id}
+    pub fn getRestoreJob(self: *@This(), job_id: []const u8) !ApiResponse(types.RestoreJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Request cooperative restore cancellation
+    /// DELETE /db/v1/restore/jobs/{job_id}
+    pub fn cancelRestoreJob(self: *@This(), job_id: []const u8) !ApiResponse(types.RestoreJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
     /// List secrets status
@@ -1266,15 +1322,19 @@ pub const Client = struct {
 
     /// Restore a table from backup
     /// POST /db/v1/tables/{tableName}/restore
-    pub fn restoreTable(self: *@This(), table_name: []const u8, body: types.RestoreRequest) !ApiResponse(types.RestoreCommittedDurableResponse) {
+    pub fn restoreTable(self: *@This(), table_name: []const u8, body: types.RestoreRequest, idempotency_key: ?[]const u8) !ApiResponse(types.RestoreJob) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/restore", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.RestoreCommittedDurableResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
     /// Update a table's schema

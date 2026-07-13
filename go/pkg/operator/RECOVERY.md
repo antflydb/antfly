@@ -91,7 +91,7 @@ Recommended `AntflyCluster` conditions:
 - `WorkloadReconciled`
 - `MetadataReady`
 - `DataReady`
-- `SwarmReady`
+- `StandaloneReady`
 - `InferenceReady`
 - `Available`
 
@@ -237,7 +237,7 @@ Map this to:
 
 - component-specific readiness condition, such as `PodsReady=False`,
   `InferenceReady=False`, `MetadataReady=False`, `DataReady=False`, or
-  `SwarmReady=False`
+  `StandaloneReady=False`
 - `Available=False`
 - `phase=Degraded`
 
@@ -338,7 +338,7 @@ The intended user experience should be:
    map findings to conditions.
 4. Add pod watches for InferencePool pods using labels such as
    `antfly.io/pool=<pool-name>`.
-5. Add equivalent diagnosis mapping for AntflyCluster metadata, data, and swarm
+5. Add equivalent diagnosis mapping for AntflyCluster metadata, data, and standalone
    pods using `app.kubernetes.io/instance` and
    `app.kubernetes.io/component`.
 6. Add tests for:

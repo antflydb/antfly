@@ -669,6 +669,7 @@ pub const ExclusiveTransition = struct {
 
     pub fn validate(self: *const ExclusiveTransition, path: []const u8) !void {
         if (!self.active or !std.mem.eql(u8, self.path, path)) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.id, path);
     }
 
     pub fn deinit(self: *ExclusiveTransition) void {

@@ -497,7 +497,7 @@ func (tm *TableManager) needsUpdates(
 	case store.ShardState_SplittingOff:
 		if !newShardInfo.Initializing {
 			// We we're splitting but now we've seen a node with the shard so set the state to pre-snapshot
-			// TODO (ajr) Should we wait until all three nodes (or one in swarm mode) have checked in before switching states?
+			// TODO (ajr) Should we wait until all three nodes (or one in standalone mode) have checked in before switching states?
 			log.Printf("SPLIT_STATE: Shard %s transitioning SplittingOff -> SplitOffPreSnap", oldShardStatus.ID)
 			newShardStatus.State = store.ShardState_SplitOffPreSnap
 			needsPersist = true

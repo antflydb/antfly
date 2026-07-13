@@ -33,6 +33,7 @@ const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const doc_identity = @import("doc_identity.zig");
+pub const DocIdentityNamespace = doc_identity.Namespace;
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -2973,8 +2974,14 @@ pub const DB = struct {
         .run_until_idle = maintenanceDriverRunUntilIdle,
     };
 
-    pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
+    pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
+            var opts = requested_opts;
+            if (opts.backend_runtime) |runtime| {
+                if (runtime.db_open_configurator) |configurator| {
+                    try configurator.configure(path, &opts);
+                }
+            }
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
@@ -30063,10 +30070,12 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
 
     const flush_start_ns = monotonicTimeNs();
     const save_start_ns = monotonicTimeNs();
-    // Applied-sequence state is metadata-only and already serialized by the
-    // coalescer mutex plus the backend's single-writer commit path. Do not
-    // route it through the DB-global apply lock; that makes foreground writes
-    // wait behind watermark persistence that does not mutate shared index state.
+    // Checkpointing managed projection effects reaches into live index
+    // backends. Hold a shared apply lease so concurrent persistence remains
+    // parallel while catalog replacement's exclusive lease cannot retire a
+    // backend underneath this durability boundary.
+    ctx.apply_mutex.lockShared();
+    defer ctx.apply_mutex.unlockShared();
     const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
         .index_name = pending.owned_name,
         .sequence = pending.sequence,
@@ -30112,8 +30121,11 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
     const sync_ns: u64 = 0;
 
     const save_start_ns = monotonicTimeNs();
-    // Index apply/publish paths own index-state durability. The checkpoint
-    // writer only persists small applied watermarks used for replay retention.
+    // Keep the complete metadata/checkpoint/status transaction on one stable
+    // index generation. Shared holders may proceed concurrently; index
+    // replacement and teardown require the exclusive lease.
+    ctx.apply_mutex.lockShared();
+    defer ctx.apply_mutex.unlockShared();
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(

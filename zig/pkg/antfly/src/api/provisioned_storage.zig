@@ -367,7 +367,6 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
         resource_manager_mod.Slice.lite_native_page_cache,
         resource_manager_mod.Slice.lite_native_link_cache,
-        resource_manager_mod.Slice.lite_docstore_snapshot_cache,
     }) |slice| {
         const stats = storage.resource_manager.sliceStats(slice);
         try std.testing.expect(stats.hard_limit_bytes > 0);

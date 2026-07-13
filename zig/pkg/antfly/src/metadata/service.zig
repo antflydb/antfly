@@ -1244,7 +1244,7 @@ pub const MetadataService = struct {
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
@@ -2478,7 +2478,7 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .store, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
@@ -3306,6 +3306,16 @@ pub const MetadataHttpService = struct {
         return self.raft.host.owned_metadata_store;
     }
 
+    /// Returns the current Raft term only while this node is the metadata
+    /// leader. A term change is the fencing boundary for control-plane jobs.
+    pub fn localMetadataLeadershipTerm(self: *MetadataHttpService) ?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return null;
+        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or raft_status.soft.leader_id.? != raft_status.id) return null;
+        return raft_status.hard.current_term;
+    }
+
     pub fn getProjectedReconcileLease(self: *MetadataHttpService) !?metadata_reconcile_lease.ReconcileLeaseRecord {
         self.lockRuntime();
         defer self.unlockRuntime();
@@ -3997,7 +4007,7 @@ pub const MetadataHttpService = struct {
         var cdc_group_router = api_table_router.CatalogBackedGroupRouter.init(
             catalog,
             // CDC is metadata-owned but data-applied; force the routed API path even
-            // when metadata and data live in the same swarm process.
+            // when metadata and data live in the same standalone process.
             0,
         );
         var hosted_write_source = api_table_writes.HostedProvisionedTableWriteSource.init(

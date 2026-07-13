@@ -96,6 +96,12 @@ pub const Socket = struct {
         self.io.vtable.netClose(self.io.userdata, @ptrCast((&self.handle)[0..1]));
     }
 
+    /// Shuts down reads and writes without releasing the handle. This is used
+    /// to wake a blocking connection fiber before its owner performs close.
+    pub fn shutdown(self: *Self) void {
+        self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
+    }
+
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
         try self.applyRequestDeadline(.send);

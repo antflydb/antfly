@@ -26,6 +26,8 @@ components:
           example: 4200
         storage:
           $ref: "#/components/schemas/StorageConfig"
+        transaction_sessions:
+          $ref: "#/components/schemas/TransactionSessionConfig"
         metadata:
           $ref: "#/components/schemas/MetadataInfo"
         inference:
@@ -53,15 +55,13 @@ components:
             The first provider defined becomes the default when no provider name is specified.
 
             **Example:**
-            ```yaml
-            speech_to_text:
-              antfly-whisper:
-                provider: antfly
-                api_url: "http://localhost:8080"
-                model: openai/whisper-base
-              openai-whisper:
-                provider: openai
-                model: whisper-1
+            ```json
+            {
+              "speech_to_text": {
+                "antfly-whisper": { "provider": "antfly", "api_url": "http://localhost:8080", "model": "openai/whisper-base" },
+                "openai-whisper": { "provider": "openai", "model": "whisper-1" }
+              }
+            }
             ```
 
             Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
@@ -140,10 +140,15 @@ components:
           default: 3
           example: 4
           x-go-type: uint64
-        swarm_mode:
-          type: boolean
-          description: "Bypasses Raft consensus for shards, using direct writes instead. Useful for development and testing with a single node."
-          default: false
+        deployment_mode:
+          type: string
+          description: "Runtime deployment topology. Standalone runs metadata, data, APIs, and inference in one process."
+          enum:
+            - embedded
+            - distributed
+            - standalone
+            - serverless
+          default: distributed
         embedders:
           type: object
           additionalProperties:
@@ -156,14 +161,12 @@ components:
 
             **API Key Configuration:**
 
-            API keys can be provided via the encrypted keystore (recommended) or environment variables:
+            API keys can be provided through a protected secret-store file or environment variables:
 
-            1. **Keystore** (recommended for production):
-               ```bash
-               antfly keystore create
-               antfly keystore add openai.api_key
-               ```
-               Then reference in config: `api_key: ${secret:openai.api_key}`
+            1. **Secret store** (recommended for production): mount a platform-managed
+               secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`.
+               Reference its values in JSON config as
+               `"api_key": "${secret:openai.api_key}"`.
 
             2. **Environment variable** (simpler for development):
                Omit `api_key` from config and set the appropriate env var:
@@ -175,15 +178,13 @@ components:
             See [Secrets Management](/docs/secrets) for complete documentation.
 
             **Example:**
-            ```yaml
-            embedders:
-              openai-small:
-                provider: openai
-                model: text-embedding-3-small
-              antfly-local:
-                provider: antfly
-                model: bge-base-en-v1.5
-                api_url: "http://localhost:8082"
+            ```json
+            {
+              "embedders": {
+                "openai-small": { "provider": "openai", "model": "text-embedding-3-small" },
+                "antfly-local": { "provider": "antfly", "model": "bge-base-en-v1.5", "api_url": "http://localhost:8082" }
+              }
+            }
             ```
           example:
             openai-small:
@@ -205,14 +206,12 @@ components:
 
             **API Key Configuration:**
 
-            API keys can be provided via the encrypted keystore (recommended) or environment variables:
+            API keys can be provided through a protected secret-store file or environment variables:
 
-            1. **Keystore** (recommended for production):
-               ```bash
-               antfly keystore create
-               antfly keystore add gemini.api_key
-               ```
-               Then reference in config: `api_key: ${secret:gemini.api_key}`
+            1. **Secret store** (recommended for production): mount a platform-managed
+               secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`.
+               Reference its values in JSON config as
+               `"api_key": "${secret:gemini.api_key}"`.
 
             2. **Environment variable** (simpler for development):
                Omit `api_key` from config and set the appropriate env var:
@@ -223,17 +222,14 @@ components:
             See [Secrets Management](/docs/secrets) for complete documentation.
 
             **Example:**
-            ```yaml
-            generators:
-              gemini-flash:
-                provider: gemini
-                model: gemini-2.5-flash
-              ollama-local:
-                provider: ollama
-                model: llama3
-              openai-gpt4:
-                provider: openai
-                model: gpt-4.1
+            ```json
+            {
+              "generators": {
+                "gemini-flash": { "provider": "gemini", "model": "gemini-2.5-flash" },
+                "ollama-local": { "provider": "ollama", "model": "llama3" },
+                "openai-gpt4": { "provider": "openai", "model": "gpt-4.1" }
+              }
+            }
             ```
           example:
             gemini-flash:
@@ -265,19 +261,19 @@ components:
             - `always`: Always try the next generator
 
             **Example:**
-            ```yaml
-            chains:
-              default:
-                - generator: gemini-flash  # Reference by name
-                  retry:
-                    max_attempts: 3
-                  condition: on_rate_limit
-                - generator: ollama-local  # Reference by name
-              with-inline:
-                - generator: gemini-flash
-                - generator_config:  # Inline config
-                    provider: anthropic
-                    model: claude-sonnet-4-5-20250929
+            ```json
+            {
+              "chains": {
+                "default": [
+                  { "generator": "gemini-flash", "retry": { "max_attempts": 3 }, "condition": "on_rate_limit" },
+                  { "generator": "ollama-local" }
+                ],
+                "with-inline": [
+                  { "generator": "gemini-flash" },
+                  { "generator_config": { "provider": "anthropic", "model": "claude-sonnet-4-5-20250929" } }
+                ]
+              }
+            }
             ```
 
             Then in API calls: `chain: "default"` or `chain: "with-inline"`
@@ -304,15 +300,13 @@ components:
             The first reranker defined becomes the default when no reranker name is specified.
 
             **Example:**
-            ```yaml
-            rerankers:
-              cohere-english:
-                provider: cohere
-                model: rerank-english-v3.0
-              antfly-local:
-                provider: antfly
-                model: mxbai-rerank-base-v1
-                url: "http://localhost:8080"
+            ```json
+            {
+              "rerankers": {
+                "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" },
+                "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" }
+              }
+            }
             ```
           example:
             cohere-english:
@@ -333,17 +327,13 @@ components:
             The first chunker defined becomes the default when no chunker name is specified.
 
             **Example:**
-            ```yaml
-            chunkers:
-              fixed-500:
-                provider: antfly
-                model: fixed
-                target_tokens: 500
-                overlap_tokens: 50
-              semantic:
-                provider: antfly
-                model: semantic-chunker
-                api_url: "http://localhost:8080"
+            ```json
+            {
+              "chunkers": {
+                "fixed-500": { "provider": "antfly", "model": "fixed", "target_tokens": 500, "overlap_tokens": 50 },
+                "semantic": { "provider": "antfly", "model": "semantic-chunker", "api_url": "http://localhost:8080" }
+              }
+            }
             ```
           example:
             fixed-500:
@@ -395,34 +385,73 @@ components:
         - http
       description: External IO transport protocol.
     ConnectionConfig:
+      discriminator:
+        propertyName: kind
+        mapping:
+          inference: "#/components/schemas/InferenceConnectionVariant"
+          web_search: "#/components/schemas/WebSearchConnectionVariant"
+          external_io: "#/components/schemas/ExternalIoConnectionVariant"
+          cdc: "#/components/schemas/CdcConnectionVariant"
+      oneOf:
+        - $ref: "#/components/schemas/InferenceConnectionVariant"
+        - $ref: "#/components/schemas/WebSearchConnectionVariant"
+        - $ref: "#/components/schemas/ExternalIoConnectionVariant"
+        - $ref: "#/components/schemas/CdcConnectionVariant"
+    InferenceConnectionVariant:
       type: object
-      required:
-        - kind
-        - capabilities
+      additionalProperties: false
+      required: [kind, capabilities, inference]
       properties:
-        display_name:
-          type: string
-          description: Optional display name for UIs.
-        provider:
-          type: string
-          description: Provider token for connection kinds that have a provider-level service identity, such as web_search.
-        kind:
-          $ref: "#/components/schemas/ConnectionKind"
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [inference] }
         capabilities:
           type: array
-          items:
-            type: string
+          items: { type: string }
           description: Namespaced actions and workflow uses this connection supports.
-        inference:
-          $ref: "#/components/schemas/InferenceConnectionConfig"
-        web_search:
-          $ref: "#/components/schemas/WebSearchConnectionConfig"
-        external_io:
-          $ref: "#/components/schemas/ExternalIoConnectionConfig"
-        cdc:
-          $ref: "#/components/schemas/CdcConnectionConfig"
+        inference: { $ref: "#/components/schemas/InferenceConnectionConfig" }
+    WebSearchConnectionVariant:
+      type: object
+      additionalProperties: false
+      required: [kind, capabilities, web_search]
+      properties:
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [web_search] }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: Namespaced actions and workflow uses this connection supports.
+        web_search: { $ref: "#/components/schemas/WebSearchConnectionConfig" }
+    ExternalIoConnectionVariant:
+      type: object
+      additionalProperties: false
+      required: [kind, capabilities, external_io]
+      properties:
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [external_io] }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: Namespaced actions and workflow uses this connection supports.
+        external_io: { $ref: "#/components/schemas/ExternalIoConnectionConfig" }
+    CdcConnectionVariant:
+      type: object
+      additionalProperties: false
+      required: [kind, capabilities, cdc]
+      properties:
+        display_name: { type: string, description: Optional display name for UIs. }
+        provider: { type: string, description: Optional provider-level service identity. }
+        kind: { type: string, enum: [cdc] }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: Namespaced actions and workflow uses this connection supports.
+        cdc: { $ref: "#/components/schemas/CdcConnectionConfig" }
     InferenceConnectionConfig:
       type: object
+      additionalProperties: false
       required:
         - provider
       properties:
@@ -464,6 +493,7 @@ components:
           description: Model types this connection is configured to serve.
     WebSearchConnectionConfig:
       type: object
+      additionalProperties: false
       properties:
         service:
           type: string
@@ -524,47 +554,203 @@ components:
             type: string
           description: Exclude results from these domains when provider supports it.
     ExternalIoConnectionConfig:
+      oneOf:
+        - $ref: "#/components/schemas/S3ExternalIoConfig"
+        - $ref: "#/components/schemas/GcsExternalIoConfig"
+        - $ref: "#/components/schemas/FilesystemExternalIoConfig"
+        - $ref: "#/components/schemas/HttpExternalIoConfig"
+      discriminator:
+        propertyName: protocol
+        mapping:
+          s3: "#/components/schemas/S3ExternalIoConfig"
+          gcs: "#/components/schemas/GcsExternalIoConfig"
+          filesystem: "#/components/schemas/FilesystemExternalIoConfig"
+          http: "#/components/schemas/HttpExternalIoConfig"
+    S3ExternalIoConfig:
       type: object
-      required:
-        - protocol
+      additionalProperties: false
+      required: [protocol, buckets]
       properties:
-        protocol:
-          $ref: "#/components/schemas/ExternalIoProtocol"
-        endpoint:
+        protocol: { type: string, enum: [s3] }
+        endpoint: { type: string, description: S3-compatible endpoint override. }
+        region: { type: string }
+        addressing_style:
           type: string
-          description: Custom endpoint URL when configured.
+          enum: [path, virtual_hosted]
+          default: virtual_hosted
+        bucket_provisioning:
+          type: string
+          enum: [require_existing, create_if_missing]
+          default: require_existing
         buckets:
           type: array
-          items:
-            type: string
-          description: Buckets this connection is configured for.
-        prefix:
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 3, maxLength: 63 }
+        prefix: { type: string }
+        credentials: { $ref: "#/components/schemas/AwsCredentialConfig" }
+        use_ssl: { type: boolean }
+    GcsExternalIoConfig:
+      type: object
+      additionalProperties: false
+      required: [protocol, buckets]
+      properties:
+        protocol: { type: string, enum: [gcs] }
+        endpoint: { type: string, description: GCS JSON API endpoint override. }
+        upload_endpoint: { type: string, description: GCS JSON upload endpoint override. }
+        project_id: { type: string }
+        bucket_provisioning:
           type: string
-          description: Key prefix when configured.
+          enum: [require_existing, create_if_missing]
+          default: require_existing
+        buckets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 3, maxLength: 63 }
+        prefix: { type: string }
+        credentials: { $ref: "#/components/schemas/GcsCredentialConfig" }
+    FilesystemExternalIoConfig:
+      type: object
+      additionalProperties: false
+      required: [protocol, root]
+      properties:
+        protocol: { type: string, enum: [filesystem] }
+        root:
+          type: string
+          description: Absolute administrator-controlled root. URI paths are resolved beneath this root.
+    HttpExternalIoConfig:
+      type: object
+      additionalProperties: false
+      required: [protocol]
+      properties:
+        protocol: { type: string, enum: [http] }
         hosts:
           type: array
-          items:
-            type: string
-          description: Hosts or base URLs this connection applies to.
+          items: { type: string }
         headers:
           type: object
-          additionalProperties:
-            type: string
+          additionalProperties: { type: string }
           description: HTTP headers or secret references. Never returned by inventory APIs.
+    GcsCredentialConfig:
+      type: object
+      additionalProperties: false
+      required: [source]
+      oneOf:
+        - title: Application default credentials
+          properties:
+            source: { type: string, enum: [default] }
+        - title: Bearer token
+          required: [bearer_token]
+          properties:
+            source: { type: string, enum: [bearer_token] }
+        - title: Service account
+          properties:
+            source: { type: string, enum: [service_account] }
+          oneOf:
+            - required: [service_account_json]
+            - required: [credentials_path]
+      properties:
+        source: { type: string, enum: [default, bearer_token, service_account] }
+        bearer_token: { type: string, description: Token or secret reference. }
+        service_account_json: { type: string, description: Service-account JSON or secret reference. }
+        credentials_path: { type: string }
+        scope: { type: string }
+    AwsCredentialConfig:
+      type: object
+      additionalProperties: false
+      required: [source]
+      description: >-
+        Per-connection AWS credential identity. Each named connection owns an
+        independent refresh cache, allowing lanes to use different accounts,
+        profiles, or workload identities.
+      oneOf:
+        - title: Default AWS credential chain
+          properties:
+            source: { type: string, enum: [default] }
+          not:
+            anyOf:
+              - required: [access_key_id]
+              - required: [secret_access_key]
+              - required: [session_token]
+              - required: [profile]
+              - required: [shared_credentials_file]
+              - required: [role_arn]
+              - required: [token_file]
+              - required: [session_name]
+              - required: [sts_endpoint]
+        - title: Static credentials
+          required: [access_key_id, secret_access_key]
+          properties:
+            source: { type: string, enum: [static] }
+          not:
+            anyOf:
+              - required: [profile]
+              - required: [shared_credentials_file]
+              - required: [role_arn]
+              - required: [token_file]
+              - required: [session_name]
+              - required: [sts_endpoint]
+        - title: Shared credentials profile
+          required: [profile]
+          properties:
+            source: { type: string, enum: [profile] }
+          not:
+            anyOf:
+              - required: [access_key_id]
+              - required: [secret_access_key]
+              - required: [session_token]
+              - required: [role_arn]
+              - required: [token_file]
+              - required: [session_name]
+              - required: [sts_endpoint]
+        - title: Web identity
+          required: [role_arn, token_file]
+          properties:
+            source: { type: string, enum: [web_identity] }
+          not:
+            anyOf:
+              - required: [access_key_id]
+              - required: [secret_access_key]
+              - required: [session_token]
+              - required: [profile]
+              - required: [shared_credentials_file]
+      properties:
+        source:
+          type: string
+          enum: [default, static, profile, web_identity]
         access_key_id:
           type: string
-          description: Object-store access key or secret reference. Never returned by inventory APIs.
+          description: Static access key or secret reference.
         secret_access_key:
           type: string
-          description: Object-store secret key or secret reference. Never returned by inventory APIs.
+          description: Static secret key or secret reference.
         session_token:
           type: string
-          description: Object-store session token or secret reference. Never returned by inventory APIs.
-        use_ssl:
-          type: boolean
-          description: Whether S3-compatible endpoints should use TLS.
+          description: Optional static session token or secret reference.
+        profile:
+          type: string
+          description: Shared credentials profile name.
+        shared_credentials_file:
+          type: string
+          description: Optional credentials file path for this connection.
+        role_arn:
+          type: string
+          description: IAM role assumed with web identity.
+        token_file:
+          type: string
+          description: Web identity token file mounted for this connection.
+        session_name:
+          type: string
+          description: STS role session name.
+        sts_endpoint:
+          type: string
+          description: Optional STS endpoint override.
     CdcConnectionConfig:
       type: object
+      additionalProperties: false
       required:
         - provider
       properties:
@@ -618,6 +804,7 @@ components:
 
     LocalStorageConfig:
       type: object
+      additionalProperties: false
       properties:
         base_dir:
           type: string
@@ -626,43 +813,165 @@ components:
           minLength: 1
           example: "antflydb"
 
-    S3Info:
-      type: object
-      allOf:
-        - $ref: "../shared/s3.yaml#/components/schemas/Credentials"
-        - type: object
-          required:
-            - endpoint
-            - bucket
-          properties:
-            bucket:
-              type: string
-              description: "S3 bucket name where SST files will be stored"
-              minLength: 3
-              maxLength: 63
-              example: "my-antfly-bucket"
-            prefix:
-              type: string
-              description: "Optional path prefix within the bucket (e.g., 'antfly/production/')"
-              example: "production/"
-
-    StorageBackend:
+    StorageEngine:
       type: string
-      description: "Storage backend type"
+      description: "Durable storage representation, independent of deployment topology."
       enum:
+        - lite
         - local
-        - s3
-      default: "local"
-      example: "local"
+        - object
+      default: local
+
+    TransactionSessionConfig:
+      type: object
+      additionalProperties: false
+      description: "Resource and retention limits for multi-request transaction sessions."
+      properties:
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          default: 3600
+        cleanup_interval_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 60
+        max_count:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 1024
+        max_record_bytes:
+          type: integer
+          minimum: 65536
+          maximum: 67108864
+          default: 16777216
+        max_savepoints:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          default: 64
+
+    LiteStorageConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - path
+      properties:
+        path:
+          type: string
+          minLength: 8
+          pattern: "\\.aflite$"
+          description: "Path to the single writable Antfly Lite database file."
+          example: "./data.antfly.aflite"
+        fsync:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+          description: "Synchronize committed Lite state before acknowledging it."
+
+    ObjectStorageConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - connection
+        - bucket
+      properties:
+        connection:
+          type: string
+          minLength: 1
+          description: >-
+            ID of a connections entry with kind external_io, protocol s3, and
+            the storage.primary capability. Storage credentials are resolved
+            from that connection independently of remote-content credentials.
+        bucket:
+          type: string
+          minLength: 3
+          maxLength: 63
+        prefix:
+          type: string
+        lanes:
+          $ref: "#/components/schemas/ObjectStorageLanes"
+
+    ObjectStorageLanes:
+      type: object
+      additionalProperties: false
+      description: >-
+        Optional placement overrides for independently managed serverless
+        durability lanes. Unspecified fields inherit from the object-level
+        connection, bucket, and prefix.
+      properties:
+        artifacts:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        manifests:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        wal:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        progress:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+        catalog:
+          $ref: "#/components/schemas/ObjectStorageLocation"
+
+    ObjectStorageLocation:
+      type: object
+      additionalProperties: false
+      properties:
+        connection:
+          type: string
+          minLength: 1
+          description: Optional external_io connection override for this lane.
+        bucket:
+          type: string
+          minLength: 3
+          maxLength: 63
+        prefix:
+          type: string
 
     StorageConfig:
       type: object
+      additionalProperties: false
+      description: >-
+        Tagged storage-engine configuration. Engine is required and exactly the
+        matching engine member must be present.
+      required: [engine]
+      oneOf:
+        - title: Lite storage configuration
+          required: [engine, lite]
+          properties:
+            engine:
+              type: string
+              enum: [lite]
+          not:
+            anyOf:
+              - required: [local]
+              - required: [object]
+        - title: Local storage configuration
+          required: [engine, local]
+          properties:
+            engine:
+              type: string
+              enum: [local]
+          not:
+            anyOf:
+              - required: [lite]
+              - required: [object]
+        - title: Object storage configuration
+          required: [engine, object]
+          properties:
+            engine:
+              type: string
+              enum: [object]
+          not:
+            anyOf:
+              - required: [lite]
+              - required: [local]
       properties:
+        engine:
+          $ref: "#/components/schemas/StorageEngine"
+        lite:
+          $ref: "#/components/schemas/LiteStorageConfig"
+        object:
+          $ref: "#/components/schemas/ObjectStorageConfig"
         local:
           $ref: "#/components/schemas/LocalStorageConfig"
-        data:
-          $ref: "#/components/schemas/StorageBackend"
-        metadata:
-          $ref: "#/components/schemas/StorageBackend"
-        s3:
-          $ref: "#/components/schemas/S3Info"

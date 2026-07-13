@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     // Server-side subcommands
     if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "swarm")) return try cmd.swarm.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
@@ -187,7 +187,7 @@ fn printUsage(argv0: []const u8) void {
         \\server subcommands:
         \\  data
         \\  metadata
-        \\  swarm
+        \\  standalone
         \\  inference
         \\  serverless
         \\  lite           Embedded Antfly Lite databases (*.aflite)

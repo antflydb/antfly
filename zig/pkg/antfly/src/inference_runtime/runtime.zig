@@ -336,6 +336,8 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var capabilities_csv: ?[]const u8 = null;
     var projector_selection: inference.registry.download.ProjectorSelection = .auto;
     var predictor_pull = false;
+    var first_ai_only_flag: ?[]const u8 = null;
+    var first_predictor_only_flag: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < argv.items.len) : (i += 1) {
@@ -349,6 +351,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             continue;
         }
         if (std.mem.eql(u8, arg, "--optimize")) {
+            if (first_predictor_only_flag == null) first_predictor_only_flag = arg;
             try passthrough.append(alloc, arg);
             continue;
         }
@@ -364,6 +367,15 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             return error.InvalidArguments;
         }
         const value = argv.items[i];
+        switch (pullFlagDomain(arg)) {
+            .shared => {},
+            .ai => if (first_ai_only_flag == null) {
+                first_ai_only_flag = arg;
+            },
+            .predictor => if (first_predictor_only_flag == null) {
+                first_predictor_only_flag = arg;
+            },
+        }
         if (std.mem.eql(u8, arg, "--variants")) {
             variants_csv = value;
         } else if (std.mem.eql(u8, arg, "--token")) {
@@ -389,8 +401,14 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         return error.InvalidArguments;
     }
 
-    if (inference.tabular.cli.isHttpUrl(refs.items[0]) or predictor_pull) {
-        if (refs.items.len != 1 or variants_csv != null) return error.InvalidArguments;
+    const predictor_mode = inference.tabular.cli.isHttpUrl(refs.items[0]) or predictor_pull;
+    validatePullFlagDomains(predictor_mode, first_ai_only_flag, first_predictor_only_flag) catch |err| {
+        printPullUsage();
+        return err;
+    };
+
+    if (predictor_mode) {
+        if (refs.items.len != 1) return error.InvalidArguments;
         var normalized = std.ArrayListUnmanaged([]const u8).empty;
         defer normalized.deinit(alloc);
         try normalized.append(alloc, refs.items[0]);
@@ -445,6 +463,35 @@ fn pullFlagTakesValue(arg: []const u8) bool {
     };
     for (flags) |flag| if (std.mem.eql(u8, arg, flag)) return true;
     return false;
+}
+
+const PullFlagDomain = enum { shared, ai, predictor };
+
+fn pullFlagDomain(arg: []const u8) PullFlagDomain {
+    if (std.mem.eql(u8, arg, "--token")) return .shared;
+    const ai_flags = [_][]const u8{
+        "--variants", "--models-dir", "--tasks", "--capabilities", "--projector",
+    };
+    for (ai_flags) |flag| if (std.mem.eql(u8, arg, flag)) return .ai;
+    return .predictor;
+}
+
+fn validatePullFlagDomains(
+    predictor_mode: bool,
+    first_ai_only_flag: ?[]const u8,
+    first_predictor_only_flag: ?[]const u8,
+) !void {
+    if (predictor_mode) {
+        if (first_ai_only_flag) |flag| {
+            std.debug.print("unexpected arg '{s}': only valid for AI model pulls; use --ml-dir for predictor storage\n", .{flag});
+            return error.InvalidArguments;
+        }
+        return;
+    }
+    if (first_predictor_only_flag) |flag| {
+        std.debug.print("unexpected arg '{s}': only valid for predictor pulls; use --type predictor or an HTTP URL\n", .{flag});
+        return error.InvalidArguments;
+    }
 }
 
 fn isHelpArg(arg: []const u8) bool {
@@ -562,6 +609,16 @@ test "inference pull classifies order independent value flags" {
     try std.testing.expect(pullFlagTakesValue("--framework"));
     try std.testing.expect(!pullFlagTakesValue("--optimize"));
     try std.testing.expect(!pullFlagTakesValue("--unknown"));
+    try std.testing.expectEqual(PullFlagDomain.ai, pullFlagDomain("--models-dir"));
+    try std.testing.expectEqual(PullFlagDomain.predictor, pullFlagDomain("--ml-dir"));
+    try std.testing.expectEqual(PullFlagDomain.shared, pullFlagDomain("--token"));
+}
+
+test "inference pull rejects flags from the other model domain" {
+    try std.testing.expectError(error.InvalidArguments, validatePullFlagDomains(true, "--models-dir", null));
+    try std.testing.expectError(error.InvalidArguments, validatePullFlagDomains(false, null, "--ml-dir"));
+    try validatePullFlagDomains(true, null, "--ml-dir");
+    try validatePullFlagDomains(false, "--models-dir", null);
 }
 
 test "parseBackendType accepts warm generator backends" {

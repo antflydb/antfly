@@ -9,7 +9,7 @@ Antfly is a distributed search engine built on [etcd's raft library](https://git
 ```bash
 # Start a single-node cluster with built-in ML inference
 cd go/pkg/antfly
-go run ./cmd swarm
+go run ./cmd standalone
 
 # Or run with Docker
 docker run -p 8080:8080 ghcr.io/antflydb/antfly:omni
@@ -72,7 +72,7 @@ SELECT * FROM docs WHERE content @@@ 'fix my computer';
 
 ### Inference Runtime
 
-Antfly inference handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. It runs under the `antfly inference` CLI and starts automatically in swarm mode, so you don't need to set it up separately.
+Antfly inference handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. It runs under the `antfly inference` CLI and starts automatically in standalone mode, so you don't need to set it up separately.
 
 ## Libraries & Tools
 

@@ -17,7 +17,6 @@ const antfly = @import("antfly-zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
-const platform_sync = @import("antfly_platform").sync;
 const fs_paths = antfly.common.fs_paths;
 
 const Allocator = std.mem.Allocator;
@@ -32,9 +31,6 @@ const portable_backup = antfly.portable_backup;
 const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 const LiteDb = antfly.lite.connection.Connection;
-
-var active_lite_http_state: ?*LiteHttpState = null;
-const lite_http_state_key = "antfly.lite.state";
 
 const CompactReport = struct {
     compacted: bool,
@@ -92,10 +88,12 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
         return;
     }
 
-    return try dispatchSubcommand(init.gpa, init.io, argv0, subcommand, args);
+    return try dispatchSubcommand(init, argv0, subcommand, args);
 }
 
-fn dispatchSubcommand(allocator: Allocator, io: std.Io, argv0: []const u8, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
+fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
+    const allocator = init.gpa;
+    const io = init.io;
     if (std.mem.eql(u8, subcommand, "init")) return try initLite(allocator, io, args);
     if (isStatusSubcommand(subcommand)) return try status(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "batch")) return try batch(allocator, io, args);
@@ -114,7 +112,7 @@ fn dispatchSubcommand(allocator: Allocator, io: std.Io, argv0: []const u8, subco
     if (std.mem.eql(u8, subcommand, "check")) return try check(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "compact")) return try compact(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(allocator, io, args);
-    if (std.mem.eql(u8, subcommand, "serve")) return try serve(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "serve")) return try serve(init, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -154,6 +152,16 @@ fn status(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     writeJsonLine(io, json);
 }
 
+fn openEmbeddedDataSurface(allocator: Allocator, path: []const u8, mode: db_mod.OpenOptions.OpenMode) !LiteDb {
+    var lite = try LiteDb.open(allocator, path, mode);
+    errdefer lite.close();
+    if (try lite.backend.isStandaloneArtifact() and !lite.backend.hasStandaloneRootAdoption()) {
+        std.debug.print("error: this Lite artifact contains standalone table namespaces; use antfly lite serve and the /db/v1 API\n", .{});
+        return error.StandaloneLiteRequiresApi;
+    }
+    return lite;
+}
+
 fn batch(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
@@ -162,7 +170,7 @@ fn batch(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     const json = try batchJson(allocator, &lite.db, body);
@@ -198,7 +206,7 @@ fn lookup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
         try allocator.dupe(u8, "");
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    var lite = try openEmbeddedDataSurface(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try lookupJson(allocator, &lite.db, resolved_key, body);
@@ -214,7 +222,7 @@ fn scan(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !voi
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    var lite = try openEmbeddedDataSurface(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try scanJson(allocator, &lite.db, body);
@@ -230,7 +238,7 @@ fn query(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
+    var lite = try openEmbeddedDataSurface(allocator, path, .query_readonly);
     defer lite.close();
 
     const json = try searchJson(allocator, &lite.db, body);
@@ -251,7 +259,7 @@ fn indexList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .status_only);
+    var lite = try openEmbeddedDataSurface(allocator, path, .status_only);
     defer lite.close();
 
     const configs = try lite.db.listIndexes(allocator);
@@ -277,7 +285,7 @@ fn indexCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterato
     defer parsed.deinit();
     parsed.value.coverage_generation = 0;
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.addIndex(parsed.value);
@@ -291,7 +299,7 @@ fn indexDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     try requireAflitePath(path);
     const name = parseNameFlag(args, "--index");
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     const removed = try lite.db.deleteIndex(name);
@@ -313,7 +321,7 @@ fn enrichmentList(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .status_only);
+    var lite = try openEmbeddedDataSurface(allocator, path, .status_only);
     defer lite.close();
 
     const configs = try lite.db.listEnrichments(allocator);
@@ -336,7 +344,7 @@ fn enrichmentCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.It
     });
     defer parsed.deinit();
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.addEnrichment(parsed.value);
@@ -364,7 +372,7 @@ fn enrichmentDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
     const resolved_kind = kind orelse cli.fatal("--kind is required", .{});
     const resolved_name = name orelse cli.fatal("--name is required", .{});
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     const removed = try lite.db.deleteEnrichment(resolved_kind, resolved_name);
@@ -385,7 +393,7 @@ fn schemaGet(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .status_only);
+    var lite = try openEmbeddedDataSurface(allocator, path, .status_only);
     defer lite.close();
 
     const schema_json = try lite.db.getSchemaJson(allocator);
@@ -405,7 +413,7 @@ fn schemaSet(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.setSchemaJson(allocator, body);
@@ -417,7 +425,7 @@ fn runUntilIdle(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
     try requireAflitePath(path);
     requireNoMoreArgs(args);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
 
     try lite.db.maintenanceDriver().runUntilIdle();
@@ -434,6 +442,10 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
 
     var lite = try LiteDb.open(allocator, path, .query_readonly);
     defer lite.close();
+    ensureOfflinePortableBackupSupported(&lite) catch |err| {
+        std.debug.print("error: standalone Lite databases must use the authenticated /db/v1 backup API; use 'antfly lite snapshot' for a complete physical copy\n", .{});
+        return err;
+    };
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -444,6 +456,16 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     cli.writeStdout(io, "{\"format\":\"afb\",\"path\":");
     try writeJsonString(allocator, io, out_path);
     cli.writeStdout(io, "}\n");
+}
+
+fn ensureOfflinePortableBackupSupported(lite: *const LiteDb) !void {
+    if (lite.backend.hasStandaloneRootAdoption() or try lite.backend.isStandaloneArtifact()) {
+        return error.StandaloneLitePortableBackupRequiresApi;
+    }
+}
+
+fn ensureOfflineRootOnlyOperationSupported(lite: *const LiteDb) !void {
+    if (try lite.backend.isStandaloneArtifact()) return error.StandaloneLiteRequiresApi;
 }
 
 const SnapshotOptions = struct {
@@ -578,6 +600,7 @@ fn importPortableIntoExistingLite(
     {
         var lite = try LiteDb.open(allocator, target_path, .status_only);
         defer lite.close();
+        try ensureOfflineRootOnlyOperationSupported(&lite);
         if (!(try lite_restore_staging.isImportTargetEmpty(allocator, &lite.db))) {
             return error.LiteImportTargetNotEmpty;
         }
@@ -693,6 +716,10 @@ const PromoteOptions = struct {
     table: []const u8,
     backup_id: []const u8,
     location: []const u8,
+    connection: []const u8,
+    idempotency_key: ?[]const u8 = null,
+    wait: bool = true,
+    wait_timeout_ms: u64 = 30 * 60 * 1000,
 
     fn deinit(self: *PromoteOptions, allocator: Allocator) void {
         allocator.free(self.backup_id);
@@ -701,11 +728,34 @@ const PromoteOptions = struct {
     }
 };
 
-const PromoteRestoreFn = *const fn (ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) anyerror!void;
+const PromoteRestoreAcceptance = struct {
+    job_id: i64,
+    encoded: []u8,
+};
+
+const PromoteRestoreFn = *const fn (ctx: *anyopaque, allocator: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) anyerror!PromoteRestoreAcceptance;
+
+const PromoteSubmission = struct {
+    staged: lite_restore_staging.StagedRestore,
+    restore_job_id: i64,
+    accepted_json: []u8,
+
+    fn deinit(self: *PromoteSubmission, allocator: Allocator) void {
+        self.staged.deinit(allocator);
+        allocator.free(self.accepted_json);
+        self.* = undefined;
+    }
+};
 
 fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
+
+    {
+        var lite = try LiteDb.open(allocator, path, .status_only);
+        defer lite.close();
+        try ensureOfflineRootOnlyOperationSupported(&lite);
+    }
 
     const opts = parsePromoteOptions(allocator, path, args) catch cli.fatal("invalid promote arguments", .{});
     defer {
@@ -720,18 +770,19 @@ fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     defer client.deinit();
     try client.setBaseUrl(opts.target);
 
-    var staged = try promoteWithRestore(allocator, path, opts, &client, promoteRestoreWithClient);
-    defer staged.deinit(allocator);
+    var submission = try promoteWithRestore(allocator, path, opts, &client, promoteRestoreWithClient);
+    defer submission.deinit(allocator);
 
-    cli.writeStdout(io, "{\"promoted\":true,\"table\":");
-    try writeJsonString(allocator, io, opts.table);
-    cli.writeStdout(io, ",\"target\":");
-    try writeJsonString(allocator, io, opts.target);
-    cli.writeStdout(io, ",\"backup_id\":");
-    try writeJsonString(allocator, io, staged.backup_id);
-    cli.writeStdout(io, ",\"location\":");
-    try writeJsonString(allocator, io, staged.location);
-    cli.writeStdout(io, "}\n");
+    if (!opts.wait) {
+        writeJsonLine(io, submission.accepted_json);
+        return;
+    }
+
+    var response = try cli.backup.waitForRestoreJob(&client, io, submission.restore_job_id, opts.wait_timeout_ms);
+    defer response.deinit();
+    const job = if (response.data) |*data| data.value else return error.InvalidRestoreResponse;
+    try cli.writeJson(allocator, io, job);
+    try cli.backup.restorePhaseResult(job.phase);
 }
 
 fn promoteWithRestore(
@@ -740,22 +791,30 @@ fn promoteWithRestore(
     opts: PromoteOptions,
     restore_ctx: *anyopaque,
     restore_fn: PromoteRestoreFn,
-) !lite_restore_staging.StagedRestore {
+) !PromoteSubmission {
     var staged = try lite_restore_staging.stageAfliteRestoreBackup(allocator, path, opts.table, opts.backup_id, opts.location);
     errdefer staged.deinit(allocator);
 
-    try restore_fn(restore_ctx, opts.table, .{
+    const accepted = try restore_fn(restore_ctx, allocator, opts.table, .{
         .backup_id = staged.backup_id,
         .location = staged.location,
-        .format = "portable",
-    });
+        .connection = opts.connection,
+    }, opts.idempotency_key);
+    errdefer allocator.free(accepted.encoded);
 
-    return staged;
+    return .{ .staged = staged, .restore_job_id = accepted.job_id, .accepted_json = accepted.encoded };
 }
 
-fn promoteRestoreWithClient(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
+fn promoteRestoreWithClient(ctx: *anyopaque, allocator: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, idempotency_key: ?[]const u8) !PromoteRestoreAcceptance {
     const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ctx));
-    try client.restoreTable(table, request);
+    var resp = try client.restoreTableWithOptions(table, request, .{ .idempotency_key = idempotency_key });
+    defer resp.deinit();
+    cli.expectHttpSuccess(resp);
+    const job = if (resp.data) |*data| data.value else return error.InvalidRestoreResponse;
+    return .{
+        .job_id = job.job_id,
+        .encoded = try std.json.Stringify.valueAlloc(allocator, job, .{}),
+    };
 }
 
 fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.process.Args.Iterator) !PromoteOptions {
@@ -763,6 +822,10 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
     var table: ?[]const u8 = null;
     var backup_id: ?[]const u8 = null;
     var location: ?[]const u8 = null;
+    var connection: ?[]const u8 = null;
+    var idempotency_key: ?[]const u8 = null;
+    var wait = true;
+    var wait_timeout_ms: u64 = 30 * 60 * 1000;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "--url")) {
             target = try nextRequiredArg(args);
@@ -772,6 +835,16 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
             backup_id = try nextRequiredArg(args);
         } else if (std.mem.eql(u8, arg, "--location")) {
             location = try nextRequiredArg(args);
+        } else if (std.mem.eql(u8, arg, "--connection")) {
+            connection = try nextRequiredArg(args);
+        } else if (std.mem.eql(u8, arg, "--idempotency-key")) {
+            idempotency_key = try nextRequiredArg(args);
+        } else if (std.mem.eql(u8, arg, "--no-wait")) {
+            wait = false;
+        } else if (std.mem.eql(u8, arg, "--wait-timeout")) {
+            const seconds = try std.fmt.parseUnsigned(u64, try nextRequiredArg(args), 10);
+            wait_timeout_ms = try std.math.mul(u64, seconds, 1000);
+            wait = true;
         } else {
             return error.UnknownArgument;
         }
@@ -780,17 +853,17 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
     const resolved_table = table orelse return error.MissingArgument;
     const resolved_backup_id = if (backup_id) |id| try allocator.dupe(u8, id) else try lite_restore_staging.defaultBackupIdAlloc(allocator, path);
     errdefer allocator.free(resolved_backup_id);
-    const resolved_location = if (location) |value| try allocator.dupe(u8, value) else try defaultLitePromoteLocationAlloc(allocator);
+    const resolved_location = try allocator.dupe(u8, location orelse return error.MissingArgument);
     return .{
         .target = resolved_target,
         .table = resolved_table,
         .backup_id = resolved_backup_id,
         .location = resolved_location,
+        .connection = connection orelse return error.MissingArgument,
+        .idempotency_key = idempotency_key,
+        .wait = wait,
+        .wait_timeout_ms = wait_timeout_ms,
     };
-}
-
-fn defaultLitePromoteLocationAlloc(allocator: Allocator) ![]u8 {
-    return try lite_paths.defaultBackupsLocationAlloc(allocator);
 }
 
 fn nextRequiredArg(args: *std.process.Args.Iterator) ![]const u8 {
@@ -828,6 +901,7 @@ fn compact(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     {
         var lite = try LiteDb.open(allocator, path, .writer);
         defer lite.close();
+        try ensureOfflineRootOnlyOperationSupported(&lite);
         try prepareCompactLite(&lite);
     }
 
@@ -865,11 +939,12 @@ fn compactLite(lite: *LiteDb) !CompactReport {
 const ServeOptions = struct {
     path: []const u8,
     addr: []const u8 = "127.0.0.1:8080",
-};
+    fsync: bool = true,
+    standalone_args: std.ArrayListUnmanaged([]const u8) = .empty,
 
-const LiteHttpState = struct {
-    lite: *LiteDb,
-    mutex: std.atomic.Mutex = .unlocked,
+    fn deinit(self: *ServeOptions, alloc: std.mem.Allocator) void {
+        self.standalone_args.deinit(alloc);
+    }
 };
 
 const LiteListenAddress = struct {
@@ -877,52 +952,56 @@ const LiteListenAddress = struct {
     port: u16,
 };
 
-fn serve(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
-    const opts = try parseServeOptions(args);
-    try requireAflitePath(opts.path);
-
-    const listen = try parseLiteListenAddress(opts.addr);
-    var lite = try LiteDb.open(allocator, opts.path, .writer);
-    defer lite.close();
-
-    var state = LiteHttpState{ .lite = &lite };
-    if (active_lite_http_state != null) return error.UnsupportedLiteServe;
-    active_lite_http_state = &state;
-    defer active_lite_http_state = null;
-
-    var server = httpx.Server.initWithConfig(allocator, io, .{
-        .host = listen.host,
-        .port = listen.port,
-        .max_body_size = max_json_file_bytes,
-    });
-    defer server.deinit();
-
-    try registerLiteHttpRoutes(&server);
-    try server.bind();
-    if (server.boundAddress()) |addr| {
-        std.debug.print("antfly lite serving {s} on http://{}\n", .{ opts.path, addr });
-    }
-    try server.listen();
+fn serve(init: std.process.Init, args: *std.process.Args.Iterator) !void {
+    var opts = try parseServeOptions(init.gpa, args);
+    defer opts.deinit(init.gpa);
+    return try serveWithOptions(init, opts);
 }
 
-fn parseServeOptions(args: *std.process.Args.Iterator) !ServeOptions {
+fn serveWithOptions(init: std.process.Init, opts: ServeOptions) !void {
+    try requireAflitePath(opts.path);
+    const listen = try parseLiteListenAddress(opts.addr);
+    return try antfly.standalone.runtime.runLite(init, opts.path, listen.host, listen.port, opts.fsync, opts.standalone_args.items);
+}
+
+fn parseServeOptions(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !ServeOptions {
     const path = args.next() orelse {
         std.debug.print("error: database path is required\n", .{});
         return error.InvalidArguments;
     };
     var opts: ServeOptions = .{ .path = path };
+    errdefer opts.deinit(alloc);
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--addr")) {
             opts.addr = args.next() orelse {
                 std.debug.print("error: --addr value is required\n", .{});
                 return error.InvalidArguments;
             };
-        } else {
-            std.debug.print("error: unknown serve argument: {s}\n", .{arg});
+        } else if (std.mem.eql(u8, arg, "--fsync")) {
+            opts.fsync = parseLiteBool(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+        } else if (std.mem.startsWith(u8, arg, "--fsync=")) {
+            opts.fsync = parseLiteBool(arg["--fsync=".len..]) orelse return error.InvalidArguments;
+        } else if (isReservedLiteServeFlag(arg)) {
+            std.debug.print("error: {s} is controlled by antfly lite serve\n", .{arg});
             return error.InvalidArguments;
+        } else {
+            try opts.standalone_args.append(alloc, arg);
         }
     }
     return opts;
+}
+
+fn isReservedLiteServeFlag(arg: []const u8) bool {
+    for ([_][]const u8{ "--storage-engine", "--storage-path", "--host", "--port" }) |flag| {
+        if (std.mem.eql(u8, arg, flag) or (arg.len > flag.len and std.mem.startsWith(u8, arg, flag) and arg[flag.len] == '=')) return true;
+    }
+    return false;
+}
+
+fn parseLiteBool(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return null;
 }
 
 fn parseLiteListenAddress(addr: []const u8) !LiteListenAddress {
@@ -939,309 +1018,6 @@ fn isLiteLocalListenHost(host: []const u8) bool {
         std.mem.eql(u8, host, "127.0.0.1") or
         std.mem.eql(u8, host, "::1") or
         std.mem.eql(u8, host, "[::1]");
-}
-
-const LiteHttpRoute = struct {
-    method: httpx.Method,
-    path: []const u8,
-    handler: httpx.Handler,
-};
-
-const lite_http_routes = [_]LiteHttpRoute{
-    .{ .method = .GET, .path = "/healthz", .handler = liteHttpHealth },
-    .{ .method = .GET, .path = "/lite/v1/status", .handler = liteHttpStatus },
-    .{ .method = .GET, .path = "/lite/v1/capabilities", .handler = liteHttpCapabilities },
-    .{ .method = .POST, .path = "/lite/v1/batch", .handler = liteHttpBatch },
-    .{ .method = .POST, .path = "/lite/v1/lookup/:key", .handler = liteHttpLookup },
-    .{ .method = .POST, .path = "/lite/v1/scan", .handler = liteHttpScan },
-    .{ .method = .POST, .path = "/lite/v1/query", .handler = liteHttpQuery },
-    .{ .method = .GET, .path = "/lite/v1/indexes", .handler = liteHttpIndexList },
-    .{ .method = .POST, .path = "/lite/v1/indexes", .handler = liteHttpIndexCreate },
-    .{ .method = .DELETE, .path = "/lite/v1/indexes/:name", .handler = liteHttpIndexDrop },
-    .{ .method = .GET, .path = "/lite/v1/enrichments", .handler = liteHttpEnrichmentList },
-    .{ .method = .POST, .path = "/lite/v1/enrichments", .handler = liteHttpEnrichmentCreate },
-    .{ .method = .DELETE, .path = "/lite/v1/enrichments/:kind/:name", .handler = liteHttpEnrichmentDrop },
-    .{ .method = .GET, .path = "/lite/v1/schema", .handler = liteHttpSchemaGet },
-    .{ .method = .PUT, .path = "/lite/v1/schema", .handler = liteHttpSchemaSet },
-    .{ .method = .POST, .path = "/lite/v1/run-until-idle", .handler = liteHttpRunUntilIdle },
-    .{ .method = .GET, .path = "/lite/v1/check", .handler = liteHttpCheck },
-    .{ .method = .POST, .path = "/lite/v1/compact", .handler = liteHttpCompact },
-    .{ .method = .POST, .path = "/lite/v1/vacuum", .handler = liteHttpVacuum },
-};
-
-fn registerLiteHttpRoutes(server: *httpx.Server) !void {
-    try server.preRoute(liteHttpInjectState);
-    for (lite_http_routes) |route| {
-        try server.route(route.method, route.path, route.handler);
-    }
-}
-
-fn liteHttpInjectState(ctx: *httpx.Context) anyerror!void {
-    const state = active_lite_http_state orelse return error.LiteHttpServerUnavailable;
-    try ctx.setData(lite_http_state_key, state, null);
-}
-
-fn liteHttpState(ctx: *httpx.Context) !*LiteHttpState {
-    const raw = ctx.getData(lite_http_state_key) orelse return error.LiteHttpServerUnavailable;
-    return @ptrCast(@alignCast(raw));
-}
-
-fn lockLiteHttpState(state: *LiteHttpState) void {
-    platform_sync.lockYielding(&state.mutex);
-}
-
-fn liteHttpJson(ctx: *httpx.Context, status_code: u16, body: []const u8) !httpx.Response {
-    _ = ctx.response.status(status_code);
-    _ = try ctx.response.header("Content-Type", "application/json");
-    _ = ctx.response.body(body);
-    return ctx.response.build();
-}
-
-fn liteHttpError(ctx: *httpx.Context, err: anyerror) anyerror!httpx.Response {
-    const status_code: u16 = switch (err) {
-        error.FileNotFound, error.NotFound => 404,
-        error.WouldBlock, error.WriterLocked, error.FileBusy => 409,
-        error.InvalidArguments,
-        error.InvalidArgument,
-        error.InvalidQueryRequest,
-        error.UnsupportedQueryRequest,
-        error.UnsupportedLiteServe,
-        error.InvalidNativeMagic,
-        error.TruncatedNativeHeader,
-        error.UnsupportedNativeFormatVersion,
-        error.InvalidNativeHeaderSize,
-        error.NativeHeaderChecksumMismatch,
-        error.InvalidNativePageSize,
-        error.InvalidNativeCheckpoint,
-        error.TruncatedNativeFile,
-        error.EndOfStream,
-        error.Truncated,
-        error.InvalidMagic,
-        error.HeaderCrcMismatch,
-        error.UnsupportedVersion,
-        error.BlockCrcMismatch,
-        => 400,
-        else => 500,
-    };
-    var buf: [256]u8 = undefined;
-    const body = std.fmt.bufPrint(&buf, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch "{\"error\":\"internal\"}";
-    return liteHttpJson(ctx, status_code, body);
-}
-
-fn liteHttpRequestBody(ctx: *httpx.Context) ![]const u8 {
-    return (try ctx.body()) orelse "";
-}
-
-fn liteHttpHealth(ctx: *httpx.Context) anyerror!httpx.Response {
-    return liteHttpJson(ctx, 200, "{\"status\":\"ok\"}");
-}
-
-fn liteHttpStatus(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const json = statusJson(ctx.allocator, state.lite, .native) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpCapabilities(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    var status_value = state.lite.backend.fullStatus(ctx.allocator, &state.lite.db, .native) catch |err| return liteHttpError(ctx, err);
-    defer status_value.deinit(ctx.allocator);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, status_value.capabilities, .{}) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpBatch(ctx: *httpx.Context) anyerror!httpx.Response {
-    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const json = batchJson(ctx.allocator, &state.lite.db, body) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpLookup(ctx: *httpx.Context) anyerror!httpx.Response {
-    const key = ctx.param("key") orelse return liteHttpError(ctx, error.InvalidArguments);
-    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const json = lookupJson(ctx.allocator, &state.lite.db, key, body) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpScan(ctx: *httpx.Context) anyerror!httpx.Response {
-    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const json = scanJson(ctx.allocator, &state.lite.db, body) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpQuery(ctx: *httpx.Context) anyerror!httpx.Response {
-    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const json = searchJson(ctx.allocator, &state.lite.db, body) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpIndexList(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const configs = state.lite.db.listIndexes(ctx.allocator) catch |err| return liteHttpError(ctx, err);
-    defer db_types.freeIndexConfigs(ctx.allocator, configs);
-    const public_configs = db_types.publicIndexConfigsAlloc(ctx.allocator, configs) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(public_configs);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, public_configs, .{}) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpIndexCreate(ctx: *httpx.Context) anyerror!httpx.Response {
-    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
-    var parsed = std.json.parseFromSlice(db_types.IndexConfig, ctx.allocator, body, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| return liteHttpError(ctx, err);
-    defer parsed.deinit();
-    parsed.value.coverage_generation = 0;
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    state.lite.db.addIndex(parsed.value) catch |err| return liteHttpError(ctx, err);
-    const json = mutationJson(ctx.allocator, "created", parsed.value.name, true) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpIndexDrop(ctx: *httpx.Context) anyerror!httpx.Response {
-    const name = ctx.param("name") orelse return liteHttpError(ctx, error.InvalidArguments);
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const removed = state.lite.db.deleteIndex(name) catch |err| return liteHttpError(ctx, err);
-    const json = mutationJson(ctx.allocator, "removed", name, removed) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpEnrichmentList(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const configs = state.lite.db.listEnrichments(ctx.allocator) catch |err| return liteHttpError(ctx, err);
-    defer db_types.freeEnrichmentConfigs(ctx.allocator, configs);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, configs, .{}) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpEnrichmentCreate(ctx: *httpx.Context) anyerror!httpx.Response {
-    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
-    var parsed = std.json.parseFromSlice(db_types.EnrichmentConfig, ctx.allocator, body, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| return liteHttpError(ctx, err);
-    defer parsed.deinit();
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    state.lite.db.addEnrichment(parsed.value) catch |err| return liteHttpError(ctx, err);
-    const json = mutationJson(ctx.allocator, "created", parsed.value.name, true) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpEnrichmentDrop(ctx: *httpx.Context) anyerror!httpx.Response {
-    const kind_raw = ctx.param("kind") orelse return liteHttpError(ctx, error.InvalidArguments);
-    const name = ctx.param("name") orelse return liteHttpError(ctx, error.InvalidArguments);
-    const kind = parseLiteHttpEnrichmentKind(kind_raw) catch |err| return liteHttpError(ctx, err);
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const removed = state.lite.db.deleteEnrichment(kind, name) catch |err| return liteHttpError(ctx, err);
-    const json = mutationJson(ctx.allocator, "removed", name, removed) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn parseLiteHttpEnrichmentKind(value: []const u8) !db_types.EnrichmentKind {
-    if (std.mem.eql(u8, value, "chunk")) return .chunk;
-    if (std.mem.eql(u8, value, "asset")) return .asset;
-    if (std.mem.eql(u8, value, "embedding")) return .embedding;
-    return error.InvalidArguments;
-}
-
-fn liteHttpSchemaGet(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const schema_json = state.lite.db.getSchemaJson(ctx.allocator) catch |err| return liteHttpError(ctx, err);
-    if (schema_json) |json| {
-        defer ctx.allocator.free(json);
-        return liteHttpJson(ctx, 200, json);
-    }
-    return liteHttpJson(ctx, 200, "null");
-}
-
-fn liteHttpSchemaSet(ctx: *httpx.Context) anyerror!httpx.Response {
-    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    state.lite.db.setSchemaJson(ctx.allocator, body) catch |err| return liteHttpError(ctx, err);
-    return liteHttpJson(ctx, 200, "{\"updated\":true}");
-}
-
-fn liteHttpRunUntilIdle(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    state.lite.db.maintenanceDriver().runUntilIdle() catch |err| return liteHttpError(ctx, err);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, state.lite.db.maintenanceDriver().pendingWorkStats(), .{}) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpCheck(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const report = state.lite.backend.check() catch |err| return liteHttpError(ctx, err);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, report, .{}) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpCompact(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const report = compactLite(state.lite) catch |err| return liteHttpError(ctx, err);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, report, .{}) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
-}
-
-fn liteHttpVacuum(ctx: *httpx.Context) anyerror!httpx.Response {
-    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
-    lockLiteHttpState(state);
-    defer state.mutex.unlock();
-    const report = state.lite.backend.vacuum() catch |err| return liteHttpError(ctx, err);
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, report, .{}) catch |err| return liteHttpError(ctx, err);
-    defer ctx.allocator.free(json);
-    return liteHttpJson(ctx, 200, json);
 }
 
 fn batchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
@@ -1642,11 +1418,11 @@ fn printUsage(argv0: []const u8) void {
         \\  restore <backup.afb> --out <db.aflite> [--replace]
         \\  restore <source.aflite> --out <db.aflite> [--replace] (stable snapshot copy)
         \\  import <db.aflite> --from <backup.afb|source.aflite> [--replace]
-        \\  promote <db.aflite> --target <url> --table <name> [--backup-id <id>] [--location <uri>]
+        \\  promote <db.aflite> --target <url> --table <name> --connection <reader> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--no-wait] [--wait-timeout <seconds>]
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
-        \\  serve <db.aflite> --addr 127.0.0.1:8080
+        \\  serve <db.aflite> --addr 127.0.0.1:8080 [--fsync <true|false>] [standalone options]
         \\
     , .{argv0});
 }
@@ -1673,21 +1449,31 @@ test "lite restore source validation accepts afb and aflite" {
     try std.testing.expectError(error.InvalidArguments, requireRestoreSourcePath("app.db"));
 }
 
-test "lite serve parser preserves optional addr and rejects unknown args" {
+test "lite serve parser preserves convenience flags and forwards standalone options" {
     {
         const argv = [_][*:0]const u8{"app.aflite"};
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        const opts = try parseServeOptions(&args);
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
         try std.testing.expectEqualStrings("127.0.0.1:8080", opts.addr);
+        try std.testing.expect(opts.fsync);
         const listen = try parseLiteListenAddress(opts.addr);
         try std.testing.expectEqualStrings("127.0.0.1", listen.host);
         try std.testing.expectEqual(@as(u16, 8080), listen.port);
     }
     {
+        const argv = [_][*:0]const u8{ "app.aflite", "--fsync=false" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
+        try std.testing.expect(!opts.fsync);
+    }
+    {
         const argv = [_][*:0]const u8{ "app.aflite", "--addr", "127.0.0.1:9090" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        const opts = try parseServeOptions(&args);
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
         try std.testing.expectEqualStrings("127.0.0.1:9090", opts.addr);
         const listen = try parseLiteListenAddress(opts.addr);
@@ -1697,7 +1483,14 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--port", "9090" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        try std.testing.expectError(error.InvalidArguments, parseServeOptions(&args));
+        try std.testing.expectError(error.InvalidArguments, parseServeOptions(std.testing.allocator, &args));
+    }
+    {
+        const argv = [_][*:0]const u8{ "app.aflite", "--config", "production.json", "--admin-api-token", "secret" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var opts = try parseServeOptions(std.testing.allocator, &args);
+        defer opts.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices([]const u8, &.{ "--config", "production.json", "--admin-api-token", "secret" }, opts.standalone_args.items);
     }
     try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("127.0.0.1"));
     try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress(":8080"));
@@ -1711,21 +1504,11 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
     }
 }
 
-test "lite serve route table is narrow and unique" {
-    try std.testing.expect(lite_http_routes.len > 0);
-    for (lite_http_routes, 0..) |route, i| {
-        try std.testing.expect(std.mem.eql(u8, route.path, "/healthz") or std.mem.startsWith(u8, route.path, "/lite/v1/"));
-        for (lite_http_routes[i + 1 ..]) |other| {
-            try std.testing.expect(!(route.method == other.method and std.mem.eql(u8, route.path, other.path)));
-        }
-    }
-}
-
 test "lite promote parser requires values and derives default backup id" {
     const allocator = std.testing.allocator;
 
     {
-        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--location", "file:///tmp/backups" };
+        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--location", "file:///tmp/backups" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
@@ -1733,16 +1516,24 @@ test "lite promote parser requires values and derives default backup id" {
         try std.testing.expectEqualStrings("docs", opts.table);
         try std.testing.expectEqualStrings("lite-app", opts.backup_id);
         try std.testing.expectEqualStrings("file:///tmp/backups", opts.location);
+        try std.testing.expectEqualStrings("local-reader", opts.connection);
     }
 
     {
-        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--backup-id", "explicit-id" };
+        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--backup-id", "explicit-id", "--location", "s3://promotions/app", "--idempotency-key", "promote-app", "--no-wait" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("explicit-id", opts.backup_id);
-        try std.testing.expect(std.mem.startsWith(u8, opts.location, "file://"));
-        try std.testing.expect(std.mem.endsWith(u8, opts.location, "/.antfly/lite/backups"));
+        try std.testing.expectEqualStrings("s3://promotions/app", opts.location);
+        try std.testing.expectEqualStrings("promote-app", opts.idempotency_key.?);
+        try std.testing.expect(!opts.wait);
+    }
+
+    {
+        const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try std.testing.expectError(error.MissingArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 
     {
@@ -2066,7 +1857,10 @@ test "lite export subcommand dispatches portable backup alias" {
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    try dispatchSubcommand(allocator, io, "antfly lite", "export", &args);
+    var init: std.process.Init = undefined;
+    init.gpa = allocator;
+    init.io = io;
+    try dispatchSubcommand(init, "antfly lite", "export", &args);
 
     const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
     defer allocator.free(body);
@@ -2629,6 +2423,42 @@ test "lite snapshot rejects same existing aflite through different path spelling
     try std.testing.expect(std.mem.indexOf(u8, json, "\"self snapshot rejected\"") != null);
 }
 
+test "lite offline portable backup rejects standalone-adopted artifacts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/adopted-backup.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var lite = try LiteDb.create(allocator, path, true);
+    defer lite.close();
+    try ensureOfflinePortableBackupSupported(&lite);
+    try ensureOfflineRootOnlyOperationSupported(&lite);
+    try lite.backend.adoptEmbeddedRootAsNamespace("group-42/table-db");
+    try std.testing.expectError(
+        error.StandaloneLitePortableBackupRequiresApi,
+        ensureOfflinePortableBackupSupported(&lite),
+    );
+
+    // Fresh standalone artifacts without an adopted embedded root must also
+    // reject the root-only offline archive path.
+    var fresh_tmp = std.testing.tmpDir(.{});
+    defer fresh_tmp.cleanup();
+    const fresh_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/standalone-backup.aflite", .{fresh_tmp.sub_path});
+    defer allocator.free(fresh_path);
+    var fresh = try LiteDb.create(allocator, fresh_path, true);
+    defer fresh.close();
+    try fresh.backend.markStandaloneArtifact();
+    try std.testing.expectError(
+        error.StandaloneLitePortableBackupRequiresApi,
+        ensureOfflinePortableBackupSupported(&fresh),
+    );
+    try std.testing.expectError(
+        error.StandaloneLiteRequiresApi,
+        ensureOfflineRootOnlyOperationSupported(&fresh),
+    );
+}
+
 test "lite restore malformed backup leaves target untouched" {
     const allocator = std.testing.allocator;
 
@@ -2737,8 +2567,11 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"format_version\":1") != null);
+    const expected_format_version = try std.fmt.allocPrint(allocator, "\"format_version\":{d}", .{antfly.lite.native.format_version});
+    defer allocator.free(expected_format_version);
+    try std.testing.expect(std.mem.indexOf(u8, json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"page_size\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"fsync\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"active_checkpoint\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"checkpoint_sequence\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":") != null);
@@ -2786,170 +2619,6 @@ test "lite status rejects internal bridge aflite files" {
     var argv = [_][*:0]const u8{path_z.ptr};
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expectError(error.TruncatedNativeHeader, status(allocator, std.testing.io, &args));
-}
-
-fn testLiteHttpCall(
-    allocator: Allocator,
-    state: ?*LiteHttpState,
-    comptime handler: httpx.Handler,
-    method: httpx.Method,
-    url: []const u8,
-    body: []const u8,
-    params: []const @import("httpx").router.RouteParam,
-) !httpx.Response {
-    var req = try httpx.Request.init(allocator, method, url);
-    defer req.deinit();
-    if (body.len > 0) try req.setBody(body);
-
-    var ctx = httpx.Context.init(allocator, std.testing.io, &req);
-    defer ctx.deinit();
-    ctx.params = params;
-    if (state) |s| try ctx.setData(lite_http_state_key, s, null);
-    return try handler(&ctx);
-}
-
-fn testLiteHttpBody(resp: *const httpx.Response) []const u8 {
-    return resp.body orelse "";
-}
-
-test "lite http handlers expose narrow embedded api" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/http-api.aflite", .{tmp.sub_path});
-    defer allocator.free(path);
-
-    var lite = try LiteDb.create(allocator, path, true);
-    defer lite.close();
-
-    var state = LiteHttpState{ .lite = &lite };
-    {
-        var resp = try testLiteHttpCall(allocator, null, liteHttpHealth, .GET, "http://lite.test/healthz", "", &.{});
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"status\":\"ok\"") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(
-            allocator,
-            &state,
-            liteHttpBatch,
-            .POST,
-            "http://lite.test/lite/v1/batch",
-            "{\"inserts\":{\"doc:http\":{\"title\":\"served lite\"}}}",
-            &.{},
-        );
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"inserted\":1") != null);
-    }
-    {
-        const params = [_]@import("httpx").router.RouteParam{.{ .name = "key", .value = "doc:http" }};
-        var resp = try testLiteHttpCall(
-            allocator,
-            &state,
-            liteHttpLookup,
-            .POST,
-            "http://lite.test/lite/v1/lookup/doc:http",
-            "{}",
-            params[0..],
-        );
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"served lite\"") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(allocator, &state, liteHttpStatus, .GET, "http://lite.test/lite/v1/status", "", &.{});
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"format\":\"aflite\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"engine\":\"native_single_file\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"capabilities\":") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(allocator, &state, liteHttpCapabilities, .GET, "http://lite.test/lite/v1/capabilities", "", &.{});
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"dense_vector_search\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"raft_replication\":false") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(
-            allocator,
-            &state,
-            liteHttpIndexCreate,
-            .POST,
-            "http://lite.test/lite/v1/indexes",
-            "{\"name\":\"ft_title\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
-            &.{},
-        );
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"created\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"name\":\"ft_title\"") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(allocator, &state, liteHttpRunUntilIdle, .POST, "http://lite.test/lite/v1/run-until-idle", "", &.{});
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"derived_target_sequence\":") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"text_merge\"") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(
-            allocator,
-            &state,
-            liteHttpQuery,
-            .POST,
-            "http://lite.test/lite/v1/query",
-            "{\"full_text_search\":{\"match\":{\"field\":\"title\",\"text\":\"served lite\"}},\"limit\":1}",
-            &.{},
-        );
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"doc:http\"") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(allocator, &state, liteHttpCheck, .GET, "http://lite.test/lite/v1/check", "", &.{});
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"valid\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"record_count\":") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(allocator, &state, liteHttpCompact, .POST, "http://lite.test/lite/v1/compact", "", &.{});
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"reclaimed_bytes\":") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"live_bytes\":") != null);
-    }
-    {
-        var resp = try testLiteHttpCall(allocator, &state, liteHttpVacuum, .POST, "http://lite.test/lite/v1/vacuum", "", &.{});
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"before_size\":") != null);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"reclaimed_bytes\":") != null);
-    }
-    {
-        var req = try httpx.Request.init(allocator, .GET, "http://lite.test/lite/v1/status");
-        defer req.deinit();
-
-        var ctx = httpx.Context.init(allocator, std.testing.io, &req);
-        defer ctx.deinit();
-
-        active_lite_http_state = &state;
-        defer active_lite_http_state = null;
-        try liteHttpInjectState(&ctx);
-        try std.testing.expect(ctx.getData(lite_http_state_key) != null);
-
-        var resp = try liteHttpStatus(&ctx);
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"format\":\"aflite\"") != null);
-    }
 }
 
 test "lite writer close syncs unsynced batch before readonly reopen" {
@@ -3219,7 +2888,7 @@ test "lite promote helper stages backup then submits normal restore request" {
 
     const location_z = try allocator.dupeZ(u8, location);
     defer allocator.free(location_z);
-    const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
+    const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--connection", "local-reader", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var opts = try parsePromoteOptions(allocator, src_path, &args);
     defer opts.deinit(allocator);
@@ -3229,27 +2898,34 @@ test "lite promote helper stages backup then submits normal restore request" {
         table: []const u8 = "",
         backup_id: []const u8 = "",
         location: []const u8 = "",
-        format: []const u8 = "",
+        connection: []const u8 = "",
 
-        fn restore(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
+        fn restore(ctx: *anyopaque, allocator_inner: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, _: ?[]const u8) !PromoteRestoreAcceptance {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.called = true;
             self.table = table;
             self.backup_id = request.backup_id;
             self.location = request.location;
-            self.format = request.format orelse "";
+            self.connection = request.connection;
+            return .{
+                .job_id = 42,
+                .encoded = try allocator_inner.dupe(u8, "{\"job_id\":42,\"phase\":\"queued\"}"),
+            };
         }
     };
 
     var capture = Capture{};
-    var staged = try promoteWithRestore(allocator, src_path, opts, &capture, Capture.restore);
-    defer staged.deinit(allocator);
+    var submission = try promoteWithRestore(allocator, src_path, opts, &capture, Capture.restore);
+    defer submission.deinit(allocator);
+    const staged = submission.staged;
 
     try std.testing.expect(capture.called);
+    try std.testing.expectEqual(@as(i64, 42), submission.restore_job_id);
+    try std.testing.expectEqualStrings("{\"job_id\":42,\"phase\":\"queued\"}", submission.accepted_json);
     try std.testing.expectEqualStrings("docs", capture.table);
     try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
     try std.testing.expectEqualStrings(staged.location, capture.location);
-    try std.testing.expectEqualStrings("portable", capture.format);
+    try std.testing.expectEqualStrings("local-reader", capture.connection);
     try std.testing.expectEqualStrings("lite-promote-command.afb", staged.snapshot_path);
 
     var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);
