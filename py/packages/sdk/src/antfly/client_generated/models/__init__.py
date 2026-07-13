@@ -436,6 +436,8 @@ from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
+from .list_restore_jobs_phase import ListRestoreJobsPhase
+from .list_restore_jobs_scope import ListRestoreJobsScope
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
@@ -529,8 +531,10 @@ from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
 from .restore_job import RestoreJob
+from .restore_job_list import RestoreJobList
 from .restore_job_phase import RestoreJobPhase
 from .restore_job_result import RestoreJobResult
+from .restore_job_result_durability import RestoreJobResultDurability
 from .restore_job_result_failure_details_item import RestoreJobResultFailureDetailsItem
 from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
@@ -1095,6 +1099,8 @@ __all__ = (
     "LinkupSearchConfigDepth",
     "LinkupSearchConfigOutputType",
     "ListDocumentArtifactManifestsDetail",
+    "ListRestoreJobsPhase",
+    "ListRestoreJobsScope",
     "ListUsersResponse200Item",
     "LookupKeyConsistency",
     "LookupKeyResponse200",
@@ -1188,8 +1194,10 @@ __all__ = (
     "RerankerProvider",
     "ResourceType",
     "RestoreJob",
+    "RestoreJobList",
     "RestoreJobPhase",
     "RestoreJobResult",
+    "RestoreJobResultDurability",
     "RestoreJobResultFailureDetailsItem",
     "RestoreJobResultRestore",
     "RestoreJobResultStatus",

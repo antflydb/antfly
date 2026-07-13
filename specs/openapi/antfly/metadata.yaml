@@ -4735,7 +4735,7 @@ components:
           example: "skip_if_exists"
     RestoreJob:
       type: object
-      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, published_table_count, completed_table_count, created_at_ms, updated_at_ms]
+      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, durability_pending_table_count, published_table_count, completed_table_count, created_at_ms, updated_at_ms]
       properties:
         job_id:
           type: string
@@ -4749,6 +4749,11 @@ components:
         backup_id: { type: string }
         phase: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
         cancel_requested: { type: boolean }
+        durability_pending_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
         published_table_count:
           type: integer
           format: int64
@@ -4768,21 +4773,28 @@ components:
           type: object
           additionalProperties: false
           description: |
-            Bounded terminal result. Cluster restores report aggregate triggered, skipped, and failed table counts plus
-            a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part
-            of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for partial
-            progress and use a new idempotency key when retrying a changed request.
+            Bounded terminal result. A committed result with durability pending means publication is visible but
+            parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed,
+            durability-pending, skipped, and failed table counts plus a bounded sample of failure details.
+            `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted.
+            Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress
+            and use a new idempotency key when retrying a changed request.
           properties:
             restore:
               type: string
-              enum: [triggered]
-              description: Present for a successful single-table restore.
+              enum: [triggered, committed]
+              description: Present for a single-table restore result.
+            durability:
+              type: string
+              enum: [pending]
+              description: Present when table publication is visible but filesystem durability could not be confirmed.
             status:
               type: string
-              enum: [completed, partial, failed]
+              enum: [completed, durability_pending, partial, failed]
               description: Aggregate terminal status for a cluster restore.
             triggered_table_count: { type: integer, format: int64, minimum: 0 }
             committed_table_count: { type: integer, format: int64, minimum: 0 }
+            durability_pending_table_count: { type: integer, format: int64, minimum: 0 }
             skipped_table_count: { type: integer, format: int64, minimum: 0 }
             failed_table_count: { type: integer, format: int64, minimum: 0 }
             failure_details:
@@ -4806,6 +4818,21 @@ components:
           type: integer
           format: int64
           description: Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+    RestoreJobList:
+      type: object
+      additionalProperties: false
+      required: [jobs]
+      properties:
+        jobs:
+          type: array
+          maxItems: 100
+          items: { $ref: "#/components/schemas/RestoreJob" }
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 20
+          pattern: '^[1-9][0-9]{0,19}$'
+          description: Opaque newest-first continuation cursor. Omitted when no additional authorized jobs match the filters.
     ClusterRestoreResponse:
       type: object
       required:
@@ -8228,6 +8255,38 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /restore/jobs:
+    get:
+      summary: List durable restore jobs
+      description: Returns a newest-first, authorization-filtered page of retained restore jobs from the metadata leader.
+      operationId: listRestoreJobs
+      tags: [cluster_management]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 20
+            pattern: '^[1-9][0-9]{0,19}$'
+          description: Opaque cursor returned by the preceding page.
+        - name: phase
+          in: query
+          schema: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        - name: scope
+          in: query
+          schema: { type: string, enum: [table, cluster] }
+      responses:
+        "200":
+          description: Authorized restore jobs
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreJobList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
   /restore/jobs/{job_id}:
     parameters:
       - name: job_id

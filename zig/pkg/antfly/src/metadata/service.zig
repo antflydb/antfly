@@ -674,7 +674,8 @@ const ProjectedCoreSnapshot = struct {
             if (intent.record.backup_restore_bootstrap) |record| out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len;
         }
         for (self.restore_progresses) |record| {
-            out.estimated_bytes += record.backup_id.len + record.snapshot_path.len + record.phase.len + record.last_error.len;
+            out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len +
+                record.phase.len + record.last_error.len;
         }
         for (self.replication_source_statuses) |record| {
             out.estimated_bytes += record.source_kind.len + record.external_table.len + record.cutover_mode.len +
@@ -4169,6 +4170,7 @@ fn syncLocalRestoreProgress(
 
 fn restoreProgressEquivalent(a: metadata_table_manager.RestoreProgressRecord, b: metadata_table_manager.RestoreProgressRecord) bool {
     return std.mem.eql(u8, a.backup_id, b.backup_id) and
+        std.mem.eql(u8, a.location, b.location) and
         std.mem.eql(u8, a.snapshot_path, b.snapshot_path) and
         a.primary_restored == b.primary_restored and
         a.runtime_repair_complete == b.runtime_repair_complete and
@@ -4225,7 +4227,8 @@ fn completeRestoreIntentsForService(
     for (ranges) |range| {
         const table = findProjectedTableById(tables, range.table_id) orelse continue;
         const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, placements, progress)) continue;
+        const restore_location = restoreLocationForRange(range, table) orelse continue;
+        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, restore_location, placements, progress)) continue;
         if (range.restore_backup_id.len == 0 and range.restore_location.len == 0) continue;
 
         var cleared = try metadata_table_manager.cloneRange(service.alloc, range);
@@ -4265,8 +4268,9 @@ fn restoreIntentComplete(
     for (ranges) |range| {
         if (range.table_id != table.table_id) continue;
         const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
+        const restore_location = restoreLocationForRange(range, table) orelse return false;
         found_any_range = true;
-        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, placements, progress)) return false;
+        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, restore_location, placements, progress)) return false;
     }
     return found_any_range;
 }
@@ -4275,6 +4279,7 @@ fn rangeRestoreIntentComplete(
     table_id: u64,
     group_id: u64,
     restore_backup_id: []const u8,
+    restore_location: []const u8,
     placements: []const raft_reconciler.PlacementIntent,
     progress: []const metadata_table_manager.RestoreProgressRecord,
 ) bool {
@@ -4284,6 +4289,7 @@ fn rangeRestoreIntentComplete(
         found_any_placement = true;
         const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, group_id) orelse return false;
         if (!std.mem.eql(u8, restored.backup_id, restore_backup_id)) return false;
+        if (!std.mem.eql(u8, restored.location, restore_location)) return false;
         if (!restored.primary_restored or !restored.runtime_repair_complete) return false;
     }
     return found_any_placement;
@@ -4295,6 +4301,15 @@ fn restoreBackupIdForRange(
 ) ?[]const u8 {
     if (range.restore_backup_id.len > 0) return range.restore_backup_id;
     if (table.restore_backup_id.len > 0) return table.restore_backup_id;
+    return null;
+}
+
+fn restoreLocationForRange(
+    range: metadata_table_manager.RangeRecord,
+    table: metadata_table_manager.TableRecord,
+) ?[]const u8 {
+    if (range.restore_location.len > 0) return range.restore_location;
+    if (table.restore_location.len > 0) return table.restore_location;
     return null;
 }
 
@@ -9386,8 +9401,8 @@ test "metadata service clears restore intent once all placement replicas report 
             .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
         },
         .progress = &.{
-            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
         },
     };
     defer service.deinit();
@@ -9408,11 +9423,11 @@ test "metadata service keeps restore intent until runtime repair completes" {
         .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
     };
     const progress = [_]metadata_table_manager.RestoreProgressRecord{
-        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
     };
 
-    try std.testing.expect(!rangeRestoreIntentComplete(7, 7001, "snap1", &placements, &progress));
+    try std.testing.expect(!rangeRestoreIntentComplete(7, 7001, "snap1", "file:///tmp/backups", &placements, &progress));
 }
 
 test "metadata http service projected tables cache invalidates without prior runRound registration" {

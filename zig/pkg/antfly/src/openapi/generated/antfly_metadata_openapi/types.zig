@@ -2172,19 +2172,27 @@ pub const RestoreJob = struct {
     backup_id: []const u8,
     phase: []const u8,
     cancel_requested: bool,
+    /// Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+    durability_pending_table_count: i64,
     /// Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
     published_table_count: i64,
     /// Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
     completed_table_count: i64,
     /// Requested table count when known before execution.
     total_table_count: ?i64 = null,
-    /// Bounded terminal result. Cluster restores report aggregate triggered, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
+    /// Bounded terminal result. A committed result with durability pending means publication is visible but parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed, durability-pending, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
     result: ?std.json.Value = null,
     @"error": ?[]const u8 = null,
     created_at_ms: i64,
     updated_at_ms: i64,
     /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
     expires_at_ms: ?i64 = null,
+};
+
+pub const RestoreJobList = struct {
+    jobs: []const RestoreJob,
+    /// Opaque newest-first continuation cursor. Omitted when no additional authorized jobs match the filters.
+    next_cursor: ?[]const u8 = null,
 };
 
 pub const RestoreRequest = struct {

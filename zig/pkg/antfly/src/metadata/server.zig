@@ -464,7 +464,9 @@ const MetadataAdminMux = struct {
 
     fn isRestoreApiRequest(uri: []const u8) bool {
         const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query| uri[0..query] else uri;
-        if (std.mem.eql(u8, path, "/db/v1/restore") or std.mem.startsWith(u8, path, "/db/v1/restore/jobs/")) return true;
+        if (std.mem.eql(u8, path, "/db/v1/restore") or
+            std.mem.eql(u8, path, "/db/v1/restore/jobs") or
+            std.mem.startsWith(u8, path, "/db/v1/restore/jobs/")) return true;
         return std.mem.startsWith(u8, path, "/db/v1/tables/") and std.mem.endsWith(u8, path, "/restore");
     }
 };

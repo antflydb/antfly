@@ -16204,13 +16204,17 @@ test "data server wires configured HA executors into API server" {
     defer alloc.free(primary_slots_raw);
     const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
     defer alloc.free(primary_slots);
+    const restore_jobs_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-restore-jobs-{d}", .{nonce});
+    defer alloc.free(restore_jobs_path);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), restore_jobs_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), restore_jobs_path) catch {};
 
     var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
         .cluster_id = 100,
@@ -16226,6 +16230,7 @@ test "data server wires configured HA executors into API server" {
 
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = ".",
+        .api_server_cfg = .{ .restore_job_store_path = restore_jobs_path },
         .ha = .{
             .admin_context = .{
                 .primary = &primary,
@@ -16255,6 +16260,7 @@ test "data server wires configured HA executors into API server" {
         .authorization = "Bearer runtime-secret-token",
     });
     defer admin_resp.deinit(server.http_server.?.alloc);
+    try std.testing.expect(admin_resp.owner_allocator != null);
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
 

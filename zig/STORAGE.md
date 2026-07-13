@@ -322,7 +322,11 @@ verify that both the shared asynchronous backend-runtime lane and a durable
 engine, filesystem, or replicated-metadata job store are available, then persist
 the job before returning `202`; otherwise admission fails with `503` and creates
 no job. Clients poll or cancel
-`/db/v1/restore/jobs/{job_id}`. `Idempotency-Key` safely coalesces retries,
+`/db/v1/restore/jobs/{job_id}` and list retained jobs with
+`GET /db/v1/restore/jobs`. The list is newest-first, cursor-paginated, and may
+be filtered by phase or scope. Authorization is applied before a job enters the
+page: table administrators see jobs for their tables and cluster administrators
+see cluster jobs. `Idempotency-Key` safely coalesces retries,
 while requests without a key create independent jobs. Catalog publication and
 replica completion are recorded as separate durable per-table checkpoints.
 Publication is not repeated after restart. If leadership
@@ -333,8 +337,15 @@ job becomes `succeeded` only after every placement replica reports completion,
 the catalog clears the table's restore intents, and the completion checkpoint is
 durable. Job status exposes separate published and completed table counts so
 operators can distinguish accepted work from readable restored data. Progress
-is stored as bounded manifest ordinals rather than repeated table-name strings,
-so its durable footprint remains O(table count). Cluster jobs persist a bounded
+also exposes a durability-pending count. A table enters that state when its new
+generation is visible but parent-directory durability cannot be confirmed; the
+job fails closed with a committed/pending result instead of reporting either a
+rollback or durable success. The active table ordinal is checkpointed before
+irreversible work, so recovery can reconcile an exact restore identity after a
+worker crash without treating an unrelated existing table as resumable.
+Progress is stored as a single active ordinal plus disjoint compressed ranges
+for durability-pending, published, and completed tables rather than repeated
+table-name strings, so its durable footprint remains O(table count). Cluster jobs persist a bounded
 terminal summary instead of duplicating every table name: aggregate counts are
 complete, up to eight failure details are retained, and a truncation flag is
 explicit. A partial cluster restore has phase `failed`, so CLI and automation
@@ -366,7 +377,11 @@ requiring client traffic. It reloads replicated state, fences the old worker
 owner, and returns incomplete attempts to their original FIFO positions with a
 higher attempt ID. Mutations are acknowledged only after a Raft read barrier
 confirms the proposed value is committed and applied. At most two restore jobs
-execute across the control-plane leader. The runnable deque is rebuilt once on
+execute across the control-plane leader. A single nonblocking dispatcher owns
+FIFO admission. Concurrent wakeups coalesce into another pass, and leadership
+transition pauses admission before draining the old worker owner, preventing
+completion callbacks from deadlocking against dispatch or reordering requeued
+work. The runnable deque is rebuilt once on
 leadership acquisition and consumed incrementally, so completing a job does
 not rescan retained terminal history. Expired history is removed in bounded
 batches of up to 1,024 keys per metadata-Raft transition rather than one

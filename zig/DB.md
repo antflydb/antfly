@@ -194,6 +194,20 @@ matches the persisted backup, source location, shard, and repair-complete state,
 reconciles publication, and reports committed/durable. A retry against an
 unrelated existing table is rejected without modifying storage.
 
+The public restore-job journal mirrors that generation state instead of reducing
+it to success/failure. Before irreversible table work it persists one active
+manifest ordinal. Publication moves that ordinal to either a durability-pending
+or published compressed range, and replica convergence moves published ordinals
+to the completed range. The ranges are disjoint where ownership differs and are
+validated on load, keeping restart decisions explicit while bounding serialized
+state. A durability-pending table terminates the attempt with a committed/pending
+result; a later idempotent request reconciles the generation marker rather than
+blindly replacing or rejecting the visible table. Restore dispatch is likewise
+generation-fenced: leadership pauses FIFO admission, drains the old runtime
+owner, rebuilds durable attempts, publishes the new term, and only then reopens
+admission. Completion callbacks request another dispatch pass without blocking
+on the dispatcher that may be destroying them.
+
 Replacing an existing direct-path generation requires an atomic directory
 exchange; platforms or filesystems without that primitive reject publication
 before changing the live namespace. If the exchange is visible but its

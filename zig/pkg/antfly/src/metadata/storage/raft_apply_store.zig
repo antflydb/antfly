@@ -3380,6 +3380,8 @@ fn appendRestoreProgressRecord(
     try appendInt(alloc, out, u64, record.group_id);
     try appendInt(alloc, out, u32, @intCast(record.backup_id.len));
     try out.appendSlice(alloc, record.backup_id);
+    try appendInt(alloc, out, u32, @intCast(record.location.len));
+    try out.appendSlice(alloc, record.location);
     try appendInt(alloc, out, u32, @intCast(record.snapshot_path.len));
     try out.appendSlice(alloc, record.snapshot_path);
     try out.append(alloc, if (record.primary_restored) 1 else 0);
@@ -3852,6 +3854,8 @@ fn readRestoreProgressRecord(
     const group_id = try readInt(encoded, pos, u64);
     const backup_id = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(backup_id);
+    const location = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(location);
     const snapshot_path = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(snapshot_path);
     if (pos.* >= encoded.len) return error.InvalidRestoreProgressRecord;
@@ -3878,6 +3882,7 @@ fn readRestoreProgressRecord(
         .node_id = node_id,
         .group_id = group_id,
         .backup_id = backup_id,
+        .location = location,
         .snapshot_path = snapshot_path,
         .primary_restored = primary_restored,
         .runtime_repair_complete = runtime_repair_complete,
@@ -5409,6 +5414,7 @@ test "metadata restore progress transition command round-trips" {
             .node_id = 7,
             .group_id = 4101,
             .backup_id = "snap1",
+            .location = "s3://archive/snap1",
         },
     };
 
@@ -5424,6 +5430,7 @@ test "metadata restore progress transition command round-trips" {
     try std.testing.expectEqual(@as(u64, 7), decoded.?.upsert_restore_progress.node_id);
     try std.testing.expectEqual(@as(u64, 4101), decoded.?.upsert_restore_progress.group_id);
     try std.testing.expectEqualStrings("snap1", decoded.?.upsert_restore_progress.backup_id);
+    try std.testing.expectEqualStrings("s3://archive/snap1", decoded.?.upsert_restore_progress.location);
 }
 
 test "metadata replication source status transition command round-trips" {

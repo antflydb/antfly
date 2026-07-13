@@ -470,6 +470,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/restore/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List durable restore jobs
+         * @description Returns a newest-first, authorization-filtered page of retained restore jobs from the metadata leader.
+         */
+        get: operations["listRestoreJobs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/restore/jobs/{job_id}": {
         parameters: {
             query?: never;
@@ -4832,6 +4852,11 @@ export interface components {
             cancel_requested: boolean;
             /**
              * Format: int64
+             * @description Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+             */
+            durability_pending_table_count: number;
+            /**
+             * Format: int64
              * @description Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
              */
             published_table_count: number;
@@ -4846,26 +4871,35 @@ export interface components {
              */
             total_table_count?: number;
             /**
-             * @description Bounded terminal result. Cluster restores report aggregate triggered, skipped, and failed table counts plus
-             *     a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part
-             *     of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for partial
-             *     progress and use a new idempotency key when retrying a changed request.
+             * @description Bounded terminal result. A committed result with durability pending means publication is visible but
+             *     parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed,
+             *     durability-pending, skipped, and failed table counts plus a bounded sample of failure details.
+             *     `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted.
+             *     Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress
+             *     and use a new idempotency key when retrying a changed request.
              */
             result?: {
                 /**
-                 * @description Present for a successful single-table restore.
+                 * @description Present for a single-table restore result.
                  * @enum {string}
                  */
-                restore?: "triggered";
+                restore?: "triggered" | "committed";
+                /**
+                 * @description Present when table publication is visible but filesystem durability could not be confirmed.
+                 * @enum {string}
+                 */
+                durability?: "pending";
                 /**
                  * @description Aggregate terminal status for a cluster restore.
                  * @enum {string}
                  */
-                status?: "completed" | "partial" | "failed";
+                status?: "completed" | "durability_pending" | "partial" | "failed";
                 /** Format: int64 */
                 triggered_table_count?: number;
                 /** Format: int64 */
                 committed_table_count?: number;
+                /** Format: int64 */
+                durability_pending_table_count?: number;
                 /** Format: int64 */
                 skipped_table_count?: number;
                 /** Format: int64 */
@@ -4888,6 +4922,11 @@ export interface components {
              * @description Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
              */
             expires_at_ms?: number;
+        };
+        RestoreJobList: {
+            jobs: components["schemas"]["RestoreJob"][];
+            /** @description Opaque newest-first continuation cursor. Omitted when no additional authorized jobs match the filters. */
+            next_cursor?: string;
         };
         ClusterRestoreResponse: {
             /** @description Status of each table restore */
@@ -13158,6 +13197,34 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listRestoreJobs: {
+        parameters: {
+            query?: {
+                limit?: number;
+                /** @description Opaque cursor returned by the preceding page. */
+                cursor?: string;
+                phase?: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+                scope?: "table" | "cluster";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authorized restore jobs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJobList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };

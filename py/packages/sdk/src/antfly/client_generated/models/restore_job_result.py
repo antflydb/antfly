@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.restore_job_result_durability import RestoreJobResultDurability
 from ..models.restore_job_result_restore import RestoreJobResultRestore
 from ..models.restore_job_result_status import RestoreJobResultStatus
 from ..types import UNSET, Unset
@@ -18,17 +19,21 @@ T = TypeVar("T", bound="RestoreJobResult")
 
 @_attrs_define
 class RestoreJobResult:
-    """Bounded terminal result. Cluster restores report aggregate triggered, skipped, and failed table counts plus
-    a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part
-    of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for
-    partial
-    progress and use a new idempotency key when retrying a changed request.
+    """Bounded terminal result. A committed result with durability pending means publication is visible but
+    parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed,
+    durability-pending, skipped, and failed table counts plus a bounded sample of failure details.
+    `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted.
+    Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress
+    and use a new idempotency key when retrying a changed request.
 
         Attributes:
-            restore (RestoreJobResultRestore | Unset): Present for a successful single-table restore.
+            restore (RestoreJobResultRestore | Unset): Present for a single-table restore result.
+            durability (RestoreJobResultDurability | Unset): Present when table publication is visible but filesystem
+                durability could not be confirmed.
             status (RestoreJobResultStatus | Unset): Aggregate terminal status for a cluster restore.
             triggered_table_count (int | Unset):
             committed_table_count (int | Unset):
+            durability_pending_table_count (int | Unset):
             skipped_table_count (int | Unset):
             failed_table_count (int | Unset):
             failure_details (list[RestoreJobResultFailureDetailsItem] | Unset):
@@ -37,9 +42,11 @@ class RestoreJobResult:
     """
 
     restore: RestoreJobResultRestore | Unset = UNSET
+    durability: RestoreJobResultDurability | Unset = UNSET
     status: RestoreJobResultStatus | Unset = UNSET
     triggered_table_count: int | Unset = UNSET
     committed_table_count: int | Unset = UNSET
+    durability_pending_table_count: int | Unset = UNSET
     skipped_table_count: int | Unset = UNSET
     failed_table_count: int | Unset = UNSET
     failure_details: list[RestoreJobResultFailureDetailsItem] | Unset = UNSET
@@ -50,6 +57,10 @@ class RestoreJobResult:
         if not isinstance(self.restore, Unset):
             restore = self.restore.value
 
+        durability: str | Unset = UNSET
+        if not isinstance(self.durability, Unset):
+            durability = self.durability.value
+
         status: str | Unset = UNSET
         if not isinstance(self.status, Unset):
             status = self.status.value
@@ -57,6 +68,8 @@ class RestoreJobResult:
         triggered_table_count = self.triggered_table_count
 
         committed_table_count = self.committed_table_count
+
+        durability_pending_table_count = self.durability_pending_table_count
 
         skipped_table_count = self.skipped_table_count
 
@@ -76,12 +89,16 @@ class RestoreJobResult:
         field_dict.update({})
         if restore is not UNSET:
             field_dict["restore"] = restore
+        if durability is not UNSET:
+            field_dict["durability"] = durability
         if status is not UNSET:
             field_dict["status"] = status
         if triggered_table_count is not UNSET:
             field_dict["triggered_table_count"] = triggered_table_count
         if committed_table_count is not UNSET:
             field_dict["committed_table_count"] = committed_table_count
+        if durability_pending_table_count is not UNSET:
+            field_dict["durability_pending_table_count"] = durability_pending_table_count
         if skipped_table_count is not UNSET:
             field_dict["skipped_table_count"] = skipped_table_count
         if failed_table_count is not UNSET:
@@ -105,6 +122,13 @@ class RestoreJobResult:
         else:
             restore = RestoreJobResultRestore(_restore)
 
+        _durability = d.pop("durability", UNSET)
+        durability: RestoreJobResultDurability | Unset
+        if isinstance(_durability, Unset):
+            durability = UNSET
+        else:
+            durability = RestoreJobResultDurability(_durability)
+
         _status = d.pop("status", UNSET)
         status: RestoreJobResultStatus | Unset
         if isinstance(_status, Unset):
@@ -115,6 +139,8 @@ class RestoreJobResult:
         triggered_table_count = d.pop("triggered_table_count", UNSET)
 
         committed_table_count = d.pop("committed_table_count", UNSET)
+
+        durability_pending_table_count = d.pop("durability_pending_table_count", UNSET)
 
         skipped_table_count = d.pop("skipped_table_count", UNSET)
 
@@ -133,9 +159,11 @@ class RestoreJobResult:
 
         restore_job_result = cls(
             restore=restore,
+            durability=durability,
             status=status,
             triggered_table_count=triggered_table_count,
             committed_table_count=committed_table_count,
+            durability_pending_table_count=durability_pending_table_count,
             skipped_table_count=skipped_table_count,
             failed_table_count=failed_table_count,
             failure_details=failure_details,

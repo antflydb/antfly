@@ -31,6 +31,7 @@ const common_secrets = @import("../common/secrets.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const backups_api = @import("backups.zig");
+const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
@@ -1193,6 +1194,37 @@ pub const AntflyApiHandler = struct {
 
     pub fn cancelRestoreJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id_raw: []const u8) !httpx.Response {
         return try self.restoreJob(ctx, job_id_raw, true);
+    }
+
+    pub fn listRestoreJobs(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListRestoreJobsParams) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const limit = if (params.limit) |value|
+            std.fmt.parseInt(usize, value, 10) catch return try textResponse(ctx, 400, "invalid restore job list limit")
+        else
+            50;
+        if (limit == 0 or limit > 100) return try textResponse(ctx, 400, "invalid restore job list limit");
+        const cursor = if (params.cursor) |value| blk: {
+            const parsed = std.fmt.parseUnsigned(u64, value, 10) catch return try textResponse(ctx, 400, "invalid restore job list cursor");
+            if (parsed == 0) return try textResponse(ctx, 400, "invalid restore job list cursor");
+            break :blk parsed;
+        } else null;
+        const phase = if (params.phase) |value|
+            std.meta.stringToEnum(restore_jobs.Phase, value) orelse return try textResponse(ctx, 400, "invalid restore job list phase")
+        else
+            null;
+        const scope = if (params.scope) |value|
+            std.meta.stringToEnum(restore_jobs.Scope, value) orelse return try textResponse(ctx, 400, "invalid restore job list scope")
+        else
+            null;
+        var resp = try self.api_server.handlePublicListRestoreJobs(authenticated_identity, .{
+            .limit = limit,
+            .cursor = cursor,
+            .phase = phase,
+            .scope = scope,
+        });
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     fn restoreJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id_raw: []const u8, cancel: bool) !httpx.Response {

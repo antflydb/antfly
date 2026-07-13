@@ -794,7 +794,8 @@ fn normalizeRestoreBootstrapIntent(
     const range = findRangeRecord(ranges, intent.record.group_id) orelse return effective;
     const table = findTableRecord(tables, range.table_id) orelse return effective;
     const restore_backup_id = restoreBackupIdForRange(range, table) orelse return effective;
-    if (findRestoreProgress(current.restore_progresses, table.table_id, intent.record.local_node_id, intent.record.group_id, restore_backup_id)) |progress| {
+    const restore_location = if (range.restore_location.len > 0) range.restore_location else table.restore_location;
+    if (findRestoreProgress(current.restore_progresses, table.table_id, intent.record.local_node_id, intent.record.group_id, restore_backup_id, restore_location)) |progress| {
         if (!progress.primary_restored) return effective;
         effective.record.bootstrap_mode = .persisted;
         effective.record.snapshot_bootstrap = null;
@@ -804,7 +805,7 @@ fn normalizeRestoreBootstrapIntent(
         effective.record.snapshot_bootstrap = null;
         effective.record.backup_restore_bootstrap = .{
             .backup_id = restore_backup_id,
-            .location = if (range.restore_location.len > 0) range.restore_location else table.restore_location,
+            .location = restore_location,
             .snapshot_path = range.restore_snapshot_path,
         };
     }
@@ -1129,12 +1130,14 @@ fn findRestoreProgress(
     node_id: u64,
     group_id: u64,
     backup_id: []const u8,
+    location: []const u8,
 ) ?table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
         if (record.node_id != node_id) continue;
         if (record.group_id != group_id) continue;
         if (!std.mem.eql(u8, record.backup_id, backup_id)) continue;
+        if (!std.mem.eql(u8, record.location, location)) continue;
         return record;
     }
     return null;
@@ -5909,7 +5912,7 @@ test "metadata reconciler marks restore-active placements with fetch_snapshot un
     });
 
     const progress = [_]table_manager.RestoreProgressRecord{
-        .{ .table_id = 490, .node_id = 1, .group_id = 4901, .backup_id = "snap1", .primary_restored = true, .phase = "runtime_repair" },
+        .{ .table_id = 490, .node_id = 1, .group_id = 4901, .backup_id = "snap1", .location = "file:///tmp/backups", .primary_restored = true, .phase = "runtime_repair" },
     };
 
     var reconciler = Reconciler.init(std.testing.allocator);

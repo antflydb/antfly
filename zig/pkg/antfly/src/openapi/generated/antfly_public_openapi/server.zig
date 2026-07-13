@@ -250,6 +250,14 @@ pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.jso
     return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+pub const ListRestoreJobsParams = struct {
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
+    phase: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+};
+
 /// Get durable restore job status
 pub const GetRestoreJobPathParams = struct {
     job_id: []const u8,
@@ -739,6 +747,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
+    .{ .method = "GET", .path = "/restore/jobs", .operation_id = "listRestoreJobs" },
     .{ .method = "GET", .path = "/restore/jobs/{job_id}", .operation_id = "getRestoreJob" },
     .{ .method = "DELETE", .path = "/restore/jobs/{job_id}", .operation_id = "cancelRestoreJob" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
@@ -829,6 +838,7 @@ pub const routes = [_]Route{
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listRestoreJobs(self: *Impl, ctx: *httpx.Context, params: ListRestoreJobsParams) !httpx.Response
 //   fn getRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn cancelRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response

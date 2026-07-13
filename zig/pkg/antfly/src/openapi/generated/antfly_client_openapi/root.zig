@@ -381,6 +381,7 @@ pub const RerankerProfile = types.RerankerProfile;
 pub const RerankerProvider = types.RerankerProvider;
 pub const ResourceType = types.ResourceType;
 pub const RestoreJob = types.RestoreJob;
+pub const RestoreJobList = types.RestoreJobList;
 pub const RestoreRequest = types.RestoreRequest;
 pub const RetrievalAgentRequest = types.RetrievalAgentRequest;
 pub const RetrievalAgentResult = types.RetrievalAgentResult;

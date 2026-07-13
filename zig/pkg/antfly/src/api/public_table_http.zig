@@ -2618,8 +2618,6 @@ test "public table restore handler maps target already exists" {
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
         Backend.iface(),
         null,
-        null,
-        null,
         &node_config,
         null,
     );

@@ -64,6 +64,14 @@ pub const ListConnectionsParams = struct {
     refresh: ?[]const u8 = null,
 };
 
+pub const ListRestoreJobsParams = struct {
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
+    phase: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -764,6 +772,55 @@ pub const Client = struct {
         if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// List durable restore jobs
+    /// GET /db/v1/restore/jobs
+    pub fn listRestoreJobs(self: *@This(), params: ListRestoreJobsParams) !ApiResponse(types.RestoreJobList) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.phase) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "phase=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.scope) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "scope=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RestoreJobList).fromResponse(self.allocator, &resp);
     }
 
     /// Get durable restore job status

@@ -329,6 +329,7 @@ pub const RestoreProgressRecord = struct {
     node_id: u64,
     group_id: u64,
     backup_id: []const u8,
+    location: []const u8 = "",
     snapshot_path: []const u8 = "",
     primary_restored: bool = false,
     runtime_repair_complete: bool = false,
@@ -855,6 +856,8 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
     const backup_id = try alloc.dupe(u8, record.backup_id);
     errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, record.location);
+    errdefer alloc.free(location);
     const snapshot_path = try alloc.dupe(u8, record.snapshot_path);
     errdefer alloc.free(snapshot_path);
     const phase = try alloc.dupe(u8, record.phase);
@@ -866,6 +869,7 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
         .node_id = record.node_id,
         .group_id = record.group_id,
         .backup_id = backup_id,
+        .location = location,
         .snapshot_path = snapshot_path,
         .primary_restored = record.primary_restored,
         .runtime_repair_complete = record.runtime_repair_complete,
@@ -877,6 +881,7 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
 
 pub fn freeRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) void {
     alloc.free(record.backup_id);
+    alloc.free(record.location);
     alloc.free(record.snapshot_path);
     alloc.free(record.phase);
     alloc.free(record.last_error);

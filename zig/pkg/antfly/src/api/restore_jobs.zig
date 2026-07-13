@@ -24,7 +24,7 @@ const max_cluster_result_bytes: usize = 4 * 1024;
 const max_cluster_failure_details: usize = 8;
 const max_cluster_failure_table_name_bytes: usize = 256;
 const max_cluster_failure_error_bytes: usize = 256;
-const restore_job_format_version: u32 = 2;
+const restore_job_format_version: u32 = 3;
 
 pub const Scope = enum { table, cluster };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
@@ -34,6 +34,7 @@ pub const TableIndexRange = [2]u16;
 pub const ClusterResultSummary = struct {
     encoded: []u8,
     succeeded: bool,
+    durability_pending: bool,
 
     pub fn deinit(self: *ClusterResultSummary, alloc: std.mem.Allocator) void {
         alloc.free(self.encoded);
@@ -53,6 +54,8 @@ pub const JobState = struct {
     connection: []const u8,
     restore_mode: []const u8 = "fail_if_exists",
     table_names: ?[]const []const u8 = null,
+    active_table_index: ?u16 = null,
+    durability_pending_table_ranges: ?[]const TableIndexRange = null,
     published_table_ranges: ?[]const TableIndexRange = null,
     completed_table_ranges: ?[]const TableIndexRange = null,
     phase: Phase = .queued,
@@ -78,6 +81,17 @@ pub const StartRequest = struct {
     table_names: ?[]const []const u8 = null,
     idempotency_namespace: []const u8,
     idempotency_key: ?[]const u8 = null,
+};
+
+pub const ListBatch = struct {
+    records: [][]u8,
+    next_scan_cursor: ?u64,
+
+    pub fn deinit(self: *ListBatch, alloc: std.mem.Allocator) void {
+        for (self.records) |record| alloc.free(record);
+        alloc.free(self.records);
+        self.* = undefined;
+    }
 };
 
 pub const OpenedStore = struct {
@@ -138,6 +152,7 @@ pub const Store = struct {
     idempotency: std.StringHashMapUnmanaged(u64) = .empty,
     pending: std.ArrayListUnmanaged(PendingJob) = .empty,
     pending_head: usize = 0,
+    history: std.ArrayListUnmanaged(PendingJob) = .empty,
     next_enqueue_sequence: u64 = 1,
     opened: ?*OpenedStore = null,
     runtime: ?*backend_erased.Store = null,
@@ -161,6 +176,7 @@ pub const Store = struct {
         while (keys.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.idempotency.deinit(self.alloc);
         self.pending.deinit(self.alloc);
+        self.history.deinit(self.alloc);
         if (self.opened) |opened| {
             opened.deinit();
             self.alloc.destroy(opened);
@@ -211,6 +227,8 @@ pub const Store = struct {
                         .connection = parsed.value.connection,
                         .restore_mode = parsed.value.restore_mode,
                         .table_names = parsed.value.table_names,
+                        .active_table_index = parsed.value.active_table_index,
+                        .durability_pending_table_ranges = parsed.value.durability_pending_table_ranges,
                         .published_table_ranges = parsed.value.published_table_ranges,
                         .completed_table_ranges = parsed.value.completed_table_ranges,
                         .phase = .queued,
@@ -231,6 +249,10 @@ pub const Store = struct {
                 const next_bytes = std.math.add(usize, self.retained_bytes, encoded.len) catch return error.RestoreJobCapacityExceeded;
                 if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
                 try self.jobs.put(self.alloc, parsed.value.job_id, encoded);
+                try self.history.append(self.alloc, .{
+                    .job_id = parsed.value.job_id,
+                    .enqueue_sequence = parsed.value.enqueue_sequence,
+                });
                 self.retained_bytes = next_bytes;
                 self.observeEnqueueSequenceLocked(parsed.value.enqueue_sequence);
                 if (!isTerminal(parsed.value.phase)) try self.pending.append(self.alloc, .{
@@ -250,6 +272,8 @@ pub const Store = struct {
             after_key = next_after;
         }
         self.sortPendingLocked();
+        self.sortHistoryLocked();
+        try self.validateHistoryLocked();
     }
 
     /// Attaches durability to a storage-engine-owned namespace. The engine owns
@@ -292,6 +316,9 @@ pub const Store = struct {
         }
 
         for (rows.items) |row| try self.attachRowLocked(row.key, row.value);
+        self.sortPendingLocked();
+        self.sortHistoryLocked();
+        try self.validateHistoryLocked();
     }
 
     pub fn attachReplicated(self: *Store, persistence: ReplicatedPersistence) !void {
@@ -305,6 +332,8 @@ pub const Store = struct {
         defer ReplicatedPersistence.freeRows(self.alloc, rows);
         for (rows) |row| try self.attachReplicatedRowLocked(row.key, row.value);
         self.sortPendingLocked();
+        self.sortHistoryLocked();
+        try self.validateHistoryLocked();
     }
 
     fn attachReplicatedRowLocked(self: *Store, key: []const u8, value: []const u8) !void {
@@ -320,6 +349,10 @@ pub const Store = struct {
         const next_bytes = std.math.add(usize, self.retained_bytes, encoded.len) catch return error.RestoreJobCapacityExceeded;
         if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
         try self.jobs.put(self.alloc, parsed.value.job_id, encoded);
+        try self.history.append(self.alloc, .{
+            .job_id = parsed.value.job_id,
+            .enqueue_sequence = parsed.value.enqueue_sequence,
+        });
         self.retained_bytes = next_bytes;
         self.observeEnqueueSequenceLocked(parsed.value.enqueue_sequence);
         if (parsed.value.phase == .queued) try self.pending.append(self.alloc, .{
@@ -363,6 +396,7 @@ pub const Store = struct {
             expired_offset = end;
         }
         self.sortPendingLocked();
+        self.sortHistoryLocked();
 
         var running = std.ArrayListUnmanaged(u64).empty;
         defer running.deinit(alloc);
@@ -395,6 +429,7 @@ pub const Store = struct {
         self.idempotency.clearRetainingCapacity();
         self.pending.clearRetainingCapacity();
         self.pending_head = 0;
+        self.history.clearRetainingCapacity();
         self.retained_bytes = 0;
         self.next_enqueue_sequence = 1;
     }
@@ -432,6 +467,8 @@ pub const Store = struct {
                 .connection = parsed.value.connection,
                 .restore_mode = parsed.value.restore_mode,
                 .table_names = parsed.value.table_names,
+                .active_table_index = parsed.value.active_table_index,
+                .durability_pending_table_ranges = parsed.value.durability_pending_table_ranges,
                 .published_table_ranges = parsed.value.published_table_ranges,
                 .completed_table_ranges = parsed.value.completed_table_ranges,
                 .phase = .queued,
@@ -452,6 +489,10 @@ pub const Store = struct {
         const next_bytes = std.math.add(usize, self.retained_bytes, encoded.len) catch return error.RestoreJobCapacityExceeded;
         if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
         try self.jobs.put(self.alloc, parsed.value.job_id, encoded);
+        try self.history.append(self.alloc, .{
+            .job_id = parsed.value.job_id,
+            .enqueue_sequence = parsed.value.enqueue_sequence,
+        });
         self.retained_bytes = next_bytes;
         self.observeEnqueueSequenceLocked(parsed.value.enqueue_sequence);
         if (!isTerminal(parsed.value.phase)) try self.pending.append(self.alloc, .{
@@ -543,13 +584,64 @@ pub const Store = struct {
         if (encoded.len > max_initial_restore_job_bytes) return error.RestoreJobRecordTooLarge;
         try self.jobs.ensureUnusedCapacity(self.alloc, 1);
         try self.pending.ensureUnusedCapacity(self.alloc, 1);
+        try self.history.ensureUnusedCapacity(self.alloc, 1);
         if (explicit_idempotency_key != null) try self.idempotency.ensureUnusedCapacity(self.alloc, 1);
         const owned_key = if (explicit_map_key) |map_key| try self.alloc.dupe(u8, map_key) else null;
         errdefer if (owned_key) |key| self.alloc.free(key);
         try self.storeLocked(job_id, encoded);
         self.pending.appendAssumeCapacity(.{ .job_id = job_id, .enqueue_sequence = enqueue_sequence });
+        self.history.appendAssumeCapacity(.{ .job_id = job_id, .enqueue_sequence = enqueue_sequence });
         if (owned_key) |key| self.idempotency.putAssumeCapacity(key, job_id);
         return encoded;
+    }
+
+    pub fn recordTableStarted(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return error.RestoreJobFenced;
+        if (tableAttempted(parsed.value, table_index)) return try alloc.dupe(u8, current);
+        if (parsed.value.active_table_index != null) return error.RestoreJobCheckpointOrder;
+        return try self.updateLocked(alloc, parsed.value, .{ .phase = .running, .active_table_index = table_index });
+    }
+
+    pub fn recordTableDurabilityPending(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return error.RestoreJobFenced;
+        if (parsed.value.active_table_index != table_index) return error.RestoreJobCheckpointOrder;
+        if (containsTableIndex(parsed.value.published_table_ranges orelse &.{}, table_index)) return try alloc.dupe(u8, current);
+        const current_ranges = parsed.value.durability_pending_table_ranges orelse &.{};
+        if (containsTableIndex(current_ranges, table_index)) return try alloc.dupe(u8, current);
+        const pending = try appendTableIndexRangeAlloc(alloc, current_ranges, table_index);
+        defer alloc.free(pending);
+        return try self.updateLocked(alloc, parsed.value, .{
+            .phase = .running,
+            .clear_active_table_index = true,
+            .durability_pending_table_ranges = pending,
+        });
+    }
+
+    /// Clears an active ordinal only after the restore implementation has
+    /// classified the error as pre-publication. Uncertain leadership and
+    /// durability outcomes must retain or advance the ordinal instead.
+    pub fn recordTableAborted(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return error.RestoreJobFenced;
+        if (parsed.value.active_table_index != table_index) return error.RestoreJobCheckpointOrder;
+        return try self.updateLocked(alloc, parsed.value, .{
+            .phase = .running,
+            .clear_active_table_index = true,
+        });
     }
 
     pub fn recordTablePublished(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
@@ -559,11 +651,20 @@ pub const Store = struct {
         var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return error.RestoreJobFenced;
+        if (parsed.value.active_table_index != table_index and
+            !containsTableIndex(parsed.value.durability_pending_table_ranges orelse &.{}, table_index)) return error.RestoreJobCheckpointOrder;
         const current_ranges = parsed.value.published_table_ranges orelse &.{};
         if (containsTableIndex(current_ranges, table_index)) return try alloc.dupe(u8, current);
         const published = try appendTableIndexRangeAlloc(alloc, current_ranges, table_index);
         defer alloc.free(published);
-        return try self.updateLocked(alloc, parsed.value, .{ .phase = .running, .published_table_ranges = published });
+        const pending = try removeTableIndexRangeAlloc(alloc, parsed.value.durability_pending_table_ranges orelse &.{}, table_index);
+        defer alloc.free(pending);
+        return try self.updateLocked(alloc, parsed.value, .{
+            .phase = .running,
+            .clear_active_table_index = true,
+            .durability_pending_table_ranges = pending,
+            .published_table_ranges = published,
+        });
     }
 
     pub fn recordTableCompleted(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
@@ -592,6 +693,45 @@ pub const Store = struct {
         return if (self.jobs.get(job_id)) |encoded| try alloc.dupe(u8, encoded) else null;
     }
 
+    /// Returns a bounded newest-first scan batch. Authorization and public
+    /// filters are applied by the API layer outside the store mutex.
+    pub fn listBatch(self: *Store, alloc: std.mem.Allocator, cursor: ?u64, limit: usize) !ListBatch {
+        if (limit == 0 or limit > restore_job_scan_page_size) return error.InvalidRestoreJobListLimit;
+        self.lock();
+        defer self.mutex.unlock();
+
+        var end = self.history.items.len;
+        if (cursor) |exclusive_sequence| {
+            var low: usize = 0;
+            var high = end;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                if (self.history.items[middle].enqueue_sequence < exclusive_sequence)
+                    low = middle + 1
+                else
+                    high = middle;
+            }
+            end = low;
+        }
+
+        const count = @min(limit, end);
+        const records = try alloc.alloc([]u8, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (records[0..initialized]) |record| alloc.free(record);
+            alloc.free(records);
+        }
+        while (initialized < count) : (initialized += 1) {
+            const entry = self.history.items[end - initialized - 1];
+            const encoded = self.jobs.get(entry.job_id) orelse return error.CorruptRestoreJobStore;
+            records[initialized] = try alloc.dupe(u8, encoded);
+        }
+        return .{
+            .records = records,
+            .next_scan_cursor = if (end > count) self.history.items[end - count].enqueue_sequence else null,
+        };
+    }
+
     fn refreshReplicatedJob(self: *Store, alloc: std.mem.Allocator, job_id: u64) !void {
         const replicated = self.replicated orelse return;
         const key = try jobKey(alloc, job_id);
@@ -614,6 +754,7 @@ pub const Store = struct {
                 if (self.jobs.fetchRemove(job_id)) |removed| {
                     self.retained_bytes -= removed.value.len;
                     self.alloc.free(removed.value);
+                    self.removeHistoryLocked(job_id);
                 }
                 if (map_key) |value_key| {
                     if (self.idempotency.fetchRemove(value_key)) |removed| self.alloc.free(removed.key);
@@ -638,9 +779,19 @@ pub const Store = struct {
                 }
             }
             const previous_len = if (self.jobs.get(job_id)) |previous| previous.len else 0;
+            if (previous_len == 0) {
+                if (self.jobs.count() >= max_retained_restore_jobs or self.historySequenceExistsLocked(parsed.value.enqueue_sequence))
+                    return error.CorruptRestoreJobStore;
+                try self.history.ensureUnusedCapacity(self.alloc, 1);
+            }
             const next_bytes = std.math.add(usize, self.retained_bytes - previous_len, owned.len) catch return error.RestoreJobCapacityExceeded;
             if (next_bytes > max_retained_restore_job_bytes) return error.RestoreJobCapacityExceeded;
             if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |previous| self.alloc.free(previous.value);
+            if (previous_len == 0) {
+                self.history.appendAssumeCapacity(.{ .job_id = job_id, .enqueue_sequence = parsed.value.enqueue_sequence });
+                self.sortHistoryLocked();
+                self.observeEnqueueSequenceLocked(parsed.value.enqueue_sequence);
+            }
             self.retained_bytes = next_bytes;
             if (owned_map_key) |value_key| {
                 self.idempotency.putAssumeCapacity(value_key, job_id);
@@ -661,6 +812,7 @@ pub const Store = struct {
             }
             self.retained_bytes -= removed.value.len;
             self.alloc.free(removed.value);
+            self.removeHistoryLocked(job_id);
         }
     }
 
@@ -694,7 +846,7 @@ pub const Store = struct {
         const encoded = self.jobs.get(job_id) orelse return;
         var parsed = try std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (parsed.value.phase == .queued) try self.pending.append(self.alloc, .{
+        if (parsed.value.phase == .queued) try self.insertPendingSortedLocked(.{
             .job_id = job_id,
             .enqueue_sequence = parsed.value.enqueue_sequence,
         });
@@ -788,6 +940,9 @@ pub const Store = struct {
         cancel_requested: ?bool = null,
         result_json: ?[]const u8 = null,
         last_error: ?[]const u8 = null,
+        active_table_index: ?u16 = null,
+        clear_active_table_index: bool = false,
+        durability_pending_table_ranges: ?[]const TableIndexRange = null,
         published_table_ranges: ?[]const TableIndexRange = null,
         completed_table_ranges: ?[]const TableIndexRange = null,
     };
@@ -805,6 +960,8 @@ pub const Store = struct {
             .connection = current.connection,
             .restore_mode = current.restore_mode,
             .table_names = current.table_names,
+            .active_table_index = if (update.clear_active_table_index) null else update.active_table_index orelse current.active_table_index,
+            .durability_pending_table_ranges = update.durability_pending_table_ranges orelse current.durability_pending_table_ranges,
             .published_table_ranges = update.published_table_ranges orelse current.published_table_ranges,
             .completed_table_ranges = update.completed_table_ranges orelse current.completed_table_ranges,
             .phase = update.phase,
@@ -885,6 +1042,7 @@ pub const Store = struct {
             }
             self.retained_bytes -= removed.value.len;
             self.alloc.free(removed.value);
+            self.removeHistoryLocked(job_id);
         }
         return more_expired;
     }
@@ -897,12 +1055,56 @@ pub const Store = struct {
     }
 
     fn sortPendingLocked(self: *Store) void {
-        std.mem.sort(PendingJob, self.pending.items, {}, struct {
-            fn lessThan(_: void, a: PendingJob, b: PendingJob) bool {
-                if (a.enqueue_sequence != b.enqueue_sequence) return a.enqueue_sequence < b.enqueue_sequence;
-                return a.job_id < b.job_id;
+        std.mem.sort(PendingJob, self.pending.items, {}, pendingJobLessThan);
+    }
+
+    fn sortHistoryLocked(self: *Store) void {
+        std.mem.sort(PendingJob, self.history.items, {}, pendingJobLessThan);
+    }
+
+    fn validateHistoryLocked(self: *Store) !void {
+        for (self.history.items, 0..) |entry, index| {
+            if (entry.enqueue_sequence == 0 or (index > 0 and self.history.items[index - 1].enqueue_sequence == entry.enqueue_sequence))
+                return error.CorruptRestoreJobStore;
+        }
+    }
+
+    fn historySequenceExistsLocked(self: *Store, sequence: u64) bool {
+        var low: usize = 0;
+        var high = self.history.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const candidate = self.history.items[middle].enqueue_sequence;
+            if (candidate < sequence) {
+                low = middle + 1;
+            } else if (candidate > sequence) {
+                high = middle;
+            } else {
+                return true;
             }
-        }.lessThan);
+        }
+        return false;
+    }
+
+    fn insertPendingSortedLocked(self: *Store, pending: PendingJob) !void {
+        self.compactPendingFullyLocked();
+        for (self.pending.items) |existing| if (existing.job_id == pending.job_id) return;
+        var index: usize = 0;
+        while (index < self.pending.items.len and pendingJobLessThan({}, self.pending.items[index], pending)) : (index += 1) {}
+        try self.pending.insert(self.alloc, index, pending);
+    }
+
+    fn removeHistoryLocked(self: *Store, job_id: u64) void {
+        for (self.history.items, 0..) |entry, index| {
+            if (entry.job_id != job_id) continue;
+            _ = self.history.orderedRemove(index);
+            return;
+        }
+    }
+
+    fn pendingJobLessThan(_: void, a: PendingJob, b: PendingJob) bool {
+        if (a.enqueue_sequence != b.enqueue_sequence) return a.enqueue_sequence < b.enqueue_sequence;
+        return a.job_id < b.job_id;
     }
 
     fn observeEnqueueSequenceLocked(self: *Store, sequence: u64) void {
@@ -912,6 +1114,14 @@ pub const Store = struct {
     fn compactPendingLocked(self: *Store) void {
         if (self.pending_head == 0) return;
         if (self.pending_head < 1024 and self.pending_head * 2 < self.pending.items.len) return;
+        const remaining = self.pending.items.len - self.pending_head;
+        std.mem.copyForwards(PendingJob, self.pending.items[0..remaining], self.pending.items[self.pending_head..]);
+        self.pending.items.len = remaining;
+        self.pending_head = 0;
+    }
+
+    fn compactPendingFullyLocked(self: *Store) void {
+        if (self.pending_head == 0) return;
         const remaining = self.pending.items.len - self.pending_head;
         std.mem.copyForwards(PendingJob, self.pending.items[0..remaining], self.pending.items[self.pending_head..]);
         self.pending.items.len = remaining;
@@ -981,6 +1191,12 @@ fn validateStartRequest(req: StartRequest) !void {
         req.idempotency_namespace.len == 0 or req.idempotency_namespace.len > 256 or
         (req.table_name != null and req.table_name.?.len > max_restore_string_bytes))
         return error.RestoreJobRecordTooLarge;
+    switch (req.scope) {
+        .table => {
+            if (req.table_name == null or req.table_name.?.len == 0 or req.table_names != null) return error.InvalidRestoreJobScope;
+        },
+        .cluster => if (req.table_name != null) return error.InvalidRestoreJobScope,
+    }
     if (req.table_names) |names| {
         if (names.len > max_explicit_tables_per_job) return error.TooManyRestoreTables;
         for (names, 0..) |name, i| {
@@ -998,6 +1214,12 @@ pub fn containsTableIndex(ranges: []const TableIndexRange, needle: u16) bool {
         if (needle <= range[1]) return true;
     }
     return false;
+}
+
+pub fn tableAttempted(state: JobState, table_index: u16) bool {
+    return state.active_table_index == table_index or
+        containsTableIndex(state.durability_pending_table_ranges orelse &.{}, table_index) or
+        containsTableIndex(state.published_table_ranges orelse &.{}, table_index);
 }
 
 pub fn tableIndexRangeCount(ranges: []const TableIndexRange) usize {
@@ -1025,6 +1247,43 @@ fn appendTableIndexRangeAlloc(alloc: std.mem.Allocator, ranges: []const TableInd
     return out;
 }
 
+fn removeTableIndexRangeAlloc(alloc: std.mem.Allocator, ranges: []const TableIndexRange, table_index: u16) ![]TableIndexRange {
+    var output_len = ranges.len;
+    var found = false;
+    for (ranges) |range| {
+        if (table_index < range[0]) break;
+        if (table_index > range[1]) continue;
+        found = true;
+        if (table_index > range[0] and table_index < range[1]) output_len += 1;
+        if (range[0] == range[1]) output_len -= 1;
+        break;
+    }
+    if (!found) return try alloc.dupe(TableIndexRange, ranges);
+
+    const out = try alloc.alloc(TableIndexRange, output_len);
+    var cursor: usize = 0;
+    for (ranges) |range| {
+        if (table_index < range[0] or table_index > range[1]) {
+            out[cursor] = range;
+            cursor += 1;
+        } else if (range[0] == range[1]) {
+            continue;
+        } else if (table_index == range[0]) {
+            out[cursor] = .{ range[0] + 1, range[1] };
+            cursor += 1;
+        } else if (table_index == range[1]) {
+            out[cursor] = .{ range[0], range[1] - 1 };
+            cursor += 1;
+        } else {
+            out[cursor] = .{ range[0], table_index - 1 };
+            out[cursor + 1] = .{ table_index + 1, range[1] };
+            cursor += 2;
+        }
+    }
+    std.debug.assert(cursor == out.len);
+    return out;
+}
+
 fn validateTableIndexRanges(ranges: []const TableIndexRange, table_count: usize) !void {
     var previous_end: ?u16 = null;
     for (ranges) |range| {
@@ -1046,7 +1305,16 @@ fn rangesContainRange(ranges: []const TableIndexRange, candidate: TableIndexRang
 
 fn validateProgressState(state: JobState) !void {
     if (state.format_version != restore_job_format_version) return error.UnsupportedRestoreJobFormat;
-    if (state.idempotency_namespace.len == 0 or state.idempotency_namespace.len > 256) return error.CorruptRestoreJobStore;
+    if (state.enqueue_sequence == 0 or state.idempotency_namespace.len == 0 or state.idempotency_namespace.len > 256)
+        return error.CorruptRestoreJobStore;
+    switch (state.scope) {
+        .table => {
+            if (state.table_name == null or state.table_name.?.len == 0 or state.table_name.?.len > max_restore_string_bytes or state.table_names != null)
+                return error.CorruptRestoreJobStore;
+        },
+        .cluster => if (state.table_name != null) return error.CorruptRestoreJobStore,
+    }
+    const durability_pending = state.durability_pending_table_ranges orelse &.{};
     const published = state.published_table_ranges orelse &.{};
     const completed = state.completed_table_ranges orelse &.{};
     const table_count: usize = switch (state.scope) {
@@ -1054,8 +1322,19 @@ fn validateProgressState(state: JobState) !void {
         .cluster => if (state.table_names) |names| names.len else max_cluster_tables_per_job,
     };
     if (table_count > max_cluster_tables_per_job) return error.CorruptRestoreJobStore;
+    try validateTableIndexRanges(durability_pending, table_count);
     try validateTableIndexRanges(published, table_count);
     try validateTableIndexRanges(completed, table_count);
+    if (state.active_table_index) |active| {
+        if (@as(usize, active) >= table_count or
+            containsTableIndex(durability_pending, active) or
+            containsTableIndex(published, active)) return error.CorruptRestoreJobStore;
+    }
+    for (durability_pending) |range| {
+        for (published) |published_range| {
+            if (range[0] <= published_range[1] and published_range[0] <= range[1]) return error.CorruptRestoreJobStore;
+        }
+    }
     if (tableIndexRangeCount(completed) > tableIndexRangeCount(published)) return error.CorruptRestoreJobStore;
     for (completed) |range| if (!rangesContainRange(published, range)) return error.CorruptRestoreJobStore;
 }
@@ -1087,6 +1366,7 @@ pub fn summarizeClusterResultAlloc(alloc: std.mem.Allocator, raw: []const u8) !C
 
     var triggered: usize = 0;
     var committed: usize = 0;
+    var durability_pending: usize = 0;
     var skipped: usize = 0;
     var failed: usize = 0;
     for (parsed.value.tables) |table| {
@@ -1094,6 +1374,8 @@ pub fn summarizeClusterResultAlloc(alloc: std.mem.Allocator, raw: []const u8) !C
             triggered += 1;
         } else if (std.mem.eql(u8, table.status, "committed")) {
             committed += 1;
+        } else if (std.mem.eql(u8, table.status, "durability_pending")) {
+            durability_pending += 1;
         } else if (std.mem.eql(u8, table.status, "skipped")) {
             skipped += 1;
         } else if (std.mem.eql(u8, table.status, "failed")) {
@@ -1124,16 +1406,19 @@ pub fn summarizeClusterResultAlloc(alloc: std.mem.Allocator, raw: []const u8) !C
     }
 
     const successful = triggered + committed;
-    const status: []const u8 = if (failed == 0)
-        "completed"
-    else if (successful == 0)
+    const status: []const u8 = if (failed > 0 and successful == 0)
         "failed"
+    else if (failed > 0)
+        "partial"
+    else if (durability_pending > 0)
+        "durability_pending"
     else
-        "partial";
+        "completed";
     const encoded = try std.json.Stringify.valueAlloc(alloc, .{
         .status = status,
         .triggered_table_count = triggered,
         .committed_table_count = committed,
+        .durability_pending_table_count = durability_pending,
         .skipped_table_count = skipped,
         .failed_table_count = failed,
         .failure_details = failures[0..failure_count],
@@ -1141,7 +1426,11 @@ pub fn summarizeClusterResultAlloc(alloc: std.mem.Allocator, raw: []const u8) !C
     }, .{ .emit_null_optional_fields = false });
     errdefer alloc.free(encoded);
     if (encoded.len > max_cluster_result_bytes) return error.ClusterRestoreResultTooLarge;
-    return .{ .encoded = encoded, .succeeded = failed == 0 };
+    return .{
+        .encoded = encoded,
+        .succeeded = failed == 0 and durability_pending == 0,
+        .durability_pending = durability_pending > 0,
+    };
 }
 
 fn boundedUtf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
@@ -1397,12 +1686,26 @@ test "restore job runnable queue drains incrementally and preserves insertion or
         job_id.* = parsed.value.job_id;
     }
 
-    const first = try store.takePendingIds(std.testing.allocator, 2);
+    var newest = try store.listBatch(std.testing.allocator, null, 2);
+    defer newest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), newest.records.len);
+    var newest_first = try std.json.parseFromSlice(JobState, std.testing.allocator, newest.records[0], .{});
+    defer newest_first.deinit();
+    var newest_second = try std.json.parseFromSlice(JobState, std.testing.allocator, newest.records[1], .{});
+    defer newest_second.deinit();
+    try std.testing.expectEqual(created[2], newest_first.value.job_id);
+    try std.testing.expectEqual(created[1], newest_second.value.job_id);
+    var oldest = try store.listBatch(std.testing.allocator, newest.next_scan_cursor, 2);
+    defer oldest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), oldest.records.len);
+
+    const first = try store.takePendingIds(std.testing.allocator, 1);
     defer std.testing.allocator.free(first);
-    try std.testing.expectEqualSlices(u64, created[0..2], first);
-    const second = try store.takePendingIds(std.testing.allocator, 2);
+    try std.testing.expectEqualSlices(u64, created[0..1], first);
+    try store.requeuePending(created[0]);
+    const second = try store.takePendingIds(std.testing.allocator, 3);
     defer std.testing.allocator.free(second);
-    try std.testing.expectEqualSlices(u64, created[2..3], second);
+    try std.testing.expectEqualSlices(u64, &created, second);
     const empty = try store.takePendingIds(std.testing.allocator, 2);
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
@@ -1527,6 +1830,14 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
             error.RestoreJobCheckpointOrder,
             first_store.recordTableCompleted(alloc, job_id, parsed_running.value.attempt_id, 0),
         );
+        const table_started = try first_store.recordTableStarted(alloc, job_id, parsed_running.value.attempt_id, 0);
+        defer alloc.free(table_started);
+        const table_aborted = try first_store.recordTableAborted(alloc, job_id, parsed_running.value.attempt_id, 0);
+        defer alloc.free(table_aborted);
+        const table_restarted = try first_store.recordTableStarted(alloc, job_id, parsed_running.value.attempt_id, 0);
+        defer alloc.free(table_restarted);
+        const durability_pending = try first_store.recordTableDurabilityPending(alloc, job_id, parsed_running.value.attempt_id, 0);
+        defer alloc.free(durability_pending);
         const published = try first_store.recordTablePublished(alloc, job_id, parsed_running.value.attempt_id, 0);
         defer alloc.free(published);
         const completed = try first_store.recordTableCompleted(alloc, job_id, parsed_running.value.attempt_id, 0);
@@ -1541,6 +1852,7 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
     var parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(Phase.queued, parsed.value.phase);
+    try std.testing.expectEqual(@as(usize, 0), tableIndexRangeCount(parsed.value.durability_pending_table_ranges orelse &.{}));
     try std.testing.expectEqualSlices(TableIndexRange, &.{.{ 0, 0 }}, parsed.value.published_table_ranges.?);
     try std.testing.expectEqualSlices(TableIndexRange, &.{.{ 0, 0 }}, parsed.value.completed_table_ranges.?);
 }
@@ -1570,6 +1882,8 @@ test "restore progress ordinals remain bounded at maximum table count" {
     defer parsed_running.deinit();
 
     for (0..max_cluster_tables_per_job) |i| {
+        const table_started = try store.recordTableStarted(alloc, parsed_started.value.job_id, parsed_running.value.attempt_id, @intCast(i));
+        alloc.free(table_started);
         const published = try store.recordTablePublished(alloc, parsed_started.value.job_id, parsed_running.value.attempt_id, @intCast(i));
         alloc.free(published);
         const completed = try store.recordTableCompleted(alloc, parsed_started.value.job_id, parsed_running.value.attempt_id, @intCast(i));
@@ -1664,6 +1978,14 @@ test "cluster restore summaries are truthful and bounded" {
     var successful = try summarizeClusterResultAlloc(alloc, "{\"status\":\"triggered\",\"tables\":[{\"name\":\"docs\",\"status\":\"triggered\"},{\"name\":\"existing\",\"status\":\"skipped\"}]}");
     defer successful.deinit(alloc);
     try std.testing.expect(successful.succeeded);
+
+    var pending = try summarizeClusterResultAlloc(alloc, "{\"tables\":[{\"name\":\"docs\",\"status\":\"durability_pending\"}]}");
+    defer pending.deinit(alloc);
+    try std.testing.expect(!pending.succeeded);
+    try std.testing.expect(pending.durability_pending);
+    var parsed_pending = try std.json.parseFromSlice(std.json.Value, alloc, pending.encoded, .{});
+    defer parsed_pending.deinit();
+    try std.testing.expectEqualStrings("durability_pending", parsed_pending.value.object.get("status").?.string);
 }
 
 test "restore job store rejects oversized request state" {
@@ -1700,6 +2022,21 @@ test "restore job store rejects oversized request state" {
         .location = "s3://archive/backups",
         .connection = "archive-reader",
         .table_names = &.{ "docs", "docs" },
+        .idempotency_namespace = "principal:admin:cluster",
+    }));
+    try std.testing.expectError(error.InvalidRestoreJobScope, store.start(std.testing.allocator, .{
+        .scope = .table,
+        .backup_id = "daily",
+        .location = "s3://archive/backups",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:table:docs",
+    }));
+    try std.testing.expectError(error.InvalidRestoreJobScope, store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .table_name = "docs",
+        .backup_id = "daily",
+        .location = "s3://archive/backups",
+        .connection = "archive-reader",
         .idempotency_namespace = "principal:admin:cluster",
     }));
     try std.testing.expectError(error.RestoreJobPersistenceUnavailable, store.start(std.testing.allocator, .{

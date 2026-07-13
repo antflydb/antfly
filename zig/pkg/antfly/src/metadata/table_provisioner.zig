@@ -415,17 +415,24 @@ pub fn collectLocalRestoreProgress(
         if (restore.snapshot_path.len > 0 and !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path)) continue;
         if (state.group_id != group_id) continue;
 
-        var record = table_manager.RestoreProgressRecord{
-            .table_id = table.table_id,
-            .node_id = local_node_id,
-            .group_id = group_id,
-            .backup_id = try alloc.dupe(u8, restore.backup_id),
-            .snapshot_path = &.{},
-            .primary_restored = state.primary_restored,
-            .runtime_repair_complete = state.runtime_repair_complete,
-            .phase = &.{},
-            .last_error = &.{},
-            .updated_at_ms = 0,
+        var record: table_manager.RestoreProgressRecord = blk: {
+            const progress_backup_id = try alloc.dupe(u8, restore.backup_id);
+            errdefer alloc.free(progress_backup_id);
+            const progress_location = try alloc.dupe(u8, restore.location);
+            errdefer alloc.free(progress_location);
+            break :blk .{
+                .table_id = table.table_id,
+                .node_id = local_node_id,
+                .group_id = group_id,
+                .backup_id = progress_backup_id,
+                .location = progress_location,
+                .snapshot_path = &.{},
+                .primary_restored = state.primary_restored,
+                .runtime_repair_complete = state.runtime_repair_complete,
+                .phase = &.{},
+                .last_error = &.{},
+                .updated_at_ms = 0,
+            };
         };
         var appended = false;
         errdefer if (!appended) table_manager.freeRestoreProgress(alloc, record);

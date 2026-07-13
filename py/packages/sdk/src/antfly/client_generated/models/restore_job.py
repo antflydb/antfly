@@ -27,6 +27,8 @@ class RestoreJob:
         backup_id (str):
         phase (RestoreJobPhase):
         cancel_requested (bool):
+        durability_pending_table_count (int): Number of tables whose generation publication is visible but whose parent-
+            directory durability could not be confirmed.
         published_table_count (int): Number of table restore intents durably published. Published tables are adopted,
             not republished, after failover.
         completed_table_count (int): Number of published tables whose placement replicas completed restore and whose
@@ -35,12 +37,13 @@ class RestoreJob:
         updated_at_ms (int):
         table_name (str | Unset):
         total_table_count (int | Unset): Requested table count when known before execution.
-        result (RestoreJobResult | Unset): Bounded terminal result. Cluster restores report aggregate triggered,
-            skipped, and failed table counts plus
-            a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part
-            of a long failure detail were omitted. Any failed table makes the job phase `failed`; inspect this result for
-            partial
-            progress and use a new idempotency key when retrying a changed request.
+        result (RestoreJobResult | Unset): Bounded terminal result. A committed result with durability pending means
+            publication is visible but
+            parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed,
+            durability-pending, skipped, and failed table counts plus a bounded sample of failure details.
+            `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted.
+            Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress
+            and use a new idempotency key when retrying a changed request.
         error (str | Unset):
         expires_at_ms (int | Unset): Unix epoch milliseconds after which this terminal job record and its idempotency
             key may be removed. Omitted while the job is nonterminal.
@@ -52,6 +55,7 @@ class RestoreJob:
     backup_id: str
     phase: RestoreJobPhase
     cancel_requested: bool
+    durability_pending_table_count: int
     published_table_count: int
     completed_table_count: int
     created_at_ms: int
@@ -75,6 +79,8 @@ class RestoreJob:
         phase = self.phase.value
 
         cancel_requested = self.cancel_requested
+
+        durability_pending_table_count = self.durability_pending_table_count
 
         published_table_count = self.published_table_count
 
@@ -106,6 +112,7 @@ class RestoreJob:
                 "backup_id": backup_id,
                 "phase": phase,
                 "cancel_requested": cancel_requested,
+                "durability_pending_table_count": durability_pending_table_count,
                 "published_table_count": published_table_count,
                 "completed_table_count": completed_table_count,
                 "created_at_ms": created_at_ms,
@@ -142,6 +149,8 @@ class RestoreJob:
 
         cancel_requested = d.pop("cancel_requested")
 
+        durability_pending_table_count = d.pop("durability_pending_table_count")
+
         published_table_count = d.pop("published_table_count")
 
         completed_table_count = d.pop("completed_table_count")
@@ -172,6 +181,7 @@ class RestoreJob:
             backup_id=backup_id,
             phase=phase,
             cancel_requested=cancel_requested,
+            durability_pending_table_count=durability_pending_table_count,
             published_table_count=published_table_count,
             completed_table_count=completed_table_count,
             created_at_ms=created_at_ms,

@@ -180,15 +180,22 @@ work. Admission requires the standalone process's shared asynchronous
 backend-runtime lane and its engine-owned durable job store; an unavailable
 worker or store returns `503` before any job is created. The accepted response
 contains a job ID; status and cooperative
-cancellation use `/db/v1/restore/jobs/{job_id}`. Idempotency keys make retries
+cancellation use `/db/v1/restore/jobs/{job_id}`. Retained jobs can be listed
+newest-first with `GET /db/v1/restore/jobs`, using cursor pagination and optional
+phase/scope filters. Authorization is applied before pagination results are
+returned. Idempotency keys make retries
 safe; requests without a key create independent jobs. Restore state lives inside
 the `.aflite` file, and completed table boundaries are durably checkpointed and
 not repeated after restart. Standalone restore is synchronous inside the worker,
 so terminal success means the restored table is readable, not merely accepted.
 Job status reports published and completed table counts separately; for Lite the
 two checkpoints normally advance back-to-back because restoration is local.
-An ambiguous publication/checkpoint interruption fails closed for operator
-inspection. Destructive overwrite is not exposed until
+It also reports generations whose publication is visible but whose
+parent-directory durability is pending. Such a job terminates failed with an
+explicit committed/pending result for operator inspection; it is never reported
+as rolled back or durably complete. The current table ordinal is checkpointed
+before irreversible work so restart reconciliation only adopts the exact backup
+identity. Destructive overwrite is not exposed until
 table generations can be staged and atomically swapped. Terminal state and
 explicit idempotency keys are retained for seven days in a history bounded by
 10,000 jobs, 64 MiB total, and 64 KiB per encoded job. Admission reserves room
