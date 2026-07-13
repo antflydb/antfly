@@ -3591,10 +3591,16 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		action := &cluster.Status.HAStatus.PlannedActions[i]
 		haBindPlannedActionToFrozenPrimaryBoundary(cluster.Status.HAStatus, action)
 		if strings.TrimSpace(action.AdminURL) == "" {
-			if haPlannedActionRequiresAdminTarget(*action) {
+			if haPlannedActionRequiresAdminURL(*action) {
 				action.AdminJobPhase = haAdminJobPhaseMissingAdminURL
+				continue
 			}
-			continue
+			// Controller-only actions are reconciled elsewhere. Portable artifact
+			// actions are the only Job-backed operations that deliberately have no
+			// HA admin URL.
+			if !haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind)) {
+				continue
+			}
 		}
 		if action.AdminJobPhase == haAdminJobPhaseFailed &&
 			action.AdminJobName == haAdminDirectAPIName &&
@@ -3807,6 +3813,13 @@ func haPlannedActionRequiresAdminTarget(action antflyv1.HAPlannedActionStatus) b
 	return len(action.AdminCommand) > 0 ||
 		strings.TrimSpace(action.AdminMethod) != "" ||
 		strings.TrimSpace(action.AdminPath) != ""
+}
+
+func haPlannedActionRequiresAdminURL(action antflyv1.HAPlannedActionStatus) bool {
+	if haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind)) {
+		return false
+	}
+	return haPlannedActionRequiresAdminTarget(action)
 }
 
 func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
@@ -5037,6 +5050,10 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 		action.AdminResult = haCompletedSlotAdminJobResult(*action)
 		return
 	}
+	if haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) {
+		action.SeedArtifactReceipt = parseHASeedArtifactReceipt(body, *action)
+		return
+	}
 	result, ok := parseHAAdminActionResultTable(body)
 	if !ok {
 		action.AdminResult = haCompletedSlotAdminJobResult(*action)
@@ -5046,6 +5063,80 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 		enrichHAPromotionAdminActionResult(result, haReplicationIdentity(cluster.Spec.HighAvailability), *action)
 	}
 	action.AdminResult = result
+}
+
+func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactReceiptStatus {
+	type fileReceipt struct {
+		Path string `json:"path"`
+	}
+	type artifactReceipt struct {
+		FormatVersion   int32         `json:"format_version"`
+		Generation      string        `json:"generation"`
+		SlotName        string        `json:"slot_name"`
+		ClusterID       uint64        `json:"cluster_id"`
+		ShardID         uint64        `json:"shard_id"`
+		TableID         uint64        `json:"table_id"`
+		TimelineID      uint64        `json:"timeline_id"`
+		Epoch           uint64        `json:"epoch"`
+		ManifestID      string        `json:"manifest_id"`
+		BackupLSN       uint64        `json:"backup_lsn"`
+		CheckpointLSN   uint64        `json:"checkpoint_lsn"`
+		ManifestSHA256  string        `json:"manifest_sha256"`
+		AggregateSHA256 string        `json:"aggregate_sha256"`
+		TotalBytes      uint64        `json:"total_bytes"`
+		Files           []fileReceipt `json:"files"`
+	}
+	type pruneReceipt struct {
+		FormatVersion      int32  `json:"format_version"`
+		SlotName           string `json:"slot_name"`
+		CurrentGeneration  string `json:"current_generation"`
+		RetainedGeneration int32  `json:"retained_generations"`
+		DeletedGeneration  int32  `json:"deleted_generations"`
+	}
+
+	if haActionKind(action.Kind) == haActionPruneSeedArtifacts {
+		var receipt pruneReceipt
+		if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &receipt); err != nil {
+			return nil
+		}
+		result := &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: receipt.FormatVersion,
+			Generation:    strings.TrimSpace(receipt.CurrentGeneration),
+			SlotName:      strings.TrimSpace(receipt.SlotName),
+			RetainedCount: receipt.RetainedGeneration,
+			DeletedCount:  receipt.DeletedGeneration,
+		}
+		if !haSeedArtifactReceiptMatchesStatus(action, result) {
+			return nil
+		}
+		return result
+	}
+
+	var receipt artifactReceipt
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &receipt); err != nil {
+		return nil
+	}
+	result := &antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion:   receipt.FormatVersion,
+		Generation:      strings.TrimSpace(receipt.Generation),
+		SlotName:        strings.TrimSpace(receipt.SlotName),
+		ClusterID:       receipt.ClusterID,
+		ShardID:         receipt.ShardID,
+		TableID:         receipt.TableID,
+		TimelineID:      receipt.TimelineID,
+		Epoch:           receipt.Epoch,
+		ManifestID:      strings.TrimSpace(receipt.ManifestID),
+		BackupLSN:       receipt.BackupLSN,
+		CheckpointLSN:   receipt.CheckpointLSN,
+		ManifestSHA256:  strings.TrimSpace(receipt.ManifestSHA256),
+		AggregateSHA256: strings.TrimSpace(receipt.AggregateSHA256),
+		TotalBytes:      receipt.TotalBytes,
+		FileCount:       int32(len(receipt.Files)),
+	}
+	if !haSeedArtifactReceiptMatchesStatus(action, result) {
+		return nil
+	}
+	return result
 }
 
 func haCompletedSlotAdminJobResult(action antflyv1.HAPlannedActionStatus) *antflyv1.HAAdminActionResultStatus {
@@ -7442,6 +7533,9 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 	if action.AdminJobPhase != haAdminJobPhaseSucceeded {
 		return false
 	}
+	if haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) {
+		return haSeedArtifactReceiptMatches(action)
+	}
 	if !haActionRequiresAdminResult(haActionKind(action.Kind)) {
 		return true
 	}
@@ -7453,6 +7547,46 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 		return false
 	}
 	return haActionHasRequiredAdminResult(action)
+}
+
+func haActionRequiresSeedArtifactReceipt(kind haActionKind) bool {
+	return haPlannedActionKindIsPortableArtifact(kind)
+}
+
+func haSeedArtifactReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
+	return haSeedArtifactReceiptMatchesStatus(action, action.SeedArtifactReceipt)
+}
+
+func haSeedArtifactReceiptMatchesStatus(action antflyv1.HAPlannedActionStatus, receipt *antflyv1.HASeedArtifactReceiptStatus) bool {
+	if receipt == nil || receipt.FormatVersion != 1 ||
+		strings.TrimSpace(receipt.Generation) != strings.TrimSpace(action.SeedArtifactGeneration) ||
+		strings.TrimSpace(receipt.SlotName) != strings.TrimSpace(action.SlotName) {
+		return false
+	}
+	if haActionKind(action.Kind) == haActionPruneSeedArtifacts {
+		return receipt.RetainedCount > 0 &&
+			receipt.RetainedCount <= action.SeedArtifactRetainGenerations &&
+			receipt.DeletedCount >= 0
+	}
+	return receipt.FileCount > 0 &&
+		strings.TrimSpace(receipt.ManifestID) != "" &&
+		receipt.BackupLSN > 0 &&
+		receipt.CheckpointLSN >= receipt.BackupLSN &&
+		receipt.CheckpointLSN >= action.TargetLSN &&
+		isLowerHexDigest(receipt.ManifestSHA256) &&
+		isLowerHexDigest(receipt.AggregateSHA256)
+}
+
+func isLowerHexDigest(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func haAdminActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
@@ -7866,7 +8000,8 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
-			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
+			(!haActionRequiresAdminResult(haActionKind(action.Kind)) &&
+				!haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind))) ||
 			haAdminActionSucceededWithStatusEvidence(cluster.Status.HAStatus, action) {
 			continue
 		}
@@ -7919,12 +8054,23 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 }
 
 func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
-	args := []string{"ha", "--ha-url", action.AdminURL}
-	if tokenEnvVar := haAdminConfiguredTokenEnvVar(admin); tokenEnvVar != "" {
-		args = append(args, "--ha-token-env", tokenEnvVar)
+	portableArtifactAction := haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind))
+	args := []string{"ha"}
+	if !portableArtifactAction {
+		args = append(args, "--ha-url", action.AdminURL)
+		if tokenEnvVar := haAdminConfiguredTokenEnvVar(admin); tokenEnvVar != "" {
+			args = append(args, "--ha-token-env", tokenEnvVar)
+		}
+		args = append(args, "--")
 	}
-	args = append(args, "--")
 	args = append(args, action.AdminCommand...)
+	envFrom := append([]corev1.EnvFromSource{}, admin.EnvFrom...)
+	if artifact := haSeedArtifactForAction(cluster, action); artifact != nil && artifact.CredentialsSecretRef != nil {
+		envFrom = append(envFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{
+			LocalObjectReference: *artifact.CredentialsSecretRef.DeepCopy(),
+		}})
+	}
+	volumeMounts, volumes := haAdminJobStorage(cluster, admin, action)
 	labels := haAdminJobLabels(cluster, action)
 	annotations := map[string]string{
 		"antfly.io/ha-action-kind":  action.Kind,
@@ -7968,14 +8114,64 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 						Command:         []string{"/antfly"},
 						Args:            args,
 						Env:             haAdminJobTokenEnv(cluster, admin),
-						EnvFrom:         append([]corev1.EnvFromSource{}, admin.EnvFrom...),
-						VolumeMounts:    append([]corev1.VolumeMount{}, admin.VolumeMounts...),
+						EnvFrom:         envFrom,
+						VolumeMounts:    volumeMounts,
 					}},
-					Volumes: append([]corev1.Volume{}, admin.Volumes...),
+					Volumes: volumes,
 				},
 			},
 		},
 	}
+}
+
+func haAdminJobStorage(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) ([]corev1.VolumeMount, []corev1.Volume) {
+	artifact := haSeedArtifactForAction(cluster, action)
+	if artifact != nil {
+		switch haActionKind(action.Kind) {
+		case haActionPublishSeedArtifact:
+			if artifact.SourcePVC != nil {
+				return haSeedArtifactPVCStorage("ha-seed-source", artifact.SourcePVC, true)
+			}
+		case haActionRestoreSeedArtifact:
+			if artifact.TargetPVC != nil {
+				return haSeedArtifactPVCStorage("ha-seed-target", artifact.TargetPVC, false)
+			}
+		case haActionPruneSeedArtifacts:
+			return nil, nil
+		}
+	}
+	return append([]corev1.VolumeMount{}, admin.VolumeMounts...), append([]corev1.Volume{}, admin.Volumes...)
+}
+
+func haSeedArtifactPVCStorage(name string, pvc *antflyv1.HASeedArtifactPVCSpec, readOnly bool) ([]corev1.VolumeMount, []corev1.Volume) {
+	if pvc == nil {
+		return nil, nil
+	}
+	return []corev1.VolumeMount{{
+			Name:      name,
+			MountPath: pvc.MountPath,
+			ReadOnly:  readOnly,
+		}}, []corev1.Volume{{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: pvc.ClaimName,
+				ReadOnly:  readOnly,
+			}},
+		}}
+}
+
+func haSeedArtifactForAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactSpec {
+	if cluster == nil || cluster.Spec.HighAvailability == nil {
+		return nil
+	}
+	for i := range cluster.Spec.HighAvailability.Standbys {
+		standby := &cluster.Spec.HighAvailability.Standbys[i]
+		if strings.TrimSpace(standby.Name) == strings.TrimSpace(action.StandbyName) ||
+			strings.TrimSpace(standbySlotName(*standby)) == strings.TrimSpace(action.SlotName) {
+			return standby.SeedArtifact
+		}
+	}
+	return nil
 }
 
 func haAdminJobTokenEnv(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec) []corev1.EnvVar {
@@ -8074,53 +8270,59 @@ func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedAc
 
 func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 	rendered, err := json.Marshal(struct {
-		Kind         string   `json:"kind"`
-		Phase        string   `json:"phase,omitempty"`
-		Executor     string   `json:"executor,omitempty"`
-		DependsOn    string   `json:"dependsOn,omitempty"`
-		StandbyName  string   `json:"standbyName,omitempty"`
-		SlotName     string   `json:"slotName,omitempty"`
-		TargetLSN    uint64   `json:"targetLSN,omitempty"`
-		ObservedLSN  uint64   `json:"observedLSN,omitempty"`
-		RetainedLSN  uint64   `json:"retainedFromLSN,omitempty"`
-		RouteFrom    string   `json:"routeFrom,omitempty"`
-		RouteTo      string   `json:"routeTo,omitempty"`
-		FenceAuth    string   `json:"fenceAuthority,omitempty"`
-		FenceHolder  string   `json:"fenceHolder,omitempty"`
-		FenceGen     uint64   `json:"fenceGeneration,omitempty"`
-		FenceReason  string   `json:"fenceReason,omitempty"`
-		SeedManifest string   `json:"seedManifestPath,omitempty"`
-		SeedRoot     string   `json:"seedContentRoot,omitempty"`
-		AdminURL     string   `json:"adminURL,omitempty"`
-		AdminNodeID  string   `json:"adminNodeID,omitempty"`
-		AdminMethod  string   `json:"adminMethod,omitempty"`
-		AdminPath    string   `json:"adminPath,omitempty"`
-		AdminCommand []string `json:"adminCommand,omitempty"`
-		Reason       string   `json:"reason,omitempty"`
+		Kind           string   `json:"kind"`
+		Phase          string   `json:"phase,omitempty"`
+		Executor       string   `json:"executor,omitempty"`
+		DependsOn      string   `json:"dependsOn,omitempty"`
+		StandbyName    string   `json:"standbyName,omitempty"`
+		SlotName       string   `json:"slotName,omitempty"`
+		TargetLSN      uint64   `json:"targetLSN,omitempty"`
+		ObservedLSN    uint64   `json:"observedLSN,omitempty"`
+		RetainedLSN    uint64   `json:"retainedFromLSN,omitempty"`
+		RouteFrom      string   `json:"routeFrom,omitempty"`
+		RouteTo        string   `json:"routeTo,omitempty"`
+		FenceAuth      string   `json:"fenceAuthority,omitempty"`
+		FenceHolder    string   `json:"fenceHolder,omitempty"`
+		FenceGen       uint64   `json:"fenceGeneration,omitempty"`
+		FenceReason    string   `json:"fenceReason,omitempty"`
+		SeedManifest   string   `json:"seedManifestPath,omitempty"`
+		SeedRoot       string   `json:"seedContentRoot,omitempty"`
+		SeedLocation   string   `json:"seedArtifactLocation,omitempty"`
+		SeedGeneration string   `json:"seedArtifactGeneration,omitempty"`
+		SeedRetention  int32    `json:"seedArtifactRetainGenerations,omitempty"`
+		AdminURL       string   `json:"adminURL,omitempty"`
+		AdminNodeID    string   `json:"adminNodeID,omitempty"`
+		AdminMethod    string   `json:"adminMethod,omitempty"`
+		AdminPath      string   `json:"adminPath,omitempty"`
+		AdminCommand   []string `json:"adminCommand,omitempty"`
+		Reason         string   `json:"reason,omitempty"`
 	}{
-		Kind:         action.Kind,
-		Phase:        action.Phase,
-		Executor:     action.Executor,
-		DependsOn:    action.DependsOn,
-		StandbyName:  action.StandbyName,
-		SlotName:     action.SlotName,
-		TargetLSN:    action.TargetLSN,
-		ObservedLSN:  action.ObservedLSN,
-		RetainedLSN:  action.RetainedFromLSN,
-		RouteFrom:    action.RouteFrom,
-		RouteTo:      action.RouteTo,
-		FenceAuth:    string(action.FenceAuthority),
-		FenceHolder:  action.FenceHolder,
-		FenceGen:     action.FenceGeneration,
-		FenceReason:  action.FenceReason,
-		SeedManifest: action.SeedManifestPath,
-		SeedRoot:     action.SeedContentRoot,
-		AdminURL:     action.AdminURL,
-		AdminNodeID:  action.AdminNodeID,
-		AdminMethod:  action.AdminMethod,
-		AdminPath:    action.AdminPath,
-		AdminCommand: action.AdminCommand,
-		Reason:       action.Reason,
+		Kind:           action.Kind,
+		Phase:          action.Phase,
+		Executor:       action.Executor,
+		DependsOn:      action.DependsOn,
+		StandbyName:    action.StandbyName,
+		SlotName:       action.SlotName,
+		TargetLSN:      action.TargetLSN,
+		ObservedLSN:    action.ObservedLSN,
+		RetainedLSN:    action.RetainedFromLSN,
+		RouteFrom:      action.RouteFrom,
+		RouteTo:        action.RouteTo,
+		FenceAuth:      string(action.FenceAuthority),
+		FenceHolder:    action.FenceHolder,
+		FenceGen:       action.FenceGeneration,
+		FenceReason:    action.FenceReason,
+		SeedManifest:   action.SeedManifestPath,
+		SeedRoot:       action.SeedContentRoot,
+		SeedLocation:   action.SeedArtifactLocation,
+		SeedGeneration: action.SeedArtifactGeneration,
+		SeedRetention:  action.SeedArtifactRetainGenerations,
+		AdminURL:       action.AdminURL,
+		AdminNodeID:    action.AdminNodeID,
+		AdminMethod:    action.AdminMethod,
+		AdminPath:      action.AdminPath,
+		AdminCommand:   action.AdminCommand,
+		Reason:         action.Reason,
 	})
 	if err != nil {
 		rendered = []byte(fmt.Sprintf("%s/%s/%s/%d/%s/%d/%s/%s/%v/%s", action.Kind, action.StandbyName, action.SlotName, action.TargetLSN, action.FenceAuthority, action.FenceGeneration, action.FenceHolder, action.AdminURL, action.AdminCommand, action.Reason))

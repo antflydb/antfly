@@ -649,9 +649,68 @@ type HAStandbySpec struct {
 	// +optional
 	SeedContentRoot string `json:"seedContentRoot,omitempty"`
 
+	// SeedArtifact enables operator-managed immutable transport for this standby's
+	// base backup. The operator publishes the source manifest and all referenced
+	// files to object storage, restores them into a target staging root, verifies
+	// identity and checksums, and only then invokes standby bootstrap.
+	// +optional
+	SeedArtifact *HASeedArtifactSpec `json:"seedArtifact,omitempty"`
+
 	// RouteSelector is the public-api Service selector to use when this standby is promoted.
 	// +optional
 	RouteSelector map[string]string `json:"routeSelector,omitempty"`
+}
+
+// HASeedArtifactSpec configures portable, publish-last seed transport.
+type HASeedArtifactSpec struct {
+	// Location is an object-store URI. Production deployments should use s3://
+	// or gs://; file:// is supported for local development and KinD fixtures.
+	// +kubebuilder:validation:Pattern=`^(s3://|gs://|file://).+`
+	Location string `json:"location"`
+
+	// GenerationPrefix is prepended to the deterministic generation selected by
+	// the operator. It must be a safe HA identifier and defaults to "seed".
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:-]+$`
+	// +optional
+	GenerationPrefix string `json:"generationPrefix,omitempty"`
+
+	// StagingRoot is the absolute target path into which the verified generation
+	// is restored. It must be on target standby durable storage and must not be a
+	// live primary data root.
+	// +kubebuilder:validation:Pattern=`^/.*`
+	StagingRoot string `json:"stagingRoot"`
+
+	// SourcePVC is mounted read-only only by the publish Job. Keeping source and
+	// target claims action-scoped allows an RWO primary PVC and an RWO standby
+	// PVC to be attached on different nodes without one Job requesting both.
+	// +optional
+	SourcePVC *HASeedArtifactPVCSpec `json:"sourcePVC,omitempty"`
+
+	// TargetPVC is mounted read-write only by the restore Job.
+	// +optional
+	TargetPVC *HASeedArtifactPVCSpec `json:"targetPVC,omitempty"`
+
+	// CredentialsSecretRef injects object-store credentials into artifact Jobs.
+	// For S3 this Secret normally contains AWS_ACCESS_KEY_ID,
+	// AWS_SECRET_ACCESS_KEY, and optionally AWS_REGION/AWS_ENDPOINT_URL.
+	// Workload identity may be used by omitting this field.
+	// +optional
+	CredentialsSecretRef *corev1.LocalObjectReference `json:"credentialsSecretRef,omitempty"`
+
+	// RetainGenerations is the desired number of complete immutable generations
+	// to retain after a newer seed becomes ready. Zero defaults to two.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	RetainGenerations int32 `json:"retainGenerations,omitempty"`
+}
+
+// HASeedArtifactPVCSpec mounts one seed source or target PVC into an artifact Job.
+type HASeedArtifactPVCSpec struct {
+	// ClaimName is the PVC in the AntflyCluster namespace.
+	ClaimName string `json:"claimName"`
+
+	// MountPath is the absolute path used by the corresponding artifact action.
+	MountPath string `json:"mountPath"`
 }
 
 // HARuntimeSpec configures how the operator starts this Antfly process in the HA runtime.
@@ -1778,6 +1837,23 @@ type HAPlannedActionStatus struct {
 	// +optional
 	SeedContentRoot string `json:"seedContentRoot,omitempty"`
 
+	// SeedArtifactLocation is the object-store URI used by portable seed actions.
+	// +optional
+	SeedArtifactLocation string `json:"seedArtifactLocation,omitempty"`
+
+	// SeedArtifactGeneration is the immutable generation selected by the operator.
+	// +optional
+	SeedArtifactGeneration string `json:"seedArtifactGeneration,omitempty"`
+
+	// SeedArtifactRetainGenerations is the retention bound applied after bootstrap.
+	// +optional
+	SeedArtifactRetainGenerations int32 `json:"seedArtifactRetainGenerations,omitempty"`
+
+	// SeedArtifactReceipt is the typed, validated receipt emitted by a completed
+	// portable publish, restore, or prune Job.
+	// +optional
+	SeedArtifactReceipt *HASeedArtifactReceiptStatus `json:"seedArtifactReceipt,omitempty"`
+
 	// AdminJobName records direct-admin-api for typed execution or the Kubernetes Job created for CLI-backed execution.
 	// +optional
 	AdminJobName string `json:"adminJobName,omitempty"`
@@ -1795,6 +1871,27 @@ type HAPlannedActionStatus struct {
 	AdminStatusCode int `json:"adminStatusCode,omitempty"`
 
 	Reason string `json:"reason,omitempty"`
+}
+
+// HASeedArtifactReceiptStatus summarizes a durable portable seed receipt.
+type HASeedArtifactReceiptStatus struct {
+	FormatVersion   int32  `json:"formatVersion"`
+	Generation      string `json:"generation"`
+	SlotName        string `json:"slotName"`
+	ClusterID       uint64 `json:"clusterID,omitempty"`
+	ShardID         uint64 `json:"shardID,omitempty"`
+	TableID         uint64 `json:"tableID,omitempty"`
+	TimelineID      uint64 `json:"timelineID,omitempty"`
+	Epoch           uint64 `json:"epoch,omitempty"`
+	ManifestID      string `json:"manifestID,omitempty"`
+	BackupLSN       uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN   uint64 `json:"checkpointLSN,omitempty"`
+	ManifestSHA256  string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256 string `json:"aggregateSHA256,omitempty"`
+	TotalBytes      uint64 `json:"totalBytes,omitempty"`
+	FileCount       int32  `json:"fileCount,omitempty"`
+	RetainedCount   int32  `json:"retainedCount,omitempty"`
+	DeletedCount    int32  `json:"deletedCount,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.

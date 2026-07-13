@@ -124,6 +124,70 @@ sufficient, the operator should mark the standby as reseed-required and publish
 the reseed action instead of silently dropping required records or holding
 unbounded retention.
 
+### Portable seed artifacts
+
+Configure `standbys[*].seedArtifact` when the source backup and the standby do
+not share a filesystem. The same path is used for initial bootstrap and reseed:
+
+1. finish the base backup and freeze its manifest boundary;
+2. publish every manifest file to an immutable object-store generation;
+3. publish `COMPLETE.json` last as the only availability boundary;
+4. restore and verify the generation on the standby PVC;
+5. bootstrap from the verified local manifest and content root;
+6. prune older complete generations after bootstrap succeeds.
+
+```yaml
+spec:
+  highAvailability:
+    admin:
+      executePlannedActions: true
+    standbys:
+      - name: standby-a
+        slotName: standby-a
+        seedManifestPath: /source/seed/manifest.afha
+        seedContentRoot: /source/seed/content
+        seedArtifact:
+          location: s3://company-ha-seeds/my-cluster
+          generationPrefix: seed
+          stagingRoot: /target/seed/current
+          retainGenerations: 2
+          credentialsSecretRef:
+            name: ha-seed-object-store
+          sourcePVC:
+            claimName: primary-data
+            mountPath: /source
+          targetPVC:
+            claimName: standby-a-data
+            mountPath: /target
+```
+
+Source volumes are mounted only by the publish Job and target volumes only by
+the restore Job. This separation is required for two node-local or RWO PVCs: no
+Job asks Kubernetes to attach both PVCs at once. The standby runtime itself must
+also mount the target path so the typed bootstrap operation can open the
+verified files.
+
+The restore helper never clears an arbitrary directory. It accepts a missing or
+empty target, a partial directory carrying the matching operator staging
+marker, or an already-complete directory whose receipt and every file reverify.
+A non-empty unowned directory, wrong cluster/shard/table/timeline/epoch, stale
+checkpoint, path traversal, size mismatch, CRC mismatch, SHA-256 mismatch, or
+missing `COMPLETE.json` fails before standby bootstrap changes durable state.
+
+Use `s3://` or `gs://` in production and `file://` only for local or KinD
+fixtures. Inject credentials through `credentialsSecretRef` or workload
+identity; never place credentials in the URI. Configure provider-side TLS,
+server-side encryption/KMS, bucket versioning, lifecycle policy, and least-
+privilege access scoped to this cluster prefix. Artifact Jobs emit receipts on
+stdout, while durable action progress, retries, terminal errors, object-store
+location, generation, and retention appear in
+`status.haStatus.plannedActions`.
+
+For local KinD validation, use a filesystem-backed object-store fixture mounted
+at a `file://` URI and distinct source and target PVCs. Delete the publish or
+restore Job/pod between attempts to exercise idempotent restart behavior; never
+use `kubectl cp`, `kubectl exec`, a hostPath bridge, or a test-only catalog.
+
 ## Promotion
 
 Automatic promotion requires a machine-checkable fence. The operator should not

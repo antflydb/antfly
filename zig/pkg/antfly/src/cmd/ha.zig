@@ -115,9 +115,23 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
 }
 
 pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "artifact")) {
+        try runArtifactArgv(alloc, io, argv[1..]);
+        return;
+    }
     var parsed = try parseLocalArgs(alloc, argv);
     defer parsed.deinit(alloc);
     if (parsed.command_args.len == 0) return error.HaCommandMissing;
+    if (std.mem.eql(u8, parsed.command_args[0], "artifact")) {
+        if (parsed.options.remote_url != null or parsed.options.remote_token_env != null or
+            parsed.options.wantsPrimary() or parsed.options.wantsStandby() or
+            parsed.options.fence_wal != null or parsed.options.former_primary_log != null)
+        {
+            return error.SeedArtifactCannotUseAdminHandles;
+        }
+        try runArtifactArgv(alloc, io, parsed.command_args[1..]);
+        return;
+    }
 
     if (parsed.options.remote_url) |remote_url| {
         if (parsed.options.wantsPrimary() or parsed.options.wantsStandby() or
@@ -202,6 +216,171 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
 
     std.Io.File.stdout().writeStreamingAll(io, rendered.body) catch {};
     std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+}
+
+const ArtifactAction = enum { publish, restore, verify, prune };
+
+const ArtifactOptions = struct {
+    action: ArtifactAction,
+    location: ?[]const u8 = null,
+    generation: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
+    manifest_path: ?[]const u8 = null,
+    content_root: ?[]const u8 = null,
+    staging_root: ?[]const u8 = null,
+    identity: IdentityOptions = .{},
+    minimum_checkpoint_lsn: u64 = 0,
+    retain_generations: usize = 2,
+};
+
+fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    const options = try parseArtifactArgs(argv);
+    const generation = options.generation orelse return error.SeedGenerationMissing;
+    const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+
+    switch (options.action) {
+        .publish => {
+            const location = options.location orelse return error.SeedLocationMissing;
+            const manifest_path = options.manifest_path orelse return error.SeedManifestMissing;
+            const content_root = options.content_root orelse return error.SeedContentRootMissing;
+            const manifest_bytes = try readArtifactFileAlloc(alloc, manifest_path, (ha.seed_artifact.Limits{}).max_manifest_bytes);
+            defer alloc.free(manifest_bytes);
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_artifact.publish(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, .{
+                .generation = generation,
+                .slot_name = slot_name,
+                .manifest_bytes = manifest_bytes,
+                .content_root = content_root,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.receipt_json);
+        },
+        .restore => {
+            const location = options.location orelse return error.SeedLocationMissing;
+            const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_artifact.restoreToStaging(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, .{
+                .expected = .{
+                    .generation = generation,
+                    .slot_name = slot_name,
+                    .identity = try options.identity.finish(),
+                    .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                },
+                .staging_root = staging_root,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.receipt_json);
+        },
+        .verify => {
+            const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            try ha.seed_artifact.verifyStaged(alloc, staging_root, .{
+                .generation = generation,
+                .slot_name = slot_name,
+                .identity = try options.identity.finish(),
+                .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+            }, .{});
+            std.Io.File.stdout().writeStreamingAll(io, "{\"verified\":true}\n") catch {};
+        },
+        .prune => {
+            const location = options.location orelse return error.SeedLocationMissing;
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_artifact.prune(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, .{
+                .slot_name = slot_name,
+                .current_generation = generation,
+                .retain_generations = options.retain_generations,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.result_json);
+        },
+    }
+}
+
+fn parseArtifactArgs(argv: []const []const u8) !ArtifactOptions {
+    if (argv.len == 0) return error.SeedArtifactActionMissing;
+    var options = ArtifactOptions{ .action = if (std.mem.eql(u8, argv[0], "publish"))
+        .publish
+    else if (std.mem.eql(u8, argv[0], "restore"))
+        .restore
+    else if (std.mem.eql(u8, argv[0], "verify"))
+        .verify
+    else if (std.mem.eql(u8, argv[0], "prune"))
+        .prune
+    else
+        return error.InvalidSeedArtifactAction };
+    var idx: usize = 1;
+    while (idx < argv.len) {
+        const flag = argv[idx];
+        idx += 1;
+        if (std.mem.eql(u8, flag, "--location")) {
+            options.location = try artifactValue(argv, &idx);
+        } else if (std.mem.eql(u8, flag, "--generation")) {
+            options.generation = try artifactValue(argv, &idx);
+        } else if (std.mem.eql(u8, flag, "--slot")) {
+            options.slot_name = try artifactValue(argv, &idx);
+        } else if (std.mem.eql(u8, flag, "--manifest")) {
+            options.manifest_path = try absoluteArtifactPath(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--content-root")) {
+            options.content_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--staging-root")) {
+            options.staging_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--ha-cluster-id")) {
+            options.identity.cluster_id = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--ha-shard-id")) {
+            options.identity.shard_id = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--ha-table-id")) {
+            options.identity.table_id = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--ha-timeline-id")) {
+            options.identity.timeline_id = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--ha-epoch")) {
+            options.identity.epoch = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--minimum-checkpoint-lsn")) {
+            options.minimum_checkpoint_lsn = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--retain-generations")) {
+            options.retain_generations = std.math.cast(usize, try parseU64(try artifactValue(argv, &idx))) orelse return error.InvalidSeedRetention;
+            if (options.retain_generations == 0) return error.InvalidSeedRetention;
+        } else {
+            return error.InvalidSeedArtifactFlag;
+        }
+    }
+    return options;
+}
+
+fn artifactValue(argv: []const []const u8, idx: *usize) ![]const u8 {
+    if (idx.* >= argv.len) return error.FlagValueMissing;
+    const out = argv[idx.*];
+    idx.* += 1;
+    return out;
+}
+
+fn absoluteArtifactPath(path: []const u8) ![]const u8 {
+    if (!ha_validation.isAbsoluteNormalizedPath(path)) return error.InvalidSeedArtifactPath;
+    return path;
+}
+
+fn readArtifactFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
+}
+
+fn writeArtifactResult(io: std.Io, body: []const u8) !void {
+    std.Io.File.stdout().writeStreamingAll(io, body) catch return error.SeedArtifactOutputFailed;
+    std.Io.File.stdout().writeStreamingAll(io, "\n") catch return error.SeedArtifactOutputFailed;
 }
 
 fn runRemoteArgv(
@@ -1078,13 +1257,16 @@ fn printUsage(argv0: []const u8) void {
         \\  --ha-epoch N
         \\
         \\examples:
+        \\  {s} ha artifact publish --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --manifest /source/manifest.afha --content-root /source/content
+        \\  {s} ha artifact restore --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --staging-root /target/seed --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
+        \\  {s} ha artifact prune --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --retain-generations 2
         \\  {s} ha --ha-url http://127.0.0.1:8081 --ha-token-env ANTFLY_HA_ADMIN_TOKEN -- status primary
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
         \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
         \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
 test "ha cmd parses local handles before admin command" {
