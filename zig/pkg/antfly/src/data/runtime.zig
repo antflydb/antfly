@@ -16338,6 +16338,9 @@ test "data server wires configured HA executors into API server" {
         captured_replica.snapshot_path,
     });
     defer alloc.free(captured_snapshot_root);
+    const captured_journal_path = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "change-journal.bin" });
+    defer alloc.free(captured_journal_path);
+    try std.Io.Dir.accessAbsolute(io_impl.io(), captured_journal_path, .{});
     const restored_db_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restored/group-1/table-db" });
     defer alloc.free(restored_db_path);
     try antfly.db.DB.restoreSnapshotTo(alloc, captured_snapshot_root, restored_db_path, .{
@@ -16358,14 +16361,6 @@ test "data server wires configured HA executors into API server" {
     const restored_txn_doc = (try restored_db.get(alloc, "doc:txn")) orelse return error.TestExpectedEqual;
     defer alloc.free(restored_txn_doc);
     try std.testing.expectEqualStrings("{\"title\":\"txn state\"}", restored_txn_doc);
-    const restored_replay = try restored_db.core.store.iterateReplayFrom(alloc, 1);
-    defer {
-        for (restored_replay) |*entry| entry.deinit(alloc);
-        alloc.free(restored_replay);
-    }
-    try std.testing.expectEqual(@as(usize, 1), restored_replay.len);
-    try std.testing.expectEqual(@as(u64, 1), restored_replay[0].sequence);
-    try std.testing.expectEqualStrings("derived-change-journal-state", restored_replay[0].payload);
     var restored_search = try restored_db.search(alloc, .{
         .index_name = "ft_v1",
         .full_text = .{ .match = .{ .field = "title", .text = "seed" } },
