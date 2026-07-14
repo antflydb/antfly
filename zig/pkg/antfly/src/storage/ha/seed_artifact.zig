@@ -1092,6 +1092,17 @@ test "storage.ha seed artifact publishes last and restores verified staging" {
     defer published.deinit(alloc);
     try std.testing.expect(!published.already_available);
 
+    var verified_remote = try verifyRemote(alloc, store, .{
+        .generation = "gen-0001",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+    }, .{});
+    defer verified_remote.deinit(alloc);
+    try std.testing.expectEqualStrings(published.receipt_json, verified_remote.receipt_json);
+    try std.testing.expectEqual(@as(usize, 2), verified_remote.file_count);
+    try std.testing.expectEqual(@as(u64, 27), verified_remote.total_bytes);
+
     var repeated = try publish(alloc, store, .{
         .generation = "gen-0001",
         .slot_name = "standby-a",
@@ -1347,6 +1358,15 @@ test "storage.ha seed artifact restores a legacy v1 single-object generation" {
     try putImmutable(alloc, store, file_key, body, "application/octet-stream");
     try putImmutable(alloc, store, manifest_key, manifest_bytes, "application/vnd.antfly.ha-manifest");
     try putImmutable(alloc, store, complete_key, receipt_json, "application/json");
+
+    var verified_remote = try verifyRemote(alloc, store, .{
+        .generation = "gen-v1-compat",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+    }, .{ .max_chunk_bytes = 4 });
+    defer verified_remote.deinit(alloc);
+    try std.testing.expectEqualStrings(receipt_json, verified_remote.receipt_json);
 
     var restored = try restoreToStaging(alloc, store, .{
         .expected = .{

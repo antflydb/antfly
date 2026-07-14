@@ -31,9 +31,12 @@ const Crc32 = std.hash.Crc32;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
 const backup_manifest = @import("backup_manifest.zig");
+const local_generation_gc = @import("local_generation_gc.zig");
 const mutation_barrier = @import("mutation_barrier.zig");
+const object_storage = @import("../object_storage.zig");
 const primary_mod = @import("primary.zig");
 const replication_log = @import("replication_log.zig");
+const seed_artifact = @import("seed_artifact.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
@@ -1243,4 +1246,72 @@ test "storage.ha seed capture burns a generation whose local snapshot was incomp
     try std.testing.expectError(error.FileNotFound, capture(alloc, request));
     try std.testing.expect(primary.slot("standby-a") == null);
     try std.testing.expectError(error.CaptureGenerationAborted, capture(alloc, request));
+}
+
+test "storage.ha seed capture gc requires a remotely verified v2 COMPLETE checkpoint" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const paths = try testPrimaryPaths(alloc, root, "capture-publish-gc");
+    defer paths.deinit(alloc);
+    var primary = try primary_mod.Primary.open(alloc, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    var barrier: mutation_barrier.MutationBarrier = .{};
+    const source_path = try std.fs.path.join(alloc, &.{ root, "live/catalog" });
+    defer alloc.free(source_path);
+    try writeTestFile(source_path, "catalog-v1");
+    const capture_root = try std.fs.path.join(alloc, &.{ root, "captures" });
+    defer alloc.free(capture_root);
+    const sources = [_]Source{.{ .file = .{
+        .source_path = source_path,
+        .artifact_path = "catalog/manifest",
+        .kind = .manifest,
+    } }};
+    var captured = try capture(alloc, .{
+        .primary = &primary,
+        .barrier = &barrier,
+        .slot_name = "standby-a",
+        .generation = "gen-published",
+        .capture_root = capture_root,
+        .sources = &sources,
+    });
+    defer captured.deinit(alloc);
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-seeds");
+    const store = seed_artifact.Store{ .client = &client, .bucket = "ha-seeds" };
+    try std.testing.expectError(error.IncompleteSeedArtifact, prunePublishedGenerations(alloc, .{
+        .store = store,
+        .capture_root = capture_root,
+        .generation = "gen-published",
+        .slot_name = "standby-a",
+        .retain_generations = 1,
+    }));
+    const marker_path = try std.fs.path.join(alloc, &.{ captured.generation_root, local_generation_gc.marker_name });
+    defer alloc.free(marker_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+
+    var published = try seed_artifact.publish(alloc, store, .{
+        .generation = "gen-published",
+        .slot_name = "standby-a",
+        .manifest_bytes = captured.manifest_bytes,
+        .content_root = captured.content_root,
+        .limits = .{ .max_chunk_bytes = 4 },
+    });
+    defer published.deinit(alloc);
+    var pruned = try prunePublishedGenerations(alloc, .{
+        .store = store,
+        .capture_root = capture_root,
+        .generation = "gen-published",
+        .slot_name = "standby-a",
+        .retain_generations = 1,
+        .artifact_limits = .{ .max_chunk_bytes = 4 },
+    });
+    defer pruned.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pruned.deleted_generations);
+    try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
 }

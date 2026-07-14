@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
 const backup_manifest = @import("backup_manifest.zig");
+const local_generation_gc = @import("local_generation_gc.zig");
 const object_storage = @import("../object_storage.zig");
 const seed_artifact = @import("seed_artifact.zig");
 const standby_mod = @import("standby.zig");
@@ -652,6 +653,77 @@ test "storage.ha seed activation publishes a verified immutable generation idemp
     try std.testing.expect(retried.already_active);
     try std.testing.expectEqualStrings(activated.generation_path, retried.generation_path);
     try std.testing.expectEqualStrings(activated.active_receipt_json, retried.active_receipt_json);
+}
+
+test "storage.ha seed activation gc requires the durable seeded-slot activation checkpoint" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const staging_root = try prepareTestStaging(alloc, root, "gen-gc", testIdentity(), "catalog-gc");
+    defer alloc.free(staging_root);
+    const target_root = try std.fs.path.join(alloc, &.{ root, "target-gc" });
+    defer alloc.free(target_root);
+    var activated = try activate(alloc, .{
+        .staging_root = staging_root,
+        .target_root = target_root,
+        .expected = .{
+            .generation = "gen-gc",
+            .slot_name = "standby-a",
+            .identity = testIdentity(),
+            .minimum_checkpoint_lsn = 11,
+        },
+    });
+    defer activated.deinit(alloc);
+    var active = try std.json.parseFromSlice(ActivationReceipt, alloc, activated.active_receipt_json, .{});
+    defer active.deinit();
+    const checkpoint_path = try std.fs.path.join(alloc, &.{ root, "seeded-slot-activation.json" });
+    defer alloc.free(checkpoint_path);
+    try std.testing.expectError(error.SeedActivationCheckpointMissing, pruneActivatedGenerations(alloc, .{
+        .target_root = target_root,
+        .slot_activation_receipt_path = checkpoint_path,
+        .retain_generations = 1,
+    }));
+    const marker_path = try std.fs.path.join(alloc, &.{ activated.generation_path, local_generation_gc.marker_name });
+    defer alloc.free(marker_path);
+    try expectPathMissing(std.testing.io, marker_path);
+
+    const checkpoint_json = try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = @as(i64, 1),
+        .action = .{
+            .action_id = "seeded_slot_activate:gen-gc",
+            .action_kind = "seeded_slot_activate",
+            .target = "gen-gc",
+            .state = "applied",
+            .node_id = "primary-a",
+        },
+        .slot_name = "standby-a",
+        .generation = "gen-gc",
+        .manifest_id = active.value.manifest_id,
+        .timeline_id = @as(i64, @intCast(active.value.timeline_id)),
+        .checkpoint_lsn = @as(i64, @intCast(active.value.checkpoint_lsn)),
+        .seed_receipt_sha256 = active.value.seed_receipt_sha256,
+        .manifest_sha256 = active.value.manifest_sha256,
+        .aggregate_sha256 = active.value.aggregate_sha256,
+    }, .{});
+    defer alloc.free(checkpoint_json);
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, checkpoint_path, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, checkpoint_json);
+        try file.sync(std.testing.io);
+    }
+    try fs_paths.syncDirPortable(std.testing.io, root);
+
+    var pruned = try pruneActivatedGenerations(alloc, .{
+        .target_root = target_root,
+        .slot_activation_receipt_path = checkpoint_path,
+        .retain_generations = 1,
+    });
+    defer pruned.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pruned.deleted_generations);
+    try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
 }
 
 test "storage.ha seed activation binds startup evidence and revalidates installed bytes on restart" {
