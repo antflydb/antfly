@@ -1213,10 +1213,20 @@ pub const Reader = struct {
         var pages = try self.resolveValue(root.get("Pages") orelse return error.MissingPages);
         defer pages.deinit(self.alloc);
 
-        const count = pages.get("Count") orelse return error.MissingPageCount;
-        const count_i = count.asInteger() orelse return error.InvalidPageCount;
-        if (count_i < 0) return error.InvalidPageCount;
-        return @intCast(count_i);
+        if (pages.get("Count")) |count_obj| {
+            var count = try self.resolveValue(count_obj);
+            defer count.deinit(self.alloc);
+            if (count.asInteger()) |count_i| {
+                if (count_i > 0) return @intCast(count_i);
+            }
+        }
+
+        // Do not silently accept a stale or malformed zero /Count. Several
+        // incremental real-world PDFs retain a valid Kids tree while reporting
+        // zero here; walking that tree keeps the document eligible for OCR.
+        const actual_count = try self.countPageTreeLeaves(&pages, 0);
+        if (actual_count == 0) return error.EmptyPdfPageTree;
+        return actual_count;
     }
 
     pub fn readPageObject(self: *const Reader, page_num: usize) !syntax.Object {
@@ -1887,6 +1897,28 @@ pub const Reader = struct {
             .obj_ref => |ptr| try self.readIndirectObject(ptr),
             else => try obj.clone(self.alloc),
         };
+    }
+
+    fn countPageTreeLeaves(self: *const Reader, node: *const syntax.Object, depth: usize) anyerror!usize {
+        if (depth > 128 or node.* != .dict) return error.InvalidPageTree;
+
+        var resolved_type = try self.resolveValue(node.get("Type") orelse return error.InvalidPageTree);
+        defer resolved_type.deinit(self.alloc);
+        const name = resolved_type.asName() orelse return error.InvalidPageTree;
+        if (std.mem.eql(u8, name, "Page")) return 1;
+        if (!std.mem.eql(u8, name, "Pages")) return error.InvalidPageTree;
+
+        var kids = try self.resolveValue(node.get("Kids") orelse return error.InvalidPageTree);
+        defer kids.deinit(self.alloc);
+        if (kids != .array) return error.InvalidPageTree;
+
+        var count: usize = 0;
+        for (kids.array) |*kid| {
+            var resolved_kid = try self.resolveValue(kid);
+            defer resolved_kid.deinit(self.alloc);
+            count = try std.math.add(usize, count, try self.countPageTreeLeaves(&resolved_kid, depth + 1));
+        }
+        return count;
     }
 
     fn findPageObject(self: *const Reader, node: *const syntax.Object, remaining: *usize) anyerror!syntax.Object {
@@ -3397,12 +3429,15 @@ pub const Reader = struct {
         if (resolved_charprocs != .dict) return font;
 
         var code_to_name = [_]?[]const u8{null} ** 256;
+        var resolved_encoding: ?syntax.Object = null;
+        defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
         if (font_obj.get("Encoding")) |encoding_obj| {
-            var resolved_encoding = try self.resolveValue(encoding_obj);
-            defer resolved_encoding.deinit(self.alloc);
-            if (resolved_encoding == .dict) {
-                if (resolved_encoding.get("Differences")) |diff_obj| {
-                    try applyEncodingDifferenceNames(&code_to_name, diff_obj);
+            resolved_encoding = try self.resolveValue(encoding_obj);
+            if (resolved_encoding) |*encoding| {
+                if (encoding.* == .dict) {
+                    if (encoding.get("Differences")) |diff_obj| {
+                        try applyEncodingDifferenceNames(&code_to_name, diff_obj);
+                    }
                 }
             }
         }
@@ -3505,12 +3540,15 @@ pub const Reader = struct {
         }
 
         var code_to_name = [_]?[]const u8{null} ** 256;
+        var resolved_encoding: ?syntax.Object = null;
+        defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
         if (font_obj.get("Encoding")) |encoding_obj| {
-            var resolved_encoding = try self.resolveValue(encoding_obj);
-            defer resolved_encoding.deinit(self.alloc);
-            if (resolved_encoding == .dict) {
-                if (resolved_encoding.get("Differences")) |diff_obj| {
-                    try applyEncodingDifferenceNames(&code_to_name, diff_obj);
+            resolved_encoding = try self.resolveValue(encoding_obj);
+            if (resolved_encoding) |*encoding| {
+                if (encoding.* == .dict) {
+                    if (encoding.get("Differences")) |diff_obj| {
+                        try applyEncodingDifferenceNames(&code_to_name, diff_obj);
+                    }
                 }
             }
         }
@@ -3697,17 +3735,18 @@ pub const Reader = struct {
 
                     switch (dst) {
                         .string => {
-                            const dst_start = try parseCodeBytesToU32(dst.string);
+                            const dst_bytes = try self.alloc.dupe(u8, dst.string);
+                            defer self.alloc.free(dst_bytes);
                             var current_src: u32 = lo;
-                            while (current_src <= hi) : (current_src += 1) {
-                                const dst_cp: u21 = @intCast(dst_start + (current_src - lo));
-                                var buf: [4]u8 = undefined;
-                                const n = try std.unicode.utf8Encode(dst_cp, &buf);
+                            while (current_src <= hi) {
                                 try entries.append(self.alloc, .{
                                     .src = current_src,
                                     .src_len = code_len,
-                                    .dst = try self.alloc.dupe(u8, buf[0..n]),
+                                    .dst = try decodeToUnicodeDestAlloc(self.alloc, dst_bytes),
                                 });
+                                if (current_src == hi) break;
+                                if (!incrementBigEndianBytes(dst_bytes)) return error.InvalidToUnicodeMap;
+                                current_src += 1;
                             }
                         },
                         .array => {
@@ -3777,6 +3816,7 @@ fn parseXrefTable(
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
 ) anyerror!void {
+    if (offset >= bytes.len) return error.InvalidStartXref;
     var cursor = offset;
     skipPdfWs(bytes, &cursor);
     if (!std.mem.startsWith(u8, bytes[cursor..], "xref")) {
@@ -3806,13 +3846,12 @@ fn parseXrefTable(
     var scanner = syntax.Scanner.init(alloc, bytes[cursor..]);
     defer scanner.deinit();
     var trailer = try scanner.readObject();
-    errdefer trailer.deinit(alloc);
+    defer trailer.deinit(alloc);
     if (trailer != .dict) return error.ExpectedTrailerDict;
 
     if (trailer_out.* == null) {
         trailer_out.* = try trailer.clone(alloc);
     }
-    defer trailer.deinit(alloc);
 
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
@@ -3911,12 +3950,27 @@ fn parseXrefEntry(index: usize, line: []const u8) !?XrefEntry {
         else => return error.MalformedXrefTable,
     };
 
+    const generation = std.fmt.parseInt(u32, gen_txt, 10) catch |err| switch (err) {
+        error.Overflow => return null,
+        error.InvalidCharacter => return error.MalformedXrefTable,
+    };
+    // Real-world incremental PDFs occasionally contain an unused, nominally
+    // in-use sentinel entry with generation 65536. A generation cannot exceed
+    // the PDF limit of 65535; ignore that one corrupt entry rather than making
+    // every valid page in the document unreachable.
+    if (generation > std.math.maxInt(u16)) return null;
+
+    const object_offset = std.fmt.parseInt(usize, off_txt, 10) catch |err| switch (err) {
+        error.Overflow => return null,
+        error.InvalidCharacter => return error.MalformedXrefTable,
+    };
+
     return .{
         .ptr = .{
             .id = @intCast(index),
-            .gen = try std.fmt.parseInt(u16, gen_txt, 10),
+            .gen = @intCast(generation),
         },
-        .offset = try std.fmt.parseInt(usize, off_txt, 10),
+        .offset = object_offset,
         .in_use = in_use,
         .compressed_obj_stream_id = null,
         .compressed_index = null,
@@ -3927,8 +3981,9 @@ fn cloneStreamHeaderAsDict(alloc: Allocator, obj: *const syntax.Object) !syntax.
     if (obj.* != .stream) return error.NotAStream;
     const header = obj.stream.header;
     const out = try alloc.alloc(syntax.DictEntry, header.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..header.len]) |*entry| {
+        for (out[0..initialized]) |*entry| {
             alloc.free(entry.key);
             entry.value.deinit(alloc);
         }
@@ -3937,8 +3992,10 @@ fn cloneStreamHeaderAsDict(alloc: Allocator, obj: *const syntax.Object) !syntax.
     for (header, 0..) |entry, i| {
         out[i] = .{
             .key = try alloc.dupe(u8, entry.key),
-            .value = try entry.value.clone(alloc),
+            .value = .null,
         };
+        initialized += 1;
+        out[i].value = try entry.value.clone(alloc);
     }
     return .{ .dict = out };
 }
@@ -5176,13 +5233,38 @@ fn decodeToUnicodeDestAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
     var i: usize = 0;
-    while (i + 1 < bytes.len) : (i += 2) {
-        const cp = (@as(u16, bytes[i]) << 8) | bytes[i + 1];
+    while (i + 1 < bytes.len) {
+        const first = (@as(u16, bytes[i]) << 8) | bytes[i + 1];
+        i += 2;
+
+        const cp: u21 = if (first >= 0xD800 and first <= 0xDBFF) blk: {
+            if (i + 1 >= bytes.len) break :blk 0xFFFD;
+            const second = (@as(u16, bytes[i]) << 8) | bytes[i + 1];
+            if (second < 0xDC00 or second > 0xDFFF) break :blk 0xFFFD;
+            i += 2;
+            const high: u21 = first - 0xD800;
+            const low: u21 = second - 0xDC00;
+            break :blk 0x10000 + (high << 10) + low;
+        } else if (first >= 0xDC00 and first <= 0xDFFF)
+            0xFFFD
+        else
+            first;
+
         var buf: [4]u8 = undefined;
         const n = try std.unicode.utf8Encode(cp, &buf);
         try out.appendSlice(alloc, buf[0..n]);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn incrementBigEndianBytes(bytes: []u8) bool {
+    var i = bytes.len;
+    while (i > 0) {
+        i -= 1;
+        bytes[i] +%= 1;
+        if (bytes[i] != 0) return true;
+    }
+    return false;
 }
 
 fn parseHexToUtf8Alloc(alloc: Allocator, hex: []const u8) ![]u8 {
@@ -8566,6 +8648,49 @@ test "reader can extract plain text from simple page content" {
     try std.testing.expectEqualStrings("Hello World\n", text);
 }
 
+test "reader ignores an invalid xref sentinel and repairs a stale zero page count" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n(Recovered document text) Tj\nET\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+    };
+    defer alloc.free(objects[3]);
+
+    var pdf_bytes = std.ArrayList(u8).empty;
+    defer pdf_bytes.deinit(alloc);
+    try pdf_bytes.appendSlice(alloc, "%PDF-1.7\n");
+
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = pdf_bytes.items.len;
+        try pdf_bytes.appendSlice(alloc, obj_src);
+    }
+
+    const xref_offset = pdf_bytes.items.len;
+    try pdf_bytes.appendSlice(alloc, "xref\n0 6\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try pdf_bytes.appendSlice(alloc, line);
+    }
+    try pdf_bytes.appendSlice(alloc, "0000000000 65536 n \n");
+    try pdf_bytes.appendSlice(alloc, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    const trailer = try std.fmt.allocPrint(alloc, "startxref\n{d}\n%%EOF\n", .{xref_offset});
+    defer alloc.free(trailer);
+    try pdf_bytes.appendSlice(alloc, trailer);
+
+    var reader = try Reader.init(alloc, pdf_bytes.items);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try reader.pageCount());
+
+    const text = try reader.extractPlainTextAlloc();
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Recovered document text\n", text);
+}
+
 test "reader can extract plain text from content stream with indirect length" {
     const alloc = std.testing.allocator;
     const content = "BT\n(Hello Again) Tj\nET\n";
@@ -8830,6 +8955,101 @@ test "reader uses multiline ToUnicode bfrange arrays" {
     const text = try reader.extractPlainTextAlloc();
     defer alloc.free(text);
     try std.testing.expectEqualStrings("AB\n", text);
+}
+
+test "reader decodes and increments UTF-16BE ToUnicode bfrange strings" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n/F1 12 Tf\n<0001000200030004> Tj\nET\n";
+    const cmap =
+        "/CIDInit /ProcSet findresource begin\n" ++
+        "12 dict begin\n" ++
+        "begincmap\n" ++
+        "1 begincodespacerange\n" ++
+        "<0000> <FFFF>\n" ++
+        "endcodespacerange\n" ++
+        "3 beginbfrange\n" ++
+        "<0001> <0002> <00660069>\n" ++
+        "<0003> <0003> <D83DDE00>\n" ++
+        "<0004> <0004> <D800>\n" ++
+        "endbfrange\n" ++
+        "endcmap\n" ++
+        "end\n" ++
+        "end\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "6 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[5]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    const text = try reader.extractPlainTextAlloc();
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("fifj\u{1f600}\u{fffd}\n", text);
+}
+
+test "xref trailer is deinitialized once when recursive Prev parsing fails" {
+    const alloc = std.testing.allocator;
+    const invalid_previous =
+        "xref\n" ++
+        "0 0\n" ++
+        "trailer\n" ++
+        "null\n";
+    const current =
+        "xref\n" ++
+        "0 0\n" ++
+        "trailer\n" ++
+        "<< /Size 1 /Prev 0 >>\n";
+    const bytes = invalid_previous ++ current;
+
+    var entries = std.ArrayList(XrefEntry).empty;
+    defer entries.deinit(alloc);
+    var trailer: ?syntax.Object = null;
+    defer if (trailer) |*value| value.deinit(alloc);
+
+    try std.testing.expectError(
+        error.ExpectedTrailerDict,
+        parseXrefTable(alloc, bytes, invalid_previous.len, &entries, &trailer),
+    );
+}
+
+test "xref parser ignores an out-of-range generation sentinel" {
+    try std.testing.expectEqual(
+        @as(?XrefEntry, null),
+        try parseXrefEntry(1, "0000000000 65536 n"),
+    );
+    try std.testing.expectError(
+        error.MalformedXrefTable,
+        parseXrefEntry(1, "0000000000 invalid n"),
+    );
 }
 
 test "reader extracts positioned text runs from text matrix operators" {
@@ -9365,8 +9585,11 @@ test "reader preserves text stroke alpha and width on positioned runs" {
     try std.testing.expectApproxEqAbs(@as(f64, 3), runs.items[0].stroke_width, 0.0001);
 }
 
-test "reader extracts Type3 text glyph shapes" {
-    const alloc = std.testing.allocator;
+test "reader keeps Type3 encoding difference names alive while building glyphs" {
+    // The production server uses the C allocator. It eagerly reuses the freed
+    // Encoding dictionary allocation that exposed this borrowed-name lifetime
+    // bug, unlike the testing allocator's quarantine behavior.
+    const alloc = std.heap.c_allocator;
     const content =
         "BT\n" ++
         "/F1 20 Tf\n" ++
@@ -9436,22 +9659,25 @@ test "reader extracts Type3 text glyph shapes" {
     try prefix.appendSlice(alloc, startxref);
     try prefix.appendSlice(alloc, "%%EOF\n");
 
-    var parsed = try Reader.init(alloc, prefix.items);
-    defer parsed.deinit();
-    const runs = try parsed.extractPageType3TextShapeRunsAlloc(1);
-    defer {
-        for (runs) |*run| run.deinit(alloc);
-        alloc.free(runs);
-    }
+    var iteration: usize = 0;
+    while (iteration < 5) : (iteration += 1) {
+        var parsed = try Reader.init(alloc, prefix.items);
+        defer parsed.deinit();
+        const runs = try parsed.extractPageType3TextShapeRunsAlloc(1);
+        defer {
+            for (runs) |*run| run.deinit(alloc);
+            alloc.free(runs);
+        }
 
-    try std.testing.expect(runs.len > 0);
-    try std.testing.expect(runs[0].kind == .fill);
-    try std.testing.expectEqual([4]u8{ 0xff, 0x00, 0x00, 0xff }, runs[0].color);
-    const bounds = pathBounds(runs[0].points);
-    try std.testing.expectApproxEqAbs(@as(f64, 10), bounds.min_x, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f64, 20), bounds.min_y, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f64, 30), bounds.max_x, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f64, 40), bounds.max_y, 0.01);
+        try std.testing.expect(runs.len > 0);
+        try std.testing.expect(runs[0].kind == .fill);
+        try std.testing.expectEqual([4]u8{ 0xff, 0x00, 0x00, 0xff }, runs[0].color);
+        const bounds = pathBounds(runs[0].points);
+        try std.testing.expectApproxEqAbs(@as(f64, 10), bounds.min_x, 0.01);
+        try std.testing.expectApproxEqAbs(@as(f64, 20), bounds.min_y, 0.01);
+        try std.testing.expectApproxEqAbs(@as(f64, 30), bounds.max_x, 0.01);
+        try std.testing.expectApproxEqAbs(@as(f64, 40), bounds.max_y, 0.01);
+    }
 }
 
 test "parse Type3 glyph advance from d1" {
