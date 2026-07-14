@@ -1253,6 +1253,48 @@ func TestPlanHAUsesExplicitExactSeedArtifactGenerationAcrossChangingLSN(t *testi
 	}
 }
 
+func TestPlanHAStandbyLocalTargetOnlyArtifactNeverCapturesOrPublishes(t *testing.T) {
+	targetOnly := false
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 10}
+	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
+		Role:   antflyv1.HARuntimeRoleStandby,
+		NodeID: "standby-a",
+		Standby: &antflyv1.HAStandbyRuntimeSpec{
+			UpstreamURL: "http://primary.default.svc:8080",
+			SlotName:    "standby-a",
+		},
+		StartupGate: &antflyv1.HAStartupGateSpec{
+			Policy:             antflyv1.HAStartupGatePolicyRequireActivatedSeed,
+			ReceiptMatchPolicy: antflyv1.HAReceiptMatchPolicyExact,
+			RequiredReceipt: &antflyv1.HARequiredSeedActivationReceipt{
+				TopologyID: "antfly", TopologyGeneration: 7, NodeID: "standby-a", SlotName: "standby-a",
+				Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
+			},
+		},
+	}
+	standby := antflyv1.HAStandbySpec{
+		Name:    "standby-a",
+		Desired: &targetOnly,
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location:    "s3://ha-seeds/antfly",
+			Generation:  "prod-standby-a-10",
+			StagingRoot: "/target/.antfly-ha/staging",
+			TargetPVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			SourcePVC:   nil,
+		},
+	}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{standby}
+
+	plan := planHA(cluster)
+	if plan.DesiredStandbyCount != 0 || len(plan.Actions) != 0 {
+		t.Fatalf("TARGET_ONLY_SEED_WAS_PLANNED: standby-local target descriptor must not enter primary seed planning, got %#v", plan)
+	}
+	if actions := haSeedCompletionActions(standby, "standby-a", 10, "must-not-run", ""); len(actions) != 0 {
+		t.Fatalf("TARGET_ONLY_SEED_WAS_PUBLISHED: source-less target descriptor must not produce capture or publication actions, got %#v", actions)
+	}
+}
+
 func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	undesired := false
 	cluster := haCluster()

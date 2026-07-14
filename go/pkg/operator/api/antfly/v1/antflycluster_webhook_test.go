@@ -2016,6 +2016,7 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 }
 
 func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRuntimeCRs(t *testing.T) {
+	targetOnly := false
 	cluster := baseSwarmCluster()
 	cluster.Name = "antflydb-standby-a"
 	cluster.Annotations = map[string]string{"antfly.io/ha-topology-id": "antflydb"}
@@ -2034,7 +2035,7 @@ func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRunt
 			},
 		},
 		Standbys: []HAStandbySpec{{
-			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			Name: "standby-a", Desired: &targetOnly,
 			SeedArtifact: &HASeedArtifactSpec{
 				Location: "s3://ha-seeds/antflydb", Generation: "prod-standby-a-10", StagingRoot: "/target/.antfly-ha/staging",
 				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
@@ -2043,8 +2044,23 @@ func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRunt
 	}
 
 	if err := cluster.ValidateCreate(); err != nil {
-		t.Fatalf("expected shared annotated topology ID to be accepted for a multi-CR standby: %v", err)
+		t.Fatalf("expected exact-gated standby-local target-only seed artifact to be accepted: %v", err)
 	}
+	cluster.Spec.HighAvailability.Standbys[0].SeedArtifact.SourcePVC = &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"}
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "sourcePVC must be omitted for standby-local target-only seed artifact") {
+		t.Fatalf("expected target-only seed artifact with sourcePVC to fail closed, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Standbys[0].SeedArtifact.SourcePVC = nil
+	cluster.Spec.HighAvailability.Standbys[0].Desired = nil
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "runtime-owned seed capture requires runtime.role Primary") {
+		t.Fatalf("expected implicit desired=true source-less artifact to retain primary-only validation, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Standbys[0].Desired = &targetOnly
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.Generation = "stale-generation"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "requiredReceipt.generation must match seedArtifact.generation") {
+		t.Fatalf("expected target-only artifact without an exact generation binding to fail closed, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.Generation = "prod-standby-a-10"
 	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TopologyID = "other-topology"
 	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "must match metadata.annotations[antfly.io/ha-topology-id]") {
 		t.Fatalf("expected annotated topology mismatch to fail closed, got: %v", err)

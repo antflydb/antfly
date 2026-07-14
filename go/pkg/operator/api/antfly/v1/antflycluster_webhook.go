@@ -1194,10 +1194,15 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			errors = append(errors, validateHASeedArtifact(artifact, fieldPath)...)
 			hasManifest := strings.TrimSpace(standby.SeedManifestPath) != ""
 			hasContent := strings.TrimSpace(standby.SeedContentRoot) != ""
+			targetOnly := standbyLocalTargetOnlySeedArtifactBound(ha, standby, artifact)
 			if hasManifest != hasContent {
 				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath and seedContentRoot must either both be set or both be omitted for runtime-owned capture", i))
 			}
-			if !hasManifest && !hasContent {
+			if targetOnly {
+				if artifact.SourcePVC != nil {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.sourcePVC must be omitted for standby-local target-only seed artifact", i))
+				}
+			} else if !hasManifest && !hasContent {
 				if ha.Runtime == nil || ha.Runtime.Role != HARuntimeRolePrimary {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d] runtime-owned seed capture requires runtime.role Primary", i))
 				}
@@ -1816,6 +1821,35 @@ func validateHAAdminJobPodSpec(admin *HAAdminSpec) []string {
 
 func standbyDesiredBySpec(standby HAStandbySpec) bool {
 	return standby.Desired == nil || *standby.Desired
+}
+
+// standbyLocalTargetOnlySeedArtifactBound recognizes the deliberately narrow
+// seed descriptor rendered into a standby runtime CR. It is not a publication
+// source: its only purpose is to bind the startup gate to the exact generation
+// already activated on the target PVC. All other source-less artifacts retain
+// the primary-only runtime capture validation path.
+func standbyLocalTargetOnlySeedArtifactBound(ha *HighAvailabilitySpec, standby HAStandbySpec, artifact *HASeedArtifactSpec) bool {
+	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != HARuntimeRoleStandby ||
+		standby.Desired == nil || *standby.Desired || artifact == nil ||
+		strings.TrimSpace(standby.SeedManifestPath) != "" || strings.TrimSpace(standby.SeedContentRoot) != "" {
+		return false
+	}
+	gate := ha.Runtime.StartupGate
+	if gate == nil || gate.Policy != HAStartupGatePolicyRequireActivatedSeed ||
+		gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
+		return false
+	}
+	required := gate.RequiredReceipt
+	slotName := strings.TrimSpace(standby.SlotName)
+	if slotName == "" {
+		slotName = strings.TrimSpace(standby.Name)
+	}
+	return slotName != "" && slotName == strings.TrimSpace(required.SlotName) &&
+		strings.TrimSpace(artifact.Generation) != "" &&
+		strings.TrimSpace(artifact.Generation) == strings.TrimSpace(required.Generation) &&
+		artifact.TargetPVC != nil &&
+		strings.TrimSpace(artifact.TargetPVC.ClaimName) != "" &&
+		strings.TrimSpace(artifact.TargetPVC.ClaimName) == strings.TrimSpace(required.TargetPVCName)
 }
 
 func highAvailabilityHasManagedConfig(ha *HighAvailabilitySpec) bool {

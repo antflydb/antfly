@@ -10735,6 +10735,7 @@ func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing
 func startupGatedSwarmControllerCluster(runtimeEligible bool) *antflyv1.AntflyCluster {
 	cluster := baseSwarmControllerCluster()
 	digest := strings.Repeat("a", 64)
+	targetOnly := false
 	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
 		Mode:     antflyv1.HAModeHotStandby,
 		Identity: &antflyv1.HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
@@ -10752,7 +10753,7 @@ func startupGatedSwarmControllerCluster(runtimeEligible bool) *antflyv1.AntflyCl
 			},
 		},
 		Standbys: []antflyv1.HAStandbySpec{{
-			Name: "standby-a",
+			Name: "standby-a", Desired: &targetOnly,
 			SeedArtifact: &antflyv1.HASeedArtifactSpec{
 				Location: "s3://ha-seeds/test-swarm", Generation: "prod-standby-a-10",
 				StagingRoot: "/target/.antfly-ha/staging",
