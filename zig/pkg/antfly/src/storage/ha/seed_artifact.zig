@@ -881,6 +881,237 @@ test "storage.ha seed artifact publishes last and restores verified staging" {
     try std.testing.expectEqualStrings(restored.receipt_json, restored_again.receipt_json);
 }
 
+test "storage.ha seed artifact v2 chunks every data object within the configured bound" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
+    defer alloc.free(content_root);
+    const source_path = try std.fs.path.join(alloc, &.{ content_root, "data/catalog" });
+    defer alloc.free(source_path);
+    try writeTestFile(alloc, source_path, "0123456789abcdefg");
+
+    const files = [_]backup_manifest.FileEntry{.{
+        .path = "data/catalog",
+        .kind = .manifest,
+        .size_bytes = 17,
+        .crc32 = backup_manifest.crc32("0123456789abcdefg"),
+    }};
+    const manifest_bytes = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = testIdentity(),
+        .manifest_id = "seed-v2-chunks",
+        .backup_lsn = 8,
+        .checkpoint_lsn = 11,
+        .files = &files,
+    });
+    defer alloc.free(manifest_bytes);
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-seeds");
+    const store = Store{ .client = &client, .bucket = "ha-seeds" };
+    const limits = Limits{ .max_chunk_bytes = 4 };
+    var published = try publish(alloc, store, .{
+        .generation = "gen-v2-chunks",
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest_bytes,
+        .content_root = content_root,
+        .limits = limits,
+    });
+    defer published.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(Receipt, alloc, published.receipt_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 2), parsed.value.format_version);
+    const chunks = parsed.value.files[0].chunks orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 5), chunks.len);
+    for (chunks, 0..) |chunk, index| {
+        try std.testing.expect(chunk.size_bytes > 0 and chunk.size_bytes <= limits.max_chunk_bytes);
+        try std.testing.expectEqual(index, chunk.index);
+        const key = try generationChunkKeyAlloc(alloc, store.prefix, "gen-v2-chunks", 0, index);
+        defer alloc.free(key);
+        const body = try getRequiredObject(alloc, store, key, limits.max_chunk_bytes);
+        defer alloc.free(body);
+        try std.testing.expectEqual(chunk.size_bytes, body.len);
+    }
+
+    const legacy_key = try generationFileKeyAlloc(alloc, store.prefix, "gen-v2-chunks", "data/catalog");
+    defer alloc.free(legacy_key);
+    try std.testing.expectError(error.FileNotFound, getOptionalObject(alloc, store, legacy_key, 64));
+
+    const staging_root = try std.fs.path.join(alloc, &.{ root, "staging" });
+    defer alloc.free(staging_root);
+    var restored = try restoreToStaging(alloc, store, .{
+        .expected = .{
+            .generation = "gen-v2-chunks",
+            .slot_name = "standby-a",
+            .identity = testIdentity(),
+            .minimum_checkpoint_lsn = 11,
+        },
+        .staging_root = staging_root,
+        .limits = limits,
+    });
+    defer restored.deinit(alloc);
+    const restored_path = try std.fs.path.join(alloc, &.{ staging_root, "data/catalog" });
+    defer alloc.free(restored_path);
+    const restored_body = try readFileAlloc(alloc, restored_path, 32);
+    defer alloc.free(restored_body);
+    try std.testing.expectEqualStrings("0123456789abcdefg", restored_body);
+}
+
+test "storage.ha seed artifact does not publish COMPLETE before all v2 chunks are durable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
+    defer alloc.free(content_root);
+    const source_path = try std.fs.path.join(alloc, &.{ content_root, "data/catalog" });
+    defer alloc.free(source_path);
+    try writeTestFile(alloc, source_path, "chunked-publication");
+    const files = [_]backup_manifest.FileEntry{.{
+        .path = "data/catalog",
+        .kind = .manifest,
+        .size_bytes = 19,
+        .crc32 = backup_manifest.crc32("chunked-publication"),
+    }};
+    const manifest_bytes = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = testIdentity(),
+        .manifest_id = "seed-v2-crash",
+        .backup_lsn = 8,
+        .checkpoint_lsn = 11,
+        .files = &files,
+    });
+    defer alloc.free(manifest_bytes);
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-seeds");
+    const store = Store{ .client = &client, .bucket = "ha-seeds" };
+
+    try std.testing.expectError(error.InjectedArtifactFailure, publishWithOptions(alloc, store, .{
+        .generation = "gen-v2-crash",
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest_bytes,
+        .content_root = content_root,
+        .limits = .{ .max_chunk_bytes = 4 },
+    }, .{ .fail_before_complete = true }));
+
+    const complete_key = try generationKeyAlloc(alloc, store.prefix, "gen-v2-crash", complete_name);
+    defer alloc.free(complete_key);
+    try std.testing.expectError(error.FileNotFound, getOptionalObject(alloc, store, complete_key, 4096));
+    const staging_root = try std.fs.path.join(alloc, &.{ root, "must-not-restore" });
+    defer alloc.free(staging_root);
+    try std.testing.expectError(error.IncompleteSeedArtifact, restoreToStaging(alloc, store, .{
+        .expected = .{
+            .generation = "gen-v2-crash",
+            .slot_name = "standby-a",
+            .identity = testIdentity(),
+        },
+        .staging_root = staging_root,
+    }));
+}
+
+test "storage.ha seed artifact restores a legacy v1 single-object generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const staging_root = try std.fs.path.join(alloc, &.{ root, "legacy-staging" });
+    defer alloc.free(staging_root);
+    const body = "legacy-v1";
+    const files = [_]backup_manifest.FileEntry{.{
+        .path = "data/catalog",
+        .kind = .manifest,
+        .size_bytes = body.len,
+        .crc32 = backup_manifest.crc32(body),
+    }};
+    const manifest_bytes = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = testIdentity(),
+        .manifest_id = "seed-v1-compat",
+        .backup_lsn = 8,
+        .checkpoint_lsn = 11,
+        .files = &files,
+    });
+    defer alloc.free(manifest_bytes);
+
+    var manifest_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(manifest_bytes, &manifest_digest, .{});
+    var file_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(body, &file_digest, .{});
+    var aggregate = Sha256.init(.{});
+    aggregate.update(&manifest_digest);
+    aggregateFile(&aggregate, files[0].path, files[0].size_bytes, &file_digest);
+    var aggregate_digest: [Sha256.digest_length]u8 = undefined;
+    aggregate.final(&aggregate_digest);
+    const manifest_hex = try hexAlloc(alloc, &manifest_digest);
+    defer alloc.free(manifest_hex);
+    const file_hex = try hexAlloc(alloc, &file_digest);
+    defer alloc.free(file_hex);
+    const aggregate_hex = try hexAlloc(alloc, &aggregate_digest);
+    defer alloc.free(aggregate_hex);
+    const receipt_files = [_]FileReceipt{.{
+        .path = files[0].path,
+        .size_bytes = files[0].size_bytes,
+        .crc32 = files[0].crc32,
+        .sha256 = file_hex,
+    }};
+    const receipt_json = try std.json.Stringify.valueAlloc(alloc, Receipt{
+        .format_version = 1,
+        .generation = "gen-v1-compat",
+        .slot_name = "standby-a",
+        .cluster_id = testIdentity().cluster_id,
+        .shard_id = testIdentity().shard_id,
+        .table_id = testIdentity().table_id,
+        .timeline_id = testIdentity().timeline_id,
+        .epoch = testIdentity().epoch,
+        .manifest_id = "seed-v1-compat",
+        .backup_lsn = 8,
+        .checkpoint_lsn = 11,
+        .manifest_sha256 = manifest_hex,
+        .aggregate_sha256 = aggregate_hex,
+        .total_bytes = body.len,
+        .files = &receipt_files,
+    }, .{});
+    defer alloc.free(receipt_json);
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-seeds");
+    const store = Store{ .client = &client, .bucket = "ha-seeds" };
+    const file_key = try generationFileKeyAlloc(alloc, store.prefix, "gen-v1-compat", files[0].path);
+    defer alloc.free(file_key);
+    const manifest_key = try generationKeyAlloc(alloc, store.prefix, "gen-v1-compat", manifest_name);
+    defer alloc.free(manifest_key);
+    const complete_key = try generationKeyAlloc(alloc, store.prefix, "gen-v1-compat", complete_name);
+    defer alloc.free(complete_key);
+    try putImmutable(alloc, store, file_key, body, "application/octet-stream");
+    try putImmutable(alloc, store, manifest_key, manifest_bytes, "application/vnd.antfly.ha-manifest");
+    try putImmutable(alloc, store, complete_key, receipt_json, "application/json");
+
+    var restored = try restoreToStaging(alloc, store, .{
+        .expected = .{
+            .generation = "gen-v1-compat",
+            .slot_name = "standby-a",
+            .identity = testIdentity(),
+            .minimum_checkpoint_lsn = 11,
+        },
+        .staging_root = staging_root,
+    });
+    defer restored.deinit(alloc);
+    const restored_path = try std.fs.path.join(alloc, &.{ staging_root, files[0].path });
+    defer alloc.free(restored_path);
+    const restored_body = try readFileAlloc(alloc, restored_path, 64);
+    defer alloc.free(restored_body);
+    try std.testing.expectEqualStrings(body, restored_body);
+}
+
 test "storage.ha seed artifact rejects incomplete stale and cross-cluster generations" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);

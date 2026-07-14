@@ -429,6 +429,30 @@ test "storage.ha backup manifest rejects unsafe paths and invalid wal bounds" {
     }));
 }
 
+test "storage.ha backup manifest accepts only canonical portable relative paths" {
+    for ([_][]const u8{
+        "catalog/manifest",
+        "tables/1/sst-0001",
+        "catalog/file..name",
+    }) |path| try validatePath(path);
+
+    for ([_][]const u8{
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "./catalog",
+        "catalog/./manifest",
+        "catalog/../escape",
+        "catalog//manifest",
+        "catalog/",
+        "catalog\\..\\escape",
+        "catalog\\manifest",
+    }) |path| {
+        try std.testing.expectError(error.InvalidManifestPath, validatePath(path));
+    }
+}
+
 test "storage.ha backup manifest detects body and header corruption" {
     const alloc = std.testing.allocator;
     const files = [_]FileEntry{
