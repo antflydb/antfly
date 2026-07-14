@@ -485,6 +485,129 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
     assert len(png_hashes) == 3
 
 
+def test_artifact_backed_embedding_table_provisions_atomically(
+    stateful_api, openai_embedder
+):
+    """Cross-index artifact dependencies must be valid during create-table."""
+
+    table_name = f"artifact_backed_embedding_create_{time.time_ns()}"
+    created = stateful_api.post(
+        f"/tables/{table_name}",
+        {
+            "num_shards": 1,
+            "indexes": {
+                "document_units": _document_units_index_config(),
+                "document_text": {
+                    "type": "full_text",
+                    "field": "text",
+                    "artifact_name": "document_chunks_v1",
+                    "enrichments": [
+                        {
+                            "name": "document_units_v1",
+                            "kind": "asset",
+                            "field": "url",
+                            "content_type": "application/json",
+                            "producer_json": json.dumps(
+                                _document_units_index_config()["artifact"][
+                                    "producer_json"
+                                ],
+                                separators=(",", ":"),
+                            ),
+                        },
+                        {
+                            "name": "document_chunks_v1",
+                            "kind": "chunk",
+                            "field": "text",
+                            "source_artifact_name": "document_units_v1",
+                            "chunk_size": 256,
+                            "chunk_overlap": 0,
+                        },
+                    ],
+                },
+                "document_vectors": {
+                    "name": "document_vectors",
+                    "type": "embeddings",
+                    "field": "embedding",
+                    "dimension": 3,
+                    "distance_metric": "cosine",
+                    "embedding_name": "document_chunk_dense_v1",
+                    "source_artifact_name": "document_chunks_v1",
+                    "embedder": {
+                        "provider": "openai",
+                        "model": "text-embedding-3-small",
+                        "url": openai_embedder,
+                        "dimensions": 3,
+                    },
+                    "enrichments": [
+                        {
+                            "name": "document_chunk_dense_v1",
+                            "kind": "embedding",
+                            "field": "text",
+                            "source_artifact_name": "document_chunks_v1",
+                            "expected_dims": 3,
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    assert created.get("name") == table_name or created.get("table_name") == table_name
+
+    assert (
+        stateful_api.get_index(table_name, "document_text")["config"]["type"]
+        == "full_text"
+    )
+    assert (
+        stateful_api.get_index(table_name, "document_vectors")["config"]["type"]
+        == "embeddings"
+    )
+
+    doc_key = "atomic-doc"
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={
+            doc_key: {
+                "filename": "atomic.txt",
+                "mime_type": "text/plain",
+                "version": "1",
+                "url": "data:text/plain;base64,YXRvbWljIHF1YWxpZmljYXRpb24gZ2FtbWE=",
+            }
+        },
+        sync_level="full_index",
+    )
+    assert batch["inserted"] == 1
+    assert (
+        wait_until(
+            lambda: _manifest_ready(stateful_api, table_name, doc_key),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+    assert (
+        wait_until(
+            lambda: (
+                response
+                if doc_key
+                in _query_hit_ids(
+                    response := stateful_api.query_table(
+                        table_name,
+                        {
+                            "semantic_search": "atomic qualification",
+                            "indexes": ["document_vectors"],
+                            "limit": 5,
+                        },
+                    )
+                )
+                else None
+            ),
+            timeout_s=120.0,
+            interval_s=1.0,
+        )
+        is not None
+    )
+
+
 def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, openai_embedder):
     table_name = f"artifact_backed_chunk_embeddings_{time.time_ns()}"
     created = stateful_api.create_table(table_name, num_shards=1)

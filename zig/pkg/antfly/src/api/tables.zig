@@ -86,7 +86,9 @@ fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json
                 continue;
             }
             if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
-            if (is_full_text) continue;
+            const artifact_backed_full_text = is_full_text and config == .object and
+                (config.object.contains("artifact_name") or config.object.contains("enrichments"));
+            if (is_full_text and !artifact_backed_full_text) continue;
         }
 
         // Replace the closing brace, append the caller-owned entry, then close
@@ -3751,6 +3753,19 @@ test "create table raw parser merges default full text with quickstart embedding
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"title_body\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"_coverage_incarnation\":") != null);
+}
+
+test "create table raw parser preserves artifact backed full text index" {
+    var parsed = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"document_text\":{\"name\":\"document_text\",\"type\":\"full_text\",\"field\":\"text\",\"artifact_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"document_units_v1\",\"chunk_size\":512}]}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"document_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"artifact_name\":\"document_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"enrichments\"") != null);
 }
 
 test "create table raw parser accepts its canonical full text output" {
