@@ -13,8 +13,13 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fs_paths = @import("../../common/fs_paths.zig");
 const raft_engine = @import("raft_engine");
+
+const TestPersistFailureBoundary = enum {
+    before_publish,
+};
 
 pub const ReplicaBootstrapMode = enum {
     empty,
@@ -266,6 +271,7 @@ pub const FileReplicaCatalog = struct {
     io_impl: std.Io.Threaded,
     path: []const u8,
     records: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+    test_persist_failure_boundary: if (builtin.is_test) ?TestPersistFailureBoundary else void = if (builtin.is_test) null else {},
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
         var self = FileReplicaCatalog{
@@ -451,10 +457,19 @@ pub const FileReplicaCatalog = struct {
             try encoded.appendSlice(self.alloc, line);
         }
 
-        try std.Io.Dir.cwd().writeFile(self.io(), .{
-            .sub_path = self.path,
-            .data = encoded.items,
-        });
+        // Keep the existing in-place persistence behavior visible to the crash
+        // regression below. The production fix must move this failure boundary
+        // to an adjacent, fully-synced temporary file immediately before atomic
+        // rename, leaving the previously published catalog untouched.
+        var file = try std.Io.Dir.cwd().createFile(self.io(), self.path, .{ .truncate = true });
+        defer file.close(self.io());
+        if (builtin.is_test and self.test_persist_failure_boundary == .before_publish) {
+            return error.TestCatalogPersistBeforePublish;
+        }
+        var writer_buffer: [4096]u8 = undefined;
+        var writer = file.writer(self.io(), &writer_buffer);
+        try writer.interface.writeAll(encoded.items);
+        try writer.flush();
     }
 
     fn io(self: *FileReplicaCatalog) std.Io {
@@ -542,6 +557,48 @@ test "file replica catalog persists records across reopen" {
         try std.testing.expectEqual(@as(u64, 7), records[0].snapshot_bootstrap.?.term);
         try std.testing.expectEqualStrings("snap-21", records[0].snapshot_bootstrap.?.snapshot_id);
     }
+}
+
+test "raft.storage file replica catalog crash before atomic publish preserves prior snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-atomic.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    {
+        var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer replica_catalog.deinit();
+        try replica_catalog.catalog().upsertReplica(.{
+            .group_id = 21,
+            .replica_id = 2,
+            .local_node_id = 5,
+            .metadata_version = 1,
+        });
+
+        replica_catalog.test_persist_failure_boundary = .before_publish;
+        try std.testing.expectError(
+            error.TestCatalogPersistBeforePublish,
+            replica_catalog.catalog().upsertReplica(.{
+                .group_id = 22,
+                .replica_id = 3,
+                .local_node_id = 5,
+                .metadata_version = 2,
+            }),
+        );
+    }
+
+    var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer reopened.deinit();
+    const records = try reopened.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+
+    // RED: the current in-place truncate destroys the last good snapshot before
+    // the replacement is durable. Atomic temp+fsync+rename persistence keeps the
+    // group-21 catalog visible and never exposes group 22 after this crash.
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(u64, 21), records[0].group_id);
+    try std.testing.expectEqual(@as(u64, 1), records[0].metadata_version);
 }
 
 test "file replica catalog persists backup restore bootstrap records across reopen" {

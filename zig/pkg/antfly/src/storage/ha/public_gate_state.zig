@@ -129,11 +129,20 @@ pub const State = struct {
     }
 
     pub fn checkWrite(self: *const State, expected_generation: ?u64) !void {
+        return self.checkWriteWithHook(expected_generation, null);
+    }
+
+    fn checkWriteWithHook(
+        self: *const State,
+        expected_generation: ?u64,
+        after_generation_check: ?*const fn (*const State) void,
+    ) !void {
         if (expected_generation) |expected| {
             if (expected != self.currentGeneration()) {
                 return error.HAPromotedStandbyRequiresPrimaryOpen;
             }
         }
+        if (after_generation_check) |hook| hook(self);
 
         const decision = switch (self.currentRole()) {
             .disabled => return,
@@ -217,6 +226,29 @@ test "storage.ha public gate state invalidates pinned standby writes during prom
         state.checkRead(.{ .consistency = .stale_ok }),
     );
     try std.testing.expect(!state.ownerJobsCanRun());
+}
+
+test "storage.ha public gate state rejects a pinned write when promotion changes generation between snapshots" {
+    var state = State{};
+    const pinned_generation = state.currentGeneration();
+
+    const PromotionInterleave = struct {
+        fn afterGenerationCheck(current: *const State) void {
+            // This is the first publication step in State.publishPrimary. Leave
+            // the prior role visible to deterministically exercise the interval
+            // between generation publication and the subsequent role store.
+            _ = @constCast(current).generation.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    // RED: checkWrite currently validates the generation once, observes the old
+    // permissive role after the concurrent increment, and returns success. A
+    // coherent role+generation snapshot (or a validating second generation
+    // load) must reject the stale pinned DB handle.
+    try std.testing.expectError(
+        error.HAPromotedStandbyRequiresPrimaryOpen,
+        state.checkWriteWithHook(pinned_generation, PromotionInterleave.afterGenerationCheck),
+    );
 }
 
 test "storage.ha public gate state never clears an observed primary fence" {
