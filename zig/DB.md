@@ -319,6 +319,28 @@ expected namespace before returning a lease. An idle mismatched owner is
 retired and closed before replacement; an active mismatch blocks the new open
 until its existing lease drains. This prevents a pre-publication destination
 open from becoming the serving writer for a differently namespaced range.
+Every destination bootstrap and catch-up batch carries a typed split replication
+context containing the source group, destination group, and inherited identity
+namespace. The context is encoded in the internal HTTP command and the data-Raft
+entry, validated against the catalog-visible source range on every replica, and
+used for the destination's first physical DB open. It is separate from the final
+checkpoint: write chunks cannot advertise bootstrap completion, while they also
+cannot race an ordinary catalog-derived open before the destination range is
+published. Public batch parsing rejects this internal context.
+
+Placement changes must also make stale leadership self-healing. If a local
+voter still observes a leader that is draining or no longer appears in the
+current serving placement, the lowest-ID serving voter campaigns after the
+placement is reconciled. Internal leader-only routes return a typed unavailable
+response during that handoff. They do not leave survivors honoring a removed
+leader or collapse retryable topology churn into a generic HTTP failure.
+
+Replicated source split lifecycle commands have one state-machine owner: the
+durable data-Raft apply store. They are transition-only entries and are never
+forwarded to the document DB executor. The apply store tracks its own durable
+entry watermark and filters overlapping committed prefixes before producing
+effects, so a Raft applied watermark that temporarily lags another state
+machine cannot apply `prepare` twice while advancing to `start`.
 
 Allocator ownership is part of the same lifetime contract. APIs that return
 owned storage/index buffers accept the allocator that must later free them, or

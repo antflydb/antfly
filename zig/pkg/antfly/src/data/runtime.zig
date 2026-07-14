@@ -335,6 +335,12 @@ const RaftTableApplyStateMachine = struct {
             if (!data_raft_batch.looksLikeEnvelope(entry.data)) continue;
             var decoded = try data_raft_batch.decode(self.alloc, entry.data);
             defer decoded.deinit(self.alloc);
+            // Split lifecycle commands belong exclusively to the durable Raft
+            // apply store. Sending an otherwise empty command through the
+            // document DB can fail on unrelated index/runtime state after the
+            // lifecycle mutation is already durable, leaving Raft replaying a
+            // partially applied command.
+            if (!batchRequiresDocumentDbApply(decoded.batch.req)) continue;
             _ = try self.write_source.applyReplicatedBatchGroupLocal(
                 self.alloc,
                 group_id,
@@ -345,6 +351,10 @@ const RaftTableApplyStateMachine = struct {
         if (last_index > 0) try self.setAppliedIndex(group_id, last_index);
     }
 };
+
+fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
+    return req.split_transition == null;
+}
 
 /// Backs the standalone data server's health/metrics endpoints. Readiness is
 /// local-only so Kubernetes probes cannot block indefinitely behind a wedged
@@ -4473,6 +4483,7 @@ pub const DataServer = struct {
         defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
+        const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
 
         const max_writes_per_batch: usize = 128;
         var offset: usize = 0;
@@ -4483,13 +4494,13 @@ pub const DataServer = struct {
             for (handoff.entries[offset..end], 0..) |entry, i| {
                 writes[i] = .{ .key = entry.key, .value = entry.value };
             }
-            try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, .{
+            try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, replication, .{
                 .writes = writes,
                 .sync_level = .write,
             });
             offset = end;
         }
-        try self.replicateSplitCheckpoint(destination_base_uri, source_group_id, destination_group_id, table_name, handoff.byte_range, handoff.base_delta_sequence);
+        try self.replicateSplitCheckpoint(destination_base_uri, source_group_id, destination_group_id, table_name, replication, handoff.byte_range, handoff.base_delta_sequence);
     }
 
     fn replicateSplitSourceTransition(
@@ -4547,6 +4558,7 @@ pub const DataServer = struct {
         defer self.alloc.free(table_name);
         const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
         defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
+        const replication = try self.splitReplicationContext(source_group_id, destination_group_id);
         const source_seq = try source_store.currentSplitDeltaSequence(self.alloc, source_group_id);
         const source_ack = try self.splitProgressForSource(source_group_id, destination_group_id);
         const after_seq = if (source_ack) |ack| ack else 0;
@@ -4575,14 +4587,14 @@ pub const DataServer = struct {
                 try deletes.append(self.alloc, try decodeSplitDeltaDocumentKeyAlloc(self.alloc, raw_key));
             }
             if (writes.items.len > 0 or deletes.items.len > 0) {
-                try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, .{
+                try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, replication, .{
                     .writes = writes.items,
                     .deletes = deletes.items,
                     .sync_level = .write,
                 });
             }
         }
-        try self.replicateSplitCheckpoint(destination_base_uri, source_group_id, destination_group_id, table_name, .{
+        try self.replicateSplitCheckpoint(destination_base_uri, source_group_id, destination_group_id, table_name, replication, .{
             .start = source_state.split_key,
             .end = source_state.original_range_end,
         }, source_seq);
@@ -4594,10 +4606,11 @@ pub const DataServer = struct {
         source_group_id: u64,
         destination_group_id: u64,
         table_name: []const u8,
+        replication: antfly.db.types.SplitReplicationContext,
         byte_range: antfly.db.types.ByteRange,
         delta_sequence: u64,
     ) !void {
-        try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, .{
+        try self.sendSplitDestinationBatch(destination_base_uri, destination_group_id, table_name, replication, .{
             .sync_level = .write,
             .split_checkpoint = .{
                 .kind = .destination,
@@ -4624,17 +4637,35 @@ pub const DataServer = struct {
         destination_base_uri: []const u8,
         destination_group_id: u64,
         table_name: []const u8,
+        replication: antfly.db.types.SplitReplicationContext,
         req: antfly.db.types.BatchRequest,
     ) !void {
+        if (replication.destination_group_id != destination_group_id) return error.InvalidBatchRequest;
         var executor = antfly.raft.transport.StdHttpExecutor.init(self.alloc, .{});
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(self.alloc, executor.executor());
-        const body = try antfly.public_api.batch.encodeBatchRequest(self.alloc, req);
+        var replicated_req = req;
+        replicated_req.split_replication = replication;
+        const body = try antfly.public_api.batch.encodeBatchRequest(self.alloc, replicated_req);
         defer self.alloc.free(body);
         // Transition work is retried from persisted metadata state. Bound each
         // attempt so a destination election cannot starve metadata Raft ticks.
         var response = try client.fetchGroupBatchWithTimeout(destination_base_uri, destination_group_id, table_name, body, 250);
         response.deinit(self.alloc);
+    }
+
+    fn splitReplicationContext(
+        self: *DataServer,
+        source_group_id: u64,
+        destination_group_id: u64,
+    ) !antfly.db.types.SplitReplicationContext {
+        if (source_group_id == destination_group_id) return error.InvalidBatchRequest;
+        return .{
+            .source_group_id = source_group_id,
+            .destination_group_id = destination_group_id,
+            .identity_namespace = (try self.identityNamespaceForLocalGroup(source_group_id)) orelse
+                return error.MissingIdentityNamespace,
+        };
     }
 
     fn localFinalizeSplitSource(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "finalize_split_source")) !void {
@@ -9195,11 +9226,15 @@ fn drainingLeaderShouldHandoff(
     const leader_node_id = raft_status.soft.leader_id orelse return false;
     if (leader_node_id == local_node_id) return false;
     if (!DataServer.localRaftStatusIsVoter(raft_status, local_node_id)) return false;
-    if (!groupLeaderPlacementIsDraining(placement_intents, local_intent.record.group_id, leader_node_id)) return false;
+    // A leader can disappear from the latest placement snapshot before its
+    // followers observe a clean step-down. Treat both an explicitly draining
+    // leader and an absent leader as stale; otherwise every surviving voter
+    // can wait forever on a node that no longer hosts the group.
+    if (groupLeaderPlacementIsServing(placement_intents, local_intent.record.group_id, leader_node_id)) return false;
     return localNodePreferredServingPeer(placement_intents, local_intent.record.group_id, local_node_id);
 }
 
-fn groupLeaderPlacementIsDraining(
+fn groupLeaderPlacementIsServing(
     placement_intents: []const antfly.raft.PlacementIntent,
     group_id: u64,
     leader_node_id: u64,
@@ -9207,7 +9242,7 @@ fn groupLeaderPlacementIsDraining(
     for (placement_intents) |intent| {
         if (intent.record.group_id == group_id and
             intent.record.local_node_id == leader_node_id and
-            intent.serving_state == .draining)
+            intent.serving_state == .serving)
         {
             return true;
         }
@@ -10291,6 +10326,25 @@ test "data raft draining leader handoff campaigns preferred serving survivor" {
     try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[0], 101));
 }
 
+test "data raft removed leader handoff campaigns preferred serving survivor" {
+    var voters = [_]u64{ 102, 103, 104 };
+    const status = raft_engine.core.Status{
+        .id = 102,
+        .group_id = 7003,
+        .soft = .{ .leader_id = 101, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7003, .replica_id = 1, .local_node_id = 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 7003, .replica_id = 2, .local_node_id = 103 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 7003, .replica_id = 3, .local_node_id = 104 }, .serving_state = .serving },
+    };
+
+    try std.testing.expect(drainingLeaderShouldHandoff(&intents, status, intents[0], 102));
+    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[1], 103));
+}
+
 test "data runtime live writer source follows raft apply ownership" {
     const Catalog = struct {
         fn iface() antfly.public_api.table_catalog.CatalogSource {
@@ -10330,6 +10384,24 @@ test "data runtime live writer source follows raft apply ownership" {
     server.data_raft_apply = &apply_sm;
 
     try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
+}
+
+test "data raft source split lifecycle commands bypass document db apply" {
+    try std.testing.expect(!batchRequiresDocumentDbApply(.{
+        .split_transition = .{
+            .kind = .prepare,
+            .destination_group_id = 7002,
+            .split_key = "doc:m",
+        },
+    }));
+    try std.testing.expect(batchRequiresDocumentDbApply(.{
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .delta_sequence = 1,
+        },
+    }));
 }
 
 test "data server can register a store without enabling data raft" {

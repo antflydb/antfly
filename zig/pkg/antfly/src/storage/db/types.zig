@@ -124,6 +124,15 @@ pub const SplitReplicationCheckpoint = struct {
     delta_sequence: u64,
 };
 
+/// Identity inherited by an unpublished split destination. Every replicated
+/// destination batch carries this context so all replicas create the physical
+/// DB with the same namespace before the destination range is catalog-visible.
+pub const SplitReplicationContext = struct {
+    source_group_id: u64,
+    destination_group_id: u64,
+    identity_namespace: doc_identity_mod.Namespace,
+};
+
 pub const SplitTransitionMutation = struct {
     pub const Kind = enum {
         prepare,
@@ -148,6 +157,8 @@ pub const BatchRequest = struct {
     sync_level: SyncLevel = .write,
     /// Internal data-Raft transition state. Public batch parsing never sets it.
     split_checkpoint: ?SplitReplicationCheckpoint = null,
+    /// Internal identity context for writes to an unpublished split destination.
+    split_replication: ?SplitReplicationContext = null,
     /// Internal source lifecycle mutation. It must be ordered with data writes.
     split_transition: ?SplitTransitionMutation = null,
 };

@@ -287,6 +287,9 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             },
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
+                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
+            },
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             else => return err,
         };
@@ -309,6 +312,9 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         _ = (writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
+                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
+            },
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         const result = batch_req.result();

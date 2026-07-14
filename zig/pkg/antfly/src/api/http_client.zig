@@ -1440,7 +1440,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
+            if (resp.status == 404) return error.UnknownGroup;
             if (resp.status == 503) return error.LeaderUnavailable;
+            const preview = resp.body[0..@min(resp.body.len, 256)];
+            std.log.warn("internal group batch returned unexpected status={} uri={s} body={s}", .{ resp.status, uri, preview });
             return error.UnexpectedHttpStatus;
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2020,6 +2023,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2464,7 +2468,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
-    if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
@@ -2588,6 +2592,7 @@ test "api http client preserves group doc identity conflicts" {
 
     conflict_executor.body = "topology changed";
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
 
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";
