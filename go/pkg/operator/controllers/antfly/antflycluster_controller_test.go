@@ -4346,6 +4346,143 @@ func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials
 	g.Expect(activateJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
 }
 
+func TestBuildHAAdminJobFreezesExactSeedIdentityOnEveryPortableWorkload(t *testing.T) {
+	g := NewWithT(t)
+	digest := strings.Repeat("a", 64)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a",
+				},
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name: "standby-a",
+					SeedArtifact: &antflyv1.HASeedArtifactSpec{
+						Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+						TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+						SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+						TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+					},
+				}},
+			},
+		},
+	}
+	base := antflyv1.HAPlannedActionStatus{
+		Executor: string(haActionExecutorCLIJob), StandbyName: "standby-a", SlotName: "standby-a", TargetLSN: 10,
+		SeedArtifactGeneration: "seed-standby-a-10", TopologyID: "topology-a", TopologyGeneration: 7,
+		TopologyNodeID: "standby-a", SourcePVCName: "primary-data", SourcePVCUID: "source-pvc-uid",
+		TargetPVCName: "standby-data", TargetPVCUID: "target-pvc-uid",
+		AdminCommand: []string{"artifact", "test"},
+	}
+	capture := base
+	capture.Kind = string(haActionCaptureSeedArtifact)
+	capture.Executor = string(haActionExecutorAdminAPI)
+	capture.AdminNodeID = "primary-a"
+	capture.AdminJobName = haAdminDirectAPIName
+	capture.AdminJobPhase = haAdminJobPhaseSucceeded
+	capture.AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1, ActionID: "seed_capture:seed-standby-a-10", ActionKind: "seed_capture",
+		ActionTarget: "seed-standby-a-10", ActionState: "applied", ActionNodeID: "primary-a",
+		SlotName: "standby-a", ManifestID: "manifest-standby-a-10", BackupLSN: 10, CheckpointLSN: 12, EndRecordLSN: 13,
+		SeedArtifactGeneration: "seed-standby-a-10", ManifestSHA256: digest,
+		SeedClusterID: 100, SeedTimelineID: 4, SeedEpoch: 6, SeedSourcePlanSHA256: digest, SeedFileCount: 2,
+		SeedGenerationRoot: "/antflydb/ha/seed-captures/generations/seed-standby-a-10",
+		SeedContentRoot:    "/antflydb/ha/seed-captures/generations/seed-standby-a-10/content",
+		SeedManifestPath:   "/antflydb/ha/seed-captures/generations/seed-standby-a-10/manifest.afha",
+	}
+	// Capture's runtime contract requires manifest ID == immutable generation.
+	capture.AdminResult.ManifestID = capture.SeedArtifactGeneration
+	g.Expect(haAdminActionSucceededWithEvidence(capture)).To(BeTrue(), "the prerequisite fixture must itself satisfy the typed receipt contract")
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{capture}}
+
+	common := map[string]string{
+		"antfly.io/ha-topology-id":          "topology-a",
+		"antfly.io/ha-topology-generation":  "7",
+		"antfly.io/ha-node-id":              "standby-a",
+		"antfly.io/ha-slot-name":            "standby-a",
+		"antfly.io/ha-seed-generation":      "seed-standby-a-10",
+		"antfly.io/ha-seed-manifest-id":     "seed-standby-a-10",
+		"antfly.io/ha-seed-manifest-sha256": digest,
+		"antfly.io/ha-seed-checkpoint-lsn":  "12",
+	}
+	tests := []struct {
+		kind       haActionKind
+		pvcBinding map[string]string
+		role       string
+	}{
+		{kind: haActionPublishSeedArtifact, pvcBinding: map[string]string{
+			"antfly.io/ha-seed-source-pvc-name": "primary-data", "antfly.io/ha-seed-source-pvc-uid": "source-pvc-uid",
+		}},
+		{kind: haActionGCSourceSeedGenerations, pvcBinding: map[string]string{
+			"antfly.io/ha-seed-source-pvc-name": "primary-data", "antfly.io/ha-seed-source-pvc-uid": "source-pvc-uid",
+		}},
+		{kind: haActionRestoreSeedArtifact, role: "restore", pvcBinding: map[string]string{
+			"antfly.io/ha-seed-target-pvc-name": "standby-data", "antfly.io/ha-seed-target-pvc-uid": "target-pvc-uid",
+		}},
+		{kind: haActionActivateSeedArtifact, pvcBinding: map[string]string{
+			"antfly.io/ha-seed-target-pvc-name": "standby-data", "antfly.io/ha-seed-target-pvc-uid": "target-pvc-uid",
+		}},
+		{kind: haActionGCTargetSeedGenerations, pvcBinding: map[string]string{
+			"antfly.io/ha-seed-target-pvc-name": "standby-data", "antfly.io/ha-seed-target-pvc-uid": "target-pvc-uid",
+		}},
+		{kind: haActionPruneSeedArtifacts, pvcBinding: map[string]string{
+			"antfly.io/ha-seed-target-pvc-name": "standby-data", "antfly.io/ha-seed-target-pvc-uid": "target-pvc-uid",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.kind), func(t *testing.T) {
+			g := NewWithT(t)
+			action := base
+			action.Kind = string(tt.kind)
+			expected := maps.Clone(common)
+			maps.Copy(expected, tt.pvcBinding)
+			if tt.role != "" {
+				expected["antfly.io/ha-seed-role"] = tt.role
+			}
+			job := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
+			g.Expect(testHASeedIdentityAnnotations(job.Annotations)).To(Equal(expected))
+			g.Expect(job.Spec.Template.Annotations).To(Equal(expected), "the immutable Job Pod template must carry the same exact identity")
+		})
+	}
+
+	// Before a capture/publish receipt exists, Kubernetes identity can bind the
+	// planned topology and exact PVC incarnation, but it must not fabricate
+	// manifest or checkpoint evidence that has not been observed yet.
+	preReceiptCluster := cluster.DeepCopy()
+	preReceiptCluster.Status.HAStatus = nil
+	preReceipt := base
+	preReceipt.Kind = string(haActionPublishSeedArtifact)
+	preReceiptJob := buildHAAdminJob(preReceiptCluster, &antflyv1.HAAdminSpec{}, preReceipt)
+	g.Expect(preReceiptJob.Spec.Template.Annotations).To(Equal(map[string]string{
+		"antfly.io/ha-topology-id":          "topology-a",
+		"antfly.io/ha-topology-generation":  "7",
+		"antfly.io/ha-node-id":              "standby-a",
+		"antfly.io/ha-slot-name":            "standby-a",
+		"antfly.io/ha-seed-generation":      "seed-standby-a-10",
+		"antfly.io/ha-seed-source-pvc-name": "primary-data",
+		"antfly.io/ha-seed-source-pvc-uid":  "source-pvc-uid",
+	}), "pre-receipt manifest ID/SHA and checkpoint LSN must be omitted, never guessed")
+}
+
+func testHASeedIdentityAnnotations(annotations map[string]string) map[string]string {
+	keys := []string{
+		"antfly.io/ha-topology-id", "antfly.io/ha-topology-generation", "antfly.io/ha-node-id", "antfly.io/ha-slot-name",
+		"antfly.io/ha-seed-generation", "antfly.io/ha-seed-manifest-id", "antfly.io/ha-seed-manifest-sha256",
+		"antfly.io/ha-seed-source-pvc-name", "antfly.io/ha-seed-source-pvc-uid",
+		"antfly.io/ha-seed-target-pvc-name", "antfly.io/ha-seed-target-pvc-uid",
+		"antfly.io/ha-seed-checkpoint-lsn", "antfly.io/ha-seed-role",
+	}
+	result := map[string]string{}
+	for _, key := range keys {
+		if value, ok := annotations[key]; ok {
+			result[key] = value
+		}
+	}
+	return result
+}
+
 func TestHASeedCompletionActionsPlanLifecycleGatedLocalGCBeforeRemotePrune(t *testing.T) {
 	g := NewWithT(t)
 	standby := antflyv1.HAStandbySpec{
@@ -4548,6 +4685,134 @@ func TestHAPortableArtifactJobActionFreezesBothPVCsAndRejectsStaleTopology(t *te
 	reconciler.Client = fake.NewClientBuilder().WithScheme(s).WithObjects(source, replacedTarget).Build()
 	_, _, err = reconciler.haPortableArtifactJobAction(context.Background(), cluster, action)
 	g.Expect(err).To(MatchError(ContainSubstring("target PVC UID is stale")))
+}
+
+func TestReconcileHAAdminJobPersistsExactSourcePVCIdentityAndRejectsReplacement(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec: antflyv1.AntflyClusterSpec{Image: "antfly:test", HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Standbys: []antflyv1.HAStandbySpec{{Name: "standby-a", SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+				TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+				SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			}}},
+		}},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionPublishSeedArtifact), Executor: string(haActionExecutorCLIJob),
+		StandbyName: "standby-a", SlotName: "standby-a", TargetLSN: 10,
+		SeedArtifactGeneration: "seed-standby-a-10", TopologyID: "topology-a", TopologyGeneration: 7,
+		TopologyNodeID: "standby-a", TargetPVCName: "standby-data", TargetPVCUID: "target-pvc-uid",
+		AdminCommand: []string{"artifact", "publish", "--location", "s3://ha-seeds/cluster-a"},
+	}
+	source := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary-data", Namespace: "default", UID: types.UID("source-pvc-uid")},
+		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
+	}
+	target := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "standby-data", Namespace: "default", UID: types.UID("target-pvc-uid")},
+		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
+	}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(source, target).Build(), Scheme: s}
+	g.Expect(reconciler.reconcileHAAdminJob(context.Background(), cluster, &antflyv1.HAAdminSpec{}, &action)).To(Succeed())
+	g.Expect(action.SourcePVCName).To(Equal("primary-data"))
+	g.Expect(action.SourcePVCUID).To(Equal("source-pvc-uid"))
+	g.Expect(action.AdminJobName).To(Equal(haAdminJobName(cluster, action)), "the durable action and deterministic Job hash must freeze the same PVC incarnation")
+	created := &batchv1.Job{}
+	g.Expect(reconciler.Get(context.Background(), types.NamespacedName{Name: action.AdminJobName, Namespace: cluster.Namespace}, created)).To(Succeed())
+	g.Expect(created.Annotations).To(HaveKeyWithValue("antfly.io/ha-seed-source-pvc-uid", "source-pvc-uid"))
+
+	for name, stale := range map[string]antflyv1.HAPlannedActionStatus{
+		"name": func() antflyv1.HAPlannedActionStatus {
+			copy := action
+			copy.SourcePVCName = "replaced-primary-data"
+			return copy
+		}(),
+		"uid": func() antflyv1.HAPlannedActionStatus {
+			copy := action
+			copy.SourcePVCUID = "replaced-source-pvc-uid"
+			return copy
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			_, _, err := reconciler.haPortableArtifactJobAction(context.Background(), cluster, stale)
+			g.Expect(err).To(MatchError(ContainSubstring("source PVC identity is stale")))
+		})
+	}
+}
+
+func TestReconcileHAAdminJobRejectsMutablePortableSeedIdentity(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	baseCluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec: antflyv1.AntflyClusterSpec{Image: "antfly:test", HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Identity: &antflyv1.HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a"},
+			Standbys: []antflyv1.HAStandbySpec{{Name: "standby-a", SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+				TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+				TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			}}},
+		}},
+	}
+	baseAction := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionRestoreSeedArtifact), Executor: string(haActionExecutorCLIJob),
+		StandbyName: "standby-a", SlotName: "standby-a", TargetLSN: 10,
+		SeedArtifactGeneration: "seed-standby-a-10", TopologyID: "topology-a", TopologyGeneration: 7,
+		TopologyNodeID: "standby-a", TargetPVCName: "standby-data", TargetPVCUID: "target-pvc-uid",
+		AdminCommand: []string{"artifact", "restore", "--location", "s3://ha-seeds/cluster-a"},
+	}
+	publish := baseAction
+	publish.Kind = string(haActionPublishSeedArtifact)
+	publish.AdminJobPhase = haAdminJobPhaseSucceeded
+	publish.SeedArtifactReceipt = &antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion: 3, Generation: baseAction.SeedArtifactGeneration, SlotName: baseAction.SlotName,
+		ClusterID: 100, TimelineID: 4, Epoch: 6, ManifestID: "manifest-standby-a-10",
+		BackupLSN: 10, CheckpointLSN: 12, ManifestSHA256: digest, AggregateSHA256: strings.Repeat("b", 64),
+		TotalBytes: 42, FileCount: 1, TopologyID: baseAction.TopologyID, TopologyGeneration: baseAction.TopologyGeneration,
+		NodeID: baseAction.TopologyNodeID, TargetPVCName: baseAction.TargetPVCName, TargetPVCUID: baseAction.TargetPVCUID,
+	}
+	baseCluster.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{publish, baseAction}}
+
+	mutations := map[string]func(*batchv1.Job){
+		"job annotation": func(job *batchv1.Job) {
+			job.Annotations["antfly.io/ha-seed-target-pvc-uid"] = "stale-target-pvc-uid"
+		},
+		"pod template annotation": func(job *batchv1.Job) {
+			if job.Spec.Template.Annotations == nil {
+				job.Spec.Template.Annotations = map[string]string{}
+			}
+			job.Spec.Template.Annotations["antfly.io/ha-seed-manifest-sha256"] = strings.Repeat("c", 64)
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			s := runtime.NewScheme()
+			g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+			g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+			g.Expect(corev1.AddToScheme(s)).To(Succeed())
+			cluster := baseCluster.DeepCopy()
+			action := baseAction
+			existing := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
+			existing.UID = types.UID("existing-job-uid")
+			g.Expect(controllerutil.SetControllerReference(cluster, existing, s)).To(Succeed())
+			mutate(existing)
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "standby-data", Namespace: "default", UID: types.UID("target-pvc-uid")},
+				Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
+			}
+			reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(existing, pvc).Build(), Scheme: s}
+			err := reconciler.reconcileHAAdminJob(context.Background(), cluster, &antflyv1.HAAdminSpec{}, &action)
+			g.Expect(err).To(MatchError(ContainSubstring("immutable seed identity annotations")))
+		})
+	}
 }
 
 func TestPortableArtifactJobFollowsLiveRWOConsumerPod(t *testing.T) {
@@ -12239,19 +12504,39 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
 
 	digest := strings.Repeat("a", 64)
-	cluster.Status.HAStatus = &antflyv1.HAStatus{StartupGate: &antflyv1.HAStartupGateStatus{
-		RuntimeEligible: true,
-		ActivationReceipt: &antflyv1.HASeedActivationReceiptStatus{
-			TopologyID: "test-standalone", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
-			Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
-			ManifestSHA256: digest, AggregateSHA256: strings.Repeat("b", 64), SeedReceiptSHA256: strings.Repeat("c", 64),
-			GenerationPath: "generations/prod-standby-a-10",
-		},
-	}}
+	// Decode through the API so the test also proves manifestID is a durable
+	// status field rather than an in-memory inference from the generation name.
+	observedStatus := &antflyv1.HAStatus{}
+	g.Expect(json.Unmarshal([]byte(fmt.Sprintf(`{
+		"startupGate": {
+			"runtimeEligible": true,
+			"activationReceipt": {
+				"topologyID": "test-standalone", "topologyGeneration": 3,
+				"nodeID": "standby-a", "slotName": "standby-a", "generation": "prod-standby-a-10",
+				"manifestID": "manifest-standby-a-10", "targetPVCName": "standby-a-data", "targetPVCUID": "pvc-uid-1",
+				"checkpointLSN": 12, "manifestSHA256": %q, "aggregateSHA256": %q, "seedReceiptSHA256": %q,
+				"generationPath": "generations/prod-standby-a-10"
+			}
+		}
+	}`, digest, strings.Repeat("b", 64), strings.Repeat("c", 64))), observedStatus)).To(Succeed())
+	cluster.Status.HAStatus = observedStatus
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 	g.Expect(sts.Spec.Template.Annotations).To(HaveKey("antfly.io/ha-startup-receipt-hash"))
+	g.Expect(testHASeedIdentityAnnotations(sts.Spec.Template.Annotations)).To(Equal(map[string]string{
+		"antfly.io/ha-seed-role":            "standby-runtime",
+		"antfly.io/ha-topology-id":          "test-standalone",
+		"antfly.io/ha-topology-generation":  "3",
+		"antfly.io/ha-node-id":              "standby-a",
+		"antfly.io/ha-slot-name":            "standby-a",
+		"antfly.io/ha-seed-generation":      "prod-standby-a-10",
+		"antfly.io/ha-seed-manifest-id":     "manifest-standby-a-10",
+		"antfly.io/ha-seed-manifest-sha256": digest,
+		"antfly.io/ha-seed-target-pvc-name": "standby-a-data",
+		"antfly.io/ha-seed-target-pvc-uid":  "pvc-uid-1",
+		"antfly.io/ha-seed-checkpoint-lsn":  "12",
+	}), "every runtime Pod incarnation must inherit the exact activated seed authority")
 	container := sts.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Env).To(ContainElement(haPodUIDEnv()[0]))
 	runtimeArgs := container.Args[0]
