@@ -56,7 +56,10 @@ pub const ListOptions = struct {
     prefix: []const u8 = "",
     recursive: bool = true,
     delimiter: []const u8 = "/",
+    /// Exclusive lexicographic lower bound. Providers with an inclusive native
+    /// primitive (notably GCS `startOffset`) must normalize their first page.
     start_after: ?[]const u8 = null,
+    /// Opaque provider cursor. Mutually exclusive with `start_after`.
     continuation_token: ?[]const u8 = null,
     max_keys: u32 = 1000,
 };

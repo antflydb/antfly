@@ -1046,7 +1046,9 @@ pub const Server = struct {
 
     fn execute(ptr: *anyopaque, _: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *Server = @ptrCast(@alignCast(ptr));
-        return try self.handle(req);
+        var response = try self.handle(req);
+        if (response.owner_allocator == null) response.owner_allocator = self.alloc;
+        return response;
     }
 
     fn ready(self: *const Server) bool {
@@ -3556,12 +3558,17 @@ test "storage.ha http admin implemented admin routes are documented" {
 }
 
 test "storage.ha http admin exposes request executor" {
-    const alloc = std.testing.allocator;
-    var server = Server.init(alloc, .{});
+    var owner_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(owner_gpa.deinit() == .ok);
+    var caller_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(caller_gpa.deinit() == .ok);
+
+    var server = Server.init(owner_gpa.allocator(), .{});
     defer server.deinit();
     const executor = server.executor();
-    var health = try executor.execute(alloc, .{ .method = .GET, .uri = Routes.health });
-    defer health.deinit(alloc);
+    var health = try executor.execute(caller_gpa.allocator(), .{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(caller_gpa.allocator());
+    try std.testing.expect(health.owner_allocator != null);
     try std.testing.expectEqual(@as(u16, 200), health.status);
 }
 

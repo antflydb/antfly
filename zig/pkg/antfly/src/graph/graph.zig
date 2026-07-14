@@ -1772,9 +1772,13 @@ test "graph reverse backend adapters expose txn cursor and batch operations" {
         var txn = try graph.beginWriteReverseTxn();
         errdefer txn.abort();
         try txn.put("k1", "v1");
-        var cur = try txn.openCursor();
-        defer cur.close();
-        try std.testing.expectEqualStrings("k1", (try cur.start(.{})).?.key);
+        {
+            // Cursors must close before commit: committing with an open
+            // cursor fails closed with error.TransactionCursorActive.
+            var cur = try txn.openCursor();
+            defer cur.close();
+            try std.testing.expectEqualStrings("k1", (try cur.start(.{})).?.key);
+        }
         try txn.commit();
     }
 

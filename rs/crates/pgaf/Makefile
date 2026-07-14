@@ -24,8 +24,8 @@ test-e2e: start-antfly
 	exit $$status
 
 start-antfly:
-	@echo "Starting Antfly swarm..."
-	@cd $(ANTFLY_DIR) && GOEXPERIMENT=simd go run ./go/pkg/antfly/cmd swarm > /tmp/antfly-test.log 2>&1 &
+	@echo "Starting Antfly standalone..."
+	@cd $(ANTFLY_DIR) && GOEXPERIMENT=simd go run ./go/pkg/antfly/cmd standalone > /tmp/antfly-test.log 2>&1 &
 	@echo "Waiting for Antfly to be ready..."
 	@for i in $$(seq 1 30); do \
 		curl -sf http://localhost:4200/healthz > /dev/null 2>&1 && { echo "Antfly is ready."; break; }; \
@@ -34,4 +34,4 @@ start-antfly:
 
 stop-antfly:
 	@echo "Stopping Antfly..."
-	@-pkill -f "antfly swarm" 2>/dev/null || true
+	@-pkill -f "antfly standalone" 2>/dev/null || true

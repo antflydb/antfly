@@ -485,7 +485,7 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
         timeout_s=30.0,
         interval_s=0.5,
     )
-    assert ready is not None
+    assert ready is not None, json.dumps(stateful_api.get_index(table_name, index_name), indent=2, sort_keys=True)
 
     result = wait_until(
         lambda: (

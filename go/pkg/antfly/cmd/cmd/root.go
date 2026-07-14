@@ -43,7 +43,7 @@ var rootCmd = &cobra.Command{
 
 - store: Run as a data storage node (default)
 - metadata: Run as a metadata server to manage cluster metadata
-- swarm: Run as both metadata and raft services
+- standalone: Run as both metadata and raft services
 - inference: Run the inference runtime
 
 Each mode has its own set of configuration options. Use 'antfly [mode] --help' for mode-specific options.`,

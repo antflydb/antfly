@@ -68,6 +68,10 @@ pub fn finalizeRestoredLiteDb(allocator: Allocator, db: *db_mod.DB) !void {
 pub fn importPortableIntoLiteDb(allocator: Allocator, db: *db_mod.DB, backup: []const u8) !void {
     try portable_backup.validatePortable(allocator, backup);
     try portable_backup.importPortable(allocator, db.core.store, backup);
+    // Portable archives carry source identity rows for consistency checks,
+    // but the restore target owns its namespace. Rebuild canonical mappings
+    // before indexes or queries can observe the imported documents.
+    try db.reassignIdentityNamespaceForInternalTransition(connection.embeddedRootIdentity());
     try finalizeRestoredLiteDb(allocator, db);
 }
 
@@ -1022,7 +1026,6 @@ test "lite portable backup roundtrips through normal table backup APIs" {
         .backup_root = backup_root,
         .manifest = &lite_manifest,
     });
-    try normal_db.core.loadIndexes();
     _ = try normal_db.rebuildDenseIndexesForTargetCoverage(allocator);
     _ = try normal_db.rebuildSparseIndexesForTargetCoverage(allocator);
     try normal_db.rebuildGraphIndexesForTargetCoverage(allocator);

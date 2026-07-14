@@ -170,7 +170,7 @@ Antfly should emit ARD-compatible `ai-catalog.json`:
 
 Host identity should be configurable. For hosted Colony deployments, the host identity should be tenant/deployment aware. For local dev, a domain identity may be absent.
 
-Antfly exposes host identity through API server config and the data/swarm runtime flags:
+Antfly exposes host identity through API server config and the data/standalone runtime flags:
 
 ```text
 --ard-base-url <url>

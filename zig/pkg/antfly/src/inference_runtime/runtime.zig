@@ -317,52 +317,103 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
 }
 
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
-    const ref = args.next() orelse {
-        std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
-        std.debug.print("       antfly inference pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{});
-        std.debug.print("       antfly inference pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
-        std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
-        std.debug.print("CLIP/CLAP v0.2 example: antfly inference pull antflydb/clipclap:gguf:Q4_K\n", .{});
-        return;
-    };
-
     var argv = std.ArrayListUnmanaged([]const u8).empty;
     defer argv.deinit(alloc);
-    try argv.append(alloc, ref);
     while (args.next()) |arg| try argv.append(alloc, arg);
-
-    if (inference.tabular.cli.isHttpUrl(ref) or isPredictorPull(argv.items)) {
-        return try inference.tabular.cli.pullMain(alloc, io, argv.items, defaultMlDir(alloc));
+    if (argv.items.len == 0) {
+        printPullUsage();
+        return;
     }
 
+    var refs = std.ArrayListUnmanaged([]const u8).empty;
+    defer refs.deinit(alloc);
+    var passthrough = std.ArrayListUnmanaged([]const u8).empty;
+    defer passthrough.deinit(alloc);
+    var variants_csv: ?[]const u8 = null;
     var token: ?[]const u8 = null;
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
     var projector_selection: inference.registry.download.ProjectorSelection = .auto;
-    var i: usize = 1;
+    var predictor_pull = false;
+    var first_ai_only_flag: ?[]const u8 = null;
+    var first_predictor_only_flag: ?[]const u8 = null;
+
+    var i: usize = 0;
     while (i < argv.items.len) : (i += 1) {
         const arg = argv.items[i];
-        if (std.mem.eql(u8, arg, "--token")) {
-            i += 1;
-            if (i < argv.items.len) token = argv.items[i];
-        } else if (std.mem.eql(u8, arg, "--models-dir")) {
-            i += 1;
-            if (i < argv.items.len) models_dir = argv.items[i];
-        } else if (std.mem.eql(u8, arg, "--ml-dir")) {
-            // ML storage is only meaningful for URL predictor pulls.
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--tasks")) {
-            i += 1;
-            if (i < argv.items.len) tasks_csv = argv.items[i];
-        } else if (std.mem.eql(u8, arg, "--capabilities")) {
-            i += 1;
-            if (i < argv.items.len) capabilities_csv = argv.items[i];
-        } else if (std.mem.eql(u8, arg, "--projector")) {
-            i += 1;
-            const value = if (i < argv.items.len) argv.items[i] else return error.InvalidArguments;
-            projector_selection = inference.registry.download.parseProjectorSelection(value) orelse return error.InvalidArguments;
+        if (isHelpArg(arg)) {
+            printPullUsage();
+            return;
         }
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            try refs.append(alloc, arg);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--optimize")) {
+            if (first_predictor_only_flag == null) first_predictor_only_flag = arg;
+            try passthrough.append(alloc, arg);
+            continue;
+        }
+        if (!pullFlagTakesValue(arg)) {
+            std.debug.print("unknown inference pull flag: {s}\n", .{arg});
+            printPullUsage();
+            return error.InvalidArguments;
+        }
+        i += 1;
+        if (i >= argv.items.len) {
+            std.debug.print("{s} requires a value\n", .{arg});
+            printPullUsage();
+            return error.InvalidArguments;
+        }
+        const value = argv.items[i];
+        switch (pullFlagDomain(arg)) {
+            .shared => {},
+            .ai => if (first_ai_only_flag == null) {
+                first_ai_only_flag = arg;
+            },
+            .predictor => if (first_predictor_only_flag == null) {
+                first_predictor_only_flag = arg;
+            },
+        }
+        if (std.mem.eql(u8, arg, "--variants")) {
+            variants_csv = value;
+        } else if (std.mem.eql(u8, arg, "--token")) {
+            token = value;
+            try passthrough.appendSlice(alloc, &.{ arg, value });
+        } else if (std.mem.eql(u8, arg, "--models-dir")) {
+            models_dir = value;
+        } else if (std.mem.eql(u8, arg, "--tasks")) {
+            tasks_csv = value;
+        } else if (std.mem.eql(u8, arg, "--capabilities")) {
+            capabilities_csv = value;
+        } else if (std.mem.eql(u8, arg, "--projector")) {
+            projector_selection = inference.registry.download.parseProjectorSelection(value) orelse return error.InvalidArguments;
+        } else {
+            if (std.mem.eql(u8, arg, "--type") and (std.mem.eql(u8, value, "predictor") or std.mem.eql(u8, value, "predictors"))) predictor_pull = true;
+            try passthrough.appendSlice(alloc, &.{ arg, value });
+        }
+    }
+
+    if (refs.items.len == 0) {
+        std.debug.print("inference pull requires at least one model reference\n", .{});
+        printPullUsage();
+        return error.InvalidArguments;
+    }
+
+    const predictor_mode = inference.tabular.cli.isHttpUrl(refs.items[0]) or predictor_pull;
+    validatePullFlagDomains(predictor_mode, first_ai_only_flag, first_predictor_only_flag) catch |err| {
+        printPullUsage();
+        return err;
+    };
+
+    if (predictor_mode) {
+        if (refs.items.len != 1) return error.InvalidArguments;
+        var normalized = std.ArrayListUnmanaged([]const u8).empty;
+        defer normalized.deinit(alloc);
+        try normalized.append(alloc, refs.items[0]);
+        try normalized.appendSlice(alloc, passthrough.items);
+        return try inference.tabular.cli.pullMain(alloc, io, normalized.items, defaultMlDir(alloc));
     }
 
     // Also check HF_TOKEN env var
@@ -370,24 +421,89 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         token = platform.env.getenv("HF_TOKEN");
     }
 
-    std.debug.print("pulling {s}...\n", .{ref});
-
     var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
-    try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
+    for (refs.items) |ref| {
+        if (variants_csv) |raw_variants| {
+            var variants = std.mem.splitScalar(u8, raw_variants, ',');
+            var pulled_any = false;
+            while (variants.next()) |raw_variant| {
+                const variant = std.mem.trim(u8, raw_variant, " \t\r\n");
+                if (variant.len == 0) continue;
+                pulled_any = true;
+                const qualified_ref = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ ref, variant });
+                defer alloc.free(qualified_ref);
+                try pullOneModel(&reg, io, qualified_ref, token, tasks_csv, capabilities_csv, projector_selection);
+            }
+            if (!pulled_any) return error.InvalidArguments;
+        } else {
+            try pullOneModel(&reg, io, ref, token, tasks_csv, capabilities_csv, projector_selection);
+        }
+    }
+}
 
+fn pullOneModel(
+    registry: *inference.registry.ModelRegistry,
+    io: std.Io,
+    ref: []const u8,
+    token: ?[]const u8,
+    tasks_csv: ?[]const u8,
+    capabilities_csv: ?[]const u8,
+    projector_selection: inference.registry.download.ProjectorSelection,
+) !void {
+    std.debug.print("pulling {s}...\n", .{ref});
+    try registry.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
     std.debug.print("done.\n", .{});
 }
 
-fn isPredictorPull(args: []const []const u8) bool {
-    if (args.len == 0 or !inference.tabular.cli.isHuggingFaceRef(args[0])) return false;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--type") and i + 1 < args.len) {
-            return std.mem.eql(u8, args[i + 1], "predictor") or std.mem.eql(u8, args[i + 1], "predictors");
-        }
-    }
+fn pullFlagTakesValue(arg: []const u8) bool {
+    const flags = [_][]const u8{
+        "--variants", "--token", "--models-dir", "--ml-dir",    "--tasks",               "--capabilities", "--projector",
+        "--type",     "--name",  "--file",       "--framework", "--dead-leaf-threshold",
+    };
+    for (flags) |flag| if (std.mem.eql(u8, arg, flag)) return true;
     return false;
+}
+
+const PullFlagDomain = enum { shared, ai, predictor };
+
+fn pullFlagDomain(arg: []const u8) PullFlagDomain {
+    if (std.mem.eql(u8, arg, "--token")) return .shared;
+    const ai_flags = [_][]const u8{
+        "--variants", "--models-dir", "--tasks", "--capabilities", "--projector",
+    };
+    for (ai_flags) |flag| if (std.mem.eql(u8, arg, flag)) return .ai;
+    return .predictor;
+}
+
+fn validatePullFlagDomains(
+    predictor_mode: bool,
+    first_ai_only_flag: ?[]const u8,
+    first_predictor_only_flag: ?[]const u8,
+) !void {
+    if (predictor_mode) {
+        if (first_ai_only_flag) |flag| {
+            std.debug.print("unexpected arg '{s}': only valid for AI model pulls; use --ml-dir for predictor storage\n", .{flag});
+            return error.InvalidArguments;
+        }
+        return;
+    }
+    if (first_predictor_only_flag) |flag| {
+        std.debug.print("unexpected arg '{s}': only valid for predictor pulls; use --type predictor or an HTTP URL\n", .{flag});
+        return error.InvalidArguments;
+    }
+}
+
+fn isHelpArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help");
+}
+
+fn printPullUsage() void {
+    std.debug.print("usage: antfly inference pull [--variants <csv>] <model-ref>... [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
+    std.debug.print("       antfly inference pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{});
+    std.debug.print("       antfly inference pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
+    std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
+    std.debug.print("CLIP/CLAP v0.2 example: antfly inference pull antflydb/clipclap:gguf:Q4_K\n", .{});
 }
 
 fn collectArgs(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) ![]const []const u8 {
@@ -478,6 +594,31 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference pull recognizes help before model resolution" {
+    try std.testing.expect(isHelpArg("--help"));
+    try std.testing.expect(isHelpArg("-h"));
+    try std.testing.expect(isHelpArg("help"));
+    try std.testing.expect(!isHelpArg("antflydb/clipclap"));
+}
+
+test "inference pull classifies order independent value flags" {
+    try std.testing.expect(pullFlagTakesValue("--variants"));
+    try std.testing.expect(pullFlagTakesValue("--models-dir"));
+    try std.testing.expect(pullFlagTakesValue("--framework"));
+    try std.testing.expect(!pullFlagTakesValue("--optimize"));
+    try std.testing.expect(!pullFlagTakesValue("--unknown"));
+    try std.testing.expectEqual(PullFlagDomain.ai, pullFlagDomain("--models-dir"));
+    try std.testing.expectEqual(PullFlagDomain.predictor, pullFlagDomain("--ml-dir"));
+    try std.testing.expectEqual(PullFlagDomain.shared, pullFlagDomain("--token"));
+}
+
+test "inference pull rejects flags from the other model domain" {
+    try std.testing.expectError(error.InvalidArguments, validatePullFlagDomains(true, "--models-dir", null));
+    try std.testing.expectError(error.InvalidArguments, validatePullFlagDomains(false, null, "--ml-dir"));
+    try validatePullFlagDomains(true, null, "--ml-dir");
+    try validatePullFlagDomains(false, "--models-dir", null);
 }
 
 test "parseBackendType accepts warm generator backends" {

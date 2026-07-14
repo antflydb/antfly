@@ -30,6 +30,8 @@ const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 const common_secrets = @import("../common/secrets.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
+const backups_api = @import("backups.zig");
+const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
@@ -103,7 +105,7 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    fn respondWithAllocator(ctx: *httpx.Context, resp: *http_common.HttpResponse, alloc: std.mem.Allocator) !httpx.Response {
+    pub fn respondWithAllocator(ctx: *httpx.Context, resp: *http_common.HttpResponse, alloc: std.mem.Allocator) !httpx.Response {
         defer resp.deinit(alloc);
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
@@ -358,7 +360,8 @@ pub const AntflyApiHandler = struct {
         var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
-        public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        public_status.deployment_mode = self.api_server.cfg.deployment_mode;
+        public_status.storage = self.api_server.currentStorageRuntimeStatus();
         if (self.api_server.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -377,7 +380,8 @@ pub const AntflyApiHandler = struct {
         var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
         defer public_status.deinit(alloc);
         public_status.auth_enabled = self.api_server.cfg.auth_enabled;
-        public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        public_status.deployment_mode = self.api_server.cfg.deployment_mode;
+        public_status.storage = self.api_server.currentStorageRuntimeStatus();
         if (self.api_server.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
@@ -899,8 +903,7 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
-        const alloc = self.api_server.alloc;
-        const info = (self.api_server.txn_sessions.createSavepoint(alloc, txn_id) catch |err| switch (err) {
+        const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, txn_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -941,8 +944,7 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
-        const alloc = self.api_server.alloc;
-        const info = (self.api_server.txn_sessions.rollbackToSavepoint(alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
+        const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -1154,8 +1156,7 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
-        const alloc = self.api_server.alloc;
-        if (!self.api_server.txn_sessions.remove(alloc, txn_id)) {
+        if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
@@ -1170,7 +1171,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store);
+        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -1179,15 +1180,79 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try cluster_api_http.handleClusterRestore(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store);
-        return respondOwnedApiResponse(ctx, &resp);
+        var resp = try self.api_server.handlePublicClusterRestore(
+            body_data,
+            ctx.header("idempotency-key"),
+            if (authenticated_identity) |identity| identity.username else null,
+        );
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn getRestoreJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id_raw: []const u8) !httpx.Response {
+        return try self.restoreJob(ctx, job_id_raw, false);
+    }
+
+    pub fn cancelRestoreJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id_raw: []const u8) !httpx.Response {
+        return try self.restoreJob(ctx, job_id_raw, true);
+    }
+
+    pub fn listRestoreJobs(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListRestoreJobsParams) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const limit = if (params.limit) |value|
+            std.fmt.parseInt(usize, value, 10) catch return try textResponse(ctx, 400, "invalid restore job list limit")
+        else
+            50;
+        if (limit == 0 or limit > 100) return try textResponse(ctx, 400, "invalid restore job list limit");
+        const cursor = if (params.cursor) |value| blk: {
+            const parsed = std.fmt.parseUnsigned(u64, value, 10) catch return try textResponse(ctx, 400, "invalid restore job list cursor");
+            if (parsed == 0) return try textResponse(ctx, 400, "invalid restore job list cursor");
+            break :blk parsed;
+        } else null;
+        const phase = if (params.phase) |value|
+            std.meta.stringToEnum(restore_jobs.Phase, value) orelse return try textResponse(ctx, 400, "invalid restore job list phase")
+        else
+            null;
+        const scope = if (params.scope) |value|
+            std.meta.stringToEnum(restore_jobs.Scope, value) orelse return try textResponse(ctx, 400, "invalid restore job list scope")
+        else
+            null;
+        var resp = try self.api_server.handlePublicListRestoreJobs(authenticated_identity, .{
+            .limit = limit,
+            .cursor = cursor,
+            .phase = phase,
+            .scope = scope,
+        });
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    fn restoreJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id_raw: []const u8, cancel: bool) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch return try textResponse(ctx, 400, "invalid job id");
+        if (authenticated_identity) |identity| {
+            if (!(try self.api_server.restoreJobAllowed(ctx.allocator, identity, job_id))) return try textResponse(ctx, 404, "not found");
+        }
+        var resp = try self.api_server.handlePublicRestoreJob(job_id, cancel);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn listBackups(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListBackupsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, self.api_server.clusterApi());
+        const limit = if (params.limit) |value|
+            std.fmt.parseInt(usize, value, 10) catch return try textResponse(ctx, 400, "invalid backup list limit")
+        else
+            backups_api.default_backup_list_limit;
+        if (limit == 0 or limit > backups_api.max_backup_list_limit) return try textResponse(ctx, 400, "invalid backup list limit");
+        if (params.cursor) |cursor| backups_api.validateBackupId(cursor) catch return try textResponse(ctx, 400, "invalid backup list cursor");
+        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo(), .{
+            .limit = limit,
+            .cursor = params.cursor,
+        });
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -1514,7 +1579,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("unsupported table pattern");
         }
-        const storage_statuses = try self.api_server.collectTableStorageStatuses(&snapshot, params.prefix);
+        const storage_statuses = try self.api_server.collectTableStorageStatuses(alloc, &snapshot, params.prefix);
         defer if (storage_statuses) |items| alloc.free(items);
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
@@ -1598,6 +1663,14 @@ pub const AntflyApiHandler = struct {
         const metadata_create_start_ns = platform_time.monotonicNs();
         while (true) {
             self.api_server.source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
+                error.TableAlreadyExists => {
+                    _ = ctx.status(409);
+                    return ctx.text("table already exists");
+                },
+                error.InvalidCreateTableRequest => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid table configuration");
+                },
                 error.UnsupportedOperation => {
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
@@ -1837,7 +1910,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableBackup(ctx.allocator, decoded_table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store);
+        var resp = try public_table_http.handleTableBackup(ctx.allocator, decoded_table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -1848,8 +1921,13 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableRestore(ctx.allocator, decoded_table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store);
-        return respondOwnedApiResponse(ctx, &resp);
+        var resp = try self.api_server.handlePublicTableRestore(
+            decoded_table_name,
+            body_data,
+            ctx.header("idempotency-key"),
+            if (authenticated_identity) |identity| identity.username else null,
+        );
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -1870,7 +1948,7 @@ pub const AntflyApiHandler = struct {
         };
         defer alloc.free(schema_json);
 
-        const table_before = try self.api_server.loadOwnedTableRecord(decoded_table_name);
+        const table_before = try self.api_server.loadOwnedTableRecord(alloc, decoded_table_name);
         if (table_before == null) {
             self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => {
@@ -1996,7 +2074,7 @@ pub const AntflyApiHandler = struct {
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
-            const filtered = try self.api_server.filterScanResultByRowFilter(source, decoded_table_name, result.ndjson, value);
+            const filtered = try self.api_server.filterScanResultByRowFilter(alloc, source, decoded_table_name, result.ndjson, value);
             defer alloc.free(filtered);
             try ctx.setHeader("content-type", "application/x-ndjson");
             _ = ctx.response.body(filtered);
@@ -3322,7 +3400,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     var source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
-        .swarm_mode = true,
+        .deployment_mode = .standalone,
         .secret_store = &secret_store,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
@@ -3360,6 +3438,28 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     try std.testing.expectEqual(@as(u16, 403), forbidden.status.code);
     try std.testing.expectEqualStrings("text/plain", forbidden.contentType().?);
     try std.testing.expectEqualStrings("forbidden", forbidden.body.?);
+
+    const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/batch", .{base_url});
+    defer alloc.free(batch_url);
+    const batch_headers = [_][2][]const u8{
+        .{ "authorization", reader_auth },
+        .{ "content-type", "application/json" },
+    };
+    for (0..100) |_| {
+        var denied_batch = try requestWithRetry(
+            &client,
+            client_io.io(),
+            .POST,
+            batch_url,
+            "{\"inserts\":{\"doc-2\":{\"title\":\"blocked\"}}}",
+            &batch_headers,
+            20,
+        );
+        defer denied_batch.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied_batch.status.code);
+        try std.testing.expectEqualStrings("text/plain", denied_batch.contentType().?);
+        try std.testing.expectEqualStrings("forbidden", denied_batch.body.?);
+    }
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);

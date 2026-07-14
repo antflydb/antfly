@@ -226,6 +226,7 @@ const GenerateBackendSelection = struct {
     compiled_partition_backend: ?ops.BackendKind = null,
     compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = .partitioned,
     graph_mode_requested: bool = false,
+    eager_mode_requested: bool = false,
 };
 
 fn parseGenerateBackendSelection(
@@ -239,8 +240,12 @@ fn parseGenerateBackendSelection(
         native_backend_choice.Choice.auto;
     try native_backend_choice.validate(choice);
 
+    var eager_mode_requested = false;
     const compiled_mode_requested = if (mode_value) |value| blk: {
-        if (std.mem.eql(u8, value, "eager")) break :blk false;
+        if (std.mem.eql(u8, value, "eager")) {
+            eager_mode_requested = true;
+            break :blk false;
+        }
         if (std.mem.eql(u8, value, "compiled")) break :blk true;
         return error.InvalidGenerateMode;
     } else false;
@@ -263,7 +268,21 @@ fn parseGenerateBackendSelection(
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
+        .eager_mode_requested = eager_mode_requested,
     };
+}
+
+fn shouldAutoUseMetalWholeModelGenerate(
+    loaded_backend: backends_mod.BackendType,
+    metal_executor_supported: bool,
+    deepseek_compressed_cache: bool,
+    selection: GenerateBackendSelection,
+) bool {
+    if (!build_options.enable_metal) return false;
+    if (selection.eager_mode_requested) return false;
+    if (selection.compiled_partition_backend != null) return false;
+    if (selection.native_choice == .native) return false;
+    return loaded_backend == .metal and metal_executor_supported and !deepseek_compressed_cache;
 }
 
 fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
@@ -2833,15 +2852,30 @@ pub const Node = struct {
             }
         }
 
+        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
+            model.session.backend(),
+            graph_mod.metal_executor.supportsSession(model.session),
+            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
+            backend_selection,
+        );
+        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
+            .metal
+        else
+            backend_selection.compiled_partition_backend;
+        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
+            .whole_model
+        else
+            backend_selection.compiled_attachment_target;
+
         const graph_mode = backend_selection.graph_mode_requested or
-            backend_selection.compiled_partition_backend != null or
+            effective_compiled_partition_backend != null or
             graphModeEnabled();
         const use_scheduler = !graph_mode;
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
             model.session.backend() == .metal and
-            backend_selection.compiled_partition_backend == .metal and
-            backend_selection.compiled_attachment_target == .whole_model and
+            effective_compiled_partition_backend == .metal and
+            effective_compiled_attachment_target == .whole_model and
             graph_mod.metal_executor.supportsSession(model.session) and
             !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
         var request_graph_cache: ?graph_mod.cache.GraphCache = if (graph_mode and !use_model_graph_cache)
@@ -2884,8 +2918,8 @@ pub const Node = struct {
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
             .prompt_cache = prompt_cache,
             .graph_cache = graph_cache,
-            .compiled_partition_backend = backend_selection.compiled_partition_backend,
-            .compiled_attachment_target = backend_selection.compiled_attachment_target,
+            .compiled_partition_backend = effective_compiled_partition_backend,
+            .compiled_attachment_target = effective_compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
         };
 
@@ -5584,7 +5618,7 @@ pub const Node = struct {
     }
 
     /// Register inference API routes on an external server with a compile-time prefix.
-    /// Used by swarm mode to register on the unified httpx.Server.
+    /// Used by standalone mode to register on the unified httpx.Server.
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
@@ -6900,6 +6934,17 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expectEqual(native_backend_choice.Choice.auto, auto_compiled.native_choice);
     try std.testing.expectEqual(@as(?ops.BackendKind, null), auto_compiled.compiled_partition_backend);
     try std.testing.expect(auto_compiled.graph_mode_requested);
+
+    const auto_default = try parseGenerateBackendSelection(null, null, null);
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, auto_default));
+
+    const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
+    try std.testing.expect(metal_eager.eager_mode_requested);
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
 }

@@ -34,9 +34,20 @@ pub const ManagedServiceConfig = struct {
     max_ready_groups: usize = 64,
 };
 
+pub const TransitionAuthority = struct {
+    ptr: ?*anyopaque = null,
+    holds_fn: *const fn (?*anyopaque, u64) bool,
+
+    pub fn holds(self: TransitionAuthority, metadata_group_id: u64) bool {
+        return self.holds_fn(self.ptr, metadata_group_id);
+    }
+};
+
 pub const ManagedServiceDeps = struct {
     transition_runtime: ?transition_runtime.TransitionRuntime = null,
     transition_ops: ?shard_ops.ShardOperationAdapter = null,
+    transition_retry_clock: transition_service.RetryClock = transition_service.RetryClock.real(),
+    transition_authority: ?TransitionAuthority = null,
 };
 
 pub const ManagedServiceMetrics = struct {
@@ -103,10 +114,25 @@ const TestSingleNodeFactory = struct {
     }
 };
 
+fn establishManagedHostTransitionAuthorityForTest(svc: *ManagedHostService, group_id: u64) !void {
+    try svc.host.host.campaignGroup(group_id);
+    for (0..16) |_| {
+        if (svc.host.host.isLocalLeader(group_id)) return;
+        _ = try svc.host.runRoundBounded(
+            svc.cfg.max_inbound_messages,
+            svc.cfg.max_tick_groups,
+            svc.cfg.max_ready_groups,
+        );
+    }
+    return error.SimulationProgressTimeout;
+}
+
 pub const ManagedHostService = struct {
     alloc: std.mem.Allocator,
     cfg: ManagedServiceConfig,
     host: managed_host.ManagedHost,
+    transition_retry_clock: transition_service.RetryClock,
+    transition_authority: ?TransitionAuthority,
     local_transition_runtime: ?transition_runtime.TransitionRuntime = null,
     pending_updates: std.ArrayListUnmanaged(metadata_view.MetadataUpdate) = .empty,
     transition_svc: ?transition_service.TransitionService = null,
@@ -123,11 +149,13 @@ pub const ManagedHostService = struct {
             .alloc = alloc,
             .cfg = cfg,
             .host = try managed_host.ManagedHost.init(alloc, host_cfg, host_deps),
+            .transition_retry_clock = deps.transition_retry_clock,
+            .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                transition_service.TransitionService.init(alloc, ops)
+                transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
             else if (deps.transition_runtime) |runtime|
-                transition_service.TransitionService.init(alloc, runtime)
+                transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
             else
                 null,
         };
@@ -288,12 +316,19 @@ pub const ManagedHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHostService) !transition_service.TransitionStepResult {
+        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
         }
         return .{};
+    }
+
+    fn holdsTransitionAuthority(self: *ManagedHostService) bool {
+        const metadata_group_id = self.host.host.cfg.metadata_group_id orelse return true;
+        if (self.transition_authority) |authority| return authority.holds(metadata_group_id);
+        return self.host.host.isLocalLeader(metadata_group_id);
     }
 
     pub fn observeSplitTransition(self: *ManagedHostService, transition_id: u64) !?metadata.SplitObservation {
@@ -407,6 +442,8 @@ pub const ManagedHttpHostService = struct {
     alloc: std.mem.Allocator,
     cfg: ManagedServiceConfig,
     host: managed_host.ManagedHttpHost,
+    transition_retry_clock: transition_service.RetryClock,
+    transition_authority: ?TransitionAuthority,
     local_transition_runtime: ?transition_runtime.TransitionRuntime = null,
     pending_updates: std.ArrayListUnmanaged(metadata_view.MetadataUpdate) = .empty,
     transition_svc: ?transition_service.TransitionService = null,
@@ -424,11 +461,13 @@ pub const ManagedHttpHostService = struct {
             .alloc = alloc,
             .cfg = cfg,
             .host = try managed_host.ManagedHttpHost.init(alloc, host_cfg, host_deps),
+            .transition_retry_clock = deps.transition_retry_clock,
+            .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                transition_service.TransitionService.init(alloc, ops)
+                transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
             else if (deps.transition_runtime) |runtime|
-                transition_service.TransitionService.init(alloc, runtime)
+                transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
             else
                 null,
         };
@@ -460,7 +499,7 @@ pub const ManagedHttpHostService = struct {
     pub fn replaceTransitionOps(self: *ManagedHttpHostService, ops: shard_ops.ShardOperationAdapter) !void {
         if (self.transition_svc) |*transition_svc| transition_svc.deinit();
         self.transition_svc = null;
-        self.transition_svc = transition_service.TransitionService.init(self.alloc, ops);
+        self.transition_svc = transition_service.TransitionService.initWithRetryClock(self.alloc, ops, self.transition_retry_clock);
         errdefer {
             if (self.transition_svc) |*transition_svc| transition_svc.deinit();
             self.transition_svc = null;
@@ -647,12 +686,19 @@ pub const ManagedHttpHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHttpHostService) !transition_service.TransitionStepResult {
+        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
         }
         return .{};
+    }
+
+    fn holdsTransitionAuthority(self: *ManagedHttpHostService) bool {
+        const metadata_group_id = self.host.http_host.host.cfg.metadata_group_id orelse return true;
+        if (self.transition_authority) |authority| return authority.holds(metadata_group_id);
+        return self.host.http_host.host.isLocalLeader(metadata_group_id);
     }
 
     pub fn observeSplitTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.SplitObservation {
@@ -1338,6 +1384,7 @@ test "managed host service seeds queued transitions from projected metadata stor
     defer restarted.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), restarted.metrics.queued_split_transitions);
+    try establishManagedHostTransitionAuthorityForTest(&restarted, 1300);
 
     try restarted.runRound();
     try restarted.runRound();
@@ -1443,6 +1490,7 @@ test "managed host service resumes real split transition after restart" {
         defer svc.deinit();
 
         try std.testing.expectEqual(@as(usize, 1), svc.metrics.queued_split_transitions);
+        try establishManagedHostTransitionAuthorityForTest(&svc, 1300);
         try svc.runRound();
         const state = (try svc.describeSplitTransition(1001)) orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(metadata.SplitExecutionStateTag.bootstrapping_destination, state.tag);
@@ -1472,6 +1520,7 @@ test "managed host service resumes real split transition after restart" {
         defer restarted.deinit();
 
         try std.testing.expectEqual(@as(usize, 1), restarted.metrics.queued_split_transitions);
+        try establishManagedHostTransitionAuthorityForTest(&restarted, 1300);
         var rounds: usize = 0;
         while (rounds < 8 and restarted.metrics.completed_split_transitions == 0) : (rounds += 1) {
             try restarted.runRound();
@@ -1594,6 +1643,7 @@ test "managed host service resumes real merge transition after restart" {
         defer svc.deinit();
 
         try std.testing.expectEqual(@as(usize, 1), svc.metrics.queued_merge_transitions);
+        try establishManagedHostTransitionAuthorityForTest(&svc, 1300);
         try svc.runRound();
         const state = (try svc.describeMergeTransition(1002)) orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(metadata.MergeExecutionStateTag.bootstrapping_receiver, state.tag);
@@ -1623,6 +1673,7 @@ test "managed host service resumes real merge transition after restart" {
         defer restarted.deinit();
 
         try std.testing.expectEqual(@as(usize, 1), restarted.metrics.queued_merge_transitions);
+        try establishManagedHostTransitionAuthorityForTest(&restarted, 1300);
         var rounds: usize = 0;
         while (rounds < 8 and restarted.metrics.completed_merge_transitions == 0) : (rounds += 1) {
             try restarted.runRound();

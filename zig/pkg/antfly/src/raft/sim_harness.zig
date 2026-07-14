@@ -31,10 +31,19 @@ const feature_reads = @import("feature_reads.zig");
 const transport = @import("transport/mod.zig");
 const transition_checker = @import("transition_checker.zig");
 const transition_runtime_mod = @import("transition_runtime.zig");
+const transition_service = @import("transition_service.zig");
 const raft_state_machine = @import("state_machine/mod.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
+
+fn simulationHoldsTransitionAuthority(_: ?*anyopaque, _: u64) bool {
+    return true;
+}
+
+fn simulationTransitionAuthority() service.TransitionAuthority {
+    return .{ .holds_fn = simulationHoldsTransitionAuthority };
+}
 
 pub const ManagedHostSimulationConfig = struct {
     host: managed_host.ManagedHostConfig,
@@ -117,6 +126,8 @@ pub const DelayingRequestExecutor = struct {
 };
 
 pub const VirtualHttpNetwork = struct {
+    const tick_duration_ms: u64 = 100;
+
     pub const DeliveryMode = enum {
         immediate,
         queued,
@@ -211,6 +222,18 @@ pub const VirtualHttpNetwork = struct {
                 .execute = execute,
             },
         };
+    }
+
+    pub fn transitionRetryClock(self: *VirtualHttpNetwork) transition_service.RetryClock {
+        return .{
+            .ptr = self,
+            .now_ms_fn = transitionRetryNowMs,
+        };
+    }
+
+    fn transitionRetryNowMs(ptr: ?*anyopaque) u64 {
+        const self: *VirtualHttpNetwork = @ptrCast(@alignCast(ptr.?));
+        return self.virtual_tick *| tick_duration_ms;
     }
 
     pub fn baseUri(alloc: std.mem.Allocator, node_id: u64) ![]u8 {
@@ -1208,7 +1231,10 @@ pub const ManagedHttpClusterSimulation = struct {
         for (owned_configs) |*cfg| cfg.async_transport = false;
         const owned_deps = try alloc.dupe(ManagedHttpHostSimulationDeps, deps);
         errdefer alloc.free(owned_deps);
-        for (owned_deps) |*dep| dep.host.http.request_executor = network.executor();
+        for (owned_deps) |*dep| {
+            dep.host.http.request_executor = network.executor();
+            dep.service.transition_retry_clock = network.transitionRetryClock();
+        }
 
         const nodes = try alloc.alloc(ManagedHttpHostSimulation, configs.len);
         errdefer alloc.free(nodes);
@@ -1542,6 +1568,7 @@ const StorageRecorder = struct {
         const store = self.stores.get(group_id) orelse return error.UnknownGroup;
         if (ready.snapshot) |snapshot| try store.applySnapshot(snapshot);
         if (ready.hard_state) |hard_state| store.setHardState(hard_state);
+        if (ready.conf_state) |conf_state| try store.setConfState(conf_state);
         if (ready.entries.len > 0) try store.append(ready.entries);
     }
 };
@@ -3249,6 +3276,27 @@ test "managed http cluster simulation drives three-node churn and admin workflow
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_a, conf_target, 64));
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_b, conf_target, 64));
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_c, conf_target, 64));
+    var membership_converged = false;
+    for (0..64) |_| {
+        try cluster.stepAll();
+        membership_converged = true;
+        for (0..3) |node_index| {
+            const status = cluster.node(node_index).raftStatus(3001) orelse {
+                membership_converged = false;
+                break;
+            };
+            if (!std.mem.eql(u64, &.{ 1, 2 }, status.conf_state.voters)) {
+                membership_converged = false;
+                break;
+            }
+        }
+        if (membership_converged) break;
+    }
+    try std.testing.expect(membership_converged);
+    for (0..3) |node_index| {
+        const status = cluster.node(node_index).raftStatus(3001) orelse return error.MissingRaftStatus;
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, status.conf_state.voters);
+    }
 
     try cluster.node(2).applyBatch(&.{
         .{ .remove_peer_route = .{ .group_id = 3001, .node_id = 1 } },
@@ -5418,7 +5466,10 @@ test "cluster simulation resumes queued split transitions after node restart wit
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .split = split.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .split = split.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -5579,7 +5630,10 @@ test "cluster simulation removes queued split transition mid-flight across node 
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .split = split.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .split = split.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -5752,7 +5806,10 @@ test "cluster simulation rolls back queued split transition mid-flight across no
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .split = split.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .split = split.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -5958,7 +6015,10 @@ test "cluster simulation survives repeated same-id split overwrites across resta
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .split = split.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .split = split.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -6941,7 +7001,10 @@ test "cluster simulation resumes queued merge transitions after node restart wit
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .merge = merge.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .merge = merge.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -7111,7 +7174,10 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .merge = merge.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .merge = merge.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -7306,7 +7372,10 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .merge = merge.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .merge = merge.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -7547,10 +7616,13 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{
-                .split = split.runtime(),
-                .merge = merge.runtime(),
-            } },
+            .service = .{
+                .transition_runtime = .{
+                    .split = split.runtime(),
+                    .merge = merge.runtime(),
+                },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -7837,10 +7909,13 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{
-                .split = split.runtime(),
-                .merge = merge.runtime(),
-            } },
+            .service = .{
+                .transition_runtime = .{
+                    .split = split.runtime(),
+                    .merge = merge.runtime(),
+                },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -8161,7 +8236,10 @@ test "cluster simulation drives multiple concurrent real transition ids through 
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = multiplex.runtime() },
+            .service = .{
+                .transition_runtime = multiplex.runtime(),
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -8473,7 +8551,10 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = multiplex.runtime() },
+            .service = .{
+                .transition_runtime = multiplex.runtime(),
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };
@@ -8727,7 +8808,10 @@ test "cluster simulation removes queued merge transition mid-flight across node 
             .host = .{
                 .http = .{ .host = .{ .descriptor_factory = metadata_factory.iface() } },
             },
-            .service = .{ .transition_runtime = .{ .merge = merge.runtime() } },
+            .service = .{
+                .transition_runtime = .{ .merge = merge.runtime() },
+                .transition_authority = simulationTransitionAuthority(),
+            },
         },
         .{},
     };

@@ -204,7 +204,7 @@ func indexAntflyDocsWithHierarchy(t *testing.T, ctx context.Context, client *ant
 	require.NoError(t, err, "Failed to configure embedder")
 
 	inferenceURL := GetInferenceURL()
-	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after swarm start")
+	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after standalone start")
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
@@ -354,7 +354,7 @@ func indexAntflyDocs(t *testing.T, ctx context.Context, client *antfly.AntflyCli
 
 	// Configure fixed-size chunker (no ML model needed - reduces memory usage)
 	inferenceURL := GetInferenceURL()
-	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after swarm start")
+	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after standalone start")
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
@@ -1061,7 +1061,7 @@ func setupTestTableWithHierarchy(
 type evalTestSetup struct {
 	Ctx               context.Context
 	Cancel            context.CancelFunc
-	Swarm             *SwarmInstance
+	Standalone        *StandaloneInstance
 	StopMemoryMonitor func()
 }
 
@@ -1088,14 +1088,14 @@ func setupEvalTest(t *testing.T, timeout time.Duration) *evalTestSetup {
 	// Start background memory monitor
 	stopMemoryMonitor := startMemoryMonitor(t, 10*time.Second)
 
-	// Start Antfly swarm
-	t.Log("Starting Antfly swarm...")
-	swarm := startAntflySwarm(t, ctx)
+	// Start Antfly standalone
+	t.Log("Starting Antfly standalone...")
+	standalone := startAntflyStandalone(t, ctx)
 
 	return &evalTestSetup{
 		Ctx:               ctx,
 		Cancel:            combinedCancel,
-		Swarm:             swarm,
+		Standalone:        standalone,
 		StopMemoryMonitor: stopMemoryMonitor,
 	}
 }
@@ -1103,7 +1103,7 @@ func setupEvalTest(t *testing.T, timeout time.Duration) *evalTestSetup {
 // Cleanup releases all resources from the eval test setup.
 func (s *evalTestSetup) Cleanup() {
 	s.StopMemoryMonitor()
-	s.Swarm.Cleanup()
+	s.Standalone.Cleanup()
 	s.Cancel()
 }
 
@@ -1155,13 +1155,13 @@ func TestE2E_RetrievalAgent_DocsEval(t *testing.T) {
 	defer setup.Cleanup()
 
 	dumpMemoryProfile(t, "baseline", true)
-	dumpMemoryProfile(t, "after_swarm_start", true)
+	dumpMemoryProfile(t, "after_standalone_start", true)
 
 	tableName := "antfly_docs_e2e"
 	backupID := "docsaf-test-backup"
 
 	// Setup table (restore or index)
-	tableResult := setupTestTable(t, setup.Ctx, setup.Swarm.Client, tableName, backupID)
+	tableResult := setupTestTable(t, setup.Ctx, setup.Standalone.Client, tableName, backupID)
 	if !tableResult.Restored {
 		dumpMemoryProfile(t, "after_indexing", true)
 		dumpMemoryProfile(t, "after_embeddings", true)
@@ -1173,8 +1173,8 @@ func TestE2E_RetrievalAgent_DocsEval(t *testing.T) {
 	require.NotEmpty(t, queries, "No test queries loaded")
 
 	t.Log("Executing retrieval agent queries with hybrid search and inline evaluation...")
-	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Inference.ApiUrl)
-	results := executeRetrievalAgentQueries(t, setup.Ctx, setup.Swarm.Client, cfg, queries)
+	cfg := newTestQueryConfig(t, tableName, setup.Standalone.Config.Inference.ApiUrl)
+	results := executeRetrievalAgentQueries(t, setup.Ctx, setup.Standalone.Client, cfg, queries)
 
 	// Aggregate and report
 	t.Log("Aggregating evaluation results...")

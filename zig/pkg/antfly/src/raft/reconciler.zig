@@ -223,6 +223,7 @@ pub const ReconcileResult = struct {
     ensured: usize = 0,
     removed: usize = 0,
     refreshed_peers: usize = 0,
+    membership_proposals: usize = 0,
 };
 
 pub const Reconciler = struct {
@@ -269,6 +270,7 @@ pub const Reconciler = struct {
                 }
                 try self.last_intent_hashes.put(self.alloc, intent.record.group_id, intent_hash);
             }
+            if (try self.reconcileRaftMembership(intent)) result.membership_proposals += 1;
         }
         for (existing) |group_id| {
             if (desired_group_ids.contains(group_id)) continue;
@@ -279,7 +281,86 @@ pub const Reconciler = struct {
         self.host.metrics.reconcile_rounds += 1;
         return result;
     }
+
+    fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !bool {
+        const status = self.host.raftStatus(intent.record.group_id) orelse return false;
+        if (status.soft.role != .leader or status.soft.leader_id != status.id) return false;
+
+        // A new change cannot be proposed while joint consensus is active. Leave
+        // the committed joint configuration first; the next reconcile round will
+        // calculate any remaining delta from the resulting stable voter set.
+        if (status.conf_state.voters_outgoing.len > 0) {
+            self.host.proposeConfChangeV2(intent.record.group_id, .{}) catch |err| return switch (err) {
+                error.PendingConfChange,
+                error.NotInJointState,
+                error.NotLeader,
+                error.ProposalDropped,
+                error.LeaderTransferInProgress,
+                => false,
+                else => err,
+            };
+            return true;
+        }
+
+        const changes = try allocMembershipChanges(
+            self.alloc,
+            status.conf_state.voters,
+            intent.record.local_node_id,
+            intent.peer_node_ids,
+        );
+        defer self.alloc.free(changes);
+        if (changes.len == 0) return false;
+
+        self.host.proposeConfChangeV2(intent.record.group_id, .{ .changes = changes }) catch |err| return switch (err) {
+            error.PendingConfChange,
+            error.MustLeaveJointFirst,
+            error.NotLeader,
+            error.ProposalDropped,
+            error.LeaderTransferInProgress,
+            => false,
+            else => err,
+        };
+        return true;
+    }
 };
+
+fn allocMembershipChanges(
+    alloc: std.mem.Allocator,
+    current_voters: []const u64,
+    local_node_id: u64,
+    peer_node_ids: []const u64,
+) ![]raft_engine.core.ConfChangeSingle {
+    var desired = std.ArrayListUnmanaged(u64).empty;
+    defer desired.deinit(alloc);
+    try appendUniqueNodeId(alloc, &desired, local_node_id);
+    for (peer_node_ids) |node_id| try appendUniqueNodeId(alloc, &desired, node_id);
+    std.mem.sort(u64, desired.items, {}, std.sort.asc(u64));
+
+    var changes = std.ArrayListUnmanaged(raft_engine.core.ConfChangeSingle).empty;
+    errdefer changes.deinit(alloc);
+    for (desired.items) |node_id| {
+        if (!containsNodeId(current_voters, node_id)) {
+            try changes.append(alloc, .{ .change_type = .add_node, .node_id = node_id });
+        }
+    }
+    for (current_voters) |node_id| {
+        if (!containsNodeId(desired.items, node_id)) {
+            try changes.append(alloc, .{ .change_type = .remove_node, .node_id = node_id });
+        }
+    }
+    return try changes.toOwnedSlice(alloc);
+}
+
+fn appendUniqueNodeId(alloc: std.mem.Allocator, node_ids: *std.ArrayListUnmanaged(u64), node_id: u64) !void {
+    if (!containsNodeId(node_ids.items, node_id)) try node_ids.append(alloc, node_id);
+}
+
+fn containsNodeId(node_ids: []const u64, node_id: u64) bool {
+    for (node_ids) |candidate| {
+        if (candidate == node_id) return true;
+    }
+    return false;
+}
 
 fn hashIntent(intent: PlacementIntent) u64 {
     var hasher = std.hash.Wyhash.init(0);
@@ -573,6 +654,34 @@ test "reconciler skips unchanged intents after first apply" {
     try std.testing.expectEqual(@as(usize, 0), second.removed);
     try std.testing.expectEqual(ensure_calls_after_first, host.metrics.ensure_replica_calls);
     try std.testing.expectEqual(rounds_after_first + 1, host.metrics.reconcile_rounds);
+}
+
+test "membership reconciliation expands before removing obsolete voters" {
+    const changes = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 1, 2, 5 },
+        1,
+        &.{ 1, 2, 3, 4 },
+    );
+    defer std.testing.allocator.free(changes);
+
+    try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
+        .{ .change_type = .add_node, .node_id = 3 },
+        .{ .change_type = .add_node, .node_id = 4 },
+        .{ .change_type = .remove_node, .node_id = 5 },
+    }, changes);
+}
+
+test "membership reconciliation normalizes duplicate and missing local voters" {
+    const changes = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 7, 8 },
+        7,
+        &.{ 8, 8 },
+    );
+    defer std.testing.allocator.free(changes);
+
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
 }
 
 test "reconciler module compiles" {

@@ -29,6 +29,11 @@ pub const header_size: usize = 64;
 /// Block envelope overhead: type(1) + flags(1) + payload_len(4) + crc32(4).
 pub const block_envelope_overhead: usize = 10;
 
+/// Portable writers target 4 MiB blocks. Leave headroom for a large individual
+/// record while bounding malformed lengths and compressed expansion before
+/// they reach the importer allocator.
+pub const max_block_payload_bytes: usize = 128 * 1024 * 1024;
+
 // --- Block types ---
 
 pub const BlockType = enum(u8) {
@@ -147,6 +152,7 @@ pub fn writeHeader(buf: *ArrayList(u8), alloc: Allocator, h: FileHeader) !void {
 }
 
 pub fn writeBlock(buf: *ArrayList(u8), alloc: Allocator, block_type: BlockType, payload: []const u8) !void {
+    if (payload.len > max_block_payload_bytes) return error.BackupBlockTooLarge;
     var env_header: [6]u8 = undefined;
     env_header[0] = @intFromEnum(block_type);
     env_header[1] = 0; // no compression
@@ -163,6 +169,35 @@ pub fn writeBlock(buf: *ArrayList(u8), alloc: Allocator, block_type: BlockType, 
     var crc_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &crc_buf, crc_val, .little);
     try buf.appendSlice(alloc, &crc_buf);
+}
+
+pub fn writeHeaderTo(writer: *std.Io.Writer, h: FileHeader) !void {
+    var dest: [header_size]u8 = @splat(0);
+    @memcpy(dest[0..8], &magic);
+    std.mem.writeInt(u32, dest[8..12], h.format_version, .little);
+    std.mem.writeInt(u32, dest[12..16], h.flags, .little);
+    std.mem.writeInt(i64, dest[16..24], h.created_at_ns, .little);
+    @memcpy(dest[24..40], &h.backup_id);
+    std.mem.writeInt(u32, dest[40..44], h.table_count, .little);
+    std.mem.writeInt(u32, dest[44..48], h.shard_count, .little);
+    std.mem.writeInt(u32, dest[48..52], Crc32.hash(dest[0..48]), .little);
+    try writer.writeAll(&dest);
+}
+
+pub fn writeBlockTo(writer: *std.Io.Writer, block_type: BlockType, payload: []const u8) !void {
+    if (payload.len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+    var env_header: [6]u8 = undefined;
+    env_header[0] = @intFromEnum(block_type);
+    env_header[1] = 0;
+    std.mem.writeInt(u32, env_header[2..6], @intCast(payload.len), .little);
+    var crc = Crc32.init();
+    crc.update(&env_header);
+    crc.update(payload);
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
+    try writer.writeAll(&env_header);
+    try writer.writeAll(payload);
+    try writer.writeAll(&crc_buf);
 }
 
 // --- Reader ---
@@ -216,6 +251,7 @@ pub const SliceReader = struct {
         const block_type: BlockType = @enumFromInt(env[0]);
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
+        if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
 
         const payload = try self.readExact(payload_len);
         const crc_bytes = try self.readExact(4);
@@ -239,6 +275,80 @@ pub const SliceReader = struct {
         const owned = try alloc.dupe(u8, payload);
         return .{ .block_type = block_type, .payload = owned };
     }
+
+    pub fn hasRemaining(self: *const SliceReader) bool {
+        return self.pos < self.data.len;
+    }
+};
+
+/// Positional portable reader for bounded-memory server restores. The file is
+/// borrowed and may be shared by multiple sequential passes because reads do
+/// not mutate its descriptor offset.
+pub const FileReader = struct {
+    io: std.Io,
+    file: std.Io.File,
+    size: u64,
+    pos: u64 = 0,
+
+    pub fn init(io: std.Io, file: std.Io.File, size: u64) FileReader {
+        return .{ .io = io, .file = file, .size = size };
+    }
+
+    fn readExact(self: *FileReader, out: []u8) !void {
+        if (out.len > self.size -| self.pos) return error.EndOfStream;
+        const n = try self.file.readPositionalAll(self.io, out, self.pos);
+        if (n != out.len) return error.EndOfStream;
+        self.pos += out.len;
+    }
+
+    pub fn readHeader(self: *FileReader) !FileHeader {
+        var buf: [header_size]u8 = undefined;
+        try self.readExact(&buf);
+        if (!std.mem.eql(u8, buf[0..8], &magic)) return error.InvalidMagic;
+
+        const stored_crc = std.mem.readInt(u32, buf[48..52], .little);
+        if (stored_crc != Crc32.hash(buf[0..48])) return error.HeaderCrcMismatch;
+        const ver = std.mem.readInt(u32, buf[8..12], .little);
+        if (ver > format_version) return error.UnsupportedVersion;
+        return .{
+            .format_version = ver,
+            .flags = std.mem.readInt(u32, buf[12..16], .little),
+            .created_at_ns = std.mem.readInt(i64, buf[16..24], .little),
+            .backup_id = buf[24..40].*,
+            .table_count = std.mem.readInt(u32, buf[40..44], .little),
+            .shard_count = std.mem.readInt(u32, buf[44..48], .little),
+        };
+    }
+
+    pub fn readBlock(self: *FileReader, alloc: Allocator) !Block {
+        var env: [6]u8 = undefined;
+        try self.readExact(&env);
+        const block_type: BlockType = @enumFromInt(env[0]);
+        const flags = env[1];
+        const payload_len = std.mem.readInt(u32, env[2..6], .little);
+        if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+
+        const payload = try alloc.alloc(u8, payload_len);
+        errdefer alloc.free(payload);
+        try self.readExact(payload);
+        var crc_bytes: [4]u8 = undefined;
+        try self.readExact(&crc_bytes);
+        var crc = Crc32.init();
+        crc.update(&env);
+        crc.update(payload);
+        if (crc.final() != std.mem.readInt(u32, &crc_bytes, .little)) return error.BlockCrcMismatch;
+
+        if (flags & block_flag_compressed != 0) {
+            const decompressed = try decompressZstd(alloc, payload);
+            alloc.free(payload);
+            return .{ .block_type = block_type, .payload = decompressed };
+        }
+        return .{ .block_type = block_type, .payload = payload };
+    }
+
+    pub fn hasRemaining(self: *const FileReader) bool {
+        return self.pos < self.size;
+    }
 };
 
 pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
@@ -246,7 +356,7 @@ pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     var input = Reader.fixed(compressed);
     var window_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
     var decomp = std.compress.zstd.Decompress.init(&input, &window_buf, .{});
-    return decomp.reader.allocRemaining(alloc, .unlimited);
+    return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
 }
 
 // --- Batch Encoding helpers ---

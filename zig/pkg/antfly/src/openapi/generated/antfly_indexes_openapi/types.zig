@@ -186,6 +186,142 @@ pub const AntflyType = enum {
     }
 };
 
+/// A structured reason why the coverage projection cannot be treated as globally complete.
+pub const DerivedCoverageObservationIncompleteReason = enum {
+    runtime_unavailable,
+    missing_group,
+    unknown_group,
+    remote_unknown_group,
+    stale_group,
+    summary_unavailable,
+    config_mismatch,
+    counter_mismatch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .runtime_unavailable => "runtime_unavailable",
+            .missing_group => "missing_group",
+            .unknown_group => "unknown_group",
+            .remote_unknown_group => "remote_unknown_group",
+            .stale_group => "stale_group",
+            .summary_unavailable => "summary_unavailable",
+            .config_mismatch => "config_mismatch",
+            .counter_mismatch => "counter_mismatch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "missing_group", .missing_group },
+            .{ "unknown_group", .unknown_group },
+            .{ "remote_unknown_group", .remote_unknown_group },
+            .{ "stale_group", .stale_group },
+            .{ "summary_unavailable", .summary_unavailable },
+            .{ "config_mismatch", .config_mismatch },
+            .{ "counter_mismatch", .counter_mismatch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How generation-scoped source outcomes determine derived-index completeness.
+pub const DerivedCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const DerivedCoverageStatus = struct {
+    policy: DerivedCoverageStatusPolicy,
+    /// Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality.
+    observation_complete: bool,
+    /// Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete.
+    observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
+    /// Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it.
+    config_fingerprint: []const u8,
+    /// Whether all observed shard-local coverage summaries were read atomically and completely.
+    summary_ready: bool,
+    /// Freshly observed shard groups reporting a different semantic configuration fingerprint.
+    config_mismatch_group_count: i64,
+    /// Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
+    source_total: i64,
+    /// Source documents with a durable produced outcome for this index generation.
+    produced: i64,
+    /// Source documents intentionally producing no indexable output.
+    skipped: i64,
+    /// Source documents whose generation failed non-retryably.
+    terminal_failed: i64,
+    /// Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
+    covered: i64,
+    /// Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+    pending: ?i64,
+    /// Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy.
+    complete: bool,
+    /// Whether coverage is complete without terminal failures.
+    healthy: bool,
+    /// Whether coverage is complete under best_effort but includes terminal failures.
+    degraded: bool,
+};
+
+pub const DerivedCoverageStatusPolicy = enum {
+    strict,
+    partial,
+    best_effort,
+    external,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .strict => "strict",
+            .partial => "partial",
+            .best_effort => "best_effort",
+            .external => "external",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "strict", .strict },
+            .{ "partial", .partial },
+            .{ "best_effort", .best_effort },
+            .{ "external", .external },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
 pub const DistanceMetric = enum {
     l2_squared,
@@ -282,6 +418,8 @@ pub const EdgeTypeConfig = struct {
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -364,8 +502,10 @@ pub const EmbeddingsIndexStats = struct {
     backfill_items_processed: ?i64 = null,
     /// Operational readiness state such as ready, running, retrying, or failed.
     backfill_state: ?[]const u8 = null,
-    /// Number of documents visible to the index.
+    /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
     doc_count: ?i64 = null,
+    /// Generation-scoped source-document coverage, separate from physical index cardinality.
+    coverage: ?DerivedCoverageStatus = null,
     /// Documents currently visible to queries.
     query_visible_doc_count: ?i64 = null,
     published_doc_count: ?i64 = null,
@@ -844,6 +984,8 @@ pub const IndexConfig = struct {
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
@@ -900,6 +1042,10 @@ pub const IndexConfig = struct {
         }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
             try jw.write(value);
         }
         if (self.external) |value| {

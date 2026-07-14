@@ -4913,9 +4913,13 @@ test "sparse backend adapters expose txn cursor operations" {
         errdefer txn.abort();
         const encoded = std.mem.toBytes(@as(u64, 7));
         try txn.put("meta:next_doc_num", &encoded);
-        var cur = try txn.openCursor();
-        defer cur.close();
-        try std.testing.expectEqualStrings("meta:next_doc_num", (try cur.first()).?.key);
+        {
+            // Cursors must close before commit: committing with an open
+            // cursor fails closed with error.TransactionCursorActive.
+            var cur = try txn.openCursor();
+            defer cur.close();
+            try std.testing.expectEqualStrings("meta:next_doc_num", (try cur.first()).?.key);
+        }
         try txn.commit();
     }
 

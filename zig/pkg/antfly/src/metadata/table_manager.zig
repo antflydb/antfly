@@ -57,6 +57,21 @@ pub const TableRecord = struct {
 // remains as the current storage/runtime name during the migration.
 pub const TableDefinition = TableRecord;
 
+pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
+    return lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.name, rhs.name) and
+        std.mem.eql(u8, lhs.description, rhs.description) and
+        std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
+        std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
+        std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
+        std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
+        std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        lhs.desired_replica_count == rhs.desired_replica_count and
+        lhs.min_ranges == rhs.min_ranges;
+}
+
 pub const TableMigrationState = struct {
     schema_json: []const u8,
     read_schema_json: []const u8,
@@ -82,6 +97,46 @@ pub const RangeRecord = struct {
     restore_location: []const u8 = "",
     restore_snapshot_path: []const u8 = "",
 };
+
+pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
+    return lhs.group_id == rhs.group_id and
+        lhs.range_id == rhs.range_id and
+        lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.start_key, rhs.start_key) and
+        ((lhs.end_key == null and rhs.end_key == null) or
+            (lhs.end_key != null and rhs.end_key != null and std.mem.eql(u8, lhs.end_key.?, rhs.end_key.?))) and
+        lhs.doc_identity_shard_id == rhs.doc_identity_shard_id and
+        lhs.doc_identity_range_id == rhs.doc_identity_range_id and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path);
+}
+
+/// Returns true when an existing topology is either the exact requested
+/// restore intent or a prefix left by an interrupted multi-record publish.
+pub fn restoreIntentTopologyCompatible(
+    alloc: std.mem.Allocator,
+    existing_table: TableRecord,
+    existing_ranges: []const RangeRecord,
+    expected_table: TableRecord,
+    expected_ranges: []const RangeRecord,
+) !bool {
+    if (!tableDefinitionsEqual(existing_table, expected_table)) return false;
+
+    var expected_by_group: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty;
+    defer expected_by_group.deinit(alloc);
+    try expected_by_group.ensureTotalCapacity(alloc, @intCast(expected_ranges.len));
+    for (expected_ranges) |expected_range| {
+        if (expected_by_group.contains(expected_range.group_id)) return false;
+        expected_by_group.putAssumeCapacity(expected_range.group_id, expected_range);
+    }
+    for (existing_ranges) |existing_range| {
+        if (existing_range.table_id != existing_table.table_id) continue;
+        const expected_range = expected_by_group.get(existing_range.group_id) orelse return false;
+        if (!rangeRecordsEqual(existing_range, expected_range)) return false;
+    }
+    return true;
+}
 
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
@@ -127,6 +182,8 @@ pub const GroupStatusReport = struct {
     local_leader: bool = false,
     local_voter: bool = false,
     voter_count: u16 = 0,
+    voter_set_known: bool = false,
+    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
     joint_consensus: bool = false,
     transition_pending: bool = false,
     replay_required: bool = false,
@@ -134,6 +191,66 @@ pub const GroupStatusReport = struct {
     cutover_ready: bool = false,
     reads_ready_after_cutover: bool = false,
 };
+
+pub const voter_set_fingerprint_len = std.crypto.hash.sha2.Sha256.digest_length;
+pub const VoterSetFingerprint = [voter_set_fingerprint_len]u8;
+
+pub fn normalizedVoterCount(node_ids: []const u64, required_node_id: ?u64) usize {
+    var count: usize = 0;
+    for (node_ids, 0..) |node_id, index| {
+        var first = true;
+        for (node_ids[0..index]) |previous| {
+            if (previous == node_id) {
+                first = false;
+                break;
+            }
+        }
+        if (first) count += 1;
+    }
+    if (required_node_id) |required| {
+        for (node_ids) |node_id| {
+            if (node_id == required) return count;
+        }
+        count += 1;
+    }
+    return count;
+}
+
+/// Produces a canonical membership fingerprint without allocating. Raft voter
+/// sets are unique and small, so an O(n^2) ordered scan is preferable to
+/// allocating and sorting on every status report.
+pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterSetFingerprint {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-raft-voter-set-v1\x00");
+
+    const count = normalizedVoterCount(node_ids, required_node_id);
+    var count_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_bytes, @intCast(count), .big);
+    hasher.update(&count_bytes);
+
+    var previous: ?u64 = null;
+    for (0..count) |_| {
+        var next: ?u64 = null;
+        for (node_ids) |node_id| {
+            if (previous != null and node_id <= previous.?) continue;
+            if (next == null or node_id < next.?) next = node_id;
+        }
+        if (required_node_id) |node_id| {
+            if ((previous == null or node_id > previous.?) and (next == null or node_id < next.?)) {
+                next = node_id;
+            }
+        }
+        const node_id = next orelse unreachable;
+        var node_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &node_bytes, node_id, .big);
+        hasher.update(&node_bytes);
+        previous = node_id;
+    }
+
+    var digest: VoterSetFingerprint = undefined;
+    hasher.final(&digest);
+    return digest;
+}
 
 pub const StoreStatusReport = struct {
     store_id: u64,
@@ -227,6 +344,13 @@ pub const RuntimeIndexStatusReport = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    coverage_produced_count: u64 = 0,
+    coverage_skipped_count: u64 = 0,
+    coverage_terminal_failed_count: u64 = 0,
+    coverage_generation: u64 = 0,
+    coverage_config_hash: u64 = 0,
+    coverage_identity_ready: bool = false,
+    coverage_summary_ready: bool = true,
     backfill_active: bool = false,
     backfill_progress_millis: u16 = 0,
     replay_applied_sequence: u64 = 0,
@@ -245,6 +369,7 @@ pub const RestoreProgressRecord = struct {
     node_id: u64,
     group_id: u64,
     backup_id: []const u8,
+    location: []const u8 = "",
     snapshot_path: []const u8 = "",
     primary_restored: bool = false,
     runtime_repair_complete: bool = false,
@@ -771,6 +896,8 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
     const backup_id = try alloc.dupe(u8, record.backup_id);
     errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, record.location);
+    errdefer alloc.free(location);
     const snapshot_path = try alloc.dupe(u8, record.snapshot_path);
     errdefer alloc.free(snapshot_path);
     const phase = try alloc.dupe(u8, record.phase);
@@ -782,6 +909,7 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
         .node_id = record.node_id,
         .group_id = record.group_id,
         .backup_id = backup_id,
+        .location = location,
         .snapshot_path = snapshot_path,
         .primary_restored = record.primary_restored,
         .runtime_repair_complete = record.runtime_repair_complete,
@@ -793,6 +921,7 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
 
 pub fn freeRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) void {
     alloc.free(record.backup_id);
+    alloc.free(record.location);
     alloc.free(record.snapshot_path);
     alloc.free(record.phase);
     alloc.free(record.last_error);
@@ -940,6 +1069,8 @@ pub fn cloneGroupStatus(alloc: std.mem.Allocator, record: GroupStatusReport) !Gr
         .local_leader = record.local_leader,
         .local_voter = record.local_voter,
         .voter_count = record.voter_count,
+        .voter_set_known = record.voter_set_known,
+        .voter_set_fingerprint = record.voter_set_fingerprint,
         .joint_consensus = record.joint_consensus,
         .transition_pending = record.transition_pending,
         .replay_required = record.replay_required,
@@ -971,6 +1102,19 @@ pub fn cloneGroupStatuses(alloc: std.mem.Allocator, records: []const GroupStatus
 pub fn freeGroupStatuses(alloc: std.mem.Allocator, records: []const GroupStatusReport) void {
     for (records) |record| freeGroupStatus(alloc, record);
     if (records.len > 0) alloc.free(records);
+}
+
+test "raft voter set fingerprint is canonical and includes required local voter" {
+    const canonical = voterSetFingerprint(&.{ 101, 102, 104 }, null);
+    const reordered = voterSetFingerprint(&.{ 104, 101, 102 }, null);
+    const local_added = voterSetFingerprint(&.{ 101, 102 }, 104);
+    const duplicate = voterSetFingerprint(&.{ 101, 102, 104, 102 }, null);
+    const different = voterSetFingerprint(&.{ 101, 103, 104 }, null);
+    try std.testing.expectEqualSlices(u8, &canonical, &reordered);
+    try std.testing.expectEqualSlices(u8, &canonical, &local_added);
+    try std.testing.expectEqualSlices(u8, &canonical, &duplicate);
+    try std.testing.expect(!std.mem.eql(u8, &canonical, &different));
+    try std.testing.expectEqual(@as(usize, 3), normalizedVoterCount(&.{ 101, 102 }, 104));
 }
 
 pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGroupStatusReport) !RuntimeGroupStatusReport {
@@ -1052,6 +1196,13 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .edge_count = record.edge_count,
         .node_count = record.node_count,
         .root_node = record.root_node,
+        .coverage_produced_count = record.coverage_produced_count,
+        .coverage_skipped_count = record.coverage_skipped_count,
+        .coverage_terminal_failed_count = record.coverage_terminal_failed_count,
+        .coverage_generation = record.coverage_generation,
+        .coverage_config_hash = record.coverage_config_hash,
+        .coverage_identity_ready = record.coverage_identity_ready,
+        .coverage_summary_ready = record.coverage_summary_ready,
         .backfill_active = record.backfill_active,
         .backfill_progress_millis = record.backfill_progress_millis,
         .replay_applied_sequence = record.replay_applied_sequence,

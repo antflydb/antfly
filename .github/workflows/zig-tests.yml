@@ -454,7 +454,7 @@ jobs:
   e2e-base:
     name: e2e-base
     needs: changes
-    if: github.event_name != 'schedule' && needs.changes.outputs.e2e == 'true'
+    if: github.event_name == 'pull_request' && needs.changes.outputs.e2e == 'true'
     runs-on: arc-antfly-heavy
     timeout-minutes: 45
     env:
@@ -503,7 +503,7 @@ jobs:
   e2e-full:
     name: e2e-full
     needs: changes
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
@@ -574,20 +574,34 @@ jobs:
 
       - name: Run Antfly full E2E
         id: antfly_full_e2e
+        continue-on-error: true
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_LSM_OPEN_DEBUG: "1"
-          ANTFLY_FS_PATH_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          uv run --project e2e/antfly pytest -q e2e/antfly
+          uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
 
       - name: Run Antfly inference full E2E
-        if: ${{ success() || steps.antfly_full_e2e.outcome == 'failure' }}
+        id: inference_full_e2e
+        if: always()
+        continue-on-error: true
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
-        run: uv run --project e2e/inference pytest -q e2e/inference
+        run: uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+
+      - name: Report full E2E result
+        if: always()
+        env:
+          ANTFLY_E2E_OUTCOME: ${{ steps.antfly_full_e2e.outcome }}
+          INFERENCE_E2E_OUTCOME: ${{ steps.inference_full_e2e.outcome }}
+        run: |
+          if [[ "$ANTFLY_E2E_OUTCOME" != "success" || "$INFERENCE_E2E_OUTCOME" != "success" ]]; then
+            echo "Antfly E2E: $ANTFLY_E2E_OUTCOME" >&2
+            echo "Inference E2E: $INFERENCE_E2E_OUTCOME" >&2
+            exit 1
+          fi

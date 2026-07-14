@@ -318,7 +318,8 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
     inference_internal_mod.addImport("onnx_graph", onnx_graph_mod);
-    configureOnnxRuntime(b, inference_internal_mod, backend.enable_onnx, backend.onnx_root);
+    configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
+    inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
 
@@ -674,6 +675,9 @@ fn configureRuntimeLinks(
     backend: BackendOptions,
     paths: Paths,
 ) void {
+    if (backend.link_libc) {
+        addMacosSdkPaths(b, module, target);
+    }
     if (backend.enable_system_blas) {
         configureSystemBlas(b, module, target, backend.blas_root);
     }

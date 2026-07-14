@@ -1055,7 +1055,7 @@ fn executeMatchAll(
         };
 
         if (request.include_stored) {
-            if (try snap.storedDocDecompressed(global_id)) |stored| {
+            if (try snap.storedDocDecompressed(alloc, global_id)) |stored| {
                 hit.id = stored.id;
                 hit.stored_data = stored.data;
             }
@@ -2115,7 +2115,7 @@ fn executeSort(
             .stored_data = null,
         };
         if (request.include_stored) {
-            if (try snap.storedDocDecompressed(dv.doc_id)) |stored| {
+            if (try snap.storedDocDecompressed(alloc, dv.doc_id)) |stored| {
                 hit.id = stored.id;
                 hit.stored_data = stored.data;
             }
@@ -2172,7 +2172,7 @@ fn executeKNN(
             .stored_data = null,
         };
         if (request.include_stored) {
-            if (try snap.storedDocDecompressed(doc_id)) |stored| {
+            if (try snap.storedDocDecompressed(alloc, doc_id)) |stored| {
                 hit.id = stored.id;
                 hit.stored_data = stored.data;
             }
@@ -2271,7 +2271,7 @@ fn executeHybrid(
         };
         errdefer freeIndexScores(alloc, hit.index_scores);
         if (request.include_stored) {
-            if (try snap.storedDocDecompressed(doc_id)) |stored| {
+            if (try snap.storedDocDecompressed(alloc, doc_id)) |stored| {
                 hit.id = stored.id;
                 hit.stored_data = stored.data;
             }
@@ -2323,7 +2323,7 @@ fn buildResult(
         };
 
         if (request.include_stored) {
-            if (try snap.storedDocDecompressed(sh.doc_id)) |stored| {
+            if (try snap.storedDocDecompressed(alloc, sh.doc_id)) |stored| {
                 hit.id = stored.id;
                 hit.stored_data = stored.data;
             }

@@ -713,9 +713,9 @@ test "merge direct-copies single-source field sections when eligible" {
     const merged_title = merged_reader.getSection("title", .inverted_text).?;
     try std.testing.expectEqualStrings(original_title, merged_title);
 
-    const stored0 = (try merged_reader.storedDocDecompressed(0)).?;
+    const stored0 = (try merged_reader.storedDocDecompressed(alloc, 0)).?;
     defer alloc.free(stored0.data);
-    const stored1 = (try merged_reader.storedDocDecompressed(1)).?;
+    const stored1 = (try merged_reader.storedDocDecompressed(alloc, 1)).?;
     defer alloc.free(stored1.data);
 
     try std.testing.expectEqualStrings("title-doc", stored0.id);
@@ -759,11 +759,11 @@ test "merge mapper-built multi-field text segments" {
     try std.testing.expectEqual(@as(u32, 2), alpha.docFreq());
     try std.testing.expectEqual(@as(u32, 2), beta.docFreq());
 
-    const doc0 = (try reader.storedDocDecompressed(0)).?;
+    const doc0 = (try reader.storedDocDecompressed(alloc, 0)).?;
     defer alloc.free(doc0.data);
-    const doc1 = (try reader.storedDocDecompressed(1)).?;
+    const doc1 = (try reader.storedDocDecompressed(alloc, 1)).?;
     defer alloc.free(doc1.data);
-    const doc2 = (try reader.storedDocDecompressed(2)).?;
+    const doc2 = (try reader.storedDocDecompressed(alloc, 2)).?;
     defer alloc.free(doc2.data);
 
     try std.testing.expectEqualStrings("doc1", doc0.id);

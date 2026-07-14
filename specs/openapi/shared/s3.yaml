@@ -19,13 +19,13 @@ components:
           default: true
         access_key_id:
           type: string
-          description: "AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set."
+          description: "AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set."
           example: "your-access-key-id"
         secret_access_key:
           type: string
-          description: "AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set."
+          description: "AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set."
           example: "your-secret-access-key"
         session_token:
           type: string
-          description: "Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup."
+          description: "Optional AWS session token for temporary credentials. Supports secret-store references."
           example: "your-session-token"

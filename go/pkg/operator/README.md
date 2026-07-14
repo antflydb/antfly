@@ -368,9 +368,9 @@ The `examples/` directory contains ready-to-use configurations organized by comp
 kubectl apply -f examples/development-cluster.yaml
 ```
 
-**[Swarm Cluster](examples/swarm-cluster.yaml)**: Single-node swarm-mode deployment for local development and reduced-topology smoke tests
+**[Standalone Cluster](examples/standalone-cluster.yaml)**: Single-node standalone-mode deployment for local development and reduced-topology smoke tests
 ```bash
-kubectl apply -f examples/swarm-cluster.yaml
+kubectl apply -f examples/standalone-cluster.yaml
 ```
 
 ### Level 2: Production Configuration

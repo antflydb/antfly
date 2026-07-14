@@ -59,6 +59,7 @@ pub const Run = struct {
     entry_count: u32,
     bloom_filter: ?bloom.OwnedFilter,
     owns_metadata: bool = true,
+    owns_path: bool = false,
     owns_bloom_filter: bool = true,
     cached_state_index: ?usize = null,
     cached_index_index: ?usize = null,
@@ -68,8 +69,13 @@ pub const Run = struct {
     state: ?state_mod.State,
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
-        if (self.owns_metadata) {
+        if (self.owns_path) {
             if (self.path) |path| allocator.free(path);
+        }
+        if (self.owns_metadata) {
+            if (!self.owns_path) {
+                if (self.path) |path| allocator.free(path);
+            }
             if (self.smallest_namespace_name) |name| allocator.free(name);
             allocator.free(self.smallest_key);
             if (self.largest_namespace_name) |name| allocator.free(name);
@@ -93,6 +99,7 @@ pub const Run = struct {
             .entry_count = 0,
             .bloom_filter = null,
             .owns_metadata = false,
+            .owns_path = false,
             .owns_bloom_filter = false,
             .cached_state_index = null,
             .cached_index_index = null,
@@ -269,12 +276,15 @@ pub fn loadManifestIfPresentWithStorage(
     next_run_id.* = decoded.next_run_id;
     try runs.ensureTotalCapacity(allocator, decoded.runs.len);
     for (decoded.runs) |*meta| {
+        const owned_path = try runPath(allocator, root_dir, meta.id);
+        var path_owned = true;
+        errdefer if (path_owned) allocator.free(owned_path);
         try runs.append(allocator, .{
             .id = meta.id,
             .level = meta.level,
             .size_bytes = meta.size_bytes,
             .compression_stats = meta.compression_stats,
-            .path = @constCast(meta.path),
+            .path = owned_path,
             .smallest_namespace_name = if (meta.smallest_namespace_name) |name| @constCast(name) else null,
             .smallest_key = @constCast(meta.smallest_key),
             .largest_namespace_name = if (meta.largest_namespace_name) |name| @constCast(name) else null,
@@ -282,12 +292,14 @@ pub fn loadManifestIfPresentWithStorage(
             .entry_count = meta.entry_count,
             .bloom_filter = null,
             .owns_metadata = false,
+            .owns_path = true,
             .state = null,
         });
+        path_owned = false;
     }
     try obsolete_paths.ensureTotalCapacity(allocator, decoded.obsolete_paths.len);
     for (decoded.obsolete_paths) |obsolete| {
-        const owned_path = try allocator.dupe(u8, obsolete.path);
+        const owned_path = try rebaseManifestPathAlloc(allocator, root_dir, obsolete.path);
         obsolete_paths.appendAssumeCapacity(.{
             .path = owned_path,
             .delete_after_ns = obsolete.delete_after_ns,
@@ -296,6 +308,13 @@ pub fn loadManifestIfPresentWithStorage(
     manifest_backing.* = decoded.raw;
     decoded.raw = &.{};
     return true;
+}
+
+fn rebaseManifestPathAlloc(allocator: Allocator, root_dir: []const u8, path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) return try std.fs.path.join(allocator, &.{ root_dir, path });
+    const parent = std.fs.path.dirname(path) orelse return try allocator.dupe(u8, path);
+    if (!std.mem.eql(u8, std.fs.path.basename(parent), "runs")) return try allocator.dupe(u8, path);
+    return try std.fs.path.join(allocator, &.{ root_dir, "runs", std.fs.path.basename(path) });
 }
 
 pub fn persistRunFile(allocator: Allocator, root_dir: []const u8, run: *Run) ![]u8 {

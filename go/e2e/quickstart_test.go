@@ -43,14 +43,14 @@ func TestE2E_Quickstart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Start swarm with Antfly inference for BGE + CLIP + Gemma-3-ONNX.
-	t.Log("Starting Antfly swarm with Antfly inference...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{})
-	defer swarm.Cleanup()
+	// Start standalone with Antfly inference for BGE + CLIP + Gemma-3-ONNX.
+	t.Log("Starting Antfly standalone with Antfly inference...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{})
+	defer standalone.Cleanup()
 
 	inferenceURL := GetInferenceURL()
 	if inferenceURL == "" {
-		t.Fatal("Antfly inference URL not set — swarm should have started Antfly inference")
+		t.Fatal("Antfly inference URL not set — standalone should have started Antfly inference")
 	}
 
 	tableName := "wikipedia"
@@ -105,7 +105,7 @@ func TestE2E_Quickstart(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+	err = standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 		NumShards: 1,
 		Indexes: map[string]antfly.IndexConfig{
 			"title_body": titleBodyIndex,
@@ -113,7 +113,7 @@ func TestE2E_Quickstart(t *testing.T) {
 		},
 	})
 	require.NoError(t, err, "Failed to create table")
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 	t.Log("Table created with BGE text index + CLIP thumbnail index")
 
 	// --- Insert documents (some with thumbnails, some without) ---
@@ -153,7 +153,7 @@ func TestE2E_Quickstart(t *testing.T) {
 		},
 	}
 
-	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
+	_, err = standalone.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
 		SyncLevel: antfly.SyncLevelFullIndex,
 	})
@@ -161,11 +161,11 @@ func TestE2E_Quickstart(t *testing.T) {
 	t.Logf("Inserted %d documents (4 with thumbnails, 1 without)", len(docs))
 
 	// --- Wait for text embeddings ---
-	waitForEmbeddings(t, ctx, swarm.Client, tableName, "title_body", len(docs), 5*time.Minute)
+	waitForEmbeddings(t, ctx, standalone.Client, tableName, "title_body", len(docs), 5*time.Minute)
 
 	// --- Semantic text search ---
 	t.Log("Running semantic text search...")
-	results, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		SemanticSearch: "theory of relativity and physics",
 		Indexes:        []string{"title_body"},
@@ -201,10 +201,10 @@ func TestE2E_Quickstart(t *testing.T) {
 
 	// --- Image search via CLIP ---
 	// Wait for CLIP embeddings (only docs with thumbnail_url get embedded)
-	waitForEmbeddings(t, ctx, swarm.Client, tableName, "thumbnail", 4, 5*time.Minute)
+	waitForEmbeddings(t, ctx, standalone.Client, tableName, "thumbnail", 4, 5*time.Minute)
 
 	t.Log("Running image search via CLIP...")
-	results, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		SemanticSearch: "ancient building architecture",
 		Indexes:        []string{"thumbnail"},
@@ -233,7 +233,7 @@ func TestE2E_Quickstart(t *testing.T) {
 	require.NoError(t, err)
 	rerankerConfig.Field = "body"
 
-	results, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		SemanticSearch: "theory of relativity and physics",
 		Indexes:        []string{"title_body"},
@@ -265,7 +265,7 @@ func TestE2E_Quickstart(t *testing.T) {
 			"title_body": 0.6, // semantic embedding weight
 		},
 	}
-	results, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		FullTextSearch: &ftsQuery,
 		SemanticSearch: "theory of relativity and physics",
@@ -295,7 +295,7 @@ func TestE2E_Quickstart(t *testing.T) {
 
 	// --- Hybrid FTS + semantic with RSF + reranker ---
 	t.Log("Running hybrid FTS + semantic search with RSF + reranker...")
-	results, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		FullTextSearch: &ftsQuery,
 		SemanticSearch: "theory of relativity and physics",
@@ -317,7 +317,7 @@ func TestE2E_Quickstart(t *testing.T) {
 
 	// --- Multi-index hybrid search (text + image) ---
 	t.Log("Running multi-index hybrid search (title_body + thumbnail)...")
-	results, err = swarm.Client.Query(ctx, antfly.QueryRequest{
+	results, err = standalone.Client.Query(ctx, antfly.QueryRequest{
 		Table:          tableName,
 		SemanticSearch: "ancient civilizations and archaeology",
 		Indexes:        []string{"title_body", "thumbnail"},

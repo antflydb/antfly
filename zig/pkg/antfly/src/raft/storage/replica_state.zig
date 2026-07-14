@@ -90,6 +90,7 @@ pub const PersistentReplicaState = struct {
             if (snapshot.metadata.index > self.applied_index) self.applied_index = snapshot.metadata.index;
         }
         if (ready.hard_state) |hard_state| self.store.setHardState(hard_state);
+        if (ready.conf_state) |conf_state| try self.store.setConfState(conf_state);
         if (ready.entries.len > 0) try self.store.append(ready.entries);
         try self.persist();
     }
@@ -309,9 +310,6 @@ test "persistent replica state persists ready updates across reopen" {
     {
         var state = try PersistentReplicaState.init(std.testing.allocator, layout);
         defer state.deinit();
-        var conf_state = raft_engine.core.ConfState{ .voters = try std.testing.allocator.dupe(u64, &.{ 1, 2, 3 }) };
-        defer conf_state.deinit(std.testing.allocator);
-        try state.setConfState(conf_state);
 
         const data_one = try std.testing.allocator.dupe(u8, "one");
         defer std.testing.allocator.free(data_one);
@@ -320,6 +318,7 @@ test "persistent replica state persists ready updates across reopen" {
 
         try state.groupStorage().persistReady(77, .{
             .hard_state = .{ .current_term = 4, .voted_for = 2, .commit_index = 2 },
+            .conf_state = .{ .voters = @constCast((&[_]u64{ 1, 2, 3 })[0..]) },
             .entries = &.{
                 .{ .term = 4, .index = 1, .data = data_one },
                 .{ .term = 4, .index = 2, .data = data_two },

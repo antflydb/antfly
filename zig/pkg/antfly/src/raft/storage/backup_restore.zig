@@ -23,8 +23,14 @@ const portable_backup = @import("../../storage/portable_backup.zig");
 pub const RestoreSource = struct {
     backup_id: []const u8,
     location: []const u8,
+    identity_location: ?[]const u8 = null,
     snapshot_path: []const u8,
+    manifest: ?*const backups_api.TableBackupManifest = null,
 };
+
+fn restoreIdentityLocation(restore: RestoreSource) []const u8 {
+    return restore.identity_location orelse restore.location;
+}
 
 pub const RestoreOptions = struct {
     expected_table_name: ?[]const u8 = null,
@@ -66,7 +72,120 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
-    try applyRestoreSnapshotIfNeeded(alloc, path, group_id, restore, options);
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(path);
+    defer transition.deinit();
+    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
+}
+
+pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !void {
+    var prepared = (try prepareRestoreSnapshotToPathWithExclusiveTransition(
+        transition,
+        alloc,
+        path,
+        group_id,
+        restore,
+        options,
+    )) orelse return;
+    defer prepared.deinit();
+    const outcome = try publishPreparedRestore(alloc, path, &prepared);
+    if (outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
+}
+
+/// Builds and validates a replacement generation without mutating the live
+/// root. The caller must hold `transition` until the returned generation is
+/// either published or destroyed.
+pub fn prepareRestoreSnapshotToPathWithExclusiveTransition(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !?db_mod.generation_lifecycle.StagedGeneration {
+    try transition.validate(path);
+    try transition.reconcilePublished();
+    return try prepareRestoreSnapshotIfNeeded(transition, alloc, path, group_id, restore, options);
+}
+
+/// Prepares a sibling generation while the current generation remains
+/// readable. The caller must drain serving leases and promote `preparation`
+/// before publishing the returned generation.
+pub fn prepareRestoreSnapshotToPathWithPreparation(
+    preparation: *db_mod.generation_lifecycle.PreparationTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !?db_mod.generation_lifecycle.StagedGeneration {
+    return try prepareRestoreSnapshotIfNeeded(preparation, alloc, path, group_id, restore, options);
+}
+
+pub fn publishPreparedRestore(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    prepared: *db_mod.generation_lifecycle.StagedGeneration,
+) !db_mod.generation_lifecycle.PublicationOutcome {
+    try prepared.validateLivePath(path);
+    const outcome = try prepared.publish();
+    cleanupSnapshotsForPublishedRestore(alloc, path);
+    return outcome;
+}
+
+pub fn reconcileCommittedRestoreWithExclusiveTransition(
+    transition: *db_mod.generation_lifecycle.ExclusiveTransition,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    try transition.validate(path);
+    try transition.reconcilePublished();
+    try validateCommittedRestoreIdentity(alloc, path, group_id, restore);
+}
+
+pub fn validateCommittedRestoreIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse return error.RestoreIdentityMismatch;
+    defer state.deinit(alloc);
+    if (!state.primary_restored or
+        !state.runtime_repair_complete or
+        state.group_id != group_id or
+        !std.mem.eql(u8, state.backup_id, restore.backup_id) or
+        !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
+        !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
+    {
+        return error.RestoreIdentityMismatch;
+    }
+}
+
+pub fn validateImportedRestoreIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !void {
+    var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse return error.RestoreIdentityMismatch;
+    defer state.deinit(alloc);
+    if (!state.primary_restored or
+        state.group_id != group_id or
+        !std.mem.eql(u8, state.backup_id, restore.backup_id) or
+        !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
+        !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
+    {
+        return error.RestoreIdentityMismatch;
+    }
 }
 
 pub fn restoreSnapshotMatchesPath(
@@ -106,79 +225,76 @@ pub fn applyBackupRestoreFromRecord(
     }, null);
 }
 
-pub fn forceApplyBackupRestoreFromRecord(
-    alloc: std.mem.Allocator,
-    replica_root_dir: []const u8,
-    group_id: u64,
-    restore: @import("../catalog.zig").BackupRestoreBootstrapRecord,
-) !void {
-    const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-    try applyRestoreSnapshot(
-        alloc,
-        path,
-        group_id,
-        .{
-            .backup_id = restore.backup_id,
-            .location = restore.location,
-            .snapshot_path = restore.snapshot_path,
-        },
-        .{},
-    );
-}
-
-fn applyRestoreSnapshotIfNeeded(
+fn prepareRestoreSnapshotIfNeeded(
+    transition: anytype,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
     options: RestoreOptions,
-) !void {
+) !?db_mod.generation_lifecycle.StagedGeneration {
     if (try db_mod.DB.readRestoreStateForPath(alloc, path)) |state_value| {
         var state = state_value;
         defer state.deinit(alloc);
         if (state.primary_restored and
             std.mem.eql(u8, state.backup_id, restore.backup_id) and
-            std.mem.eql(u8, state.location, restore.location) and
+            std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) and
             std.mem.eql(u8, state.snapshot_path, restore.snapshot_path) and
             state.group_id == group_id)
         {
             if (!state.runtime_repair_complete or
                 try restoreSnapshotMatchesPath(alloc, path, restore, options))
             {
-                return;
+                return null;
             }
         }
     }
 
-    try applyRestoreSnapshot(alloc, path, group_id, restore, options);
+    return try prepareRestoreSnapshot(transition, alloc, path, group_id, restore, options);
 }
 
-fn applyRestoreSnapshot(
+fn prepareRestoreSnapshot(
+    transition: anytype,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
     options: RestoreOptions,
-) !void {
+) !db_mod.generation_lifecycle.StagedGeneration {
     var location = try backups_api.openBackupLocation(alloc, restore.location);
     defer location.deinit(alloc);
-    var manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
-    defer manifest.deinit(alloc);
+    var owned_manifest: ?backups_api.TableBackupManifest = null;
+    defer if (owned_manifest) |*manifest| manifest.deinit(alloc);
+    const manifest = restore.manifest orelse blk: {
+        owned_manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
+        break :blk &owned_manifest.?;
+    };
     if (options.expected_table_name) |table_name| {
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+        if (!std.mem.eql(u8, manifest.table_name, table_name)) {
+            std.log.err("restore manifest table mismatch expected={s} actual={s} backup_id={s} snapshot_path={s}", .{
+                table_name,
+                manifest.table_name,
+                restore.backup_id,
+                restore.snapshot_path,
+            });
+            return error.InvalidBackupRequest;
+        }
     }
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
     const snapshot_path = if (restore.snapshot_path.len > 0)
         restore.snapshot_path
     else blk: {
-        const shard = backups_api.findShardSnapshot(&manifest, group_id) orelse return error.UnsupportedBackupFormat;
+        const shard = backups_api.findShardSnapshot(manifest, group_id) orelse return error.UnsupportedBackupFormat;
         break :blk shard.snapshot_path;
     };
 
+    var staged_generation = try transition.beginStaging();
+    errdefer staged_generation.deinit();
+    const staged_path = staged_generation.path();
+
     if (std.mem.endsWith(u8, snapshot_path, ".afb")) {
-        try applyPortableRestore(alloc, path, group_id, restore, snapshot_path, &manifest, options);
-        return;
+        try applyPortableRestore(&staged_generation, alloc, staged_path, group_id, restore, snapshot_path, manifest, options);
+        return staged_generation;
     }
 
     const snapshot_root = try stageRestoreSnapshot(alloc, path, &location, snapshot_path);
@@ -190,15 +306,17 @@ fn applyRestoreSnapshot(
         },
     };
 
-    try resetLocalTablePath(path);
-    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, .{
+    std.log.info("native restore build staged generation live_path={s} staged_path={s} snapshot_root={s}", .{ path, staged_path, snapshot_root });
+    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(&staged_generation, alloc, snapshot_root, staged_path, .{
         .identity_namespace = options.expected_identity_namespace,
     }, .{
         .backup_id = restore.backup_id,
-        .location = restore.location,
+        .location = restoreIdentityLocation(restore),
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     });
+    std.log.info("native restore generation prepared live_path={s} staged_path={s} snapshot_root={s}", .{ path, staged_path, snapshot_root });
+    return staged_generation;
 }
 
 fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u64 {
@@ -240,6 +358,7 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
 }
 
 fn applyPortableRestore(
+    staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
@@ -264,10 +383,10 @@ fn applyPortableRestore(
     const afb_data = try readFileAlloc(alloc, afb_path, 16 * 1024 * 1024 * 1024);
     defer alloc.free(afb_data);
 
-    try resetLocalTablePath(path);
     var db = try db_mod.DB.open(alloc, path, .{
         .identity_namespace = options.expected_identity_namespace,
         .start_index_workers = false,
+        .staged_generation = staged_generation,
     });
     var db_closed = false;
     defer if (!db_closed) db.close();
@@ -286,7 +405,7 @@ fn applyPortableRestore(
     db.close();
     db_closed = true;
     destroyPathIfExists(indexes_path);
-    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, restore.backup_id, restore.location, snapshot_path, group_id);
+    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, restore.backup_id, restoreIdentityLocation(restore), snapshot_path, group_id);
 }
 
 fn portableEmbeddingSourceFieldsFromIndexesJson(
@@ -403,12 +522,9 @@ fn stageRestoreFile(
     };
 }
 
-fn resetLocalTablePath(path: []const u8) !void {
-    destroyPathIfExists(path);
-    try ensureDirPath(path);
-
-    const snapshot_dir = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.snapshots", .{path});
-    defer std.heap.page_allocator.free(snapshot_dir);
+fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
+    const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
+    defer alloc.free(snapshot_dir);
     destroyPathIfExists(snapshot_dir);
 }
 

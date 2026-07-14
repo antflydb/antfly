@@ -18,6 +18,7 @@ pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");
 pub const health_server = @import("health_server.zig");
+pub const prometheus = @import("prometheus.zig");
 pub const group_ids = @import("group_ids.zig");
 pub const data_format = @import("data_format.zig");
 pub const fs_paths = @import("fs_paths.zig");
@@ -31,6 +32,7 @@ test {
     _ = audio_runtime;
     _ = secrets;
     _ = health_server;
+    _ = prometheus;
     _ = group_ids;
     _ = data_format;
     _ = fs_paths;

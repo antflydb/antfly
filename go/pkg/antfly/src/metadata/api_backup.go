@@ -79,7 +79,7 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 		}
 	}
 
-	if err := newBackupStore(br.Location, &t.ln.config.Storage.S3).WriteMetadata(ctx, br.BackupId, table); err != nil {
+	if err := newBackupStore(br.Location, &t.ln.config.Storage.Local.S3).WriteMetadata(ctx, br.BackupId, table); err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to write backup metadata: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -111,7 +111,7 @@ func (t *TableApi) RestoreTable(w http.ResponseWriter, r *http.Request, tableNam
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	tableMetadata, err := newBackupStore(rr.Location, &t.ln.config.Storage.S3).ReadMetadata(ctx, rr.BackupId)
+	tableMetadata, err := newBackupStore(rr.Location, &t.ln.config.Storage.Local.S3).ReadMetadata(ctx, rr.BackupId)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to read backup metadata: %v", err), http.StatusInternalServerError)
 		return
@@ -403,7 +403,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 
 			// Write table metadata with table-specific backup ID
 			tableBackupID := tableName + "-" + req.BackupId
-			if err := newBackupStore(req.Location, &t.ln.config.Storage.S3).WriteMetadata(ctx, tableBackupID, table); err != nil {
+			if err := newBackupStore(req.Location, &t.ln.config.Storage.Local.S3).WriteMetadata(ctx, tableBackupID, table); err != nil {
 				mu.Lock()
 				results[i] = TableBackupStatus{
 					Name:   tableName,
@@ -440,7 +440,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 
 	// Write cluster-level metadata
 	if strings.HasPrefix(req.Location, "s3://") {
-		if err := writeClusterMetadataToBlobStore(ctx, req.Location, req.BackupId, clusterMeta, &t.ln.config.Storage.S3); err != nil {
+		if err := writeClusterMetadataToBlobStore(ctx, req.Location, req.BackupId, clusterMeta, &t.ln.config.Storage.Local.S3); err != nil {
 			errorResponse(w, fmt.Sprintf("Failed to write cluster metadata: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -502,7 +502,7 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 	var clusterMeta *ClusterBackupMetadata
 	var err error
 	if strings.HasPrefix(req.Location, "s3://") {
-		clusterMeta, err = readClusterMetadataFromBlobStore(ctx, req.Location, req.BackupId, &t.ln.config.Storage.S3)
+		clusterMeta, err = readClusterMetadataFromBlobStore(ctx, req.Location, req.BackupId, &t.ln.config.Storage.Local.S3)
 	} else {
 		clusterMeta, err = readClusterMetadataFromFile(ctx, req.Location, req.BackupId)
 	}
@@ -595,7 +595,7 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 
 			// Read table metadata from backup using table-specific backup ID
 			tableBackupID := tableName + "-" + req.BackupId
-			tableMetadata, err := newBackupStore(req.Location, &t.ln.config.Storage.S3).ReadMetadata(ctx, tableBackupID)
+			tableMetadata, err := newBackupStore(req.Location, &t.ln.config.Storage.Local.S3).ReadMetadata(ctx, tableBackupID)
 			if err != nil {
 				mu.Lock()
 				results[i] = TableRestoreStatus{
@@ -698,7 +698,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 			errorResponse(w, fmt.Sprintf("Invalid location URL: %v", err), http.StatusBadRequest)
 			return
 		}
-		minioClient, err := t.ln.config.Storage.S3.NewMinioClient()
+		minioClient, err := t.ln.config.Storage.Local.S3.NewMinioClient()
 		if err != nil {
 			errorResponse(w, fmt.Sprintf("Failed to create S3 client: %v", err), http.StatusInternalServerError)
 			return
@@ -723,7 +723,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 				}
 
 				// Read the metadata
-				meta, err := readClusterMetadataFromBlobStore(ctx, location, backupID, &t.ln.config.Storage.S3)
+				meta, err := readClusterMetadataFromBlobStore(ctx, location, backupID, &t.ln.config.Storage.Local.S3)
 				if err != nil {
 					t.logger.Warn("Error reading cluster metadata", zap.String("backup_id", backupID), zap.Error(err))
 					continue

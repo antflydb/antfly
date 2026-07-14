@@ -79,6 +79,11 @@ type RestoreSource struct {
 	// +kubebuilder:validation:Pattern=`^(s3://|file://).+`
 	Location string `json:"location"`
 
+	// Connection is the ID of an external_io connection configured on the
+	// AntflyCluster. It must grant restore.read and authorize this location.
+	// +optional
+	Connection string `json:"connection,omitempty"`
+
 	// CredentialsSecret references a Secret containing storage credentials
 	// For S3: expects keys AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally AWS_REGION
 	// +optional

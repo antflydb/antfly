@@ -213,6 +213,12 @@ pub fn parseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json
 pub const ListBackupsParams = struct {
     /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
     location: []const u8,
+    /// Named `external_io` connection authorized for reading this backup location.
+    connection: []const u8,
+    /// Maximum backups returned in one page.
+    limit: ?[]const u8 = null,
+    /// Continuation cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for multiBatchWrite.
@@ -223,9 +229,9 @@ pub fn parseMultiBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) 
 pub const ListConnectionsParams = struct {
     /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
-    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
+    /// Comma-separated list of expansions. Supported values: `models` to live-query inference model listings and `status` to live-probe external connections. Live work is opt-in and single-flight per server.
     include: ?[]const u8 = null,
-    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
+    /// Set to "true" to bypass the short server-side cache for requested live expansions. Live expansion passes are serialized to prevent concurrent refresh amplification. This does not force a node config or metadata reload.
     refresh: ?[]const u8 = null,
 };
 
@@ -243,6 +249,24 @@ pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std
 pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterRestoreRequest) {
     return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
+
+pub const ListRestoreJobsParams = struct {
+    limit: ?[]const u8 = null,
+    /// Opaque cursor returned by the preceding page.
+    cursor: ?[]const u8 = null,
+    phase: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+};
+
+/// Get durable restore job status
+pub const GetRestoreJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// Request cooperative restore cancellation
+pub const CancelRestoreJobPathParams = struct {
+    job_id: []const u8,
+};
 
 /// Store a secret
 pub const PutSecretPathParams = struct {
@@ -723,6 +747,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
+    .{ .method = "GET", .path = "/restore/jobs", .operation_id = "listRestoreJobs" },
+    .{ .method = "GET", .path = "/restore/jobs/{job_id}", .operation_id = "getRestoreJob" },
+    .{ .method = "DELETE", .path = "/restore/jobs/{job_id}", .operation_id = "cancelRestoreJob" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
@@ -811,6 +838,9 @@ pub const routes = [_]Route{
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listRestoreJobs(self: *Impl, ctx: *httpx.Context, params: ListRestoreJobsParams) !httpx.Response
+//   fn getRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelRestoreJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response

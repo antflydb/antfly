@@ -76,6 +76,7 @@ pub const ServerlessHttpServer = struct {
 
         return .{
             .status = resp.status,
+            .owner_allocator = self.alloc,
             .content_type = try self.alloc.dupe(u8, resp.content_type),
             .body = try self.alloc.dupe(u8, resp.body),
         };

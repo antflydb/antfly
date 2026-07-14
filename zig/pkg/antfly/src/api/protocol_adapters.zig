@@ -91,7 +91,9 @@ const mcp_tool_specs = [_]McpToolSpec{
         .description = "Create an Antfly table",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "numShards", .schema_type = .integer, .default_json = "3" },
+            // The runtime default is topology-aware: one for standalone and
+            // three for distributed deployments.
+            .{ .name = "numShards", .schema_type = .integer },
             .{ .name = "key", .schema_type = .string },
             .{ .name = "fields", .schema_type = .string, .description = "JSON object defining field types" },
         },
@@ -318,7 +320,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             var body = std.json.ObjectMap.empty;
-            try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse 3 });
+            const default_shards: i64 = if (ctx.server.cfg.deployment_mode.isStandalone()) 1 else 3;
+            try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse default_shards });
             if (jsonStringArg(args, "fields")) |fields_json| {
                 if (fields_json.len != 0) {
                     const fields = std.json.parseFromSliceLeaky(std.json.Value, alloc, fields_json, .{}) catch return mcpError(alloc, "invalid fields JSON");

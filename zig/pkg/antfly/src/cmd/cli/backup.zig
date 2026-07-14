@@ -16,25 +16,34 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const platform_time = antfly.platform_time;
 
-const backup_codec = antfly.backup_codec;
-const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 const portable_backup = antfly.portable_backup;
 
-const default_backup_location = "file:///tmp/antfly_backups";
+const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
+const restore_poll_interval_ms: u64 = 1000;
+const max_restore_tables: usize = 256;
+const default_backup_list_limit: usize = 100;
+const max_backup_list_limit: usize = 1000;
+
+const RestorePollDisposition = enum { use_data, retry, invalid };
 
 const BackupArgs = struct {
     help: bool = false,
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
-    location: []const u8 = default_backup_location,
+    location: []const u8 = "",
     format: ?[]const u8 = null,
     url: ?[]const u8 = null,
     output: ?[]const u8 = null,
-    out_path: ?[]const u8 = null,
+    connection: ?[]const u8 = null,
+    location_explicit: bool = false,
     list_backups: bool = false,
+    list_limit: usize = default_backup_list_limit,
+    list_limit_explicit: bool = false,
+    list_cursor: ?[]const u8 = null,
 };
 
 const RestoreArgs = struct {
@@ -42,12 +51,15 @@ const RestoreArgs = struct {
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
-    location: []const u8 = default_backup_location,
+    location: []const u8 = "",
     location_explicit: bool = false,
-    format: ?[]const u8 = null,
     restore_mode: ?[]const u8 = null,
     url: ?[]const u8 = null,
     input_path: ?[]const u8 = null,
+    connection: ?[]const u8 = null,
+    idempotency_key: ?[]const u8 = null,
+    wait: bool = false,
+    wait_timeout_ms: u64 = default_restore_wait_timeout_ms,
 };
 
 const InputRestorePlan = struct {
@@ -70,6 +82,14 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         printBackupUsage();
         return;
     }
+    const connection = opts.connection orelse cli.fatal("--connection is required", .{});
+    validateBackupArgs(opts) catch |err| switch (err) {
+        error.BackupLocationRequired => cli.fatal("--location is required", .{}),
+        error.InvalidBackupListLimit => cli.fatal("--limit must be between 1 and {d}", .{max_backup_list_limit}),
+        error.InvalidBackupCursor => cli.fatal("--cursor is invalid", .{}),
+        error.BackupPaginationRequiresList => cli.fatal("--limit and --cursor require --list", .{}),
+        else => cli.fatal("invalid backup arguments", .{}),
+    };
 
     if (opts.url) |value| try client.setBaseUrl(value);
 
@@ -79,66 +99,73 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
                 cli.fatal("only JSON output is supported for backup --list", .{});
             }
         }
-        var resp = try client.listBackups(.{ .location = opts.location });
+        var limit_buf: [20]u8 = undefined;
+        const limit = try std.fmt.bufPrint(&limit_buf, "{d}", .{opts.list_limit});
+        var resp = try client.listBackups(.{
+            .location = opts.location,
+            .connection = connection,
+            .limit = limit,
+            .cursor = opts.list_cursor,
+        });
         defer resp.deinit();
-        if (resp.data) |data| {
-            try cli.writeJson(allocator, io, data.value);
-        }
+        const result = if (resp.data) |*data| data.value else cli.fatal("invalid backup-list response", .{});
+        try cli.writeJson(allocator, io, result);
         return;
     }
 
     if (opts.table_name) |tbl| {
-        const selected_format = if (opts.out_path != null and opts.format == null) "portable" else opts.format orelse "native";
+        const selected_format = opts.format orelse "portable";
         if (!std.mem.eql(u8, selected_format, "native") and !std.mem.eql(u8, selected_format, "portable")) {
             cli.fatal("unsupported backup format: {s}", .{selected_format});
         }
-
-        var out_plan: ?PortableOutPlan = null;
-        defer if (out_plan) |*plan| plan.deinit(allocator);
-        const bid = if (opts.out_path) |out_path| blk: {
-            if (!std.mem.eql(u8, selected_format, "portable")) {
-                cli.fatal("--out is only supported with --format portable", .{});
-            }
-            out_plan = try PortableOutPlan.init(allocator, out_path, opts.backup_id);
-            break :blk out_plan.?.backup_id;
-        } else opts.backup_id orelse cli.fatal("--backup-id is required", .{});
-        const location = if (out_plan) |plan| plan.location else opts.location;
-        try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .format = selected_format });
-        if (out_plan) |plan| {
-            validatePortableOutputFile(allocator, io, plan.out_path) catch |err| switch (err) {
-                error.EmptyPortableOutput => cli.fatal("portable backup completed but local --out file is empty: {s}", .{plan.out_path}),
-                error.FileNotFound => cli.fatal("portable backup completed but local --out file is not readable: {s}", .{plan.out_path}),
-                else => cli.fatal("portable backup completed but local --out file is not a valid portable AFB: {s}", .{plan.out_path}),
-            };
-            std.debug.print("Portable backup written to {s}.\n", .{plan.out_path});
-        } else {
-            std.debug.print("Backup command successful.\n", .{});
-        }
+        const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
+        try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
+        std.debug.print("Backup command successful.\n", .{});
         return;
     }
 
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    defer names.deinit(allocator);
     var table_names: ?[]const []const u8 = null;
     if (opts.tables_str) |ts| {
-        var names = std.ArrayListUnmanaged([]const u8).empty;
-        var it = std.mem.splitScalar(u8, ts, ',');
-        while (it.next()) |name| {
-            try names.append(allocator, std.mem.trim(u8, name, " "));
-        }
+        parseTableNames(allocator, &names, ts) catch |err| tableListFatal(err);
         table_names = names.items;
     }
 
     var resp = try client.clusterBackup(.{
         .backup_id = bid,
         .location = opts.location,
+        .connection = connection,
+        .format = opts.format orelse "portable",
         .table_names = table_names,
     });
     defer resp.deinit();
-    if (resp.data) |data| {
-        try cli.writeJson(allocator, io, data.value);
-    }
+    const result = if (resp.data) |*data| data.value else cli.fatal("invalid cluster backup response", .{});
+    try cli.writeJson(allocator, io, result);
+    validateClusterBackupResult(result.status, result.tables) catch |err| switch (err) {
+        error.ClusterBackupIncomplete => cli.fatal("cluster backup incomplete; inspect the result above", .{}),
+        error.InvalidBackupResponse => cli.fatal("invalid or internally inconsistent cluster backup response", .{}),
+    };
     std.debug.print("Backup command successful.\n", .{});
+}
+
+fn validateClusterBackupResult(status: []const u8, tables: []const antfly_client.types.TableBackupStatus) !void {
+    var completed: usize = 0;
+    var incomplete: usize = 0;
+    for (tables) |table| {
+        if (std.mem.eql(u8, table.status, "completed")) {
+            completed += 1;
+        } else if (std.mem.eql(u8, table.status, "failed") or std.mem.eql(u8, table.status, "skipped")) {
+            incomplete += 1;
+        } else {
+            return error.InvalidBackupResponse;
+        }
+    }
+    const expected = if (completed == 0) "failed" else if (incomplete > 0) "partial" else "completed";
+    if (!std.mem.eql(u8, status, expected)) return error.InvalidBackupResponse;
+    if (!std.mem.eql(u8, expected, "completed")) return error.ClusterBackupIncomplete;
 }
 
 pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -147,8 +174,10 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         printRestoreUsage();
         return;
     }
+    const connection = opts.connection orelse cli.fatal("--connection is required", .{});
 
     validateRestoreArgs(opts) catch |err| switch (err) {
+        error.RestoreLocationRequired => cli.fatal("--location is required", .{}),
         error.RestoreInputModeUnsupported => cli.fatal("--input restore targets one table; omit --mode", .{}),
         else => cli.fatal("invalid restore arguments", .{}),
     };
@@ -158,50 +187,110 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     if (opts.input_path) |input| {
         if (opts.tables_str != null) cli.fatal("--input restore supports exactly one --table", .{});
         const tbl = opts.table_name orelse cli.fatal("--table is required with --input", .{});
-        if (opts.format) |value| {
-            if (!std.mem.eql(u8, value, "portable")) {
-                cli.fatal("--input restore is portable; omit --format or use --format portable", .{});
-            }
-        }
-
         const location = try restoreInputLocationAlloc(allocator, input, opts);
         defer allocator.free(location);
-        var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location);
+        var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location, connection);
         defer plan.deinit(allocator);
-        try client.restoreTable(plan.tableName(), plan.request);
-        std.debug.print("Restore command successfully initiated.\n", .{});
+        var resp = try client.restoreTableWithOptions(plan.tableName(), plan.request, .{ .idempotency_key = opts.idempotency_key });
+        defer resp.deinit();
+        try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
         return;
     }
 
     const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
 
     if (opts.table_name) |tbl| {
-        try client.restoreTable(tbl, .{ .backup_id = bid, .location = opts.location, .format = opts.format });
-        std.debug.print("Restore command successfully initiated.\n", .{});
+        var resp = try client.restoreTableWithOptions(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection }, .{ .idempotency_key = opts.idempotency_key });
+        defer resp.deinit();
+        try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
         return;
     }
 
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    defer names.deinit(allocator);
     var table_names: ?[]const []const u8 = null;
     if (opts.tables_str) |ts| {
-        var names = std.ArrayListUnmanaged([]const u8).empty;
-        var it = std.mem.splitScalar(u8, ts, ',');
-        while (it.next()) |name| {
-            try names.append(allocator, std.mem.trim(u8, name, " "));
-        }
+        parseTableNames(allocator, &names, ts) catch |err| tableListFatal(err);
         table_names = names.items;
     }
 
-    var resp = try client.clusterRestore(.{
+    var resp = try client.clusterRestoreWithOptions(.{
         .backup_id = bid,
         .location = opts.location,
+        .connection = connection,
         .table_names = table_names,
         .restore_mode = opts.restore_mode,
-    });
+    }, .{ .idempotency_key = opts.idempotency_key });
     defer resp.deinit();
-    if (resp.data) |data| {
-        try cli.writeJson(allocator, io, data.value);
+    try writeRestoreResponse(allocator, io, client, &resp, opts.wait, opts.wait_timeout_ms);
+}
+
+fn writeRestoreResponse(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *antfly_client.AntflyClient,
+    accepted: *antfly_client.openapi.ApiResponse(antfly_client.types.RestoreJob),
+    wait: bool,
+    timeout_ms: u64,
+) !void {
+    cli.expectHttpSuccess(accepted.*);
+    const initial = if (accepted.data) |*data| data.value else return error.InvalidRestoreResponse;
+    if (!wait or isTerminalRestorePhase(initial.phase)) {
+        try cli.writeJson(allocator, io, initial);
+        return restorePhaseResult(initial.phase);
     }
-    std.debug.print("Restore command successfully initiated.\n", .{});
+
+    var terminal = try waitForRestoreJob(client, io, initial.job_id, timeout_ms);
+    defer terminal.deinit();
+    const job = if (terminal.data) |*data| data.value else return error.InvalidRestoreResponse;
+    try cli.writeJson(allocator, io, job);
+    return restorePhaseResult(job.phase);
+}
+
+pub fn waitForRestoreJob(
+    client: *antfly_client.AntflyClient,
+    io: std.Io,
+    job_id: []const u8,
+    timeout_ms: u64,
+) !antfly_client.openapi.ApiResponse(antfly_client.types.RestoreJob) {
+    const started_ns = platform_time.monotonicNs();
+    const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    while (true) {
+        var response = try client.getRestoreJob(job_id);
+        if (response.data) |*data| {
+            if (isTerminalRestorePhase(data.value.phase)) return response;
+        } else if (classifyRestorePollResponse(response.status_code, false) == .invalid) {
+            cli.expectHttpSuccess(response);
+            response.deinit();
+            return error.InvalidRestoreResponse;
+        } else {
+            // A distributed metadata follower can legitimately lag the
+            // replicated restore catalog for a short period. The endpoint's
+            // 503 contract is explicitly retryable; keep the canonical CLI
+            // usable behind a non-sticky load balancer instead of turning
+            // normal Raft propagation into a terminal restore failure.
+        }
+        response.deinit();
+        const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+        if (elapsed_ns >= timeout_ns) return error.RestoreWaitTimeout;
+        const poll_ns = restore_poll_interval_ms * std.time.ns_per_ms;
+        const delay_ns = @min(poll_ns, timeout_ns - elapsed_ns);
+        io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch return error.RestoreWaitInterrupted;
+    }
+}
+
+fn classifyRestorePollResponse(status_code: u16, has_data: bool) RestorePollDisposition {
+    if (has_data) return .use_data;
+    return if (status_code == 503) .retry else .invalid;
+}
+
+pub fn isTerminalRestorePhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, "succeeded") or std.mem.eql(u8, phase, "failed") or std.mem.eql(u8, phase, "cancelled");
+}
+
+pub fn restorePhaseResult(phase: []const u8) !void {
+    if (std.mem.eql(u8, phase, "failed")) return error.RestoreJobFailed;
+    if (std.mem.eql(u8, phase, "cancelled")) return error.RestoreJobCancelled;
 }
 
 fn prepareInputRestorePlan(
@@ -210,6 +299,7 @@ fn prepareInputRestorePlan(
     table_name: []const u8,
     backup_id: ?[]const u8,
     location: []const u8,
+    connection: []const u8,
 ) !InputRestorePlan {
     var owned_backup_id: ?[]u8 = null;
     defer if (owned_backup_id) |value| allocator.free(value);
@@ -229,7 +319,7 @@ fn prepareInputRestorePlan(
         .request = .{
             .backup_id = staged.backup_id,
             .location = staged.location,
-            .format = "portable",
+            .connection = connection,
         },
     };
 }
@@ -247,16 +337,22 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
             out.backup_id = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--location")) {
             out.location = try nextRequired(args);
+            out.location_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--connection")) {
+            out.connection = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--format")) {
             out.format = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--url")) {
             out.url = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
             out.output = try nextRequired(args);
-        } else if (std.mem.eql(u8, arg, "--out")) {
-            out.out_path = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--list")) {
             out.list_backups = true;
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            out.list_limit = try std.fmt.parseUnsigned(usize, try nextRequired(args), 10);
+            out.list_limit_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--cursor")) {
+            out.list_cursor = try nextRequired(args);
         } else {
             return error.UnknownArgument;
         }
@@ -278,14 +374,22 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
         } else if (std.mem.eql(u8, arg, "--location")) {
             out.location = try nextRequired(args);
             out.location_explicit = true;
-        } else if (std.mem.eql(u8, arg, "--format")) {
-            out.format = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--connection")) {
+            out.connection = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--mode")) {
             out.restore_mode = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
             out.input_path = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--url")) {
             out.url = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--idempotency-key")) {
+            out.idempotency_key = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--wait")) {
+            out.wait = true;
+        } else if (std.mem.eql(u8, arg, "--wait-timeout")) {
+            const seconds = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
+            out.wait_timeout_ms = try std.math.mul(u64, seconds, 1000);
+            out.wait = true;
         } else {
             return error.UnknownArgument;
         }
@@ -293,10 +397,32 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
     return out;
 }
 
+fn validateBackupArgs(opts: BackupArgs) !void {
+    if (!opts.location_explicit) return error.BackupLocationRequired;
+    if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
+    if (opts.list_backups and (opts.table_name != null or opts.tables_str != null or opts.backup_id != null or opts.format != null))
+        return error.ConflictingBackupListArguments;
+    if (!opts.list_backups and (opts.list_limit_explicit or opts.list_cursor != null)) return error.BackupPaginationRequiresList;
+    if (opts.list_limit == 0 or opts.list_limit > max_backup_list_limit) return error.InvalidBackupListLimit;
+    if (opts.list_cursor) |cursor| try validateBackupCursor(cursor);
+    if (opts.format) |format| {
+        if (!std.mem.eql(u8, format, "native") and !std.mem.eql(u8, format, "portable")) return error.UnsupportedBackupFormat;
+    }
+}
+
+fn validateBackupCursor(cursor: []const u8) !void {
+    if (cursor.len == 0 or cursor.len > 128 or std.mem.eql(u8, cursor, ".") or std.mem.eql(u8, cursor, "..")) return error.InvalidBackupCursor;
+    for (cursor) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return error.InvalidBackupCursor;
+}
+
 fn validateRestoreArgs(opts: RestoreArgs) !void {
-    if (opts.input_path == null) return;
-    if (opts.restore_mode != null) return error.RestoreInputModeUnsupported;
-    if (!isPortableRestoreInputPath(opts.input_path.?)) return error.InvalidRestoreInputPath;
+    if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
+    if (opts.input_path) |input| {
+        if (opts.tables_str != null or opts.table_name == null) return error.InvalidRestoreInputTarget;
+        if (opts.restore_mode != null) return error.RestoreInputModeUnsupported;
+        if (!isPortableRestoreInputPath(input)) return error.InvalidRestoreInputPath;
+    }
+    if (!opts.location_explicit) return error.RestoreLocationRequired;
 }
 
 fn isPortableRestoreInputPath(path: []const u8) bool {
@@ -304,26 +430,44 @@ fn isPortableRestoreInputPath(path: []const u8) bool {
 }
 
 fn restoreInputLocationAlloc(allocator: std.mem.Allocator, input_path: []const u8, opts: RestoreArgs) ![]u8 {
-    if (opts.location_explicit or !std.mem.endsWith(u8, input_path, ".aflite")) {
-        return try allocator.dupe(u8, opts.location);
-    }
-    return try defaultLiteInputRestoreLocationAlloc(allocator);
+    _ = input_path;
+    if (!opts.location_explicit) return error.RestoreInputLocationRequired;
+    return try allocator.dupe(u8, opts.location);
 }
 
-fn defaultLiteInputRestoreLocationAlloc(allocator: std.mem.Allocator) ![]u8 {
-    return try lite_paths.defaultBackupsLocationAlloc(allocator);
+fn parseTableNames(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), raw: []const u8) !void {
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |candidate| {
+        const name = std.mem.trim(u8, candidate, " \t\r\n");
+        if (name.len == 0) return error.InvalidTableName;
+        if (out.items.len >= max_restore_tables) return error.TooManyRestoreTables;
+        for (out.items) |existing| if (std.mem.eql(u8, existing, name)) return error.DuplicateTableName;
+        try out.append(allocator, name);
+    }
+    if (out.items.len == 0) return error.InvalidTableName;
+}
+
+fn tableListFatal(err: anyerror) noreturn {
+    switch (err) {
+        error.InvalidTableName => cli.fatal("--tables contains an empty table name", .{}),
+        error.DuplicateTableName => cli.fatal("--tables contains a duplicate table name", .{}),
+        error.TooManyRestoreTables => cli.fatal("--tables supports at most {d} table names", .{max_restore_tables}),
+        else => cli.fatal("invalid --tables value: {s}", .{@errorName(err)}),
+    }
 }
 
 fn printBackupUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly backup --table <name> --backup-id <id> [--location <uri>] [--format native|portable] [--url <url>]
-        \\  antfly backup --table <name> --format portable --out <backup.afb> [--url <url>]
-        \\  antfly backup --tables <a,b> --backup-id <id> [--location <uri>] [--url <url>]
-        \\  antfly backup --list [--location <uri>] [--output json] [--url <url>]
+        \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
+        \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
+        \\  antfly backup --list --connection <id> --location <uri> [--limit <1-1000>] [--cursor <cursor>] [--output json] [--url <url>]
         \\
         \\notes:
-        \\  `--out` writes a single portable AFB file for Lite restore/import.
+        \\  Network backups are written by the server through the named connection.
+        \\  Table and cluster backups default to the portable format.
+        \\  Backup listing returns one page and includes next_cursor when more results remain.
+        \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local AFB artifact.
         \\
     , .{});
 }
@@ -331,86 +475,21 @@ fn printBackupUsage() void {
 fn printRestoreUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly restore --table <name> --backup-id <id> [--location <uri>] [--format native|portable] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> [--location <uri>] [--mode <mode>] [--url <url>]
-        \\  antfly restore --input <db.aflite|backup.afb> --table <name> [--backup-id <id>] [--location <uri>] [--url <url>]
+        \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\
         \\notes:
         \\  `--input db.aflite` stages an Antfly Lite database as a portable backup,
         \\  then restores it through the normal Antfly table restore path.
-        \\  Without --location, .aflite input stages under ~/.antfly/lite/backups.
+        \\  Input restore requires a location writable by this client and readable
+        \\  by the target's named connection. These may use different credentials.
         \\
     , .{});
 }
 
 fn nextRequired(args: *std.process.Args.Iterator) ![]const u8 {
     return args.next() orelse error.MissingArgument;
-}
-
-const PortableOutPlan = struct {
-    out_path: []u8,
-    backup_id: []u8,
-    location: []u8,
-
-    fn init(allocator: std.mem.Allocator, out_path: []const u8, requested_backup_id: ?[]const u8) !PortableOutPlan {
-        if (!std.mem.endsWith(u8, out_path, ".afb")) cli.fatal("--out path must end in .afb: {s}", .{out_path});
-
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", allocator);
-        defer allocator.free(cwd);
-        const absolute_out_path = if (std.fs.path.isAbsolute(out_path))
-            try allocator.dupe(u8, out_path)
-        else
-            try std.fs.path.join(allocator, &.{ cwd, out_path });
-        errdefer allocator.free(absolute_out_path);
-
-        const base = std.fs.path.basename(absolute_out_path);
-        const derived_backup_id = try allocator.dupe(u8, base[0 .. base.len - ".afb".len]);
-        errdefer allocator.free(derived_backup_id);
-        if (requested_backup_id) |backup_id| {
-            if (!std.mem.eql(u8, backup_id, derived_backup_id)) {
-                cli.fatal("--backup-id must match the --out file stem for portable file output", .{});
-            }
-        }
-
-        const parent = std.fs.path.dirname(absolute_out_path) orelse cwd;
-        const location = try std.fmt.allocPrint(allocator, "file://{s}", .{parent});
-        errdefer allocator.free(location);
-
-        return .{
-            .out_path = absolute_out_path,
-            .backup_id = derived_backup_id,
-            .location = location,
-        };
-    }
-
-    fn deinit(self: *PortableOutPlan, allocator: std.mem.Allocator) void {
-        allocator.free(self.out_path);
-        allocator.free(self.backup_id);
-        allocator.free(self.location);
-        self.* = undefined;
-    }
-};
-
-fn validatePortableOutputFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    const body = try readOutputFileAlloc(allocator, io, path, lite_restore_staging.max_afb_file_bytes);
-    defer allocator.free(body);
-    if (body.len == 0) return error.EmptyPortableOutput;
-    try portable_backup.validatePortable(allocator, body);
-}
-
-fn readOutputFileAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
-    if (!std.fs.path.isAbsolute(path)) {
-        return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
-    }
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    const size = (try file.stat(io)).size;
-    if (size > max_bytes or size > std.math.maxInt(usize)) return error.FileTooBig;
-    var buf: [8192]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    return try reader.interface.readAlloc(allocator, @intCast(size));
 }
 
 test "backup cli parser accepts help flag" {
@@ -420,13 +499,28 @@ test "backup cli parser accepts help flag" {
     try std.testing.expect(opts.help);
 }
 
+test "cluster backup CLI fails closed on incomplete and unknown results" {
+    const completed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "completed" }};
+    const failed = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "failed" }};
+    const partial = [_]antfly_client.types.TableBackupStatus{
+        .{ .name = "docs", .status = "completed" },
+        .{ .name = "events", .status = "failed" },
+    };
+    const unknown = [_]antfly_client.types.TableBackupStatus{.{ .name = "docs", .status = "queued" }};
+    try validateClusterBackupResult("completed", &completed);
+    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult("partial", &partial));
+    try std.testing.expectError(error.ClusterBackupIncomplete, validateClusterBackupResult("failed", &failed));
+    try std.testing.expectError(error.InvalidBackupResponse, validateClusterBackupResult("completed", &failed));
+    try std.testing.expectError(error.InvalidBackupResponse, validateClusterBackupResult("queued", &unknown));
+}
+
 test "backup cli parser rejects unknown arguments" {
     var argv = [_][*:0]const u8{ "--backup-id", "daily", "--bogus" };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
 }
 
-test "backup cli parser accepts portable out path" {
+test "backup cli parser rejects local out path" {
     var argv = [_][*:0]const u8{
         "--table",
         "docs",
@@ -436,51 +530,34 @@ test "backup cli parser accepts portable out path" {
         "docs.afb",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
+}
+
+test "network backup requires explicit location" {
+    var argv = [_][*:0]const u8{ "--backup-id", "daily", "--connection", "archive-writer" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseBackupArgs(&iter);
-    try std.testing.expectEqualStrings("docs", opts.table_name.?);
-    try std.testing.expectEqualStrings("portable", opts.format.?);
-    try std.testing.expectEqualStrings("docs.afb", opts.out_path.?);
+    try std.testing.expectError(error.BackupLocationRequired, validateBackupArgs(opts));
 }
 
-test "portable out plan derives file location and backup id" {
-    const allocator = std.testing.allocator;
-    var plan = try PortableOutPlan.init(allocator, "docs.afb", null);
-    defer plan.deinit(allocator);
-    try std.testing.expectEqualStrings("docs", plan.backup_id);
-    try std.testing.expect(std.mem.endsWith(u8, plan.out_path, "/docs.afb"));
-    try std.testing.expect(std.mem.startsWith(u8, plan.location, "file://"));
+test "backup rejects conflicting table selectors" {
+    var argv = [_][*:0]const u8{ "--table", "one", "--tables", "two,three", "--location", "s3://archive/backups" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseBackupArgs(&iter);
+    try std.testing.expectError(error.ConflictingTableSelection, validateBackupArgs(opts));
 }
 
-test "portable output validation requires a valid afb" {
-    const allocator = std.testing.allocator;
+test "backup list CLI exposes bounded cursor pagination" {
+    var argv = [_][*:0]const u8{ "--list", "--location", "s3://archive/backups", "--limit", "250", "--cursor", "snap-024" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseBackupArgs(&iter);
+    try validateBackupArgs(opts);
+    try std.testing.expectEqual(@as(usize, 250), opts.list_limit);
+    try std.testing.expectEqualStrings("snap-024", opts.list_cursor.?);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
-    const valid_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/valid.afb", .{tmp.sub_path});
-    defer allocator.free(valid_path);
-    const malformed_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/malformed.afb", .{tmp.sub_path});
-    defer allocator.free(malformed_path);
-
-    var valid = std.ArrayList(u8).empty;
-    defer valid.deinit(allocator);
-    try backup_codec.writeHeader(&valid, allocator, .{
-        .format_version = backup_codec.format_version,
-        .flags = 0,
-        .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
-        .table_count = 1,
-        .shard_count = 1,
-    });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = valid_path, .data = valid.items });
-    try validatePortableOutputFile(allocator, io, valid_path);
-
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = malformed_path, .data = "not an afb" });
-    try std.testing.expectError(error.EndOfStream, validatePortableOutputFile(allocator, io, malformed_path));
+    var invalid_argv = [_][*:0]const u8{ "--location", "s3://archive/backups", "--limit", "10" };
+    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid_argv[0..] });
+    try std.testing.expectError(error.BackupPaginationRequiresList, validateBackupArgs(try parseBackupArgs(&invalid_iter)));
 }
 
 test "restore cli parser accepts aflite input shape" {
@@ -489,8 +566,6 @@ test "restore cli parser accepts aflite input shape" {
         "app.aflite",
         "--table",
         "docs",
-        "--format",
-        "portable",
         "--location",
         "file:///tmp/backups",
         "--backup-id",
@@ -500,13 +575,18 @@ test "restore cli parser accepts aflite input shape" {
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectEqualStrings("app.aflite", opts.input_path.?);
     try std.testing.expectEqualStrings("docs", opts.table_name.?);
-    try std.testing.expectEqualStrings("portable", opts.format.?);
     try std.testing.expectEqualStrings("file:///tmp/backups", opts.location);
     try std.testing.expect(opts.location_explicit);
     try std.testing.expectEqualStrings("lite-app", opts.backup_id.?);
 }
 
-test "restore input location defaults aflite staging under lite workspace" {
+test "restore CLI rejects ignored format selection" {
+    var argv = [_][*:0]const u8{ "--table", "docs", "--format", "portable" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&iter));
+}
+
+test "restore input location requires explicit shared staging" {
     const allocator = std.testing.allocator;
 
     var argv = [_][*:0]const u8{
@@ -519,13 +599,10 @@ test "restore input location defaults aflite staging under lite workspace" {
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(!opts.location_explicit);
 
-    const location = try restoreInputLocationAlloc(allocator, opts.input_path.?, opts);
-    defer allocator.free(location);
-    try std.testing.expect(std.mem.startsWith(u8, location, "file://"));
-    try std.testing.expect(std.mem.endsWith(u8, location, "/.antfly/lite/backups"));
+    try std.testing.expectError(error.RestoreInputLocationRequired, restoreInputLocationAlloc(allocator, opts.input_path.?, opts));
 }
 
-test "restore input location keeps generic default for afb input" {
+test "restore afb input also requires explicit shared staging" {
     const allocator = std.testing.allocator;
 
     var argv = [_][*:0]const u8{
@@ -538,9 +615,7 @@ test "restore input location keeps generic default for afb input" {
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(!opts.location_explicit);
 
-    const location = try restoreInputLocationAlloc(allocator, opts.input_path.?, opts);
-    defer allocator.free(location);
-    try std.testing.expectEqualStrings(default_backup_location, location);
+    try std.testing.expectError(error.RestoreInputLocationRequired, restoreInputLocationAlloc(allocator, opts.input_path.?, opts));
 }
 
 test "restore input plan stages aflite as portable table restore" {
@@ -569,17 +644,9 @@ test "restore input plan stages aflite as portable table restore" {
     ;
 
     {
-        var backend = try antfly.lite.backend.Handle.create(allocator, src_path, true);
-        defer backend.deinit();
-
-        var opts = antfly.db.OpenOptions{
-            .open_mode = .writer,
-            .external_derived_checkpoints = false,
-        };
-        try backend.configureDbOpenOptions(&opts);
-
-        var db = try antfly.db.DB.open(allocator, src_path, opts);
-        defer db.close();
+        var lite = try antfly.lite.connection.Connection.create(allocator, src_path, true);
+        defer lite.close();
+        const db = &lite.db;
         try db.setSchemaJson(allocator, schema_json);
         try db.addEnrichment(.{
             .name = "restore_input_chunks_v1",
@@ -603,13 +670,12 @@ test "restore input plan stages aflite as portable table restore" {
         try db.runUntilIdle();
     }
 
-    var plan = try prepareInputRestorePlan(allocator, src_path, "docs", null, location);
+    var plan = try prepareInputRestorePlan(allocator, src_path, "docs", null, location, "local-reader");
     defer plan.deinit(allocator);
 
     try std.testing.expectEqualStrings("docs", plan.tableName());
     try std.testing.expectEqualStrings("lite-restore-input-plan-src", plan.request.backup_id);
     try std.testing.expectEqualStrings(location, plan.request.location);
-    try std.testing.expectEqualStrings("portable", plan.request.format.?);
     try std.testing.expectEqualStrings("lite-restore-input-plan-src.afb", plan.staged.snapshot_path);
 
     var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);
@@ -645,6 +711,20 @@ test "restore cli parser accepts help flag" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(opts.help);
+}
+
+test "network restore requires explicit location" {
+    var argv = [_][*:0]const u8{ "--backup-id", "daily", "--connection", "archive-reader" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectError(error.RestoreLocationRequired, validateRestoreArgs(opts));
+}
+
+test "restore rejects conflicting table selectors" {
+    var argv = [_][*:0]const u8{ "--table", "one", "--tables", "two,three", "--location", "s3://archive/backups" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectError(error.ConflictingTableSelection, validateRestoreArgs(opts));
 }
 
 test "restore cli parser keeps mode visible for input validation" {
@@ -688,8 +768,29 @@ test "restore cli validation rejects unsupported input extension" {
     try std.testing.expectError(error.InvalidRestoreInputPath, validateRestoreArgs(opts));
 }
 
+test "restore polling response classification retries only service unavailable" {
+    try std.testing.expectEqual(RestorePollDisposition.use_data, classifyRestorePollResponse(200, true));
+    try std.testing.expectEqual(RestorePollDisposition.retry, classifyRestorePollResponse(503, false));
+    try std.testing.expectEqual(RestorePollDisposition.invalid, classifyRestorePollResponse(404, false));
+    try std.testing.expectEqual(RestorePollDisposition.invalid, classifyRestorePollResponse(500, false));
+}
+
 test "restore cli parser rejects unknown arguments" {
     var argv = [_][*:0]const u8{ "--input", "app.aflite", "--table", "docs", "--bogus" };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&iter));
+}
+
+test "restore table list trims names and rejects ambiguous input" {
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    defer names.deinit(std.testing.allocator);
+    try parseTableNames(std.testing.allocator, &names, " alpha, beta ");
+    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    try std.testing.expectEqualStrings("alpha", names.items[0]);
+    try std.testing.expectEqualStrings("beta", names.items[1]);
+
+    names.clearRetainingCapacity();
+    try std.testing.expectError(error.InvalidTableName, parseTableNames(std.testing.allocator, &names, "alpha,,beta"));
+    names.clearRetainingCapacity();
+    try std.testing.expectError(error.DuplicateTableName, parseTableNames(std.testing.allocator, &names, "alpha,alpha"));
 }

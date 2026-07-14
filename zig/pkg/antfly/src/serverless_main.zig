@@ -18,8 +18,44 @@ const antfly = @import("antfly-zig");
 const serverless = antfly.serverless;
 const serverless_default_max_request_bytes: usize = antfly.public_api.http_server.public_api_max_request_body_bytes;
 const serverless_default_max_connection_threads: u32 = 64;
+const serverless_default_query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024;
+const serverless_default_query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024;
+
+var termination_requested: std.atomic.Value(bool) = .init(false);
+
+fn terminationSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    termination_requested.store(true, .release);
+}
+
+const TerminationSignalScope = struct {
+    old_int: std.posix.Sigaction,
+    old_term: std.posix.Sigaction,
+
+    fn install() TerminationSignalScope {
+        termination_requested.store(false, .release);
+        const action = std.posix.Sigaction{
+            .handler = .{ .handler = terminationSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_int: std.posix.Sigaction = undefined;
+        var old_term: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.INT, &action, &old_int);
+        std.posix.sigaction(.TERM, &action, &old_term);
+        return .{ .old_int = old_int, .old_term = old_term };
+    }
+
+    fn deinit(self: *TerminationSignalScope) void {
+        std.posix.sigaction(.INT, &self.old_int, null);
+        std.posix.sigaction(.TERM, &self.old_term, null);
+        termination_requested.store(false, .release);
+        self.* = undefined;
+    }
+};
 
 const CliConfig = struct {
+    config_path: ?[]const u8 = null,
+    secret_store_path: ?[]const u8 = null,
     artifacts_uri: ?[]const u8 = null,
     manifests_uri: ?[]const u8 = null,
     wal_uri: ?[]const u8 = null,
@@ -51,14 +87,14 @@ pub fn run(
     init: std.process.Init,
     forced_role: ?serverless.RuntimeRole,
     forced_listener: ?bool,
-    forced_swarm_mode: ?bool,
+    forced_combined_mode: ?bool,
 ) !void {
     const alloc = init.gpa;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
 
     const argv0 = args.next() orelse "antfly_serverless";
-    return try runFromIterator(init, argv0, &args, forced_role, forced_listener, forced_swarm_mode);
+    return try runFromIterator(init, argv0, &args, forced_role, forced_listener, forced_combined_mode);
 }
 
 pub fn runFromIterator(
@@ -67,46 +103,69 @@ pub fn runFromIterator(
     args: *std.process.Args.Iterator,
     forced_role: ?serverless.RuntimeRole,
     forced_listener: ?bool,
-    forced_swarm_mode: ?bool,
+    forced_combined_mode: ?bool,
 ) !void {
     const alloc = init.gpa;
+    var termination_signals = TerminationSignalScope.install();
+    defer termination_signals.deinit();
     const cli = try parseCli(args);
     if (cli.help) {
         printUsage(argv0);
         return;
     }
 
+    var secret_store: ?antfly.common.secrets.FileStore = if (cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH")) |path|
+        try antfly.common.secrets.FileStore.init(alloc, path)
+    else
+        null;
+    defer if (secret_store) |*store| store.deinit();
+    var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |path|
+        try antfly.common.config.loadFromPathWithSecretsForDeployment(alloc, path, if (secret_store) |*store| store else null, .serverless)
+    else
+        null;
+    defer if (loaded_config) |*cfg| cfg.deinit();
+    var configured_uris = try ConfiguredStorageUris.init(
+        alloc,
+        if (loaded_config) |*cfg| cfg else null,
+        if (secret_store) |*store| store else null,
+    );
+    defer configured_uris.deinit(alloc);
+    if (loaded_config != null) try rejectStorageUriOverrides(init.environ_map, cli);
+
     var remote_content: ?antfly.common.config.Config.RemoteContentConfig = null;
-    if (cli.remote_content_block_private_ips orelse parseEnvOptionalBool(init.environ_map, "ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS")) |block_private_ips| {
+    if (cli.remote_content_block_private_ips orelse try parseEnvOptionalBool(init.environ_map, "ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS")) |block_private_ips| {
         remote_content = .{
             .security = .{ .block_private_ips = block_private_ips },
         };
+    } else if (loaded_config) |*cfg| {
+        if (cfg.remote_content) |value| remote_content = value;
     }
 
     const bootstrap = serverless.BootstrapConfig{
-        .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
-        .manifests_uri = try resolveRequired(init.environ_map, cli.manifests_uri, "ANTFLY_SERVERLESS_MANIFESTS_URI"),
-        .wal_uri = try resolveRequired(init.environ_map, cli.wal_uri, "ANTFLY_SERVERLESS_WAL_URI"),
-        .progress_uri = try resolveRequired(init.environ_map, cli.progress_uri, "ANTFLY_SERVERLESS_PROGRESS_URI"),
-        .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, "ANTFLY_SERVERLESS_CATALOG_URI"),
+        .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, configured_uris.artifacts, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
+        .manifests_uri = try resolveRequired(init.environ_map, cli.manifests_uri, configured_uris.manifests, "ANTFLY_SERVERLESS_MANIFESTS_URI"),
+        .wal_uri = try resolveRequired(init.environ_map, cli.wal_uri, configured_uris.wal, "ANTFLY_SERVERLESS_WAL_URI"),
+        .progress_uri = try resolveRequired(init.environ_map, cli.progress_uri, configured_uris.progress, "ANTFLY_SERVERLESS_PROGRESS_URI"),
+        .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, configured_uris.catalog, "ANTFLY_SERVERLESS_CATALOG_URI"),
+        .s3_options = configured_uris.s3_options,
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
-        .query_cache_max_bytes = cli.query_cache_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", 0),
-        .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", 0),
+        .query_cache_max_bytes = cli.query_cache_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", serverless_default_query_cache_max_bytes),
+        .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", serverless_default_query_cache_payload_max_bytes),
         .embedding_indexes_json = cli.embedding_indexes_json orelse init.environ_map.get("ANTFLY_SERVERLESS_EMBEDDING_INDEXES_JSON"),
         .sparse_embedding_index_name = cli.sparse_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME") orelse "serverless_sparse",
         .chunk_embedding_index_name = cli.chunk_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_CHUNK_EMBEDDING_INDEX_NAME") orelse "serverless_chunk",
-        .chunk_embedding_dimensions = cli.chunk_embedding_dimensions orelse parseEnvIntOrDefault(init.environ_map, u32, "ANTFLY_SERVERLESS_CHUNK_EMBEDDING_DIMS", 8),
-        .tick_interval_ms = cli.tick_ms orelse parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_TICK_INTERVAL_MS", 25),
+        .chunk_embedding_dimensions = cli.chunk_embedding_dimensions orelse try parseEnvIntOrDefault(init.environ_map, u32, "ANTFLY_SERVERLESS_CHUNK_EMBEDDING_DIMS", 8),
+        .tick_interval_ms = cli.tick_ms orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_TICK_INTERVAL_MS", 25),
         .role = forced_role orelse try parseRuntimeRole(cli.role orelse init.environ_map.get("ANTFLY_SERVERLESS_ROLE") orelse "combined"),
-        .swarm_mode = forced_swarm_mode orelse false,
-        .publish_enabled = cli.publish_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PUBLISH_ENABLED", true),
-        .compaction_enabled = cli.compaction_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_COMPACTION_ENABLED", true),
-        .prune_enabled = cli.prune_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
-        .enrichment_enabled = cli.enrichment_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
+        .combined_mode = forced_combined_mode orelse false,
+        .publish_enabled = cli.publish_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PUBLISH_ENABLED", true),
+        .compaction_enabled = cli.compaction_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_COMPACTION_ENABLED", true),
+        .prune_enabled = cli.prune_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
+        .enrichment_enabled = cli.enrichment_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
         .remote_content = if (remote_content) |*cfg| cfg else null,
     };
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
-    const listener = if (listener_enabled) serverless_serverConfigFromEnv(init.environ_map, cli) else null;
+    const listener = if (listener_enabled) try serverless_serverConfigFromEnv(init.environ_map, cli) else null;
 
     var srv = serverless.ServerlessServer.init(alloc, .{
         .bootstrap = bootstrap,
@@ -132,7 +191,7 @@ pub fn runFromIterator(
     printRuntimeStatusSummary(srv.runtimeStatus());
 
     var health_source = ServerlessHealthSource{ .srv = &srv };
-    const health_port = cli.health_port orelse parseEnvOptionalInt(init.environ_map, u16, "ANTFLY_SERVERLESS_HEALTH_PORT");
+    const health_port = cli.health_port orelse try parseEnvOptionalInt(init.environ_map, u16, "ANTFLY_SERVERLESS_HEALTH_PORT");
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
         "serverless",
@@ -142,8 +201,10 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    while (true) {
-        sleepMs(init.io, 60_000);
+    while (!termination_requested.load(.acquire)) {
+        // A short interruptible wait bounds graceful termination latency even
+        // on platforms whose clock sleep is automatically restarted.
+        sleepMs(init.io, 250);
     }
 }
 
@@ -173,29 +234,34 @@ const ServerlessHealthSource = struct {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
         const run_stats = self.srv.stack.runtime.metricsSnapshot();
         const query_metrics = self.srv.stack.query.metricsSnapshot();
-        const append = antfly.common.health_server.appendPromMetric;
-
-        try append(writer, "antfly_serverless_published_namespaces_total", "counter", "Namespaces published by the maintenance runtime", @intCast(run_stats.published_namespaces));
-        try append(writer, "antfly_serverless_compacted_namespaces_total", "counter", "Namespaces compacted by the maintenance runtime", @intCast(run_stats.compacted_namespaces));
-        try append(writer, "antfly_serverless_pruned_namespaces_total", "counter", "Namespaces pruned by the maintenance runtime", @intCast(run_stats.pruned_namespaces));
-        try append(writer, "antfly_serverless_deleted_versions_total", "counter", "Manifest versions deleted by pruning", @intCast(run_stats.deleted_versions));
-        try append(writer, "antfly_serverless_enriched_documents_total", "counter", "Documents successfully enriched", @intCast(run_stats.enriched_documents));
-        try append(writer, "antfly_serverless_enrichment_failed_documents_total", "counter", "Documents for which enrichment failed", @intCast(run_stats.enrichment_failed_documents));
-        try append(writer, "antfly_serverless_queries_total", "counter", "Total query executions", query_metrics.total_queries);
-        try append(writer, "antfly_serverless_vector_queries_total", "counter", "Vector query executions", query_metrics.vector_queries);
-        try append(writer, "antfly_serverless_hybrid_queries_total", "counter", "Hybrid query executions", query_metrics.hybrid_queries);
-        try append(writer, "antfly_serverless_sparse_queries_total", "counter", "Sparse query executions", query_metrics.sparse_queries);
-        try antfly.db.query_metrics.writePrometheus(writer);
+        try writeServerlessPrometheus(writer, run_stats, query_metrics);
     }
 };
+
+fn writeServerlessPrometheus(writer: *std.Io.Writer, run_stats: anytype, query_metrics: anytype) !void {
+    const append = antfly.common.prometheus.appendPromMetric;
+
+    try append(writer, "antfly_serverless_published_namespaces_total", "counter", "Namespaces published by the maintenance runtime", @intCast(run_stats.published_namespaces));
+    try append(writer, "antfly_serverless_compacted_namespaces_total", "counter", "Namespaces compacted by the maintenance runtime", @intCast(run_stats.compacted_namespaces));
+    try append(writer, "antfly_serverless_pruned_namespaces_total", "counter", "Namespaces pruned by the maintenance runtime", @intCast(run_stats.pruned_namespaces));
+    try append(writer, "antfly_serverless_deleted_versions_total", "counter", "Manifest versions deleted by pruning", @intCast(run_stats.deleted_versions));
+    try append(writer, "antfly_serverless_enriched_documents_total", "counter", "Documents successfully enriched", @intCast(run_stats.enriched_documents));
+    try append(writer, "antfly_serverless_enrichment_failed_documents_total", "counter", "Documents for which enrichment failed", @intCast(run_stats.enrichment_failed_documents));
+    try append(writer, "antfly_serverless_queries_total", "counter", "Total query executions", query_metrics.total_queries);
+    try append(writer, "antfly_serverless_vector_queries_total", "counter", "Vector query executions", query_metrics.vector_queries);
+    try append(writer, "antfly_serverless_hybrid_queries_total", "counter", "Hybrid query executions", query_metrics.hybrid_queries);
+    try append(writer, "antfly_serverless_sparse_queries_total", "counter", "Sparse query executions", query_metrics.sparse_queries);
+    try antfly.db.query_metrics.writePrometheus(writer);
+    try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+}
 
 fn parseEnvOptionalInt(
     env_map: *std.process.Environ.Map,
     comptime T: type,
     env_name: []const u8,
-) ?T {
+) !?T {
     const raw = env_map.get(env_name) orelse return null;
-    return std.fmt.parseInt(T, raw, 10) catch null;
+    return std.fmt.parseInt(T, raw, 10) catch return invalidEnvironmentValue(env_name, raw, "an unsigned base-10 integer");
 }
 
 fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
@@ -203,6 +269,14 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cfg.help = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--config")) {
+            cfg.config_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--secret-store-path")) {
+            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--artifacts-uri")) {
@@ -309,13 +383,148 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
 fn resolveRequired(
     env_map: *std.process.Environ.Map,
     cli_value: ?[]const u8,
+    config_value: ?[]const u8,
     env_name: []const u8,
 ) ![]const u8 {
     if (cli_value) |value| return value;
-    return env_map.get(env_name) orelse {
+    if (env_map.get(env_name)) |value| return value;
+    return config_value orelse {
         std.debug.print("missing required config: {s}\n", .{env_name});
         return error.MissingConfiguration;
     };
+}
+
+fn rejectStorageUriOverrides(env_map: *std.process.Environ.Map, cli: CliConfig) !void {
+    if (cli.artifacts_uri != null or env_map.get("ANTFLY_SERVERLESS_ARTIFACTS_URI") != null or
+        cli.manifests_uri != null or env_map.get("ANTFLY_SERVERLESS_MANIFESTS_URI") != null or
+        cli.wal_uri != null or env_map.get("ANTFLY_SERVERLESS_WAL_URI") != null or
+        cli.progress_uri != null or env_map.get("ANTFLY_SERVERLESS_PROGRESS_URI") != null or
+        cli.catalog_uri != null or env_map.get("ANTFLY_SERVERLESS_CATALOG_URI") != null)
+    {
+        std.debug.print("serverless storage URI overrides cannot be combined with --config; select per-lane connection, bucket, and prefix under storage.object.lanes\n", .{});
+        return error.ConflictingStorageConfiguration;
+    }
+}
+
+const ConfiguredStorageUris = struct {
+    artifacts: ?[]u8 = null,
+    manifests: ?[]u8 = null,
+    wal: ?[]u8 = null,
+    progress: ?[]u8 = null,
+    catalog: ?[]u8 = null,
+    s3_options: [5]?serverless.BootstrapConfig.S3Options = .{ null, null, null, null, null },
+    resolved_credentials: [5]?antfly.common.config.Config.ResolvedExternalIoCredentials = .{ null, null, null, null, null },
+
+    fn init(
+        alloc: std.mem.Allocator,
+        cfg: ?*const antfly.common.config.Config,
+        secret_store: ?*antfly.common.secrets.FileStore,
+    ) !ConfiguredStorageUris {
+        const config = cfg orelse return .{};
+        if (config.deployment_mode != .serverless or config.storage.engine != .object) return error.InvalidServerlessStorageConfig;
+        const connection = config.storage.object_connection orelse return error.InvalidServerlessStorageConfig;
+        const bucket = config.storage.object_bucket orelse return error.InvalidServerlessStorageConfig;
+        const prefix = config.storage.object_prefix orelse "";
+        var out: ConfiguredStorageUris = .{};
+        errdefer out.deinit(alloc);
+        const lanes = [_]antfly.common.config.Config.ObjectStorageLocation{
+            config.storage.object_lanes.artifacts,
+            config.storage.object_lanes.manifests,
+            config.storage.object_lanes.wal,
+            config.storage.object_lanes.progress,
+            config.storage.object_lanes.catalog,
+        };
+        const names = [_][]const u8{ "artifacts", "manifests", "wal", "progress", "catalog" };
+        const uris = [_]*?[]u8{ &out.artifacts, &out.manifests, &out.wal, &out.progress, &out.catalog };
+        for (lanes, names, 0..) |lane, name, index| {
+            const lane_connection = lane.connection orelse connection;
+            const lane_bucket = lane.bucket orelse bucket;
+            uris[index].* = if (lane.prefix) |lane_prefix|
+                try objectUriAlloc(alloc, lane_bucket, lane_prefix)
+            else
+                try objectLaneUriAlloc(alloc, lane_bucket, prefix, name);
+            out.s3_options[index] = try storageS3Options(
+                alloc,
+                config,
+                lane_connection,
+                secret_store,
+                &out.resolved_credentials[index],
+            );
+        }
+        return out;
+    }
+
+    fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
+        if (self.artifacts) |value| alloc.free(value);
+        if (self.manifests) |value| alloc.free(value);
+        if (self.wal) |value| alloc.free(value);
+        if (self.progress) |value| alloc.free(value);
+        if (self.catalog) |value| alloc.free(value);
+        for (&self.resolved_credentials) |*maybe_credentials| {
+            if (maybe_credentials.*) |*credentials| credentials.deinit(alloc);
+        }
+        self.* = .{};
+    }
+};
+
+fn storageS3Options(
+    alloc: std.mem.Allocator,
+    config: *const antfly.common.config.Config,
+    connection_id: []const u8,
+    secret_store: ?*antfly.common.secrets.FileStore,
+    resolved_credentials: *?antfly.common.config.Config.ResolvedExternalIoCredentials,
+) !serverless.BootstrapConfig.S3Options {
+    const connection = config.connections.get(connection_id) orelse return error.InvalidServerlessStorageConfig;
+    if (connection.kind != .external_io) return error.InvalidServerlessStorageConfig;
+    const configured_external = connection.external_io orelse return error.InvalidServerlessStorageConfig;
+    if (configured_external.protocol != .s3) return error.InvalidServerlessStorageConfig;
+    resolved_credentials.* = try antfly.common.config.Config.resolveExternalIoCredentials(alloc, configured_external, secret_store);
+    const external = resolved_credentials.*.?.apply(configured_external);
+    var options = serverless.BootstrapConfig.S3Options{
+        .endpoint = external.endpoint,
+        .region = external.region,
+        .use_ssl = external.use_ssl orelse true,
+        .addressing_style = switch (external.addressing_style) {
+            .path => .path,
+            .virtual_hosted => .virtual_hosted,
+        },
+        .create_bucket = external.bucket_provisioning == .create_if_missing,
+    };
+    switch (external.credentials.source) {
+        .default => options.credential_source = .default,
+        .static => {
+            options.access_key_id = external.credentials.access_key_id;
+            options.secret_access_key = external.credentials.secret_access_key;
+            options.session_token = external.credentials.session_token;
+        },
+        .profile => options.credential_source = .{ .profile = .{
+            .name = external.credentials.profile.?,
+            .shared_credentials_file = external.credentials.shared_credentials_file,
+        } },
+        .web_identity => options.credential_source = .{ .web_identity = .{
+            .role_arn = external.credentials.role_arn.?,
+            .token_file = external.credentials.token_file.?,
+            .session_name = external.credentials.session_name orelse "antfly-serverless",
+            .sts_endpoint = external.credentials.sts_endpoint,
+        } },
+    }
+    return options;
+}
+
+fn objectUriAlloc(alloc: std.mem.Allocator, bucket: []const u8, raw_prefix: []const u8) ![]u8 {
+    const prefix = std.mem.trim(u8, raw_prefix, "/");
+    return if (prefix.len == 0)
+        try std.fmt.allocPrint(alloc, "s3://{s}", .{bucket})
+    else
+        try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, prefix });
+}
+
+fn objectLaneUriAlloc(alloc: std.mem.Allocator, bucket: []const u8, raw_prefix: []const u8, lane: []const u8) ![]u8 {
+    const prefix = std.mem.trim(u8, raw_prefix, "/");
+    return if (prefix.len == 0)
+        try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, lane })
+    else
+        try std.fmt.allocPrint(alloc, "s3://{s}/{s}/{s}", .{ bucket, prefix, lane });
 }
 
 fn parseEnvIntOrDefault(
@@ -323,43 +532,48 @@ fn parseEnvIntOrDefault(
     comptime T: type,
     env_name: []const u8,
     default: T,
-) T {
+) !T {
     const raw = env_map.get(env_name) orelse return default;
-    return std.fmt.parseInt(T, raw, 10) catch default;
+    return std.fmt.parseInt(T, raw, 10) catch return invalidEnvironmentValue(env_name, raw, "an unsigned base-10 integer");
 }
 
 fn parseEnvBoolOrDefault(
     env_map: *std.process.Environ.Map,
     env_name: []const u8,
     default: bool,
-) bool {
+) !bool {
     const raw = env_map.get(env_name) orelse return default;
-    return parseBool(raw) catch default;
+    return parseBool(raw) catch return invalidEnvironmentValue(env_name, raw, "true/false, yes/no, or 1/0");
 }
 
 fn parseEnvOptionalBool(
     env_map: *std.process.Environ.Map,
     env_name: []const u8,
-) ?bool {
+) !?bool {
     const raw = env_map.get(env_name) orelse return null;
-    return parseBool(raw) catch null;
+    return parseBool(raw) catch return invalidEnvironmentValue(env_name, raw, "true/false, yes/no, or 1/0");
+}
+
+fn invalidEnvironmentValue(name: []const u8, value: []const u8, expected: []const u8) error{InvalidEnvironmentValue} {
+    std.log.err("invalid environment variable {s}={s}; expected {s}", .{ name, value, expected });
+    return error.InvalidEnvironmentValue;
 }
 
 fn serverless_serverConfigFromEnv(
     env_map: *std.process.Environ.Map,
     cli: CliConfig,
-) antfly.raft.transport.StdHttpListenerConfig {
+) !antfly.raft.transport.StdHttpListenerConfig {
     return .{
         .bind_host = cli.bind_host orelse env_map.get("ANTFLY_SERVERLESS_BIND_HOST") orelse "127.0.0.1",
-        .bind_port = cli.bind_port orelse parseEnvIntOrDefault(env_map, u16, "ANTFLY_SERVERLESS_BIND_PORT", 8080),
-        .max_request_bytes = cli.max_request_bytes orelse parseEnvIntOrDefault(
+        .bind_port = cli.bind_port orelse try parseEnvIntOrDefault(env_map, u16, "ANTFLY_SERVERLESS_BIND_PORT", 8080),
+        .max_request_bytes = cli.max_request_bytes orelse try parseEnvIntOrDefault(
             env_map,
             usize,
             "ANTFLY_SERVERLESS_MAX_REQUEST_BYTES",
             serverless_default_max_request_bytes,
         ),
         .serve_in_connection_threads = true,
-        .max_connection_threads = cli.max_connection_threads orelse parseEnvIntOrDefault(
+        .max_connection_threads = cli.max_connection_threads orelse try parseEnvIntOrDefault(
             env_map,
             u32,
             "ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS",
@@ -398,6 +612,8 @@ fn printUsage(argv0: []const u8) void {
         \\usage: {s} [options]
         \\
         \\options:
+        \\  --config <path>                 JSON common config with deployment_mode=serverless and storage.engine=object
+        \\  --secret-store-path <path>      Resolve ${{secret:...}} references from this protected JSON store
         \\  --artifacts-uri <uri>
         \\  --manifests-uri <uri>
         \\  --wal-uri <uri>
@@ -431,9 +647,10 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_WAL_URI
         \\  ANTFLY_SERVERLESS_PROGRESS_URI
         \\  ANTFLY_SERVERLESS_CATALOG_URI
+        \\  ANTFLY_SECRET_STORE_PATH
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_DIR
-        \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 0 (unbounded)
-        \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 0 (unbounded)
+        \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 4294967296
+        \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 67108864
         \\  ANTFLY_SERVERLESS_BIND_HOST      default: 127.0.0.1
         \\  ANTFLY_SERVERLESS_BIND_PORT      default: 8080
         \\  ANTFLY_SERVERLESS_HEALTH_PORT    default: unset (disables dedicated health server)
@@ -464,10 +681,15 @@ fn startupErrorHint(err: anyerror) ?[]const u8 {
         error.InvalidRemoteUri => "invalid storage URI; expected a non-empty path or bucket/prefix",
         error.InvalidTickInterval => "invalid tick interval; ANTFLY_SERVERLESS_TICK_INTERVAL_MS must be greater than zero",
         error.InvalidQueryCacheDir => "invalid query cache dir; ANTFLY_SERVERLESS_QUERY_CACHE_DIR must be non-empty when set",
+        error.InvalidQueryCacheBudget => "invalid query cache budget; ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES must be greater than zero when the cache is enabled",
+        error.InvalidQueryCachePayloadBudget => "invalid query cache payload budget; ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES must be greater than zero when the cache is enabled",
+        error.QueryCachePayloadExceedsBudget => "invalid query cache budgets; the per-payload limit cannot exceed the total cache limit",
         error.InvalidRuntimeRole => "invalid runtime role; expected combined, api, query, or maintenance",
-        error.MissingEndpoint => "missing S3-compatible endpoint; set AWS_ENDPOINT_URL for s3:// backends",
-        error.MissingAccessKeyId => "missing S3-compatible access key; set AWS_ACCESS_KEY_ID for s3:// backends",
-        error.MissingSecretAccessKey => "missing S3-compatible secret; set AWS_SECRET_ACCESS_KEY for s3:// backends",
+        error.InvalidEnvironmentValue => "invalid serverless environment configuration; see the preceding variable-specific error",
+        error.MissingEndpoint => "missing S3-compatible endpoint; configure the storage connection endpoint or AWS_ENDPOINT_URL",
+        error.MissingAccessKeyId => "missing S3 access key; configure the storage connection secret or AWS_ACCESS_KEY_ID",
+        error.MissingSecretAccessKey => "missing S3 secret key; configure the storage connection secret or AWS_SECRET_ACCESS_KEY",
+        error.BucketNotFound => "configured object-storage bucket does not exist; provision it or set bucket_provisioning=create_if_missing for development",
         error.MissingServiceAccount => "missing GCS auth; set GCS_BEARER_TOKEN, GOOGLE_OAUTH_ACCESS_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, or GOOGLE_APPLICATION_CREDENTIALS for gs:// backends",
         error.MissingProjectId => "missing GCS project id; set GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT, or use a service account that includes project_id",
         else => null,
@@ -482,9 +704,9 @@ fn sleepMs(io: std.Io, ms: u64) void {
 }
 
 fn printRuntimeStatusSummary(status: *const serverless.ServerlessRuntimeStatus) void {
-    std.debug.print("serverless bootstrap role={s} swarm_mode={any} validated={any} tick_ms={d}\n", .{
+    std.debug.print("serverless bootstrap role={s} combined_mode={any} validated={any} tick_ms={d}\n", .{
         @tagName(status.role),
-        status.swarm_mode,
+        status.combined_mode,
         status.validated,
         status.tick_interval_ms,
     });
@@ -514,9 +736,36 @@ test "serverless main module compiles" {
     _ = CliConfig;
 }
 
+test "serverless metrics include shared enrichment utf8 repair counter" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeServerlessPrometheus(
+        &writer.writer,
+        .{
+            .published_namespaces = 0,
+            .compacted_namespaces = 0,
+            .pruned_namespaces = 0,
+            .deleted_versions = 0,
+            .enriched_documents = 0,
+            .enrichment_failed_documents = 0,
+        },
+        .{
+            .total_queries = 0,
+            .vector_queries = 0,
+            .hybrid_queries = 0,
+            .sparse_queries = 0,
+        },
+    );
+
+    const out = writer.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "# TYPE antfly_enrichment_invalid_utf8_repairs_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "antfly_enrichment_invalid_utf8_repairs_total ") != null);
+}
+
 test "serverless main startup hint covers backend config errors" {
     try std.testing.expectEqualStrings(
-        "missing S3-compatible endpoint; set AWS_ENDPOINT_URL for s3:// backends",
+        "missing S3-compatible endpoint; configure the storage connection endpoint or AWS_ENDPOINT_URL",
         startupErrorHint(error.MissingEndpoint).?,
     );
     try std.testing.expectEqualStrings(
@@ -548,7 +797,7 @@ test "serverless main listener config defaults request limit to public API limit
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
-    const cfg = serverless_serverConfigFromEnv(&env_map, .{});
+    const cfg = try serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
     try std.testing.expect(cfg.serve_in_connection_threads);
     try std.testing.expectEqual(serverless_default_max_connection_threads, cfg.max_connection_threads);
@@ -560,11 +809,11 @@ test "serverless main listener config allows env and cli listener limit override
     try env_map.put("ANTFLY_SERVERLESS_MAX_REQUEST_BYTES", "4194304");
     try env_map.put("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS", "7");
 
-    const env_cfg = serverless_serverConfigFromEnv(&env_map, .{});
+    const env_cfg = try serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), env_cfg.max_request_bytes);
     try std.testing.expectEqual(@as(u32, 7), env_cfg.max_connection_threads);
 
-    const cli_cfg = serverless_serverConfigFromEnv(&env_map, .{
+    const cli_cfg = try serverless_serverConfigFromEnv(&env_map, .{
         .max_request_bytes = 8 * 1024 * 1024,
         .max_connection_threads = 11,
     });
@@ -572,11 +821,33 @@ test "serverless main listener config allows env and cli listener limit override
     try std.testing.expectEqual(@as(u32, 11), cli_cfg.max_connection_threads);
 }
 
+test "serverless main rejects malformed explicit environment values" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS", "many");
+    try std.testing.expectError(error.InvalidEnvironmentValue, serverless_serverConfigFromEnv(&env_map, .{}));
+
+    _ = env_map.remove("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS");
+    try env_map.put("ANTFLY_SERVERLESS_PRUNE_ENABLED", "sometimes");
+    try std.testing.expectError(
+        error.InvalidEnvironmentValue,
+        parseEnvBoolOrDefault(&env_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
+    );
+}
+
 test "serverless main parses maintenance booleans" {
     try std.testing.expect(try parseBoolArg("true"));
     try std.testing.expect(try parseBoolArg("1"));
     try std.testing.expect(!(try parseBoolArg("false")));
     try std.testing.expectError(error.InvalidArguments, parseBoolArg("maybe"));
+}
+
+test "serverless main rejects location-only overrides with connection config" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try std.testing.expectError(error.ConflictingStorageConfiguration, rejectStorageUriOverrides(&env_map, .{ .wal_uri = "s3://other/wal" }));
+    try env_map.put("ANTFLY_SERVERLESS_CATALOG_URI", "s3://other/catalog");
+    try std.testing.expectError(error.ConflictingStorageConfiguration, rejectStorageUriOverrides(&env_map, .{}));
 }
 
 test "serverless main backend summary prefers parsed location" {
@@ -593,4 +864,43 @@ test "serverless main backend summary prefers parsed location" {
         .backend = .file,
         .path = @constCast("/tmp/antfly-artifacts"),
     }));
+}
+
+test "serverless main derives multi-bucket lanes and per-connection credentials" {
+    const alloc = std.testing.allocator;
+    const store_path = ".zig-cache/test-serverless-storage-secrets.json";
+    defer {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+    }
+    var secret_store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+    inline for (.{
+        .{ "data.key", "data-key" },
+        .{ "data.secret", "data-secret" },
+        .{ "wal.key", "wal-key" },
+        .{ "wal.secret", "wal-secret" },
+    }) |entry| {
+        var stored = try secret_store.put(alloc, entry[0], entry[1]);
+        stored.deinit(alloc);
+    }
+    var cfg = try antfly.common.config.Config.parseFromSliceWithSecrets(alloc,
+        \\{
+        \\  "deployment_mode": "serverless",
+        \\  "connections": {
+        \\    "data": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "region": "us-west-2", "buckets": ["data-bucket"], "credentials": { "source": "static", "access_key_id": "${secret:data.key}", "secret_access_key": "${secret:data.secret}" } } },
+        \\    "wal": { "kind": "external_io", "capabilities": ["storage.primary"], "external_io": { "protocol": "s3", "endpoint": "minio:9000", "use_ssl": false, "buckets": ["wal-bucket"], "credentials": { "source": "static", "access_key_id": "${secret:wal.key}", "secret_access_key": "${secret:wal.secret}" } } }
+        \\  },
+        \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket", "prefix": "/prod/", "lanes": { "wal": { "connection": "wal", "bucket": "wal-bucket", "prefix": "/durable/" } } } }
+        \\}
+    , &secret_store);
+    defer cfg.deinit();
+    var configured = try ConfiguredStorageUris.init(alloc, &cfg, &secret_store);
+    defer configured.deinit(alloc);
+    try std.testing.expectEqualStrings("s3://data-bucket/prod/artifacts", configured.artifacts.?);
+    try std.testing.expectEqualStrings("s3://wal-bucket/durable", configured.wal.?);
+    try std.testing.expectEqualStrings("data-key", configured.s3_options[0].?.access_key_id.?);
+    try std.testing.expectEqualStrings("wal-key", configured.s3_options[2].?.access_key_id.?);
+    try std.testing.expect(!configured.s3_options[2].?.use_ssl);
 }

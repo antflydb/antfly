@@ -103,6 +103,12 @@ Examples:
 For GCS: Use s3:// URLs with HMAC credentials and set AWS_ENDPOINT_URL=https://storage.googleapis.com
 in your credentials secret.`, source.Location)
 	}
+	if source.Connection != "" && source.CredentialsSecret != nil {
+		return fmt.Errorf("spec.source.connection and spec.source.credentialsSecret are mutually exclusive")
+	}
+	if source.Connection != "" && !strings.HasPrefix(source.Location, "s3://") {
+		return fmt.Errorf("spec.source.connection requires an s3:// location")
+	}
 
 	return nil
 }

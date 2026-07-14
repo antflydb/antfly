@@ -284,7 +284,7 @@ func (m *Store) ID() types.ID {
 }
 
 func (m *Store) S3Info() *common.S3Info {
-	return &m.antflyConfig.Storage.S3
+	return &m.antflyConfig.Storage.Local.S3
 }
 
 // ErrorcC dynamically receives new error channels from shards and fans them in
@@ -639,9 +639,9 @@ func (m *Store) StartRaftGroup(
 	var commitC <-chan *raft.Commit
 	var raftNode raft.RaftNode
 
-	// In swarm mode, bypass Raft consensus with a pass-through channel
-	if m.antflyConfig != nil && m.antflyConfig.SwarmMode {
-		lg.Info("Starting shard in swarm mode (bypassing Raft)")
+	// In standalone mode, bypass Raft consensus with a pass-through channel
+	if m.antflyConfig != nil && m.antflyConfig.IsStandalone() {
+		lg.Info("Starting shard in standalone mode (bypassing Raft)")
 		commitC, errorC = m.createPassThroughChannels(proposeC)
 	} else {
 		raftConf := raft.RaftNodeConfig{
@@ -671,13 +671,13 @@ func (m *Store) StartRaftGroup(
 	dbDir := common.StorageDBDir(dataDir, shardID, m.config.ID)
 	var err2 error
 
-	// In swarm mode without Raft, provide a stub function that returns the restore archive ID if set,
-	// or an empty snapshot ID. This allows backup/restore to work in swarm mode.
+	// In standalone mode without Raft, provide a stub function that returns the restore archive ID if set,
+	// or an empty snapshot ID. This allows backup/restore to work in standalone mode.
 	var getSnapshotID func(ctx context.Context) (string, error)
 	if raftNode != nil {
 		getSnapshotID = raftNode.GetSnapshotID
 	} else {
-		// In swarm mode, return the restore archive ID if provided, otherwise empty
+		// In standalone mode, return the restore archive ID if provided, otherwise empty
 		initArchive := conf.InitWithDBArchive
 		getSnapshotID = func(ctx context.Context) (string, error) {
 			return initArchive, nil
@@ -741,7 +741,7 @@ func (m *Store) StartRaftGroup(
 
 		// Wait for the Raft node to fully stop by draining errorC.
 		// The Raft node closes errorC when it stops (see raftNode.stop()).
-		// In swarm mode, errorC is closed by the pass-through goroutine.
+		// In standalone mode, errorC is closed by the pass-through goroutine.
 		if errorC != nil {
 			for range errorC {
 				// Drain any remaining errors
@@ -762,7 +762,7 @@ func (m *Store) StartRaftGroup(
 	if raftNode != nil {
 		raftNode.SetLeaderFactory(dbw.LeaderFactory)
 	} else {
-		// In swarm mode without Raft, call the leader factory directly
+		// In standalone mode without Raft, call the leader factory directly
 		// since we're always the leader. Use a cancellable context so we
 		// can properly stop the LeaderFactory when the shard is removed.
 		ctx, cancel := context.WithCancel(context.Background())
@@ -813,7 +813,7 @@ func (m *Store) StartRaftGroup(
 
 // copyLocalBackupToSnapDir copies a backup file from a local directory into the
 // shard's snap store and returns the initWithDBArchive name to use. This handles
-// the local-client restore path (swarm mode) where the HTTP multipart upload
+// the local-client restore path (standalone mode) where the HTTP multipart upload
 // path in api.go is not used.
 func copyLocalBackupToSnapDir(
 	lg *zap.Logger,

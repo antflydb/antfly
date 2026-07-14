@@ -79,10 +79,10 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Start single-node swarm without Antfly inference.
-	t.Log("Starting Antfly swarm (no Antfly inference)...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	defer swarm.Cleanup()
+	// Start single-node standalone without Antfly inference.
+	t.Log("Starting Antfly standalone (no Antfly inference)...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	defer standalone.Cleanup()
 
 	// Create table with external embedding index (no embedder).
 	embIdx := antfly.IndexConfig{Name: indexName, Type: "aknn_v0"}
@@ -93,12 +93,12 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+	err = standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 		NumShards: 1,
 		Indexes:   map[string]antfly.IndexConfig{indexName: embIdx},
 	})
 	require.NoError(t, err)
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 
 	// Insert documents with pre-computed embeddings via _embeddings field.
 	// Using vector.T triggers base64 MarshalJSON (~4x smaller than float arrays).
@@ -113,7 +113,7 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 				"_embeddings": map[string]any{indexName: vector.T(dataset.At(i))},
 			}
 		}
-		_, batchErr := swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
+		_, batchErr := standalone.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   inserts,
 			SyncLevel: antfly.SyncLevelFullIndex,
 		})
@@ -125,7 +125,7 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 	queryEmb := antfly.NewPackedDenseEmbedding(queryVectors.At(0))
 	t.Log("Waiting for index to become ready...")
 	require.Eventually(t, func() bool {
-		resp, qErr := swarm.Client.Query(ctx, antfly.QueryRequest{
+		resp, qErr := standalone.Client.Query(ctx, antfly.QueryRequest{
 			Table:      tableName,
 			Limit:      1,
 			Embeddings: map[string]antfly.Embedding{indexName: queryEmb},
@@ -142,7 +142,7 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 
 	// Warmup.
 	for i := range min(10, queryCount) {
-		_, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+		_, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 			Table:      tableName,
 			Limit:      topK,
 			Embeddings: map[string]antfly.Embedding{indexName: queryEmbeddings[i]},
@@ -162,7 +162,7 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 	var recallSum float64
 	for i := range queryCount {
 		start := time.Now()
-		resp, qErr := swarm.Client.Query(ctx, antfly.QueryRequest{
+		resp, qErr := standalone.Client.Query(ctx, antfly.QueryRequest{
 			Table:      tableName,
 			Limit:      topK,
 			Embeddings: map[string]antfly.Embedding{indexName: queryEmbeddings[i]},
@@ -215,14 +215,14 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 	for i := range min(5, queryCount) {
 		v := queryVectors.At(i)
 
-		denseResp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+		denseResp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 			Table:      tableName,
 			Limit:      topK,
 			Embeddings: map[string]antfly.Embedding{indexName: antfly.NewDenseEmbedding(v)},
 		})
 		require.NoError(t, err)
 
-		packedResp, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+		packedResp, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 			Table:      tableName,
 			Limit:      topK,
 			Embeddings: map[string]antfly.Embedding{indexName: antfly.NewPackedDenseEmbedding(v)},

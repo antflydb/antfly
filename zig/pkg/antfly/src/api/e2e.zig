@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const group_ids = @import("../common/group_ids.zig");
 const raft_engine = @import("raft_engine");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -2148,15 +2149,16 @@ test "public api split e2e backs up drops and restores a table" {
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 }
 
-test "public api swarm-like e2e backs up drops and restores a table" {
+test "public api standalone-like e2e backs up drops and restores a table" {
+    const process_alloc = platform.allocator.processAllocator(std.testing.allocator);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-swarm-like-backup-restore-root", .{tmp.sub_path});
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
-    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-swarm-like-backup-restore-catalog.txt", .{tmp.sub_path});
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
-    const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-swarm-like-backup-restore-out", .{tmp.sub_path});
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -2211,7 +2213,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
     defer metadata_admin_listener.deinit();
     defer metadata_admin_server.deinit();
 
-    var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
+    var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
         .replica_root_dir = replica_root,
         .store_registration = .{
             .node_id = 1,
@@ -2254,9 +2256,14 @@ test "public api swarm-like e2e backs up drops and restores a table" {
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
 
+    var query_resp = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"match":{"field":"body","text":"restored"}},"limit":5}
+    );
+    defer query_resp.deinit(std.testing.allocator);
+
     const backup_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"backup_id\":\"swarm-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
+        "{{\"backup_id\":\"standalone-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
         .{backup_root},
     );
     defer std.testing.allocator.free(backup_body);
@@ -2275,7 +2282,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
 
     const restore_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"backup_id\":\"swarm-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
+        "{{\"backup_id\":\"standalone-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
         .{backup_root},
     );
     defer std.testing.allocator.free(restore_body);
@@ -6859,16 +6866,7 @@ test "public api e2e serves cluster backup list and restore routes" {
         .{backup_root},
     );
     defer std.testing.allocator.free(overwrite_restore_body);
-    var overwrite_restore_resp = try client.fetchClusterRestore(base_uri, overwrite_restore_body);
-    defer overwrite_restore_resp.deinit(std.testing.allocator);
-    var parsed_overwrite_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, overwrite_restore_resp.body, .{});
-    defer parsed_overwrite_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_overwrite_restore.value.status);
-    try std.testing.expectEqual(@as(usize, 2), parsed_overwrite_restore.value.tables.len);
-    for (parsed_overwrite_restore.value.tables) |table_status| {
-        try std.testing.expectEqualStrings("triggered", table_status.status);
-        try std.testing.expect(table_status.@"error" == null);
-    }
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchClusterRestore(base_uri, overwrite_restore_body));
 
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
@@ -6877,13 +6875,13 @@ test "public api e2e serves cluster backup list and restore routes" {
     defer docs_lookup_after_overwrite.deinit(std.testing.allocator);
     var parsed_docs_lookup_after_overwrite = try parseJsonBody(LookupTitle, std.testing.allocator, docs_lookup_after_overwrite.body);
     defer parsed_docs_lookup_after_overwrite.deinit();
-    try std.testing.expectEqualStrings("alpha", parsed_docs_lookup_after_overwrite.value.title);
+    try std.testing.expectEqualStrings("overwrite-me", parsed_docs_lookup_after_overwrite.value.title);
 
     var logs_lookup_after_overwrite = try client.fetchLookup(base_uri, "logs", "log:a", null);
     defer logs_lookup_after_overwrite.deinit(std.testing.allocator);
     var parsed_logs_lookup_after_overwrite = try parseJsonBody(LookupTitle, std.testing.allocator, logs_lookup_after_overwrite.body);
     defer parsed_logs_lookup_after_overwrite.deinit();
-    try std.testing.expectEqualStrings("entry", parsed_logs_lookup_after_overwrite.value.title);
+    try std.testing.expectEqualStrings("overwrite-log", parsed_logs_lookup_after_overwrite.value.title);
 }
 
 test "public api e2e reports partial cluster backup and restore statuses" {

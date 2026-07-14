@@ -60,11 +60,15 @@ pub const Header = struct {
 
 pub const HttpResponse = struct {
     status: u16,
+    /// Allocator that owns all response allocations. Executors that allocate
+    /// independently of the allocator supplied by the caller must set this.
+    owner_allocator: ?std.mem.Allocator = null,
     content_type: ?[]u8 = null,
     headers: []Header = &.{},
     body: []u8 = &.{},
 
-    pub fn deinit(self: *HttpResponse, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *HttpResponse, fallback_alloc: std.mem.Allocator) void {
+        const alloc = self.owner_allocator orelse fallback_alloc;
         if (self.content_type) |content_type| alloc.free(content_type);
         for (self.headers) |*header| header.deinit(alloc);
         if (self.headers.len > 0) alloc.free(self.headers);
@@ -138,4 +142,26 @@ test "http common types compile" {
     _ = StreamWriter;
     _ = StreamingRequestExecutor;
     _ = RequestExecutor;
+}
+
+test "http response uses its owning allocator" {
+    var owner_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(owner_gpa.deinit() == .ok);
+    var fallback_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(fallback_gpa.deinit() == .ok);
+
+    const owner = owner_gpa.allocator();
+    const headers = try owner.alloc(Header, 1);
+    headers[0] = .{
+        .name = try owner.dupe(u8, "X-Test"),
+        .value = try owner.dupe(u8, "owned"),
+    };
+    var response = HttpResponse{
+        .status = 200,
+        .owner_allocator = owner,
+        .content_type = try owner.dupe(u8, "text/plain"),
+        .headers = headers,
+        .body = try owner.dupe(u8, "ok"),
+    };
+    response.deinit(fallback_gpa.allocator());
 }

@@ -40,15 +40,15 @@ func TestE2E_Auth(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Start swarm with auth enabled.
-	t.Log("Starting Antfly swarm with auth enabled...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
+	// Start standalone with auth enabled.
+	t.Log("Starting Antfly standalone with auth enabled...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{
 		DisableInference: true,
 		EnableAuth:       true,
 	})
-	defer swarm.Cleanup()
+	defer standalone.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/db/v1"
+	baseURL := standalone.MetadataAPIURL + "/db/v1"
 
 	// ---- 1. Unauthenticated request → 401 ----
 	t.Log("Step 1: Unauthenticated GET /secrets → 401")
@@ -196,16 +196,16 @@ func TestE2E_ApiKeys(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Start swarm with auth enabled.
-	t.Log("Starting Antfly swarm with auth enabled...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
+	// Start standalone with auth enabled.
+	t.Log("Starting Antfly standalone with auth enabled...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{
 		DisableInference: true,
 		EnableAuth:       true,
 	})
-	defer swarm.Cleanup()
+	defer standalone.Cleanup()
 
-	dbURL := swarm.MetadataAPIURL + "/db/v1"
-	authURL := swarm.MetadataAPIURL + "/auth/v1"
+	dbURL := standalone.MetadataAPIURL + "/db/v1"
+	authURL := standalone.MetadataAPIURL + "/auth/v1"
 	adminAuth := basicAuth("admin", "admin")
 
 	// ---- 1. Create a test user with permissions ----

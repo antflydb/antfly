@@ -81,8 +81,8 @@
   },
   {
     "query": "Can I run Antfly locally for development?",
-    "expected_keywords": ["swarm", "development", "local", "ollama", "docker"],
-    "description": "Should explain swarm mode for local development"
+    "expected_keywords": ["standalone", "development", "local", "ollama", "docker"],
+    "description": "Should explain standalone mode for local development"
   },
   {
     "query": "How do I update document fields without overwriting everything?",
@@ -211,8 +211,8 @@
   },
   {
     "query": "Can I run Antfly on a small VPS?",
-    "expected_keywords": ["vps", "minimum", "requirements", "small", "swarm"],
-    "description": "Should explain minimum deployment requirements and swarm mode for small setups"
+    "expected_keywords": ["vps", "minimum", "requirements", "small", "standalone"],
+    "description": "Should explain minimum deployment requirements and standalone mode for small setups"
   },
   {
     "query": "How does Antfly handle backpressure?",

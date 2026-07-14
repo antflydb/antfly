@@ -172,7 +172,7 @@ func RegisterCommands(parent *cobra.Command) {
 	}
 
 	// Chain client init onto parent's PersistentPreRunE, but only
-	// trigger for CLI subcommands (not swarm/metadata/store/inference).
+	// trigger for CLI subcommands (not standalone/metadata/store/inference).
 	origPreRunE := parent.PersistentPreRunE
 	parent.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if origPreRunE != nil {

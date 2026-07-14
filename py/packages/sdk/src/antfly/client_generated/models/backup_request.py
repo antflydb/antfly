@@ -4,7 +4,6 @@ from collections.abc import Mapping
 from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.backup_request_format import BackupRequestFormat
 from ..types import UNSET, Unset
@@ -20,11 +19,15 @@ class BackupRequest:
             Choose a meaningful name that includes date/version information.
              Example: backup-2025-01-15-v2.
         location (str): Storage location for the backup. Supports multiple backends:
-            - Local filesystem: `file:///path/to/backup`
+            - Scoped filesystem connection: `file:///logical/path`
             - Amazon S3: `s3://bucket-name/path/to/backup`
+            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
             The backup includes all table data, indexes, and metadata for the specified table.
              Example: s3://mybucket/antfly-backups/users-table/2025-01-15.
+        connection (str): ID of a configured `external_io` connection. Required for every
+            network API backup and restore. Object locations enforce bucket and
+            prefix scopes; filesystem URI paths resolve beneath the connection root.
         format_ (BackupRequestFormat | Unset): Backup format to use:
             - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only)
             - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be
@@ -36,24 +39,27 @@ class BackupRequest:
 
     backup_id: str
     location: str
+    connection: str
     format_: BackupRequestFormat | Unset = BackupRequestFormat.PORTABLE
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         backup_id = self.backup_id
 
         location = self.location
 
+        connection = self.connection
+
         format_: str | Unset = UNSET
         if not isinstance(self.format_, Unset):
             format_ = self.format_.value
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "backup_id": backup_id,
                 "location": location,
+                "connection": connection,
             }
         )
         if format_ is not UNSET:
@@ -68,6 +74,8 @@ class BackupRequest:
 
         location = d.pop("location")
 
+        connection = d.pop("connection")
+
         _format_ = d.pop("format", UNSET)
         format_: BackupRequestFormat | Unset
         if isinstance(_format_, Unset):
@@ -78,24 +86,8 @@ class BackupRequest:
         backup_request = cls(
             backup_id=backup_id,
             location=location,
+            connection=connection,
             format_=format_,
         )
 
-        backup_request.additional_properties = d
         return backup_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

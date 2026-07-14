@@ -274,6 +274,8 @@ pub const DB = struct {
         }
         try support.portable_backup.validatePortable(alloc, backup);
         try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
+        const target_identity = self.inner.core.identity_namespace;
+        try self.inner.reassignIdentityNamespaceForInternalTransition(target_identity);
     }
 
     pub fn checkLite(self: *DB) !LiteCheckReport {

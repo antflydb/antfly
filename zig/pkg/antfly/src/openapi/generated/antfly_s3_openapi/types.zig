@@ -8,10 +8,10 @@ pub const Credentials = struct {
     endpoint: ?[]const u8 = null,
     /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
     use_ssl: ?bool = null,
-    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+    /// AWS access key ID. Supports secret-store references. Falls back to AWS_ACCESS_KEY_ID when not set.
     access_key_id: ?[]const u8 = null,
-    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+    /// AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
     secret_access_key: ?[]const u8 = null,
-    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+    /// Optional AWS session token for temporary credentials. Supports secret-store references.
     session_token: ?[]const u8 = null,
 };
