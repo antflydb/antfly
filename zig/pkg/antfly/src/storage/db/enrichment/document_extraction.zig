@@ -68,6 +68,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 return .{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
             }
         };
+
+        pub fn renderPagePngAlloc(_: Allocator, _: []const u8, _: usize, _: u16, _: u64) ![]u8 {
+            return error.PdfRenderingUnavailable;
+        }
     }
 else
     @import("antfly_pdf");
@@ -103,6 +107,32 @@ pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentCo
     if (try inlineDataUriSourceTooLarge(remote_content, source_text)) return error.StreamTooLong;
 }
 
+pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    return try pdf.renderPagePngAlloc(alloc, pdf_bytes, page_number, dpi, max_pixels);
+}
+
+pub fn ocrPagePartsJsonAlloc(alloc: Allocator, config: Config, route_type: []const u8, source_content_type: []const u8, unit: Unit, png: []const u8) ![]u8 {
+    const encoded_len = std.base64.standard.Encoder.calcSize(png.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, png);
+    const prompt = if (config.ocr_prompt.len > 0) config.ocr_prompt else default_ocr_prompt;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .{ .type = "text", .text = prompt },
+        .{ .type = "media", .mime_type = "image/png", .data = encoded },
+        .{ .type = "metadata", .schema = "antfly.document_generated_text_request.v1", .route_type = route_type, .source_content_type = source_content_type, .unit_id = unit.unit_id, .page_number = unit.page_number, .page_label = unit.page_label, .page_bbox = unit.page_bbox, .page_rotation = unit.page_rotation },
+    }, .{});
+}
+
+pub fn rebaseUnitCharOffsets(units: []Unit) void {
+    var cursor: usize = 0;
+    for (units) |*unit| {
+        unit.char_start = std.math.cast(u32, cursor);
+        cursor += unit.text.len;
+        unit.char_end = std.math.cast(u32, cursor);
+    }
+}
+
 pub const TextRegion = struct {
     span: [2]u32,
     bbox: [4]f64,
@@ -118,6 +148,11 @@ pub const Unit = struct {
     source_sha256: ?[]u8 = null,
     byte_length: ?u64 = null,
     ocr_used: bool = false,
+    ocr_attempted: bool = false,
+    ocr_render_dpi: ?u16 = null,
+    ocr_trigger_reasons: ?[]u8 = null,
+    ocr_embedded_quality: ?[]u8 = null,
+    ocr_output_quality: ?[]u8 = null,
     ocr_confidence: ?f64 = null,
     ocr_bbox: ?[4]f64 = null,
     transcript_used: bool = false,
@@ -140,6 +175,9 @@ pub const Unit = struct {
         if (self.extraction_status) |value| alloc.free(value);
         if (self.source_sha256) |value| alloc.free(value);
         if (self.extraction_warning) |value| alloc.free(value);
+        if (self.ocr_trigger_reasons) |value| alloc.free(value);
+        if (self.ocr_embedded_quality) |value| alloc.free(value);
+        if (self.ocr_output_quality) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         if (self.text_regions.len > 0) alloc.free(self.text_regions);
         self.* = undefined;
@@ -151,6 +189,11 @@ pub const Result = struct {
     route_type: []u8,
     unsupported_reason: []u8 = "",
     units: []Unit,
+    ocr_attempted_count: usize = 0,
+    ocr_selected_count: usize = 0,
+    ocr_retained_embedded_count: usize = 0,
+    ocr_failed_count: usize = 0,
+    ocr_failed_page_numbers: []const u32 = &.{},
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
         alloc.free(self.content_type);
@@ -191,7 +234,12 @@ pub const Config = struct {
     last_modified_field: []const u8 = "",
     html_strip_tags: bool = true,
     ocr_enabled: bool = false,
+    ocr_mode: OcrMode = .auto,
     ocr_config_json: []const u8 = "",
+    ocr_render_dpi: u16 = 150,
+    ocr_max_rendered_pixels: u64 = 40_000_000,
+    ocr_prompt: []const u8 = "",
+    ocr_quality: OcrQualityConfig = .{},
     transcription_enabled: bool = false,
     transcription_config_json: []const u8 = "",
     route_preset: RoutePreset = .mixed_files,
@@ -212,12 +260,185 @@ pub const Config = struct {
         if (self.version_field.len > 0) alloc.free(@constCast(self.version_field));
         if (self.last_modified_field.len > 0) alloc.free(@constCast(self.last_modified_field));
         if (self.ocr_config_json.len > 0) alloc.free(@constCast(self.ocr_config_json));
+        if (self.ocr_prompt.len > 0) alloc.free(@constCast(self.ocr_prompt));
         if (self.transcription_config_json.len > 0) alloc.free(@constCast(self.transcription_config_json));
         for (self.routes) |*route| route.deinit(alloc);
         if (self.routes.len > 0) alloc.free(self.routes);
         self.* = undefined;
     }
 };
+
+pub const OcrMode = enum {
+    auto,
+    always,
+};
+
+pub const default_ocr_prompt = "Transcribe this page faithfully. Preserve reading order, headings, lists, and table structure. Render tables as Markdown with one row per visual row. Do not summarize, infer, or omit text. Return only the transcription.";
+
+pub const OcrQualityConfig = struct {
+    min_content_chars: usize = 50,
+    garbled_min_words: usize = 20,
+    garbled_sample_words: usize = 50,
+    max_single_char_word_ratio: f64 = 0.40,
+    substantial_line_min_chars: usize = 15,
+    max_corrupted_line_ratio: f64 = 0.20,
+    font_corruption_score_threshold: f64 = 0.50,
+    max_replacement_char_ratio: f64 = 0.05,
+};
+
+pub const OcrQuality = struct {
+    too_short: bool = false,
+    garbled: bool = false,
+    font_corrupted: bool = false,
+    replacement_corrupted: bool = false,
+    single_char_word_ratio: f64 = 0,
+    corrupted_line_ratio: f64 = 0,
+    replacement_char_ratio: f64 = 0,
+    trimmed_len: usize = 0,
+
+    pub fn needsFallback(self: OcrQuality) bool {
+        return self.too_short or self.garbled or self.font_corrupted or self.replacement_corrupted;
+    }
+
+    pub fn failureCount(self: OcrQuality) u8 {
+        return @intFromBool(self.too_short) + @intFromBool(self.garbled) + @intFromBool(self.font_corrupted) + @intFromBool(self.replacement_corrupted);
+    }
+};
+
+pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
+    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+    var out = OcrQuality{ .trimmed_len = trimmed.len, .too_short = trimmed.len < config.min_content_chars };
+
+    var word_count: usize = 0;
+    var sampled_words: usize = 0;
+    var suspicious_words: usize = 0;
+    var words = std.mem.tokenizeAny(u8, trimmed, &std.ascii.whitespace);
+    while (words.next()) |word| {
+        word_count += 1;
+        if (sampled_words >= config.garbled_sample_words) continue;
+        sampled_words += 1;
+        if (word.len == 1 and std.mem.indexOfScalar(u8, ".-Xxv:", word[0]) == null) suspicious_words += 1;
+    }
+    if (sampled_words > 0) out.single_char_word_ratio = @as(f64, @floatFromInt(suspicious_words)) / @as(f64, @floatFromInt(sampled_words));
+    out.garbled = word_count >= config.garbled_min_words and out.single_char_word_ratio > config.max_single_char_word_ratio;
+
+    var substantial_lines: usize = 0;
+    var corrupted_lines: usize = 0;
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, &std.ascii.whitespace);
+        if (line.len < config.substantial_line_min_chars) continue;
+        substantial_lines += 1;
+        if (fontCorruptionScore(line) > config.font_corruption_score_threshold) corrupted_lines += 1;
+    }
+    if (substantial_lines > 0) out.corrupted_line_ratio = @as(f64, @floatFromInt(corrupted_lines)) / @as(f64, @floatFromInt(substantial_lines));
+    out.font_corrupted = out.corrupted_line_ratio > config.max_corrupted_line_ratio;
+
+    var codepoints: usize = 0;
+    var replacements: usize = 0;
+    const view = std.unicode.Utf8View.init(trimmed) catch null;
+    if (view) |valid_view| {
+        var iter = valid_view.iterator();
+        while (iter.nextCodepoint()) |cp| {
+            codepoints += 1;
+            if (cp == 0xfffd) replacements += 1;
+        }
+    } else {
+        codepoints = trimmed.len;
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, trimmed, cursor, "\xef\xbf\xbd")) |idx| {
+            replacements += 1;
+            cursor = idx + 3;
+        }
+    }
+    if (codepoints > 0) out.replacement_char_ratio = @as(f64, @floatFromInt(replacements)) / @as(f64, @floatFromInt(codepoints));
+    out.replacement_corrupted = out.replacement_char_ratio > config.max_replacement_char_ratio;
+    return out;
+}
+
+fn fontCorruptionScore(text_raw: []const u8) f64 {
+    const text = std.mem.trim(u8, text_raw, &std.ascii.whitespace);
+    if (text.len < 10) return 0;
+    var letters: usize = 0;
+    var upper: usize = 0;
+    var lower: usize = 0;
+    var vowels: usize = 0;
+    var consonant_runs: usize = 0;
+    var consonant_run: usize = 0;
+    for (text) |ch| {
+        if (!std.ascii.isAlphabetic(ch)) continue;
+        letters += 1;
+        if (std.ascii.isUpper(ch)) upper += 1 else lower += 1;
+        if (std.mem.indexOfScalar(u8, "aeiouAEIOU", ch) != null) {
+            vowels += 1;
+            if (consonant_run >= 4) consonant_runs += 1;
+            consonant_run = 0;
+        } else consonant_run += 1;
+    }
+    if (consonant_run >= 4) consonant_runs += 1;
+    if (letters == 0) return 0;
+    var score: f64 = 0;
+    if (upper > 0 and lower > 0) {
+        const upper_ratio = @as(f64, @floatFromInt(upper)) / @as(f64, @floatFromInt(letters));
+        if (upper_ratio > 0.3 and upper_ratio < 0.7) score += 0.3;
+    }
+    var word_count: usize = 0;
+    var no_vowel_long_words: usize = 0;
+    var words = std.mem.tokenizeAny(u8, text, &std.ascii.whitespace);
+    while (words.next()) |word_raw| {
+        word_count += 1;
+        const word = std.mem.trim(u8, word_raw, ".,!?;:\"'()[]{}$%");
+        if (word.len <= 4) continue;
+        var has_vowel = false;
+        for (word) |ch| if (std.mem.indexOfScalar(u8, "aeiouAEIOU", ch) != null) {
+            has_vowel = true;
+            break;
+        };
+        if (!has_vowel) no_vowel_long_words += 1;
+    }
+    const consonant_ratio = @as(f64, @floatFromInt(consonant_runs)) / @as(f64, @floatFromInt(word_count + 1));
+    if (consonant_runs > 0 and consonant_ratio > 0.3) score += 0.3;
+    const vowel_ratio = @as(f64, @floatFromInt(vowels)) / @as(f64, @floatFromInt(letters));
+    if (vowel_ratio < 0.15) score += 0.3;
+    if (word_count > 0 and @as(f64, @floatFromInt(no_vowel_long_words)) / @as(f64, @floatFromInt(word_count)) > 0.5) score += 0.2;
+    return @min(1.0, score);
+}
+
+pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
+    if (embedded.needsFallback() != ocr.needsFallback()) return !ocr.needsFallback();
+    if (embedded.failureCount() != ocr.failureCount()) return ocr.failureCount() < embedded.failureCount();
+    if (embedded.replacement_char_ratio != ocr.replacement_char_ratio) return ocr.replacement_char_ratio < embedded.replacement_char_ratio;
+    if (embedded.corrupted_line_ratio != ocr.corrupted_line_ratio) return ocr.corrupted_line_ratio < embedded.corrupted_line_ratio;
+    if (embedded.single_char_word_ratio != ocr.single_char_word_ratio) return ocr.single_char_word_ratio < embedded.single_char_word_ratio;
+    return ocr.trimmed_len > embedded.trimmed_len;
+}
+
+pub fn ocrQualityJsonAlloc(alloc: Allocator, quality: OcrQuality) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, quality, .{});
+}
+
+fn ocrTriggerReasonsAlloc(alloc: Allocator, quality: OcrQuality, forced: bool) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    if (forced) try out.appendSlice(alloc, "always");
+    if (quality.too_short) {
+        if (out.items.len > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "too_short");
+    }
+    if (quality.garbled) {
+        if (out.items.len > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "garbled");
+    }
+    if (quality.font_corrupted) {
+        if (out.items.len > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "font_corruption");
+    }
+    if (quality.replacement_corrupted) {
+        if (out.items.len > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "replacement_chars");
+    }
+    return try out.toOwnedSlice(alloc);
+}
 
 const RoutePreset = enum {
     mixed_files,
@@ -311,11 +532,86 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.html_strip_tags = boolField(object, "html_strip_tags") orelse true;
     config.ocr_enabled = boolField(object, "ocr_fallback") orelse false;
     config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
+    try parseOcrOptions(alloc, object, &config);
     config.transcription_enabled = boolField(object, "transcribe_audio") orelse false;
     config.transcription_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "transcription", &config.transcription_enabled);
     config.route_preset = try parseRoutePreset(object);
     config.routes = try parseRoutesAlloc(alloc, object);
     return config;
+}
+
+fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config) !void {
+    const value = object.get("ocr") orelse return;
+    if (value != .object) return;
+    const ocr = value.object;
+    if (ocr.get("mode")) |mode| {
+        if (mode != .string) return error.InvalidDocumentExtractionConfig;
+        config.ocr_mode = if (std.mem.eql(u8, mode.string, "auto"))
+            .auto
+        else if (std.mem.eql(u8, mode.string, "always"))
+            .always
+        else
+            return error.InvalidDocumentExtractionConfig;
+    }
+    if (intField(ocr, "render_dpi")) |dpi| {
+        if (dpi < 72 or dpi > 600) return error.InvalidDocumentExtractionConfig;
+        config.ocr_render_dpi = @intCast(dpi);
+    }
+    if (intField(ocr, "max_rendered_pixels")) |pixels| {
+        if (pixels < 1) return error.InvalidDocumentExtractionConfig;
+        config.ocr_max_rendered_pixels = @intCast(pixels);
+    }
+    if (ocr.get("prompt")) |prompt| {
+        if (prompt != .string) return error.InvalidDocumentExtractionConfig;
+        config.ocr_prompt = try alloc.dupe(u8, prompt.string);
+    } else if (ocr.get("config")) |producer| {
+        if (producer == .object) if (producer.object.get("prompt")) |prompt| {
+            if (prompt != .string) return error.InvalidDocumentExtractionConfig;
+            config.ocr_prompt = try alloc.dupe(u8, prompt.string);
+        };
+    }
+    const quality_value = ocr.get("quality") orelse return;
+    if (quality_value != .object) return error.InvalidDocumentExtractionConfig;
+    const quality = quality_value.object;
+    if (intField(quality, "min_content_chars")) |v| {
+        if (v < 0) return error.InvalidDocumentExtractionConfig;
+        config.ocr_quality.min_content_chars = @intCast(v);
+    }
+    if (intField(quality, "garbled_min_words")) |v| {
+        if (v < 0) return error.InvalidDocumentExtractionConfig;
+        config.ocr_quality.garbled_min_words = @intCast(v);
+    }
+    if (intField(quality, "garbled_sample_words")) |v| {
+        if (v < 1) return error.InvalidDocumentExtractionConfig;
+        config.ocr_quality.garbled_sample_words = @intCast(v);
+    }
+    if (floatField(quality, "max_single_char_word_ratio")) |v| config.ocr_quality.max_single_char_word_ratio = try ratio(v);
+    if (intField(quality, "substantial_line_min_chars")) |v| {
+        if (v < 1) return error.InvalidDocumentExtractionConfig;
+        config.ocr_quality.substantial_line_min_chars = @intCast(v);
+    }
+    if (floatField(quality, "max_corrupted_line_ratio")) |v| config.ocr_quality.max_corrupted_line_ratio = try ratio(v);
+    if (floatField(quality, "font_corruption_score_threshold")) |v| config.ocr_quality.font_corruption_score_threshold = try ratio(v);
+    if (floatField(quality, "max_replacement_char_ratio")) |v| config.ocr_quality.max_replacement_char_ratio = try ratio(v);
+}
+
+fn intField(object: std.json.ObjectMap, field: []const u8) ?i64 {
+    const value = object.get(field) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
+fn floatField(object: std.json.ObjectMap, field: []const u8) ?f64 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    };
+}
+
+fn ratio(value: f64) !f64 {
+    if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidDocumentExtractionConfig;
+    return value;
 }
 
 fn parseRoutePreset(object: std.json.ObjectMap) !RoutePreset {
@@ -556,13 +852,13 @@ pub fn extractDownloadedAlloc(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags);
+        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality);
     }
     if (config.route_preset == .explicit_only) {
         return try unsupportedResultAlloc(alloc, content_type, "no_configured_route_matched");
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfAlloc(alloc, downloaded.data, content_type);
+        return try extractPdfAlloc(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags);
@@ -604,14 +900,14 @@ pub fn extractDownloadedStreaming(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, sink);
+        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality, sink);
     }
     if (config.route_preset == .explicit_only) {
         try streamUnsupportedResult(sink, content_type, "no_configured_route_matched");
         return;
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfStreaming(alloc, downloaded.data, content_type, sink);
+        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality, sink);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags, sink);
@@ -649,10 +945,12 @@ fn extractWithRouteStreaming(
     content_type: []const u8,
     route: Route,
     html_strip_tags: bool,
+    ocr_mode: OcrMode,
+    ocr_quality: OcrQualityConfig,
     sink: UnitSink,
 ) !void {
     switch (route.extractor_type) {
-        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, sink),
+        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, ocr_mode, ocr_quality, sink),
         .html => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags, sink),
         .text => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "document", "text", false, sink),
         .email => return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"), sink),
@@ -750,9 +1048,11 @@ fn extractWithRouteAlloc(
     content_type: []const u8,
     route: Route,
     html_strip_tags: bool,
+    ocr_mode: OcrMode,
+    ocr_quality: OcrQualityConfig,
 ) !Result {
     return switch (route.extractor_type) {
-        .pdf => try extractPdfAlloc(alloc, bytes, content_type),
+        .pdf => try extractPdfAlloc(alloc, bytes, content_type, ocr_mode, ocr_quality),
         .html => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags),
         .text => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "document", "text", false),
         .email => try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"),
@@ -801,7 +1101,7 @@ fn sha256HexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
-fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8) !Result {
+fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig) !Result {
     var parsed = try pdf.reader.Reader.init(alloc, bytes);
     defer parsed.deinit();
 
@@ -816,9 +1116,13 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     var page_num: usize = 1;
     var cursor: usize = 0;
     while (page_num <= page_count) : (page_num += 1) {
-        const text = try parsed.extractPageTextAlloc(page_num);
+        const force_ocr = ocr_mode == .always;
+        const text = if (force_ocr) try alloc.alloc(u8, 0) else try parsed.extractPageTextAlloc(page_num);
         errdefer alloc.free(text);
-        const text_regions = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        const text_regions: []TextRegion = if (force_ocr)
+            @constCast(&.{})
+        else
+            try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
@@ -828,7 +1132,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer if (unit_id) |value| alloc.free(value);
         var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
         errdefer if (unit_type) |value| alloc.free(value);
-        const scanned_page = text.len == 0;
+        const quality = assessOcrQuality(text, quality_config);
+        const scanned_page = force_ocr or quality.needsFallback();
         var method: ?[]u8 = try alloc.dupe(u8, if (scanned_page) "pdf_ocr_pending" else "pdf_text");
         errdefer if (method) |value| alloc.free(value);
         var extraction_status: ?[]u8 = if (scanned_page) try alloc.dupe(u8, "pending_ocr") else null;
@@ -842,6 +1147,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .method = method.?,
             .extraction_status = extraction_status,
             .ocr_used = false,
+            .ocr_trigger_reasons = if (scanned_page) try ocrTriggerReasonsAlloc(alloc, quality, force_ocr) else null,
+            .ocr_embedded_quality = if (scanned_page) try ocrQualityJsonAlloc(alloc, quality) else null,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
@@ -866,7 +1173,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     };
 }
 
-fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, sink: UnitSink) !void {
+fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
     var parsed = try pdf.reader.Reader.init(alloc, bytes);
     defer parsed.deinit();
 
@@ -876,16 +1183,21 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
     var page_num: usize = 1;
     var cursor: usize = 0;
     while (page_num <= page_count) : (page_num += 1) {
-        var text = try parsed.extractPageTextAlloc(page_num);
+        const force_ocr = ocr_mode == .always;
+        var text = if (force_ocr) try alloc.alloc(u8, 0) else try parsed.extractPageTextAlloc(page_num);
         errdefer alloc.free(text);
-        var text_regions = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        var text_regions: []TextRegion = if (force_ocr)
+            @constCast(&.{})
+        else
+            try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_text_len = text.len;
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + page_text_len);
-        const scanned_page = page_text_len == 0;
+        const quality = assessOcrQuality(text, quality_config);
+        const scanned_page = force_ocr or quality.needsFallback();
         var unit_id: ?[]u8 = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page_num});
         errdefer if (unit_id) |value| alloc.free(value);
         var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
@@ -903,6 +1215,8 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
             .method = method.?,
             .extraction_status = extraction_status,
             .ocr_used = false,
+            .ocr_trigger_reasons = if (scanned_page) try ocrTriggerReasonsAlloc(alloc, quality, force_ocr) else null,
+            .ocr_embedded_quality = if (scanned_page) try ocrQualityJsonAlloc(alloc, quality) else null,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
@@ -2877,4 +3191,56 @@ test "document extraction classifies unsupported content without units" {
     try std.testing.expectEqualStrings("unsupported", result.route_type);
     try std.testing.expectEqualStrings("unsupported_content_type", result.unsupported_reason);
     try std.testing.expectEqual(@as(usize, 0), result.units.len);
+}
+
+test "OCR quality fallback covers born digital scanned garbled and encoding failures" {
+    const config = OcrQualityConfig{};
+    const born_digital = assessOcrQuality("This is a normal born-digital document page with enough readable English text to be indexed without optical character recognition.", config);
+    try std.testing.expect(!born_digital.needsFallback());
+    try std.testing.expect(assessOcrQuality("", config).too_short);
+
+    const garbled = assessOcrQuality("a b c d e f g h i j k l m n o p q r s t u v w y z a b c d e f", config);
+    try std.testing.expect(garbled.garbled);
+
+    const replacement = assessOcrQuality("Readable source text that is long enough but contains replacement markers \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd}.", config);
+    try std.testing.expect(replacement.replacement_corrupted);
+}
+
+test "OCR text selection retains embedded text on ties and chooses a better transcription" {
+    const config = OcrQualityConfig{};
+    const embedded = assessOcrQuality("a b c d e f g h i j k l m n o p q r s t u v w y z a b c d e f", config);
+    const ocr = assessOcrQuality("A faithfully transcribed table page with readable headings and enough ordinary English content to pass all quality checks.", config);
+    try std.testing.expect(preferOcrText(embedded, ocr));
+    try std.testing.expect(!preferOcrText(ocr, ocr));
+}
+
+test "OCR options parse configurable thresholds resolution and layout prompt" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"mode":"always","render_dpi":200,"max_rendered_pixels":123456,"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"config":{"provider":"antfly","prompt":"Preserve tables"}}}
+    );
+    defer config.deinit(alloc);
+    try std.testing.expect(config.ocr_enabled);
+    try std.testing.expectEqual(OcrMode.always, config.ocr_mode);
+    try std.testing.expectEqual(@as(u16, 200), config.ocr_render_dpi);
+    try std.testing.expectEqual(@as(u64, 123456), config.ocr_max_rendered_pixels);
+    try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_content_chars);
+    try std.testing.expectEqualStrings("Preserve tables", config.ocr_prompt);
+}
+
+test "OCR page request carries PNG media page metadata and layout prompt" {
+    const alloc = std.testing.allocator;
+    const unit = Unit{
+        .unit_id = @constCast("page:000002"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("pdf_ocr_pending"),
+        .page_number = 2,
+    };
+    const parts = try ocrPagePartsJsonAlloc(alloc, .{}, "pdf", "application/pdf", unit, "png");
+    defer alloc.free(parts);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "image/png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "Render tables as Markdown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "page:000002") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "cG5n") != null);
 }

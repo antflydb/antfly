@@ -58,11 +58,27 @@ fn extractTextNative(_: *const anyopaque, alloc: Allocator, pdf_bytes: []const u
 }
 
 fn renderFirstPagePngNative(_: *const anyopaque, alloc: Allocator, pdf_bytes: []const u8) ![]u8 {
+    return try renderPagePngAlloc(alloc, pdf_bytes, 1, 72, 40_000_000);
+}
+
+/// Renders a one-based PDF page at the requested raster resolution. Geometry is
+/// scaled before rasterization so embedded page images are sampled directly at
+/// the target resolution rather than upscaling a 72-DPI preview.
+pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    if (page_number == 0) return error.InvalidPageNumber;
+    if (dpi < 72 or dpi > 600) return error.InvalidRenderDpi;
     var parsed = try reader.Reader.init(alloc, pdf_bytes);
     defer parsed.deinit();
-    var render_runs = try parsed.extractPageRenderRunsAlloc(1);
+    const page_count = try parsed.pageCount();
+    if (page_number > page_count) return error.InvalidPageNumber;
+    var render_runs = try parsed.extractPageRenderRunsAlloc(page_number);
     defer render_runs.deinit(alloc);
+    const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
+    scalePageRenderRuns(&render_runs, scale);
     const page_box = render_runs.page_box;
+    const page_width = @max(1.0, page_box.max_x - page_box.min_x);
+    const page_height = @max(1.0, page_box.max_y - page_box.min_y);
+    if (page_width * page_height > @as(f64, @floatFromInt(max_pixels))) return error.RenderedPageTooLarge;
     const runs = render_runs.text_runs;
     const image_runs = render_runs.image_runs;
     const shading_runs = render_runs.shading_runs;
@@ -91,8 +107,14 @@ fn renderFirstPagePngNative(_: *const anyopaque, alloc: Allocator, pdf_bytes: []
         if (has_pattern or run.vectorizable) continue;
         try plain_runs.append(alloc, run);
     }
-    if (needs_vector_text_patterns) text_pattern_runs = try parsed.extractPageVectorTextPatternRunsAlloc(1);
-    if (needs_vector_text_shapes) text_shape_runs = try parsed.extractPageVectorTextShapeRunsAlloc(1);
+    if (needs_vector_text_patterns) {
+        text_pattern_runs = try parsed.extractPageVectorTextPatternRunsAlloc(page_number);
+        scalePatternRuns(text_pattern_runs, scale);
+    }
+    if (needs_vector_text_shapes) {
+        text_shape_runs = try parsed.extractPageVectorTextShapeRunsAlloc(page_number);
+        scaleShapeRuns(text_shape_runs, scale);
+    }
     var all_shape_runs = std.ArrayList(reader.ShapeRun).empty;
     defer {
         for (all_shape_runs.items) |*run| run.deinit(alloc);
@@ -168,10 +190,123 @@ fn renderFirstPagePngNative(_: *const anyopaque, alloc: Allocator, pdf_bytes: []
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    if (plain_runs.items.len > 0 or image_runs.len > 0 or shading_runs.len > 0 or all_pattern_runs.items.len > 0 or all_shape_runs.items.len > 0) return try render.renderPageContentPngInBox(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items);
-    const text = try parsed.extractPageTextAlloc(1);
-    defer alloc.free(text);
-    return try render.renderTextPreviewPng(alloc, text);
+    return try render.renderPageContentPngInBox(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items);
+}
+
+fn scaleBox(box: *reader.PageBox, scale: f64) void {
+    box.min_x *= scale;
+    box.min_y *= scale;
+    box.max_x *= scale;
+    box.max_y *= scale;
+}
+
+fn scalePoints(points: ?[]const [2]f64, scale: f64) void {
+    if (points) |items| for (@constCast(items)) |*point| {
+        point[0] *= scale;
+        point[1] *= scale;
+    };
+}
+
+fn scaleTextRuns(runs: []reader.TextRun, scale: f64) void {
+    for (runs) |*run| {
+        run.x *= scale;
+        run.y *= scale;
+        run.font_size *= scale;
+        run.stroke_width *= scale;
+        run.char_spacing *= scale;
+        run.word_spacing *= scale;
+        run.advance_width *= scale;
+        run.ascent *= scale;
+        run.descent *= scale;
+        if (run.clip_box) |*box| scaleBox(box, scale);
+        scalePoints(run.clip_points, scale);
+    }
+}
+
+fn scaleImageRuns(runs: []reader.ImageRun, scale: f64) void {
+    for (runs) |*run| {
+        run.a *= scale;
+        run.b *= scale;
+        run.c *= scale;
+        run.d *= scale;
+        run.e *= scale;
+        run.f *= scale;
+        run.x *= scale;
+        run.y *= scale;
+        run.draw_width *= scale;
+        run.draw_height *= scale;
+        if (run.clip_box) |*box| scaleBox(box, scale);
+        scalePoints(run.clip_points, scale);
+    }
+}
+
+fn scaleShadingRuns(runs: []reader.ShadingRun, scale: f64) void {
+    for (runs) |*run| {
+        run.x0 *= scale;
+        run.y0 *= scale;
+        run.r0 *= scale;
+        run.x1 *= scale;
+        run.y1 *= scale;
+        run.r1 *= scale;
+        if (run.clip_box) |*box| scaleBox(box, scale);
+        scalePoints(run.clip_points, scale);
+    }
+}
+
+fn scaleShapeRuns(runs: []reader.ShapeRun, scale: f64) void {
+    for (runs) |*run| {
+        run.stroke_width *= scale;
+        run.dash_phase *= scale;
+        if (run.dash_array) |dash| {
+            for (dash) |*value| value.* *= scale;
+        }
+        for (run.points) |*point| {
+            point[0] *= scale;
+            point[1] *= scale;
+        }
+        if (run.clip_box) |*box| scaleBox(box, scale);
+        scalePoints(run.clip_points, scale);
+    }
+}
+
+fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
+    for (runs) |*run| {
+        run.stroke_width *= scale;
+        run.dash_phase *= scale;
+        if (run.dash_array) |dash| {
+            for (dash) |*value| value.* *= scale;
+        }
+        for (run.points) |*point| {
+            point[0] *= scale;
+            point[1] *= scale;
+        }
+        if (run.clip_box) |*box| scaleBox(box, scale);
+        scalePoints(run.clip_points, scale);
+        scaleBox(&run.pattern_bbox, scale);
+        run.pattern_x_step *= scale;
+        run.pattern_y_step *= scale;
+        run.pattern_matrix.a *= scale;
+        run.pattern_matrix.b *= scale;
+        run.pattern_matrix.c *= scale;
+        run.pattern_matrix.d *= scale;
+        run.pattern_matrix.e *= scale;
+        run.pattern_matrix.f *= scale;
+        if (run.shading) |*shading| scaleShadingRuns(@as(*[1]reader.ShadingRun, @ptrCast(shading))[0..], scale);
+        scaleTextRuns(run.tile_text_runs, scale);
+        scaleImageRuns(run.tile_image_runs, scale);
+        scaleShadingRuns(run.tile_shading_runs, scale);
+        scalePatternRuns(run.tile_pattern_runs, scale);
+        scaleShapeRuns(run.tile_shape_runs, scale);
+    }
+}
+
+fn scalePageRenderRuns(runs: *reader.PageRenderRuns, scale: f64) void {
+    scaleBox(&runs.page_box, scale);
+    scaleTextRuns(runs.text_runs, scale);
+    scaleImageRuns(runs.image_runs, scale);
+    scaleShadingRuns(runs.shading_runs, scale);
+    scalePatternRuns(runs.pattern_runs, scale);
+    scaleShapeRuns(runs.shape_runs, scale);
 }
 
 fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternRun {
@@ -548,6 +683,14 @@ test "native backend renders simple pdf first page png" {
     const png = try backend.renderFirstPagePng(alloc, out.items);
     defer alloc.free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+    const ocr_png = try renderPagePngAlloc(alloc, out.items, 1, 150, 40_000_000);
+    defer alloc.free(ocr_png);
+    const native_page = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(native_page.rgba);
+    const ocr_page = try @import("antfly_image").png.decodeRgba(alloc, ocr_png);
+    defer alloc.free(ocr_page.rgba);
+    try std.testing.expect(ocr_page.width > native_page.width);
+    try std.testing.expect(ocr_page.height > native_page.height);
 }
 
 test "native backend renders embedded fixture pdf first page png" {
@@ -627,6 +770,14 @@ test "native backend renders simple image xobject pdf first page png" {
     const png = try backend.renderFirstPagePng(alloc, out.items);
     defer alloc.free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+    const scanned_ocr_png = try renderPagePngAlloc(alloc, out.items, 1, 150, 40_000_000);
+    defer alloc.free(scanned_ocr_png);
+    const scanned_native_page = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(scanned_native_page.rgba);
+    const scanned_ocr_page = try @import("antfly_image").png.decodeRgba(alloc, scanned_ocr_png);
+    defer alloc.free(scanned_ocr_page.rgba);
+    try std.testing.expect(scanned_ocr_page.width > scanned_native_page.width);
+    try std.testing.expect(scanned_ocr_page.height > scanned_native_page.height);
 }
 
 test "native backend renders Type3 text glyphs through shape path" {
@@ -2279,4 +2430,67 @@ test {
     _ = reader;
     _ = syntax;
     _ = render;
+}
+
+test "native page renderer honors OCR DPI and pixel guard" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    const png_72 = try renderPagePngAlloc(alloc, fixture, 1, 72, 40_000_000);
+    defer alloc.free(png_72);
+    const png_150 = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(png_150);
+    const decoded_72 = try @import("antfly_image").png.decodeRgba(alloc, png_72);
+    defer alloc.free(decoded_72.rgba);
+    const decoded_150 = try @import("antfly_image").png.decodeRgba(alloc, png_150);
+    defer alloc.free(decoded_150.rgba);
+    try std.testing.expect(decoded_150.width > decoded_72.width);
+    try std.testing.expect(decoded_150.height > decoded_72.height);
+    try std.testing.expectError(error.RenderedPageTooLarge, renderPagePngAlloc(alloc, fixture, 1, 150, 10));
+    try std.testing.expectError(error.InvalidPageNumber, renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000));
+}
+
+test "native page renderer renders the requested one-based PDF page" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    const second_text = try parsed.extractPageTextAlloc(2);
+    defer alloc.free(second_text);
+    try std.testing.expect(std.mem.indexOf(u8, second_text, "SECOND PAGE") != null);
+
+    const first_png = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(first_png);
+    const second_png = try renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000);
+    defer alloc.free(second_png);
+    const first = try @import("antfly_image").png.decodeRgba(alloc, first_png);
+    defer alloc.free(first.rgba);
+    const second = try @import("antfly_image").png.decodeRgba(alloc, second_png);
+    defer alloc.free(second.rgba);
+    try std.testing.expectEqual(first.width, second.width);
+    try std.testing.expectEqual(first.height, second.height);
+    try std.testing.expect(!std.mem.eql(u8, first.rgba, second.rgba));
+}
+
+test "native page renderer preserves a raster scanned-table fixture for OCR" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/scanned_table_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    const embedded_text = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(embedded_text);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, embedded_text, &std.ascii.whitespace).len);
+
+    const png = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(png);
+    const page = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(page.rgba);
+    try std.testing.expect(page.width >= 133);
+    try std.testing.expect(page.height >= 100);
+
+    var dark_pixels: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < page.rgba.len) : (i += 4) {
+        if (page.rgba[i] < 128 and page.rgba[i + 1] < 128 and page.rgba[i + 2] < 128) dark_pixels += 1;
+    }
+    try std.testing.expect(dark_pixels > 500);
 }
