@@ -59,6 +59,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
+const document_extraction_mod = @import("../storage/db/enrichment/document_extraction.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
 const tracing = @import("../tracing/mod.zig");
@@ -13658,6 +13659,20 @@ fn putCachedLocalArtifactEnrichment(
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
         const mutation_err: ?anyerror = blk: {
+            var enrichments = createManagedDbEnrichments(
+                cached.db.runtime_alloc,
+                metadata.indexes_json,
+                self.backend_runtime,
+                self.antfly_provider,
+                self.inference_api_url,
+                self.secret_store,
+                self.remote_content,
+            ) catch |err| break :blk err;
+            defer enrichments.deinit(cached.db.runtime_alloc);
+            if (enrichments.enabled()) {
+                cached.db.reconfigureEnrichmentRuntime(enrichments.config()) catch |err| break :blk err;
+                enrichments.forgetTransferred();
+            }
             putArtifactEnrichmentInDb(alloc, cached.db, artifact_name, enrichment_json) catch |err| break :blk err;
             publishArtifactEnrichmentRuntimeStatusBestEffort(self, alloc, table_name, artifact_name, group_id, cached.db);
             break :blk null;
@@ -14939,7 +14954,12 @@ fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json
     defer if (owns_producer_json) alloc.free(@constCast(producer_json));
     var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
     defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy and producer_cfg.type != .document_extraction;
+    if (producer_cfg.type == .document_extraction) {
+        var extraction_cfg = document_extraction_mod.parseConfig(alloc, producer_cfg.config_json) catch return false;
+        defer extraction_cfg.deinit(alloc);
+        return extraction_cfg.ocr_enabled or extraction_cfg.transcription_enabled;
+    }
+    return producer_cfg.type != .copy;
 }
 
 test "provisioning detects model backed graph shorthand assets inside config_json strings" {
@@ -14969,6 +14989,16 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
         \\}]
     ));
+}
+
+test "provisioning detects document extraction OCR as model backed" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
+        \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\"}}}}"}]}]
+    ));
+    try std.testing.expect(!(try indexesJsonNeedsAssetProducer(alloc,
+        \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
+    )));
 }
 
 test "provisioning detects generated embedding chunkers inside index metadata" {

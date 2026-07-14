@@ -317,16 +317,13 @@ pub const Runtime = struct {
         var flat_images = std.ArrayListUnmanaged([]const u8).empty;
         defer flat_images.deinit(alloc);
 
-        var shared_prompt: ?[]const u8 = null;
+        var shared_prompt: ?[]const u8 = cfg_parsed.value.prompt;
         for (requests, 0..) |request, i| {
             sources[i] = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
             sources_filled += 1;
-            if (!optionalStringsEqual(shared_prompt, sources[i].prompt)) {
-                if (i == 0) {
-                    shared_prompt = sources[i].prompt;
-                } else {
-                    return error.BatchIncompatible;
-                }
+            const effective_prompt = sources[i].prompt orelse cfg_parsed.value.prompt;
+            if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
+                if (i == 0) shared_prompt = effective_prompt else return error.BatchIncompatible;
             }
             image_counts[i] = sources[i].images.len;
             try flat_images.appendSlice(alloc, sources[i].images);
@@ -423,7 +420,7 @@ pub const Runtime = struct {
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
             const results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
                 .images = source.images,
-                .prompt = source.prompt,
+                .prompt = source.prompt orelse cfg_parsed.value.prompt,
                 .max_tokens = cfg_parsed.value.max_tokens,
             });
             defer {
@@ -444,7 +441,7 @@ pub const Runtime = struct {
         const provider = try runtime.get("asset");
         const results = try provider.read(alloc, .{
             .images = source.images,
-            .prompt = source.prompt,
+            .prompt = source.prompt orelse cfg_parsed.value.prompt,
             .max_tokens = cfg_parsed.value.max_tokens,
         });
         defer {

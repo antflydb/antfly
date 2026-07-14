@@ -18008,7 +18008,8 @@ fn computeDocumentExtractionAssetRequestDerived(
         },
     };
     defer extraction.deinit(alloc);
-    try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, extraction.content_type, &extraction);
+    try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, downloaded_mut.data, extraction.content_type, &extraction);
+    document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
 
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
@@ -18185,6 +18186,7 @@ fn completeDocumentExtractionGeneratedText(
     runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     config: document_extraction_mod.Config,
     source_url: []const u8,
+    source_bytes: []const u8,
     source_content_type: []const u8,
     extraction: *document_extraction_mod.Result,
 ) !void {
@@ -18192,17 +18194,33 @@ fn completeDocumentExtractionGeneratedText(
     const producer = active_runtime.config.asset_producer orelse return;
     for (extraction.units) |*unit| {
         if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
-            const parts_json = try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
+            unit.ocr_attempted = true;
+            unit.ocr_render_dpi = if (std.mem.eql(u8, extraction.route_type, "pdf")) config.ocr_render_dpi else null;
+            const rendered = if (std.mem.eql(u8, extraction.route_type, "pdf"))
+                document_extraction_mod.renderPdfPagePngAlloc(alloc, source_bytes, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels) catch |err| {
+                    try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
+                    continue;
+                }
+            else
+                null;
+            defer if (rendered) |png| alloc.free(png);
+            const parts_json = if (rendered) |png|
+                try document_extraction_mod.ocrPagePartsJsonAlloc(alloc, config, extraction.route_type, source_content_type, unit.*, png)
+            else
+                try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
             defer alloc.free(parts_json);
-            const produced = try producer.produce(alloc, .{
+            const produced = producer.produce(alloc, .{
                 .producer_type = .reader,
                 .config_json = config.ocr_config_json,
-                .source_text = source_url,
+                .source_text = if (rendered != null) "" else source_url,
                 .source_parts_json = parts_json,
                 .content_type = "text/plain",
-            });
+            }) catch |err| {
+                try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
+                continue;
+            };
             errdefer alloc.free(produced);
-            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr);
+            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr, config.ocr_quality);
             continue;
         }
         if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
@@ -18216,7 +18234,7 @@ fn completeDocumentExtractionGeneratedText(
                 .content_type = "text/plain",
             });
             errdefer alloc.free(produced);
-            try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript);
+            try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript, config.ocr_quality);
         }
     }
 }
@@ -18230,14 +18248,33 @@ fn applyGeneratedUnitText(
     method: []const u8,
     status: []const u8,
     kind: GeneratedUnitTextKind,
+    quality_config: document_extraction_mod.OcrQualityConfig,
 ) !void {
-    if (produced.len == 0) {
+    if (produced.len == 0 and kind != .ocr) {
         alloc.free(produced);
         return;
     }
     defer alloc.free(produced);
     var parsed = try parseGeneratedUnitTextOutputAlloc(alloc, produced);
     errdefer parsed.deinit(alloc);
+    if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) {
+        unit.ocr_attempted = true;
+        const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
+        const output_quality = document_extraction_mod.assessOcrQuality(parsed.text, quality_config);
+        if (unit.ocr_embedded_quality) |value| alloc.free(value);
+        unit.ocr_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
+        if (unit.ocr_output_quality) |value| alloc.free(value);
+        unit.ocr_output_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, output_quality);
+        if (!document_extraction_mod.preferOcrText(embedded_quality, output_quality)) {
+            if (unit.extraction_status) |value| alloc.free(value);
+            unit.extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            alloc.free(unit.method);
+            unit.method = try alloc.dupe(u8, "pdf_text");
+            unit.ocr_used = false;
+            parsed.deinit(alloc);
+            return;
+        }
+    }
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
     const owned_status = try alloc.dupe(u8, status);
@@ -18256,6 +18293,8 @@ fn applyGeneratedUnitText(
             unit.ocr_used = true;
             unit.ocr_confidence = parsed.confidence;
             unit.ocr_bbox = parsed.bbox;
+            if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
+            unit.text_regions = &.{};
         },
         .transcript => {
             unit.transcript_used = true;
@@ -18267,6 +18306,25 @@ fn applyGeneratedUnitText(
     const start = unit.char_start orelse 0;
     unit.char_start = start;
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+fn markGeneratedUnitTextFailure(alloc: Allocator, unit: *document_extraction_mod.Unit, method: []const u8, kind: GeneratedUnitTextKind, err: anyerror) !void {
+    const status = if (kind == .ocr) "failed_ocr" else "failed_transcription";
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    if (unit.extraction_status) |value| alloc.free(value);
+    if (unit.extraction_warning) |value| alloc.free(value);
+    unit.extraction_status = try alloc.dupe(u8, status);
+    unit.extraction_warning = warning;
+    if (kind == .ocr) {
+        unit.ocr_attempted = true;
+        unit.ocr_used = false;
+        alloc.free(unit.method);
+        unit.method = try alloc.dupe(u8, "pdf_text");
+        if (std.mem.eql(u8, unit.unit_type, "image")) {
+            alloc.free(unit.text);
+            unit.text = try alloc.dupe(u8, "");
+        }
+    }
 }
 
 const ParsedGeneratedUnitText = struct {
@@ -18351,6 +18409,11 @@ fn documentGeneratedTextPartsJsonAlloc(
         .text_regions = unit.text_regions,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
@@ -18956,6 +19019,11 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .confidence = documentUnitConfidence(unit),
         .ocr_used = unit.ocr_used,
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_used = unit.transcript_used,
@@ -19001,6 +19069,15 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         hasher.update(&buf);
     }
     hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    hasher.update(if (unit.ocr_attempted) "ocr_attempted:1" else "ocr_attempted:0");
+    if (unit.ocr_render_dpi) |dpi| {
+        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
+        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
+        hasher.update(&dpi_buf);
+    }
+    if (unit.ocr_trigger_reasons) |value| hasher.update(value);
+    if (unit.ocr_embedded_quality) |value| hasher.update(value);
+    if (unit.ocr_output_quality) |value| hasher.update(value);
     if (unit.ocr_confidence) |confidence| {
         var value = confidence;
         hasher.update(std.mem.asBytes(&value));
@@ -19235,6 +19312,11 @@ fn documentUnitPayloadAlloc(
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
         .confidence = documentUnitConfidence(unit),
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
@@ -19248,6 +19330,11 @@ fn documentUnitPayloadAlloc(
             .byte_length = unit.byte_length,
             .confidence = documentUnitConfidence(unit),
             .ocr_used = unit.ocr_used,
+            .ocr_attempted = unit.ocr_attempted,
+            .ocr_render_dpi = unit.ocr_render_dpi,
+            .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+            .ocr_embedded_quality = unit.ocr_embedded_quality,
+            .ocr_output_quality = unit.ocr_output_quality,
             .ocr_confidence = unit.ocr_confidence,
             .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
@@ -19272,6 +19359,11 @@ fn documentUnitPayloadAlloc(
                 .byte_length = unit.byte_length,
                 .confidence = documentUnitConfidence(unit),
                 .ocr_used = unit.ocr_used,
+                .ocr_attempted = unit.ocr_attempted,
+                .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+                .ocr_embedded_quality = unit.ocr_embedded_quality,
+                .ocr_output_quality = unit.ocr_output_quality,
                 .ocr_confidence = unit.ocr_confidence,
                 .ocr_bbox = unit.ocr_bbox,
                 .transcript_used = unit.transcript_used,
@@ -19469,6 +19561,17 @@ fn documentArtifactManifestFromJsonAlloc(
     errdefer if (last_error_code) |value| alloc.free(value);
     const last_error_message = try jsonObjectOptionalNestedStringDup(alloc, object, "last_error", "message");
     errdefer if (last_error_message) |value| alloc.free(value);
+    var ocr_failed_page_numbers: []i64 = &.{};
+    if (object.get("ocr_failed_page_numbers")) |pages| {
+        if (pages != .array) return error.InvalidDocumentExtractionManifest;
+        ocr_failed_page_numbers = try alloc.alloc(i64, pages.array.items.len);
+        errdefer if (ocr_failed_page_numbers.len > 0) alloc.free(ocr_failed_page_numbers);
+        for (pages.array.items, 0..) |page, i| {
+            if (page != .integer) return error.InvalidDocumentExtractionManifest;
+            if (page.integer < 1) return error.InvalidDocumentExtractionManifest;
+            ocr_failed_page_numbers[i] = page.integer;
+        }
+    }
 
     const child_ranges = try documentArtifactChildRangesFromJsonAlloc(alloc, object);
     errdefer {
@@ -19515,6 +19618,12 @@ fn documentArtifactManifestFromJsonAlloc(
         .unsupported_reason = unsupported_reason,
         .unit_count = try jsonObjectUsize(object, "unit_count"),
         .chunk_count = try jsonObjectUsize(object, "chunk_count"),
+        .ocr_attempted_count = (try jsonObjectOptionalUsize(object, "ocr_attempted_count")) orelse 0,
+        .ocr_selected_count = (try jsonObjectOptionalUsize(object, "ocr_selected_count")) orelse 0,
+        .ocr_retained_embedded_count = (try jsonObjectOptionalUsize(object, "ocr_retained_embedded_count")) orelse 0,
+        .ocr_failed_count = (try jsonObjectOptionalUsize(object, "ocr_failed_count")) orelse 0,
+        .ocr_failed_page_numbers = ocr_failed_page_numbers,
+        .ocr_failed_pages_truncated = (try jsonObjectOptionalBool(object, "ocr_failed_pages_truncated")) orelse false,
         .child_ranges = child_ranges,
         .child_range_count = child_ranges.len,
         .merge_status = merge_status,
@@ -19841,6 +19950,41 @@ fn documentExtractionManifestPayloadAlloc(
     }
     try appendJsonFieldUsize(alloc, &out, &first, "unit_count", extraction.units.len);
     try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
+    var ocr_attempted_count: usize = 0;
+    var ocr_selected_count: usize = 0;
+    var ocr_retained_embedded_count: usize = 0;
+    var ocr_failed_count: usize = 0;
+    var failed_pages: [32]u32 = undefined;
+    var failed_pages_len: usize = 0;
+    for (extraction.units) |unit| {
+        if (!unit.ocr_attempted) continue;
+        ocr_attempted_count += 1;
+        if (unit.ocr_used) ocr_selected_count += 1;
+        if (unit.extraction_status) |status| {
+            if (std.mem.eql(u8, status, "completed_embedded_preferred")) ocr_retained_embedded_count += 1;
+            if (std.mem.eql(u8, status, "failed_ocr")) {
+                ocr_failed_count += 1;
+                if (failed_pages_len < failed_pages.len) if (unit.page_number) |page| {
+                    failed_pages[failed_pages_len] = page;
+                    failed_pages_len += 1;
+                };
+            }
+        }
+    }
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_attempted_count", ocr_attempted_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_selected_count", ocr_selected_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_retained_embedded_count", ocr_retained_embedded_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_failed_count", ocr_failed_count);
+    try appendJsonFieldName(alloc, &out, &first, "ocr_failed_page_numbers");
+    try out.append(alloc, '[');
+    for (failed_pages[0..failed_pages_len], 0..) |page, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const rendered_page = try std.fmt.allocPrint(alloc, "{d}", .{page});
+        defer alloc.free(rendered_page);
+        try out.appendSlice(alloc, rendered_page);
+    }
+    try out.append(alloc, ']');
+    try appendJsonFieldBool(alloc, &out, &first, "ocr_failed_pages_truncated", ocr_failed_count > failed_pages_len);
     try appendJsonFieldName(alloc, &out, &first, "child_ranges");
     try out.append(alloc, '[');
     try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
