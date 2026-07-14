@@ -10087,6 +10087,10 @@ pub const ProvisionedTableWriteSource = struct {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const apply_req = req;
+        const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
+        if (apply_req.split_replication) |replication| {
+            try validateSplitReplicationIdentityAgainstCatalog(alloc, self.catalog, table_name, replication);
+        }
         self.beginGroupOperation(table_name, group_id);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
@@ -10103,15 +10107,19 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group_id);
-            var cached = try self.getOrOpenCachedDbForLocalMutation(
-                alloc,
-                cache,
-                path,
-                group_id,
-                target_generation,
-                table_name,
-                true,
-            );
+            var cached = if (split_identity_namespace) |namespace|
+                (try self.leaseCachedTransitionGroupWriter(alloc, group_id, table_name, namespace)) orelse
+                    return error.TableNotFound
+            else
+                try self.getOrOpenCachedDbForLocalMutation(
+                    alloc,
+                    cache,
+                    path,
+                    group_id,
+                    target_generation,
+                    table_name,
+                    true,
+                );
             defer cached.deinit(alloc);
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
@@ -10141,7 +10149,17 @@ pub const ProvisionedTableWriteSource = struct {
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
             self.notifyLocalChange(table_name, .data);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+            var db = try openManagedDbForReplicatedApply(
+                alloc,
+                path,
+                self.catalog,
+                table_name,
+                group_id,
+                self.backend_runtime,
+                self.ha_write_gate,
+                self.ha_async_mirror,
+                split_identity_namespace,
+            );
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
@@ -16622,6 +16640,113 @@ fn validateProvisionedDbIdentityNamespaceExpected(expected: ?doc_identity.Namesp
     if (!db.core.identity_namespace.eql(namespace)) return error.DocIdentityNamespaceMismatch;
 }
 
+fn validateSplitReplicationForApply(req: db_mod.types.BatchRequest, group_id: u64) !?doc_identity.Namespace {
+    const replication = req.split_replication orelse {
+        if (req.split_checkpoint) |checkpoint| {
+            if (checkpoint.kind == .destination) return error.MissingSplitReplicationContext;
+        }
+        return null;
+    };
+    if (replication.source_group_id == replication.destination_group_id or
+        replication.destination_group_id != group_id or
+        replication.identity_namespace.table_id == 0 or
+        replication.identity_namespace.shard_id == 0 or
+        replication.identity_namespace.range_id == 0 or
+        req.split_transition != null)
+    {
+        return error.InvalidBatchRequest;
+    }
+    if (req.split_checkpoint) |checkpoint| {
+        if (checkpoint.kind != .destination or
+            checkpoint.source_group_id != replication.source_group_id or
+            checkpoint.destination_group_id != replication.destination_group_id)
+        {
+            return error.InvalidBatchRequest;
+        }
+    }
+    return replication.identity_namespace;
+}
+
+fn validateSplitReplicationIdentityAgainstCatalog(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    replication: db_mod.types.SplitReplicationContext,
+) !void {
+    const source_namespace = (try loadTableIdentityNamespaceForGroup(
+        alloc,
+        catalog,
+        table_name,
+        replication.source_group_id,
+    )) orelse return error.MissingIdentityNamespace;
+    if (!source_namespace.eql(replication.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+}
+
+fn openManagedDbForReplicatedApply(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+    split_identity_namespace: ?doc_identity.Namespace,
+) !db_mod.DB {
+    const namespace = split_identity_namespace orelse
+        return try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
+            alloc,
+            path,
+            catalog,
+            table_name,
+            group_id,
+            backend_runtime,
+            ha_write_gate,
+            ha_async_mirror,
+        );
+    const indexes_json = try loadTableIndexesJson(alloc, catalog, table_name);
+    defer if (indexes_json) |value| alloc.free(value);
+    const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
+    var db = if (indexes_json) |value|
+        try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+            alloc,
+            path,
+            value,
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default_async,
+            backend_runtime,
+            null,
+            null,
+            null,
+            namespace,
+            .{
+                .drain_resolver_backfill = false,
+                .ha_write_gate = ha_write_gate,
+                .ha_async_effect_mirror = effective_ha_mirror,
+                .ha_async_batch_mirror = effective_ha_mirror,
+                .ha_async_metadata_mirror = effective_ha_mirror,
+            },
+        )
+    else
+        try db_mod.DB.open(alloc, path, .{
+            .backend_runtime = backend_runtime,
+            .identity_namespace = namespace,
+            .prefer_existing_identity_namespace = true,
+            .ha_write_gate = ha_write_gate,
+            .ha_async_effect_mirror = effective_ha_mirror,
+            .ha_async_batch_mirror = effective_ha_mirror,
+            .ha_async_metadata_mirror = effective_ha_mirror,
+            .open_mode = .writer_no_replay,
+            .index_open_parallelism = 1,
+        });
+    errdefer db.close();
+    try validateProvisionedDbIdentityNamespaceExpected(namespace, &db);
+    return db;
+}
+
 fn validateProvisionedDbIdentityNamespace(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -17095,6 +17220,84 @@ test "provisioned table write source seeds doc identity namespace from table ran
         .table_id = 7,
         .shard_id = 7001,
         .range_id = 7101,
+    }));
+}
+
+test "replicated split destination seeds inherited doc identity before range publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-destination-identity", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{}",
+                }})[0..]),
+                // The destination deliberately remains unpublished until cutover.
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7101,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7101 };
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
+        .writes = &.{.{ .key = "doc:m", .value = "{\"title\":\"m\"}" }},
+        .split_replication = .{
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .identity_namespace = namespace,
+        },
+    });
+
+    var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+        return error.TestUnexpectedResult;
+    defer destination.deinit(alloc);
+    try std.testing.expect(destination.db.core.identity_namespace.eql(namespace));
+    var doc = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
+    defer doc.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, doc.json, "\"m\"") != null);
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
+        .split_replication = .{
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+        },
     }));
 }
 

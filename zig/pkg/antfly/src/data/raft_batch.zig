@@ -118,3 +118,23 @@ test "raft batch round trips internal split checkpoint" {
     try std.testing.expectEqualStrings("doc:z", checkpoint.range_end);
     try std.testing.expectEqual(@as(u64, 7), checkpoint.delta_sequence);
 }
+
+test "raft batch round trips internal split replication identity" {
+    const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 41, .range_id = 4100 };
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .writes = &.{.{ .key = "doc:m", .value = "{}" }},
+        .split_replication = .{
+            .source_group_id = 41,
+            .destination_group_id = 42,
+            .identity_namespace = namespace,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const replication = decoded.batch.req.split_replication orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
+    try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
+    try std.testing.expect(replication.identity_namespace.eql(namespace));
+}

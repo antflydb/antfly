@@ -214,7 +214,31 @@ pub const RaftApplyStore = struct {
     }
 
     fn writeBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
-        const metadata = try describeEntries(self.alloc, entries_bytes);
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        const existing_batch = try self.ensureLoaded(shard, group_id);
+        if (existing_batch) |existing| {
+            if (commit_index < existing.commit_index) return error.OutOfOrderDataApplyBatch;
+            if (commit_index == existing.commit_index) {
+                try self.verifyPersistedBatch(group_id, commit_index, entries_bytes);
+                return;
+            }
+        } else {
+            // Reserve before the durable write so cache publication cannot fail
+            // after storage has advanced.
+            try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+        }
+        // A failed sibling state machine can leave this store ahead of Raft's
+        // shared applied watermark. Raft then legitimately presents an
+        // overlapping committed prefix. Apply effects only for entries newer
+        // than this store's own durable watermark.
+        const metadata = try describeEntries(
+            self.alloc,
+            entries_bytes,
+            if (existing_batch) |existing| existing.last_entry_index else 0,
+        );
         defer {
             for (metadata.normal_entries) |entry| self.alloc.free(entry.data);
             self.alloc.free(metadata.normal_entries);
@@ -233,22 +257,6 @@ pub const RaftApplyStore = struct {
                 .acknowledge_split, .finalize_split, .rollback_split => {},
             };
             self.alloc.free(metadata.operations);
-        }
-        const io = self.io_impl.io();
-        const shard = self.batchShard(group_id);
-        shard.mutex.lockUncancelable(io);
-        defer shard.mutex.unlock(io);
-        const existing_batch = try self.ensureLoaded(shard, group_id);
-        if (existing_batch) |existing| {
-            if (commit_index < existing.commit_index) return error.OutOfOrderDataApplyBatch;
-            if (commit_index == existing.commit_index) {
-                try self.verifyPersistedBatch(group_id, commit_index, entries_bytes);
-                return;
-            }
-        } else {
-            // Reserve before the durable write so cache publication cannot fail
-            // after storage has advanced.
-            try shard.batches.ensureUnusedCapacity(self.alloc, 1);
         }
         var writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
         defer shard_state_store.freeOwnedWrites(self.alloc, &writes);
@@ -366,7 +374,7 @@ pub const RaftApplyStore = struct {
 
     const DataOperation = shard_state_store.DataOperation;
 
-    fn describeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8) !EntryMetadata {
+    fn describeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8, after_index: u64) !EntryMetadata {
         const decoded = try raft_state_machine.decodeCommittedEntries(alloc, entries_bytes);
         defer alloc.free(decoded);
         var normal_entry_count: usize = 0;
@@ -398,6 +406,7 @@ pub const RaftApplyStore = struct {
             switch (entry.entry_type) {
                 .normal => {
                     normal_entry_count += 1;
+                    if (entry.index <= after_index) continue;
                     try normal_entries.append(alloc, .{
                         .index = entry.index,
                         .data = try alloc.dupe(u8, entry.data),
@@ -1025,6 +1034,62 @@ test "data raft apply store persists split destination acknowledgements" {
         return error.MissingSplitAcknowledgement;
     try std.testing.expectEqual(@as(u64, 202), acknowledgement.destination_group_id);
     try std.testing.expectEqual(@as(u64, 9), acknowledgement.delta_sequence);
+}
+
+test "data raft apply store skips persisted split commands in overlapping replay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-overlap", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .prepare,
+            .destination_group_id = 212,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(prepare);
+    const start = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .start,
+            .destination_group_id = 212,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(start);
+
+    const initial = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare },
+    });
+    defer std.testing.allocator.free(initial);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 211,
+        .commit_index = 2,
+        .entries_bytes = initial,
+    });
+
+    const overlapping = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = start },
+    });
+    defer std.testing.allocator.free(overlapping);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 211,
+        .commit_index = 3,
+        .entries_bytes = overlapping,
+    });
+
+    const split_state = (try store.currentSplitState(std.testing.allocator, 211)) orelse
+        return error.MissingSplitState;
+    defer shard_state_store.freeSplitState(std.testing.allocator, split_state);
+    try std.testing.expectEqual(shard_mod.SplitPhase.splitting, split_state.phase);
+    try std.testing.expectEqual(@as(u64, 212), split_state.new_shard_id);
+    try std.testing.expectEqualStrings("doc:m", split_state.split_key);
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {
