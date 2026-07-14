@@ -806,8 +806,7 @@ type HAStartupGateSpec struct {
 	// RuntimeEligible is necessary but never sufficient for startup. False always
 	// forces replicas to zero, including during declarative role handoff. True is
 	// honored only after the operator-observed policy evidence matches.
-	// +optional
-	RuntimeEligible bool `json:"runtimeEligible,omitempty"`
+	RuntimeEligible bool `json:"runtimeEligible"`
 
 	// ReceiptMatchPolicy currently supports only Exact.
 	// +kubebuilder:validation:Enum=Exact

@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,6 +10,19 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestHAStartupGateSerializationPreservesExplicitFalseRuntimeEligibility(t *testing.T) {
+	raw, err := json.Marshal(HAStartupGateSpec{
+		Policy:             HAStartupGatePolicyRequireActivatedSeed,
+		ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"runtimeEligible":false`) {
+		t.Fatalf("fail-closed runtimeEligible=false was omitted from JSON: %s", raw)
+	}
+}
 
 func TestValidateCreate_ValidBalanced(t *testing.T) {
 	cluster := &AntflyCluster{
