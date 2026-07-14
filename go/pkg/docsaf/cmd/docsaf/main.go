@@ -294,9 +294,9 @@ func loadCmd(args []string) error {
 	embeddingModel := fs.String("embedding-model", defaultDocsafEmbeddingModel, "Embedding model for managed vector search")
 	embeddingConfigJSON := fs.String("embedding-config-json", "", "Full JSON Antfly SDK EmbedderConfig for managed vector search; overrides --embedding-provider and --embedding-model")
 	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
-	ocrConfigJSON := fs.String("ocr-config-json", "", "Reader provider config JSON; enables selective server-side PDF OCR")
-	ocrRenderDPI := fs.Int("ocr-render-dpi", 150, "PDF page render DPI for selective OCR")
-	ocrMinContentChars := fs.Int("ocr-min-content-chars", docsaf.DefaultOCRMinContent, "Minimum usable embedded-text characters before OCR fallback")
+	ocrConfigJSON := fs.String("ocr-config-json", "", "Reader provider config JSON for selective server-side PDF OCR (table creation only; requires --create-table)")
+	ocrRenderDPI := fs.Int("ocr-render-dpi", 150, "PDF OCR render DPI (table creation only; requires --create-table)")
+	ocrMinContentChars := fs.Int("ocr-min-content-chars", docsaf.DefaultOCRMinContent, "Embedded-text threshold for PDF OCR fallback (table creation only; requires --create-table)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
@@ -370,9 +370,9 @@ func syncCmd(args []string) error {
 	embeddingModel := fs.String("embedding-model", defaultDocsafEmbeddingModel, "Embedding model for managed vector search")
 	embeddingConfigJSON := fs.String("embedding-config-json", "", "Full JSON Antfly SDK EmbedderConfig for managed vector search; overrides --embedding-provider and --embedding-model")
 	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
-	ocrConfigJSON := fs.String("ocr-config-json", "", "Reader provider config JSON; enables selective server-side PDF OCR")
-	ocrRenderDPI := fs.Int("ocr-render-dpi", 150, "PDF page render DPI for selective OCR")
-	ocrMinContentChars := fs.Int("ocr-min-content-chars", docsaf.DefaultOCRMinContent, "Minimum usable embedded-text characters before OCR fallback")
+	ocrConfigJSON := fs.String("ocr-config-json", "", "Reader provider config JSON for selective server-side PDF OCR (table creation only; requires --create-table)")
+	ocrRenderDPI := fs.Int("ocr-render-dpi", 150, "PDF OCR render DPI (table creation only; requires --create-table)")
+	ocrMinContentChars := fs.Int("ocr-min-content-chars", docsaf.DefaultOCRMinContent, "Embedded-text threshold for PDF OCR fallback (table creation only; requires --create-table)")
 	sourceFlags := registerSourceFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
