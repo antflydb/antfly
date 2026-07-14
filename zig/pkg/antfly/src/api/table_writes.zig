@@ -4408,6 +4408,7 @@ pub const ProvisionedTableWriteSource = struct {
         operation_active: bool = false,
         structural_active: bool = false,
         structural_reconcile_active: bool = false,
+        structural_reconcile_queued: usize = 0,
         structural_reconcile_waiters: usize = 0,
         restore_preparations: usize = 0,
     };
@@ -4935,7 +4936,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn pruneTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) void {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
-        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return;
+        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return;
         const removed = self.active_table_activities.swapRemove(index);
         std.heap.page_allocator.free(removed.table_name);
         if (self.active_table_activities.items.len == 0) {
@@ -4958,7 +4959,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
+                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4972,7 +4973,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
+                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -4986,7 +4987,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn tryBeginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return false;
+            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return false;
         }
         const entry = self.activityEntryLocked(table_name, null);
         entry.table_request_active += 1;
@@ -5029,6 +5030,44 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn reserveStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        self.activityEntryLocked(table_name, null).structural_reconcile_queued += 1;
+    }
+
+    fn cancelStructuralReconcileReservation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, null) orelse return;
+        const entry = &self.active_table_activities.items[index];
+        std.debug.assert(entry.structural_reconcile_queued > 0);
+        entry.structural_reconcile_queued -= 1;
+        self.pruneTableActivityLocked(table_name, null);
+        self.table_activity_ready.broadcast(io);
+    }
+
+    fn beginReservedStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        while (true) {
+            const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
+            const entry = self.active_table_activities.items[index];
+            std.debug.assert(entry.structural_reconcile_queued > 0);
+            if (entry.structural_active or entry.structural_reconcile_active or entry.restore_preparations > 0 or entry.table_request_active > 0) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
+            const mutable_entry = &self.active_table_activities.items[index];
+            mutable_entry.structural_reconcile_queued -= 1;
+            mutable_entry.structural_reconcile_active = true;
+            return;
+        }
+    }
+
     fn endStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
@@ -5065,7 +5104,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
+                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5140,7 +5179,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn tryBeginStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) return false;
+            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) return false;
         }
         if (self.hasAnyActiveGroupOperationLocked(table_name)) return false;
         const entry = self.activityEntryLocked(table_name, null);
@@ -5153,7 +5192,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) {
+                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5181,7 +5220,7 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0) {
+                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5541,7 +5580,7 @@ pub const ProvisionedTableWriteSource = struct {
             const entry = &self.active_table_activities.items[index];
             if (entry.restore_preparations > 0) {
                 entry.restore_preparations -= 1;
-                std.debug.assert(!entry.structural_active and !entry.structural_reconcile_active and entry.structural_reconcile_waiters == 0 and entry.table_request_active == 0);
+                std.debug.assert(!entry.structural_active and !entry.structural_reconcile_active and entry.structural_reconcile_queued == 0 and entry.structural_reconcile_waiters == 0 and entry.table_request_active == 0);
                 entry.structural_active = true;
                 while (true) {
                     const current_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
@@ -7454,7 +7493,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return true;
+            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return true;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             if (self.active_table_activities.items[index].operation_active) return true;
@@ -7493,7 +7532,7 @@ pub const ProvisionedTableWriteSource = struct {
         var request_busy = false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) structural_busy = true;
+            if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) structural_busy = true;
             if (entry.table_request_active > 0 or entry.read_request_active > 0) request_busy = true;
         }
 
@@ -8477,7 +8516,10 @@ pub const ProvisionedTableWriteSource = struct {
         const alloc = std.heap.page_allocator;
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
-        for (self.structural_reconcile_tables.items) |*request| request.deinit(alloc);
+        for (self.structural_reconcile_tables.items) |*request| {
+            self.cancelStructuralReconcileReservation(request.table_name);
+            request.deinit(alloc);
+        }
         self.structural_reconcile_tables.deinit(alloc);
         self.structural_reconcile_tables = .empty;
     }
@@ -8511,6 +8553,7 @@ pub const ProvisionedTableWriteSource = struct {
             while (i < self.structural_reconcile_tables.items.len) {
                 if (std.mem.eql(u8, self.structural_reconcile_tables.items[i].table_name, table_name)) {
                     var removed = self.structural_reconcile_tables.orderedRemove(i);
+                    self.cancelStructuralReconcileReservation(removed.table_name);
                     removed.deinit(alloc);
                     continue;
                 }
@@ -8527,10 +8570,13 @@ pub const ProvisionedTableWriteSource = struct {
             .table_name = owned_table_name,
             .index_name = owned_index_name,
         });
+        self.reserveStructuralReconcileActivity(table_name);
 
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.restore_repair_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
-            _ = self.structural_reconcile_tables.orderedRemove(appended_index);
+            var removed = self.structural_reconcile_tables.orderedRemove(appended_index);
+            self.cancelStructuralReconcileReservation(removed.table_name);
+            removed.deinit(alloc);
             self.structural_reconcile_scheduled.store(false, .release);
             return err;
         };
@@ -8549,10 +8595,18 @@ pub const ProvisionedTableWriteSource = struct {
             var pending = self.structural_reconcile_tables;
             self.structural_reconcile_tables = .empty;
             self.structural_reconcile_mutex.unlock(io);
-            defer pending.deinit(alloc);
+            var next_request: usize = 0;
+            defer {
+                for (pending.items[next_request..]) |*request| {
+                    self.cancelStructuralReconcileReservation(request.table_name);
+                    request.deinit(alloc);
+                }
+                pending.deinit(alloc);
+            }
 
-            for (pending.items) |*request| {
-                defer request.deinit(alloc);
+            while (next_request < pending.items.len) : (next_request += 1) {
+                const request = &pending.items[next_request];
+                self.beginReservedStructuralReconcileActivity(request.table_name);
                 self.reconcileTableStructureUntilIdle(alloc, request.table_name, request.index_name) catch |err| {
                     if (request.index_name) |index_name| {
                         std.log.warn("structural reconcile failed table={s} index={s} err={s}", .{ request.table_name, index_name, @errorName(err) });
@@ -8560,6 +8614,8 @@ pub const ProvisionedTableWriteSource = struct {
                         std.log.warn("structural reconcile failed table={s} err={s}", .{ request.table_name, @errorName(err) });
                     }
                 };
+                self.endStructuralReconcileActivity(request.table_name);
+                request.deinit(alloc);
             }
         }
     }
@@ -8570,8 +8626,6 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
     ) !void {
-        self.beginStructuralReconcileActivity(table_name);
-        defer self.endStructuralReconcileActivity(table_name);
         const io = self.table_activity_threaded.io();
         if (target_index_name) |index_name| {
             std.log.info("structural reconcile begin table={s} index={s}", .{ table_name, index_name });
@@ -24146,6 +24200,38 @@ test "provisioned table write request queues structural reconcile ahead of later
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     write_thread.join();
+}
+
+test "queued structural reconcile reserves write admission before its worker starts" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-queued-reconcile-admission", NoCatalog.iface());
+    defer source.deinit();
+
+    // Keep the worker behind an existing request so this assertion exercises
+    // the enqueue-time reservation, not worker scheduling speed.
+    source.beginTableRequest("docs");
+    var request_active = true;
+    defer if (request_active) source.endTableRequest("docs");
+    try source.enqueueTableIndexStructuralReconcile("docs", "semantic_idx");
+
+    try std.testing.expect(!source.tryBeginTableRequest("docs"));
+
+    source.endTableRequest("docs");
+    request_active = false;
+    source.waitForNoStructuralActivity("docs");
+    try std.testing.expect(source.tryBeginTableRequest("docs"));
+    source.endTableRequest("docs");
 }
 
 test "best effort table request admission does not deadlock behind queued reconcile" {

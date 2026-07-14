@@ -4607,6 +4607,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
             "provisioned table write request queues structural reconcile ahead of later writes",
+            "queued structural reconcile reserves write admission before its worker starts",
             "provisioned structural reconcile blocks table write admission",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
