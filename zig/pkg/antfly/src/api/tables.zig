@@ -1837,34 +1837,8 @@ fn buildCanonicalIndexConfigValue(
     return .{ .object = object };
 }
 
-fn canonicalIndexEnrichmentsValue(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    if (value != .array) return try cloneJsonValueAlloc(alloc, value);
-    var array = std.json.Array.init(alloc);
-    errdefer {
-        var owned: std.json.Value = .{ .array = array };
-        deinitJsonValue(alloc, &owned);
-    }
-    for (value.array.items) |item| {
-        switch (item) {
-            .string => |name| try array.append(.{ .string = try alloc.dupe(u8, name) }),
-            .object => |object| {
-                const name = object.get("name") orelse return error.InvalidTableIndexMetadata;
-                if (name != .string) return error.InvalidTableIndexMetadata;
-                try array.append(.{ .string = try alloc.dupe(u8, name.string) });
-            },
-            else => return error.InvalidTableIndexMetadata,
-        }
-    }
-    return .{ .array = array };
-}
-
 fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
-    defer parsed.deinit();
-    var owned = try cloneJsonValueAlloc(alloc, parsed.value);
-    defer deinitJsonValue(alloc, &owned);
-    try projectInlineEnrichmentConfigsInTableStatusValue(alloc, &owned);
-    return try std.json.Stringify.valueAlloc(alloc, owned, .{ .emit_null_optional_fields = false });
+    return try alloc.dupe(u8, encoded);
 }
 
 fn projectSingleTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8, indexes_json: []const u8) ![]u8 {
@@ -1872,7 +1846,6 @@ fn projectSingleTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8, i
     defer parsed.deinit();
     var owned = try cloneJsonValueAlloc(alloc, parsed.value);
     defer deinitJsonValue(alloc, &owned);
-    try projectInlineEnrichmentConfigsInTableStatusValue(alloc, &owned);
     try attachArtifactEnrichmentsToTableStatus(alloc, &owned, indexes_json);
     return try std.json.Stringify.valueAlloc(alloc, owned, .{ .emit_null_optional_fields = false });
 }
@@ -1886,27 +1859,6 @@ fn attachArtifactEnrichmentsToTableStatus(alloc: std.mem.Allocator, value: *std.
     const enrichments = parsed.value.object.get("enrichments") orelse return;
     if (enrichments != .array or enrichments.array.items.len == 0) return;
     try value.object.put(alloc, try alloc.dupe(u8, "artifact_enrichments"), try cloneJsonValueAlloc(alloc, enrichments));
-}
-
-fn projectInlineEnrichmentConfigsInTableStatusValue(alloc: std.mem.Allocator, value: *std.json.Value) !void {
-    switch (value.*) {
-        .array => |*array| {
-            for (array.items) |*item| try projectInlineEnrichmentConfigsInTableStatusValue(alloc, item);
-        },
-        .object => |*object| {
-            const indexes_value = object.getPtr("indexes") orelse return;
-            if (indexes_value.* != .object) return;
-            var index_it = indexes_value.object.iterator();
-            while (index_it.next()) |index_entry| {
-                if (index_entry.value_ptr.* != .object) continue;
-                const enrichments_value = index_entry.value_ptr.object.getPtr("enrichments") orelse continue;
-                const projected = try canonicalIndexEnrichmentsValue(alloc, enrichments_value.*);
-                deinitJsonValue(alloc, enrichments_value);
-                enrichments_value.* = projected;
-            }
-        },
-        else => {},
-    }
 }
 
 fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexType {
@@ -3549,7 +3501,7 @@ test "metadata.table status merges observed capabilities conservatively" {
     try std.testing.expectEqualStrings("observed_dynamic", price.object.get("provenance").?.string);
 }
 
-test "metadata.table status encoder projects inline enrichment configs as names" {
+test "metadata.table status encoder preserves inline enrichment configs" {
     const indexes_json =
         \\{
         \\  "document_text":{
@@ -3583,8 +3535,9 @@ test "metadata.table status encoder projects inline enrichment configs as names"
 
     const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[\"document_units_v1\",\"document_chunks_v1\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[\"document_chunk_dense_v1\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[{\"name\":\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "{\"name\":\"document_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[{\"name\":\"document_chunk_dense_v1\"") != null);
 }
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
