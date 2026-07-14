@@ -805,7 +805,9 @@ pub const StagedGeneration = struct {
                 // available for operator recovery instead of destroying both sides
                 // of the last durable namespace state.
                 self.preserve_retired = true;
-                std.log.err("retaining previous generation after uncertain publication path={s}", .{self.staging_path});
+                // syncPublishedParent records the durability failure. This message
+                // describes the recovery action and must not duplicate the error.
+                std.log.warn("retaining previous generation after uncertain publication path={s}", .{self.staging_path});
             }
             return outcome;
         }

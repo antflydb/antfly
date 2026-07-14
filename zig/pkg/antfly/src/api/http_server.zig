@@ -8880,7 +8880,11 @@ pub const ApiHttpServer = struct {
             defer parsed.deinit();
             const failed = try self.repair_job_store.markPhase(self.alloc, parsed.value, .failed, @errorName(err));
             defer self.alloc.free(failed);
-            std.log.err("failed to submit table repair job table={s} job_id={d} err={}", .{ table_name, job_id, err });
+            if (err == error.BackgroundOwnerClosing) {
+                std.log.warn("table repair job submission canceled during shutdown table={s} job_id={d}", .{ table_name, job_id });
+            } else {
+                std.log.err("failed to submit table repair job table={s} job_id={d} err={}", .{ table_name, job_id, err });
+            }
             return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, failed);
         };
         work_consumed = true;
