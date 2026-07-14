@@ -535,7 +535,8 @@ func ValidateHASeedArtifactCaptureResponse(response HASeedArtifactCaptureRespons
 		response.BackupLsn == 0 || response.CheckpointLsn == 0 || response.EndRecordLsn == 0 || response.FileCount == 0 {
 		return fmt.Errorf("missing seed capture identity, checkpoint, or file evidence")
 	}
-	if !validSHA256Hex(response.SourcePlanSha256) || !validSHA256Hex(response.ManifestSha256) {
+	if !validSHA256Hex(response.SourcePlanSha256) || !validSHA256Hex(response.ManifestSha256) ||
+		!validSHA256Hex(response.CaptureReceiptSha256) {
 		return fmt.Errorf("invalid seed capture digest evidence")
 	}
 	for field, value := range map[string]string{
@@ -563,7 +564,7 @@ func ValidateHASeedArtifactCaptureResponseEvidence(raw []byte) error {
 		response.CheckpointLsn == nil || response.EndRecordLsn == nil || response.FileCount == nil ||
 		response.TotalBytes == nil || response.AlreadyCaptured == nil || response.TopologyId == nil ||
 		response.TopologyGeneration == nil || response.NodeId == nil || response.TargetPvcName == nil ||
-		response.TargetPvcUid == nil {
+		response.TargetPvcUid == nil || response.CaptureReceiptSha256 == nil {
 		return fmt.Errorf("missing seed capture field evidence")
 	}
 	return nil
@@ -712,7 +713,8 @@ func ValidateHASeededSlotActivateResponse(response HASeededSlotActivateResponse)
 	if strings.TrimSpace(response.ManifestId) == "" || response.TimelineId == 0 || response.CheckpointLsn == 0 {
 		return fmt.Errorf("missing seeded slot activate identity or checkpoint")
 	}
-	if !validSHA256Hex(response.SeedReceiptSha256) || !validSHA256Hex(response.ManifestSha256) || !validSHA256Hex(response.AggregateSha256) {
+	if !validSHA256Hex(response.SeedReceiptSha256) || !validSHA256Hex(response.CaptureReceiptSha256) ||
+		!validSHA256Hex(response.ManifestSha256) || !validSHA256Hex(response.AggregateSha256) {
 		return fmt.Errorf("invalid seeded slot activate digest evidence")
 	}
 	if err := validateHAActionReceiptTarget(response.Action, HASeededSlotActivateReceiptExpectation(), response.Generation, "seeded slot activate"); err != nil {
@@ -727,6 +729,7 @@ func ValidateHASeededSlotActivateResponseEvidence(raw []byte) error {
 		return err
 	}
 	if response.TimelineId == nil || response.CheckpointLsn == nil || response.SeedReceiptSha256 == nil ||
+		response.CaptureReceiptSha256 == nil ||
 		response.ManifestSha256 == nil || response.AggregateSha256 == nil {
 		return fmt.Errorf("missing seeded slot activate field evidence")
 	}
@@ -1347,30 +1350,32 @@ type haBaseBackupFinishResponseEvidence struct {
 }
 
 type haSeededSlotActivateResponseEvidence struct {
-	TimelineId        *uint64 `json:"timeline_id"`
-	CheckpointLsn     *uint64 `json:"checkpoint_lsn"`
-	SeedReceiptSha256 *string `json:"seed_receipt_sha256"`
-	ManifestSha256    *string `json:"manifest_sha256"`
-	AggregateSha256   *string `json:"aggregate_sha256"`
+	TimelineId           *uint64 `json:"timeline_id"`
+	CheckpointLsn        *uint64 `json:"checkpoint_lsn"`
+	SeedReceiptSha256    *string `json:"seed_receipt_sha256"`
+	CaptureReceiptSha256 *string `json:"capture_receipt_sha256"`
+	ManifestSha256       *string `json:"manifest_sha256"`
+	AggregateSha256      *string `json:"aggregate_sha256"`
 }
 
 type haSeedArtifactCaptureResponseEvidence struct {
-	ClusterId          *uint64 `json:"cluster_id"`
-	ShardId            *uint64 `json:"shard_id"`
-	TableId            *uint64 `json:"table_id"`
-	TimelineId         *uint64 `json:"timeline_id"`
-	Epoch              *uint64 `json:"epoch"`
-	BackupLsn          *uint64 `json:"backup_lsn"`
-	CheckpointLsn      *uint64 `json:"checkpoint_lsn"`
-	EndRecordLsn       *uint64 `json:"end_record_lsn"`
-	FileCount          *uint64 `json:"file_count"`
-	TotalBytes         *uint64 `json:"total_bytes"`
-	AlreadyCaptured    *bool   `json:"already_captured"`
-	TopologyId         *string `json:"topology_id"`
-	TopologyGeneration *uint64 `json:"topology_generation"`
-	NodeId             *string `json:"node_id"`
-	TargetPvcName      *string `json:"target_pvc_name"`
-	TargetPvcUid       *string `json:"target_pvc_uid"`
+	ClusterId            *uint64 `json:"cluster_id"`
+	ShardId              *uint64 `json:"shard_id"`
+	TableId              *uint64 `json:"table_id"`
+	TimelineId           *uint64 `json:"timeline_id"`
+	Epoch                *uint64 `json:"epoch"`
+	BackupLsn            *uint64 `json:"backup_lsn"`
+	CheckpointLsn        *uint64 `json:"checkpoint_lsn"`
+	EndRecordLsn         *uint64 `json:"end_record_lsn"`
+	FileCount            *uint64 `json:"file_count"`
+	TotalBytes           *uint64 `json:"total_bytes"`
+	AlreadyCaptured      *bool   `json:"already_captured"`
+	TopologyId           *string `json:"topology_id"`
+	TopologyGeneration   *uint64 `json:"topology_generation"`
+	NodeId               *string `json:"node_id"`
+	TargetPvcName        *string `json:"target_pvc_name"`
+	TargetPvcUid         *string `json:"target_pvc_uid"`
+	CaptureReceiptSha256 *string `json:"capture_receipt_sha256"`
 }
 
 type haSeedLifecycleReceiptEventEvidence struct {
@@ -3040,7 +3045,8 @@ func (c *HAClient) ActivateSeededSlotResponse(ctx context.Context, body SeededSl
 	if !validHAIdentifier(body.Generation) || strings.TrimSpace(body.ManifestId) == "" || body.TimelineId == 0 || body.CheckpointLsn == 0 {
 		return nil, fmt.Errorf("activate HA seeded slot requires generation, manifest, timeline and checkpoint evidence")
 	}
-	if !validSHA256Hex(body.SeedReceiptSha256) || !validSHA256Hex(body.ManifestSha256) || !validSHA256Hex(body.AggregateSha256) {
+	if !validSHA256Hex(body.SeedReceiptSha256) || !validSHA256Hex(body.CaptureReceiptSha256) ||
+		!validSHA256Hex(body.ManifestSha256) || !validSHA256Hex(body.AggregateSha256) {
 		return nil, fmt.Errorf("activate HA seeded slot requires lowercase SHA-256 digest evidence")
 	}
 	resp, err := c.client.ActivateHASeededSlotWithResponse(ctx, body, c.editors...)

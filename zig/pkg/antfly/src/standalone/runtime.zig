@@ -137,6 +137,7 @@ const CliConfig = struct {
     ha_startup_manifest_sha256: ?[]const u8 = null,
     ha_startup_aggregate_sha256: ?[]const u8 = null,
     ha_startup_seed_receipt_sha256: ?[]const u8 = null,
+    ha_startup_capture_receipt_sha256: ?[]const u8 = null,
     ha_cluster_id: ?u64 = null,
     ha_shard_id: ?u64 = null,
     ha_table_id: ?u64 = null,
@@ -3034,6 +3035,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_startup_seed_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-startup-capture-receipt-sha256")) {
+            cfg.ha_startup_capture_receipt_sha256 = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
             cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -3295,7 +3300,8 @@ fn haStartupGateRequested(cli: CliConfig) bool {
         cli.ha_startup_target_pvc_uid != null or
         cli.ha_startup_manifest_sha256 != null or
         cli.ha_startup_aggregate_sha256 != null or
-        cli.ha_startup_seed_receipt_sha256 != null;
+        cli.ha_startup_seed_receipt_sha256 != null or
+        cli.ha_startup_capture_receipt_sha256 != null;
 }
 
 fn haSyncPolicyRequested(cli: CliConfig) bool {
@@ -3416,23 +3422,29 @@ fn validateHAPathsUnderRoot(cli: CliConfig, data_root: []const u8) !void {
 fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.StartupExpectation {
     if (!haStartupGateRequested(cli)) return null;
     if (!haStandbyRequested(cli)) return error.HAStartupGateRequiresStandby;
+    const binding = antfly.ha.seed_activation.ActivationBinding{
+        .topology_id = try requireHAIdentifier(cli.ha_startup_topology_id, error.HAStartupTopologyIdMissing, error.HAStartupTopologyIdInvalid),
+        .topology_generation = cli.ha_startup_topology_generation orelse return error.HAStartupTopologyGenerationMissing,
+        .node_id = try requireHAIdentifier(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid),
+        .target_pvc_name = try requireHAIdentifier(cli.ha_startup_target_pvc_name, error.HAStartupTargetPVCNameMissing, error.HAStartupTargetPVCNameInvalid),
+        .target_pvc_uid = try requireHAIdentifier(cli.ha_startup_target_pvc_uid, error.HAStartupTargetPVCUIDMissing, error.HAStartupTargetPVCUIDInvalid),
+    };
+    const capture_receipt_sha256 = (try optionalHAStartupDigest(cli.ha_startup_capture_receipt_sha256)) orelse
+        return error.HAStartupCaptureReceiptSHA256Missing;
     return .{
         .target_root = try requireHAPath(cli.ha_startup_target_root, error.HAStartupTargetRootMissing, error.HAStartupTargetRootInvalid),
         .expected = .{
             .generation = try requireHAIdentifier(cli.ha_startup_generation, error.HAStartupGenerationMissing, error.HAStartupGenerationInvalid),
             .slot_name = try requireHAIdentifier(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid),
             .identity = try haStandbyIdentity(cli),
+            .binding = binding,
+            .capture_receipt_sha256 = capture_receipt_sha256,
         },
-        .binding = .{
-            .topology_id = try requireHAIdentifier(cli.ha_startup_topology_id, error.HAStartupTopologyIdMissing, error.HAStartupTopologyIdInvalid),
-            .topology_generation = cli.ha_startup_topology_generation orelse return error.HAStartupTopologyGenerationMissing,
-            .node_id = try requireHAIdentifier(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid),
-            .target_pvc_name = try requireHAIdentifier(cli.ha_startup_target_pvc_name, error.HAStartupTargetPVCNameMissing, error.HAStartupTargetPVCNameInvalid),
-            .target_pvc_uid = try requireHAIdentifier(cli.ha_startup_target_pvc_uid, error.HAStartupTargetPVCUIDMissing, error.HAStartupTargetPVCUIDInvalid),
-        },
+        .binding = binding,
         .manifest_sha256 = try optionalHAStartupDigest(cli.ha_startup_manifest_sha256),
         .aggregate_sha256 = try optionalHAStartupDigest(cli.ha_startup_aggregate_sha256),
         .seed_receipt_sha256 = try optionalHAStartupDigest(cli.ha_startup_seed_receipt_sha256),
+        .capture_receipt_sha256 = capture_receipt_sha256,
     };
 }
 
@@ -4444,6 +4456,8 @@ test "parse cli accepts HA standby runtime flags" {
         "standby-a-data",
         "--ha-startup-target-pvc-uid",
         "pvc-uid-1",
+        "--ha-startup-capture-receipt-sha256",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "--ha-cluster-id",
         "100",
         "--ha-shard-id",
@@ -4474,6 +4488,7 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqualStrings("generation-a", cfg.ha_startup_generation.?);
     try std.testing.expectEqualStrings("standby-a-data", cfg.ha_startup_target_pvc_name.?);
     try std.testing.expectEqualStrings("pvc-uid-1", cfg.ha_startup_target_pvc_uid.?);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", cfg.ha_startup_capture_receipt_sha256.?);
     try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
@@ -4488,6 +4503,11 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqualStrings("topology-a", startup.binding.topology_id);
     try std.testing.expectEqual(@as(u64, 3), startup.binding.topology_generation);
     try std.testing.expectEqualStrings("generation-a", startup.expected.generation);
+    try std.testing.expectEqualStrings(startup.capture_receipt_sha256.?, startup.expected.capture_receipt_sha256.?);
+
+    var missing_capture_authority = cfg;
+    missing_capture_authority.ha_startup_capture_receipt_sha256 = null;
+    try std.testing.expectError(error.HAStartupCaptureReceiptSHA256Missing, haStartupExpectationFromCli(missing_capture_authority));
 }
 
 test "standalone HA standby replication flags require upstream and slot" {

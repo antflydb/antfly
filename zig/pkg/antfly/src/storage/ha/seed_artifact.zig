@@ -22,7 +22,8 @@ const validation = @import("validation.zig");
 
 pub const legacy_format_version: u16 = 1;
 pub const chunked_format_version: u16 = 2;
-pub const format_version: u16 = 3;
+pub const topology_format_version: u16 = 3;
+pub const format_version: u16 = 4;
 pub const complete_name = "COMPLETE.json";
 pub const manifest_name = "manifest.afha";
 pub const receipt_name = ".antfly-ha-seed-receipt.json";
@@ -61,8 +62,13 @@ pub const PublishRequest = struct {
     slot_name: []const u8,
     manifest_bytes: []const u8,
     content_root: []const u8,
+    /// The exact runtime-owned capture COMPLETE bytes and their controller-
+    /// observed digest. Both are mandatory for topology-bound production
+    /// publication and intentionally absent for direct legacy-v2 callers.
+    capture_receipt_json: ?[]const u8 = null,
+    capture_receipt_sha256: ?[]const u8 = null,
     /// Null is retained only for direct legacy-v2 callers. Production CLI and
-    /// operator workflows require this and therefore publish format v3.
+    /// operator workflows require this and therefore publish format v4.
     binding: ?LifecycleBinding = null,
     limits: Limits = .{},
 };
@@ -81,6 +87,7 @@ pub const ExpectedArtifact = struct {
     identity: standby_mod.Identity,
     minimum_checkpoint_lsn: u64 = 0,
     binding: ?LifecycleBinding = null,
+    capture_receipt_sha256: ?[]const u8 = null,
 };
 
 pub const RestoreRequest = struct {
@@ -167,6 +174,7 @@ pub const Receipt = struct {
     checkpoint_lsn: u64,
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
+    capture_receipt_sha256: []const u8 = "",
     total_bytes: u64,
     files: []const FileReceipt,
     topology_id: []const u8 = "",
@@ -176,6 +184,40 @@ pub const Receipt = struct {
     target_pvc_uid: []const u8 = "",
 
     pub fn identity(self: Receipt) standby_mod.Identity {
+        return .{
+            .cluster_id = self.cluster_id,
+            .shard_id = self.shard_id,
+            .table_id = self.table_id,
+            .timeline_id = self.timeline_id,
+            .epoch = self.epoch,
+        };
+    }
+};
+
+const CaptureReceiptEvidence = struct {
+    format_version: u16,
+    generation: []const u8,
+    slot_name: []const u8,
+    cluster_id: u64,
+    shard_id: u64,
+    table_id: u64,
+    timeline_id: u64,
+    epoch: u64,
+    source_plan_sha256: []const u8,
+    manifest_id: []const u8,
+    backup_lsn: u64,
+    checkpoint_lsn: u64,
+    end_record_lsn: u64,
+    manifest_sha256: []const u8,
+    file_count: usize,
+    total_bytes: u64,
+    topology_id: []const u8,
+    topology_generation: u64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
+
+    fn identity(self: CaptureReceiptEvidence) standby_mod.Identity {
         return .{
             .cluster_id = self.cluster_id,
             .shard_id = self.shard_id,
@@ -264,20 +306,30 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
         return error.InvalidArtifactChunkSize;
     if (request.binding) |binding| try validateLifecycleBinding(binding);
 
+    const manifest = try backup_manifest.decodeAlloc(alloc, request.manifest_bytes);
+    defer backup_manifest.freeDecoded(alloc, manifest);
+    if (manifest.files.len > request.limits.max_files) return error.TooManyArtifactFiles;
+    var capture_receipt_hex: [Sha256.digest_length * 2]u8 = undefined;
+    const has_capture_authority = try validateCaptureReceiptAuthority(alloc, request, manifest, &capture_receipt_hex);
+
     const complete_key = try generationKeyAlloc(alloc, store.prefix, request.generation, complete_name);
     defer alloc.free(complete_key);
     if (getOptionalObject(alloc, store, complete_key, request.limits.max_receipt_bytes)) |existing| {
         defer alloc.free(existing);
-        try validateExistingReceipt(alloc, existing, request.generation, request.slot_name, request.manifest_bytes, request.binding);
+        try validateExistingReceipt(
+            alloc,
+            existing,
+            request.generation,
+            request.slot_name,
+            request.manifest_bytes,
+            request.binding,
+            if (has_capture_authority) &capture_receipt_hex else null,
+        );
         return .{ .receipt_json = try alloc.dupe(u8, existing), .already_available = true };
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
-
-    const manifest = try backup_manifest.decodeAlloc(alloc, request.manifest_bytes);
-    defer backup_manifest.freeDecoded(alloc, manifest);
-    if (manifest.files.len > request.limits.max_files) return error.TooManyArtifactFiles;
 
     var total_bytes: u64 = 0;
     var owned_files = try alloc.alloc(OwnedFileReceipt, manifest.files.len);
@@ -397,6 +449,7 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
         .checkpoint_lsn = manifest.checkpoint_lsn,
         .manifest_sha256 = manifest_hex,
         .aggregate_sha256 = aggregate_hex,
+        .capture_receipt_sha256 = if (has_capture_authority) &capture_receipt_hex else "",
         .total_bytes = total_bytes,
         .files = file_views,
         .topology_id = if (binding) |value| value.topology_id else "",
@@ -413,6 +466,58 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
     if (options.fail_before_complete) return error.InjectedArtifactFailure;
     try putImmutable(alloc, store, complete_key, receipt_json, "application/json");
     return .{ .receipt_json = receipt_json, .already_available = false };
+}
+
+fn validateCaptureReceiptAuthority(
+    alloc: Allocator,
+    request: PublishRequest,
+    manifest: backup_manifest.ManifestView,
+    digest_hex: *[Sha256.digest_length * 2]u8,
+) !bool {
+    if (request.binding == null) {
+        if (request.capture_receipt_json != null or request.capture_receipt_sha256 != null)
+            return error.UnexpectedCaptureReceiptAuthority;
+        return false;
+    }
+    const receipt_json = request.capture_receipt_json orelse return error.CaptureReceiptRequired;
+    const expected_digest = request.capture_receipt_sha256 orelse return error.CaptureReceiptDigestRequired;
+    if (!isCanonicalSha256(expected_digest)) return error.InvalidCaptureReceiptDigest;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(receipt_json, &digest, .{});
+    encodeHex(digest_hex, &digest);
+    if (!std.mem.eql(u8, digest_hex, expected_digest)) return error.CaptureReceiptDigestMismatch;
+
+    var parsed = std.json.parseFromSlice(CaptureReceiptEvidence, alloc, receipt_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidCaptureReceipt;
+    defer parsed.deinit();
+    const receipt = parsed.value;
+    const binding = request.binding.?;
+    if (receipt.format_version != 2 or
+        !std.mem.eql(u8, receipt.generation, request.generation) or
+        !std.mem.eql(u8, receipt.slot_name, request.slot_name) or
+        !std.mem.eql(u8, receipt.manifest_id, manifest.manifest_id) or
+        receipt.backup_lsn != manifest.backup_lsn or
+        receipt.checkpoint_lsn != manifest.checkpoint_lsn or
+        receipt.end_record_lsn <= receipt.checkpoint_lsn or
+        receipt.file_count != manifest.files.len or
+        !std.mem.eql(u8, receipt.topology_id, binding.topology_id) or
+        receipt.topology_generation != binding.topology_generation or
+        !std.mem.eql(u8, receipt.node_id, binding.node_id) or
+        !std.mem.eql(u8, receipt.target_pvc_name, binding.target_pvc_name) or
+        !std.mem.eql(u8, receipt.target_pvc_uid, binding.target_pvc_uid) or
+        !isCanonicalSha256(receipt.source_plan_sha256) or
+        !isCanonicalSha256(receipt.manifest_sha256)) return error.CaptureReceiptMismatch;
+    expectIdentity(manifest.identity, receipt.identity()) catch return error.CaptureReceiptMismatch;
+
+    var manifest_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(request.manifest_bytes, &manifest_digest, .{});
+    var manifest_hex: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&manifest_hex, &manifest_digest);
+    if (!std.mem.eql(u8, &manifest_hex, receipt.manifest_sha256)) return error.CaptureReceiptMismatch;
+    var total_bytes: u64 = 0;
+    for (manifest.files) |file| total_bytes = try std.math.add(u64, total_bytes, file.size_bytes);
+    if (total_bytes != receipt.total_bytes) return error.CaptureReceiptMismatch;
+    return true;
 }
 
 fn readChunk(reader: *std.Io.Reader, buffer: []u8) !usize {
@@ -746,19 +851,29 @@ fn readOptionalLocalFileAlloc(alloc: Allocator, path: []const u8, max_bytes: usi
 }
 
 fn validateReceipt(receipt: Receipt, expected: ExpectedArtifact, limits: Limits) !void {
-    if (receipt.format_version != legacy_format_version and receipt.format_version != chunked_format_version and receipt.format_version != format_version)
+    if (receipt.format_version != legacy_format_version and receipt.format_version != chunked_format_version and
+        receipt.format_version != topology_format_version and receipt.format_version != format_version)
         return error.UnsupportedArtifactVersion;
     if (limits.max_chunk_bytes == 0 or limits.max_chunk_bytes > limits.max_file_bytes)
         return error.InvalidArtifactChunkSize;
     if (!std.mem.eql(u8, receipt.generation, expected.generation)) return error.WrongArtifactGeneration;
     if (!std.mem.eql(u8, receipt.slot_name, expected.slot_name)) return error.WrongArtifactSlot;
     try expectIdentity(expected.identity, receipt.identity());
-    if (receipt.format_version == format_version) {
+    if (receipt.format_version == topology_format_version or receipt.format_version == format_version) {
         const binding = expected.binding orelse return error.ArtifactBindingRequired;
         try validateLifecycleBinding(binding);
         try expectLifecycleBinding(binding, receipt);
     } else if (expected.binding != null) {
         return error.ArtifactBindingMissing;
+    }
+    if (receipt.format_version == format_version) {
+        if (!isCanonicalSha256(receipt.capture_receipt_sha256)) return error.InvalidCaptureReceiptDigest;
+        if (expected.capture_receipt_sha256) |digest| {
+            if (!isCanonicalSha256(digest) or !std.mem.eql(u8, digest, receipt.capture_receipt_sha256))
+                return error.WrongCaptureReceiptDigest;
+        }
+    } else if (expected.capture_receipt_sha256 != null) {
+        return error.CaptureReceiptAuthorityMissing;
     }
     if (receipt.manifest_id.len == 0) return error.InvalidManifestId;
     if (receipt.backup_lsn == 0 or receipt.checkpoint_lsn < receipt.backup_lsn) return error.InvalidArtifactBoundary;
@@ -775,7 +890,7 @@ fn validateReceipt(receipt: Receipt, expected: ExpectedArtifact, limits: Limits)
         total = try std.math.add(u64, total, file.size_bytes);
         switch (receipt.format_version) {
             legacy_format_version => if (file.chunks != null) return error.InvalidArtifactChunks,
-            chunked_format_version, format_version => {
+            chunked_format_version, topology_format_version, format_version => {
                 const chunks = file.chunks orelse return error.InvalidArtifactChunks;
                 var chunk_total: u64 = 0;
                 for (chunks, 0..) |chunk, chunk_index| {
@@ -813,15 +928,19 @@ fn validateExistingReceipt(
     slot_name: []const u8,
     manifest_bytes: []const u8,
     binding: ?LifecycleBinding,
+    capture_receipt_sha256: ?[]const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(Receipt, alloc, raw, .{}) catch return error.GenerationConflict;
     defer parsed.deinit();
-    if ((parsed.value.format_version != legacy_format_version and parsed.value.format_version != chunked_format_version and parsed.value.format_version != format_version) or
+    if ((parsed.value.format_version != legacy_format_version and parsed.value.format_version != chunked_format_version and
+        parsed.value.format_version != topology_format_version and parsed.value.format_version != format_version) or
         !std.mem.eql(u8, parsed.value.generation, generation) or !std.mem.eql(u8, parsed.value.slot_name, slot_name)) return error.GenerationConflict;
     if (binding) |expected_binding| {
         if (parsed.value.format_version != format_version) return error.GenerationConflict;
         expectLifecycleBinding(expected_binding, parsed.value) catch return error.GenerationConflict;
-    } else if (parsed.value.format_version == format_version) return error.GenerationConflict;
+        const expected_capture = capture_receipt_sha256 orelse return error.GenerationConflict;
+        if (!std.mem.eql(u8, parsed.value.capture_receipt_sha256, expected_capture)) return error.GenerationConflict;
+    } else if (parsed.value.format_version == topology_format_version or parsed.value.format_version == format_version) return error.GenerationConflict;
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(manifest_bytes, &digest, .{});
     const hex = try hexAlloc(alloc, &digest);
@@ -1017,7 +1136,7 @@ fn checksumRemoteArtifactFile(
                 }
             }
         },
-        chunked_format_version, format_version => {
+        chunked_format_version, topology_format_version, format_version => {
             const chunks = receipt.chunks orelse return error.InvalidArtifactChunks;
             for (chunks, 0..) |chunk, index| {
                 if (chunk.index != index) return error.InvalidArtifactChunks;
@@ -1135,7 +1254,7 @@ fn restoreArtifactFile(
                     }
                 }
             },
-            chunked_format_version, format_version => {
+            chunked_format_version, topology_format_version, format_version => {
                 const chunks = receipt.chunks orelse return error.InvalidArtifactChunks;
                 for (chunks, 0..) |chunk, index| {
                     if (chunk.index != index) return error.InvalidArtifactChunks;
@@ -1227,6 +1346,14 @@ fn expectSha256(body: []const u8, expected_hex: []const u8, err: anyerror) !void
     if (!std.mem.eql(u8, &encoded, expected_hex)) return err;
 }
 
+fn isCanonicalSha256(value: []const u8) bool {
+    if (value.len != Sha256.digest_length * 2) return false;
+    for (value) |byte| {
+        if ((byte < '0' or byte > '9') and (byte < 'a' or byte > 'f')) return false;
+    }
+    return true;
+}
+
 fn aggregateFile(hash: *Sha256, path: []const u8, size: u64, digest: *const [Sha256.digest_length]u8) void {
     hash.update(path);
     const separator = [_]u8{0};
@@ -1264,6 +1391,52 @@ fn decodeHexDigest(hex: []const u8) ![Sha256.digest_length]u8 {
 
 fn testIdentity() standby_mod.Identity {
     return .{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 2, .epoch = 4 };
+}
+
+fn testCaptureReceiptAlloc(
+    alloc: Allocator,
+    generation: []const u8,
+    slot_name: []const u8,
+    manifest_bytes: []const u8,
+    binding: LifecycleBinding,
+) ![]u8 {
+    const manifest = try backup_manifest.decodeAlloc(alloc, manifest_bytes);
+    defer backup_manifest.freeDecoded(alloc, manifest);
+    var manifest_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(manifest_bytes, &manifest_digest, .{});
+    var manifest_hex: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&manifest_hex, &manifest_digest);
+    var total_bytes: u64 = 0;
+    for (manifest.files) |file| total_bytes += file.size_bytes;
+    return try std.json.Stringify.valueAlloc(alloc, CaptureReceiptEvidence{
+        .format_version = 2,
+        .generation = generation,
+        .slot_name = slot_name,
+        .cluster_id = manifest.identity.cluster_id,
+        .shard_id = manifest.identity.shard_id,
+        .table_id = manifest.identity.table_id,
+        .timeline_id = manifest.identity.timeline_id,
+        .epoch = manifest.identity.epoch,
+        .source_plan_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_id = manifest.manifest_id,
+        .backup_lsn = manifest.backup_lsn,
+        .checkpoint_lsn = manifest.checkpoint_lsn,
+        .end_record_lsn = manifest.checkpoint_lsn + 1,
+        .manifest_sha256 = &manifest_hex,
+        .file_count = manifest.files.len,
+        .total_bytes = total_bytes,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
+    }, .{});
+}
+
+fn sha256HexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return try hexAlloc(alloc, &digest);
 }
 
 fn writeTestFile(alloc: Allocator, path: []const u8, body: []const u8) !void {
@@ -1738,7 +1911,7 @@ test "storage.ha seed artifact prunes older complete generations publish marker 
     try std.testing.expect(retained.len > 0);
 }
 
-test "storage.ha portable seed v3 binds immutable COMPLETE to topology node and target pvc" {
+test "storage.ha portable seed v4 binds immutable COMPLETE to exact capture topology and pvc authority" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1748,16 +1921,16 @@ test "storage.ha portable seed v3 binds immutable COMPLETE to topology node and 
     defer alloc.free(content_root);
     const source_path = try std.fs.path.join(alloc, &.{ content_root, "catalog/manifest" });
     defer alloc.free(source_path);
-    try writeTestFile(alloc, source_path, "catalog-v3");
+    try writeTestFile(alloc, source_path, "catalog-v4");
     const files = [_]backup_manifest.FileEntry{.{
         .path = "catalog/manifest",
         .kind = .manifest,
         .size_bytes = 10,
-        .crc32 = backup_manifest.crc32("catalog-v3"),
+        .crc32 = backup_manifest.crc32("catalog-v4"),
     }};
     const manifest_bytes = try backup_manifest.encodeAlloc(alloc, .{
         .identity = testIdentity(),
-        .manifest_id = "seed-bound-v3",
+        .manifest_id = "seed-bound-v4",
         .backup_lsn = 8,
         .checkpoint_lsn = 11,
         .files = &files,
@@ -1776,34 +1949,43 @@ test "storage.ha portable seed v3 binds immutable COMPLETE to topology node and 
         .target_pvc_name = "standby-a-data",
         .target_pvc_uid = "pvc-uid-9",
     };
+    const capture_receipt = try testCaptureReceiptAlloc(alloc, "seed-bound-v4", "standby-a", manifest_bytes, binding);
+    defer alloc.free(capture_receipt);
+    const capture_receipt_sha256 = try sha256HexAlloc(alloc, capture_receipt);
+    defer alloc.free(capture_receipt_sha256);
     var published = try publish(alloc, store, .{
-        .generation = "seed-bound-v3",
+        .generation = "seed-bound-v4",
         .slot_name = "standby-a",
         .manifest_bytes = manifest_bytes,
         .content_root = content_root,
+        .capture_receipt_json = capture_receipt,
+        .capture_receipt_sha256 = capture_receipt_sha256,
         .binding = binding,
     });
     defer published.deinit(alloc);
     var parsed = try std.json.parseFromSlice(Receipt, alloc, published.receipt_json, .{ .ignore_unknown_fields = false });
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u16, 3), parsed.value.format_version);
+    try std.testing.expectEqual(@as(u16, 4), parsed.value.format_version);
+    try std.testing.expectEqualStrings(capture_receipt_sha256, parsed.value.capture_receipt_sha256);
     try std.testing.expectEqualStrings(binding.topology_id, parsed.value.topology_id);
     try std.testing.expectEqual(binding.topology_generation, parsed.value.topology_generation);
     try std.testing.expectEqualStrings(binding.node_id, parsed.value.node_id);
     try std.testing.expectEqualStrings(binding.target_pvc_name, parsed.value.target_pvc_name);
     try std.testing.expectEqualStrings(binding.target_pvc_uid, parsed.value.target_pvc_uid);
 
-    const complete_key = try generationKeyAlloc(alloc, store.prefix, "seed-bound-v3", complete_name);
+    const complete_key = try generationKeyAlloc(alloc, store.prefix, "seed-bound-v4", complete_name);
     defer alloc.free(complete_key);
     var before = try client.statObject(store.bucket, complete_key);
     defer before.deinit(alloc);
     try std.testing.expectEqualStrings("application/json", before.content_type.?);
 
     var repeated = try publish(alloc, store, .{
-        .generation = "seed-bound-v3",
+        .generation = "seed-bound-v4",
         .slot_name = "standby-a",
         .manifest_bytes = manifest_bytes,
         .content_root = content_root,
+        .capture_receipt_json = capture_receipt,
+        .capture_receipt_sha256 = capture_receipt_sha256,
         .binding = binding,
     });
     defer repeated.deinit(alloc);
@@ -1813,20 +1995,59 @@ test "storage.ha portable seed v3 binds immutable COMPLETE to topology node and 
     defer after.deinit(alloc);
     try std.testing.expectEqualStrings(before.etag.?, after.etag.?);
 
-    var wrong_target = binding;
-    wrong_target.target_pvc_uid = "pvc-uid-other";
-    try std.testing.expectError(error.GenerationConflict, publish(alloc, store, .{
-        .generation = "seed-bound-v3",
+    var corrupted_capture = try alloc.dupe(u8, capture_receipt);
+    defer alloc.free(corrupted_capture);
+    corrupted_capture[corrupted_capture.len - 2] = if (corrupted_capture[corrupted_capture.len - 2] == '9') '8' else '9';
+    try std.testing.expectError(error.CaptureReceiptDigestMismatch, publish(alloc, store, .{
+        .generation = "seed-bound-v4",
         .slot_name = "standby-a",
         .manifest_bytes = manifest_bytes,
         .content_root = content_root,
+        .capture_receipt_json = corrupted_capture,
+        .capture_receipt_sha256 = capture_receipt_sha256,
+        .binding = binding,
+    }));
+
+    const other_capture = try testCaptureReceiptAlloc(alloc, "seed-bound-other", "standby-a", manifest_bytes, binding);
+    defer alloc.free(other_capture);
+    const other_capture_sha256 = try sha256HexAlloc(alloc, other_capture);
+    defer alloc.free(other_capture_sha256);
+    try std.testing.expectError(error.CaptureReceiptMismatch, publish(alloc, store, .{
+        .generation = "seed-bound-v4",
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest_bytes,
+        .content_root = content_root,
+        .capture_receipt_json = other_capture,
+        .capture_receipt_sha256 = other_capture_sha256,
+        .binding = binding,
+    }));
+
+    var wrong_target = binding;
+    wrong_target.target_pvc_uid = "pvc-uid-other";
+    try std.testing.expectError(error.CaptureReceiptMismatch, publish(alloc, store, .{
+        .generation = "seed-bound-v4",
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest_bytes,
+        .content_root = content_root,
+        .capture_receipt_json = capture_receipt,
+        .capture_receipt_sha256 = capture_receipt_sha256,
         .binding = wrong_target,
     }));
     try std.testing.expectError(error.WrongArtifactTargetPVCUID, verifyRemote(alloc, store, .{
-        .generation = "seed-bound-v3",
+        .generation = "seed-bound-v4",
         .slot_name = "standby-a",
         .identity = testIdentity(),
         .minimum_checkpoint_lsn = 11,
         .binding = wrong_target,
+        .capture_receipt_sha256 = capture_receipt_sha256,
+    }, .{}));
+
+    try std.testing.expectError(error.WrongCaptureReceiptDigest, verifyRemote(alloc, store, .{
+        .generation = "seed-bound-v4",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+        .binding = binding,
+        .capture_receipt_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     }, .{}));
 }

@@ -399,6 +399,9 @@ test "admin openapi contract module is generated and wired" {
     try std.testing.expect(@hasField(admin_generated.SeedArtifactCaptureRequest, "target_pvc_uid"));
     try std.testing.expect(@hasField(admin_generated.HASeedArtifactCaptureResponse, "topology_id"));
     try std.testing.expect(@hasField(admin_generated.HASeedArtifactCaptureResponse, "target_pvc_uid"));
+    try std.testing.expect(@hasField(admin_generated.HASeedArtifactCaptureResponse, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(admin_generated.SeededSlotActivateRequest, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(admin_generated.HASeededSlotActivateResponse, "capture_receipt_sha256"));
     try std.testing.expect(@hasDecl(admin_facade, "HAActionReceipt"));
     try std.testing.expect(@hasDecl(admin_facade, "HASeedLifecycleReceiptInventoryResponse"));
     try std.testing.expect(@hasDecl(admin_facade, "HARejoinRewindResult"));

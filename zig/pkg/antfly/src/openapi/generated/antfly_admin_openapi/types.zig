@@ -371,6 +371,8 @@ pub const HASeedArtifactCaptureResponse = struct {
     checkpoint_lsn: i64,
     end_record_lsn: i64,
     manifest_sha256: []const u8,
+    /// SHA-256 of the exact immutable runtime capture COMPLETE response bytes.
+    capture_receipt_sha256: []const u8,
     file_count: i64,
     total_bytes: i64,
     generation_root: []const u8,
@@ -417,6 +419,8 @@ pub const HASeededSlotActivateResponse = struct {
     timeline_id: i64,
     checkpoint_lsn: i64,
     seed_receipt_sha256: []const u8,
+    /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+    capture_receipt_sha256: []const u8,
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
 };
@@ -563,6 +567,8 @@ pub const SeededSlotActivateRequest = struct {
     timeline_id: i64,
     checkpoint_lsn: i64,
     seed_receipt_sha256: []const u8,
+    /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+    capture_receipt_sha256: []const u8,
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
 };

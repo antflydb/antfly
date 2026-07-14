@@ -965,6 +965,7 @@ components:
         - timeline_id
         - checkpoint_lsn
         - seed_receipt_sha256
+        - capture_receipt_sha256
         - manifest_sha256
         - aggregate_sha256
       additionalProperties: false
@@ -990,6 +991,10 @@ components:
           minimum: 1
         seed_receipt_sha256:
           type: string
+          pattern: "^[0-9a-f]{64}$"
+        capture_receipt_sha256:
+          type: string
+          description: SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
           pattern: "^[0-9a-f]{64}$"
         manifest_sha256:
           type: string
@@ -1710,6 +1715,7 @@ components:
         - timeline_id
         - checkpoint_lsn
         - seed_receipt_sha256
+        - capture_receipt_sha256
         - manifest_sha256
         - aggregate_sha256
       additionalProperties: false
@@ -1738,6 +1744,10 @@ components:
           minimum: 1
         seed_receipt_sha256:
           type: string
+          pattern: "^[0-9a-f]{64}$"
+        capture_receipt_sha256:
+          type: string
+          description: SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
           pattern: "^[0-9a-f]{64}$"
         manifest_sha256:
           type: string
@@ -1768,6 +1778,7 @@ components:
         - checkpoint_lsn
         - end_record_lsn
         - manifest_sha256
+        - capture_receipt_sha256
         - file_count
         - total_bytes
         - generation_root
@@ -1843,6 +1854,10 @@ components:
           minimum: 1
         manifest_sha256:
           type: string
+          pattern: "^[0-9a-f]{64}$"
+        capture_receipt_sha256:
+          type: string
+          description: SHA-256 of the exact immutable runtime capture COMPLETE response bytes.
           pattern: "^[0-9a-f]{64}$"
         file_count:
           type: integer

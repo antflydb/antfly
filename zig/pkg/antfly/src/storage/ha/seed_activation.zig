@@ -29,6 +29,7 @@ const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const local_generation_gc = @import("local_generation_gc.zig");
 const object_storage = @import("../object_storage.zig");
 const seed_artifact = @import("seed_artifact.zig");
+const seed_capture = @import("seed_capture.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
@@ -55,6 +56,7 @@ pub const StartupExpectation = struct {
     manifest_sha256: ?[]const u8 = null,
     aggregate_sha256: ?[]const u8 = null,
     seed_receipt_sha256: ?[]const u8 = null,
+    capture_receipt_sha256: ?[]const u8 = null,
     limits: seed_artifact.Limits = .{},
 };
 
@@ -94,6 +96,9 @@ pub const ActivationReceipt = struct {
     backup_lsn: u64,
     checkpoint_lsn: u64,
     seed_receipt_sha256: []const u8,
+    /// Digest of the exact runtime-owned capture COMPLETE bytes that
+    /// authorized publication of the portable seed artifact.
+    capture_receipt_sha256: []const u8 = "",
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
     generation_path: []const u8,
@@ -152,6 +157,7 @@ const SeededSlotActivationCheckpoint = struct {
     timeline_id: i64,
     checkpoint_lsn: i64,
     seed_receipt_sha256: []const u8,
+    capture_receipt_sha256: []const u8,
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
 };
@@ -198,6 +204,13 @@ pub fn pruneActivatedGenerations(
 
     const generation_path = try std.fs.path.join(alloc, &.{ request.target_root, active.value.generation_path });
     defer alloc.free(generation_path);
+    const active_binding = ActivationBinding{
+        .topology_id = active.value.topology_id,
+        .topology_generation = active.value.topology_generation,
+        .node_id = active.value.node_id,
+        .target_pvc_name = active.value.target_pvc_name,
+        .target_pvc_uid = active.value.target_pvc_uid,
+    };
     try validatePublishedGeneration(alloc, generation_path, .{
         .staging_root = "/unused",
         .target_root = request.target_root,
@@ -206,7 +219,10 @@ pub fn pruneActivatedGenerations(
             .slot_name = active.value.slot_name,
             .identity = active.value.identity(),
             .minimum_checkpoint_lsn = active.value.checkpoint_lsn,
+            .binding = active_binding,
+            .capture_receipt_sha256 = active.value.capture_receipt_sha256,
         },
+        .binding = active_binding,
         .limits = request.limits,
     }, active_json);
 
@@ -237,9 +253,10 @@ fn validateActiveForGC(alloc: Allocator, receipt: ActivationReceipt) !void {
         receipt.manifest_id.len == 0 or
         receipt.backup_lsn == 0 or
         receipt.checkpoint_lsn < receipt.backup_lsn or
-        receipt.seed_receipt_sha256.len != Sha256.digest_length * 2 or
-        receipt.manifest_sha256.len != Sha256.digest_length * 2 or
-        receipt.aggregate_sha256.len != Sha256.digest_length * 2)
+        !isCanonicalSha256(receipt.seed_receipt_sha256) or
+        !isCanonicalSha256(receipt.capture_receipt_sha256) or
+        !isCanonicalSha256(receipt.manifest_sha256) or
+        !isCanonicalSha256(receipt.aggregate_sha256))
         return error.InvalidActiveReceipt;
     try standby_mod.validateIdentity(receipt.identity());
     const expected_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ generations_dir_name, receipt.generation });
@@ -268,6 +285,7 @@ fn validateActivationCheckpoint(
         checkpoint.timeline_id <= 0 or @as(u64, @intCast(checkpoint.timeline_id)) != active.timeline_id or
         checkpoint.checkpoint_lsn <= 0 or @as(u64, @intCast(checkpoint.checkpoint_lsn)) != active.checkpoint_lsn or
         !std.mem.eql(u8, checkpoint.seed_receipt_sha256, active.seed_receipt_sha256) or
+        !std.mem.eql(u8, checkpoint.capture_receipt_sha256, active.capture_receipt_sha256) or
         !std.mem.eql(u8, checkpoint.manifest_sha256, active.manifest_sha256) or
         !std.mem.eql(u8, checkpoint.aggregate_sha256, active.aggregate_sha256))
         return error.SeedActivationCheckpointMismatch;
@@ -302,6 +320,19 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     var seed_receipt_hex: [Sha256.digest_length * 2]u8 = undefined;
     encodeHex(&seed_receipt_hex, &seed_receipt_digest);
 
+    const capture_receipt_sha256 = staged_receipt.value.capture_receipt_sha256;
+    if (request.binding != null) {
+        if (staged_receipt.value.format_version != seed_artifact.format_version or
+            !isCanonicalSha256(capture_receipt_sha256)) return error.CaptureReceiptAuthorityMissing;
+        const expected_capture = request.expected.capture_receipt_sha256 orelse
+            return error.CaptureReceiptAuthorityMissing;
+        if (!isCanonicalSha256(expected_capture) or
+            !std.mem.eql(u8, expected_capture, capture_receipt_sha256))
+            return error.WrongCaptureReceiptDigest;
+    } else if (capture_receipt_sha256.len != 0) {
+        return error.UnexpectedCaptureReceiptAuthority;
+    }
+
     const generation_relative_path = try std.fs.path.join(alloc, &.{ generations_dir_name, request.expected.generation });
     defer alloc.free(generation_relative_path);
     const binding = request.binding orelse ActivationBinding{};
@@ -317,6 +348,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
         .backup_lsn = staged_receipt.value.backup_lsn,
         .checkpoint_lsn = staged_receipt.value.checkpoint_lsn,
         .seed_receipt_sha256 = &seed_receipt_hex,
+        .capture_receipt_sha256 = capture_receipt_sha256,
         .manifest_sha256 = staged_receipt.value.manifest_sha256,
         .aggregate_sha256 = staged_receipt.value.aggregate_sha256,
         .generation_path = generation_relative_path,
@@ -342,7 +374,15 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     try inspectTargetRoot(io, request.target_root);
     if (readOptionalFileAlloc(io, alloc, active_path, request.limits.max_receipt_bytes)) |existing_active| {
         defer alloc.free(existing_active);
-        try validateActiveReceipt(alloc, existing_active, request.expected, request.binding, &seed_receipt_hex, generation_relative_path);
+        try validateActiveReceipt(
+            alloc,
+            existing_active,
+            request.expected,
+            request.binding,
+            &seed_receipt_hex,
+            capture_receipt_sha256,
+            generation_relative_path,
+        );
         try inspectGenerationsRoot(io, generations_root, request.expected.generation, installing_name);
         try validatePublishedGeneration(alloc, generation_path, request, activation_json);
         try recordLifecycleReceipt(alloc, request, existing_active);
@@ -419,7 +459,16 @@ fn validateRequest(request: ActivateRequest) !void {
     if (!validAbsoluteRoot(request.staging_root)) return error.InvalidStagingRoot;
     if (!validAbsoluteRoot(request.target_root)) return error.InvalidActivationTarget;
     if (pathsOverlap(request.staging_root, request.target_root)) return error.OverlappingActivationPaths;
-    if (request.binding) |binding| try validateBinding(binding);
+    if (request.binding) |binding| {
+        try validateBinding(binding);
+        const expected_binding = request.expected.binding orelse return error.ArtifactBindingRequired;
+        try expectArtifactBinding(binding, expected_binding, error.ActivationBindingMismatch);
+        const capture_digest = request.expected.capture_receipt_sha256 orelse
+            return error.CaptureReceiptAuthorityMissing;
+        if (!isCanonicalSha256(capture_digest)) return error.InvalidCaptureReceiptDigest;
+    } else if (request.expected.binding != null or request.expected.capture_receipt_sha256 != null) {
+        return error.UnexpectedActivationBinding;
+    }
     if (request.pod_uid) |pod_uid| if (!validation.isIdentifier(pod_uid)) return error.InvalidActivationPodUID;
 }
 
@@ -492,6 +541,7 @@ fn validateActiveReceipt(
     expected: seed_artifact.ExpectedArtifact,
     expected_binding: ?ActivationBinding,
     seed_receipt_sha256: []const u8,
+    capture_receipt_sha256: []const u8,
     generation_path: []const u8,
 ) !void {
     var parsed = std.json.parseFromSlice(ActivationReceipt, alloc, raw, .{}) catch return error.InvalidActiveReceipt;
@@ -501,6 +551,7 @@ fn validateActiveReceipt(
     if (!std.mem.eql(u8, receipt.generation, expected.generation) or
         !std.mem.eql(u8, receipt.slot_name, expected.slot_name) or
         !std.mem.eql(u8, receipt.seed_receipt_sha256, seed_receipt_sha256) or
+        !std.mem.eql(u8, receipt.capture_receipt_sha256, capture_receipt_sha256) or
         !std.mem.eql(u8, receipt.generation_path, generation_path)) return error.ActiveGenerationConflict;
     try expectIdentity(expected.identity, receipt.identity(), error.ActiveGenerationConflict);
     if (receipt.checkpoint_lsn < expected.minimum_checkpoint_lsn) return error.ActiveGenerationConflict;
@@ -533,6 +584,7 @@ fn verifyInstalledActivationEvidence(io: std.Io, alloc: Allocator, generation_pa
         !std.mem.eql(u8, receipt.manifest_id, active.value.manifest_id) or
         receipt.backup_lsn != active.value.backup_lsn or
         receipt.checkpoint_lsn != active.value.checkpoint_lsn or
+        !std.mem.eql(u8, receipt.capture_receipt_sha256, active.value.capture_receipt_sha256) or
         !std.mem.eql(u8, receipt.manifest_sha256, active.value.manifest_sha256) or
         !std.mem.eql(u8, receipt.aggregate_sha256, active.value.aggregate_sha256)) return error.ActivationReceiptMismatch;
     try expectIdentity(receipt.identity(), active.value.identity(), error.ActivationReceiptMismatch);
@@ -571,6 +623,7 @@ pub fn validateActivatedGeneration(alloc: Allocator, expectation: StartupExpecta
     try expectOptionalDigest(expectation.manifest_sha256, receipt.manifest_sha256);
     try expectOptionalDigest(expectation.aggregate_sha256, receipt.aggregate_sha256);
     try expectOptionalDigest(expectation.seed_receipt_sha256, receipt.seed_receipt_sha256);
+    try expectOptionalDigest(expectation.capture_receipt_sha256, receipt.capture_receipt_sha256);
 
     const generation_path = try std.fs.path.join(alloc, &.{ expectation.target_root, generation_relative_path });
     defer alloc.free(generation_path);
@@ -592,10 +645,26 @@ fn expectBinding(expected: ActivationBinding, actual: ActivationReceipt, mismatc
         !std.mem.eql(u8, expected.target_pvc_uid, actual.target_pvc_uid)) return mismatch;
 }
 
+fn expectArtifactBinding(expected: ActivationBinding, actual: seed_artifact.LifecycleBinding, mismatch: anyerror) !void {
+    if (!std.mem.eql(u8, expected.topology_id, actual.topology_id) or
+        expected.topology_generation != actual.topology_generation or
+        !std.mem.eql(u8, expected.node_id, actual.node_id) or
+        !std.mem.eql(u8, expected.target_pvc_name, actual.target_pvc_name) or
+        !std.mem.eql(u8, expected.target_pvc_uid, actual.target_pvc_uid)) return mismatch;
+}
+
 fn expectOptionalDigest(expected: ?[]const u8, actual: []const u8) !void {
     if (expected) |digest| {
-        if (digest.len != Sha256.digest_length * 2 or !std.mem.eql(u8, digest, actual)) return error.ActiveGenerationConflict;
+        if (!isCanonicalSha256(digest) or !std.mem.eql(u8, digest, actual)) return error.ActiveGenerationConflict;
     }
+}
+
+fn isCanonicalSha256(value: []const u8) bool {
+    if (value.len != Sha256.digest_length * 2) return false;
+    for (value) |byte| {
+        if ((byte < '0' or byte > '9') and (byte < 'a' or byte > 'f')) return false;
+    }
+    return true;
 }
 
 fn verifyGenerationReceipt(io: std.Io, alloc: Allocator, marker_path: []const u8, expected: []const u8, max_bytes: usize) !void {
@@ -722,7 +791,20 @@ fn testIdentity() standby_mod.Identity {
     return .{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 2, .epoch = 4 };
 }
 
-fn prepareTestStaging(alloc: Allocator, root: []const u8, generation: []const u8, identity: standby_mod.Identity, body: []const u8) ![]u8 {
+const PreparedTestStaging = struct {
+    root: []u8,
+    capture_receipt_sha256: [Sha256.digest_length * 2]u8,
+    bound: bool,
+};
+
+fn prepareTestStagingWithBinding(
+    alloc: Allocator,
+    root: []const u8,
+    generation: []const u8,
+    identity: standby_mod.Identity,
+    body: []const u8,
+    binding: ?ActivationBinding,
+) !PreparedTestStaging {
     const source_root = try std.fs.path.join(alloc, &.{ root, "source", generation });
     defer alloc.free(source_root);
     const source_path = try std.fs.path.join(alloc, &.{ source_root, "data/catalog.txt" });
@@ -751,6 +833,42 @@ fn prepareTestStaging(alloc: Allocator, root: []const u8, generation: []const u8
     });
     defer alloc.free(manifest);
 
+    var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = [_]u8{0} ** (Sha256.digest_length * 2);
+    var capture_receipt_json: ?[]u8 = null;
+    defer if (capture_receipt_json) |json| alloc.free(json);
+    if (binding) |authority| {
+        var manifest_digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(manifest, &manifest_digest, .{});
+        var manifest_sha256: [Sha256.digest_length * 2]u8 = undefined;
+        encodeHex(&manifest_sha256, &manifest_digest);
+        capture_receipt_json = try std.json.Stringify.valueAlloc(alloc, seed_capture.CaptureReceipt{
+            .format_version = seed_capture.format_version,
+            .generation = generation,
+            .slot_name = "standby-a",
+            .cluster_id = identity.cluster_id,
+            .shard_id = identity.shard_id,
+            .table_id = identity.table_id,
+            .timeline_id = identity.timeline_id,
+            .epoch = identity.epoch,
+            .source_plan_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .manifest_id = generation,
+            .backup_lsn = 8,
+            .checkpoint_lsn = 11,
+            .end_record_lsn = 12,
+            .manifest_sha256 = &manifest_sha256,
+            .file_count = files.len,
+            .total_bytes = body.len,
+            .topology_id = authority.topology_id,
+            .topology_generation = authority.topology_generation,
+            .node_id = authority.node_id,
+            .target_pvc_name = authority.target_pvc_name,
+            .target_pvc_uid = authority.target_pvc_uid,
+        }, .{});
+        var capture_digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(capture_receipt_json.?, &capture_digest, .{});
+        encodeHex(&capture_receipt_sha256, &capture_digest);
+    }
+
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
     var client = memory.client();
@@ -761,6 +879,9 @@ fn prepareTestStaging(alloc: Allocator, root: []const u8, generation: []const u8
         .slot_name = "standby-a",
         .manifest_bytes = manifest,
         .content_root = source_root,
+        .capture_receipt_json = capture_receipt_json,
+        .capture_receipt_sha256 = if (binding != null) &capture_receipt_sha256 else null,
+        .binding = binding,
     });
     defer published.deinit(alloc);
 
@@ -772,11 +893,23 @@ fn prepareTestStaging(alloc: Allocator, root: []const u8, generation: []const u8
             .slot_name = "standby-a",
             .identity = identity,
             .minimum_checkpoint_lsn = 11,
+            .binding = binding,
+            .capture_receipt_sha256 = if (binding != null) &capture_receipt_sha256 else null,
         },
         .staging_root = staging_root,
     });
     restored.deinit(alloc);
-    return staging_root;
+    return .{
+        .root = staging_root,
+        .capture_receipt_sha256 = capture_receipt_sha256,
+        .bound = binding != null,
+    };
+}
+
+fn prepareTestStaging(alloc: Allocator, root: []const u8, generation: []const u8, identity: standby_mod.Identity, body: []const u8) ![]u8 {
+    const prepared = try prepareTestStagingWithBinding(alloc, root, generation, identity, body, null);
+    std.debug.assert(!prepared.bound);
+    return prepared.root;
 }
 
 fn expectPathMissing(io: std.Io, path: []const u8) !void {
@@ -826,19 +959,29 @@ test "storage.ha seed activation gc requires the durable seeded-slot activation 
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(root);
-    const staging_root = try prepareTestStaging(alloc, root, "gen-gc", testIdentity(), "catalog-gc");
-    defer alloc.free(staging_root);
+    const binding = ActivationBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 3,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-1",
+    };
+    const prepared = try prepareTestStagingWithBinding(alloc, root, "gen-gc", testIdentity(), "catalog-gc", binding);
+    defer alloc.free(prepared.root);
     const target_root = try std.fs.path.join(alloc, &.{ root, "target-gc" });
     defer alloc.free(target_root);
     var activated = try activate(alloc, .{
-        .staging_root = staging_root,
+        .staging_root = prepared.root,
         .target_root = target_root,
         .expected = .{
             .generation = "gen-gc",
             .slot_name = "standby-a",
             .identity = testIdentity(),
             .minimum_checkpoint_lsn = 11,
+            .binding = binding,
+            .capture_receipt_sha256 = &prepared.capture_receipt_sha256,
         },
+        .binding = binding,
     });
     defer activated.deinit(alloc);
     var active = try std.json.parseFromSlice(ActivationReceipt, alloc, activated.active_receipt_json, .{});
@@ -869,6 +1012,7 @@ test "storage.ha seed activation gc requires the durable seeded-slot activation 
         .timeline_id = @as(i64, @intCast(active.value.timeline_id)),
         .checkpoint_lsn = @as(i64, @intCast(active.value.checkpoint_lsn)),
         .seed_receipt_sha256 = active.value.seed_receipt_sha256,
+        .capture_receipt_sha256 = active.value.capture_receipt_sha256,
         .manifest_sha256 = active.value.manifest_sha256,
         .aggregate_sha256 = active.value.aggregate_sha256,
     }, .{});
@@ -897,10 +1041,6 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(root);
-    const staging_root = try prepareTestStaging(alloc, root, "gen-bound", testIdentity(), "catalog-bound");
-    defer alloc.free(staging_root);
-    const target_root = try std.fs.path.join(alloc, &.{ root, "target-bound" });
-    defer alloc.free(target_root);
     const binding = ActivationBinding{
         .topology_id = "topology-a",
         .topology_generation = 3,
@@ -908,15 +1048,32 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
         .target_pvc_name = "standby-a-data",
         .target_pvc_uid = "pvc-uid-1",
     };
+    const prepared = try prepareTestStagingWithBinding(alloc, root, "gen-bound", testIdentity(), "catalog-bound", binding);
+    defer alloc.free(prepared.root);
+    const target_root = try std.fs.path.join(alloc, &.{ root, "target-bound" });
+    defer alloc.free(target_root);
     const expected = seed_artifact.ExpectedArtifact{
         .generation = "gen-bound",
         .slot_name = "standby-a",
         .identity = testIdentity(),
         .minimum_checkpoint_lsn = 11,
+        .binding = binding,
+        .capture_receipt_sha256 = &prepared.capture_receipt_sha256,
     };
 
+    var wrong_expected = expected;
+    wrong_expected.capture_receipt_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try std.testing.expectError(error.WrongCaptureReceiptDigest, activate(alloc, .{
+        .staging_root = prepared.root,
+        .target_root = target_root,
+        .expected = wrong_expected,
+        .binding = binding,
+        .pod_uid = "pod-activation-wrong-capture",
+    }));
+    try expectPathMissing(std.testing.io, target_root);
+
     var activated = try activate(alloc, .{
-        .staging_root = staging_root,
+        .staging_root = prepared.root,
         .target_root = target_root,
         .expected = expected,
         .binding = binding,
@@ -928,6 +1085,7 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
     try std.testing.expectEqualStrings("topology-a", receipt.value.topology_id);
     try std.testing.expectEqual(@as(u64, 3), receipt.value.topology_generation);
     try std.testing.expectEqualStrings("pvc-uid-1", receipt.value.target_pvc_uid);
+    try std.testing.expectEqualStrings(&prepared.capture_receipt_sha256, receipt.value.capture_receipt_sha256);
 
     var ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, target_root, .{});
     var page = try ledger.readPage(alloc, .activation, .{ .limit = 10 }, .{ .authoritative_root = target_root });
@@ -938,7 +1096,7 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
     ledger.close();
 
     var repeated = try activate(alloc, .{
-        .staging_root = staging_root,
+        .staging_root = prepared.root,
         .target_root = target_root,
         .expected = expected,
         .binding = binding,
@@ -959,6 +1117,7 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
         .manifest_sha256 = receipt.value.manifest_sha256,
         .aggregate_sha256 = receipt.value.aggregate_sha256,
         .seed_receipt_sha256 = receipt.value.seed_receipt_sha256,
+        .capture_receipt_sha256 = receipt.value.capture_receipt_sha256,
     };
     try std.testing.expectEqual(@as(u64, 11), try validateActivatedGeneration(alloc, expectation));
     try std.testing.expectEqual(@as(u64, 11), try validateActivatedGeneration(alloc, expectation));
@@ -966,6 +1125,10 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
     var stale = expectation;
     stale.binding.topology_generation = 2;
     try std.testing.expectError(error.ActiveGenerationConflict, validateActivatedGeneration(alloc, stale));
+
+    var wrong_capture = expectation;
+    wrong_capture.capture_receipt_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try std.testing.expectError(error.ActiveGenerationConflict, validateActivatedGeneration(alloc, wrong_capture));
 
     const installed_file = try std.fs.path.join(alloc, &.{ activated.generation_path, "data/catalog.txt" });
     defer alloc.free(installed_file);

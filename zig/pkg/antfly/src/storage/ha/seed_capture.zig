@@ -285,7 +285,7 @@ pub fn prunePublishedGenerations(
     var remote = std.json.parseFromSlice(seed_artifact.Receipt, alloc, verified.receipt_json, .{ .ignore_unknown_fields = false }) catch
         return error.InvalidArtifactReceipt;
     defer remote.deinit();
-    try validateRemoteAgainstCapture(remote.value, local.value);
+    try validateRemoteAgainstCapture(remote.value, local.value, local_json);
 
     try local_generation_gc.markEligible(alloc, .{
         .root = request.capture_root,
@@ -334,8 +334,10 @@ fn validatePublishedGCManifest(manifest: backup_manifest.ManifestView, receipt: 
     if (total_bytes != receipt.total_bytes) return error.CaptureManifestMismatch;
 }
 
-fn validateRemoteAgainstCapture(remote: seed_artifact.Receipt, local: CaptureReceipt) !void {
-    if (remote.format_version != seed_artifact.chunked_format_version and remote.format_version != seed_artifact.format_version)
+fn validateRemoteAgainstCapture(remote: seed_artifact.Receipt, local: CaptureReceipt, local_json: []const u8) !void {
+    if (remote.format_version != seed_artifact.chunked_format_version and
+        remote.format_version != seed_artifact.topology_format_version and
+        remote.format_version != seed_artifact.format_version)
         return error.LocalGCRequiresArtifactV2;
     if (!std.mem.eql(u8, remote.generation, local.generation) or
         !std.mem.eql(u8, remote.slot_name, local.slot_name) or
@@ -353,6 +355,7 @@ fn validateRemoteAgainstCapture(remote: seed_artifact.Receipt, local: CaptureRec
             !std.mem.eql(u8, binding.node_id, remote.node_id) or
             !std.mem.eql(u8, binding.target_pvc_name, remote.target_pvc_name) or
             !std.mem.eql(u8, binding.target_pvc_uid, remote.target_pvc_uid)) return error.ArtifactCaptureMismatch;
+        try expectSha256(local_json, remote.capture_receipt_sha256, error.ArtifactCaptureMismatch);
     }
 }
 

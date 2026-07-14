@@ -177,6 +177,7 @@ const ActivationReceipt = struct {
     backup_lsn: u64,
     checkpoint_lsn: u64,
     seed_receipt_sha256: []const u8,
+    capture_receipt_sha256: []const u8,
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
     generation_path: []const u8,
@@ -373,7 +374,8 @@ fn validateActivationReceipt(receipt: ActivationReceipt) !void {
     try validateNormalized(normalizedActivation(receipt));
     if (receipt.cluster_id == 0 or receipt.timeline_id == 0 or receipt.epoch == 0 or
         receipt.manifest_id.len == 0 or receipt.backup_lsn == 0 or receipt.checkpoint_lsn < receipt.backup_lsn or
-        !validSha256(receipt.seed_receipt_sha256) or !validSha256(receipt.manifest_sha256) or
+        !validSha256(receipt.seed_receipt_sha256) or !validSha256(receipt.capture_receipt_sha256) or
+        !validSha256(receipt.manifest_sha256) or
         !validSha256(receipt.aggregate_sha256) or !validation.isNormalizedPath(receipt.generation_path))
         return error.InvalidLifecycleReceipt;
 }

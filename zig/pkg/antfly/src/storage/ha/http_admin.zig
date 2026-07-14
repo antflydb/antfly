@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const platform_sync = @import("antfly_platform").sync;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
@@ -758,6 +759,11 @@ pub const Server = struct {
             return try textResponse(self.alloc, 500, "InvalidSeedCaptureReceipt");
         }
 
+        var capture_receipt_digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(result.capture.receipt_json, &capture_receipt_digest, .{});
+        var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = undefined;
+        encodeSha256Hex(&capture_receipt_sha256, &capture_receipt_digest);
+
         const action_id = try std.fmt.allocPrint(self.alloc, "seed_capture:{s}", .{value.generation});
         defer self.alloc.free(action_id);
         return try self.handleTypedJson(admin_api.HASeedArtifactCaptureResponse{
@@ -787,6 +793,7 @@ pub const Server = struct {
             .checkpoint_lsn = try adminI64(value.checkpoint_lsn),
             .end_record_lsn = try adminI64(value.end_record_lsn),
             .manifest_sha256 = value.manifest_sha256,
+            .capture_receipt_sha256 = &capture_receipt_sha256,
             .file_count = try adminI64(@intCast(value.file_count)),
             .total_bytes = try adminI64(value.total_bytes),
             .generation_root = result.capture.generation_root,
@@ -885,6 +892,7 @@ pub const Server = struct {
             !validation.isIdentifier(request.generation) or
             request.manifest_id.len == 0 or
             !validSha256Hex(request.seed_receipt_sha256) or
+            !validSha256Hex(request.capture_receipt_sha256) or
             !validSha256Hex(request.manifest_sha256) or
             !validSha256Hex(request.aggregate_sha256))
         {
@@ -922,6 +930,7 @@ pub const Server = struct {
             .timeline_id = request.timeline_id,
             .checkpoint_lsn = request.checkpoint_lsn,
             .seed_receipt_sha256 = request.seed_receipt_sha256,
+            .capture_receipt_sha256 = request.capture_receipt_sha256,
             .manifest_sha256 = request.manifest_sha256,
             .aggregate_sha256 = request.aggregate_sha256,
         });
@@ -2224,6 +2233,13 @@ fn validSha256Hex(value: []const u8) bool {
         if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
     }
     return true;
+}
+
+fn encodeSha256Hex(out: *[Sha256.digest_length * 2]u8, digest: *const [Sha256.digest_length]u8) void {
+    for (digest, 0..) |byte, index| {
+        out[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
 }
 
 fn uint64Text(raw: []const u8) !u64 {
@@ -3573,8 +3589,8 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const activate_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"slot_name\":\"standby-seed\",\"generation\":\"seed-standby-seed-1\",\"manifest_id\":\"base-http\",\"timeline_id\":1,\"checkpoint_lsn\":2,\"seed_receipt_sha256\":\"{s}\",\"manifest_sha256\":\"{s}\",\"aggregate_sha256\":\"{s}\"}}",
-        .{ digest, digest, digest },
+        "{{\"slot_name\":\"standby-seed\",\"generation\":\"seed-standby-seed-1\",\"manifest_id\":\"base-http\",\"timeline_id\":1,\"checkpoint_lsn\":2,\"seed_receipt_sha256\":\"{s}\",\"capture_receipt_sha256\":\"{s}\",\"manifest_sha256\":\"{s}\",\"aggregate_sha256\":\"{s}\"}}",
+        .{ digest, digest, digest, digest },
     );
     defer alloc.free(activate_body);
     var typed_activate = try server.handle(.{
@@ -3590,6 +3606,7 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try expectContains(typed_activate.body, "\"target\":\"seed-standby-seed-1\"");
     try expectContains(typed_activate.body, "\"state\":\"applied\"");
     try expectContains(typed_activate.body, "\"checkpoint_lsn\":2");
+    try expectContains(typed_activate.body, "\"capture_receipt_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"");
     const activated = primary.slot("standby-seed") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(slot_store.SlotLifecycle.streaming, activated.lifecycle);
     try std.testing.expect(activated.active);

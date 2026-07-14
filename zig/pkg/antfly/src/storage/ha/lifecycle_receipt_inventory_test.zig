@@ -75,6 +75,7 @@ fn activationReceiptJSON(alloc: std.mem.Allocator, generation: []const u8, check
         .backup_lsn = checkpoint_lsn - 1,
         .checkpoint_lsn = checkpoint_lsn,
         .seed_receipt_sha256 = digest_c,
+        .capture_receipt_sha256 = digest_a,
         .manifest_sha256 = digest_b,
         .aggregate_sha256 = digest_d,
         .generation_path = generation_path,

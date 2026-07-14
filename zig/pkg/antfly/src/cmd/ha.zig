@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly = @import("antfly-zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const admin_api = antfly.admin;
 const ha = antfly.ha;
@@ -226,6 +227,8 @@ const ArtifactFlag = enum {
     slot,
     manifest,
     content_root,
+    capture_receipt,
+    capture_receipt_sha256,
     staging_root,
     target_root,
     capture_root,
@@ -276,6 +279,8 @@ const ArtifactOptions = struct {
     slot_name: ?[]const u8 = null,
     manifest_path: ?[]const u8 = null,
     content_root: ?[]const u8 = null,
+    capture_receipt_path: ?[]const u8 = null,
+    capture_receipt_sha256: ?[]const u8 = null,
     staging_root: ?[]const u8 = null,
     target_root: ?[]const u8 = null,
     capture_root: ?[]const u8 = null,
@@ -304,9 +309,13 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const location = options.location orelse return error.SeedLocationMissing;
             const manifest_path = options.manifest_path orelse return error.SeedManifestMissing;
             const content_root = options.content_root orelse return error.SeedContentRootMissing;
+            const capture_receipt_path = options.capture_receipt_path orelse return error.CaptureReceiptMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
             const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             const manifest_bytes = try readArtifactFileAlloc(alloc, manifest_path, (ha.seed_artifact.Limits{}).max_manifest_bytes);
             defer alloc.free(manifest_bytes);
+            const capture_receipt_json = try readArtifactFileAlloc(alloc, capture_receipt_path, (ha.seed_artifact.Limits{}).max_receipt_bytes);
+            defer alloc.free(capture_receipt_json);
             var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
             var result = try ha.seed_artifact.publish(alloc, .{
@@ -318,6 +327,8 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                 .slot_name = slot_name,
                 .manifest_bytes = manifest_bytes,
                 .content_root = content_root,
+                .capture_receipt_json = capture_receipt_json,
+                .capture_receipt_sha256 = capture_receipt_sha256,
                 .binding = binding,
             });
             defer result.deinit(alloc);
@@ -328,6 +339,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const location = options.location orelse return error.SeedLocationMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
             const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
@@ -342,6 +354,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .identity = try options.identity.finish(),
                     .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
                     .binding = binding,
+                    .capture_receipt_sha256 = capture_receipt_sha256,
                 },
                 .staging_root = staging_root,
             });
@@ -352,6 +365,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const generation = options.generation orelse return error.SeedGenerationMissing;
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
             const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             try ha.seed_artifact.verifyStaged(alloc, staging_root, .{
                 .generation = generation,
@@ -359,6 +373,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                 .identity = try options.identity.finish(),
                 .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
                 .binding = binding,
+                .capture_receipt_sha256 = capture_receipt_sha256,
             }, .{});
             std.Io.File.stdout().writeStreamingAll(io, "{\"verified\":true}\n") catch {};
         },
@@ -367,6 +382,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
             const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
             const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             var result = try ha.seed_activation.activate(alloc, .{
                 .staging_root = staging_root,
@@ -377,6 +393,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .identity = try options.identity.finish(),
                     .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
                     .binding = binding,
+                    .capture_receipt_sha256 = capture_receipt_sha256,
                 },
                 .binding = binding,
                 .pod_uid = try resolveHAPodUID(),
@@ -477,6 +494,8 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
             .slot => options.slot_name = try artifactValue(argv, &idx),
             .manifest => options.manifest_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
             .content_root => options.content_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .capture_receipt => options.capture_receipt_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .capture_receipt_sha256 => options.capture_receipt_sha256 = try artifactValue(argv, &idx),
             .staging_root => options.staging_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
             .target_root => options.target_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
             .capture_root => options.capture_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
@@ -519,6 +538,8 @@ fn artifactFlag(raw: []const u8) ?ArtifactFlag {
         .{ "--slot", .slot },
         .{ "--manifest", .manifest },
         .{ "--content-root", .content_root },
+        .{ "--capture-receipt", .capture_receipt },
+        .{ "--capture-receipt-sha256", .capture_receipt_sha256 },
         .{ "--staging-root", .staging_root },
         .{ "--target-root", .target_root },
         .{ "--capture-root", .capture_root },
@@ -545,6 +566,8 @@ fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
         .location => action == .publish or action == .restore or action == .prune or action == .gc_source,
         .generation, .slot => action != .gc_target,
         .manifest, .content_root => action == .publish,
+        .capture_receipt => action == .publish,
+        .capture_receipt_sha256 => action == .publish or action == .restore or action == .verify or action == .activate,
         .staging_root => action == .restore or action == .verify or action == .activate,
         .target_root => action == .activate or action == .gc_target,
         .capture_root => action == .gc_source,
@@ -566,6 +589,16 @@ fn artifactValue(argv: []const []const u8, idx: *usize) ![]const u8 {
 fn absoluteArtifactPath(path: []const u8) ![]const u8 {
     if (!ha_validation.isAbsoluteNormalizedPath(path)) return error.InvalidSeedArtifactPath;
     return path;
+}
+
+fn requireCaptureReceiptDigest(raw_digest: ?[]const u8) ![]const u8 {
+    const digest = raw_digest orelse return error.CaptureReceiptDigestMissing;
+    if (digest.len != Sha256.digest_length * 2) return error.InvalidCaptureReceiptDigest;
+    for (digest) |byte| {
+        if ((byte < '0' or byte > '9') and (byte < 'a' or byte > 'f'))
+            return error.InvalidCaptureReceiptDigest;
+    }
+    return digest;
 }
 
 fn readArtifactFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -1653,6 +1686,15 @@ test "ha cmd artifact requires capture receipt digest chain flags" {
     defer options.deinit(alloc);
     try std.testing.expect(@hasField(ArtifactOptions, "capture_receipt_path"));
     try std.testing.expect(@hasField(ArtifactOptions, "capture_receipt_sha256"));
+    try std.testing.expectEqualStrings("/source/COMPLETE.json", options.capture_receipt_path.?);
+    try std.testing.expectEqualStrings(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        options.capture_receipt_sha256.?,
+    );
+    try std.testing.expectEqualStrings(
+        options.capture_receipt_sha256.?,
+        try requireCaptureReceiptDigest(options.capture_receipt_sha256),
+    );
 }
 
 test "ha cmd artifact parses lifecycle-gated source and target generation gc actions" {

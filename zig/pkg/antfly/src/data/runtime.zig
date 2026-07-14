@@ -17241,6 +17241,29 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"manifest_path\":") != null);
+    const CaptureDigestResponse = struct { capture_receipt_sha256: []const u8 };
+    var capture_response = try std.json.parseFromSlice(CaptureDigestResponse, alloc, capture_resp.body, .{ .ignore_unknown_fields = true });
+    defer capture_response.deinit();
+    const runtime_capture_receipt_path = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/COMPLETE.json",
+    });
+    defer alloc.free(runtime_capture_receipt_path);
+    const runtime_capture_receipt = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        runtime_capture_receipt_path,
+        alloc,
+        .limited(1024 * 1024),
+    );
+    defer alloc.free(runtime_capture_receipt);
+    var runtime_capture_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(runtime_capture_receipt, &runtime_capture_digest, .{});
+    var runtime_capture_digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+    for (runtime_capture_digest, 0..) |byte, index| {
+        runtime_capture_digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        runtime_capture_digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    try std.testing.expectEqualStrings(&runtime_capture_digest_hex, capture_response.value.capture_receipt_sha256);
     // Contract: DataServer must package only provider-produced logical output,
     // never recursively copy the live replica tree (which contains Raft WAL).
     try std.testing.expectEqual(@as(usize, 1), seed_snapshot_provider.calls);
@@ -17350,6 +17373,9 @@ test "data server wires configured HA executors into API server" {
     defer capture_retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), capture_retry.status);
     try std.testing.expect(std.mem.indexOf(u8, capture_retry.body, "\"state\":\"already_applied\"") != null);
+    var capture_retry_response = try std.json.parseFromSlice(CaptureDigestResponse, alloc, capture_retry.body, .{ .ignore_unknown_fields = true });
+    defer capture_retry_response.deinit();
+    try std.testing.expectEqualStrings(capture_response.value.capture_receipt_sha256, capture_retry_response.value.capture_receipt_sha256);
 
     server.ha_cfg.seed_snapshot_provider = null;
     var default_capture = try DataServer.captureHASeedCallback(
