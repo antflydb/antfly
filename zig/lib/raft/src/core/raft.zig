@@ -380,10 +380,16 @@ pub const Raft = struct {
         for (msg.entries) |entry| {
             const appended = try self.appendLocalEntryOfTypeUnchecked(entry.entry_type, entry.data);
             switch (entry.entry_type) {
-                .normal => {},
-                .conf_change, .conf_change_v2 => self.pending_conf_index = appended,
+                .normal => self.trace(.replicate, null),
+                .conf_change => {
+                    self.pending_conf_index = appended;
+                    self.traceEncodedConfChange(entry.data, false);
+                },
+                .conf_change_v2 => {
+                    self.pending_conf_index = appended;
+                    self.traceEncodedConfChange(entry.data, true);
+                },
             }
-            self.trace(.replicate, null);
         }
         _ = self.maybeCommit();
         try self.bcastAppend();
@@ -492,7 +498,11 @@ pub const Raft = struct {
         defer self.alloc.free(encoded);
 
         self.pending_conf_index = try self.appendLocalEntryOfType(.conf_change, encoded);
-        self.trace(.replicate, null);
+        const changes = [_]types.ConfChangeSingle{.{
+            .change_type = conf_change.change_type,
+            .node_id = conf_change.node_id,
+        }};
+        self.traceConfChange(.change_conf, changes[0..], .auto);
         _ = self.maybeCommit();
         try self.bcastAppend();
     }
@@ -520,7 +530,7 @@ pub const Raft = struct {
         defer self.alloc.free(encoded);
 
         self.pending_conf_index = try self.appendLocalEntryOfType(.conf_change_v2, encoded);
-        self.trace(.replicate, null);
+        self.traceConfChange(.change_conf, conf_change.changes, conf_change.transition);
         _ = self.maybeCommit();
         try self.bcastAppend();
     }
@@ -620,6 +630,11 @@ pub const Raft = struct {
         })) orelse return self.conf_state;
         try self.applyRuntimeConfState(next);
         self.maybeStepDownOnRemoval();
+        const changes = [_]types.ConfChangeSingle{.{
+            .change_type = conf_change.change_type,
+            .node_id = conf_change.node_id,
+        }};
+        self.traceConfChange(.apply_conf_change, changes[0..], .auto);
         return self.conf_state;
     }
 
@@ -632,6 +647,7 @@ pub const Raft = struct {
             try self.appendAutoLeaveJointEntry();
         }
         self.maybeStepDownOnRemoval();
+        self.traceConfChange(.apply_conf_change, conf_change.changes, conf_change.transition);
         return self.conf_state;
     }
 
@@ -1327,6 +1343,43 @@ pub const Raft = struct {
     }
 
     fn trace(self: *const Raft, event_type: logger_mod.TraceEventType, msg: ?*const message.Message) void {
+        self.traceEvent(event_type, msg, &.{}, .auto);
+    }
+
+    fn traceConfChange(
+        self: *const Raft,
+        event_type: logger_mod.TraceEventType,
+        changes: []const types.ConfChangeSingle,
+        transition: types.ConfChangeTransition,
+    ) void {
+        self.traceEvent(event_type, null, changes, transition);
+    }
+
+    fn traceEncodedConfChange(self: *const Raft, data: []const u8, comptime v2: bool) void {
+        // Trace instrumentation must never change proposal behavior, especially
+        // after the entry has already been appended to the local log.
+        if (self.trace_logger == null) return;
+        if (v2) {
+            var conf_change = types.ConfChangeV2.decode(data, self.alloc) catch return;
+            defer conf_change.deinit(self.alloc);
+            self.traceConfChange(.change_conf, conf_change.changes, conf_change.transition);
+        } else {
+            const conf_change = types.ConfChange.decode(data) catch return;
+            const changes = [_]types.ConfChangeSingle{.{
+                .change_type = conf_change.change_type,
+                .node_id = conf_change.node_id,
+            }};
+            self.traceConfChange(.change_conf, changes[0..], .auto);
+        }
+    }
+
+    fn traceEvent(
+        self: *const Raft,
+        event_type: logger_mod.TraceEventType,
+        msg: ?*const message.Message,
+        conf_changes: []const types.ConfChangeSingle,
+        conf_transition: types.ConfChangeTransition,
+    ) void {
         const trace_logger = self.trace_logger orelse return;
         const event = logger_mod.TraceEvent{
             .event_type = event_type,
@@ -1344,6 +1397,8 @@ pub const Raft = struct {
             .learners_next = self.conf_state.learners_next,
             .auto_leave = self.conf_state.auto_leave,
             .message = msg,
+            .conf_changes = conf_changes,
+            .conf_transition = conf_transition,
         };
         trace_logger.traceEvent(&event);
     }

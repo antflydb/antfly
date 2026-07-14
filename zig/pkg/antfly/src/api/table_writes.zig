@@ -5060,6 +5060,22 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn beginStatusRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        while (true) {
+            if (self.findTableActivityLocked(table_name, null)) |index| {
+                const entry = self.active_table_activities.items[index];
+                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
+                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    continue;
+                }
+            }
+            const entry = self.activityEntryLocked(table_name, null);
+            entry.read_request_active += 1;
+            return;
+        }
+    }
+
     fn endReadRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         const index = self.findTableActivityLocked(table_name, null) orelse {
@@ -5265,6 +5281,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginReadRequestLocked(table_name);
+    }
+
+    fn beginStatusRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        self.beginStatusRequestLocked(table_name);
     }
 
     fn endReadRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -7675,22 +7698,29 @@ pub const ProvisionedTableWriteSource = struct {
         // clearly missing dense visibility for existing primary documents.
         const snapshot_cache = self.runtime_status_cache orelse return null;
         var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+        errdefer cached.deinit(alloc);
         const needs_cold_refresh = runtimeStatusesNeedColdVisibilityRefresh(&cached);
-        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
-        if (!needs_cold_refresh) return cached;
-        cached.deinit(alloc);
+        if (needs_cold_refresh) {
+            cached.deinit(alloc);
+            return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+        }
 
-        return try self.recoverRuntimeStatusesFromStorage(alloc, table_name);
+        // Cached snapshots are the steady-state status plane, but an active
+        // writer can advance derived replay after its last publish, including
+        // after primary-write dirtiness has been cleared. Refresh stale/aged
+        // snapshots from an already-open writer. Tables without one continue
+        // to use the published snapshot, so polling never opens a DB.
+        try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
+        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
+        return cached;
     }
 
-    fn refreshRuntimeStatusesFromDirtyWriteCache(
+    fn refreshRuntimeStatusesFromWriteCache(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         statuses: *runtime_status.LocalTableRuntimeStatuses,
     ) !void {
-        if (!self.isWriteCacheDirtyForTable(table_name)) return;
-
         const now_ns = platform_time.monotonicNs();
         if (!runtimeStatusesNeedWriterRefresh(statuses, now_ns)) return;
 
@@ -7719,46 +7749,16 @@ pub const ProvisionedTableWriteSource = struct {
         try replaceRuntimeStatusesWithMergedRefresh(alloc, statuses, &live_statuses);
     }
 
-    fn refreshStaleRuntimeStatusesFromStorage(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        statuses: *runtime_status.LocalTableRuntimeStatuses,
-    ) !void {
-        if (self.isWriteCacheDirtyForTable(table_name)) return;
-
-        const now_ns = platform_time.monotonicNs();
-        if (!runtimeStatusesNeedWriterRefresh(statuses, now_ns)) return;
-
-        var uncached = (try self.snapshotUncachedRuntimeStatusesAndUpdateCache(alloc, table_name)) orelse return;
-        defer uncached.deinit(alloc);
-
-        try replaceRuntimeStatusesWithMergedRefresh(alloc, statuses, &uncached);
-    }
-
     fn runtimeStatusesNeedWriterRefresh(statuses: *const runtime_status.LocalTableRuntimeStatuses, now_ns: u64) bool {
         const min_refresh_interval_ns = std.time.ns_per_s;
         if (statuses.items.len == 0) return true;
         for (statuses.items) |status| {
+            if (status.metadata.source != .cached_snapshot) continue;
             if (!runtime_status.statusRuntimeFresh(status)) return true;
             if (status.metadata.updated_at_ns == 0) return true;
             if (now_ns -| status.metadata.updated_at_ns >= min_refresh_interval_ns) return true;
         }
         return false;
-    }
-
-    fn snapshotUncachedRuntimeStatusesAndUpdateCache(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-    ) !?runtime_status.LocalTableRuntimeStatuses {
-        const snapshot_cache = self.runtime_status_cache orelse return null;
-        var uncached = (try snapshotLocalTableRuntimeStatusesUncached(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name)) orelse return null;
-        errdefer uncached.deinit(alloc);
-        for (uncached.items) |item| {
-            try snapshot_cache.upsertGroupStatus(table_name, item);
-        }
-        return uncached;
     }
 
     fn overlayManagedWriterReplayTargetsBestEffort(
@@ -10454,7 +10454,11 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.localRuntimeStatuses(alloc, table_name);
-        self.beginReadRequest(table_name);
+        // Status must not observe a structural generation transition, but it
+        // is safe to serve immutable snapshots during ordinary group work.
+        // The narrower admission avoids deadlocking status callers that run
+        // inside a group operation while still fencing restore/drop/publish.
+        self.beginStatusRequest(table_name);
         defer self.endReadRequest(table_name);
         return try self.snapshotRuntimeStatusesBestEffort(alloc, table_name);
     }
@@ -19569,9 +19573,33 @@ test "dirty auto bulk writer publishes runtime status without closing the cached
     try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
 
     source.readPreparation().prepareForRead("docs", .general);
-
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));
+
+    const replay_target = write_cache.entries.items[0].db.core.nextDerivedSequence();
+    try write_cache.entries.items[0].db.executor.waitForAll(replay_target);
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &write_cache.entries.items[0].db));
+
+    var stale = (try snapshot_cache.snapshotGroupStatus(alloc, "docs", 7001)).?;
+    defer stale.deinit(alloc);
+    try std.testing.expect(stale.stats.indexes.len > 0);
+    stale.metadata = .{
+        .source = .cached_snapshot,
+        .freshness = .stale,
+        .updated_at_ns = 1,
+    };
+    stale.stats.indexes[0].replay_applied_sequence = 0;
+    stale.stats.indexes[0].replay_target_sequence = replay_target;
+    stale.stats.indexes[0].replay_catch_up_required = true;
+    snapshot_cache.invalidateTable("docs");
+    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", stale);
+
+    var refreshed = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, refreshed.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, refreshed.items[0].metadata.freshness);
+    try std.testing.expectEqual(replay_target, refreshed.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!refreshed.items[0].stats.indexes[0].replay_catch_up_required);
 
     var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);

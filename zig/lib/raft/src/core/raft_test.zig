@@ -65,6 +65,9 @@ const CaptureLogger = struct {
 
 const CaptureTraceLogger = struct {
     events: std.ArrayListUnmanaged(logger_mod.TraceEventType) = .empty,
+    conf_change_event_count: usize = 0,
+    last_conf_change_type: ?types.ConfChangeType = null,
+    last_conf_change_node_id: ?types.NodeId = null,
 
     fn traceLogger(self: *CaptureTraceLogger) logger_mod.TraceLogger {
         return .{
@@ -82,6 +85,11 @@ const CaptureTraceLogger = struct {
     fn traceEventImpl(ptr: *anyopaque, event: *const logger_mod.TraceEvent) void {
         const self: *CaptureTraceLogger = @ptrCast(@alignCast(ptr));
         self.events.append(std.testing.allocator, event.event_type) catch return;
+        if (event.event_type != .change_conf and event.event_type != .apply_conf_change) return;
+        self.conf_change_event_count += 1;
+        if (event.conf_changes.len == 0) return;
+        self.last_conf_change_type = event.conf_changes[0].change_type;
+        self.last_conf_change_node_id = event.conf_changes[0].node_id;
     }
 };
 
@@ -302,6 +310,19 @@ test "custom trace logger observes init ready and role transitions" {
     try std.testing.expectEqual(logger_mod.TraceEventType.ready, trace_logger.events.items[1]);
     try std.testing.expectEqual(logger_mod.TraceEventType.become_candidate, trace_logger.events.items[2]);
     try std.testing.expectEqual(logger_mod.TraceEventType.become_leader, trace_logger.events.items[3]);
+
+    var changes = [_]types.ConfChangeSingle{.{
+        .change_type = .add_learner_node,
+        .node_id = 2,
+    }};
+    try raw.proposeConfChangeV2(.{ .changes = changes[0..] });
+    _ = try raw.applyConfChangeV2(.{ .changes = changes[0..] });
+
+    try std.testing.expect(std.mem.indexOfScalar(logger_mod.TraceEventType, trace_logger.events.items, .change_conf) != null);
+    try std.testing.expect(std.mem.indexOfScalar(logger_mod.TraceEventType, trace_logger.events.items, .apply_conf_change) != null);
+    try std.testing.expectEqual(@as(usize, 2), trace_logger.conf_change_event_count);
+    try std.testing.expectEqual(types.ConfChangeType.add_learner_node, trace_logger.last_conf_change_type.?);
+    try std.testing.expectEqual(@as(types.NodeId, 2), trace_logger.last_conf_change_node_id.?);
 }
 
 test "custom logger records ignored stale snapshot" {
