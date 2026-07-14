@@ -67,6 +67,14 @@ pub const PublishRequest = struct {
     limits: Limits = .{},
 };
 
+test "storage.ha portable production seed schema requires exact capture receipt authority" {
+    try std.testing.expectEqual(@as(u16, 4), format_version);
+    try std.testing.expect(@hasField(PublishRequest, "capture_receipt_json"));
+    try std.testing.expect(@hasField(PublishRequest, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(ExpectedArtifact, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(Receipt, "capture_receipt_sha256"));
+}
+
 pub const ExpectedArtifact = struct {
     generation: []const u8,
     slot_name: []const u8,

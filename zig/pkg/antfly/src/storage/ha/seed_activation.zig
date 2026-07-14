@@ -114,6 +114,13 @@ pub const ActivationReceipt = struct {
     }
 };
 
+test "storage.ha activation schema preserves capture and seed receipt digest chain" {
+    try std.testing.expectEqual(@as(u16, 1), format_version);
+    try std.testing.expect(@hasField(ActivationReceipt, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(StartupExpectation, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(SeededSlotActivationCheckpoint, "capture_receipt_sha256"));
+}
+
 const FailureBoundary = enum {
     generation_copied,
     generation_published,

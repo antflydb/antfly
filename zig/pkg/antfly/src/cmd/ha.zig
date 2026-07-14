@@ -1621,6 +1621,40 @@ test "ha cmd artifact accepts portable publish and restore topology pvc binding"
     try std.testing.expect((try restore.binding.finish()) != null);
 }
 
+test "ha cmd artifact requires capture receipt digest chain flags" {
+    const alloc = std.testing.allocator;
+    var options = try parseArtifactArgs(alloc, &.{
+        "publish",
+        "--location",
+        "s3://ha-seeds/topology-a",
+        "--generation",
+        "seed-9",
+        "--slot",
+        "standby-a",
+        "--manifest",
+        "/source/manifest.afha",
+        "--content-root",
+        "/source/content",
+        "--capture-receipt",
+        "/source/COMPLETE.json",
+        "--capture-receipt-sha256",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--topology-id",
+        "topology-a",
+        "--topology-generation",
+        "9",
+        "--node-id",
+        "primary-a",
+        "--target-pvc-name",
+        "standby-a-data",
+        "--target-pvc-uid",
+        "pvc-uid-9",
+    });
+    defer options.deinit(alloc);
+    try std.testing.expect(@hasField(ArtifactOptions, "capture_receipt_path"));
+    try std.testing.expect(@hasField(ArtifactOptions, "capture_receipt_sha256"));
+}
+
 test "ha cmd artifact parses lifecycle-gated source and target generation gc actions" {
     const alloc = std.testing.allocator;
     var source = try parseArtifactArgs(alloc, &.{
