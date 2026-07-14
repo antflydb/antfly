@@ -1140,6 +1140,81 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
     try std.testing.expectError(error.SeedGenerationConflict, validateActivatedGeneration(alloc, expectation));
 }
 
+test "storage.ha bound activation keeps immutable transport separate from mutable live runtime" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const binding = ActivationBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 3,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-1",
+    };
+    const prepared = try prepareTestStagingWithBinding(
+        alloc,
+        root,
+        "gen-materialized",
+        testIdentity(),
+        "catalog-before-runtime-writes",
+        binding,
+    );
+    defer alloc.free(prepared.root);
+    const target_root = try std.fs.path.join(alloc, &.{ root, "target-materialized" });
+    defer alloc.free(target_root);
+    const expected = seed_artifact.ExpectedArtifact{
+        .generation = "gen-materialized",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+        .binding = binding,
+        .capture_receipt_sha256 = &prepared.capture_receipt_sha256,
+    };
+
+    var activated = try activate(alloc, .{
+        .staging_root = prepared.root,
+        .target_root = target_root,
+        .expected = expected,
+        .binding = binding,
+        .pod_uid = "pod-materialize",
+    });
+    defer activated.deinit(alloc);
+
+    const raw_generation_path = try std.fs.path.join(alloc, &.{ target_root, generations_dir_name, "gen-materialized" });
+    defer alloc.free(raw_generation_path);
+    const expected_live_path = try std.fs.path.join(alloc, &.{ target_root, "live-generations", "gen-materialized" });
+    defer alloc.free(expected_live_path);
+    try std.testing.expectEqualStrings(expected_live_path, activated.generation_path);
+
+    const raw_catalog_path = try std.fs.path.join(alloc, &.{ raw_generation_path, "data/catalog.txt" });
+    defer alloc.free(raw_catalog_path);
+    const live_catalog_path = try std.fs.path.join(alloc, &.{ expected_live_path, "data/catalog.txt" });
+    defer alloc.free(live_catalog_path);
+    const raw_before = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 1024);
+    defer alloc.free(raw_before);
+    try std.testing.expectEqualStrings("catalog-before-runtime-writes", raw_before);
+
+    // Runtime-owned files must be allowed to evolve after ACTIVE publication.
+    // Restart validates the immutable receipt chain and installed identity,
+    // never by treating the mutable live tree as the raw transport artifact.
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, live_catalog_path, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "catalog-after-runtime-writes");
+        try file.sync(std.testing.io);
+    }
+    try std.testing.expectEqual(@as(u64, 11), try validateActivatedGeneration(alloc, .{
+        .target_root = target_root,
+        .expected = expected,
+        .binding = binding,
+    }));
+    const raw_after = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 1024);
+    defer alloc.free(raw_after);
+    try std.testing.expectEqualStrings("catalog-before-runtime-writes", raw_after);
+}
+
 test "storage.ha seed activation rejects unrelated nonempty targets without mutation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
