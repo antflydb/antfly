@@ -50,6 +50,7 @@ const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
 const ha_fencing_mod = @import("../ha/fencing.zig");
+const ha_mutation_barrier_mod = @import("../ha/mutation_barrier.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
 const ha_public_gate_state_mod = @import("../ha/public_gate_state.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
@@ -328,8 +329,15 @@ pub const OpenOptions = struct {
 
 pub const OpenMode = OpenOptions.OpenMode;
 
+pub const HAMutationBarrier = ha_mutation_barrier_mod.MutationBarrier;
+
 pub const HAAsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
+    /// Shared across every DB/catalog writer owned by one HA runtime. Mutations
+    /// hold a shared lease from before their first persistent side effect until
+    /// WAL publication and the sync durability decision finish. Seed capture
+    /// takes the exclusive lease before choosing its checkpoint.
+    mutation_barrier: ?*HAMutationBarrier = null,
     /// Serializes the final client-write gate check, HA WAL append, and sync
     /// acknowledgement with a node-local promotion fence. When configured,
     /// every acknowledged write is wholly before or wholly after the frozen

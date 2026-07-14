@@ -2101,6 +2101,9 @@ pub const DataServer = struct {
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
     ha_state_mutex: std.atomic.Mutex = .unlocked,
+    /// Global primary mutation/capture ordering point. All DB/catalog writers
+    /// share this instance through their HA mirror configuration.
+    ha_mutation_barrier: antfly.db.HAMutationBarrier = .{},
     ha_public_gate_state: antfly.ha.public_gate_state.State = .{},
     ha_admin_server: ?antfly.ha.http_admin.Server = null,
     ha_internal_server: ?antfly.ha.http_internal.Server = null,
@@ -2776,6 +2779,7 @@ pub const DataServer = struct {
     fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.ha.primary.Primary) antfly.db.HAAsyncEffectMirror {
         var mirror = antfly.db.HAAsyncEffectMirror{
             .primary = primary,
+            .mutation_barrier = &self.ha_mutation_barrier,
             .transition_mutex = &self.ha_state_mutex,
             .last_lsn = &self.ha_primary_mirror_last_lsn,
             .failure_count = &self.ha_primary_mirror_failure_count,
