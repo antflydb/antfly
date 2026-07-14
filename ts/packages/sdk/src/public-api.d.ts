@@ -2976,6 +2976,18 @@ export interface components {
             unit_count: number;
             /** @description Number of indexable chunks derived from the units. */
             chunk_count: number;
+            /** @description Number of pages for which OCR was attempted. */
+            ocr_attempted_count?: number;
+            /** @description Number of pages where OCR text was selected over embedded text. */
+            ocr_selected_count?: number;
+            /** @description Number of attempted pages where embedded text remained preferable. */
+            ocr_retained_embedded_count?: number;
+            /** @description Number of pages whose OCR rendering or recognition failed. */
+            ocr_failed_count?: number;
+            /** @description Up to 32 one-based page numbers with retryable OCR failures. */
+            ocr_failed_page_numbers?: number[];
+            /** @description Whether additional failed page numbers were omitted from the summary. */
+            ocr_failed_pages_truncated?: boolean;
             /** @description Parsed child range descriptors for this artifact generation. */
             child_ranges: components["schemas"]["DocumentArtifactChildRange"][];
             /** @description Number of storage child ranges used by this artifact. */
