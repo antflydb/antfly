@@ -286,7 +286,15 @@ pub fn validatePath(path: []const u8) !void {
     if (path.len == 0) return error.InvalidManifestPath;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidManifestPath;
     if (std.fs.path.isAbsolute(path)) return error.InvalidManifestPath;
-    if (std.mem.indexOf(u8, path, "..") != null) return error.InvalidManifestPath;
+    // Artifact manifests are portable and always use canonical POSIX-style
+    // relative paths. Reject ambiguous spellings rather than normalizing them:
+    // the exact bytes are bound into object keys and aggregate digests.
+    if (path[path.len - 1] == '/' or std.mem.indexOfScalar(u8, path, '\\') != null) return error.InvalidManifestPath;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, ".."))
+            return error.InvalidManifestPath;
+    }
 }
 
 fn findContent(contents: []const FileContent, path: []const u8) ?FileContent {

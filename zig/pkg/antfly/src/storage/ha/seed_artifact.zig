@@ -14,12 +14,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const fs_paths = @import("../../common/fs_paths.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const object_storage = @import("../object_storage.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
-pub const format_version: u16 = 1;
+pub const legacy_format_version: u16 = 1;
+pub const format_version: u16 = 2;
 pub const complete_name = "COMPLETE.json";
 pub const manifest_name = "manifest.afha";
 pub const receipt_name = ".antfly-ha-seed-receipt.json";
@@ -30,6 +32,9 @@ pub const Limits = struct {
     max_manifest_bytes: usize = 16 * 1024 * 1024,
     max_receipt_bytes: usize = 16 * 1024 * 1024,
     max_file_bytes: usize = 8 * 1024 * 1024 * 1024,
+    /// Maximum payload passed to any object-store put/get operation for file
+    /// data. Manifest and receipt objects have their own independent bounds.
+    max_chunk_bytes: usize = 8 * 1024 * 1024,
     max_total_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_files: usize = 1_000_000,
 };
@@ -104,6 +109,14 @@ pub const FileReceipt = struct {
     size_bytes: u64,
     crc32: u32,
     sha256: []const u8,
+    /// Absent only for legacy v1 generations, which stored one object per file.
+    chunks: ?[]const ChunkReceipt = null,
+};
+
+pub const ChunkReceipt = struct {
+    index: usize,
+    size_bytes: u64,
+    sha256: []const u8,
 };
 
 pub const Receipt = struct {
@@ -151,7 +164,8 @@ const StagingState = enum {
 };
 
 const PruneReceipt = struct {
-    format_version: u16 = format_version,
+    // This is an action-result schema, not an artifact transport schema.
+    format_version: u16 = legacy_format_version,
     slot_name: []const u8,
     current_generation: []const u8,
     retained_generations: usize,
@@ -173,6 +187,7 @@ const OwnedFileReceipt = struct {
     sha256: []u8,
     size_bytes: u64,
     crc32: u32,
+    chunks: []ChunkReceipt,
 
     fn view(self: OwnedFileReceipt) FileReceipt {
         return .{
@@ -180,21 +195,34 @@ const OwnedFileReceipt = struct {
             .size_bytes = self.size_bytes,
             .crc32 = self.crc32,
             .sha256 = self.sha256,
+            .chunks = self.chunks,
         };
     }
 
     fn deinit(self: *OwnedFileReceipt, alloc: Allocator) void {
         alloc.free(self.path);
         alloc.free(self.sha256);
+        for (self.chunks) |chunk| alloc.free(chunk.sha256);
+        alloc.free(self.chunks);
         self.* = undefined;
     }
 };
 
+const PublishOptions = struct {
+    fail_before_complete: bool = false,
+};
+
 pub fn publish(alloc: Allocator, store: Store, request: PublishRequest) !PublishResult {
+    return publishWithOptions(alloc, store, request, .{});
+}
+
+fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, options: PublishOptions) !PublishResult {
     try validateIdentifier(request.generation, error.InvalidSeedGeneration);
     try validateIdentifier(request.slot_name, error.InvalidSlotName);
     if (!validation.isNormalizedPath(request.content_root)) return error.InvalidContentRoot;
     if (request.manifest_bytes.len > request.limits.max_manifest_bytes) return error.ManifestTooLarge;
+    if (request.limits.max_chunk_bytes == 0 or request.limits.max_chunk_bytes > request.limits.max_file_bytes)
+        return error.InvalidArtifactChunkSize;
 
     const complete_key = try generationKeyAlloc(alloc, store.prefix, request.generation, complete_name);
     defer alloc.free(complete_key);
@@ -223,6 +251,11 @@ pub fn publish(alloc: Allocator, store: Store, request: PublishRequest) !Publish
     var manifest_digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(request.manifest_bytes, &manifest_digest, .{});
     aggregate.update(&manifest_digest);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const chunk_buffer = try alloc.alloc(u8, request.limits.max_chunk_bytes);
+    defer alloc.free(chunk_buffer);
 
     for (manifest.files, 0..) |file, idx| {
         if (file.size_bytes > request.limits.max_file_bytes) return error.ArtifactFileTooLarge;
@@ -231,24 +264,65 @@ pub fn publish(alloc: Allocator, store: Store, request: PublishRequest) !Publish
 
         const local_path = try std.fs.path.join(alloc, &.{ request.content_root, file.path });
         defer alloc.free(local_path);
-        const body = try readFileAlloc(alloc, local_path, request.limits.max_file_bytes);
-        defer alloc.free(body);
-        if (body.len != file.size_bytes) return error.ManifestFileSizeMismatch;
-        if (backup_manifest.crc32(body) != file.crc32) return error.ManifestFileChecksumMismatch;
+        const stat = try std.Io.Dir.cwd().statFile(io, local_path, .{ .follow_symlinks = false });
+        if (stat.kind != .file) return error.UnsupportedArtifactSource;
+        if (stat.size != file.size_bytes) return error.ManifestFileSizeMismatch;
+        var source = try std.Io.Dir.cwd().openFile(io, local_path, .{});
+        defer source.close(io);
+        var reader = source.reader(io, &.{});
+        var file_sha = Sha256.init(.{});
+        var file_crc = std.hash.Crc32.init();
+        var streamed_bytes: u64 = 0;
+        var chunk_receipts = std.ArrayListUnmanaged(ChunkReceipt).empty;
+        errdefer {
+            for (chunk_receipts.items) |chunk| alloc.free(chunk.sha256);
+            chunk_receipts.deinit(alloc);
+        }
+        while (true) {
+            const read = try readChunk(&reader.interface, chunk_buffer);
+            if (read == 0) break;
+            const body = chunk_buffer[0..read];
+            streamed_bytes = try std.math.add(u64, streamed_bytes, read);
+            if (streamed_bytes > file.size_bytes) return error.ManifestFileSizeMismatch;
+            file_sha.update(body);
+            file_crc.update(body);
 
+            var chunk_digest: [Sha256.digest_length]u8 = undefined;
+            Sha256.hash(body, &chunk_digest, .{});
+            const chunk_index = chunk_receipts.items.len;
+            const object_key = try generationChunkKeyAlloc(alloc, store.prefix, request.generation, idx, chunk_index);
+            defer alloc.free(object_key);
+            try putImmutable(alloc, store, object_key, body, "application/vnd.antfly.ha-chunk");
+            const chunk_hex = try hexAlloc(alloc, &chunk_digest);
+            errdefer alloc.free(chunk_hex);
+            try chunk_receipts.append(alloc, .{
+                .index = chunk_index,
+                .size_bytes = read,
+                .sha256 = chunk_hex,
+            });
+        }
+        if (streamed_bytes != file.size_bytes) return error.ManifestFileSizeMismatch;
+        if (file_crc.final() != file.crc32) return error.ManifestFileChecksumMismatch;
         var digest: [Sha256.digest_length]u8 = undefined;
-        Sha256.hash(body, &digest, .{});
+        file_sha.final(&digest);
         aggregateFile(&aggregate, file.path, file.size_bytes, &digest);
 
-        const object_key = try generationFileKeyAlloc(alloc, store.prefix, request.generation, file.path);
-        defer alloc.free(object_key);
-        try putImmutable(alloc, store, object_key, body, "application/octet-stream");
+        const chunks = try chunk_receipts.toOwnedSlice(alloc);
+        errdefer {
+            for (chunks) |chunk| alloc.free(chunk.sha256);
+            alloc.free(chunks);
+        }
 
+        const owned_path = try alloc.dupe(u8, file.path);
+        errdefer alloc.free(owned_path);
+        const owned_sha = try hexAlloc(alloc, &digest);
+        errdefer alloc.free(owned_sha);
         owned_files[idx] = .{
-            .path = try alloc.dupe(u8, file.path),
-            .sha256 = try hexAlloc(alloc, &digest),
+            .path = owned_path,
+            .sha256 = owned_sha,
             .size_bytes = file.size_bytes,
             .crc32 = file.crc32,
+            .chunks = chunks,
         };
         owned_count += 1;
     }
@@ -286,11 +360,23 @@ pub fn publish(alloc: Allocator, store: Store, request: PublishRequest) !Publish
         .files = file_views,
     }, .{});
     errdefer alloc.free(receipt_json);
+    if (receipt_json.len > request.limits.max_receipt_bytes) return error.ArtifactReceiptTooLarge;
 
     // This conditional write is the publication boundary. A partial upload has
     // no COMPLETE object and therefore can never be selected by a restore.
+    if (options.fail_before_complete) return error.InjectedArtifactFailure;
     try putImmutable(alloc, store, complete_key, receipt_json, "application/json");
     return .{ .receipt_json = receipt_json, .already_available = false };
+}
+
+fn readChunk(reader: *std.Io.Reader, buffer: []u8) !usize {
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const read = try reader.readSliceShort(buffer[used..]);
+        if (read == 0) break;
+        used += read;
+    }
+    return used;
 }
 
 pub fn restoreToStaging(alloc: Allocator, store: Store, request: RestoreRequest) !RestoreResult {
@@ -340,23 +426,13 @@ pub fn restoreToStaging(alloc: Allocator, store: Store, request: RestoreRequest)
 
     for (receipt.files, 0..) |file, idx| {
         const manifest_file = manifest.files[idx];
-        const object_key = try generationFileKeyAlloc(alloc, store.prefix, request.expected.generation, file.path);
-        defer alloc.free(object_key);
-        const body = try getRequiredObject(alloc, store, object_key, request.limits.max_file_bytes);
-        defer alloc.free(body);
-        if (body.len != file.size_bytes) return error.ArtifactFileSizeMismatch;
-        if (backup_manifest.crc32(body) != file.crc32) return error.ArtifactFileChecksumMismatch;
-        try expectSha256(body, file.sha256, error.ArtifactFileDigestMismatch);
         if (manifest_file.size_bytes != file.size_bytes or manifest_file.crc32 != file.crc32) return error.ManifestReceiptMismatch;
-
-        var digest: [Sha256.digest_length]u8 = undefined;
-        Sha256.hash(body, &digest, .{});
-        aggregateFile(&aggregate, file.path, file.size_bytes, &digest);
-        total_bytes = try std.math.add(u64, total_bytes, file.size_bytes);
 
         const destination = try std.fs.path.join(alloc, &.{ request.staging_root, file.path });
         defer alloc.free(destination);
-        try writeFileAtomically(alloc, destination, body);
+        const restored = try restoreArtifactFile(alloc, store, request.expected.generation, receipt.format_version, idx, file, destination, request.limits);
+        aggregateFile(&aggregate, file.path, restored.size_bytes, &restored.sha256);
+        total_bytes = try std.math.add(u64, total_bytes, restored.size_bytes);
     }
 
     if (total_bytes != receipt.total_bytes) return error.ArtifactTotalSizeMismatch;
@@ -394,18 +470,19 @@ pub fn verifyStaged(alloc: Allocator, staging_root: []const u8, expected: Expect
     const manifest_digest = try decodeHexDigest(parsed.value.manifest_sha256);
     aggregate.update(&manifest_digest);
     var total_bytes: u64 = 0;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
     for (parsed.value.files) |file| {
         const path = try std.fs.path.join(alloc, &.{ staging_root, file.path });
         defer alloc.free(path);
-        const body = try readFileAlloc(alloc, path, limits.max_file_bytes);
-        defer alloc.free(body);
-        if (body.len != file.size_bytes) return error.ArtifactFileSizeMismatch;
-        if (backup_manifest.crc32(body) != file.crc32) return error.ArtifactFileChecksumMismatch;
-        try expectSha256(body, file.sha256, error.ArtifactFileDigestMismatch);
-        var digest: [Sha256.digest_length]u8 = undefined;
-        Sha256.hash(body, &digest, .{});
-        aggregateFile(&aggregate, file.path, file.size_bytes, &digest);
-        total_bytes = try std.math.add(u64, total_bytes, file.size_bytes);
+        const checked = try checksumLocalFile(io_impl.io(), path, limits.max_file_bytes);
+        if (checked.size_bytes != file.size_bytes) return error.ArtifactFileSizeMismatch;
+        if (checked.crc32 != file.crc32) return error.ArtifactFileChecksumMismatch;
+        var digest_hex: [Sha256.digest_length * 2]u8 = undefined;
+        encodeHex(&digest_hex, &checked.sha256);
+        if (!std.mem.eql(u8, &digest_hex, file.sha256)) return error.ArtifactFileDigestMismatch;
+        aggregateFile(&aggregate, file.path, checked.size_bytes, &checked.sha256);
+        total_bytes = try std.math.add(u64, total_bytes, checked.size_bytes);
     }
     if (total_bytes != parsed.value.total_bytes) return error.ArtifactTotalSizeMismatch;
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -558,7 +635,10 @@ fn readOptionalLocalFileAlloc(alloc: Allocator, path: []const u8, max_bytes: usi
 }
 
 fn validateReceipt(receipt: Receipt, expected: ExpectedArtifact, limits: Limits) !void {
-    if (receipt.format_version != format_version) return error.UnsupportedArtifactVersion;
+    if (receipt.format_version != legacy_format_version and receipt.format_version != format_version)
+        return error.UnsupportedArtifactVersion;
+    if (limits.max_chunk_bytes == 0 or limits.max_chunk_bytes > limits.max_file_bytes)
+        return error.InvalidArtifactChunkSize;
     if (!std.mem.eql(u8, receipt.generation, expected.generation)) return error.WrongArtifactGeneration;
     if (!std.mem.eql(u8, receipt.slot_name, expected.slot_name)) return error.WrongArtifactSlot;
     try expectIdentity(expected.identity, receipt.identity());
@@ -575,6 +655,22 @@ fn validateReceipt(receipt: Receipt, expected: ExpectedArtifact, limits: Limits)
         if (file.size_bytes > limits.max_file_bytes) return error.ArtifactFileTooLarge;
         if (file.sha256.len != Sha256.digest_length * 2) return error.InvalidArtifactDigest;
         total = try std.math.add(u64, total, file.size_bytes);
+        switch (receipt.format_version) {
+            legacy_format_version => if (file.chunks != null) return error.InvalidArtifactChunks,
+            format_version => {
+                const chunks = file.chunks orelse return error.InvalidArtifactChunks;
+                var chunk_total: u64 = 0;
+                for (chunks, 0..) |chunk, chunk_index| {
+                    if (chunk.index != chunk_index or chunk.size_bytes == 0 or
+                        chunk.size_bytes > limits.max_chunk_bytes or
+                        chunk.sha256.len != Sha256.digest_length * 2)
+                        return error.InvalidArtifactChunks;
+                    chunk_total = try std.math.add(u64, chunk_total, chunk.size_bytes);
+                }
+                if (chunk_total != file.size_bytes) return error.InvalidArtifactChunks;
+            },
+            else => unreachable,
+        }
         for (receipt.files[0..idx]) |previous| {
             if (std.mem.eql(u8, previous.path, file.path)) return error.DuplicateArtifactPath;
         }
@@ -595,7 +691,8 @@ fn validateManifestAgainstReceipt(manifest: backup_manifest.ManifestView, receip
 fn validateExistingReceipt(alloc: Allocator, raw: []const u8, generation: []const u8, slot_name: []const u8, manifest_bytes: []const u8) !void {
     var parsed = std.json.parseFromSlice(Receipt, alloc, raw, .{}) catch return error.GenerationConflict;
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.generation, generation) or !std.mem.eql(u8, parsed.value.slot_name, slot_name)) return error.GenerationConflict;
+    if ((parsed.value.format_version != legacy_format_version and parsed.value.format_version != format_version) or
+        !std.mem.eql(u8, parsed.value.generation, generation) or !std.mem.eql(u8, parsed.value.slot_name, slot_name)) return error.GenerationConflict;
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(manifest_bytes, &digest, .{});
     const hex = try hexAlloc(alloc, &digest);
@@ -685,6 +782,18 @@ fn generationFileKeyAlloc(alloc: Allocator, prefix: []const u8, generation: []co
     return try generationKeyAlloc(alloc, prefix, generation, suffix);
 }
 
+fn generationChunkKeyAlloc(
+    alloc: Allocator,
+    prefix: []const u8,
+    generation: []const u8,
+    file_index: usize,
+    chunk_index: usize,
+) ![]u8 {
+    const suffix = try std.fmt.allocPrint(alloc, "chunks/{d:0>8}/{d:0>8}", .{ file_index, chunk_index });
+    defer alloc.free(suffix);
+    return try generationKeyAlloc(alloc, prefix, generation, suffix);
+}
+
 fn putImmutable(alloc: Allocator, store: Store, key: []const u8, body: []const u8, content_type: []const u8) !void {
     var result = store.client.putObject(store.bucket, key, body, .{
         .content_type = content_type,
@@ -702,11 +811,14 @@ fn putImmutable(alloc: Allocator, store: Store, key: []const u8, body: []const u
 }
 
 fn getOptionalObject(alloc: Allocator, store: Store, key: []const u8, max_bytes: usize) ![]u8 {
-    var result = store.client.getObject(store.bucket, key, .{}) catch |err| switch (err) {
+    const probe_len = std.math.add(usize, max_bytes, 1) catch return error.ArtifactObjectTooLarge;
+    var result = store.client.getObject(store.bucket, key, .{
+        .range = .{ .offset = 0, .length = @intCast(probe_len) },
+    }) catch |err| switch (err) {
         error.NoSuchKey, error.ObjectNotFound, error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
-    defer result.deinit(alloc);
+    defer result.deinit(store.client.allocator);
     if (result.body.len > max_bytes) return error.ArtifactObjectTooLarge;
     return try alloc.dupe(u8, result.body);
 }
@@ -714,6 +826,145 @@ fn getOptionalObject(alloc: Allocator, store: Store, key: []const u8, max_bytes:
 fn getRequiredObject(alloc: Allocator, store: Store, key: []const u8, max_bytes: usize) ![]u8 {
     return getOptionalObject(alloc, store, key, max_bytes) catch |err| switch (err) {
         error.FileNotFound => error.IncompleteSeedArtifact,
+        else => err,
+    };
+}
+
+const RestoredFile = struct {
+    size_bytes: u64,
+    crc32: u32,
+    sha256: [Sha256.digest_length]u8,
+};
+
+fn checksumLocalFile(io: std.Io, path: []const u8, max_bytes: usize) !RestoredFile {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.UnsupportedArtifactSource;
+    if (stat.size > max_bytes) return error.ArtifactFileTooLarge;
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var sha = Sha256.init(.{});
+    var crc = std.hash.Crc32.init();
+    var size: u64 = 0;
+    while (true) {
+        const read = try reader.interface.readSliceShort(&buffer);
+        if (read == 0) break;
+        size = try std.math.add(u64, size, read);
+        if (size > max_bytes) return error.ArtifactFileTooLarge;
+        sha.update(buffer[0..read]);
+        crc.update(buffer[0..read]);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    sha.final(&digest);
+    return .{ .size_bytes = size, .crc32 = crc.final(), .sha256 = digest };
+}
+
+fn restoreArtifactFile(
+    alloc: Allocator,
+    store: Store,
+    generation: []const u8,
+    receipt_version: u16,
+    file_index: usize,
+    receipt: FileReceipt,
+    destination: []const u8,
+    limits: Limits,
+) !RestoredFile {
+    const parent = std.fs.path.dirname(destination) orelse return error.InvalidArtifactPath;
+    const temp = try std.fmt.allocPrint(alloc, "{s}.tmp", .{destination});
+    defer alloc.free(temp);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+    errdefer std.Io.Dir.cwd().deleteFile(io, temp) catch {};
+
+    var sha = Sha256.init(.{});
+    var crc = std.hash.Crc32.init();
+    var written: u64 = 0;
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, temp, .{ .truncate = true });
+        defer file.close(io);
+        var write_buffer: [64 * 1024]u8 = undefined;
+        var writer = file.writer(io, &write_buffer);
+
+        switch (receipt_version) {
+            legacy_format_version => {
+                const object_key = try generationFileKeyAlloc(alloc, store.prefix, generation, receipt.path);
+                defer alloc.free(object_key);
+                if (receipt.size_bytes == 0) {
+                    var metadata = store.client.statObject(store.bucket, object_key) catch |err| switch (err) {
+                        error.NoSuchKey, error.ObjectNotFound, error.FileNotFound => return error.IncompleteSeedArtifact,
+                        else => return err,
+                    };
+                    defer metadata.deinit(store.client.allocator);
+                    if (metadata.content_length != 0) return error.ArtifactFileSizeMismatch;
+                } else {
+                    while (written < receipt.size_bytes) {
+                        const remaining = receipt.size_bytes - written;
+                        const requested: usize = @intCast(@min(remaining, limits.max_chunk_bytes));
+                        var object = try getRequiredObjectResult(store, object_key, .{
+                            .range = .{ .offset = written, .length = @intCast(requested) },
+                        });
+                        defer object.deinit(store.client.allocator);
+                        if (object.body.len != requested) return error.ArtifactFileSizeMismatch;
+                        try appendRestoredBytes(&writer.interface, &sha, &crc, &written, object.body, receipt.size_bytes);
+                    }
+                }
+            },
+            format_version => {
+                const chunks = receipt.chunks orelse return error.InvalidArtifactChunks;
+                for (chunks, 0..) |chunk, index| {
+                    if (chunk.index != index) return error.InvalidArtifactChunks;
+                    const object_key = try generationChunkKeyAlloc(alloc, store.prefix, generation, file_index, index);
+                    defer alloc.free(object_key);
+                    const probe_len = std.math.add(u64, chunk.size_bytes, 1) catch return error.ArtifactChunkSizeMismatch;
+                    var object = try getRequiredObjectResult(store, object_key, .{
+                        .range = .{ .offset = 0, .length = probe_len },
+                    });
+                    defer object.deinit(store.client.allocator);
+                    if (object.body.len != chunk.size_bytes or object.body.len > limits.max_chunk_bytes)
+                        return error.ArtifactChunkSizeMismatch;
+                    try expectSha256(object.body, chunk.sha256, error.ArtifactChunkDigestMismatch);
+                    try appendRestoredBytes(&writer.interface, &sha, &crc, &written, object.body, receipt.size_bytes);
+                }
+            },
+            else => return error.UnsupportedArtifactVersion,
+        }
+
+        if (written != receipt.size_bytes) return error.ArtifactFileSizeMismatch;
+        if (crc.final() != receipt.crc32) return error.ArtifactFileChecksumMismatch;
+        try writer.end();
+        try file.sync(io);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    sha.final(&digest);
+    var digest_hex: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&digest_hex, &digest);
+    if (!std.mem.eql(u8, &digest_hex, receipt.sha256)) return error.ArtifactFileDigestMismatch;
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), temp, std.Io.Dir.cwd(), destination, io);
+    try fs_paths.syncDirPortable(io, parent);
+    return .{ .size_bytes = written, .crc32 = receipt.crc32, .sha256 = digest };
+}
+
+fn appendRestoredBytes(
+    writer: *std.Io.Writer,
+    sha: *Sha256,
+    crc: *std.hash.Crc32,
+    written: *u64,
+    body: []const u8,
+    expected_size: u64,
+) !void {
+    written.* = try std.math.add(u64, written.*, body.len);
+    if (written.* > expected_size) return error.ArtifactFileSizeMismatch;
+    sha.update(body);
+    crc.update(body);
+    try writer.writeAll(body);
+}
+
+fn getRequiredObjectResult(store: Store, key: []const u8, options: object_storage.GetOptions) !object_storage.GetResult {
+    return store.client.getObject(store.bucket, key, options) catch |err| switch (err) {
+        error.NoSuchKey, error.ObjectNotFound, error.FileNotFound => error.IncompleteSeedArtifact,
         else => err,
     };
 }
@@ -739,8 +990,10 @@ fn writeFileAtomically(alloc: Allocator, path: []const u8, body: []const u8) !vo
         var writer = file.writer(io, &buffer);
         try writer.interface.writeAll(body);
         try writer.end();
+        try file.sync(io);
     }
     try std.Io.Dir.rename(std.Io.Dir.cwd(), temp, std.Io.Dir.cwd(), path, io);
+    try fs_paths.syncDirPortable(io, parent);
 }
 
 fn expectSha256(body: []const u8, expected_hex: []const u8, err: anyerror) !void {
