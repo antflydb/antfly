@@ -75,6 +75,16 @@ pub const ActivationResult = struct {
     }
 };
 
+pub const ActivatedGenerationGCRequest = struct {
+    target_root: []const u8,
+    /// Durable controller-owned copy of HASeededSlotActivateResponse.
+    slot_activation_receipt_path: []const u8,
+    protected_generations: []const []const u8 = &.{},
+    retain_generations: usize = 2,
+    limits: seed_artifact.Limits = .{},
+    max_local_generations: usize = 10_000,
+};
+
 pub const ActivationReceipt = struct {
     format_version: u16 = format_version,
     generation: []const u8,
@@ -120,6 +130,144 @@ const ActivateOptions = struct {
 
 pub fn activate(alloc: Allocator, request: ActivateRequest) !ActivationResult {
     return activateWithOptions(alloc, request, .{});
+}
+
+const SeededSlotActivationAction = struct {
+    action_id: []const u8,
+    action_kind: []const u8,
+    target: []const u8,
+    state: []const u8,
+    node_id: []const u8,
+};
+
+const SeededSlotActivationCheckpoint = struct {
+    schema_version: i64,
+    action: SeededSlotActivationAction,
+    slot_name: []const u8,
+    generation: []const u8,
+    manifest_id: []const u8,
+    timeline_id: i64,
+    checkpoint_lsn: i64,
+    seed_receipt_sha256: []const u8,
+    manifest_sha256: []const u8,
+    aggregate_sha256: []const u8,
+};
+
+/// Grants target-volume deletion authority only after the runtime's immutable
+/// ACTIVE evidence and the primary's durable seeded-slot activation response
+/// are both present and agree field-for-field.
+pub fn pruneActivatedGenerations(
+    alloc: Allocator,
+    request: ActivatedGenerationGCRequest,
+) !local_generation_gc.PruneResult {
+    if (!validAbsoluteRoot(request.target_root)) return error.InvalidActivationTarget;
+    if (!validation.isAbsoluteNormalizedPath(request.slot_activation_receipt_path))
+        return error.InvalidSeedActivationCheckpointPath;
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const checkpoint_stat = std.Io.Dir.cwd().statFile(io, request.slot_activation_receipt_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.SeedActivationCheckpointMissing,
+        else => return err,
+    };
+    if (checkpoint_stat.kind != .file or checkpoint_stat.size > request.limits.max_receipt_bytes)
+        return error.InvalidSeedActivationCheckpoint;
+    const checkpoint_json = readFileAlloc(io, alloc, request.slot_activation_receipt_path, request.limits.max_receipt_bytes) catch
+        return error.InvalidSeedActivationCheckpoint;
+    defer alloc.free(checkpoint_json);
+    var checkpoint = std.json.parseFromSlice(SeededSlotActivationCheckpoint, alloc, checkpoint_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidSeedActivationCheckpoint;
+    defer checkpoint.deinit();
+
+    const active_path = try std.fs.path.join(alloc, &.{ request.target_root, active_receipt_name });
+    defer alloc.free(active_path);
+    const active_json = readFileAlloc(io, alloc, active_path, request.limits.max_receipt_bytes) catch |err| switch (err) {
+        error.FileNotFound => return error.ActiveReceiptMissing,
+        else => return err,
+    };
+    defer alloc.free(active_json);
+    var active = std.json.parseFromSlice(ActivationReceipt, alloc, active_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidActiveReceipt;
+    defer active.deinit();
+    try validateActiveForGC(alloc, active.value);
+    try validateActivationCheckpoint(alloc, checkpoint.value, active.value);
+
+    const generation_path = try std.fs.path.join(alloc, &.{ request.target_root, active.value.generation_path });
+    defer alloc.free(generation_path);
+    try validatePublishedGeneration(alloc, generation_path, .{
+        .staging_root = "/unused",
+        .target_root = request.target_root,
+        .expected = .{
+            .generation = active.value.generation,
+            .slot_name = active.value.slot_name,
+            .identity = active.value.identity(),
+            .minimum_checkpoint_lsn = active.value.checkpoint_lsn,
+        },
+        .limits = request.limits,
+    }, active_json);
+
+    try local_generation_gc.markEligible(alloc, .{
+        .root = request.target_root,
+        .scope = .target_activation,
+        .generation = active.value.generation,
+        .slot_name = active.value.slot_name,
+        .checkpoint_lsn = active.value.checkpoint_lsn,
+        .checkpoint_bytes = checkpoint_json,
+        .max_checkpoint_bytes = request.limits.max_receipt_bytes,
+    });
+    return try local_generation_gc.prune(alloc, .{
+        .root = request.target_root,
+        .scope = .target_activation,
+        .slot_name = active.value.slot_name,
+        .current_generation = active.value.generation,
+        .protected_generations = request.protected_generations,
+        .retain_generations = request.retain_generations,
+        .max_entries = request.max_local_generations,
+    });
+}
+
+fn validateActiveForGC(alloc: Allocator, receipt: ActivationReceipt) !void {
+    if (receipt.format_version != format_version or
+        !validation.isIdentifier(receipt.generation) or
+        !validation.isIdentifier(receipt.slot_name) or
+        receipt.manifest_id.len == 0 or
+        receipt.backup_lsn == 0 or
+        receipt.checkpoint_lsn < receipt.backup_lsn or
+        receipt.seed_receipt_sha256.len != Sha256.digest_length * 2 or
+        receipt.manifest_sha256.len != Sha256.digest_length * 2 or
+        receipt.aggregate_sha256.len != Sha256.digest_length * 2)
+        return error.InvalidActiveReceipt;
+    try standby_mod.validateIdentity(receipt.identity());
+    const expected_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ generations_dir_name, receipt.generation });
+    defer alloc.free(expected_path);
+    if (!std.mem.eql(u8, receipt.generation_path, expected_path)) return error.InvalidActiveReceipt;
+}
+
+fn validateActivationCheckpoint(
+    alloc: Allocator,
+    checkpoint: SeededSlotActivationCheckpoint,
+    active: ActivationReceipt,
+) !void {
+    const expected_action_id = try std.fmt.allocPrint(alloc, "seeded_slot_activate:{s}", .{active.generation});
+    defer alloc.free(expected_action_id);
+    const state_valid = std.mem.eql(u8, checkpoint.action.state, "applied") or
+        std.mem.eql(u8, checkpoint.action.state, "already_applied");
+    if (checkpoint.schema_version != 1 or
+        !std.mem.eql(u8, checkpoint.action.action_id, expected_action_id) or
+        !std.mem.eql(u8, checkpoint.action.action_kind, "seeded_slot_activate") or
+        !std.mem.eql(u8, checkpoint.action.target, active.generation) or
+        !validation.isIdentifier(checkpoint.action.node_id) or
+        !state_valid or
+        !std.mem.eql(u8, checkpoint.slot_name, active.slot_name) or
+        !std.mem.eql(u8, checkpoint.generation, active.generation) or
+        !std.mem.eql(u8, checkpoint.manifest_id, active.manifest_id) or
+        checkpoint.timeline_id <= 0 or @as(u64, @intCast(checkpoint.timeline_id)) != active.timeline_id or
+        checkpoint.checkpoint_lsn <= 0 or @as(u64, @intCast(checkpoint.checkpoint_lsn)) != active.checkpoint_lsn or
+        !std.mem.eql(u8, checkpoint.seed_receipt_sha256, active.seed_receipt_sha256) or
+        !std.mem.eql(u8, checkpoint.manifest_sha256, active.manifest_sha256) or
+        !std.mem.eql(u8, checkpoint.aggregate_sha256, active.aggregate_sha256))
+        return error.SeedActivationCheckpointMismatch;
 }
 
 fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: ActivateOptions) !ActivationResult {

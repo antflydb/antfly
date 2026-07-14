@@ -105,6 +105,17 @@ pub const CaptureResult = struct {
     }
 };
 
+pub const PublishedGenerationGCRequest = struct {
+    store: seed_artifact.Store,
+    capture_root: []const u8,
+    generation: []const u8,
+    slot_name: []const u8,
+    protected_generations: []const []const u8 = &.{},
+    retain_generations: usize = 2,
+    artifact_limits: seed_artifact.Limits = .{},
+    max_local_generations: usize = 10_000,
+};
+
 const PreparedReceipt = struct {
     format_version: u16 = format_version,
     generation: []const u8,
@@ -204,6 +215,115 @@ const CaptureOptions = struct {
 
 pub fn capture(alloc: Allocator, request: CaptureRequest) !CaptureResult {
     return captureWithOptions(alloc, request, .{});
+}
+
+/// Verifies the complete remote v2 artifact against the immutable local
+/// capture receipt before granting local deletion authority. The source PVC
+/// must be mounted read-write for this distinct post-publish action.
+pub fn prunePublishedGenerations(
+    alloc: Allocator,
+    request: PublishedGenerationGCRequest,
+) !local_generation_gc.PruneResult {
+    if (!validAbsoluteRoot(request.capture_root) or std.mem.eql(u8, request.capture_root, "/"))
+        return error.InvalidCaptureRoot;
+    if (!validation.isIdentifier(request.generation)) return error.InvalidCaptureGeneration;
+    if (!validation.isIdentifier(request.slot_name)) return error.InvalidSlotName;
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const generation_root = try std.fs.path.join(alloc, &.{ request.capture_root, generations_dir_name, request.generation });
+    defer alloc.free(generation_root);
+    const complete_path = try std.fs.path.join(alloc, &.{ generation_root, complete_name });
+    defer alloc.free(complete_path);
+    const local_json = readFileAlloc(io, alloc, complete_path, request.artifact_limits.max_receipt_bytes) catch |err| switch (err) {
+        error.FileNotFound => return error.CaptureCompletionMissing,
+        else => return err,
+    };
+    defer alloc.free(local_json);
+    var local = std.json.parseFromSlice(CaptureReceipt, alloc, local_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidCaptureReceipt;
+    defer local.deinit();
+    try validatePublishedGCReceipt(local.value, request);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ generation_root, manifest_name });
+    defer alloc.free(manifest_path);
+    const manifest_bytes = try readFileAlloc(io, alloc, manifest_path, request.artifact_limits.max_manifest_bytes);
+    defer alloc.free(manifest_bytes);
+    try expectSha256(manifest_bytes, local.value.manifest_sha256, error.CaptureManifestDigestMismatch);
+    const manifest = try backup_manifest.decodeAlloc(alloc, manifest_bytes);
+    defer backup_manifest.freeDecoded(alloc, manifest);
+    try validatePublishedGCManifest(manifest, local.value);
+
+    var verified = try seed_artifact.verifyRemote(alloc, request.store, .{
+        .generation = request.generation,
+        .slot_name = request.slot_name,
+        .identity = local.value.identity(),
+        .minimum_checkpoint_lsn = local.value.checkpoint_lsn,
+    }, request.artifact_limits);
+    defer verified.deinit(alloc);
+    var remote = std.json.parseFromSlice(seed_artifact.Receipt, alloc, verified.receipt_json, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidArtifactReceipt;
+    defer remote.deinit();
+    try validateRemoteAgainstCapture(remote.value, local.value);
+
+    try local_generation_gc.markEligible(alloc, .{
+        .root = request.capture_root,
+        .scope = .source_capture,
+        .generation = request.generation,
+        .slot_name = request.slot_name,
+        .checkpoint_lsn = remote.value.checkpoint_lsn,
+        .checkpoint_bytes = verified.receipt_json,
+        .max_checkpoint_bytes = request.artifact_limits.max_receipt_bytes,
+    });
+    return try local_generation_gc.prune(alloc, .{
+        .root = request.capture_root,
+        .scope = .source_capture,
+        .slot_name = request.slot_name,
+        .current_generation = request.generation,
+        .protected_generations = request.protected_generations,
+        .retain_generations = request.retain_generations,
+        .max_entries = request.max_local_generations,
+    });
+}
+
+fn validatePublishedGCReceipt(receipt: CaptureReceipt, request: PublishedGenerationGCRequest) !void {
+    if (receipt.format_version != format_version or
+        !std.mem.eql(u8, receipt.generation, request.generation) or
+        !std.mem.eql(u8, receipt.slot_name, request.slot_name) or
+        !std.mem.eql(u8, receipt.manifest_id, request.generation)) return error.CaptureStateConflict;
+    if (receipt.backup_lsn == 0 or receipt.checkpoint_lsn != receipt.backup_lsn or receipt.end_record_lsn <= receipt.checkpoint_lsn)
+        return error.CaptureCheckpointMismatch;
+    if (receipt.file_count == 0 or receipt.file_count > request.artifact_limits.max_files or
+        receipt.total_bytes > request.artifact_limits.max_total_bytes or
+        receipt.manifest_sha256.len != Sha256.digest_length * 2 or
+        receipt.source_plan_sha256.len != Sha256.digest_length * 2)
+        return error.InvalidCaptureReceipt;
+    try standby_mod.validateIdentity(receipt.identity());
+}
+
+fn validatePublishedGCManifest(manifest: backup_manifest.ManifestView, receipt: CaptureReceipt) !void {
+    try expectIdentity(receipt.identity(), manifest.identity, error.CaptureIdentityMismatch);
+    if (!std.mem.eql(u8, manifest.manifest_id, receipt.manifest_id) or
+        manifest.backup_lsn != receipt.backup_lsn or
+        manifest.checkpoint_lsn != receipt.checkpoint_lsn or
+        manifest.files.len != receipt.file_count) return error.CaptureManifestMismatch;
+    var total_bytes: u64 = 0;
+    for (manifest.files) |file| total_bytes = try std.math.add(u64, total_bytes, file.size_bytes);
+    if (total_bytes != receipt.total_bytes) return error.CaptureManifestMismatch;
+}
+
+fn validateRemoteAgainstCapture(remote: seed_artifact.Receipt, local: CaptureReceipt) !void {
+    if (remote.format_version != seed_artifact.format_version) return error.LocalGCRequiresArtifactV2;
+    if (!std.mem.eql(u8, remote.generation, local.generation) or
+        !std.mem.eql(u8, remote.slot_name, local.slot_name) or
+        !std.mem.eql(u8, remote.manifest_id, local.manifest_id) or
+        remote.backup_lsn != local.backup_lsn or
+        remote.checkpoint_lsn != local.checkpoint_lsn or
+        !std.mem.eql(u8, remote.manifest_sha256, local.manifest_sha256) or
+        remote.files.len != local.file_count or
+        remote.total_bytes != local.total_bytes) return error.ArtifactCaptureMismatch;
+    try expectIdentity(local.identity(), remote.identity(), error.ArtifactCaptureMismatch);
 }
 
 /// Capture while the caller already owns the exclusive mutation lease.
