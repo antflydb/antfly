@@ -72,6 +72,7 @@ const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
+const portable_backup = @import("../portable_backup.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
@@ -62903,6 +62904,142 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         defer restored.close();
 
         try std.testing.expect(try restored.repairRestoreRuntimeStateIfNeeded(alloc));
+
+        const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+        defer alloc.free(query_vec);
+        var after = try waitForSearchResult(alloc, &restored, .{
+            .index_name = "dv_v1",
+            .dense = .{ .vector = query_vec, .k = 3 },
+            .return_mode = .parent,
+        }, 1);
+        defer after.deinit();
+        try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+    }
+
+    const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, std.mem.span(restore_path));
+    defer alloc.free(repair_marker_path);
+    try std.Io.Dir.cwd().access(std.testing.io, repair_marker_path, .{});
+}
+
+test "db restore repair does not complete before regenerated chunk embeddings are query visible" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        try portable_backup.exportPortable(alloc, db.core.store, &portable);
+    }
+
+    // Portable import starts with an empty runtime-index directory and restores
+    // only portable logical state. Remove imported embedding artifacts while
+    // retaining chunks to reproduce the CI snapshot precisely.
+    {
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer restored.close();
+        try portable_backup.importPortable(alloc, restored.core.store, portable.items);
+
+        const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+        defer alloc.free(chunk_prefix);
+        const chunk_records = try restored.core.store.scanPrefix(alloc, chunk_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
+        try std.testing.expect(chunk_records.len > 0);
+        for (chunk_records) |chunk| {
+            const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk.key, "dv_v1");
+            defer alloc.free(embedding_key);
+            try restored.core.store.delete(embedding_key);
+        }
+
+        // A restored source checkpoint can equal the destination's first
+        // regenerated replay sequence even though the destination runtime
+        // index is empty. Repair must reset this projection boundary or the
+        // enrichment worker will skip sequence 1 as already applied.
+        try enrichment_state.saveProjectionCheckpoint(
+            restored.core.store,
+            enrichment_runtime_mod.scope_name,
+            .{ .applied_sequence = 1 },
+        );
+    }
+
+    try DB.markRestorePrimaryRestoredForPath(
+        alloc,
+        std.mem.span(restore_path),
+        "snap1",
+        "file:///tmp/backups",
+        "snapshots/snap1",
+        7001,
+    );
+    try DB.markRestoreRuntimeRepairNeeded(alloc, std.mem.span(restore_path));
+    try std.testing.expect(try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path)));
+
+    // Keep every repair phase isolated in writer-no-replay mode so background
+    // workers cannot accidentally make the assertion pass.
+    while (try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path))) {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer restored.close();
+
+        try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    }
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer restored.close();
 
         const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
         defer alloc.free(query_vec);

@@ -105,11 +105,17 @@ const TestStartupCatchUpReplayPassHook = struct {
     run: *const fn (ptr: *anyopaque, db: *db_mod.DB) anyerror!void,
 };
 
+const TestRestoreRepairStepHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque) anyerror!void,
+};
+
 var test_before_batch_execution_hook: ?TestExecutionHook = null;
 var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
 var test_before_restore_repair_retry_sleep_hook: ?TestExecutionHook = null;
+var test_before_restore_repair_step_hook: ?TestRestoreRepairStepHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
@@ -190,6 +196,12 @@ fn runTestBeforeRestoreWorkHook() void {
 fn runTestBeforeRestoreRepairRetrySleepHook() void {
     if (comptime builtin.is_test) {
         if (test_before_restore_repair_retry_sleep_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforeRestoreRepairStepHook() !void {
+    if (comptime builtin.is_test) {
+        if (test_before_restore_repair_step_hook) |hook| try hook.run(hook.ptr);
     }
 }
 
@@ -7424,6 +7436,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
             defer db.close();
 
+            try runTestBeforeRestoreRepairStepHook();
             if (try db.repairRestoreRuntimeStateStepIfNeeded(self.alloc)) {
                 db.clearDenseHbcCaches();
             }
@@ -16472,6 +16485,99 @@ test "provisioned restore repair source deinit cancels sleeping retry worker" {
     try std.testing.expect(deinit_elapsed_ns < 75 * std.time.ns_per_ms);
 }
 
+test "provisioned restore repair worker retries transient step failures to completion" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(cwd);
+    const path = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/provisioned-restore-transient-retry", .{ cwd, tmp.sub_path });
+    defer alloc.free(path);
+
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    _ = try source.source().createTable(alloc, "docs", .{});
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+    source.invalidateWriteCacheForTable("docs");
+    source.clearDirtyWriteTable("docs");
+
+    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, db_path, "snap1", "local", "snap1/groups/7001", 7001);
+    try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path));
+
+    const HookCtx = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.calls.fetchAdd(1, .acq_rel) == 0) return error.ReplayDocumentNotVisible;
+        }
+    };
+    var hook_ctx = HookCtx{};
+    test_before_restore_repair_step_hook = .{ .ptr = &hook_ctx, .run = HookCtx.run };
+    defer test_before_restore_repair_step_hook = null;
+
+    source.requestRestoreRepairCatchUp("docs", 7001);
+    source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
+    source.restore_repair_completion_group.await(source.table_activity_threaded.io()) catch {};
+
+    try std.testing.expect(hook_ctx.calls.load(.acquire) >= 2);
+    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
+}
+
 test "provisioned table write source backs up a portable local table" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-table-portable-backup";
@@ -22304,18 +22410,39 @@ test "provisioned table write source restore repair completion retires cached ve
         }
     };
     var hook = Hook{};
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
     defer source.deinit();
     source.read_cache = &read_cache;
+    source.runtime_status_cache = &snapshot_cache;
     source.setLocalChangeHook(.{
         .ptr = &hook,
         .on_change = Hook.onChange,
     });
 
+    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", .{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+            .updated_at_ns = 1,
+        },
+        .stats = .{ .doc_count = 99 },
+    });
+    {
+        var cached = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer cached.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 99), cached.items[0].stats.doc_count);
+    }
+
     source.enqueueRestoreRepairComplete("docs");
     source.restore_repair_completion_group.await(source.table_activity_threaded.io()) catch {};
 
     try std.testing.expectEqual(@as(u64, 0), hbc_cache.global_stats.total_bytes);
+    var cached_after_completion = try snapshot_cache.snapshot(alloc, "docs");
+    defer if (cached_after_completion) |*cached| cached.deinit(alloc);
+    try std.testing.expect(cached_after_completion == null);
     try std.testing.expectEqual(@as(usize, 1), hook.calls);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
 

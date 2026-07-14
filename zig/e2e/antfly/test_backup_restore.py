@@ -543,7 +543,7 @@ def test_table_backup_restore_round_trip(backup_api):
         )
 
 
-def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, openai_embedder):
+def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, slow_openai_embedder):
     table_name = f"backup_chunked_semantic_{time.time_ns()}"
     backup_id = f"backup-chunked-semantic-{time.time_ns()}"
 
@@ -562,7 +562,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
                 "embedder": {
                     "provider": "openai",
                     "model": "text-embedding-3-small",
-                    "url": openai_embedder,
+                    "url": slow_openai_embedder,
                 },
                 "chunker": {
                     "provider": "antfly",
@@ -669,8 +669,10 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
                     "fields": ["title", "_chunks", "_embeddings"],
                 },
             )
+            server_logs = backup_api.debug_logs()
             raise AssertionError(
-                f"semantic restore query did not recover; status={after_status}, scan={after_scan}, query={after_query}"
+                "semantic restore query did not recover; "
+                f"status={after_status}, scan={after_scan}, query={after_query}, logs={server_logs}"
             )
         assert semantic_after
 

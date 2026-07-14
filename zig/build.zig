@@ -4206,6 +4206,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned table restore retry skips exact incomplete restore state with active writer",
             "provisioned restore repair source deinit cancels sleeping retry worker",
+            "provisioned restore repair worker retries transient step failures to completion",
+            "provisioned table write source restore repair completion retires cached vector read state",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned create index updates cached writer in place",
