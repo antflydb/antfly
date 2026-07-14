@@ -203,7 +203,7 @@ pub const RaftNdjsonTraceLogger = struct {
             }
             try w.writeAll("],\"transition\":\"");
             try w.writeAll(@tagName(event.conf_transition));
-            try w.writeAll("\"}}}");
+            try w.writeAll("\"}}");
         }
 
         try w.writeAll("}}\n");
@@ -572,4 +572,11 @@ test "raft trace logger emits valid ndjson" {
     try std.testing.expect(std.mem.indexOf(u8, change_output, "\"name\":\"ChangeConf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, change_output, "\"action\":\"RemoveServer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, change_output, "\"nid\":\"3\"") != null);
+
+    var lines = std.mem.splitScalar(u8, change_output, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        parsed.deinit();
+    }
 }
