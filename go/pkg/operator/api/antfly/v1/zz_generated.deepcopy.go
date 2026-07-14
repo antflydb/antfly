@@ -935,6 +935,11 @@ func (in *HAPlannedActionStatus) DeepCopyInto(out *HAPlannedActionStatus) {
 		*out = new(HAAdminActionResultStatus)
 		**out = **in
 	}
+	if in.SeedArtifactProtectedGenerations != nil {
+		in, out := &in.SeedArtifactProtectedGenerations, &out.SeedArtifactProtectedGenerations
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.SeedArtifactReceipt != nil {
 		in, out := &in.SeedArtifactReceipt, &out.SeedArtifactReceipt
 		*out = new(HASeedArtifactReceiptStatus)

@@ -1842,6 +1842,8 @@ spec:
                             location:
                               pattern: ^(s3://|gs://|file://).+
                               type: string
+                            nodeID:
+                              type: string
                             retainGenerations:
                               format: int32
                               minimum: 1
@@ -1869,6 +1871,14 @@ spec:
                               - claimName
                               - mountPath
                               type: object
+                            targetPVCUID:
+                              type: string
+                            topologyGeneration:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            topologyID:
+                              type: string
                           required:
                           - location
                           - stagingRoot
@@ -4569,6 +4579,9 @@ spec:
                               type: boolean
                             promotionSafe:
                               type: boolean
+                            rawReceiptJSON:
+                              maxLength: 65536
+                              type: string
                             rejoinAction:
                               type: string
                             rejoinReason:
@@ -4724,12 +4737,21 @@ spec:
                           type: string
                         routeTo:
                           type: string
+                        seedArtifactCaptureRoot:
+                          type: string
                         seedArtifactGeneration:
                           type: string
                         seedArtifactLocation:
                           type: string
+                        seedArtifactProtectedGenerations:
+                          items:
+                            type: string
+                          maxItems: 256
+                          type: array
                         seedArtifactReceipt:
                           properties:
+                            actionKind:
+                              type: string
                             aggregateSHA256:
                               type: string
                             backupLSN:
@@ -4738,6 +4760,8 @@ spec:
                             checkpointLSN:
                               format: int64
                               type: integer
+                            checkpointSHA256:
+                              type: string
                             clusterID:
                               format: int64
                               type: integer
@@ -4763,13 +4787,24 @@ spec:
                               type: string
                             nodeID:
                               type: string
+                            protectedCount:
+                              format: int32
+                              type: integer
+                            resumedTombstoneCount:
+                              format: int32
+                              type: integer
                             retainedCount:
                               format: int32
                               type: integer
+                            scope:
+                              type: string
                             seedReceiptSHA256:
                               type: string
                             shardID:
                               format: int64
+                              type: integer
+                            skippedIneligibleCount:
+                              format: int32
                               type: integer
                             slotName:
                               type: string
@@ -4807,11 +4842,26 @@ spec:
                           type: string
                         slotName:
                           type: string
+                        sourcePVCName:
+                          type: string
+                        sourcePVCUID:
+                          type: string
                         standbyName:
                           type: string
                         targetLSN:
                           format: int64
                           type: integer
+                        targetPVCName:
+                          type: string
+                        targetPVCUID:
+                          type: string
+                        topologyGeneration:
+                          format: int64
+                          type: integer
+                        topologyID:
+                          type: string
+                        topologyNodeID:
+                          type: string
                       type: object
                     type: array
                   primaryAdminLastError:

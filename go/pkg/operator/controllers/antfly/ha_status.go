@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,28 +26,30 @@ import (
 type haActionKind string
 
 const (
-	haActionCreateSlot           haActionKind = "CreateSlot"
-	haActionResumeSlot           haActionKind = "ResumeSlot"
-	haActionPauseSlot            haActionKind = "PauseSlot"
-	haActionDropSlot             haActionKind = "DropSlot"
-	haActionSeedStandby          haActionKind = "SeedStandby"
-	haActionFinishStandbySeed    haActionKind = "FinishStandbySeed"
-	haActionCaptureSeedArtifact  haActionKind = "CaptureSeedArtifact"
-	haActionPublishSeedArtifact  haActionKind = "PublishSeedArtifact"
-	haActionRestoreSeedArtifact  haActionKind = "RestoreSeedArtifact"
-	haActionActivateSeedArtifact haActionKind = "ActivateSeedArtifact"
-	haActionActivateSeededSlot   haActionKind = "ActivateSeededSlot"
-	haActionBootstrapStandbySeed haActionKind = "BootstrapStandbySeed"
-	haActionPruneSeedArtifacts   haActionKind = "PruneSeedArtifacts"
-	haActionMarkReseed           haActionKind = "MarkReseed"
-	haActionAcquireFence         haActionKind = "AcquireFence"
-	haActionAssessPromotion      haActionKind = "AssessPromotion"
-	haActionPromoteStandby       haActionKind = "PromoteStandby"
-	haActionUpdatePrimaryRoute   haActionKind = "UpdatePrimaryRoute"
-	haActionFenceFormerPrimary   haActionKind = "FenceFormerPrimary"
-	haActionDemoteFormerPrimary  haActionKind = "DemoteFormerPrimary"
-	haActionRewindFormerPrimary  haActionKind = "RewindFormerPrimary"
-	haActionReseedFormerPrimary  haActionKind = "ReseedFormerPrimary"
+	haActionCreateSlot              haActionKind = "CreateSlot"
+	haActionResumeSlot              haActionKind = "ResumeSlot"
+	haActionPauseSlot               haActionKind = "PauseSlot"
+	haActionDropSlot                haActionKind = "DropSlot"
+	haActionSeedStandby             haActionKind = "SeedStandby"
+	haActionFinishStandbySeed       haActionKind = "FinishStandbySeed"
+	haActionCaptureSeedArtifact     haActionKind = "CaptureSeedArtifact"
+	haActionPublishSeedArtifact     haActionKind = "PublishSeedArtifact"
+	haActionGCSourceSeedGenerations haActionKind = "GCSourceSeedGenerations"
+	haActionRestoreSeedArtifact     haActionKind = "RestoreSeedArtifact"
+	haActionActivateSeedArtifact    haActionKind = "ActivateSeedArtifact"
+	haActionActivateSeededSlot      haActionKind = "ActivateSeededSlot"
+	haActionGCTargetSeedGenerations haActionKind = "GCTargetSeedGenerations"
+	haActionBootstrapStandbySeed    haActionKind = "BootstrapStandbySeed"
+	haActionPruneSeedArtifacts      haActionKind = "PruneSeedArtifacts"
+	haActionMarkReseed              haActionKind = "MarkReseed"
+	haActionAcquireFence            haActionKind = "AcquireFence"
+	haActionAssessPromotion         haActionKind = "AssessPromotion"
+	haActionPromoteStandby          haActionKind = "PromoteStandby"
+	haActionUpdatePrimaryRoute      haActionKind = "UpdatePrimaryRoute"
+	haActionFenceFormerPrimary      haActionKind = "FenceFormerPrimary"
+	haActionDemoteFormerPrimary     haActionKind = "DemoteFormerPrimary"
+	haActionRewindFormerPrimary     haActionKind = "RewindFormerPrimary"
+	haActionReseedFormerPrimary     haActionKind = "ReseedFormerPrimary"
 )
 
 type haActionPhase string
@@ -98,6 +102,8 @@ const (
 
 const haFencingLeaseDefaultDurationSeconds int32 = 30
 
+const haSeededSlotActivationReceiptPath = "/var/run/antfly-ha/seeded-slot-activation/seeded-slot-activation.json"
+
 const (
 	haFencingLeaseAnnotationClusterID        = "antfly.io/ha-fence-cluster-id"
 	haFencingLeaseAnnotationShardID          = "antfly.io/ha-fence-shard-id"
@@ -127,26 +133,33 @@ func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
 }
 
 type haPlannedAction struct {
-	Kind                   haActionKind
-	DependsOn              haActionKind
-	StandbyName            string
-	SlotName               string
-	TargetLSN              uint64
-	ObservedLSN            uint64
-	RetainedFromLSN        uint64
-	RouteFrom              string
-	RouteTo                string
-	FenceAuthority         antflyv1.HAFencingAuthority
-	FenceHolder            string
-	FenceGeneration        uint64
-	FenceReason            string
-	SeedManifestPath       string
-	SeedContentRoot        string
-	SeedArtifactTargetRoot string
-	SeedArtifactLocation   string
-	SeedArtifactGeneration string
-	SeedArtifactRetention  int32
-	Reason                 string
+	Kind                             haActionKind
+	DependsOn                        haActionKind
+	StandbyName                      string
+	SlotName                         string
+	TargetLSN                        uint64
+	ObservedLSN                      uint64
+	RetainedFromLSN                  uint64
+	RouteFrom                        string
+	RouteTo                          string
+	FenceAuthority                   antflyv1.HAFencingAuthority
+	FenceHolder                      string
+	FenceGeneration                  uint64
+	FenceReason                      string
+	SeedManifestPath                 string
+	SeedContentRoot                  string
+	SeedArtifactTargetRoot           string
+	SeedArtifactLocation             string
+	SeedArtifactGeneration           string
+	SeedArtifactRetention            int32
+	SeedArtifactCaptureRoot          string
+	SeedArtifactProtectedGenerations []string
+	TopologyID                       string
+	TopologyGeneration               int64
+	TopologyNodeID                   string
+	TargetPVCName                    string
+	TargetPVCUID                     string
+	Reason                           string
 }
 
 type haSyncEvaluation struct {
@@ -1025,36 +1038,45 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			out = append(out, *retainedAssessment)
 			retainedAssessment = nil
 		}
-		haBindSeedCaptureResultToPublish(&action, status)
+		haBindSeedCaptureResult(&action, status)
+		haBindSeedArtifactProtections(&action, status)
+		haBindSeedTopology(&action, ha)
 		adminMethod, adminPath := haAdminOperation(action)
 		statusAction := antflyv1.HAPlannedActionStatus{
-			Kind:                          string(action.Kind),
-			Phase:                         string(haPlannedActionPhase(action.Kind)),
-			Executor:                      string(haPlannedActionExecutor(action.Kind)),
-			DependsOn:                     string(action.DependsOn),
-			StandbyName:                   action.StandbyName,
-			SlotName:                      action.SlotName,
-			TargetLSN:                     action.TargetLSN,
-			ObservedLSN:                   action.ObservedLSN,
-			RetainedFromLSN:               action.RetainedFromLSN,
-			RouteFrom:                     action.RouteFrom,
-			RouteTo:                       action.RouteTo,
-			FenceAuthority:                action.FenceAuthority,
-			FenceHolder:                   action.FenceHolder,
-			FenceGeneration:               action.FenceGeneration,
-			FenceReason:                   action.FenceReason,
-			SeedManifestPath:              action.SeedManifestPath,
-			SeedContentRoot:               action.SeedContentRoot,
-			SeedArtifactTargetRoot:        action.SeedArtifactTargetRoot,
-			SeedArtifactLocation:          action.SeedArtifactLocation,
-			SeedArtifactGeneration:        action.SeedArtifactGeneration,
-			SeedArtifactRetainGenerations: action.SeedArtifactRetention,
-			AdminCommand:                  haAdminCommand(action, haReplicationIdentity(ha), status),
-			AdminURL:                      haAdminURL(action, ha, status),
-			AdminNodeID:                   haAdminNodeID(action, ha, status),
-			AdminMethod:                   adminMethod,
-			AdminPath:                     adminPath,
-			Reason:                        action.Reason,
+			Kind:                             string(action.Kind),
+			Phase:                            string(haPlannedActionPhase(action.Kind)),
+			Executor:                         string(haPlannedActionExecutor(action.Kind)),
+			DependsOn:                        string(action.DependsOn),
+			StandbyName:                      action.StandbyName,
+			SlotName:                         action.SlotName,
+			TargetLSN:                        action.TargetLSN,
+			ObservedLSN:                      action.ObservedLSN,
+			RetainedFromLSN:                  action.RetainedFromLSN,
+			RouteFrom:                        action.RouteFrom,
+			RouteTo:                          action.RouteTo,
+			FenceAuthority:                   action.FenceAuthority,
+			FenceHolder:                      action.FenceHolder,
+			FenceGeneration:                  action.FenceGeneration,
+			FenceReason:                      action.FenceReason,
+			SeedManifestPath:                 action.SeedManifestPath,
+			SeedContentRoot:                  action.SeedContentRoot,
+			SeedArtifactTargetRoot:           action.SeedArtifactTargetRoot,
+			SeedArtifactLocation:             action.SeedArtifactLocation,
+			SeedArtifactGeneration:           action.SeedArtifactGeneration,
+			SeedArtifactRetainGenerations:    action.SeedArtifactRetention,
+			SeedArtifactCaptureRoot:          action.SeedArtifactCaptureRoot,
+			SeedArtifactProtectedGenerations: append([]string(nil), action.SeedArtifactProtectedGenerations...),
+			TopologyID:                       action.TopologyID,
+			TopologyGeneration:               action.TopologyGeneration,
+			TopologyNodeID:                   action.TopologyNodeID,
+			TargetPVCName:                    action.TargetPVCName,
+			TargetPVCUID:                     action.TargetPVCUID,
+			AdminCommand:                     haAdminCommand(action, haReplicationIdentity(ha), status),
+			AdminURL:                         haAdminURL(action, ha, status),
+			AdminNodeID:                      haAdminNodeID(action, ha, status),
+			AdminMethod:                      adminMethod,
+			AdminPath:                        adminPath,
+			Reason:                           action.Reason,
 		}
 		if ha != nil && ha.Admin != nil {
 			statusAction.RetryGeneration = ha.Admin.RetryGeneration
@@ -1066,9 +1088,26 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	return out
 }
 
-func haBindSeedCaptureResultToPublish(action *haPlannedAction, status *antflyv1.HAStatus) {
-	if action == nil || status == nil || action.Kind != haActionPublishSeedArtifact ||
-		(strings.TrimSpace(action.SeedManifestPath) != "" || strings.TrimSpace(action.SeedContentRoot) != "") {
+func haBindSeedTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
+	if action == nil || ha == nil || ha.Runtime == nil || ha.Runtime.StartupGate == nil ||
+		ha.Runtime.StartupGate.RequiredReceipt == nil {
+		return
+	}
+	required := ha.Runtime.StartupGate.RequiredReceipt
+	if strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+		strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+		return
+	}
+	action.TopologyID = strings.TrimSpace(required.TopologyID)
+	action.TopologyGeneration = required.TopologyGeneration
+	action.TopologyNodeID = strings.TrimSpace(required.NodeID)
+	action.TargetPVCName = strings.TrimSpace(required.TargetPVCName)
+	action.TargetPVCUID = strings.TrimSpace(required.TargetPVCUID)
+}
+
+func haBindSeedCaptureResult(action *haPlannedAction, status *antflyv1.HAStatus) {
+	if action == nil || status == nil ||
+		(action.Kind != haActionPublishSeedArtifact && action.Kind != haActionGCSourceSeedGenerations) {
 		return
 	}
 	for i := range status.PlannedActions {
@@ -1081,10 +1120,68 @@ func haBindSeedCaptureResultToPublish(action *haPlannedAction, status *antflyv1.
 			continue
 		}
 		result := capture.AdminResult
-		action.SeedManifestPath = result.SeedManifestPath
-		action.SeedContentRoot = result.SeedContentRoot
+		if action.Kind == haActionPublishSeedArtifact {
+			action.SeedManifestPath = result.SeedManifestPath
+			action.SeedContentRoot = result.SeedContentRoot
+		} else {
+			action.SeedArtifactCaptureRoot = haSeedCaptureRoot(result.SeedGenerationRoot, action.SeedArtifactGeneration)
+		}
 		return
 	}
+}
+
+func haSeedCaptureRoot(generationRoot, generation string) string {
+	generationRoot = path.Clean(strings.TrimSpace(generationRoot))
+	generation = strings.TrimSpace(generation)
+	if generationRoot == "." || !path.IsAbs(generationRoot) || generation == "" || path.Base(generationRoot) != generation {
+		return ""
+	}
+	generationsRoot := path.Dir(generationRoot)
+	if path.Base(generationsRoot) != "generations" {
+		return ""
+	}
+	root := path.Dir(generationsRoot)
+	if root == "." || root == "/" {
+		return ""
+	}
+	return root
+}
+
+func haBindSeedArtifactProtections(action *haPlannedAction, status *antflyv1.HAStatus) {
+	if action == nil || (action.Kind != haActionGCSourceSeedGenerations && action.Kind != haActionGCTargetSeedGenerations) {
+		return
+	}
+	protected := map[string]struct{}{}
+	if generation := strings.TrimSpace(action.SeedArtifactGeneration); generation != "" {
+		protected[generation] = struct{}{}
+	}
+	if status != nil {
+		if gate := status.StartupGate; gate != nil && gate.ActivationReceipt != nil &&
+			strings.TrimSpace(gate.ActivationReceipt.SlotName) == strings.TrimSpace(action.SlotName) {
+			if generation := strings.TrimSpace(gate.ActivationReceipt.Generation); generation != "" {
+				protected[generation] = struct{}{}
+			}
+		}
+		for i := range status.PlannedActions {
+			candidate := status.PlannedActions[i]
+			if strings.TrimSpace(candidate.StandbyName) != strings.TrimSpace(action.StandbyName) ||
+				strings.TrimSpace(candidate.SlotName) != strings.TrimSpace(action.SlotName) {
+				continue
+			}
+			if generation := strings.TrimSpace(candidate.SeedArtifactGeneration); generation != "" {
+				protected[generation] = struct{}{}
+			}
+		}
+	}
+	values := make([]string, 0, len(protected))
+	for generation := range protected {
+		values = append(values, generation)
+	}
+	sort.Strings(values)
+	if len(values) > 256 {
+		values = values[:256]
+	}
+	action.SeedArtifactProtectedGenerations = values
 }
 
 func haRetainedFormerPrimaryAssessment(actions []haPlannedAction, status *antflyv1.HAStatus) *antflyv1.HAPlannedActionStatus {
@@ -1235,6 +1332,12 @@ func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 		SeedArtifactLocation          string `json:"seed_artifact_location"`
 		SeedArtifactGeneration        string `json:"seed_artifact_generation"`
 		SeedArtifactRetainGenerations int32  `json:"seed_artifact_retain_generations"`
+		SeedArtifactCaptureRoot       string `json:"seed_artifact_capture_root"`
+		TopologyID                    string `json:"topology_id"`
+		TopologyGeneration            int64  `json:"topology_generation"`
+		TopologyNodeID                string `json:"topology_node_id"`
+		TargetPVCName                 string `json:"target_pvc_name"`
+		TargetPVCUID                  string `json:"target_pvc_uid"`
 		RetryGeneration               int64  `json:"retry_generation"`
 	}{
 		Version:                       1,
@@ -1257,6 +1360,12 @@ func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 		SeedArtifactLocation:          strings.TrimSpace(action.SeedArtifactLocation),
 		SeedArtifactGeneration:        strings.TrimSpace(action.SeedArtifactGeneration),
 		SeedArtifactRetainGenerations: action.SeedArtifactRetainGenerations,
+		SeedArtifactCaptureRoot:       strings.TrimSpace(action.SeedArtifactCaptureRoot),
+		TopologyID:                    strings.TrimSpace(action.TopologyID),
+		TopologyGeneration:            action.TopologyGeneration,
+		TopologyNodeID:                strings.TrimSpace(action.TopologyNodeID),
+		TargetPVCName:                 strings.TrimSpace(action.TargetPVCName),
+		TargetPVCUID:                  strings.TrimSpace(action.TargetPVCUID),
 		RetryGeneration:               action.RetryGeneration,
 	}
 	payload, err := json.Marshal(identity)
@@ -1320,6 +1429,13 @@ func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.H
 		a.SeedArtifactLocation == b.SeedArtifactLocation &&
 		a.SeedArtifactGeneration == b.SeedArtifactGeneration &&
 		a.SeedArtifactRetainGenerations == b.SeedArtifactRetainGenerations &&
+		a.SeedArtifactCaptureRoot == b.SeedArtifactCaptureRoot &&
+		slices.Equal(a.SeedArtifactProtectedGenerations, b.SeedArtifactProtectedGenerations) &&
+		a.TopologyID == b.TopologyID &&
+		a.TopologyGeneration == b.TopologyGeneration &&
+		a.TopologyNodeID == b.TopologyNodeID &&
+		a.TargetPVCName == b.TargetPVCName &&
+		a.TargetPVCUID == b.TargetPVCUID &&
 		a.Reason == b.Reason &&
 		haSameAdminCommandHint(a, b)
 }
@@ -1539,7 +1655,7 @@ func haPlannedActionPhase(kind haActionKind) haActionPhase {
 		return haActionPhaseRoute
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return haActionPhaseRejoin
-	case haActionCaptureSeedArtifact, haActionPublishSeedArtifact, haActionRestoreSeedArtifact, haActionActivateSeedArtifact, haActionActivateSeededSlot, haActionPruneSeedArtifacts:
+	case haActionCaptureSeedArtifact, haActionPublishSeedArtifact, haActionGCSourceSeedGenerations, haActionRestoreSeedArtifact, haActionActivateSeedArtifact, haActionActivateSeededSlot, haActionGCTargetSeedGenerations, haActionPruneSeedArtifacts:
 		return haActionPhaseSeed
 	default:
 		return haActionPhaseReconcile
@@ -1558,8 +1674,10 @@ func haPlannedActionExecutor(kind haActionKind) haActionExecutor {
 
 func haPlannedActionKindIsPortableArtifact(kind haActionKind) bool {
 	return kind == haActionPublishSeedArtifact ||
+		kind == haActionGCSourceSeedGenerations ||
 		kind == haActionRestoreSeedArtifact ||
 		kind == haActionActivateSeedArtifact ||
+		kind == haActionGCTargetSeedGenerations ||
 		kind == haActionPruneSeedArtifacts
 }
 
@@ -1603,7 +1721,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			action.SeedManifestPath == "" || action.SeedContentRoot == "" || action.SlotName == "" {
 			return nil
 		}
-		return []string{
+		command := []string{
 			"artifact", "publish",
 			"--location", action.SeedArtifactLocation,
 			"--generation", action.SeedArtifactGeneration,
@@ -1611,12 +1729,30 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--manifest", action.SeedManifestPath,
 			"--content-root", action.SeedContentRoot,
 		}
+		return haAppendArtifactTopologyBinding(command, action)
+	case haActionGCSourceSeedGenerations:
+		if action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
+			action.SlotName == "" || action.SeedArtifactCaptureRoot == "" || action.SeedArtifactRetention <= 0 {
+			return nil
+		}
+		command := []string{
+			"artifact", "gc-source",
+			"--location", action.SeedArtifactLocation,
+			"--generation", action.SeedArtifactGeneration,
+			"--slot", action.SlotName,
+			"--capture-root", action.SeedArtifactCaptureRoot,
+			"--retain-generations", strconv.FormatInt(int64(action.SeedArtifactRetention), 10),
+		}
+		for _, generation := range action.SeedArtifactProtectedGenerations {
+			command = append(command, "--protect-generation", generation)
+		}
+		return command
 	case haActionRestoreSeedArtifact:
 		if identity == nil || action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
 			action.SeedContentRoot == "" || action.SlotName == "" {
 			return nil
 		}
-		return []string{
+		command := []string{
 			"artifact", "restore",
 			"--location", action.SeedArtifactLocation,
 			"--generation", action.SeedArtifactGeneration,
@@ -1629,6 +1765,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--ha-epoch", strconv.FormatUint(identity.Epoch, 10),
 			"--minimum-checkpoint-lsn", strconv.FormatUint(action.TargetLSN, 10),
 		}
+		return haAppendArtifactTopologyBinding(command, action)
 	case haActionActivateSeedArtifact:
 		if identity == nil || action.SeedArtifactGeneration == "" || action.SeedContentRoot == "" ||
 			action.SeedArtifactTargetRoot == "" || action.SlotName == "" {
@@ -1647,6 +1784,21 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--ha-epoch", strconv.FormatUint(identity.Epoch, 10),
 			"--minimum-checkpoint-lsn", strconv.FormatUint(action.TargetLSN, 10),
 		}
+	case haActionGCTargetSeedGenerations:
+		if action.SeedArtifactGeneration == "" || action.SeedArtifactTargetRoot == "" ||
+			action.SlotName == "" || action.SeedArtifactRetention <= 0 {
+			return nil
+		}
+		command := []string{
+			"artifact", "gc-target",
+			"--target-root", action.SeedArtifactTargetRoot,
+			"--slot-activation-receipt", haSeededSlotActivationReceiptPath,
+			"--retain-generations", strconv.FormatInt(int64(action.SeedArtifactRetention), 10),
+		}
+		for _, generation := range action.SeedArtifactProtectedGenerations {
+			command = append(command, "--protect-generation", generation)
+		}
+		return command
 	case haActionPruneSeedArtifacts:
 		if action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
 			action.SeedArtifactRetention <= 0 || action.SlotName == "" {
@@ -1746,6 +1898,21 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 	default:
 		return nil
 	}
+}
+
+func haAppendArtifactTopologyBinding(command []string, action haPlannedAction) []string {
+	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
+		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
+		strings.TrimSpace(action.TargetPVCUID) == "" {
+		return nil
+	}
+	return append(command,
+		"--topology-id", action.TopologyID,
+		"--topology-generation", strconv.FormatInt(action.TopologyGeneration, 10),
+		"--node-id", action.TopologyNodeID,
+		"--target-pvc-name", action.TargetPVCName,
+		"--target-pvc-uid", action.TargetPVCUID,
+	)
 }
 
 func haSlotLifecycleCommand(operation string, action haPlannedAction) []string {
@@ -2053,7 +2220,7 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 		if retention == 0 {
 			retention = 2
 		}
-		actions := make([]haPlannedAction, 0, 6)
+		actions := make([]haPlannedAction, 0, 8)
 		publishDependsOn := haActionFinishStandbySeed
 		if runtimeOwned {
 			actions = append(actions, haPlannedAction{
@@ -2094,9 +2261,26 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 				SeedArtifactGeneration: generation,
 				Reason:                 reason,
 			},
+		)
+		restoreDependsOn := haActionPublishSeedArtifact
+		if runtimeOwned {
+			actions = append(actions, haPlannedAction{
+				Kind:                   haActionGCSourceSeedGenerations,
+				DependsOn:              haActionPublishSeedArtifact,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactLocation:   location,
+				SeedArtifactGeneration: generation,
+				SeedArtifactRetention:  retention,
+				Reason:                 reason,
+			})
+			restoreDependsOn = haActionGCSourceSeedGenerations
+		}
+		actions = append(actions,
 			haPlannedAction{
 				Kind:                   haActionRestoreSeedArtifact,
-				DependsOn:              haActionPublishSeedArtifact,
+				DependsOn:              restoreDependsOn,
 				StandbyName:            standby.Name,
 				SlotName:               slotName,
 				TargetLSN:              targetLSN,
@@ -2126,8 +2310,19 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 				Reason:                 reason,
 			},
 			haPlannedAction{
-				Kind:                   haActionPruneSeedArtifacts,
+				Kind:                   haActionGCTargetSeedGenerations,
 				DependsOn:              haActionActivateSeededSlot,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactTargetRoot: targetRoot,
+				SeedArtifactGeneration: generation,
+				SeedArtifactRetention:  retention,
+				Reason:                 reason,
+			},
+			haPlannedAction{
+				Kind:                   haActionPruneSeedArtifacts,
+				DependsOn:              haActionGCTargetSeedGenerations,
 				StandbyName:            standby.Name,
 				SlotName:               slotName,
 				TargetLSN:              targetLSN,
@@ -2137,6 +2332,15 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 				Reason:                 reason,
 			},
 		)
+		for i := range actions {
+			actions[i].TopologyID = strings.TrimSpace(artifact.TopologyID)
+			actions[i].TopologyGeneration = artifact.TopologyGeneration
+			actions[i].TopologyNodeID = strings.TrimSpace(artifact.NodeID)
+			if artifact.TargetPVC != nil {
+				actions[i].TargetPVCName = strings.TrimSpace(artifact.TargetPVC.ClaimName)
+			}
+			actions[i].TargetPVCUID = strings.TrimSpace(artifact.TargetPVCUID)
+		}
 		return actions
 	}
 	if standby.SeedManifestPath == "" {

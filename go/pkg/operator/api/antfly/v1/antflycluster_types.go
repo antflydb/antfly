@@ -699,6 +699,25 @@ type HASeedArtifactSpec struct {
 	// +optional
 	Generation string `json:"generation,omitempty"`
 
+	// TopologyID and TopologyGeneration identify the Colony topology revision
+	// that authorized this entire seed chain. The operator freezes both into
+	// every planned artifact action and refuses execution when they are absent.
+	// +optional
+	TopologyID string `json:"topologyID,omitempty"`
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	TopologyGeneration int64 `json:"topologyGeneration,omitempty"`
+
+	// NodeID is the exact target standby identity carried by the portable
+	// artifact and checked again before restore and activation.
+	// +optional
+	NodeID string `json:"nodeID,omitempty"`
+
+	// TargetPVCUID optionally pins the desired target claim incarnation. The
+	// controller always resolves the live UID and rejects a configured mismatch.
+	// +optional
+	TargetPVCUID string `json:"targetPVCUID,omitempty"`
+
 	// GenerationPrefix is prepended to the deterministic generation selected by
 	// the operator. It must be a safe HA identifier and defaults to "seed".
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:-]+$`
@@ -2022,6 +2041,34 @@ type HAPlannedActionStatus struct {
 	// +optional
 	SeedArtifactRetainGenerations int32 `json:"seedArtifactRetainGenerations,omitempty"`
 
+	// SeedArtifactCaptureRoot is the durable source capture root proven by the
+	// successful runtime capture response. It is never accepted from spec.
+	// +optional
+	SeedArtifactCaptureRoot string `json:"seedArtifactCaptureRoot,omitempty"`
+
+	// SeedArtifactProtectedGenerations freezes the current, in-flight and rollback
+	// generations that a local GC operation must preserve.
+	// +optional
+	// +kubebuilder:validation:MaxItems=256
+	SeedArtifactProtectedGenerations []string `json:"seedArtifactProtectedGenerations,omitempty"`
+
+	// Topology fields bind every seed action in this chain to one exact desired
+	// topology generation and target PVC identity.
+	// +optional
+	TopologyID string `json:"topologyID,omitempty"`
+	// +optional
+	TopologyGeneration int64 `json:"topologyGeneration,omitempty"`
+	// +optional
+	TopologyNodeID string `json:"topologyNodeID,omitempty"`
+	// +optional
+	TargetPVCName string `json:"targetPVCName,omitempty"`
+	// +optional
+	TargetPVCUID string `json:"targetPVCUID,omitempty"`
+	// +optional
+	SourcePVCName string `json:"sourcePVCName,omitempty"`
+	// +optional
+	SourcePVCUID string `json:"sourcePVCUID,omitempty"`
+
 	// SeedArtifactReceipt is the typed, validated receipt emitted by a completed
 	// portable publish, restore, or prune Job.
 	// +optional
@@ -2119,34 +2166,46 @@ type HAPlannedActionStatus struct {
 
 // HASeedArtifactReceiptStatus summarizes a durable portable seed receipt.
 type HASeedArtifactReceiptStatus struct {
-	FormatVersion      int32  `json:"formatVersion"`
-	Generation         string `json:"generation"`
-	SlotName           string `json:"slotName"`
-	ClusterID          uint64 `json:"clusterID,omitempty"`
-	ShardID            uint64 `json:"shardID,omitempty"`
-	TableID            uint64 `json:"tableID,omitempty"`
-	TimelineID         uint64 `json:"timelineID,omitempty"`
-	Epoch              uint64 `json:"epoch,omitempty"`
-	ManifestID         string `json:"manifestID,omitempty"`
-	BackupLSN          uint64 `json:"backupLSN,omitempty"`
-	CheckpointLSN      uint64 `json:"checkpointLSN,omitempty"`
-	ManifestSHA256     string `json:"manifestSHA256,omitempty"`
-	AggregateSHA256    string `json:"aggregateSHA256,omitempty"`
-	SeedReceiptSHA256  string `json:"seedReceiptSHA256,omitempty"`
-	GenerationPath     string `json:"generationPath,omitempty"`
-	TotalBytes         uint64 `json:"totalBytes,omitempty"`
-	FileCount          int32  `json:"fileCount,omitempty"`
-	RetainedCount      int32  `json:"retainedCount,omitempty"`
-	DeletedCount       int32  `json:"deletedCount,omitempty"`
-	TopologyID         string `json:"topologyID,omitempty"`
-	TopologyGeneration int64  `json:"topologyGeneration,omitempty"`
-	NodeID             string `json:"nodeID,omitempty"`
-	TargetPVCName      string `json:"targetPVCName,omitempty"`
-	TargetPVCUID       string `json:"targetPVCUID,omitempty"`
+	ActionKind             string `json:"actionKind,omitempty"`
+	Scope                  string `json:"scope,omitempty"`
+	FormatVersion          int32  `json:"formatVersion"`
+	Generation             string `json:"generation"`
+	SlotName               string `json:"slotName"`
+	ClusterID              uint64 `json:"clusterID,omitempty"`
+	ShardID                uint64 `json:"shardID,omitempty"`
+	TableID                uint64 `json:"tableID,omitempty"`
+	TimelineID             uint64 `json:"timelineID,omitempty"`
+	Epoch                  uint64 `json:"epoch,omitempty"`
+	ManifestID             string `json:"manifestID,omitempty"`
+	BackupLSN              uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN          uint64 `json:"checkpointLSN,omitempty"`
+	ManifestSHA256         string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256        string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256      string `json:"seedReceiptSHA256,omitempty"`
+	GenerationPath         string `json:"generationPath,omitempty"`
+	TotalBytes             uint64 `json:"totalBytes,omitempty"`
+	FileCount              int32  `json:"fileCount,omitempty"`
+	RetainedCount          int32  `json:"retainedCount,omitempty"`
+	DeletedCount           int32  `json:"deletedCount,omitempty"`
+	ProtectedCount         int32  `json:"protectedCount,omitempty"`
+	ResumedTombstoneCount  int32  `json:"resumedTombstoneCount,omitempty"`
+	SkippedIneligibleCount int32  `json:"skippedIneligibleCount,omitempty"`
+	CheckpointSHA256       string `json:"checkpointSHA256,omitempty"`
+	TopologyID             string `json:"topologyID,omitempty"`
+	TopologyGeneration     int64  `json:"topologyGeneration,omitempty"`
+	NodeID                 string `json:"nodeID,omitempty"`
+	TargetPVCName          string `json:"targetPVCName,omitempty"`
+	TargetPVCUID           string `json:"targetPVCUID,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
 type HAAdminActionResultStatus struct {
+	// RawReceiptJSON is the bounded exact JSON response for lifecycle receipts
+	// that a later action must re-verify independently.
+	// +optional
+	// +kubebuilder:validation:MaxLength=65536
+	RawReceiptJSON string `json:"rawReceiptJSON,omitempty"`
+
 	// SchemaVersion is the response schema version returned by the HA admin API.
 	// +optional
 	SchemaVersion uint32 `json:"schemaVersion,omitempty"`

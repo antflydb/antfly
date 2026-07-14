@@ -1099,9 +1099,17 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 		SeedManifestPath: "/source/seed/manifest.afha",
 		SeedContentRoot:  "/source/seed/content",
 		SeedArtifact: &antflyv1.HASeedArtifactSpec{
-			Location:         "s3://ha-seeds/cluster-a",
-			GenerationPrefix: "base",
-			StagingRoot:      "/target/seed/staging",
+			Location:           "s3://ha-seeds/cluster-a",
+			GenerationPrefix:   "base",
+			StagingRoot:        "/target/seed/staging",
+			TopologyID:         "topology-a",
+			TopologyGeneration: 7,
+			NodeID:             "standby-a",
+			TargetPVCUID:       "pvc-uid-1",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{
+				ClaimName: "primary-a-data",
+				MountPath: "/source",
+			},
 			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{
 				ClaimName: "standby-a-data",
 				MountPath: "/target",
@@ -1111,8 +1119,8 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 
 	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 	actions := cluster.Status.HAStatus.PlannedActions
-	if len(actions) != 8 {
-		t.Fatalf("expected create, begin, finish, publish, restore, activate artifact, activate slot, prune actions, got %#v", actions)
+	if len(actions) != 9 {
+		t.Fatalf("expected create, begin, finish, publish, restore, activate artifact, activate slot, target GC, prune actions, got %#v", actions)
 	}
 	publish := actions[3]
 	if publish.Kind != string(haActionPublishSeedArtifact) ||
@@ -1129,6 +1137,11 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 			"--slot", "standby-a",
 			"--manifest", "/source/seed/manifest.afha",
 			"--content-root", "/source/seed/content",
+			"--topology-id", "topology-a",
+			"--topology-generation", "7",
+			"--node-id", "standby-a",
+			"--target-pvc-name", "standby-a-data",
+			"--target-pvc-uid", "pvc-uid-1",
 		}) {
 		t.Fatalf("unexpected portable publish action: %#v", publish)
 	}
@@ -1169,9 +1182,14 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 		activateSlot.AdminPath != "/admin/v1/ha/base-backups/activate" {
 		t.Fatalf("slot must remain non-streamable until durable target activation evidence exists: %#v", activateSlot)
 	}
-	prune := actions[7]
+	targetGC := actions[7]
+	if targetGC.Kind != string(haActionGCTargetSeedGenerations) ||
+		targetGC.DependsOn != string(haActionActivateSeededSlot) {
+		t.Fatalf("target GC must run after durable slot activation: %#v", targetGC)
+	}
+	prune := actions[8]
 	if prune.Kind != string(haActionPruneSeedArtifacts) ||
-		prune.DependsOn != "ActivateSeededSlot" ||
+		prune.DependsOn != string(haActionGCTargetSeedGenerations) ||
 		prune.SeedArtifactRetainGenerations != 2 ||
 		!reflect.DeepEqual(prune.AdminCommand, []string{
 			"artifact", "prune",
@@ -1197,9 +1215,13 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		InitialLSN: &initial,
 		AdminURL:   "http://standby-a-ha.default.svc:8081",
 		SeedArtifact: &antflyv1.HASeedArtifactSpec{
-			Location:         "s3://ha-seeds/cluster-a",
-			GenerationPrefix: "base",
-			StagingRoot:      "/target/.antfly-ha/staging",
+			Location:           "s3://ha-seeds/cluster-a",
+			GenerationPrefix:   "base",
+			StagingRoot:        "/target/.antfly-ha/staging",
+			TopologyID:         "topology-a",
+			TopologyGeneration: 7,
+			NodeID:             "standby-a",
+			TargetPVCUID:       "pvc-uid-1",
 			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{
 				ClaimName: "primary-a-data",
 				MountPath: "/antflydb",
@@ -1216,9 +1238,11 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 	wantKinds := []string{
 		string(haActionCaptureSeedArtifact),
 		string(haActionPublishSeedArtifact),
+		string(haActionGCSourceSeedGenerations),
 		string(haActionRestoreSeedArtifact),
 		string(haActionActivateSeedArtifact),
 		string(haActionActivateSeededSlot),
+		string(haActionGCTargetSeedGenerations),
 		string(haActionPruneSeedArtifacts),
 	}
 	gotKinds := make([]string, len(actions))
@@ -1233,9 +1257,9 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		actions[0].AdminPath != "/admin/v1/ha/base-backups/capture" {
 		t.Fatalf("SEED_CAPTURE_NOT_RUNTIME_OWNED: capture must execute atomically in the mounted primary runtime, got %#v", actions[0])
 	}
-	if actions[3].Executor != string(haActionExecutorCLIJob) ||
-		actions[3].SeedArtifactGeneration != "base-standby-a-10" {
-		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[3])
+	if actions[4].Executor != string(haActionExecutorCLIJob) ||
+		actions[4].SeedArtifactGeneration != "base-standby-a-10" {
+		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[4])
 	}
 	digest := strings.Repeat("a", 64)
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = haAdminDirectAPIName
@@ -1280,8 +1304,18 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 			"--slot", "standby-a",
 			"--manifest", "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
 			"--content-root", "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
+			"--topology-id", "topology-a",
+			"--topology-generation", "7",
+			"--node-id", "standby-a",
+			"--target-pvc-name", "standby-a-data",
+			"--target-pvc-uid", "pvc-uid-1",
 		}) {
 		t.Fatalf("CAPTURE_OUTPUT_NOT_PUBLISHED: publish must consume exact runtime capture paths, got %#v", publish)
+	}
+	sourceGC := cluster.Status.HAStatus.PlannedActions[2]
+	if sourceGC.SeedArtifactCaptureRoot != "/antflydb/ha/seed-captures" ||
+		!strings.Contains(strings.Join(sourceGC.AdminCommand, " "), "artifact gc-source") {
+		t.Fatalf("CAPTURE_ROOT_NOT_GC_BOUND: source GC must use the exact durable capture root, got %#v", sourceGC)
 	}
 }
 

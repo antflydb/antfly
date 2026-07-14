@@ -1434,6 +1434,22 @@ func validateHASeedArtifact(artifact *HASeedArtifactSpec, fieldPath string) []st
 		return nil
 	}
 	var errors []string
+	hasTopologyBinding := strings.TrimSpace(artifact.TopologyID) != "" || artifact.TopologyGeneration != 0 ||
+		strings.TrimSpace(artifact.NodeID) != "" || strings.TrimSpace(artifact.TargetPVCUID) != ""
+	if hasTopologyBinding {
+		if value := strings.TrimSpace(artifact.TopologyID); value == "" || value != artifact.TopologyID || !validHAIdentifier(value) {
+			errors = append(errors, fmt.Sprintf("%s.topologyID must be a valid HA identifier when seed topology binding is configured", fieldPath))
+		}
+		if artifact.TopologyGeneration <= 0 {
+			errors = append(errors, fmt.Sprintf("%s.topologyGeneration must be greater than zero when seed topology binding is configured", fieldPath))
+		}
+		if value := strings.TrimSpace(artifact.NodeID); value == "" || value != artifact.NodeID || !validHAIdentifier(value) {
+			errors = append(errors, fmt.Sprintf("%s.nodeID must be a valid HA identifier when seed topology binding is configured", fieldPath))
+		}
+		if value := strings.TrimSpace(artifact.TargetPVCUID); value == "" || value != artifact.TargetPVCUID || containsASCIIWhitespace(value) {
+			errors = append(errors, fmt.Sprintf("%s.targetPVCUID is required without whitespace when seed topology binding is configured", fieldPath))
+		}
+	}
 	location := strings.TrimSpace(artifact.Location)
 	if location == "" {
 		errors = append(errors, fmt.Sprintf("%s.location is required", fieldPath))

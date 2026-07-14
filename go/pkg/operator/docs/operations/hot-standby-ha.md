@@ -166,12 +166,14 @@ unbounded retention.
 Configure `standbys[*].seedArtifact` when the source backup and the standby do
 not share a filesystem. The same path is used for initial bootstrap and reseed:
 
-1. finish the base backup and freeze its manifest boundary;
-2. publish every manifest file to an immutable object-store generation;
-3. publish `COMPLETE.json` last as the only availability boundary;
-4. restore and verify the generation on the standby PVC;
-5. bootstrap from the verified local manifest and content root;
-6. prune older complete generations after bootstrap succeeds.
+1. capture the base backup in the primary runtime and freeze its manifest boundary;
+2. publish every file and bounded chunk to an immutable object-store generation, then publish `COMPLETE.json` last;
+3. reverify the complete remote v3 generation before garbage-collecting old local source captures;
+4. restore and verify that exact topology-bound generation on the standby PVC;
+5. atomically activate the verified local generation;
+6. activate the replication slot from the target activation receipt;
+7. copy that exact raw slot receipt into an immutable, action-scoped ConfigMap and garbage-collect old target generations;
+8. only then prune older complete remote generations.
 
 ```yaml
 spec:
@@ -185,7 +187,11 @@ spec:
         seedContentRoot: /source/seed/content
         seedArtifact:
           location: s3://company-ha-seeds/my-cluster
-          generationPrefix: seed
+          generation: seed-standby-a-42
+          topologyID: production-us-west
+          topologyGeneration: 42
+          nodeID: standby-a
+          targetPVCUID: 21ea57e0-79d5-48d0-b124-ef42ed73fc3f
           stagingRoot: /target/seed/current
           retainGenerations: 2
           credentialsSecretRef:
@@ -198,11 +204,12 @@ spec:
             mountPath: /target
 ```
 
-Source volumes are mounted only by the publish Job and target volumes only by
-the restore Job. This separation is required for two node-local or RWO PVCs: no
-Job asks Kubernetes to attach both PVCs at once. The standby runtime itself must
-also mount the target path so the typed bootstrap operation can open the
-verified files.
+Source volumes are mounted only by publish/source-GC Jobs and target volumes
+only by restore/activate/target-GC Jobs. Every Job is scoped to one PVC. Before
+dispatch the controller compares the persisted topology generation and desired
+PVC UID with the current spec and live Kubernetes PVC; the Job name and owner
+references bind that exact PVC incarnation. A replacement PVC or topology
+generation therefore cannot inherit an old action.
 
 When a live StatefulSet pod already mounts a publish-source RWO PVC, the
 operator adds required same-node pod affinity to the artifact Job using the
@@ -215,11 +222,13 @@ same-name stale Job pod is not trusted. Multiple RWO consumers, an
 unidentifiable consumer, or an unmounted publish source that is not already
 bound to a stable PV fails closed instead of guessing placement.
 
-Portable publish and restore evidence accepts artifact receipt format v1 and
-the bounded-chunk transport format v2. Activation and prune receipts remain
-v1-only because they have different evidence schemas. Unknown versions fail
-closed, and all topology, generation, LSN, manifest, and digest fields must
-still match.
+Legacy unbound publish and restore evidence accepts artifact receipt formats v1
+and v2. Production topology-bound transport requires v3, whose `COMPLETE.json`
+carries the exact topology ID/generation, target node, slot, target PVC name and
+UID. Restore rejects a missing or mismatched binding before writing its durable
+activation receipt. Activation, local GC, and remote-prune receipts use their
+action-specific v1 schemas. Unknown versions, scopes, fields, trailing JSON,
+or identity mismatches fail closed.
 
 The restore helper never clears an arbitrary directory. It accepts a missing or
 empty target, a partial directory carrying the matching operator staging
