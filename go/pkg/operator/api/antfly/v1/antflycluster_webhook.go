@@ -15,6 +15,8 @@ import (
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
+const haTopologyIDAnnotation = "antfly.io/ha-topology-id"
+
 var (
 	// irsaARNPattern matches AWS IAM Role ARNs including China and GovCloud partitions.
 	irsaARNPattern = regexp.MustCompile(`^arn:aws(-cn|-us-gov)?:iam::\d{12}:role/.+$`)
@@ -1462,8 +1464,17 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	validateID(required.NodeID, "nodeID")
 	validateID(required.SlotName, "slotName")
 	validateID(required.Generation, "generation")
-	if strings.TrimSpace(required.TopologyID) != strings.TrimSpace(r.Name) {
-		errors = append(errors, fieldPath+".requiredReceipt.topologyID must match metadata.name")
+	expectedTopologyID := strings.TrimSpace(r.Name)
+	topologySource := "metadata.name"
+	if annotated, present := r.Annotations[haTopologyIDAnnotation]; present {
+		expectedTopologyID = strings.TrimSpace(annotated)
+		topologySource = "metadata.annotations[" + haTopologyIDAnnotation + "]"
+		if annotated != expectedTopologyID || !validHAIdentifier(expectedTopologyID) {
+			errors = append(errors, topologySource+" must be a valid HA identifier without surrounding whitespace")
+		}
+	}
+	if strings.TrimSpace(required.TopologyID) != expectedTopologyID {
+		errors = append(errors, fieldPath+".requiredReceipt.topologyID must match "+topologySource)
 	}
 	if required.TopologyGeneration < 0 {
 		errors = append(errors, fieldPath+".requiredReceipt.topologyGeneration must not be negative")

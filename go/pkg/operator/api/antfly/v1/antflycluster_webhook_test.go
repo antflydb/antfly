@@ -2015,6 +2015,42 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRuntimeCRs(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Name = "antflydb-standby-a"
+	cluster.Annotations = map[string]string{"antfly.io/ha-topology-id": "antflydb"}
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:     HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
+			StartupGate: &HAStartupGateSpec{
+				Policy: HAStartupGatePolicyRequireActivatedSeed, RuntimeEligible: false, ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
+				RequiredReceipt: HARequiredSeedActivationReceipt{
+					TopologyID: "antflydb", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
+				},
+			},
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/antflydb", Generation: "prod-standby-a-10", StagingRoot: "/target/.antfly-ha/staging",
+				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected shared annotated topology ID to be accepted for a multi-CR standby: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TopologyID = "other-topology"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "must match metadata.annotations[antfly.io/ha-topology-id]") {
+		t.Fatalf("expected annotated topology mismatch to fail closed, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
