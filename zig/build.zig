@@ -2537,7 +2537,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    pdf_test_mod.addImport("antfly_pdf", pdf_mod);
+    pdf_test_mod.addImport("antfly_image", image_mod);
+    pdf_test_mod.addImport("antfly_font", font_mod);
     const lib_pdf_tests = b.addTest(.{
         .root_module = pdf_test_mod,
     });

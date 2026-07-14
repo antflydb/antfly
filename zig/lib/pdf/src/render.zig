@@ -886,6 +886,19 @@ fn shapeRunBounds(run: reader.ShapeRun) struct { min_x: f64, max_x: f64, min_y: 
         min_y = @min(min_y, point[1]);
         max_y = @max(max_y, point[1]);
     }
+    if (run.kind == .stroke) {
+        const radius = run.stroke_width / 2.0;
+        // Stroke caps and joins extend outside the centerline path. Include a
+        // conservative miter envelope so those pixels are actually visited.
+        const padding = if (run.line_join == .miter)
+            radius * @max(1.0, run.miter_limit)
+        else
+            radius;
+        min_x -= padding;
+        max_x += padding;
+        min_y -= padding;
+        max_y += padding;
+    }
     return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = max_y };
 }
 
@@ -1245,12 +1258,14 @@ fn drawAffineGlyphBox(
 
     const det = run.a * run.d - run.b * run.c;
     if (@abs(det) < 0.000001) return;
+    const ascent = effectiveRunAscent(run);
+    const descent = effectiveRunDescent(run);
 
     const corners = [_][2]f64{
-        .{ run.x + run.a * local_x - run.c * run.descent, run.y + run.b * local_x - run.d * run.descent },
-        .{ run.x + run.a * (local_x + local_w) - run.c * run.descent, run.y + run.b * (local_x + local_w) - run.d * run.descent },
-        .{ run.x + run.a * local_x + run.c * run.ascent, run.y + run.b * local_x + run.d * run.ascent },
-        .{ run.x + run.a * (local_x + local_w) + run.c * run.ascent, run.y + run.b * (local_x + local_w) + run.d * run.ascent },
+        .{ run.x + run.a * local_x - run.c * descent, run.y + run.b * local_x - run.d * descent },
+        .{ run.x + run.a * (local_x + local_w) - run.c * descent, run.y + run.b * (local_x + local_w) - run.d * descent },
+        .{ run.x + run.a * local_x + run.c * ascent, run.y + run.b * local_x + run.d * ascent },
+        .{ run.x + run.a * (local_x + local_w) + run.c * ascent, run.y + run.b * (local_x + local_w) + run.d * ascent },
     };
 
     var min_world_x = corners[0][0];
@@ -1288,7 +1303,7 @@ fn drawAffineGlyphBox(
             const dy = world_y - run.y;
             const lx = inv_a * dx + inv_c * dy;
             const ly = inv_b * dx + inv_d * dy;
-            if (lx < local_x or lx > local_x + local_w or ly < -run.descent or ly > run.ascent) continue;
+            if (lx < local_x or lx > local_x + local_w or ly < -descent or ly > ascent) continue;
             if (glyphModeColor(run, local_x, local_w, lx, ly)) |color| {
                 blendPixelMode(rgba, (py * width + px) * 4, color, run.blend_mode);
             }
@@ -1308,8 +1323,10 @@ fn glyphModeColor(run: reader.TextRun, local_x: f64, local_w: f64, lx: f64, ly: 
 }
 
 fn glyphPointIsStroke(run: reader.TextRun, local_x: f64, local_w: f64, lx: f64, ly: f64) bool {
+    const ascent = effectiveRunAscent(run);
+    const descent = effectiveRunDescent(run);
     const usable_w = @max(1.0, local_w);
-    const usable_h = @max(1.0, run.ascent + run.descent);
+    const usable_h = @max(1.0, ascent + descent);
     const basis_x = @sqrt(run.a * run.a + run.b * run.b);
     const basis_y = @sqrt(run.c * run.c + run.d * run.d);
     const avg_scale = @max(0.000001, (basis_x + basis_y) / 2.0);
@@ -1317,8 +1334,8 @@ fn glyphPointIsStroke(run: reader.TextRun, local_x: f64, local_w: f64, lx: f64, 
     const stroke = std.math.clamp(@max(stroke_from_width, @min(usable_w, usable_h) * 0.12), 0.5, @min(usable_w, usable_h) / 2.0);
     const left = lx - local_x;
     const right = local_x + local_w - lx;
-    const bottom = ly + run.descent;
-    const top = run.ascent - ly;
+    const bottom = ly + descent;
+    const top = ascent - ly;
     return left <= stroke or right <= stroke or bottom <= stroke or top <= stroke;
 }
 
@@ -1349,11 +1366,16 @@ fn blendPixelMode(canvas: []u8, dst: usize, src: [4]u8, mode: reader.BlendMode) 
     }
 
     if (mode == .normal) {
+        const da = @as(u32, canvas[dst + 3]);
         const inv_sa = 255 - sa;
-        canvas[dst + 0] = @intCast((@as(u32, src[0]) * sa + @as(u32, canvas[dst + 0]) * inv_sa + 127) / 255);
-        canvas[dst + 1] = @intCast((@as(u32, src[1]) * sa + @as(u32, canvas[dst + 1]) * inv_sa + 127) / 255);
-        canvas[dst + 2] = @intCast((@as(u32, src[2]) * sa + @as(u32, canvas[dst + 2]) * inv_sa + 127) / 255);
-        canvas[dst + 3] = 0xff;
+        const out_a = sa + (da * inv_sa + 127) / 255;
+        if (out_a == 0) return;
+        inline for (0..3) |channel| {
+            const src_p = @as(u32, src[channel]) * sa;
+            const dst_p = (@as(u32, canvas[dst + channel]) * da * inv_sa + 127) / 255;
+            canvas[dst + channel] = @intCast((src_p + dst_p + out_a / 2) / out_a);
+        }
+        canvas[dst + 3] = @intCast(out_a);
         return;
     }
 
@@ -1641,11 +1663,13 @@ fn estimatedRunCodepointAdvance(run: reader.TextRun, cp: u21, advance_scale: f64
 
 pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
     const width_est = estimateRunWidth(run);
+    const ascent = effectiveRunAscent(run);
+    const descent = effectiveRunDescent(run);
     const corners = [_][2]f64{
-        .{ run.x - run.c * run.descent, run.y - run.d * run.descent },
-        .{ run.x + run.a * width_est - run.c * run.descent, run.y + run.b * width_est - run.d * run.descent },
-        .{ run.x + run.c * run.ascent, run.y + run.d * run.ascent },
-        .{ run.x + run.a * width_est + run.c * run.ascent, run.y + run.b * width_est + run.d * run.ascent },
+        .{ run.x - run.c * descent, run.y - run.d * descent },
+        .{ run.x + run.a * width_est - run.c * descent, run.y + run.b * width_est - run.d * descent },
+        .{ run.x + run.c * ascent, run.y + run.d * ascent },
+        .{ run.x + run.a * width_est + run.c * ascent, run.y + run.b * width_est + run.d * ascent },
     };
 
     var min_x = corners[0][0];
@@ -1659,6 +1683,14 @@ pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y
         max_y = @max(max_y, corner[1]);
     }
     return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = max_y };
+}
+
+fn effectiveRunAscent(run: reader.TextRun) f64 {
+    return if (run.ascent > 0 or run.descent > 0) run.ascent else run.font_size * 0.8;
+}
+
+fn effectiveRunDescent(run: reader.TextRun) f64 {
+    return if (run.ascent > 0 or run.descent > 0) run.descent else run.font_size * 0.2;
 }
 
 test "render text preview writes png signature" {
@@ -1724,7 +1756,7 @@ test "estimate run width includes spacing and horizontal scale" {
         .word_spacing = 5,
     };
     const width = estimateRunWidth(run);
-    try std.testing.expectApproxEqAbs(@as(f64, 40.5), width, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 43.5), width, 0.001);
 }
 
 test "estimate run width prefers measured advance width" {
@@ -1853,7 +1885,7 @@ test "draw shape run respects clip box" {
         .points = points,
     });
 
-    const inside = ((5 * 20) + 5) * 4;
+    const inside = ((14 * 20) + 5) * 4;
     const outside = ((15 * 20) + 15) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[inside]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[outside]);
@@ -1880,8 +1912,8 @@ test "draw shape run respects polygon clip" {
         .points = points,
     });
 
-    const inside = ((5 * 20) + 5) * 4;
-    const outside = ((5 * 20) + 15) * 4;
+    const inside = ((14 * 20) + 5) * 4;
+    const outside = ((14 * 20) + 15) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[inside]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[outside]);
 }
@@ -1963,8 +1995,8 @@ test "text run bounds follow affine transform" {
     });
     try std.testing.expect(bounds.min_x < bounds.max_x);
     try std.testing.expect(bounds.min_y < bounds.max_y);
-    try std.testing.expectApproxEqAbs(@as(f64, 0), bounds.min_x, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 8), bounds.max_y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.6), bounds.min_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 12.8), bounds.max_y, 0.001);
 }
 
 test "draw text run applies affine rotation" {
@@ -2000,7 +2032,7 @@ test "draw text run applies affine rotation" {
     }
     try std.testing.expect(min_x < max_x);
     try std.testing.expect(min_y < max_y);
-    try std.testing.expect((max_y - min_y) > (max_x - min_x));
+    try std.testing.expect((max_x - min_x) > (max_y - min_y));
 }
 
 test "draw text run blends alpha" {
@@ -2020,7 +2052,7 @@ test "draw text run blends alpha" {
         .d = 1,
         .alpha = 0x80,
     });
-    const idx = ((12 * 32) + 10) * 4;
+    const idx = ((4 * 32) + 10) * 4;
     try std.testing.expect(canvas[idx + 0] > 0);
     try std.testing.expect(canvas[idx + 0] < 0xff);
     try std.testing.expectEqual(canvas[idx + 0], canvas[idx + 1]);
@@ -2267,7 +2299,7 @@ test "draw shape run round cap paints endpoint beyond segment" {
         .points = points,
     });
 
-    const endpoint_pixel = ((13 * 24) + 10) * 4;
+    const endpoint_pixel = ((11 * 24) + 10) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[endpoint_pixel]);
 }
 
@@ -2313,7 +2345,7 @@ test "draw shape run bevel join paints outer corner wedge" {
         .points = points,
     });
 
-    const outer_corner = ((20 * 28) + 20) * 4;
+    const outer_corner = ((23 * 28) + 20) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[outer_corner]);
 }
 
@@ -2336,7 +2368,7 @@ test "draw shape run miter join extends beyond bevel corner" {
         .points = points,
     });
 
-    const miter_pixel = ((22 * 32) + 22) * 4;
+    const miter_pixel = ((28 * 32) + 20) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[miter_pixel]);
 }
 

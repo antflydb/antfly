@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
-const antfly_pdf = @import("antfly_pdf");
+const antfly_pdf = @import("src/mod.zig");
 
 test {
-    std.testing.refAllDecls(antfly_pdf);
+    _ = antfly_pdf;
 }

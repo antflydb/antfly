@@ -65,15 +65,24 @@ fn renderFirstPagePngNative(_: *const anyopaque, alloc: Allocator, pdf_bytes: []
 /// scaled before rasterization so embedded page images are sampled directly at
 /// the target resolution rather than upscaling a 72-DPI preview.
 pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
-    if (page_number == 0) return error.InvalidPageNumber;
-    if (dpi < 72 or dpi > 600) return error.InvalidRenderDpi;
     var parsed = try reader.Reader.init(alloc, pdf_bytes);
     defer parsed.deinit();
+    return try renderParsedPagePngAlloc(alloc, &parsed, page_number, dpi, max_pixels);
+}
+
+pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    if (page_number == 0) return error.InvalidPageNumber;
+    if (dpi < 72 or dpi > 600) return error.InvalidRenderDpi;
     const page_count = try parsed.pageCount();
     if (page_number > page_count) return error.InvalidPageNumber;
+    // Reject oversized pages before decoding page images and font resources.
+    const unscaled_box = try parsed.extractPageBox(page_number);
+    const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
+    const preflight_width = @max(1.0, unscaled_box.max_x - unscaled_box.min_x) * scale;
+    const preflight_height = @max(1.0, unscaled_box.max_y - unscaled_box.min_y) * scale;
+    if (preflight_width * preflight_height > @as(f64, @floatFromInt(max_pixels))) return error.RenderedPageTooLarge;
     var render_runs = try parsed.extractPageRenderRunsAlloc(page_number);
     defer render_runs.deinit(alloc);
-    const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
     scalePageRenderRuns(&render_runs, scale);
     const page_box = render_runs.page_box;
     const page_width = @max(1.0, page_box.max_x - page_box.min_x);
@@ -282,9 +291,9 @@ fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
         }
         if (run.clip_box) |*box| scaleBox(box, scale);
         scalePoints(run.clip_points, scale);
-        scaleBox(&run.pattern_bbox, scale);
-        run.pattern_x_step *= scale;
-        run.pattern_y_step *= scale;
+        // Tiling geometry and tile-local runs remain in pattern space. The
+        // pattern matrix is the single mapping into the scaled page space;
+        // scaling both produced tiles that grew by scale^2 at higher DPI.
         run.pattern_matrix.a *= scale;
         run.pattern_matrix.b *= scale;
         run.pattern_matrix.c *= scale;
@@ -292,11 +301,6 @@ fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
         run.pattern_matrix.e *= scale;
         run.pattern_matrix.f *= scale;
         if (run.shading) |*shading| scaleShadingRuns(@as(*[1]reader.ShadingRun, @ptrCast(shading))[0..], scale);
-        scaleTextRuns(run.tile_text_runs, scale);
-        scaleImageRuns(run.tile_image_runs, scale);
-        scaleShadingRuns(run.tile_shading_runs, scale);
-        scalePatternRuns(run.tile_pattern_runs, scale);
-        scaleShapeRuns(run.tile_shape_runs, scale);
     }
 }
 
@@ -2449,6 +2453,36 @@ test "native page renderer honors OCR DPI and pixel guard" {
     try std.testing.expectError(error.InvalidPageNumber, renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000));
 }
 
+test "OCR DPI scaling maps tiling patterns exactly once" {
+    const alloc = std.testing.allocator;
+    const tile_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 5, 0 }, .{ 5, 5 }, .{ 0, 5 } });
+    var tile_shapes = try alloc.alloc(reader.ShapeRun, 1);
+    tile_shapes[0] = .{
+        .kind = .fill,
+        .color = .{ 0, 0, 0, 0xff },
+        .stroke_width = 0,
+        .closed = true,
+        .points = tile_points,
+    };
+    const target_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 20, 0 }, .{ 20, 20 }, .{ 0, 20 } });
+    var runs = [_]reader.PatternRun{.{
+        .kind = .fill,
+        .points = target_points,
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 5, .max_y = 5 },
+        .pattern_x_step = 5,
+        .pattern_y_step = 5,
+        .tile_shape_runs = tile_shapes,
+    }};
+    defer runs[0].deinit(alloc);
+
+    scalePatternRuns(&runs, 2);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].points[1][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), runs[0].pattern_matrix.a, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_x_step, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_bbox.max_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].tile_shape_runs[0].points[1][0], 0.001);
+}
+
 test "native page renderer renders the requested one-based PDF page" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
@@ -2469,6 +2503,22 @@ test "native page renderer renders the requested one-based PDF page" {
     try std.testing.expectEqual(first.width, second.width);
     try std.testing.expectEqual(first.height, second.height);
     try std.testing.expect(!std.mem.eql(u8, first.rgba, second.rgba));
+}
+
+test "reader ignores stale positive page-tree Count hints" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const mutated = try alloc.dupe(u8, fixture);
+    defer alloc.free(mutated);
+    const marker = std.mem.indexOf(u8, mutated, "/Count 2") orelse return error.InvalidTestFixture;
+    mutated[marker + "/Count ".len] = '1';
+
+    var parsed = try reader.Reader.init(alloc, mutated);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try parsed.pageCount());
+    const second = try parsed.extractPageTextAlloc(2);
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "SECOND PAGE") != null);
 }
 
 test "native page renderer preserves a raster scanned-table fixture for OCR" {
