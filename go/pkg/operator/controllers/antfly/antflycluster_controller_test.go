@@ -11960,6 +11960,7 @@ func TestReconcileSwarmStatefulSetStartupGateRequiresExactObservedReceipt(t *tes
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 	g.Expect(sts.Spec.Template.Annotations).To(HaveKey("antfly.io/ha-startup-receipt-hash"))
 	container := sts.Spec.Template.Spec.Containers[0]
+	g.Expect(container.Env).To(ContainElement(haPodUIDEnv()[0]))
 	runtimeArgs := container.Args[0]
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-root '/antflydb/.antfly-ha/active'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-topology-id 'test-swarm'`))

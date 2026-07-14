@@ -1311,6 +1311,11 @@ func haPlannedActionExecutionStarted(action antflyv1.HAPlannedActionStatus) bool
 // Those values remain frozen in the persisted action payload after execution
 // begins, but they do not create an unbounded stream of new retry identities.
 func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
+	if strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
+		action.TopologyGeneration == 0 && strings.TrimSpace(action.TopologyNodeID) == "" &&
+		strings.TrimSpace(action.TargetPVCName) == "" && strings.TrimSpace(action.TargetPVCUID) == "" {
+		return haLegacyPlannedActionOperationID(action)
+	}
 	identity := struct {
 		Version                       int    `json:"version"`
 		Kind                          string `json:"kind"`
@@ -1340,7 +1345,7 @@ func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 		TargetPVCUID                  string `json:"target_pvc_uid"`
 		RetryGeneration               int64  `json:"retry_generation"`
 	}{
-		Version:                       1,
+		Version:                       2,
 		Kind:                          strings.TrimSpace(action.Kind),
 		Executor:                      strings.TrimSpace(action.Executor),
 		StandbyName:                   strings.TrimSpace(action.StandbyName),
@@ -1371,6 +1376,60 @@ func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
 	payload, err := json.Marshal(identity)
 	if err != nil {
 		panic(fmt.Sprintf("marshal HA operation identity: %v", err))
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("haop-v2-%x", digest[:])
+}
+
+func haLegacyPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
+	identity := struct {
+		Version                       int    `json:"version"`
+		Kind                          string `json:"kind"`
+		Executor                      string `json:"executor"`
+		StandbyName                   string `json:"standby_name"`
+		SlotName                      string `json:"slot_name"`
+		RouteFrom                     string `json:"route_from"`
+		RouteTo                       string `json:"route_to"`
+		FenceAuthority                string `json:"fence_authority"`
+		FenceHolder                   string `json:"fence_holder"`
+		FenceGeneration               uint64 `json:"fence_generation"`
+		AdminURL                      string `json:"admin_url"`
+		AdminNodeID                   string `json:"admin_node_id"`
+		AdminMethod                   string `json:"admin_method"`
+		AdminPath                     string `json:"admin_path"`
+		SeedManifestPath              string `json:"seed_manifest_path"`
+		SeedContentRoot               string `json:"seed_content_root"`
+		SeedArtifactTargetRoot        string `json:"seed_artifact_target_root"`
+		SeedArtifactLocation          string `json:"seed_artifact_location"`
+		SeedArtifactGeneration        string `json:"seed_artifact_generation"`
+		SeedArtifactRetainGenerations int32  `json:"seed_artifact_retain_generations"`
+		RetryGeneration               int64  `json:"retry_generation"`
+	}{
+		Version:                       1,
+		Kind:                          strings.TrimSpace(action.Kind),
+		Executor:                      strings.TrimSpace(action.Executor),
+		StandbyName:                   strings.TrimSpace(action.StandbyName),
+		SlotName:                      strings.TrimSpace(action.SlotName),
+		RouteFrom:                     strings.TrimSpace(action.RouteFrom),
+		RouteTo:                       strings.TrimSpace(action.RouteTo),
+		FenceAuthority:                strings.TrimSpace(string(action.FenceAuthority)),
+		FenceHolder:                   strings.TrimSpace(action.FenceHolder),
+		FenceGeneration:               action.FenceGeneration,
+		AdminURL:                      strings.TrimSpace(action.AdminURL),
+		AdminNodeID:                   strings.TrimSpace(action.AdminNodeID),
+		AdminMethod:                   strings.TrimSpace(action.AdminMethod),
+		AdminPath:                     strings.TrimSpace(action.AdminPath),
+		SeedManifestPath:              strings.TrimSpace(action.SeedManifestPath),
+		SeedContentRoot:               strings.TrimSpace(action.SeedContentRoot),
+		SeedArtifactTargetRoot:        strings.TrimSpace(action.SeedArtifactTargetRoot),
+		SeedArtifactLocation:          strings.TrimSpace(action.SeedArtifactLocation),
+		SeedArtifactGeneration:        strings.TrimSpace(action.SeedArtifactGeneration),
+		SeedArtifactRetainGenerations: action.SeedArtifactRetainGenerations,
+		RetryGeneration:               action.RetryGeneration,
+	}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		panic(fmt.Sprintf("marshal legacy HA operation identity: %v", err))
 	}
 	digest := sha256.Sum256(payload)
 	return fmt.Sprintf("haop-v1-%x", digest[:])

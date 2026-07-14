@@ -345,6 +345,28 @@ func TestHAPlannedActionRetryGenerationIsTheOnlyTerminalRecoveryNonce(t *testing
 	}
 }
 
+func TestHAPlannedActionOperationIDVersionsTopologyBindingWithoutRekeyingLegacyActions(t *testing.T) {
+	legacy := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionCreateSlot), Executor: string(haActionExecutorAdminAPI),
+		StandbyName: "standby-a", SlotName: "standby-a", AdminURL: "http://primary-ha.default.svc:8081",
+	}
+	legacyID := haPlannedActionOperationID(legacy)
+	if !strings.HasPrefix(legacyID, "haop-v1-") {
+		t.Fatalf("legacy non-topology action must preserve its v1 retry identity, got %q", legacyID)
+	}
+	bound := legacy
+	bound.Kind = string(haActionPublishSeedArtifact)
+	bound.TopologyID = "topology-a"
+	bound.TopologyGeneration = 7
+	bound.TopologyNodeID = "standby-a"
+	bound.TargetPVCName = "standby-data"
+	bound.TargetPVCUID = "pvc-uid-1"
+	boundID := haPlannedActionOperationID(bound)
+	if !strings.HasPrefix(boundID, "haop-v2-") || boundID == legacyID {
+		t.Fatalf("topology-bound seed action must use a distinct versioned identity, legacy=%q bound=%q", legacyID, boundID)
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
