@@ -218,7 +218,32 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
     std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
 }
 
-const ArtifactAction = enum { publish, restore, verify, activate, prune };
+const ArtifactAction = enum { publish, restore, verify, activate, prune, gc_source, gc_target };
+
+const ArtifactFlag = enum {
+    location,
+    generation,
+    slot,
+    manifest,
+    content_root,
+    staging_root,
+    target_root,
+    capture_root,
+    slot_activation_receipt,
+    ha_cluster_id,
+    ha_shard_id,
+    ha_table_id,
+    ha_timeline_id,
+    ha_epoch,
+    minimum_checkpoint_lsn,
+    topology_id,
+    topology_generation,
+    node_id,
+    target_pvc_name,
+    target_pvc_uid,
+    retain_generations,
+    protect_generation,
+};
 
 const ActivationBindingOptions = struct {
     topology_id: ?[]const u8 = null,
@@ -253,19 +278,29 @@ const ArtifactOptions = struct {
     content_root: ?[]const u8 = null,
     staging_root: ?[]const u8 = null,
     target_root: ?[]const u8 = null,
+    capture_root: ?[]const u8 = null,
+    slot_activation_receipt_path: ?[]const u8 = null,
     identity: IdentityOptions = .{},
     binding: ActivationBindingOptions = .{},
     minimum_checkpoint_lsn: u64 = 0,
     retain_generations: usize = 2,
+    protected_generations: []const []const u8 = &.{},
+    owns_protected_generations: bool = false,
+
+    fn deinit(self: *ArtifactOptions, alloc: std.mem.Allocator) void {
+        if (self.owns_protected_generations) alloc.free(self.protected_generations);
+        self.* = undefined;
+    }
 };
 
 fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    const options = try parseArtifactArgs(argv);
-    const generation = options.generation orelse return error.SeedGenerationMissing;
-    const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+    var options = try parseArtifactArgs(alloc, argv);
+    defer options.deinit(alloc);
 
     switch (options.action) {
         .publish => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const location = options.location orelse return error.SeedLocationMissing;
             const manifest_path = options.manifest_path orelse return error.SeedManifestMissing;
             const content_root = options.content_root orelse return error.SeedContentRootMissing;
@@ -287,6 +322,8 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             try writeArtifactResult(io, result.receipt_json);
         },
         .restore => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const location = options.location orelse return error.SeedLocationMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
             var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
@@ -308,6 +345,8 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             try writeArtifactResult(io, result.receipt_json);
         },
         .verify => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
             try ha.seed_artifact.verifyStaged(alloc, staging_root, .{
                 .generation = generation,
@@ -318,6 +357,8 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             std.Io.File.stdout().writeStreamingAll(io, "{\"verified\":true}\n") catch {};
         },
         .activate => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
             const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
             var result = try ha.seed_activation.activate(alloc, .{
@@ -335,6 +376,8 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             try writeArtifactResult(io, result.active_receipt_json);
         },
         .prune => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const location = options.location orelse return error.SeedLocationMissing;
             var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
@@ -350,10 +393,45 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             defer result.deinit(alloc);
             try writeArtifactResult(io, result.result_json);
         },
+        .gc_source => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+            const location = options.location orelse return error.SeedLocationMissing;
+            const capture_root = options.capture_root orelse return error.SeedCaptureRootMissing;
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_capture.prunePublishedGenerations(alloc, .{
+                .store = .{
+                    .client = &opened.client,
+                    .bucket = opened.bucket,
+                    .prefix = opened.prefix,
+                },
+                .capture_root = capture_root,
+                .generation = generation,
+                .slot_name = slot_name,
+                .protected_generations = options.protected_generations,
+                .retain_generations = options.retain_generations,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.result_json);
+        },
+        .gc_target => {
+            const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
+            const receipt_path = options.slot_activation_receipt_path orelse
+                return error.SeedActivationCheckpointMissing;
+            var result = try ha.seed_activation.pruneActivatedGenerations(alloc, .{
+                .target_root = target_root,
+                .slot_activation_receipt_path = receipt_path,
+                .protected_generations = options.protected_generations,
+                .retain_generations = options.retain_generations,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.result_json);
+        },
     }
 }
 
-fn parseArtifactArgs(argv: []const []const u8) !ArtifactOptions {
+fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ArtifactOptions {
     if (argv.len == 0) return error.SeedArtifactActionMissing;
     var options = ArtifactOptions{ .action = if (std.mem.eql(u8, argv[0], "publish"))
         .publish
@@ -365,56 +443,108 @@ fn parseArtifactArgs(argv: []const []const u8) !ArtifactOptions {
         .activate
     else if (std.mem.eql(u8, argv[0], "prune"))
         .prune
+    else if (std.mem.eql(u8, argv[0], "gc-source"))
+        .gc_source
+    else if (std.mem.eql(u8, argv[0], "gc-target"))
+        .gc_target
     else
         return error.InvalidSeedArtifactAction };
+    var protected_generations = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer protected_generations.deinit(alloc);
+    var seen_flags = std.EnumSet(ArtifactFlag).initEmpty();
     var idx: usize = 1;
     while (idx < argv.len) {
-        const flag = argv[idx];
+        const raw_flag = argv[idx];
         idx += 1;
-        if (std.mem.eql(u8, flag, "--location")) {
-            options.location = try artifactValue(argv, &idx);
-        } else if (std.mem.eql(u8, flag, "--generation")) {
-            options.generation = try artifactValue(argv, &idx);
-        } else if (std.mem.eql(u8, flag, "--slot")) {
-            options.slot_name = try artifactValue(argv, &idx);
-        } else if (std.mem.eql(u8, flag, "--manifest")) {
-            options.manifest_path = try absoluteArtifactPath(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--content-root")) {
-            options.content_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--staging-root")) {
-            options.staging_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--target-root")) {
-            options.target_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--ha-cluster-id")) {
-            options.identity.cluster_id = try parseU64(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--ha-shard-id")) {
-            options.identity.shard_id = try parseU64(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--ha-table-id")) {
-            options.identity.table_id = try parseU64(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--ha-timeline-id")) {
-            options.identity.timeline_id = try parseU64(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--ha-epoch")) {
-            options.identity.epoch = try parseU64(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--minimum-checkpoint-lsn")) {
-            options.minimum_checkpoint_lsn = try parseU64(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--topology-id")) {
-            options.binding.topology_id = try artifactValue(argv, &idx);
-        } else if (std.mem.eql(u8, flag, "--topology-generation")) {
-            options.binding.topology_generation = try parseU64(try artifactValue(argv, &idx));
-        } else if (std.mem.eql(u8, flag, "--node-id")) {
-            options.binding.node_id = try artifactValue(argv, &idx);
-        } else if (std.mem.eql(u8, flag, "--target-pvc-name")) {
-            options.binding.target_pvc_name = try artifactValue(argv, &idx);
-        } else if (std.mem.eql(u8, flag, "--target-pvc-uid")) {
-            options.binding.target_pvc_uid = try artifactValue(argv, &idx);
-        } else if (std.mem.eql(u8, flag, "--retain-generations")) {
-            options.retain_generations = std.math.cast(usize, try parseU64(try artifactValue(argv, &idx))) orelse return error.InvalidSeedRetention;
-            if (options.retain_generations == 0) return error.InvalidSeedRetention;
-        } else {
-            return error.InvalidSeedArtifactFlag;
+        const flag = artifactFlag(raw_flag) orelse return error.InvalidSeedArtifactFlag;
+        if (!artifactFlagAllowed(options.action, flag)) return error.SeedArtifactFlagNotAllowedForAction;
+        if (flag != .protect_generation) {
+            if (seen_flags.contains(flag)) return error.DuplicateSeedArtifactFlag;
+            seen_flags.insert(flag);
+        }
+        switch (flag) {
+            .location => options.location = try artifactValue(argv, &idx),
+            .generation => options.generation = try artifactValue(argv, &idx),
+            .slot => options.slot_name = try artifactValue(argv, &idx),
+            .manifest => options.manifest_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .content_root => options.content_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .staging_root => options.staging_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .target_root => options.target_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .capture_root => options.capture_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .slot_activation_receipt => options.slot_activation_receipt_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .ha_cluster_id => options.identity.cluster_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_shard_id => options.identity.shard_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_table_id => options.identity.table_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_timeline_id => options.identity.timeline_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_epoch => options.identity.epoch = try parseU64(try artifactValue(argv, &idx)),
+            .minimum_checkpoint_lsn => options.minimum_checkpoint_lsn = try parseU64(try artifactValue(argv, &idx)),
+            .topology_id => options.binding.topology_id = try artifactValue(argv, &idx),
+            .topology_generation => options.binding.topology_generation = try parseU64(try artifactValue(argv, &idx)),
+            .node_id => options.binding.node_id = try artifactValue(argv, &idx),
+            .target_pvc_name => options.binding.target_pvc_name = try artifactValue(argv, &idx),
+            .target_pvc_uid => options.binding.target_pvc_uid = try artifactValue(argv, &idx),
+            .retain_generations => {
+                options.retain_generations = std.math.cast(usize, try parseU64(try artifactValue(argv, &idx))) orelse return error.InvalidSeedRetention;
+                if (options.retain_generations == 0) return error.InvalidSeedRetention;
+            },
+            .protect_generation => {
+                const generation = try artifactValue(argv, &idx);
+                if (!ha_validation.isIdentifier(generation)) return error.InvalidProtectedSeedGeneration;
+                if (protected_generations.items.len >= 256) return error.TooManyProtectedSeedGenerations;
+                for (protected_generations.items) |previous| {
+                    if (std.mem.eql(u8, previous, generation)) return error.DuplicateProtectedSeedGeneration;
+                }
+                try protected_generations.append(alloc, generation);
+            },
         }
     }
+    options.protected_generations = try protected_generations.toOwnedSlice(alloc);
+    options.owns_protected_generations = true;
     return options;
+}
+
+fn artifactFlag(raw: []const u8) ?ArtifactFlag {
+    const names = std.StaticStringMap(ArtifactFlag).initComptime(.{
+        .{ "--location", .location },
+        .{ "--generation", .generation },
+        .{ "--slot", .slot },
+        .{ "--manifest", .manifest },
+        .{ "--content-root", .content_root },
+        .{ "--staging-root", .staging_root },
+        .{ "--target-root", .target_root },
+        .{ "--capture-root", .capture_root },
+        .{ "--slot-activation-receipt", .slot_activation_receipt },
+        .{ "--ha-cluster-id", .ha_cluster_id },
+        .{ "--ha-shard-id", .ha_shard_id },
+        .{ "--ha-table-id", .ha_table_id },
+        .{ "--ha-timeline-id", .ha_timeline_id },
+        .{ "--ha-epoch", .ha_epoch },
+        .{ "--minimum-checkpoint-lsn", .minimum_checkpoint_lsn },
+        .{ "--topology-id", .topology_id },
+        .{ "--topology-generation", .topology_generation },
+        .{ "--node-id", .node_id },
+        .{ "--target-pvc-name", .target_pvc_name },
+        .{ "--target-pvc-uid", .target_pvc_uid },
+        .{ "--retain-generations", .retain_generations },
+        .{ "--protect-generation", .protect_generation },
+    });
+    return names.get(raw);
+}
+
+fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
+    return switch (flag) {
+        .location => action == .publish or action == .restore or action == .prune or action == .gc_source,
+        .generation, .slot => action != .gc_target,
+        .manifest, .content_root => action == .publish,
+        .staging_root => action == .restore or action == .verify or action == .activate,
+        .target_root => action == .activate or action == .gc_target,
+        .capture_root => action == .gc_source,
+        .slot_activation_receipt => action == .gc_target,
+        .ha_cluster_id, .ha_shard_id, .ha_table_id, .ha_timeline_id, .ha_epoch, .minimum_checkpoint_lsn => action == .restore or action == .verify or action == .activate,
+        .topology_id, .topology_generation, .node_id, .target_pvc_name, .target_pvc_uid => action == .activate,
+        .retain_generations => action == .prune or action == .gc_source or action == .gc_target,
+        .protect_generation => action == .gc_source or action == .gc_target,
+    };
 }
 
 fn artifactValue(argv: []const []const u8, idx: *usize) ![]const u8 {
@@ -1318,13 +1448,15 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} ha artifact restore --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --staging-root /target/seed --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
         \\  {s} ha artifact activate --generation seed-standby-a-42 --slot standby-a --staging-root /target/.antfly-ha/staging --target-root /target --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
         \\  {s} ha artifact prune --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --retain-generations 2
+        \\  {s} ha artifact gc-source --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --capture-root /source/.antfly-ha/captures --retain-generations 2 --protect-generation seed-standby-a-41
+        \\  {s} ha artifact gc-target --target-root /target --slot-activation-receipt /checkpoint/seeded-slot-activation.json --retain-generations 2 --protect-generation seed-standby-a-41
         \\  {s} ha --ha-url http://127.0.0.1:8081 --ha-token-env ANTFLY_HA_ADMIN_TOKEN -- status primary
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
         \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
         \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
 test "ha cmd parses local handles before admin command" {
@@ -1387,8 +1519,9 @@ test "ha cmd local handles default shard and table identity to whole instance" {
     try std.testing.expectEqual(@as(u64, 2), standby_identity.epoch);
 }
 
-test "ha cmd parses offline seed activation target and identity" {
-    const options = try parseArtifactArgs(&.{
+test "ha cmd artifact parses offline seed activation target and identity" {
+    const alloc = std.testing.allocator;
+    var options = try parseArtifactArgs(alloc, &.{
         "activate",
         "--generation",
         "seed-standby-a-10",
@@ -1421,6 +1554,7 @@ test "ha cmd parses offline seed activation target and identity" {
         "--target-pvc-uid",
         "pvc-uid-1",
     });
+    defer options.deinit(alloc);
     try std.testing.expectEqual(ArtifactAction.activate, options.action);
     try std.testing.expectEqualStrings("/target/.antfly-ha/staging", options.staging_root.?);
     try std.testing.expectEqualStrings("/target", options.target_root.?);
@@ -1431,7 +1565,7 @@ test "ha cmd parses offline seed activation target and identity" {
     try std.testing.expectEqualStrings("pvc-uid-1", options.binding.target_pvc_uid.?);
 }
 
-test "ha cmd parses lifecycle-gated source and target generation gc actions" {
+test "ha cmd artifact parses lifecycle-gated source and target generation gc actions" {
     const alloc = std.testing.allocator;
     var source = try parseArtifactArgs(alloc, &.{
         "gc-source",
@@ -1470,6 +1604,56 @@ test "ha cmd parses lifecycle-gated source and target generation gc actions" {
     try std.testing.expectEqual(ArtifactAction.gc_target, target.action);
     try std.testing.expectEqualStrings("/checkpoint/seeded-slot-activation.json", target.slot_activation_receipt_path.?);
     try std.testing.expectEqual(@as(usize, 1), target.protected_generations.len);
+}
+
+test "ha cmd artifact rejects flags that the selected action would ignore" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "prune",
+        "--location",
+        "s3://ha-seeds/cluster-a",
+        "--generation",
+        "seed-standby-a-42",
+        "--slot",
+        "standby-a",
+        "--protect-generation",
+        "seed-standby-a-41",
+    }));
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "gc-source",
+        "--target-root",
+        "/target",
+    }));
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "gc-target",
+        "--generation",
+        "seed-standby-a-42",
+    }));
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "publish",
+        "--retain-generations",
+        "2",
+    }));
+}
+
+test "ha cmd artifact rejects duplicate single-valued flags" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.DuplicateSeedArtifactFlag, parseArtifactArgs(alloc, &.{
+        "gc-source",
+        "--generation",
+        "seed-standby-a-42",
+        "--generation",
+        "seed-standby-a-43",
+    }));
+    try std.testing.expectError(error.DuplicateProtectedSeedGeneration, parseArtifactArgs(alloc, &.{
+        "gc-target",
+        "--protect-generation",
+        "seed-standby-a-41",
+        "--protect-generation",
+        "seed-standby-a-41",
+    }));
 }
 
 test "ha cmd parses remote admin URL before command" {
