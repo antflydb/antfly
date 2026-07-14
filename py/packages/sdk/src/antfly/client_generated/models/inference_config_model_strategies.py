@@ -15,16 +15,17 @@ T = TypeVar("T", bound="InferenceConfigModelStrategies")
 
 @_attrs_define
 class InferenceConfigModelStrategies:
-    """Per-model loading strategy overrides. Maps model names to their loading strategy.
-    Models not in this map use the default strategy based on keep_alive:
-    - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-    - If keep_alive="0": eager loading (load at startup, never unload)
+    """Per-model loading strategy overrides for runtimes that support them. Maps model
+    names to their loading strategy. Models not in this map follow `keep_alive`:
+    positive durations permit idle eviction, while "0" keeps a model resident after
+    it is loaded. Some compatibility runtimes also eagerly load models for "0".
 
     When a model has strategy "eager" in this map:
     - It is loaded at startup through the same startup warmup path
     - It is never unloaded, even when keep_alive>0 (pinned in memory)
 
-    This allows mixing eager and lazy models in the same pool.
+    Strategy support varies by runtime. Use `preload` for portable, deterministic
+    startup loading.
 
         Example:
             {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}

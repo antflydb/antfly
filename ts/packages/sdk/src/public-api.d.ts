@@ -15470,6 +15470,17 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Service unavailable because request capacity is exhausted. */
+            503: {
+                headers: {
+                    /** @description Recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
         };
     };
     rerankMultimodalPrompts: {

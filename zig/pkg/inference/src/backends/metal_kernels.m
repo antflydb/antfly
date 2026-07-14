@@ -14431,6 +14431,26 @@ static bool termite_metal_decode_runtime_select_embedding_cache(
     return false;
 }
 
+int termite_metal_decode_runtime_embedding_cache_contains(
+    termite_metal_decode_runtime *runtime,
+    uintptr_t source_id,
+    size_t rows,
+    size_t dim,
+    size_t bytes
+) {
+    if (runtime == NULL) return 0;
+    for (size_t slot = 0; slot < TERMITE_METAL_GENERIC_EMBEDDING_CACHE_CAPACITY; ++slot) {
+        termite_metal_embedding_table_cache_entry *entry = &runtime->generic_embedding_cache[slot];
+        if (entry->buffer != nil &&
+            entry->source_id == source_id &&
+            entry->source_offset == 0 &&
+            entry->rows == rows &&
+            entry->dim == dim &&
+            entry->bytes == bytes) return 1;
+    }
+    return 0;
+}
+
 static bool termite_metal_trace_embedding_cache_enabled(void) {
     const char *enabled = getenv("TERMITE_METAL_TRACE_EMBEDDING_CACHE");
     return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;

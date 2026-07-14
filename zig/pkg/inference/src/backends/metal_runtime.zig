@@ -1413,6 +1413,17 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
     return MetalTensor.owned(output, &shape);
 }
 
+pub fn decoderRuntimeEmbeddingCacheContains(
+    self: anytype,
+    cache_key: usize,
+    rows: usize,
+    dim: usize,
+    bytes: usize,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_embedding_cache_contains(runtime, cache_key, rows, dim, bytes) != 0;
+}
+
 pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -7229,6 +7240,13 @@ pub extern fn termite_metal_decode_runtime_prepare_embedding_table_keyed(
     source_id: usize,
     rows: usize,
     dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_embedding_cache_contains(
+    runtime: ?*RawMetalDecodeRuntime,
+    source_id: usize,
+    rows: usize,
+    dim: usize,
+    bytes: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_embedding_table_bf16(
     runtime: ?*RawMetalDecodeRuntime,

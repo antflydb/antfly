@@ -5867,6 +5867,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: Service unavailable because request capacity is exhausted.
+          headers:
+            Retry-After:
+              description: Recommended delay in seconds before retrying.
+              schema:
+                type: string
+                example: '1'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/rerank_multimodal:
     post:
       summary: Rerank multimodal documents by relevance
@@ -20829,6 +20841,7 @@ components:
           example: 5m
         max_loaded_models:
           type: integer
+          minimum: 0
           description: >
             Maximum total models loaded across all registry types (embedders, rerankers,
 

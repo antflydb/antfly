@@ -1571,6 +1571,7 @@ components:
           example: "5m"
         max_loaded_models:
           type: integer
+          minimum: 0
           description: |
             Maximum total models loaded across all registry types (embedders, rerankers,
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
@@ -1827,6 +1828,18 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Service unavailable because request capacity is exhausted.
+          headers:
+            Retry-After:
+              description: Recommended delay in seconds before retrying.
+              schema:
+                type: string
+                example: "1"
           content:
             application/json:
               schema:

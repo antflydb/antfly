@@ -7491,14 +7491,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // request budget, so they deliberately use the non-persistent path.
         if (self.provider_pool_slot != 0) return null;
         const budget = self.run_budget orelse return null;
-        const limit_bytes = budget.limits.backend_limit_bytes;
-        if (limit_bytes == 0) return @intFromPtr(entry);
-
         const table_bytes = std.math.mul(usize, rows, dim) catch return null;
         const table_f32_bytes = std.math.mul(usize, table_bytes, @sizeOf(f32)) catch return null;
+        const cache_key = @intFromPtr(entry);
+        if (metal_runtime.decoderRuntimeEmbeddingCacheContains(
+            self.provider_impl,
+            cache_key,
+            rows,
+            dim,
+            table_f32_bytes,
+        )) return cache_key;
+
+        const limit_bytes = budget.limits.backend_limit_bytes;
+        if (limit_bytes == 0) return cache_key;
         const snapshot = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         const current_bytes = std.math.cast(usize, snapshot.total_bytes) orelse limit_bytes;
-        if (persistentEmbeddingCacheFits(limit_bytes, current_bytes, table_f32_bytes)) return @intFromPtr(entry);
+        if (persistentEmbeddingCacheFits(limit_bytes, current_bytes, table_f32_bytes)) return cache_key;
 
         if (!self.embedding_cache_budget_denial_noted) {
             const reported_current = @min(current_bytes, std.math.maxInt(usize) - table_f32_bytes);
@@ -15159,12 +15167,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var weight_mt = try self.ownedMetalTensorFromCt(weight);
         defer weight_mt.deinit();
+        if (weight_mt.ndim() != 2 or weight_mt.dim(0) <= 0 or
+            @as(usize, @intCast(weight_mt.dim(1))) != dim)
+        {
+            return error.InvalidTensorShape;
+        }
+        const rows: usize = @intCast(weight_mt.dim(0));
         var embedding = (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
             .weight = weight_mt,
             .ids = token_ids,
             .total = token_ids.len,
             .dim = dim,
-            .cache_key = if (weight_buf.lazy_entry) |entry| @intFromPtr(entry) else null,
+            .cache_key = self.persistentEmbeddingCacheKey(weight_buf, rows, dim),
         })) orelse return null;
         errdefer embedding.deinit();
         return scaleDecodeTensor(self, embedding, scale);
@@ -20212,6 +20226,7 @@ test "metal_compute: f32 embedding cache uses loaded weight identity" {
     }
     try std.testing.expect(first_snapshot.embedding_bytes > 0);
 
+    run_budget.limits.backend_limit_bytes = 1;
     var second = try MetalCompute.initWithIo(allocator, &metal_ws, &run_budget, std.testing.io);
     defer second.deinit();
     try std.testing.expectEqual(first_provider, @intFromPtr(second.provider_impl));
@@ -20231,6 +20246,23 @@ test "metal_compute: f32 embedding cache uses loaded weight identity" {
     const second_snapshot = metal_runtime_mod.runtimeMemorySnapshot(runtime);
     try std.testing.expectEqual(first_snapshot.embedding_bytes, second_snapshot.embedding_bytes);
     try std.testing.expectEqual(first_snapshot.embedding_logical_bytes, second_snapshot.embedding_logical_bytes);
+    try std.testing.expectEqual(first_snapshot.embedding_cache_hits + 1, second_snapshot.embedding_cache_hits);
+
+    // A different decode table must take the non-persistent path under the
+    // tight budget above.
+    var denied_identity: gpu_hosted_store_mod.LazyWeightEntry = .{
+        .tensor_ref = .{ .name = "test.embedding.denied.weight" },
+    };
+    const denied_data = try allocator.dupe(f32, &weight_data);
+    const denied_weight = try MetalCompute.denseBuf(allocator, denied_data, true, &shape);
+    MetalCompute.toBuf(denied_weight).lazy_entry = &denied_identity;
+    defer second_cb.free(denied_weight);
+    var denied_output = (try second.lookupDecodeEmbeddingTensor(denied_weight, &ids, 4, 1.0)) orelse
+        return error.UnsupportedTensorType;
+    defer denied_output.deinit();
+    const denied_snapshot = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(second_snapshot.embedding_bytes, denied_snapshot.embedding_bytes);
+    try std.testing.expectEqual(second_snapshot.embedding_logical_bytes, denied_snapshot.embedding_logical_bytes);
 }
 
 test "metal_compute: paged decode attention matches native on f32 cache" {

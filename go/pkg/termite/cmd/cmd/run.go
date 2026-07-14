@@ -15,6 +15,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
@@ -44,6 +45,11 @@ func init() {
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
+	maxLoadedModels := viper.GetInt("max_loaded_models")
+	if maxLoadedModels < 0 {
+		return fmt.Errorf("max_loaded_models must be at least 0")
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -64,7 +70,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		ModelsDir:       modelsDir, // Set from --models-dir flag (defaults to ~/.termite/models)
 		BackendPriority: viper.GetStringSlice("backend_priority"),
 		KeepAlive:       viper.GetString("keep_alive"),
-		MaxLoadedModels: viper.GetInt("max_loaded_models"),
+		MaxLoadedModels: maxLoadedModels,
 		MaxMemoryMb:     viper.GetInt("max_memory_mb"),
 		Preload:         preloadModelRefs(viper.GetStringSlice("preload")),
 	}

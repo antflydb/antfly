@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.inference_content_security_config import InferenceContentSecurityConfig
     from ..models.inference_credentials import InferenceCredentials
     from ..models.inference_model_ref import InferenceModelRef
+    from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
     from ..models.inferenceschemas_config import InferenceschemasConfig
 
 
@@ -42,21 +43,25 @@ class InferenceConfig:
              Example: ~/.antfly/inference/ml.
         content_security (InferenceContentSecurityConfig | Unset):
         s3_credentials (InferenceCredentials | Unset):
-        keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
-            Models are automatically unloaded after this duration of inactivity.
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
-            where all models are loaded at startup and never unloaded.
+        keep_alive (str | Unset): Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that
+            support idle eviction may unload a model after this duration of inactivity.
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+            Defaults to "5m". Set to "0" to keep loaded models resident without idle
+            eviction. For compatibility, some runtimes also eagerly load discovered
+            models in this mode. Use `preload` when startup loading must be deterministic.
              Default: '5m'. Example: 5m.
         max_loaded_models (int | Unset): Maximum total models loaded across all registry types (embedders, rerankers,
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
             idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
              Default: 0. Example: 3.
-        pool_size (int | Unset): Number of concurrent inference pipelines per model. Each pipeline loads
-            a copy of the model, so higher values use more memory but allow more
-            concurrent requests. Note: pool_size multiplies per-model memory
-            independently of max_loaded_models.
+        pool_size (int | Unset): Number of reusable inference execution slots per model. Some runtimes realize
+            each slot as a complete pipeline, increasing both possible concurrency and
+            per-model memory; others pool lightweight backend providers, so memory and
+            throughput effects are backend-dependent. Generation and backends with shared
+            runtime state may remain serialized even when this is greater than one. Model
+            residency is controlled separately by `max_loaded_models`.
              Default: 1. Example: 1.
+        prompt_cache (InferencePromptCacheConfig | Unset): Native generator prompt KV cache configuration.
         backend_priority (list[str] | Unset): Backend priority order for model loading with optional device specifiers.
             Format: `backend` or `backend:device` where device defaults to `auto`.
 
@@ -92,17 +97,18 @@ class InferenceConfig:
             usage depends on model sizes and may temporarily exceed this value.
             Works alongside max_loaded_models for fine-grained control.
              Default: 0. Example: 4096.
-        model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps model
-            names to their loading strategy.
-            Models not in this map use the default strategy based on keep_alive:
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-            - If keep_alive="0": eager loading (load at startup, never unload)
+        model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides for runtimes
+            that support them. Maps model
+            names to their loading strategy. Models not in this map follow `keep_alive`:
+            positive durations permit idle eviction, while "0" keeps a model resident after
+            it is loaded. Some compatibility runtimes also eagerly load models for "0".
 
             When a model has strategy "eager" in this map:
             - It is loaded at startup through the same startup warmup path
             - It is never unloaded, even when keep_alive>0 (pinned in memory)
 
-            This allows mixing eager and lazy models in the same pool.
+            Strategy support varies by runtime. Use `preload` for portable, deterministic
+            startup loading.
              Example: {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}.
         allow_downloads (bool | Unset): Whether the dashboard should show model download commands.
             Defaults to true for standalone/swarm mode. Set to false in managed
@@ -120,6 +126,7 @@ class InferenceConfig:
     keep_alive: str | Unset = "5m"
     max_loaded_models: int | Unset = 0
     pool_size: int | Unset = 1
+    prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[str] | Unset = UNSET
     max_concurrent_requests: int | Unset = 0
     max_queue_size: int | Unset = 0
@@ -153,6 +160,10 @@ class InferenceConfig:
         max_loaded_models = self.max_loaded_models
 
         pool_size = self.pool_size
+
+        prompt_cache: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.prompt_cache, Unset):
+            prompt_cache = self.prompt_cache.to_dict()
 
         backend_priority: list[str] | Unset = UNSET
         if not isinstance(self.backend_priority, Unset):
@@ -206,6 +217,8 @@ class InferenceConfig:
             field_dict["max_loaded_models"] = max_loaded_models
         if pool_size is not UNSET:
             field_dict["pool_size"] = pool_size
+        if prompt_cache is not UNSET:
+            field_dict["prompt_cache"] = prompt_cache
         if backend_priority is not UNSET:
             field_dict["backend_priority"] = backend_priority
         if max_concurrent_requests is not UNSET:
@@ -233,6 +246,7 @@ class InferenceConfig:
         from ..models.inference_content_security_config import InferenceContentSecurityConfig
         from ..models.inference_credentials import InferenceCredentials
         from ..models.inference_model_ref import InferenceModelRef
+        from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
         from ..models.inferenceschemas_config import InferenceschemasConfig
 
         d = dict(src_dict)
@@ -263,6 +277,13 @@ class InferenceConfig:
         max_loaded_models = d.pop("max_loaded_models", UNSET)
 
         pool_size = d.pop("pool_size", UNSET)
+
+        _prompt_cache = d.pop("prompt_cache", UNSET)
+        prompt_cache: InferencePromptCacheConfig | Unset
+        if isinstance(_prompt_cache, Unset):
+            prompt_cache = UNSET
+        else:
+            prompt_cache = InferencePromptCacheConfig.from_dict(_prompt_cache)
 
         backend_priority = cast(list[str], d.pop("backend_priority", UNSET))
 
@@ -309,6 +330,7 @@ class InferenceConfig:
             keep_alive=keep_alive,
             max_loaded_models=max_loaded_models,
             pool_size=pool_size,
+            prompt_cache=prompt_cache,
             backend_priority=backend_priority,
             max_concurrent_requests=max_concurrent_requests,
             max_queue_size=max_queue_size,

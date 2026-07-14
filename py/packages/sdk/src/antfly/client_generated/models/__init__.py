@@ -370,6 +370,8 @@ from .inference_predictor_task import InferencePredictorTask
 from .inference_predictors_response import InferencePredictorsResponse
 from .inference_predictors_response_object import InferencePredictorsResponseObject
 from .inference_predictors_response_predictors import InferencePredictorsResponsePredictors
+from .inference_prompt_cache_config import InferencePromptCacheConfig
+from .inference_prompt_cache_config_mode import InferencePromptCacheConfigMode
 from .inference_provider_type import InferenceProviderType
 from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
@@ -1013,6 +1015,8 @@ __all__ = (
     "InferencePredictorTask",
     "InferencePredictRequest",
     "InferencePredictResponse",
+    "InferencePromptCacheConfig",
+    "InferencePromptCacheConfigMode",
     "InferenceProviderType",
     "InferenceReadObject",
     "InferenceReadObjectObject",

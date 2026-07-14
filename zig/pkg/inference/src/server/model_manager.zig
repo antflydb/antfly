@@ -1096,6 +1096,7 @@ pub const ModelManager = struct {
         done: bool = false,
         model: ?*LoadedModel = null,
         err: ?anyerror = null,
+        preferred_backends: []const backends.BackendType = &.{},
     };
 
     allocator: std.mem.Allocator,
@@ -1363,15 +1364,12 @@ pub const ModelManager = struct {
     fn pendingLoadKey(
         self: *ModelManager,
         model_dir: []const u8,
-        preferred_backends: []const backends.BackendType,
+        _: []const backends.BackendType,
     ) ![]u8 {
-        const key = try self.allocator.alloc(u8, model_dir.len + 1 + preferred_backends.len);
-        @memcpy(key[0..model_dir.len], model_dir);
-        key[model_dir.len] = 0xff;
-        for (preferred_backends, key[model_dir.len + 1 ..]) |backend, *encoded| {
-            encoded.* = @intFromEnum(backend);
-        }
-        return key;
+        // Serialize cold loads per model. Waiters re-check their own backend
+        // preferences after the active flight completes, preserving fallback
+        // semantics without loading the same backend twice.
+        return self.allocator.dupe(u8, model_dir);
     }
 
     fn lockPendingModelLoads(self: *ModelManager) std.Io {
@@ -1393,6 +1391,9 @@ pub const ModelManager = struct {
         if (pending.users != 0) return;
         const removed = self.pending_model_loads.fetchRemove(key).?;
         self.allocator.free(removed.key);
+        if (removed.value.preferred_backends.len != 0) {
+            self.allocator.free(removed.value.preferred_backends);
+        }
         self.allocator.destroy(removed.value);
     }
 
@@ -1644,66 +1645,86 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !*LoadedModel {
-        if (try self.lookupPreferredAndTouch(model_dir, preferred_backends)) |model| {
-            if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
-            return model;
-        }
-
         const pending_key = try self.pendingLoadKey(model_dir, preferred_backends);
         defer self.allocator.free(pending_key);
 
-        const coordination_io = self.lockPendingModelLoads();
-        if (self.pending_model_loads.get(pending_key)) |pending| {
-            const model = try self.waitForPendingModelLoadLocked(coordination_io, pending_key, pending);
-            if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
-            return model;
-        }
+        while (true) {
+            if (try self.lookupPreferredAndTouch(model_dir, preferred_backends)) |model| {
+                if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
+                return model;
+            }
 
-        // Close the cache-miss/flight-claim race while holding the flight map
-        // lock. Publication never holds the manager state lock while taking
-        // this lock, so the short nested lookup cannot deadlock a loader.
-        const cached = self.lookupPreferredAndTouch(model_dir, preferred_backends) catch |err| {
-            self.pending_model_loads_lock.unlock(coordination_io);
-            return err;
-        };
-        if (cached) |model| {
-            self.pending_model_loads_lock.unlock(coordination_io);
-            if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
-            return model;
-        }
+            const coordination_io = self.lockPendingModelLoads();
+            if (self.pending_model_loads.get(pending_key)) |pending| {
+                const same_preferences = std.mem.eql(
+                    backends.BackendType,
+                    pending.preferred_backends,
+                    preferred_backends,
+                );
+                if (pending.done and !same_preferences) {
+                    self.pending_model_loads_lock.unlock(coordination_io);
+                    platform.time.yieldBriefly();
+                    continue;
+                }
+                _ = self.waitForPendingModelLoadLocked(coordination_io, pending_key, pending) catch |err| {
+                    if (same_preferences) return err;
+                    continue;
+                };
+                continue;
+            }
 
-        const stored_key = self.allocator.dupe(u8, pending_key) catch |err| {
-            self.pending_model_loads_lock.unlock(coordination_io);
-            return err;
-        };
-        const pending = self.allocator.create(PendingModelLoad) catch |err| {
-            self.allocator.free(stored_key);
-            self.pending_model_loads_lock.unlock(coordination_io);
-            return err;
-        };
-        pending.* = .{};
-        self.pending_model_loads.put(self.allocator, stored_key, pending) catch |err| {
-            self.allocator.destroy(pending);
-            self.allocator.free(stored_key);
-            self.pending_model_loads_lock.unlock(coordination_io);
-            return err;
-        };
-        self.pending_model_loads_lock.unlock(coordination_io);
+            // Close the cache-miss/flight-claim race while holding the flight
+            // map lock. Publication never takes this lock while holding state.
+            const cached = self.lookupPreferredAndTouch(model_dir, preferred_backends) catch |err| {
+                self.pending_model_loads_lock.unlock(coordination_io);
+                return err;
+            };
+            if (cached) |model| {
+                self.pending_model_loads_lock.unlock(coordination_io);
+                if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
+                return model;
+            }
 
-        self.reserveLoadSlot() catch |err| {
-            self.finishPendingModelLoad(pending_key, null, err);
-            return err;
-        };
-        var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
-        const loaded = self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias) catch |err| {
+            const stored_key = self.allocator.dupe(u8, pending_key) catch |err| {
+                self.pending_model_loads_lock.unlock(coordination_io);
+                return err;
+            };
+            const stored_preferences = self.allocator.dupe(backends.BackendType, preferred_backends) catch |err| {
+                self.allocator.free(stored_key);
+                self.pending_model_loads_lock.unlock(coordination_io);
+                return err;
+            };
+            const pending = self.allocator.create(PendingModelLoad) catch |err| {
+                self.allocator.free(stored_preferences);
+                self.allocator.free(stored_key);
+                self.pending_model_loads_lock.unlock(coordination_io);
+                return err;
+            };
+            pending.* = .{ .preferred_backends = stored_preferences };
+            self.pending_model_loads.put(self.allocator, stored_key, pending) catch |err| {
+                self.allocator.destroy(pending);
+                self.allocator.free(stored_preferences);
+                self.allocator.free(stored_key);
+                self.pending_model_loads_lock.unlock(coordination_io);
+                return err;
+            };
+            self.pending_model_loads_lock.unlock(coordination_io);
+
+            self.reserveLoadSlot() catch |err| {
+                self.finishPendingModelLoad(pending_key, null, err);
+                return err;
+            };
+            var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
+            const loaded = self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias) catch |err| {
+                self.releaseLoadSlot();
+                self.finishPendingModelLoad(pending_key, null, err);
+                return err;
+            };
             self.releaseLoadSlot();
-            self.finishPendingModelLoad(pending_key, null, err);
-            return err;
-        };
-        self.releaseLoadSlot();
 
-        self.finishPendingModelLoad(pending_key, loaded, null);
-        return loaded;
+            self.finishPendingModelLoad(pending_key, loaded, null);
+            return loaded;
+        }
     }
 
     fn loadFromDirUncached(
@@ -2059,6 +2080,18 @@ test "model manager loaded-model limit is hard and zero is unlimited" {
     try std.testing.expect(!modelLimitExceeded(0, std.math.maxInt(usize)));
     try std.testing.expect(!modelLimitExceeded(2, 2));
     try std.testing.expect(modelLimitExceeded(2, 3));
+}
+
+test "model manager cold-load flight key is shared across backend preferences" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+
+    const automatic = try manager.pendingLoadKey("model", &.{ .metal, .native });
+    defer std.testing.allocator.free(automatic);
+    const explicit = try manager.pendingLoadKey("model", &.{.metal});
+    defer std.testing.allocator.free(explicit);
+
+    try std.testing.expectEqualStrings(automatic, explicit);
 }
 
 test "model manager eviction follows the oldest active request watermark" {
