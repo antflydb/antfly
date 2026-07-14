@@ -876,6 +876,7 @@ test "storage.ha seed activation gc requires the durable seeded-slot activation 
 
 test "storage.ha seed activation binds startup evidence and revalidates installed bytes on restart" {
     const alloc = std.testing.allocator;
+    const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -903,6 +904,7 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
         .target_root = target_root,
         .expected = expected,
         .binding = binding,
+        .pod_uid = "pod-activation-1",
     });
     defer activated.deinit(alloc);
     var receipt = try std.json.parseFromSlice(ActivationReceipt, alloc, activated.active_receipt_json, .{});
@@ -910,6 +912,29 @@ test "storage.ha seed activation binds startup evidence and revalidates installe
     try std.testing.expectEqualStrings("topology-a", receipt.value.topology_id);
     try std.testing.expectEqual(@as(u64, 3), receipt.value.topology_generation);
     try std.testing.expectEqualStrings("pvc-uid-1", receipt.value.target_pvc_uid);
+
+    var ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, target_root, .{});
+    var page = try ledger.readPage(alloc, .activation, .{ .limit = 10 }, .{ .authoritative_root = target_root });
+    try std.testing.expectEqual(@as(usize, 1), page.entries.len);
+    try std.testing.expectEqualStrings(activated.active_receipt_json, page.entries[0].receipt_json);
+    try std.testing.expectEqualStrings("pod-activation-1", page.entries[0].pod_uid.?);
+    page.deinit(alloc);
+    ledger.close();
+
+    var repeated = try activate(alloc, .{
+        .staging_root = staging_root,
+        .target_root = target_root,
+        .expected = expected,
+        .binding = binding,
+        .pod_uid = "pod-activation-retry",
+    });
+    defer repeated.deinit(alloc);
+    try std.testing.expect(repeated.already_active);
+    ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, target_root, .{});
+    defer ledger.close();
+    var after_retry = try ledger.readPage(alloc, .activation, .{ .limit = 10 }, .{ .authoritative_root = target_root });
+    defer after_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), after_retry.entries.len);
 
     const expectation = StartupExpectation{
         .target_root = target_root,

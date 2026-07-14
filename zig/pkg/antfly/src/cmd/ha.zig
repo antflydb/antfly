@@ -1565,6 +1565,46 @@ test "ha cmd artifact parses offline seed activation target and identity" {
     try std.testing.expectEqualStrings("pvc-uid-1", options.binding.target_pvc_uid.?);
 }
 
+test "ha cmd artifact accepts portable publish and restore topology pvc binding" {
+    const alloc = std.testing.allocator;
+    const binding_args = [_][]const u8{
+        "--topology-id",         "topology-a",
+        "--topology-generation", "9",
+        "--node-id",             "primary-a",
+        "--target-pvc-name",     "standby-a-data",
+        "--target-pvc-uid",      "pvc-uid-9",
+    };
+    var publish_argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer publish_argv.deinit(alloc);
+    try publish_argv.appendSlice(alloc, &.{
+        "publish",        "--location",      "s3://ha-seeds/topology-a",
+        "--generation",   "seed-9",          "--slot",
+        "standby-a",      "--manifest",      "/source/manifest.afha",
+        "--content-root", "/source/content",
+    });
+    try publish_argv.appendSlice(alloc, &binding_args);
+    var publish = try parseArtifactArgs(alloc, publish_argv.items);
+    defer publish.deinit(alloc);
+    const publish_binding = (try publish.binding.finish()) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("topology-a", publish_binding.topology_id);
+    try std.testing.expectEqual(@as(u64, 9), publish_binding.topology_generation);
+    try std.testing.expectEqualStrings("pvc-uid-9", publish_binding.target_pvc_uid);
+
+    var restore_argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer restore_argv.deinit(alloc);
+    try restore_argv.appendSlice(alloc, &.{
+        "restore",         "--location",     "s3://ha-seeds/topology-a",
+        "--generation",    "seed-9",         "--slot",
+        "standby-a",       "--staging-root", "/target/staging",
+        "--ha-cluster-id", "1",              "--ha-timeline-id",
+        "1",               "--ha-epoch",     "1",
+    });
+    try restore_argv.appendSlice(alloc, &binding_args);
+    var restore = try parseArtifactArgs(alloc, restore_argv.items);
+    defer restore.deinit(alloc);
+    try std.testing.expect((try restore.binding.finish()) != null);
+}
+
 test "ha cmd artifact parses lifecycle-gated source and target generation gc actions" {
     const alloc = std.testing.allocator;
     var source = try parseArtifactArgs(alloc, &.{

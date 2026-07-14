@@ -1668,3 +1668,96 @@ test "storage.ha seed artifact prunes older complete generations publish marker 
     defer alloc.free(retained);
     try std.testing.expect(retained.len > 0);
 }
+
+test "storage.ha portable seed v3 binds immutable COMPLETE to topology node and target pvc" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
+    defer alloc.free(content_root);
+    const source_path = try std.fs.path.join(alloc, &.{ content_root, "catalog/manifest" });
+    defer alloc.free(source_path);
+    try writeTestFile(alloc, source_path, "catalog-v3");
+    const files = [_]backup_manifest.FileEntry{.{
+        .path = "catalog/manifest",
+        .kind = .manifest,
+        .size_bytes = 10,
+        .crc32 = backup_manifest.crc32("catalog-v3"),
+    }};
+    const manifest_bytes = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = testIdentity(),
+        .manifest_id = "seed-bound-v3",
+        .backup_lsn = 8,
+        .checkpoint_lsn = 11,
+        .files = &files,
+    });
+    defer alloc.free(manifest_bytes);
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("ha-seeds");
+    const store = Store{ .client = &client, .bucket = "ha-seeds", .prefix = "topology-a" };
+    const binding = LifecycleBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 9,
+        .node_id = "primary-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-9",
+    };
+    var published = try publish(alloc, store, .{
+        .generation = "seed-bound-v3",
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest_bytes,
+        .content_root = content_root,
+        .binding = binding,
+    });
+    defer published.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(Receipt, alloc, published.receipt_json, .{ .ignore_unknown_fields = false });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 3), parsed.value.format_version);
+    try std.testing.expectEqualStrings(binding.topology_id, parsed.value.topology_id);
+    try std.testing.expectEqual(binding.topology_generation, parsed.value.topology_generation);
+    try std.testing.expectEqualStrings(binding.node_id, parsed.value.node_id);
+    try std.testing.expectEqualStrings(binding.target_pvc_name, parsed.value.target_pvc_name);
+    try std.testing.expectEqualStrings(binding.target_pvc_uid, parsed.value.target_pvc_uid);
+
+    const complete_key = try generationKeyAlloc(alloc, store.prefix, "seed-bound-v3", complete_name);
+    defer alloc.free(complete_key);
+    var before = try client.statObject(store.bucket, complete_key);
+    defer before.deinit(alloc);
+    try std.testing.expectEqualStrings("application/json", before.content_type.?);
+
+    var repeated = try publish(alloc, store, .{
+        .generation = "seed-bound-v3",
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest_bytes,
+        .content_root = content_root,
+        .binding = binding,
+    });
+    defer repeated.deinit(alloc);
+    try std.testing.expect(repeated.already_available);
+    try std.testing.expectEqualStrings(published.receipt_json, repeated.receipt_json);
+    var after = try client.statObject(store.bucket, complete_key);
+    defer after.deinit(alloc);
+    try std.testing.expectEqualStrings(before.etag.?, after.etag.?);
+
+    var wrong_target = binding;
+    wrong_target.target_pvc_uid = "pvc-uid-other";
+    try std.testing.expectError(error.GenerationConflict, publish(alloc, store, .{
+        .generation = "seed-bound-v3",
+        .slot_name = "standby-a",
+        .manifest_bytes = manifest_bytes,
+        .content_root = content_root,
+        .binding = wrong_target,
+    }));
+    try std.testing.expectError(error.WrongArtifactTargetPVCUID, verifyRemote(alloc, store, .{
+        .generation = "seed-bound-v3",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+        .binding = wrong_target,
+    }, .{}));
+}

@@ -1435,3 +1435,73 @@ test "storage.ha seed capture gc requires a remotely verified v2 COMPLETE checkp
     try std.testing.expectEqual(@as(usize, 0), pruned.deleted_generations);
     try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
 }
+
+test "storage.ha seed capture v2 binds COMPLETE and journals publication before success" {
+    const alloc = std.testing.allocator;
+    const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const paths = try testPrimaryPaths(alloc, root, "capture-bound");
+    defer paths.deinit(alloc);
+    var primary = try primary_mod.Primary.open(alloc, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    var barrier: mutation_barrier.MutationBarrier = .{};
+    const source_path = try std.fs.path.join(alloc, &.{ root, "live/catalog" });
+    defer alloc.free(source_path);
+    try writeTestFile(source_path, "catalog-v2");
+    const capture_root = try std.fs.path.join(alloc, &.{ root, "captures" });
+    defer alloc.free(capture_root);
+    const sources = [_]Source{.{ .file = .{
+        .source_path = source_path,
+        .artifact_path = "catalog/manifest",
+        .kind = .manifest,
+    } }};
+    const binding = seed_artifact.LifecycleBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 9,
+        .node_id = "primary-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-9",
+    };
+    const request = CaptureRequest{
+        .primary = &primary,
+        .barrier = &barrier,
+        .slot_name = "standby-a",
+        .generation = "capture-bound",
+        .capture_root = capture_root,
+        .sources = &sources,
+        .binding = binding,
+        .pod_uid = "pod-primary-1",
+    };
+    var captured = try capture(alloc, request);
+    defer captured.deinit(alloc);
+    var receipt = try std.json.parseFromSlice(CaptureReceipt, alloc, captured.receipt_json, .{ .ignore_unknown_fields = false });
+    defer receipt.deinit();
+    try std.testing.expectEqual(@as(u16, 2), receipt.value.format_version);
+    try std.testing.expectEqualStrings(binding.topology_id, receipt.value.topology_id);
+    try std.testing.expectEqual(binding.topology_generation, receipt.value.topology_generation);
+    try std.testing.expectEqualStrings(binding.node_id, receipt.value.node_id);
+    try std.testing.expectEqualStrings(binding.target_pvc_uid, receipt.value.target_pvc_uid);
+
+    var ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, capture_root, .{});
+    defer ledger.close();
+    var page = try ledger.readPage(alloc, .capture, .{ .limit = 10 }, .{ .authoritative_root = capture_root });
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.entries.len);
+    try std.testing.expectEqualStrings(captured.receipt_json, page.entries[0].receipt_json);
+
+    var changed_binding = binding;
+    changed_binding.target_pvc_uid = "pvc-uid-other";
+    var conflicting = request;
+    conflicting.binding = changed_binding;
+    try std.testing.expectError(error.CaptureBindingMismatch, capture(alloc, conflicting));
+
+    var repeated = try capture(alloc, request);
+    defer repeated.deinit(alloc);
+    try std.testing.expect(repeated.already_captured);
+    var after_retry = try ledger.readPage(alloc, .capture, .{ .limit = 10 }, .{ .authoritative_root = capture_root });
+    defer after_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), after_retry.entries.len);
+}
