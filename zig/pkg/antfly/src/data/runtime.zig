@@ -16454,7 +16454,7 @@ test "data server wires configured HA executors into API server" {
     try health.metricsWriter().writeMetrics(&writer);
     const metrics = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_retained_age_ns 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_reseed_recommended 1\n") != null);
