@@ -385,13 +385,13 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
 
 
-def test_stateful_table_rejects_document_full_text_create_index_with_inline_enrichments(stateful_api):
-    table_name = f"document_full_text_rejected_{time.time_ns()}"
+def test_stateful_table_accepts_document_full_text_create_index_with_inline_enrichments(stateful_api):
+    table_name = f"document_full_text_inline_{time.time_ns()}"
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    with pytest.raises(requests.HTTPError) as exc_info:
+    assert (
         stateful_api.create_index(
             table_name,
             "document_text",
@@ -418,7 +418,11 @@ def test_stateful_table_rejects_document_full_text_create_index_with_inline_enri
                 ],
             },
         )
-    assert exc_info.value.response.status_code == 400
+        == {}
+    )
+    detail = stateful_api.get_index(table_name, "document_text")
+    assert detail["config"]["type"] == "full_text"
+    assert detail["config"]["artifact_name"] == "document_chunks_v1"
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):
