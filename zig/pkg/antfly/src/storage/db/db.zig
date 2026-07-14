@@ -47350,6 +47350,74 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
 }
 
+test "storage.ha seed capture barrier prevents local commit without matching wal" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.heap.c_allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 251,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var barrier: HAMutationBarrier = .{};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    var capture = barrier.acquireExclusive();
+    var write_probe = ConcurrentWriteProbe{ .db = &db };
+    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    errdefer {
+        capture.release();
+        write_thread.join();
+    }
+
+    try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
+    var still_blocked = true;
+    var attempts: usize = 0;
+    while (attempts < 10_000) : (attempts += 1) {
+        if (write_probe.done.load(.monotonic) != 0 or write_probe.failed.load(.monotonic) != 0) {
+            still_blocked = false;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expect(still_blocked);
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+    try std.testing.expect((try db.get(alloc, "doc:b")) == null);
+
+    capture.release();
+    write_thread.join();
+    try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
+}
+
 test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
     const alloc = std.testing.allocator;
 
