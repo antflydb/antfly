@@ -49,6 +49,8 @@ pub const TraceEventType = enum {
     send_message,
     receive_message,
     replicate,
+    change_conf,
+    apply_conf_change,
 };
 
 pub const TraceEvent = struct {
@@ -67,6 +69,8 @@ pub const TraceEvent = struct {
     learners_next: []const types.NodeId,
     auto_leave: bool,
     message: ?*const message_mod.Message = null,
+    conf_changes: []const types.ConfChangeSingle = &.{},
+    conf_transition: types.ConfChangeTransition = .auto,
 };
 
 pub const TraceLogger = struct {

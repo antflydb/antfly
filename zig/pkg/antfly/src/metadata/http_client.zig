@@ -287,6 +287,21 @@ pub const MetadataHttpClient = struct {
         try self.requestWithBody(base_uri, .PUT, path, schema_json, error.InvalidSchemaUpdateRequest, error.TableNotFound, null);
     }
 
+    pub fn replaceTableDefinition(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_definition_suffix,
+        });
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .PUT, path, body, error.InvalidTableDefinitionReplacement, error.TableNotFound, error.TableGenerationChanged);
+    }
+
     pub fn restoreTable(
         self: *MetadataHttpClient,
         base_uri: []const u8,

@@ -113,7 +113,7 @@ What already exists:
 - real Postgres CDC E2E coverage now exists in `e2e/test_cdc.py` for:
   - snapshot import
   - logical-stream insert/update/delete
-  - restart/resume on the unified `swarm` entrypoint with persisted
+  - restart/resume on the unified `standalone` entrypoint with persisted
     `prepared_checkpoint` and `stream_checkpoint`
   - publication recreation during streaming
   - terminal visibility for mid-stream logical slot loss
@@ -170,14 +170,14 @@ CDC follows the same ownership split as the Go implementation:
   table writes, so schema validation, indexing, enrichment, transactions, and
   shard movement semantics stay on the canonical path
 - the CDC router treats the metadata process as non-local for apply purposes,
-  even in `swarm`, so the same route is exercised in combined and split
+  even in `standalone`, so the same route is exercised in combined and split
   deployments
 - if placement, leader/store health, or store API URL is missing, CDC should
   surface a retryable route failure and resume from the persisted checkpoint
   after metadata/data topology converges
 
 The important constraint is that metadata owns CDC state, but it does not become
-the owner of table shard files. Distributed and swarm mode should both use the
+the owner of table shard files. Distributed and standalone mode should both use the
 metadata snapshot plus data API route for CDC apply; direct local shard access is
 only appropriate for explicitly local, non-HTTP test/service paths.
 
@@ -226,4 +226,4 @@ only appropriate for explicitly local, non-HTTP test/service paths.
 - [x] Build the first real Postgres logical replication tail transport
 - [x] Add richer durable CDC checkpointing
 - [x] Add end-to-end CDC tests
-- [x] Add restart/resume CDC E2E coverage on the unified stateful `swarm` path
+- [x] Add restart/resume CDC E2E coverage on the unified stateful `standalone` path

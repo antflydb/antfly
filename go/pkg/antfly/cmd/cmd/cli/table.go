@@ -215,22 +215,26 @@ func newBackupCmd() *cobra.Command {
 		Long: `Backs up one or more tables to a given location with a unique backup ID.
 
 Single table backup:
-  antfly backup --table users --backup-id my-backup --location file:///tmp/backups
+  antfly backup --table users --backup-id my-backup --location file:///tmp/backups --connection local-backups
 
 Bulk backup (all tables):
-  antfly backup --backup-id cluster-backup --location file:///tmp/backups
+  antfly backup --backup-id cluster-backup --location file:///tmp/backups --connection local-backups
 
 Bulk backup (selected tables):
-  antfly backup --tables users,products --backup-id selective-backup --location s3://bucket/path
+  antfly backup --tables users,products --backup-id selective-backup --location s3://bucket/path --connection archive
 
 List available backups:
-  antfly backup --list --location file:///tmp/backups`,
+  antfly backup --list --location file:///tmp/backups --connection local-backups`,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			return initClient(cmd, longTimeoutHTTPClient())
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			listBackups, _ := cmd.Flags().GetBool("list")
 			location, _ := cmd.Flags().GetString("location")
+			connection, _ := cmd.Flags().GetString("connection")
+			if connection == "" {
+				return fmt.Errorf("--connection is required for backup operations")
+			}
 			formatStr, _ := cmd.Flags().GetString("output")
 			format, err := parseOutputFormat(formatStr)
 			if err != nil {
@@ -240,7 +244,9 @@ List available backups:
 			// Handle --list flag
 			if listBackups {
 				if format == outputJSON {
-					backups, err := antflyClient.AntflyClient.ListBackups(cmd.Context(), location)
+					backups, err := antflyClient.AntflyClient.ListBackups(cmd.Context(), antfly.BackupListOptions{
+						Location: location, Connection: connection,
+					})
 					if err != nil {
 						return fmt.Errorf("list backups failed: %w", err)
 					}
@@ -258,7 +264,7 @@ List available backups:
 				if format != outputTable {
 					return fmt.Errorf("backup --list supports output formats table and json, got %q", formatStr)
 				}
-				if err := antflyClient.ListBackups(cmd.Context(), location); err != nil {
+				if err := antflyClient.ListBackups(cmd.Context(), location, connection); err != nil {
 					return fmt.Errorf("list backups failed: %w", err)
 				}
 				return nil
@@ -273,7 +279,7 @@ List available backups:
 				if backupID == "" {
 					backupID = fmt.Sprintf("backup-%s-%s", tableName, time.Now().Format("20060102150405"))
 				}
-				if err := antflyClient.Backup(cmd.Context(), tableName, backupID, location); err != nil {
+				if err := antflyClient.Backup(cmd.Context(), tableName, backupID, location, connection); err != nil {
 					return fmt.Errorf("backup failed: %w", err)
 				}
 				fmt.Fprintln(os.Stderr, "Backup command successful.")
@@ -285,7 +291,7 @@ List available backups:
 				backupID = fmt.Sprintf("cluster-backup-%s", time.Now().Format("20060102150405"))
 			}
 
-			if err := antflyClient.ClusterBackup(cmd.Context(), backupID, location, splitCSV(tablesStr)); err != nil {
+			if err := antflyClient.ClusterBackup(cmd.Context(), backupID, location, connection, splitCSV(tablesStr)); err != nil {
 				return fmt.Errorf("backup failed: %w", err)
 			}
 			fmt.Fprintln(os.Stderr, "Backup command successful.")
@@ -297,6 +303,7 @@ List available backups:
 	cmd.Flags().String("tables", "", "Comma-separated list of tables to backup (bulk mode)")
 	cmd.Flags().String("backup-id", "", "Unique ID for this backup")
 	cmd.Flags().String("location", "file:///tmp/antfly_backups", "Backup location (e.g., file:///path/to/dir or s3://bucket/path)")
+	cmd.Flags().String("connection", "", "Named external_io connection authorized for the backup location")
 	cmd.Flags().Bool("list", false, "List available backups at the location")
 	cmd.Flags().StringP("output", "o", "table", "Output format for --list: table, json")
 
@@ -310,13 +317,13 @@ func newRestoreCmd() *cobra.Command {
 		Long: `Restores one or more tables from a backup.
 
 Single table restore:
-  antfly restore --table users --backup-id my-backup --location file:///tmp/backups
+  antfly restore --table users --backup-id my-backup --location file:///tmp/backups --connection local-backups
 
 Bulk restore (all tables from backup):
-  antfly restore --backup-id cluster-backup --location file:///tmp/backups
+  antfly restore --backup-id cluster-backup --location file:///tmp/backups --connection local-backups
 
 Bulk restore (selected tables):
-  antfly restore --tables users,products --backup-id cluster-backup --location s3://bucket/path
+  antfly restore --tables users,products --backup-id cluster-backup --location s3://bucket/path --connection archive
 
 Restore modes (for bulk restore):
   - fail_if_exists: Abort if any table already exists (default)
@@ -330,15 +337,20 @@ Restore modes (for bulk restore):
 			tablesStr, _ := cmd.Flags().GetString("tables")
 			backupID, _ := cmd.Flags().GetString("backup-id")
 			location, _ := cmd.Flags().GetString("location")
+			connection, _ := cmd.Flags().GetString("connection")
+			idempotencyKey, _ := cmd.Flags().GetString("idempotency-key")
 			restoreMode, _ := cmd.Flags().GetString("mode")
 
 			if backupID == "" {
 				return fmt.Errorf("--backup-id is required for restore command")
 			}
+			if connection == "" {
+				return fmt.Errorf("--connection is required for restore command")
+			}
 
 			// Single table restore (--table flag provided)
 			if tableName != "" {
-				if err := antflyClient.Restore(cmd.Context(), tableName, backupID, location); err != nil {
+				if err := antflyClient.Restore(cmd.Context(), tableName, backupID, location, connection, idempotencyKey); err != nil {
 					return fmt.Errorf("restore failed: %w", err)
 				}
 				fmt.Fprintln(os.Stderr, "Restore command successfully initiated. It may take some time for the table to become fully available.")
@@ -346,7 +358,7 @@ Restore modes (for bulk restore):
 			}
 
 			// Bulk restore (no --table flag)
-			if err := antflyClient.ClusterRestore(cmd.Context(), backupID, location, splitCSV(tablesStr), restoreMode); err != nil {
+			if err := antflyClient.ClusterRestore(cmd.Context(), backupID, location, connection, splitCSV(tablesStr), restoreMode, idempotencyKey); err != nil {
 				return fmt.Errorf("restore failed: %w", err)
 			}
 			fmt.Fprintln(os.Stderr, "Restore command successfully initiated. It may take some time for the tables to become fully available.")
@@ -358,6 +370,8 @@ Restore modes (for bulk restore):
 	cmd.Flags().String("tables", "", "Comma-separated list of tables to restore (bulk mode)")
 	cmd.Flags().String("backup-id", "", "ID of the backup to restore from (required)")
 	cmd.Flags().String("location", "file:///tmp/antfly_backups", "Location of the backup (e.g., file:///path/to/dir or s3://bucket/path)")
+	cmd.Flags().String("connection", "", "Named external_io connection authorized for the backup location")
+	cmd.Flags().String("idempotency-key", "", "Stable key for safely retrying this restore request")
 	cmd.Flags().String("mode", "fail_if_exists", "Restore mode for bulk restore: fail_if_exists, skip_if_exists, overwrite")
 
 	return cmd

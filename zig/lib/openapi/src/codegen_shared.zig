@@ -44,6 +44,7 @@ pub fn queryParamsTypeName(arena: Allocator, op_id: []const u8) ![]const u8 {
 pub const CollectedParams = struct {
     path: []const types.Parameter,
     query: []const types.Parameter,
+    header: []const types.Parameter,
 };
 
 pub fn collectParameters(
@@ -54,6 +55,7 @@ pub fn collectParameters(
 ) !CollectedParams {
     var path_params = std.ArrayListUnmanaged(types.Parameter).empty;
     var query_params = std.ArrayListUnmanaged(types.Parameter).empty;
+    var header_params = std.ArrayListUnmanaged(types.Parameter).empty;
 
     for ([_][]const types.ParameterOrRef{ path_level, op_level }) |slice| {
         for (slice) |por| {
@@ -64,12 +66,13 @@ pub fn collectParameters(
             switch (p.in) {
                 .path => try path_params.append(arena, p),
                 .query => try query_params.append(arena, p),
+                .header => try header_params.append(arena, p),
                 else => {},
             }
         }
     }
 
-    return .{ .path = path_params.items, .query = query_params.items };
+    return .{ .path = path_params.items, .query = query_params.items, .header = header_params.items };
 }
 
 /// Extract the request body type from a RequestBodyOrRef.

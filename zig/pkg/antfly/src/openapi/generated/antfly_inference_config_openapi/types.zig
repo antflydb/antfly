@@ -96,7 +96,7 @@ pub const Config = struct {
     query_embedding_cache: ?QueryEmbeddingCacheConfig = null,
     /// Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that support idle eviction may unload a model after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to keep loaded models resident without idle eviction. For compatibility, some runtimes also eagerly load discovered models in this mode. Use `preload` when startup loading must be deterministic.
     keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited.
+    /// Maximum steady-state number of resident logical model instances. Manager-cached models and request-scoped specialized or composite pipelines share this budget. A composite pipeline counts as one logical model even when it owns multiple backend sessions. At capacity, one replacement may initialize while an idle cached model remains available; successful activation evicts that model. If no idle model is available, the request receives 503 Service Unavailable. Set to 0 for unlimited.
     max_loaded_models: ?i64 = null,
     /// Number of reusable inference execution slots per model. Some runtimes realize each slot as a complete pipeline, increasing both possible concurrency and per-model memory; others pool lightweight backend providers, so memory and throughput effects are backend-dependent. Generation and backends with shared runtime state may remain serialized even when this is greater than one. Model residency is controlled separately by `max_loaded_models`.
     pool_size: ?i64 = null,
@@ -110,13 +110,13 @@ pub const Config = struct {
     max_queue_size: ?i64 = null,
     /// Compatibility field retained for older configs. The Zig runtime does not currently apply a global request timeout from this value.
     request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. Specialized request-scoped pipelines are capacity-bounded but may still initialize on their first request.
     preload: ?[]const ModelRef = null,
-    /// Compatibility field for a future aggregate loaded-model memory limit. The Zig runtime does not currently enforce this value; use max_loaded_models for a hard residency bound. Set to 0 when unused (default).
+    /// Compatibility field for a future aggregate loaded-model memory limit. The Zig runtime does not currently enforce this value; use max_loaded_models for the logical-model admission and steady-state residency budget, not a byte limit. Set to 0 when unused (default).
     max_memory_mb: ?i64 = null,
     /// Per-model loading strategy overrides for runtimes that support them. Maps model names to their loading strategy. Models not in this map follow `keep_alive`: positive durations permit idle eviction, while "0" keeps a model resident after it is loaded. Some compatibility runtimes also eagerly load models for "0". When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) Strategy support varies by runtime. Use `preload` for portable, deterministic startup loading.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?antfly_logging_openapi.Config = null,
 };

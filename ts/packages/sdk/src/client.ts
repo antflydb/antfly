@@ -15,6 +15,7 @@ import type {
   ChatAgentTurnResult,
   ChatMessage,
   ChatStreamCallbacks,
+  ClusterRestoreRequest,
   ConnectionsResponse,
   CreateTableRequest,
   CreateUserRequest,
@@ -38,6 +39,7 @@ import type {
   QueryResponses,
   QueryResult,
   ResourceType,
+  RestoreJob,
   RestoreRequest,
   RetrievalAgentRequest,
   RetrievalAgentResult,
@@ -48,6 +50,23 @@ import type {
   User,
   WriteOptions,
 } from "./types.js";
+
+export interface RestoreOptions {
+  /** Stable key used to safely retry creation of the same restore job. */
+  idempotencyKey?: string;
+}
+
+export interface RestoreJobListOptions {
+  limit?: number;
+  cursor?: string;
+  phase?: RestoreJob["phase"];
+  scope?: RestoreJob["scope"];
+}
+
+export interface RestoreJobPage {
+  jobs: RestoreJob[];
+  next_cursor?: string;
+}
 
 export const DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20;
 export const DEFAULT_WRITE_MAX_RESPONSE_BYTES = 1 << 20;
@@ -915,12 +934,20 @@ export class AntflyClient {
     /**
      * Restore a table from backup
      */
-    restore: async (tableName: string, request: RestoreRequest) => {
+    restore: async (
+      tableName: string,
+      request: RestoreRequest,
+      options?: RestoreOptions
+    ): Promise<RestoreJob> => {
       const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/restore", {
         params: { path: { tableName } },
+        ...(options?.idempotencyKey
+          ? { headers: { "Idempotency-Key": options.idempotencyKey } }
+          : {}),
         body: request,
       });
       if (error) throw new Error(`Restore failed: ${error.error}`);
+      if (!data) throw new Error("Restore failed: unexpected empty response");
       return data;
     },
 
@@ -1264,6 +1291,69 @@ export class AntflyClient {
         results.push(doc);
       }
       return results;
+    },
+  };
+
+  /** Durable cluster restore job operations. */
+  restoreJobs = {
+    startCluster: async (
+      request: ClusterRestoreRequest,
+      options?: RestoreOptions
+    ): Promise<RestoreJob> => {
+      const { data, error } = await this.client.POST("/db/v1/restore", {
+        ...(options?.idempotencyKey
+          ? { headers: { "Idempotency-Key": options.idempotencyKey } }
+          : {}),
+        body: request,
+      });
+      if (error) throw new Error(`Cluster restore failed: ${error.error}`);
+      if (!data) throw new Error("Cluster restore failed: unexpected empty response");
+      return data;
+    },
+
+    get: async (jobId: string): Promise<RestoreJob> => {
+      const { data, error } = await this.client.GET("/db/v1/restore/jobs/{job_id}", {
+        params: { path: { job_id: jobId } },
+      });
+      if (error) throw new Error(`Get restore job failed: ${error.error}`);
+      if (!data) throw new Error("Get restore job failed: unexpected empty response");
+      return data;
+    },
+
+    list: async (options: RestoreJobListOptions = {}): Promise<RestoreJobPage> => {
+      const { data, error } = await this.client.GET("/db/v1/restore/jobs", {
+        params: { query: options },
+      });
+      if (error) throw new Error(`List restore jobs failed: ${error.error}`);
+      if (!data) throw new Error("List restore jobs failed: unexpected empty response");
+      return data;
+    },
+
+    listAll: async (
+      options: Omit<RestoreJobListOptions, "cursor"> = {}
+    ): Promise<RestoreJob[]> => {
+      const jobs: RestoreJob[] = [];
+      const seen = new Set<string>();
+      let cursor: string | undefined;
+      do {
+        const page = await this.restoreJobs.list({ ...options, cursor });
+        jobs.push(...page.jobs);
+        cursor = page.next_cursor;
+        if (cursor) {
+          if (seen.has(cursor)) throw new Error(`List restore jobs returned a repeated cursor: ${cursor}`);
+          seen.add(cursor);
+        }
+      } while (cursor);
+      return jobs;
+    },
+
+    cancel: async (jobId: string): Promise<RestoreJob> => {
+      const { data, error } = await this.client.DELETE("/db/v1/restore/jobs/{job_id}", {
+        params: { path: { job_id: jobId } },
+      });
+      if (error) throw new Error(`Cancel restore job failed: ${error.error}`);
+      if (!data) throw new Error("Cancel restore job failed: unexpected empty response");
+      return data;
     },
   };
 

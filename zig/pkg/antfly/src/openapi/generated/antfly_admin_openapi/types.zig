@@ -474,6 +474,93 @@ pub const StandbyBootstrapRequest = struct {
     content_root: ?[]const u8 = null,
 };
 
+pub const StorageMaintenanceJob = struct {
+    /// Opaque non-sequential job identifier.
+    job_id: i64,
+    operation: StorageMaintenanceOperation,
+    state: StorageMaintenanceState,
+    created_at_ms: i64,
+    started_at_ms: ?i64 = null,
+    completed_at_ms: ?i64 = null,
+    result: ?StorageMaintenanceResult = null,
+    @"error": ?[]const u8 = null,
+};
+
+pub const StorageMaintenanceOperation = enum {
+    check,
+    compact,
+    vacuum,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .check => "check",
+            .compact => "compact",
+            .vacuum => "vacuum",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "check", .check },
+            .{ "compact", .compact },
+            .{ "vacuum", .vacuum },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const StorageMaintenanceResult = struct {
+    valid: ?bool = null,
+    issue: ?[]const u8 = null,
+    file_size: ?i64 = null,
+    valid_prefix_size: ?i64 = null,
+    reclaimable_bytes: ?i64 = null,
+    before_size: ?i64 = null,
+    after_size: ?i64 = null,
+    reclaimed_bytes: ?i64 = null,
+    live_file_count: ?i64 = null,
+    live_bytes: ?i64 = null,
+};
+
+pub const StorageMaintenanceState = enum {
+    queued,
+    running,
+    succeeded,
+    failed,
+    canceled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .queued => "queued",
+            .running => "running",
+            .succeeded => "succeeded",
+            .failed => "failed",
+            .canceled => "canceled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "queued", .queued },
+            .{ "running", .running },
+            .{ "succeeded", .succeeded },
+            .{ "failed", .failed },
+            .{ "canceled", .canceled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const WriteCheckRequest = struct {
     role: []const u8,
     expected_identity: ?HAIdentity = null,

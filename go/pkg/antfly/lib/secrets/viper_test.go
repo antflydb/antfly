@@ -50,8 +50,8 @@ func TestResolveViperSecrets_SetsEnvVars(t *testing.T) {
 
 	// Create viper instance with config that has S3 credentials
 	v := viper.New()
-	v.Set("storage.s3.access_key_id", "AKIAIOSFODNN7EXAMPLE")
-	v.Set("storage.s3.secret_access_key", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	v.Set("storage.local.s3.access_key_id", "AKIAIOSFODNN7EXAMPLE")
+	v.Set("storage.local.s3.secret_access_key", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
 	// Resolve secrets (in this case, no ${secret:...} references, just plain values)
 	err := ResolveViperSecrets(v)
@@ -103,16 +103,16 @@ func TestResolveViperSecrets_WithKeystore(t *testing.T) {
 
 	// Create viper instance with ${secret:...} references
 	v := viper.New()
-	v.Set("storage.s3.access_key_id", "${secret:aws.access_key_id}")
-	v.Set("storage.s3.secret_access_key", "${secret:aws.secret_access_key}")
+	v.Set("storage.local.s3.access_key_id", "${secret:aws.access_key_id}")
+	v.Set("storage.local.s3.secret_access_key", "${secret:aws.secret_access_key}")
 
 	// Resolve secrets
 	err = ResolveViperSecrets(v)
 	require.NoError(t, err)
 
 	// Verify Viper has resolved values
-	assert.Equal(t, "KEYSTORE_ACCESS_KEY", v.GetString("storage.s3.access_key_id"))
-	assert.Equal(t, "KEYSTORE_SECRET_KEY", v.GetString("storage.s3.secret_access_key"))
+	assert.Equal(t, "KEYSTORE_ACCESS_KEY", v.GetString("storage.local.s3.access_key_id"))
+	assert.Equal(t, "KEYSTORE_SECRET_KEY", v.GetString("storage.local.s3.secret_access_key"))
 
 	// Verify environment variables were set from resolved values
 	assert.Equal(t, "KEYSTORE_ACCESS_KEY", os.Getenv("AWS_ACCESS_KEY_ID"))
@@ -132,7 +132,7 @@ func TestSetEnvVarsFromViper_DoesNotOverrideExisting(t *testing.T) {
 
 	// Create viper with different value
 	v := viper.New()
-	v.Set("storage.s3.access_key_id", "NEW_VALUE")
+	v.Set("storage.local.s3.access_key_id", "NEW_VALUE")
 
 	// Call setEnvVarsFromViper
 	setEnvVarsFromViper(v)

@@ -70,19 +70,19 @@ class _ExtensionProcess:
         self.api_url = antfly_public_api_url(self.url, binary=binary)
         self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
 
-        self.swarm_log_path = self.root / "swarm.log"
+        self.standalone_log_path = self.root / "standalone.log"
         self.metadata_log_path = self.root / "metadata.log"
         self.data_log_path = self.root / "data.log"
-        self.swarm_log_file = self.swarm_log_path.open("w")
+        self.standalone_log_file = self.standalone_log_path.open("w")
         self.metadata_log_file = self.metadata_log_path.open("w")
         self.data_log_file = self.data_log_path.open("w")
-        self.swarm_proc: subprocess.Popen[str] | None = None
+        self.standalone_proc: subprocess.Popen[str] | None = None
         self.metadata_proc: subprocess.Popen[str] | None = None
         self.data_proc: subprocess.Popen[str] | None = None
 
         try:
-            if mode == "swarm":
-                self._start_swarm()
+            if mode == "standalone":
+                self._start_standalone()
             elif mode == "distributed":
                 self._start_distributed()
             else:
@@ -91,11 +91,11 @@ class _ExtensionProcess:
             self.stop()
             raise
 
-    def _start_swarm(self) -> None:
+    def _start_standalone(self) -> None:
         env = self._server_env()
         command = [
             self.binary,
-            "swarm",
+            "standalone",
             "--config",
             str(_write_remote_content_e2e_config(self.root)),
             "--host",
@@ -115,9 +115,9 @@ class _ExtensionProcess:
             "--extension-package-store",
             str(self.package_store),
         ]
-        self.swarm_proc = subprocess.Popen(command, stdout=self.swarm_log_file, stderr=subprocess.STDOUT, cwd=self.root, env=env)
+        self.standalone_proc = subprocess.Popen(command, stdout=self.standalone_log_file, stderr=subprocess.STDOUT, cwd=self.root, env=env)
         if not wait_for_server(self.api_url):
-            raise RuntimeError(f"swarm extension server failed to start\n{self.debug_logs()}")
+            raise RuntimeError(f"standalone extension server failed to start\n{self.debug_logs()}")
 
     def _start_distributed(self) -> None:
         env = self._server_env()
@@ -163,16 +163,16 @@ class _ExtensionProcess:
         return env
 
     def debug_logs(self) -> str:
-        for handle in (self.swarm_log_file, self.metadata_log_file, self.data_log_file):
+        for handle in (self.standalone_log_file, self.metadata_log_file, self.data_log_file):
             handle.flush()
         return (
-            f"[swarm]\n{_read_log_tail(self.swarm_log_path)}\n"
+            f"[standalone]\n{_read_log_tail(self.standalone_log_path)}\n"
             f"[metadata]\n{_read_log_tail(self.metadata_log_path)}\n"
             f"[data]\n{_read_log_tail(self.data_log_path)}"
         )
 
     def stop(self) -> None:
-        for proc in (self.data_proc, self.metadata_proc, self.swarm_proc):
+        for proc in (self.data_proc, self.metadata_proc, self.standalone_proc):
             if proc is not None and proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)
                 try:
@@ -182,15 +182,15 @@ class _ExtensionProcess:
                     proc.wait()
         self.data_proc = None
         self.metadata_proc = None
-        self.swarm_proc = None
-        for handle in (self.swarm_log_file, self.metadata_log_file, self.data_log_file):
+        self.standalone_proc = None
+        for handle in (self.standalone_log_file, self.metadata_log_file, self.data_log_file):
             if not handle.closed:
                 handle.close()
         if not maybe_preserve_tempdir(self.tempdir):
             self.tempdir.cleanup()
 
 
-@pytest.fixture(params=["swarm", "distributed"])
+@pytest.fixture(params=["standalone", "distributed"])
 def extension_server(request) -> _ExtensionProcess:
     binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).expanduser().resolve()
     if binary.name != "antfly":
@@ -215,7 +215,7 @@ def _check_response(response: requests.Response) -> Any:
     return response.json()
 
 
-def test_extension_package_routes_match_swarm_and_distributed(extension_server: _ExtensionProcess) -> None:
+def test_extension_package_routes_match_standalone_and_distributed(extension_server: _ExtensionProcess) -> None:
     _assert_extension_package_routes(extension_server)
 
 
@@ -228,7 +228,7 @@ def test_extension_memoryaf_wasm_runtime_required() -> None:
     if not binary.exists():
         pytest.skip(f"antfly binary not built: {binary}")
 
-    server = _ExtensionProcess(str(binary), "swarm")
+    server = _ExtensionProcess(str(binary), "standalone")
     try:
         _assert_extension_package_routes(server)
     finally:

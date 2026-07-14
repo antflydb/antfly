@@ -60,7 +60,7 @@ spec:
             - |
               ORDINAL=${HOSTNAME##*-}
               ID=$((ORDINAL + 1))
-              exec /antfly store --id $ID --config /config/config.yaml \
+              exec /antfly store --id $ID --config /config/config.json \
                 --api http://0.0.0.0:12380 \
                 --raft http://0.0.0.0:9021 \
                 --service ${HOSTNAME}.antfly-workers-svc.default.svc.cluster.local

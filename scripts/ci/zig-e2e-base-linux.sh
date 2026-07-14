@@ -64,18 +64,18 @@ if [[ "$#" -gt 0 ]]; then
   run_inference="${RUN_INFERENCE_E2E:-0}"
 else
   antfly_args=(
-    -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow"
+    -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow"
     e2e/antfly
   )
   run_inference="${RUN_INFERENCE_E2E:-1}"
 fi
 
 antfly_status=0
-UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q "${antfly_args[@]}" || antfly_status=$?
+UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q --continue-on-collection-errors "${antfly_args[@]}" || antfly_status=$?
 
 inference_status=0
 if [[ "$run_inference" == "1" ]]; then
-  UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q \
+  UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q --continue-on-collection-errors \
     -m "not slow and not multimodal and not model_integration and not browser_integration" \
     e2e/inference || inference_status=$?
 fi

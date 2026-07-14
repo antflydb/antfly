@@ -360,14 +360,15 @@ func (c *AntflyClient) CancelDocumentArtifactReprocessJob(ctx context.Context, t
 }
 
 // Backup backs up a table
-func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location string) error {
+func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location, connection string) error {
 	if tableName == "" {
 		return fmt.Errorf("empty table name")
 	}
 
 	req := oapi.BackupRequest{
-		BackupId: backupID,
-		Location: location,
+		BackupId:   backupID,
+		Location:   location,
+		Connection: connection,
 	}
 
 	resp, err := c.client.BackupTable(ctx, tableName, req)
@@ -384,29 +385,88 @@ func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location
 	return nil
 }
 
-// Restore restores a table from a backup
-func (c *AntflyClient) Restore(ctx context.Context, tableName, backupID, location string) error {
+// TableRestoreOptions identifies a table backup and the connection authorized
+// to read it. IdempotencyKey is optional; an empty value omits the header.
+type TableRestoreOptions struct {
+	BackupID       string
+	Location       string
+	Connection     string
+	IdempotencyKey string
+}
+
+// Restore starts a durable asynchronous table restore.
+func (c *AntflyClient) Restore(ctx context.Context, tableName string, options TableRestoreOptions) (*RestoreJob, error) {
 	if tableName == "" {
-		return fmt.Errorf("empty table name")
+		return nil, fmt.Errorf("empty table name")
+	}
+	if options.BackupID == "" {
+		return nil, fmt.Errorf("empty backup ID")
+	}
+	if options.Location == "" {
+		return nil, fmt.Errorf("empty backup location")
+	}
+	if options.Connection == "" {
+		return nil, fmt.Errorf("empty external I/O connection")
 	}
 
 	req := oapi.RestoreRequest{
-		BackupId: backupID,
-		Location: location,
+		BackupId:   options.BackupID,
+		Location:   options.Location,
+		Connection: options.Connection,
 	}
 
-	resp, err := c.client.RestoreTable(ctx, tableName, req)
+	var params *oapi.RestoreTableParams
+	if options.IdempotencyKey != "" {
+		params = &oapi.RestoreTableParams{IdempotencyKey: &options.IdempotencyKey}
+	}
+	resp, err := c.client.RestoreTable(ctx, tableName, params, req)
 	if err != nil {
-		return fmt.Errorf("restore request failed: %w", err)
+		return nil, fmt.Errorf("restore request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Restore API might return 202 Accepted
 	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("restore failed: %w", readErrorResponse(resp))
+		return nil, fmt.Errorf("restore failed: %w", readErrorResponse(resp))
 	}
 
-	return nil
+	return decodeRestoreJob(resp)
+}
+
+// RestoreJob is the durable asynchronous restore state returned by the API.
+type RestoreJob = oapi.RestoreJob
+
+// RestoreJobPhase is a durable restore lifecycle phase.
+type RestoreJobPhase = oapi.ListRestoreJobsParamsPhase
+
+const (
+	RestoreJobPhaseQueued    = oapi.ListRestoreJobsParamsPhaseQueued
+	RestoreJobPhaseRunning   = oapi.ListRestoreJobsParamsPhaseRunning
+	RestoreJobPhaseSucceeded = oapi.ListRestoreJobsParamsPhaseSucceeded
+	RestoreJobPhaseFailed    = oapi.ListRestoreJobsParamsPhaseFailed
+	RestoreJobPhaseCancelled = oapi.ListRestoreJobsParamsPhaseCancelled
+)
+
+// RestoreJobScope selects table or cluster restore jobs.
+type RestoreJobScope = oapi.ListRestoreJobsParamsScope
+
+const (
+	RestoreJobScopeTable   = oapi.ListRestoreJobsParamsScopeTable
+	RestoreJobScopeCluster = oapi.ListRestoreJobsParamsScopeCluster
+)
+
+// RestoreJobListOptions filters and paginates durable restore jobs.
+type RestoreJobListOptions struct {
+	Limit  int
+	Cursor string
+	Phase  RestoreJobPhase
+	Scope  RestoreJobScope
+}
+
+// RestoreJobPage is one newest-first page of durable restore jobs.
+type RestoreJobPage struct {
+	Jobs       []RestoreJob
+	NextCursor string
 }
 
 // ClusterBackupResult represents the result of a cluster backup operation
@@ -424,10 +484,11 @@ type TableBackupStatus struct {
 }
 
 // ClusterBackup backs up multiple tables or all tables in the cluster
-func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location string, tableNames []string) (*ClusterBackupResult, error) {
+func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location, connection string, tableNames []string) (*ClusterBackupResult, error) {
 	req := oapi.ClusterBackupRequest{
 		BackupId:   backupID,
 		Location:   location,
+		Connection: connection,
 		TableNames: tableNames,
 	}
 
@@ -462,31 +523,42 @@ func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location str
 	}, nil
 }
 
-// ClusterRestoreResult represents the result of a cluster restore operation
-type ClusterRestoreResult struct {
-	Status string
-	Tables []TableRestoreStatus
+// ClusterRestoreOptions configures a durable cluster restore job.
+type ClusterRestoreOptions struct {
+	BackupID       string
+	Location       string
+	Connection     string
+	TableNames     []string
+	RestoreMode    string
+	IdempotencyKey string
 }
 
-// TableRestoreStatus represents restore status for a single table
-type TableRestoreStatus struct {
-	Name   string
-	Status string
-	Error  string
-}
-
-// ClusterRestore restores multiple tables from a cluster backup
-func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location string, tableNames []string, restoreMode string) (*ClusterRestoreResult, error) {
+// ClusterRestore starts a durable asynchronous cluster restore.
+func (c *AntflyClient) ClusterRestore(ctx context.Context, options ClusterRestoreOptions) (*RestoreJob, error) {
+	if options.BackupID == "" {
+		return nil, fmt.Errorf("empty backup ID")
+	}
+	if options.Location == "" {
+		return nil, fmt.Errorf("empty backup location")
+	}
+	if options.Connection == "" {
+		return nil, fmt.Errorf("empty external I/O connection")
+	}
 	req := oapi.ClusterRestoreRequest{
-		BackupId:   backupID,
-		Location:   location,
-		TableNames: tableNames,
+		BackupId:   options.BackupID,
+		Location:   options.Location,
+		Connection: options.Connection,
+		TableNames: options.TableNames,
 	}
-	if restoreMode != "" {
-		req.RestoreMode = oapi.ClusterRestoreRequestRestoreMode(restoreMode)
+	if options.RestoreMode != "" {
+		req.RestoreMode = oapi.ClusterRestoreRequestRestoreMode(options.RestoreMode)
 	}
 
-	resp, err := c.client.Restore(ctx, req)
+	var params *oapi.RestoreParams
+	if options.IdempotencyKey != "" {
+		params = &oapi.RestoreParams{IdempotencyKey: &options.IdempotencyKey}
+	}
+	resp, err := c.client.Restore(ctx, params, req)
 	if err != nil {
 		return nil, fmt.Errorf("cluster restore request failed: %w", err)
 	}
@@ -497,24 +569,85 @@ func (c *AntflyClient) ClusterRestore(ctx context.Context, backupID, location st
 		return nil, fmt.Errorf("cluster restore failed: %w", readErrorResponse(resp))
 	}
 
-	var result oapi.ClusterRestoreResponse
+	return decodeRestoreJob(resp)
+}
+
+// GetRestoreJob returns durable restore progress and terminal results.
+func (c *AntflyClient) GetRestoreJob(ctx context.Context, jobID string) (*RestoreJob, error) {
+	resp, err := c.client.GetRestoreJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("get restore job request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("get restore job failed: %w", readErrorResponse(resp))
+	}
+	return decodeRestoreJob(resp)
+}
+
+// CancelRestoreJob requests cancellation at the next safe restore boundary.
+func (c *AntflyClient) CancelRestoreJob(ctx context.Context, jobID string) (*RestoreJob, error) {
+	resp, err := c.client.CancelRestoreJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("cancel restore job request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("cancel restore job failed: %w", readErrorResponse(resp))
+	}
+	return decodeRestoreJob(resp)
+}
+
+// ListRestoreJobsPage returns one authorization-filtered page of durable restore jobs.
+func (c *AntflyClient) ListRestoreJobsPage(ctx context.Context, options RestoreJobListOptions) (*RestoreJobPage, error) {
+	params := &oapi.ListRestoreJobsParams{
+		Limit:  options.Limit,
+		Cursor: options.Cursor,
+		Phase:  options.Phase,
+		Scope:  options.Scope,
+	}
+	resp, err := c.client.ListRestoreJobs(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("list restore jobs request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("list restore jobs failed: %w", readErrorResponse(resp))
+	}
+	var result oapi.RestoreJobList
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("parsing response: %w", err)
+		return nil, fmt.Errorf("parsing restore jobs response: %w", err)
 	}
+	return &RestoreJobPage{Jobs: result.Jobs, NextCursor: result.NextCursor}, nil
+}
 
-	tables := make([]TableRestoreStatus, len(result.Tables))
-	for i, t := range result.Tables {
-		tables[i] = TableRestoreStatus{
-			Name:   t.Name,
-			Status: string(t.Status),
-			Error:  t.Error,
+// ListRestoreJobs returns all authorized jobs matching the supplied filters.
+func (c *AntflyClient) ListRestoreJobs(ctx context.Context, options RestoreJobListOptions) ([]RestoreJob, error) {
+	var jobs []RestoreJob
+	seen := make(map[string]struct{})
+	for {
+		page, err := c.ListRestoreJobsPage(ctx, options)
+		if err != nil {
+			return nil, err
 		}
+		jobs = append(jobs, page.Jobs...)
+		if page.NextCursor == "" {
+			return jobs, nil
+		}
+		if _, duplicate := seen[page.NextCursor]; duplicate {
+			return nil, fmt.Errorf("list restore jobs returned a repeated cursor %q", page.NextCursor)
+		}
+		seen[page.NextCursor] = struct{}{}
+		options.Cursor = page.NextCursor
 	}
+}
 
-	return &ClusterRestoreResult{
-		Status: string(result.Status),
-		Tables: tables,
-	}, nil
+func decodeRestoreJob(resp *http.Response) (*RestoreJob, error) {
+	var job RestoreJob
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		return nil, fmt.Errorf("parsing restore job response: %w", err)
+	}
+	return &job, nil
 }
 
 // BackupInfo represents metadata about a stored backup
@@ -525,10 +658,34 @@ type BackupInfo struct {
 	Tables        []string
 }
 
-// ListBackups lists available cluster backups at the specified location
-func (c *AntflyClient) ListBackups(ctx context.Context, location string) ([]BackupInfo, error) {
-	params := &oapi.ListBackupsParams{
-		Location: location,
+// BackupPage is one stable manifest-order page of backups.
+type BackupPage struct {
+	Backups    []BackupInfo
+	NextCursor string
+}
+
+// BackupListOptions configures one backup-list page.
+type BackupListOptions struct {
+	Location   string
+	Connection string
+	Cursor     string
+	Limit      int
+}
+
+// ListBackupsPage returns one page of cluster backups at the specified location.
+func (c *AntflyClient) ListBackupsPage(ctx context.Context, options BackupListOptions) (*BackupPage, error) {
+	if options.Location == "" {
+		return nil, fmt.Errorf("empty backup location")
+	}
+	if options.Connection == "" {
+		return nil, fmt.Errorf("empty external I/O connection")
+	}
+	params := &oapi.ListBackupsParams{Location: options.Location, Connection: options.Connection}
+	if options.Cursor != "" {
+		params.Cursor = &options.Cursor
+	}
+	if options.Limit > 0 {
+		params.Limit = &options.Limit
 	}
 
 	resp, err := c.client.ListBackups(ctx, params)
@@ -556,5 +713,32 @@ func (c *AntflyClient) ListBackups(ctx context.Context, location string) ([]Back
 		}
 	}
 
-	return backups, nil
+	return &BackupPage{Backups: backups, NextCursor: result.NextCursor}, nil
+}
+
+// ListBackups lists all backups while preserving connection and page-size options.
+func (c *AntflyClient) ListBackups(ctx context.Context, options BackupListOptions) ([]BackupInfo, error) {
+	var backups []BackupInfo
+	seen := make(map[string]struct{})
+	if options.Cursor != "" {
+		seen[options.Cursor] = struct{}{}
+	}
+	if options.Limit <= 0 {
+		options.Limit = 100
+	}
+	for {
+		page, err := c.ListBackupsPage(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		backups = append(backups, page.Backups...)
+		if page.NextCursor == "" {
+			return backups, nil
+		}
+		if _, duplicate := seen[page.NextCursor]; duplicate {
+			return nil, fmt.Errorf("list backups returned a repeated cursor %q", page.NextCursor)
+		}
+		seen[page.NextCursor] = struct{}{}
+		options.Cursor = page.NextCursor
+	}
 }

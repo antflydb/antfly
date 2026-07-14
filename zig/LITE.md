@@ -1,9 +1,10 @@
 # Antfly Lite
 
-Antfly Lite is the embedded, local-first Antfly profile. It should feel like
-SQLite for Antfly: a developer opens a local database from an application
-process, writes documents and vectors, creates indexes, runs search and query
-workloads, and can later promote the same data into a normal Antfly deployment.
+Antfly Lite is Antfly's single-file storage engine and `.aflite` format. It can
+be opened directly by an embedded application or selected by the full
+standalone server. It feels like SQLite for Antfly without making `lite` a
+deployment topology: `embedded` and `standalone` describe runtime ownership;
+`lite`, `local`, and `object` describe durable storage.
 
 The user-facing CLI surface is:
 
@@ -11,12 +12,13 @@ The user-facing CLI surface is:
 antfly lite <command>
 ```
 
-The embedded library surface should use the same name in docs and packaging:
-Antfly Lite.
+The embedded library and the storage engine use the product name Antfly Lite.
+The server topology remains Antfly Standalone.
 
 ## Goals
 
-- Provide an embedded Antfly database with no server process.
+- Provide an embedded Antfly database with no server process and a full
+  standalone server backed by the same file.
 - Keep the first-use path simple: `antfly lite init app.aflite`, then local
   reads, writes, search, backup, restore, and health checks.
 - Preserve Antfly's core feature model: documents, schemas, text search, vector
@@ -25,7 +27,7 @@ Antfly Lite.
 - Make upgrade to normal Antfly explicit and reliable through portable backup
   and restore.
 - Keep the embedded API stable enough for language bindings.
-- Make `.aflite` the public v1 database format, backed by a Lite-native
+- Make `.aflite` the public database format, backed by a Lite-native
   single-file engine instead of exposing a temporary directory-backed user
   format.
 
@@ -35,17 +37,17 @@ Antfly Lite.
 - Antfly Lite does not run Raft, shard placement, cluster metadata heartbeats,
   or multi-node balancing.
 - Antfly Lite does not require local inference to be available.
-- Antfly Lite does not need to support every operational feature of a normal
-  Antfly cluster on day one.
+- Antfly Lite uses the normal standalone `/db/v1`, SQL, metadata, inference,
+  backup, and restore contracts; it does not duplicate them under a Lite API.
 - Antfly Lite should not silently emulate distributed behavior in ways that make
   later promotion surprising.
-- Antfly Lite v1 should not include legacy fallback code for pre-release
+- Antfly Lite should not include legacy fallback code for pre-release
   `.aflite`, directory-backed, or LSM-container experiments. Unknown versions
   and invalid headers should fail explicitly.
 
-## Existing Starting Point
+## Implemented Architecture
 
-The repository already has the main ingredients:
+The implementation now consists of:
 
 - `pkg/antfly-embedded` exposes a standalone embedded package.
 - `pkg/antfly/src/embedded/db.zig` wraps the high-level DB surface.
@@ -54,20 +56,62 @@ The repository already has the main ingredients:
   `runUntilIdle`.
 - `storage/db/db.zig` already supports open modes such as writer,
   query-readonly, and status-only.
-- `storage/db/config.zig` already models primary backends as LMDB, memory, LSM
-  memory, or durable LSM.
-- The LSM backend already routes through a `Storage` abstraction with range
-  reads, writes, append, rename, delete, and atomic write hooks.
+- `storage/lite/native.zig` owns the native revision-2 header, alternating checkpoint roots,
+  page allocation, free map, crash recovery, integrity checks, stable snapshots,
+  and atomic vacuum replacement. Document commits publish a namespace-head
+  directory and per-namespace page links in the same checkpoint, so a cold
+  table snapshot walks that table's history rather than the global document
+  log. Namespace-head updates are append-only deltas backed by an in-memory
+  materialized directory; a full directory snapshot is emitted every 256
+  deltas. This makes the normal commit cost proportional to the namespaces
+  touched by the transaction instead of every namespace in the database while
+  bounding cold-open replay. The checkpoint links the directory delta and
+  document pages atomically. Normal commits remain append-only; explicit vacuum
+  reclaims superseded pages without putting a reachability walk on the write
+  path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
+  logical document key to its newest document page. Initial loads and vacuum
+  build packed trees as bounded streaming operations. Integrity checks validate
+  every tree page, separator range, and checkpoint/free-map reachability, then
+  prove that the index contains exactly the newest document page for every key
+  in history. Missing, stale, duplicate, or cross-key document pointers and
+  missing directory or namespace-link metadata are treated as corruption.
+- `storage/lite/docstore.zig` provides ordered document transactions, pinned
+  snapshots, replay lanes, and prefix-bounded logical namespaces. Point reads
+  and ordered seeks traverse the checkpoint's disk-resident B+ tree in
+  `O(log N)` pages. A cursor retains one decoded root-to-leaf path, its current
+  key, and its current value, so sequential next/previous traversal is
+  amortized `O(1)` and cold-scan memory remains bounded by tree height and the
+  page cache rather than live-key count or document payload volume. Tombstones
+  remain indexed until vacuum and are skipped during iteration. Write cursors
+  merge a sorted, latest-write-wins overlay containing only that transaction's
+  pending mutations; this provides read-your-writes without materializing the
+  durable namespace. Pinned reads use concurrent positional I/O. A
+  `std.Io.RwLock` allows normal append-only commits while readers pin roots and
+  blocks vacuum before it can reclaim those roots.
+- `storage/lite/index_storage.zig` stores Antfly index logical files in the
+  native index catalog inside the same `.aflite` file.
+- `storage/lite/backend.zig` caches one runtime per logical table/group and
+  injects those runtimes through the standalone backend-runtime DB-open hook.
+- Standalone metadata is stored in a reserved system namespace in the same
+  file. Durable HTTP transaction sessions, including staged writes and
+  savepoints, use a second reserved namespace so reopening or copying the
+  `.aflite` file retains the complete database state. The existing data, query,
+  transaction, inference, SQL, and `/db/v1` implementations are reused rather
+  than forked.
+- Durable transaction sessions are copy-on-write: the candidate record is
+  committed to the Lite namespace before it replaces the in-memory session.
+  Failed writes and fsyncs cannot expose unacknowledged staged operations.
+  Standalone applies the bounded `transaction_sessions` TTL, count, encoded
+  record size, and savepoint policy documented in `STORAGE.md`, preventing
+  abandoned sessions from growing the `.aflite` file without limit.
 
-That means the product work should harden and package the existing embedded
-path while adding a Lite-native single-file backend that avoids translating the
-embedded profile into many synthetic logical files. Directory-backed and
-LSM-container storage can remain internal development, migration, and test
-profiles, but `.aflite` should be the public v1 format.
+Directory-backed and LSM-container profiles remain internal development and
+conformance tools. They are not public `.aflite` formats and invalid or unknown
+native headers do not fall back to them.
 
 ## Product Shape
 
-Antfly Lite has three related surfaces.
+Antfly Lite has embedded, CLI, and standalone-server surfaces.
 
 ### CLI
 
@@ -90,7 +134,7 @@ antfly lite import app.aflite --from app.afb
 antfly lite check app.aflite
 antfly lite compact app.aflite
 antfly lite vacuum app.aflite
-antfly lite serve app.aflite --addr 127.0.0.1:8080
+antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
 
 `antfly lite init` should be non-destructive: it creates a new `.aflite` file
@@ -104,7 +148,7 @@ into another.
 
 `antfly lite status` should include a storage block that identifies the live
 file format, the selected engine, the primary, replay, and index layouts, the
-v1 format version, page size, and active checkpoint sequence. That makes the
+native format revision, page size, and active checkpoint sequence. That makes the
 public native `.aflite` path observable and keeps internal bridge profiles from
 being mistaken for the v1 contract.
 
@@ -115,13 +159,180 @@ For native `.aflite`, the public status contract should report
 native index engine is being completed is an implementation detail and must not
 appear as the public index layout for native Lite files.
 
-`antfly lite serve` is optional convenience mode. It should expose a narrow
-local single-node HTTP API under `/lite/v1` for development, SDK smoke tests,
-and migration testing, but the primary contract is embedded use. It should not
-pretend to be the clustered `/db/v1` service API unless a future compatibility
-profile is deliberately added. The v1 serve command should bind only to
-loopback hosts; wildcard or LAN listeners should require a future explicit
-remote/development override.
+`antfly lite serve` is an artifact-oriented convenience constructor for the
+full standalone runtime. It serves the normal `/db/v1` API and is equivalent to
+`antfly standalone --storage-engine lite --storage-path <file>`. Lite does not
+define a storage-specific HTTP namespace. The convenience command binds only
+to loopback hosts. It forwards the complete standalone option surface,
+including configuration, authentication, TLS, secrets, inference, and
+connections. It owns `--storage-engine`, `--storage-path`, `--host`, and
+`--port`; conflicting duplicates fail closed.
+
+Network backup and restore always use named, capability-scoped `external_io`
+connections. This includes `file://`, whose URI path is logical and resolved
+beneath the filesystem connection's configured root. S3 and GCS connections
+have distinct credential shapes and bucket/prefix scopes. Offline Lite
+artifact commands may still use explicit local paths or ambient cloud
+credentials because they run with the invoking user's filesystem authority.
+
+Restore through `/db/v1` is a durable asynchronous job, not request-duration
+work. Admission requires the standalone process's shared asynchronous
+backend-runtime lane and its engine-owned durable job store; an unavailable
+worker or store returns `503` before any job is created. The accepted response
+contains a job ID; status and cooperative
+cancellation use `/db/v1/restore/jobs/{job_id}`. Retained jobs can be listed
+newest-first with `GET /db/v1/restore/jobs`, using cursor pagination and optional
+phase/scope filters. Authorization is applied before pagination results are
+returned. Idempotency keys make retries
+safe; requests without a key create independent jobs. Restore state lives inside
+the `.aflite` file, and completed table boundaries are durably checkpointed and
+not repeated after restart. Standalone restore is synchronous inside the worker,
+so terminal success means the restored table is readable, not merely accepted.
+Job status reports published and completed table counts separately; for Lite the
+two checkpoints normally advance back-to-back because restoration is local.
+It also reports generations whose publication is visible but whose
+parent-directory durability is pending. Such a job terminates failed with an
+explicit committed/pending result for operator inspection; it is never reported
+as rolled back or durably complete. The current table ordinal is checkpointed
+before irreversible work so restart reconciliation only adopts the exact backup
+identity. Destructive overwrite is not exposed until
+table generations can be staged and atomically swapped. Terminal state and
+explicit idempotency keys are retained for seven days in a history bounded by
+10,000 jobs, 64 MiB total, and 64 KiB per encoded job. Admission reserves room
+for progress and terminal state before work begins. Cancellation is checked at
+safe table publication boundaries. A standalone process executes at most two
+restore jobs concurrently; the remainder stay durably queued inside the
+`.aflite` file.
+`antfly restore` always prints the accepted or terminal job document. Use
+`--idempotency-key` for retry-safe submission and `--wait` (optionally
+`--wait-timeout <seconds>`) for a terminal exit status. Failed and cancelled
+terminal jobs exit nonzero.
+
+An artifact first created through embedded commands has one root database. On
+its first standalone start, Antfly atomically adopts that root as the
+standalone `default` table: it persists a stable `group-<id>/table-db` alias in
+the file before publishing table metadata. The alias deliberately omits the
+host data-directory prefix, so moving or restoring the `.aflite` file cannot
+orphan its documents or indexes. Embedded root databases use the deterministic
+document-identity namespace of that future `default` table from creation, so
+adoption is O(1) rather than rewriting every live document; an identity mismatch
+fails closed. Subsequent standalone tables use isolated
+namespaces in the same artifact. This makes `lite batch` followed by `lite
+serve` a genuine interoperability path rather than two unrelated databases.
+After that adoption, embedded data commands continue to address the `default`
+table through the persisted alias. A file created directly by standalone has
+no unambiguous root table, so root-oriented `lite batch`, query, schema, index,
+enrichment, import, promote, and compact operations fail closed and direct the
+user to `lite serve` plus `/db/v1`. Artifact `status` and the physical `check`,
+`vacuum`, and `snapshot` operations remain available.
+
+The equivalent tagged configuration is:
+
+```json
+{
+  "storage": {
+    "engine": "lite",
+    "lite": { "path": "./app.aflite", "fsync": true }
+  }
+}
+```
+
+Storage configuration is a tagged union: `engine` is required and exactly the
+matching `lite`, `local`, or `object` member is allowed. Lite rejects Raft,
+replication, horizontal-sharding, and serverless settings.
+
+### HTTP And Administrative Operations
+
+A standalone process backed by Lite serves the same `/db/v1` API as
+directory-backed standalone. `GET /db/v1/status` includes
+a safe storage summary with the engine, format, fsync policy, and typed
+maintenance capabilities; it does not expose the database path or credentials.
+
+Portable backup and restore remain normal `/db/v1` operations. A physical
+`.aflite` copy is a stable snapshot, not the portable archival contract; `.afb`
+remains the cross-engine backup format.
+
+Once an artifact has been opened by standalone, the offline `antfly lite
+backup` command refuses to emit a misleading root-only archive. Use the
+authenticated `/db/v1` backup operation for a portable all-table archive, or
+`antfly lite snapshot` for a complete physical copy of the artifact. An
+offline physical snapshot includes metadata, every table namespace, indexes,
+and durable transaction sessions.
+
+Coordinated maintenance is an authenticated, storage-neutral admin surface:
+
+```text
+POST /admin/v1/maintenance/check
+POST /admin/v1/maintenance/compact
+POST /admin/v1/maintenance/vacuum
+GET  /admin/v1/maintenance/jobs/{job_id}
+DELETE /admin/v1/maintenance/jobs/{job_id}
+```
+
+Normal API authentication and admin RBAC protect these routes when enabled.
+For an otherwise unauthenticated standalone server, configure a dedicated
+token with `--admin-token-env <ENV_NAME>` and send it using `Authorization:
+Bearer ...`; without either mechanism the admin surface fails closed.
+
+POST requests return `202` and a job document. `Idempotency-Key` safely returns
+the original job on retries for at least 24 hours within the current server
+process. Job IDs are opaque, non-sequential 63-bit values and callers reconcile
+storage state after restart before retrying. The bounded history rejects new
+work rather than dropping an unexpired key. Jobs execute on the shared
+`std.Io` backend-runtime lane; coordinator shutdown fences its owner, requests
+cooperative cancellation, and drains outstanding work before releasing the
+Lite handle. `DELETE` requests cooperative cancellation; native maintenance
+checks the token at safe page and record boundaries, including during shutdown.
+Only one maintenance job runs at a time; a
+conflicting request returns `409`, and an engine that does not support an
+operation returns `422`. Completed jobs are retained in a bounded in-memory
+history. Lite reports `online: false`: check, compaction, and vacuum acquire the
+exclusive maintenance gate. Readiness becomes false and new database requests
+receive `503` while admin status and cancellation remain available. This avoids
+unbounded request queues and does not call a stop-the-world rewrite "online".
+Checkpoint inspection, index writes, document commits, compaction, and vacuum
+share the Lite store mutex and FIFO writer admission gate, so blocked writers
+sleep without polling and resume in arrival order. Maintenance cannot
+race checkpoint publication or file replacement. Vacuum builds a temporary,
+disk-backed LSM live-key index for one logical record class at a time. The
+newest record wins, tombstones suppress older values, and a bounded mutable
+batch is flushed to sorted runs. It then streams the ordered live references,
+values, and replacement pages, so heap use does not scale with the number of
+distinct keys. Temporary index directories are removed on success and error.
+This also avoids a
+second whole-database value snapshot and a whole-file output image in memory;
+the replacement is fsynced, atomically renamed, and adopted through its
+already-open read/write handle before the parent directory is fsynced. A
+post-rename sync error therefore cannot leave the process writing an unlinked
+old inode.
+
+All normal Lite opens require working advisory file locks. The writer lease,
+reader snapshot lock, stable-snapshot source lock, and vacuum/rewrite lock fail
+closed with `FileLocksUnsupported`; Antfly never retries without a lock.
+Filesystems and CSI drivers without advisory-lock semantics are unsupported for
+writable Lite deployments.
+
+Reinitializing an existing artifact is an atomic generation swap, not an
+in-place truncate. Readers already holding the old inode finish against their
+pinned generation; readers opened after the rename see the new database.
+
+The Kubernetes operator exposes the same topology/storage separation through
+`spec.mode: Standalone` plus `spec.storage.engine: lite`. The optional
+`spec.storage.liteFileName` selects a safe `.aflite` basename on the standalone
+PVC; the operator owns the absolute mount path and rejects competing raw
+`spec.config.storage` values.
+
+The standalone listener holds an advisory lease for its host/port while using
+restart-safe address reuse. Cross-thread shutdown only publishes an atomic stop
+request and wakes the accept loop; listener and connection teardown stay on the
+server thread. Bind/listen failure reaches the owning runtime before readiness,
+so a failed listener cannot leave a headless process holding the `.aflite`
+writer lock. Standalone metadata updates retain a copy-on-write checkpoint
+until the catalog commit is durable, so failed persistence restores the exact
+prior in-memory state.
+
+The `antfly lite check`, `compact`, and `vacuum` commands remain useful for
+offline files and automation that does not run a server.
 
 ### Embedded Library
 
@@ -164,7 +375,7 @@ invalid `.aflite` files without first opening a handle.
 
 ### File Format
 
-Antfly Lite v1 should use `.aflite` as the live database format. Users should
+Antfly Lite uses `.aflite` as the live database format. Users should
 not need to understand a temporary directory-backed layout.
 
 The single-file database should be implemented as a Lite-native backend, not as
@@ -195,20 +406,20 @@ same way. Neither should be the public Lite v1 contract.
 
 ### Compatibility Policy
 
-Because this is new, unreleased code, v1 should not carry a legacy fallback,
+Because this is new, unreleased code, native revision 2 does not carry a legacy fallback,
 pre-release importer, v0 directory reader, silent LSM-container upgrade path, or
 prototype-to-v1 auto-migrator. Prototype files can be recreated from tests or
 explicit exports while the format is still pre-release. `.aflite` readers should
-accept the documented v1 format and reject unknown versions loudly. Recovery
-from an older complete checkpoint root inside the same v1 file is crash
-recovery, not legacy compatibility; a file with no complete v1 checkpoint should
+accept the documented revision-2 format and reject unknown versions loudly. Recovery
+from an older complete checkpoint root inside the same file is crash
+recovery, not legacy compatibility; a file with no complete checkpoint should
 fail with an explicit integrity error. Compatibility branches should only be
 added after a format has shipped and users can reasonably have files that need
 preservation.
 
 The implementation consequence is that the production Lite open path should be
-small and direct: parse the v1 header, validate the v1 checkpoint, recover within
-the v1 format if needed, and otherwise return an explicit error. It should not
+small and direct: parse the current header, validate its checkpoint and ordered
+index root, recover within the same format if needed, and otherwise return an explicit error. It should not
 carry readers for discarded prototype layouts, and tests should assert rejection
 of invalid headers, unsupported versions, and bridge-profile files opened through
 the default `.aflite` path.
@@ -236,6 +447,7 @@ for embedded Antfly data:
 - checkpoint roots
 - catalog pages
 - document key/value pages or segments
+- copy-on-write ordered document-index pages
 - text index files
 - dense vector/HBC posting files
 - sparse posting files
@@ -335,31 +547,44 @@ The flow:
 
 ```sh
 antfly lite backup app.aflite --out app.afb
-antfly restore --format portable --input app.afb --table docs
+antfly restore --input app.afb --table docs \
+  --location s3://archive/promotions/app --connection promotion-reader --wait
 ```
 
 or:
 
 ```sh
-antfly lite promote app.aflite --target http://cluster:8080 --table docs
+antfly lite promote app.aflite --target http://cluster:8080 --table docs \
+  --connection promotion-reader --location s3://archive/promotions/app
 ```
 
-`promote` should just orchestrate portable backup upload plus normal restore. It
+`promote` orchestrates portable backup upload plus normal restore. The named
+connection is required by the target API and scopes its read access to the
+chosen location; the CLI uses the invoking user's separate local or ambient
+write authority to stage/upload the portable artifact. Multiple named target
+connections may select different buckets, accounts, prefixes, and reader
+roles. Promotion waits for terminal success by default, prints the restore job,
+and exits nonzero on failure. `--no-wait` returns the accepted job instead. It
 should not invent a separate migration protocol until backup/restore proves too
 slow for large databases.
 
-When `antfly lite promote` needs a local staging location and the user does not
-pass `--location`, it should use `~/.antfly/lite/backups`, not a process-global
-`/tmp` directory. Explicit `--location` values continue to support normal
-Antfly backup targets such as `file://`, `s3://`, or `gs://`.
-The direct normal restore shortcut for `.aflite` input should use the same
-Lite-local default staging location when `--location` is omitted.
+The no-wait path prints the response returned by the successful submission; it
+does not issue an immediate second GET that could turn a transient routing
+failure into an ambiguous CLI error after the job was already accepted.
+
+`promote` and network `restore --input` require an explicit `--location`.
+Client-local defaults are unsafe because a remote server resolves filesystem
+connections in its own namespace. The location must be writable by the CLI and
+readable through the target's named connection; `file://` is appropriate only
+for genuinely shared storage, while `s3://` and `gs://` are the normal remote
+choices.
 
 Normal Antfly should also be able to restore directly from a `.aflite` live
 database file:
 
 ```sh
-antfly restore --input app.aflite --table docs
+antfly restore --input app.aflite --table docs \
+  --location gs://migration-staging/app --connection migration-reader --wait
 ```
 
 That direct path should not make `.aflite` the backup format. It should open
@@ -387,9 +612,16 @@ be an optimization later when the source and target backend formats match.
 The reverse path should also work:
 
 ```sh
-antfly backup --format portable --table docs --out docs.afb
+antfly backup --format portable --table docs --backup-id docs \
+  --connection archive-writer --location s3://archive/exports/docs
+# Fetch docs.afb from the configured location with the object-store tooling.
 antfly lite restore docs.afb --out docs.aflite
 ```
+
+Network backup locations are server-owned and authorized through named
+connections, so `antfly backup` intentionally does not pretend a client-local
+`--out` path is visible to the server. For a local Lite database, create the
+artifact directly with `antfly lite backup source.aflite --out docs.afb`.
 
 This makes Lite useful for local development, debugging production data slices,
 offline demos, and customer support bundles.
@@ -511,7 +743,7 @@ single-node and local.
 - remote shard fanout
 - distributed transaction coordination
 - server-side autoscaling
-- Kubernetes operator behavior
+- multi-replica or horizontally scaled Kubernetes operator deployments
 - cluster heartbeat/status aggregation
 - S3/object-storage native serving as the primary Lite file
 
@@ -566,8 +798,8 @@ Packages:
 
 Build profiles:
 
-- `lite-core`: embedded database, indexes, CLI, and narrow `/lite/v1` local
-  serve mode, with no heavyweight inference runtime.
+- `lite-core`: embedded database, indexes, and maintenance CLI, with no
+  heavyweight inference runtime.
 - `lite-full`: embedded database plus local inference runtime.
 - `lite-wasm`: hosted/manual maintenance profile.
 - `lite-dev`: debug/status tooling and compatibility experiments.
@@ -603,13 +835,14 @@ Lite -> portable backup -> normal Antfly -> portable backup -> Lite
 The restored documents, schemas, definitions, embeddings, graph edges, and
 query-visible results should match within documented index rebuild semantics.
 
-## Implementation Plan
+## Implementation Status And Remaining Work
 
-### Phase 1: Lite-Native Single-File Backend
+### Complete: Lite-Native Single-File Backend
 
-- Implement a Lite-native storage backend for embedded Antfly.
+- Implemented a Lite-native storage backend for embedded and standalone Antfly.
 - Add database header, catalog roots, page or segment allocator, free-space map,
-  commit/checkpoint publish, crash recovery, integrity checks, and vacuum.
+  copy-on-write ordered document index, commit/checkpoint publish, crash
+  recovery, integrity checks, and streaming vacuum rebuild.
 - Preserve Antfly's document ordering, range scans, index definitions,
   enrichment state, vector/HBC artifacts, sparse artifacts, graph artifacts,
   backup, and restore semantics.
@@ -623,16 +856,16 @@ query-visible results should match within documented index rebuild semantics.
 - Add negative open tests proving that the default `.aflite` path does not fall
   back to bridge profiles or prototype readers.
 
-### Phase 2: Name And CLI Shell
+### Complete: Name, CLI, And Standalone Composition
 
-- Add `antfly lite` command group.
-- Wire commands to existing embedded DB APIs.
-- Add `init`, `status`, `batch`, `lookup`, `scan`, `query`, `run-until-idle`.
-- Make `antfly lite init app.aflite` create a single-file database.
+- Added the `antfly lite` command group and embedded database operations.
+- Added full standalone composition through `--storage-engine lite` and
+  `--storage-path`, with `lite serve` as an equivalent constructor.
+- Added multi-table key/index namespaces and same-file metadata persistence.
 - Keep `~/.antfly/lite/` for CLI registry data, caches, temporary workspaces,
   and internal developer databases only.
 
-### Phase 3: Portable Upgrade Path
+### Complete: Portable Upgrade Path
 
 - Add `antfly lite backup`.
 - Add `antfly lite restore`.
@@ -645,13 +878,14 @@ query-visible results should match within documented index rebuild semantics.
   CLI shape should be:
 
   ```sh
-  antfly restore --input app.aflite --table docs
+  antfly restore --input app.aflite --table docs \
+    --location s3://migration-staging/app --connection migration-reader
   ```
 
 - Extend portable backup coverage for schema, index definitions, enrichment
   definitions, and portable artifacts that are not yet included.
 
-### Phase 4: Embedded API Hardening
+### Ongoing: Embedded API Hardening
 
 - Define stable `libantfly` C ABI.
 - Add ownership/error/result conventions.
@@ -662,7 +896,7 @@ query-visible results should match within documented index rebuild semantics.
   stable C ABI and gated C-library smoke tests.
 - Freeze the Lite open options and capabilities response.
 
-### Phase 5: Enrichment And Inference Profiles
+### Ongoing: Enrichment And Inference Profiles
 
 - Add explicit inference modes.
 - Make "no inference configured" a clean status, not an error-prone partial
@@ -673,12 +907,16 @@ query-visible results should match within documented index rebuild semantics.
 - Support remote inference providers.
 - Support optional local inference builds.
 
-### Phase 6: Product Polish
+### Ongoing: Product Polish
 
 - Add docs and examples.
 - Add app templates for common embedded use cases.
 - Add migration guides.
 - Add package publishing for CLI and language bindings.
+- Persist any remaining standalone operational catalogs that are durable
+  database state in reserved `.aflite` namespaces.
+- Add distributed qualification for portable restore and maintenance-job
+  automation without changing the storage-neutral API paths.
 
 ## Open Questions
 
@@ -689,7 +927,7 @@ query-visible results should match within documented index rebuild semantics.
 
 ## Recommendation
 
-Ship Antfly Lite v1 as `.aflite`, not as a public directory-backed format. This
+Ship Antfly Lite as `.aflite`, not as a public directory-backed format. This
 keeps the product mental model simple: a Lite database is a file, and a portable
 backup is an `.afb` archive.
 

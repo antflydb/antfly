@@ -1631,7 +1631,7 @@ test "managed host defaults metadata and data apply stores when durable state is
     try std.testing.expect(metadata_batch.commit_index > 0);
     try std.testing.expect(metadata_batch.entries_bytes.len > 0);
     try std.testing.expect(data_batch.commit_index > 0);
-    try std.testing.expect(data_batch.entries_bytes.len > 0);
+    try std.testing.expect(data_batch.entry_count > 0);
 }
 
 test "managed host default metadata and data apply stores survive restart" {
@@ -1747,7 +1747,7 @@ test "managed host default metadata and data apply stores survive restart" {
         try std.testing.expect(metadata_batch.commit_index > 0);
         try std.testing.expect(metadata_batch.entries_bytes.len > 0);
         try std.testing.expect(data_batch.commit_index > 0);
-        try std.testing.expect(data_batch.entries_bytes.len > 0);
+        try std.testing.expect(data_batch.entry_count > 0);
     }
 }
 

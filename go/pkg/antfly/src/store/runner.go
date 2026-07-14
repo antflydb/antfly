@@ -130,7 +130,7 @@ func sendNodeRegistration(ctx context.Context, client *http.Client, url string, 
 }
 
 // RegisterWithLeaderWithRetry registers a store with the metadata cluster using
-// a default HTTP client. Suitable for swarm mode where the caller manages runtimes.
+// a default HTTP client. Suitable for standalone mode where the caller manages runtimes.
 func RegisterWithLeaderWithRetry(
 	ctx context.Context,
 	lg *zap.Logger,

@@ -143,17 +143,17 @@ func CreateTestConfig(t *testing.T, baseDir string, id types.ID) *common.Config 
 	t.Helper()
 
 	config := &common.Config{
-		SwarmMode:             true,
+		DeploymentMode:        common.ConfigDeploymentModeStandalone,
 		DisableShardAlloc:     true,
 		ReplicationFactor:     1,
 		DefaultShardsPerTable: 1,
 		HealthPort:            GetFreePort(t),
 		Storage: common.StorageConfig{
 			Local: common.LocalStorageConfig{
-				BaseDir: baseDir,
+				BaseDir:  baseDir,
+				Data:     common.StorageBackendLocal,
+				Metadata: common.StorageBackendLocal,
 			},
-			Data:     common.StorageBackendLocal,
-			Metadata: common.StorageBackendLocal,
 		},
 		Metadata: common.MetadataInfo{
 			OrchestrationUrls: map[string]string{},
@@ -475,7 +475,7 @@ func BackupTestDatabase(t *testing.T, ctx context.Context, client *antfly.Antfly
 
 	t.Logf("Creating backup '%s' for table '%s' to location: %s", backupID, tableName, location)
 
-	err := client.Backup(ctx, tableName, backupID, location)
+	err := client.Backup(ctx, tableName, backupID, location, "e2e-backups")
 	if err != nil {
 		return fmt.Errorf("backup failed: %w", err)
 	}
@@ -497,7 +497,9 @@ func RestoreTestDatabase(t *testing.T, ctx context.Context, client *antfly.Antfl
 
 	t.Logf("Restoring table '%s' from backup '%s' at location: %s", tableName, backupID, location)
 
-	err := client.Restore(ctx, tableName, backupID, location)
+	_, err := client.Restore(ctx, tableName, antfly.TableRestoreOptions{
+		BackupID: backupID, Location: location, Connection: "e2e-backups",
+	})
 	if err != nil {
 		return fmt.Errorf("restore failed: %w", err)
 	}
@@ -667,7 +669,7 @@ func cdcCleanupPG(t *testing.T, tableName, slotName, pubName string) {
 	_, _ = conn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", pubName))
 }
 
-// waitForKeyAvailable polls until a key is available (reusable for swarm tests).
+// waitForKeyAvailable polls until a key is available (reusable for standalone tests).
 func waitForKeyAvailable(t *testing.T, ctx context.Context, client *antfly.AntflyClient, table, key string, timeout time.Duration) error {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

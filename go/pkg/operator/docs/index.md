@@ -26,7 +26,7 @@ Welcome to the Antfly Operator documentation. The Antfly Operator is a Kubernete
 |-------|-------------|
 | [Backup & Restore](operations/backup-restore.md) | Schedule backups and restore data |
 | [Autoscaling](operations/autoscaling.md) | Configure automatic scaling |
-| [Hot-Standby HA](operations/hot-standby-ha.md) | Operate Postgres-style hot standby in Swarm mode |
+| [Hot-Standby HA](operations/hot-standby-ha.md) | Operate Postgres-style hot standby in Standalone mode |
 | [Monitoring](operations/monitoring.md) | Health checks and observability |
 | [Pod Scheduling](operations/pod-scheduling.md) | Taints, tolerations, affinities, and workload placement |
 | [Storage](operations/storage.md) | PVC retention, volume expansion, and storage lifecycle |

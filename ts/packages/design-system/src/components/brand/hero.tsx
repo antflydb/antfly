@@ -17,7 +17,7 @@ interface HeroProps extends Omit<React.HTMLAttributes<HTMLElement>, "title"> {
   eyebrow?: React.ReactNode;
   /**
    * Headline. Wrap an accent word with {@link Highlight} for the amber-fill
-   * marker, e.g. `<>Search the <Highlight>swarm</Highlight></>`. Typeset in
+   * marker, e.g. `<>Search the <Highlight>standalone</Highlight></>`. Typeset in
    * Aeonik bold at display sizes.
    */
   title: React.ReactNode;

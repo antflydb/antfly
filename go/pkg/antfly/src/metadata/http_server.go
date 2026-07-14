@@ -22,7 +22,7 @@ import (
 const apiServerReadTimeout = time.Minute
 
 // NewAPIServer returns the shared metadata HTTP server configuration used by
-// both standalone metadata nodes and swarm mode.
+// both standalone metadata nodes and standalone mode.
 func NewAPIServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:        addr,

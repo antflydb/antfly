@@ -24,9 +24,17 @@ pub const ObjectStore = struct {
     opened: object_store_support.OpenedObjectStore,
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
+        return try initRemoteUriWithS3Options(alloc, uri, null);
+    }
+
+    pub fn initRemoteUriWithS3Options(
+        alloc: std.mem.Allocator,
+        uri: []const u8,
+        s3_options: ?object_store_support.S3Options,
+    ) !ObjectStore {
         return .{
             .alloc = alloc,
-            .opened = try object_store_support.OpenedObjectStore.initRemoteUri(alloc, uri, "serverless-manifests"),
+            .opened = try object_store_support.OpenedObjectStore.initRemoteUriWithS3Options(alloc, uri, "serverless-manifests", s3_options),
         };
     }
 
@@ -148,16 +156,40 @@ pub const ObjectStore = struct {
     }
 
     pub fn listVersionsAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8) ![]u64 {
+        return try self.listVersionsAllocWithPageSize(alloc, namespace, 1000);
+    }
+
+    fn listVersionsAllocWithPageSize(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, page_size: u32) ![]u64 {
+        if (page_size == 0) return error.InvalidPageSize;
         const prefix = try manifestsPrefixAlloc(alloc, self.opened.prefix, namespace);
         defer alloc.free(prefix);
-        var listed = try self.opened.client.listObjects(self.opened.bucket, .{ .prefix = prefix, .recursive = true });
-        defer listed.deinit(alloc);
 
         var versions = std.ArrayListUnmanaged(u64).empty;
         defer versions.deinit(alloc);
-        for (listed.entries) |entry| {
-            const version = parseVersionFromManifestKey(entry.key) catch continue;
-            try versions.append(alloc, version);
+        var continuation_token: ?[]u8 = null;
+        defer if (continuation_token) |token| alloc.free(token);
+        while (true) {
+            var listed = try self.opened.client.listObjects(self.opened.bucket, .{
+                .prefix = prefix,
+                .recursive = true,
+                .max_keys = page_size,
+                .continuation_token = continuation_token,
+            });
+            defer listed.deinit(alloc);
+            var next_token = if (listed.next_continuation_token) |token| try alloc.dupe(u8, token) else null;
+            errdefer if (next_token) |token| alloc.free(token);
+            for (listed.entries) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidManifestKey;
+                const version = parseVersionFromManifestKey(entry.key) catch continue;
+                try versions.append(alloc, version);
+            }
+            if (continuation_token != null and next_token != null and std.mem.eql(u8, continuation_token.?, next_token.?)) {
+                return error.InvalidContinuationToken;
+            }
+            if (continuation_token) |token| alloc.free(token);
+            continuation_token = next_token;
+            next_token = null;
+            if (continuation_token == null) break;
         }
         std.mem.sort(u64, versions.items, {}, std.sort.asc(u64));
         return try versions.toOwnedSlice(alloc);
@@ -297,9 +329,13 @@ test "objectstore-backed manifest store supports publish and list" {
 
     try store.put(manifest);
     try std.testing.expect(try store.compareAndSwapHead("docs", null, 1));
-    const versions = try store.listVersionsAlloc("docs");
+    manifest.version = 2;
+    try store.put(manifest);
+    manifest.version = 3;
+    try store.put(manifest);
+    const versions = try impl.listVersionsAllocWithPageSize(std.testing.allocator, "docs", 2);
     defer std.testing.allocator.free(versions);
-    try std.testing.expectEqualSlices(u64, &.{1}, versions);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, versions);
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

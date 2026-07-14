@@ -460,6 +460,9 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
     if (preserved_visibility and incoming.stats.doc_count < previous.stats.doc_count) {
         incoming.stats.doc_count = previous.stats.doc_count;
     }
+    if (preserved_visibility and incoming.stats.source_doc_count < previous.stats.source_doc_count) {
+        incoming.stats.source_doc_count = previous.stats.source_doc_count;
+    }
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
@@ -529,7 +532,8 @@ fn indexHasArtifactVisibilityFacts(index: db_mod.types.DBIndexStats) bool {
         index.term_count > 0 or
         index.edge_count > 0 or
         index.node_count > 0 or
-        index.root_node > 0;
+        index.root_node > 0 or
+        index.coverage_config_hash != 0;
 }
 
 fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_mod.types.DBIndexStats) void {
@@ -558,6 +562,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     var merged = try placeholder.clone(alloc);
     errdefer merged.deinit(alloc);
 
+    merged.stats.source_doc_count = previous.stats.source_doc_count;
     merged.stats.doc_count = previous.stats.doc_count;
     merged.stats.enrichment = previous.stats.enrichment;
     merged.stats.ttl_cleanup = previous.stats.ttl_cleanup;
@@ -965,8 +970,13 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .edge_count = item.edge_count,
             .node_count = item.node_count,
             .root_node = item.root_node,
+            .coverage_produced_count = item.coverage_produced_count,
             .coverage_skipped_count = item.coverage_skipped_count,
             .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
+            .coverage_config_hash = item.coverage_config_hash,
+            .coverage_summary_ready = item.coverage_summary_ready,
+            .coverage_generation = item.coverage_generation,
+            .coverage_identity_ready = item.coverage_identity_ready,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
             .enrichment_failed = item.enrichment_failed,
@@ -1054,6 +1064,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     return .{
+        .source_doc_count = stats.source_doc_count,
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
@@ -1115,8 +1126,13 @@ test "table runtime snapshot cache clones stored status" {
         .kind = .dense_vector,
         .doc_count = 11,
         .node_count = 5,
+        .coverage_produced_count = 5,
         .coverage_skipped_count = 6,
         .coverage_terminal_failed_count = 7,
+        .coverage_config_hash = 0x1234,
+        .coverage_summary_ready = false,
+        .coverage_generation = 0x5678,
+        .coverage_identity_ready = true,
         .backfill_active = true,
         .backfill_progress = 0.5,
         .enrichment_failed = true,
@@ -1238,8 +1254,13 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(u64, 8), cloned.items[0].stats.doc_set_planning.ordinal_list_count);
     try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.doc_set_planning.stale_identity_generation_rejection_count);
     try std.testing.expectEqualStrings("vec", cloned.items[0].stats.indexes[0].name);
+    try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.indexes[0].coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 6), cloned.items[0].stats.indexes[0].coverage_skipped_count);
     try std.testing.expectEqual(@as(u64, 7), cloned.items[0].stats.indexes[0].coverage_terminal_failed_count);
+    try std.testing.expectEqual(@as(u64, 0x1234), cloned.items[0].stats.indexes[0].coverage_config_hash);
+    try std.testing.expect(!cloned.items[0].stats.indexes[0].coverage_summary_ready);
+    try std.testing.expectEqual(@as(u64, 0x5678), cloned.items[0].stats.indexes[0].coverage_generation);
+    try std.testing.expect(cloned.items[0].stats.indexes[0].coverage_identity_ready);
     try std.testing.expect(cloned.items[0].stats.indexes[0].backfill_active);
     try std.testing.expectEqual(@as(f64, 0.5), cloned.items[0].stats.indexes[0].backfill_progress);
     try std.testing.expect(cloned.items[0].stats.indexes[0].enrichment_failed);
@@ -1799,6 +1820,22 @@ test "synthetic status with preserved visibility counters is a runtime fact" {
         },
     };
 
+    try std.testing.expect(statusHasRuntimeFacts(status));
+}
+
+test "cached all-skipped coverage observation is a runtime fact" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_skipped_count = 2,
+        .coverage_config_hash = 0x1234,
+        .coverage_summary_ready = true,
+    }};
+    const status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{ .source_doc_count = 2, .index_count = 1, .indexes = indexes[0..] },
+    };
     try std.testing.expect(statusHasRuntimeFacts(status));
 }
 

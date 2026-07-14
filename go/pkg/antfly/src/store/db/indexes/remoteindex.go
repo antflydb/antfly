@@ -475,7 +475,7 @@ func (ss *RemoteIndexSearchStatus) Merge(other *RemoteIndexSearchStatus) {
 }
 
 // MakeLocalIndexesForShards creates LocalIndex objects for each shard, using
-// the given ShardSearcher for direct in-process search (swarm mode).
+// the given ShardSearcher for direct in-process search (standalone mode).
 // The returned indexes have no FieldFilter; call WithFieldFilter on the
 // collection to set per-query field projections.
 // MakeRemoteIndexesForShards creates RemoteIndex objects for each shard without

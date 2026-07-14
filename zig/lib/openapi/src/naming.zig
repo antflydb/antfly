@@ -152,7 +152,7 @@ fn toSnakeCase(allocator: Allocator, name: []const u8) ![]u8 {
 
     for (name, 0..) |c, i| {
         if (c == '-' or c == ' ' or c == '.') {
-            try result.append(allocator, '_');
+            if (result.items.len == 0 or result.items[result.items.len - 1] != '_') try result.append(allocator, '_');
             continue;
         }
         if (std.ascii.isUpper(c)) {
@@ -163,7 +163,7 @@ fn toSnakeCase(allocator: Allocator, name: []const u8) ![]u8 {
             if (i > 0) {
                 const prev = name[i - 1];
                 const next_lower = (i + 1 < name.len) and std.ascii.isLower(name[i + 1]);
-                if (std.ascii.isLower(prev) or next_lower) {
+                if ((std.ascii.isLower(prev) or next_lower) and (result.items.len == 0 or result.items[result.items.len - 1] != '_')) {
                     try result.append(allocator, '_');
                 }
             }
@@ -289,6 +289,12 @@ test "zigFieldName reserved" {
     const r5 = try zigFieldName(alloc, "pet_id");
     defer alloc.free(r5);
     try std.testing.expectEqualStrings("pet_id", r5);
+}
+
+test "zigFieldName collapses separator before capital" {
+    const value = try zigFieldName(std.testing.allocator, "Idempotency-Key");
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("idempotency_key", value);
 }
 
 test "toMethodName" {

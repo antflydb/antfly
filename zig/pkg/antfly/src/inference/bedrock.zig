@@ -18,13 +18,13 @@ const single_input_batch_size: usize = 1;
 const imds_default_endpoint = "http://169.254.169.254";
 const ecs_credentials_endpoint = "http://169.254.170.2";
 
-const Credentials = struct {
+pub const Credentials = struct {
     access_key_id: []const u8,
     secret_access_key: []const u8,
     session_token: ?[]const u8 = null,
     expires_at_unix: ?u64 = null,
 
-    fn deinit(self: *Credentials, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Credentials, alloc: std.mem.Allocator) void {
         alloc.free(self.access_key_id);
         alloc.free(self.secret_access_key);
         if (self.session_token) |value| alloc.free(value);
@@ -42,63 +42,244 @@ const Credentials = struct {
         else
             true;
     }
+
+    fn isUnexpired(self: Credentials, now_unix: u64) bool {
+        return if (self.expires_at_unix) |expires| expires > now_unix else true;
+    }
+};
+
+pub const ProfileCredentialSource = struct {
+    name: []const u8,
+    shared_credentials_file: ?[]const u8 = null,
+};
+
+pub const WebIdentityCredentialSource = struct {
+    role_arn: []const u8,
+    token_file: []const u8,
+    session_name: []const u8 = "antfly",
+    sts_endpoint: ?[]const u8 = null,
+};
+
+pub const CredentialSource = union(enum) {
+    default,
+    profile: ProfileCredentialSource,
+    web_identity: WebIdentityCredentialSource,
 };
 
 pub const CredentialCache = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    cached: ?Credentials = null,
+    const Snapshot = struct {
+        alloc: std.mem.Allocator,
+        refs: std.atomic.Value(usize) = .init(1), // one cache-owned reference
+        source_key: u64,
+        credentials: Credentials,
 
-    fn lock(self: *CredentialCache) void {
-        while (!self.mutex.tryLock()) {
-            if (comptime builtin.os.tag == .freestanding) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            std.Thread.yield() catch {};
+        fn retain(self: *Snapshot) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
         }
-    }
 
-    fn unlock(self: *CredentialCache) void {
-        self.mutex.unlock();
-    }
+        fn release(self: *Snapshot) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            var credentials = self.credentials;
+            credentials.deinit(self.alloc);
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    pub const Lease = struct {
+        snapshot: *Snapshot,
+
+        pub fn credentials(self: Lease) Credentials {
+            return self.snapshot.credentials;
+        }
+
+        pub fn release(self: *Lease) void {
+            self.snapshot.release();
+            self.* = undefined;
+        }
+
+        pub fn releaseOpaque(ptr: *anyopaque) void {
+            const snapshot: *Snapshot = @ptrCast(@alignCast(ptr));
+            snapshot.release();
+        }
+
+        pub fn releaseContext(self: Lease) *anyopaque {
+            return self.snapshot;
+        }
+    };
+
+    io_init_mutex: std.atomic.Mutex = .unlocked,
+    closed: std.atomic.Value(bool) = .init(false),
+    io: ?std.Io = null,
+    mutex: std.Io.Mutex = .init,
+    refreshed: std.Io.Condition = .init,
+    refreshing: bool = false,
+    closing: bool = false,
+    active_calls: usize = 0,
+    cached: ?*Snapshot = null,
 
     pub fn deinit(self: *CredentialCache, alloc: std.mem.Allocator) void {
-        self.lock();
-        defer self.unlock();
-        if (self.cached) |*creds| creds.deinit(alloc);
+        _ = alloc;
+        self.closed.store(true, .release);
+        while (!self.io_init_mutex.tryLock()) std.atomic.spinLoopHint();
+        const maybe_io = self.io;
+        self.io_init_mutex.unlock();
+        const io = maybe_io orelse return;
+        self.mutex.lockUncancelable(io);
+        self.closing = true;
+        self.refreshed.broadcast(io);
+        while (self.refreshing or self.active_calls != 0) self.refreshed.waitUncancelable(io, &self.mutex);
+        const cached = self.cached;
         self.cached = null;
+        self.mutex.unlock(io);
+        if (cached) |snapshot| snapshot.release();
     }
 
-    fn get(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
-        const now = currentUnixSeconds();
-        self.lock();
-        if (self.cached) |creds| {
-            if (creds.isFresh(now)) {
-                const cloned = creds.clone(alloc) catch |err| {
-                    self.unlock();
-                    return err;
-                };
-                self.unlock();
-                return cloned;
+    pub fn get(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
+        return try self.getForSource(alloc, http, region, .default);
+    }
+
+    pub fn getForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
+        var lease = try self.getLeaseForSource(alloc, http, region, source);
+        defer lease.release();
+        return try lease.credentials().clone(alloc);
+    }
+
+    /// Returns a ref-counted immutable credential snapshot. Storage clients use
+    /// this path so cached requests avoid serialized key copies and heap churn;
+    /// the lease keeps credentials alive across signing even when a concurrent
+    /// refresh replaces the cache entry.
+    pub fn getLeaseForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Lease {
+        const source_key = credentialSourceKey(region, source);
+        const io = try self.bindIo(http.io);
+        self.mutex.lockUncancelable(io);
+        if (self.closing) {
+            self.mutex.unlock(io);
+            return error.CredentialCacheClosed;
+        }
+        self.active_calls += 1;
+        self.mutex.unlock(io);
+        defer self.finishCall(io);
+        while (true) {
+            const now = currentUnixSeconds();
+            self.mutex.lockUncancelable(io);
+            if (self.closing) {
+                self.mutex.unlock(io);
+                return error.CredentialCacheClosed;
             }
-        }
-        self.unlock();
+            if (self.cached) |snapshot| {
+                if (snapshot.source_key == source_key and snapshot.credentials.isFresh(now)) {
+                    snapshot.retain();
+                    self.mutex.unlock(io);
+                    return .{ .snapshot = snapshot };
+                }
+            }
 
-        var fresh = try resolveCredentialsUncached(alloc, http, region);
-        errdefer fresh.deinit(alloc);
-        const cached_copy = try fresh.clone(alloc);
-        errdefer {
-            var copy = cached_copy;
-            copy.deinit(alloc);
-        }
+            if (self.refreshing) {
+                // During proactive refresh, continue serving the still-valid
+                // snapshot. Only callers with expired credentials block.
+                if (self.cached) |snapshot| {
+                    if (snapshot.source_key == source_key and snapshot.credentials.isUnexpired(now)) {
+                        snapshot.retain();
+                        self.mutex.unlock(io);
+                        return .{ .snapshot = snapshot };
+                    }
+                }
+                self.refreshed.waitUncancelable(io, &self.mutex);
+                self.mutex.unlock(io);
+                continue;
+            }
+            self.refreshing = true;
+            self.mutex.unlock(io);
 
-        self.lock();
-        defer self.unlock();
-        if (self.cached) |*old| old.deinit(alloc);
-        self.cached = cached_copy;
-        return fresh;
+            var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| {
+                self.mutex.lockUncancelable(io);
+                self.refreshing = false;
+                const closing = self.closing;
+                const fallback = if (!closing and self.cached != null) blk: {
+                    const snapshot = self.cached.?;
+                    if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(currentUnixSeconds())) break :blk null;
+                    snapshot.retain();
+                    break :blk snapshot;
+                } else null;
+                self.refreshed.broadcast(io);
+                self.mutex.unlock(io);
+                if (closing) return error.CredentialCacheClosed;
+                if (fallback) |snapshot| return .{ .snapshot = snapshot };
+                return err;
+            };
+            errdefer fresh.deinit(alloc);
+            const snapshot = alloc.create(Snapshot) catch |err| {
+                self.finishFailedRefresh(io);
+                return err;
+            };
+            snapshot.* = .{ .alloc = alloc, .source_key = source_key, .credentials = fresh };
+            fresh = undefined;
+
+            self.mutex.lockUncancelable(io);
+            if (self.closing) {
+                self.refreshing = false;
+                self.refreshed.broadcast(io);
+                self.mutex.unlock(io);
+                snapshot.release();
+                return error.CredentialCacheClosed;
+            }
+            const old = self.cached;
+            self.cached = snapshot;
+            snapshot.retain(); // caller lease
+            self.refreshing = false;
+            self.refreshed.broadcast(io);
+            self.mutex.unlock(io);
+            if (old) |previous| previous.release();
+            return .{ .snapshot = snapshot };
+        }
+    }
+
+    fn finishFailedRefresh(self: *CredentialCache, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        self.refreshing = false;
+        self.refreshed.broadcast(io);
+        self.mutex.unlock(io);
+    }
+
+    fn finishCall(self: *CredentialCache, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        std.debug.assert(self.active_calls > 0);
+        self.active_calls -= 1;
+        self.refreshed.broadcast(io);
+        self.mutex.unlock(io);
+    }
+
+    fn bindIo(self: *CredentialCache, io: std.Io) !std.Io {
+        if (self.closed.load(.acquire)) return error.CredentialCacheClosed;
+        while (!self.io_init_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.io_init_mutex.unlock();
+        if (self.closed.load(.acquire)) return error.CredentialCacheClosed;
+        if (self.io == null) self.io = io;
+        return self.io.?;
     }
 };
+
+fn credentialSourceKey(region: []const u8, source: CredentialSource) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(region);
+    const tag: [1]u8 = .{@intFromEnum(std.meta.activeTag(source))};
+    hash.update(&tag);
+    switch (source) {
+        .default => {},
+        .profile => |profile| {
+            hash.update(profile.name);
+            if (profile.shared_credentials_file) |value| hash.update(value);
+        },
+        .web_identity => |identity| {
+            hash.update(identity.role_arn);
+            hash.update(identity.token_file);
+            hash.update(identity.session_name);
+            if (identity.sts_endpoint) |value| hash.update(value);
+        },
+    }
+    return hash.final();
+}
 
 pub const Options = struct {
     region: []const u8,
@@ -257,7 +438,7 @@ pub const Provider = struct {
 /// Fetch the Bedrock control-plane foundation-models listing for a region.
 /// Returns the raw JSON response body; the caller owns it.
 pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, endpoint_override: ?[]const u8, timeout_ms: u64) ![]u8 {
-    var creds = try resolveCredentialsUncached(alloc, http, region);
+    var creds = try resolveCredentialsUncached(alloc, http, region, .default);
     defer creds.deinit(alloc);
 
     const default_endpoint = try std.fmt.allocPrint(alloc, "https://bedrock.{s}.amazonaws.com", .{region});
@@ -509,25 +690,31 @@ fn vectorFromJson(alloc: std.mem.Allocator, value: std.json.Value) ![]const f32 
     return vector;
 }
 
-fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
-    if (getEnvOwned(alloc, "AWS_ACCESS_KEY_ID")) |access| {
-        errdefer alloc.free(access);
-        const secret = getEnvOwned(alloc, "AWS_SECRET_ACCESS_KEY") orelse return error.MissingSecretAccessKey;
-        errdefer alloc.free(secret);
-        const token = getEnvOwned(alloc, "AWS_SESSION_TOKEN");
-        return .{ .access_key_id = access, .secret_access_key = secret, .session_token = token };
-    }
-    if (credentialsFromWebIdentity(alloc, http, region)) |creds| return creds else |_| {}
-    if (credentialsFromSharedFiles(alloc)) |creds| return creds else |_| {}
-    if (credentialsFromEcsMetadata(alloc, http)) |creds| return creds else |_| {}
-    if (credentialsFromInstanceMetadata(alloc, http)) |creds| return creds else |_| {}
-    return error.MissingAwsCredentials;
+fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
+    return switch (source) {
+        .profile => |profile| try credentialsFromSharedFiles(alloc, profile.name, profile.shared_credentials_file),
+        .web_identity => |identity| try credentialsFromWebIdentity(alloc, http, region, identity),
+        .default => blk: {
+            if (getEnvOwned(alloc, "AWS_ACCESS_KEY_ID")) |access| {
+                errdefer alloc.free(access);
+                const secret = getEnvOwned(alloc, "AWS_SECRET_ACCESS_KEY") orelse return error.MissingSecretAccessKey;
+                errdefer alloc.free(secret);
+                const token = getEnvOwned(alloc, "AWS_SESSION_TOKEN");
+                break :blk .{ .access_key_id = access, .secret_access_key = secret, .session_token = token };
+            }
+            if (credentialsFromWebIdentityFromEnv(alloc, http, region)) |creds| break :blk creds else |_| {}
+            const profile = getEnvOwned(alloc, "AWS_PROFILE") orelse try alloc.dupe(u8, "default");
+            defer alloc.free(profile);
+            if (credentialsFromSharedFiles(alloc, profile, null)) |creds| break :blk creds else |_| {}
+            if (credentialsFromEcsMetadata(alloc, http)) |creds| break :blk creds else |_| {}
+            if (credentialsFromInstanceMetadata(alloc, http)) |creds| break :blk creds else |_| {}
+            return error.MissingAwsCredentials;
+        },
+    };
 }
 
-fn credentialsFromSharedFiles(alloc: std.mem.Allocator) !Credentials {
-    const profile = getEnvOwned(alloc, "AWS_PROFILE") orelse try alloc.dupe(u8, "default");
-    defer alloc.free(profile);
-    const path = getEnvOwned(alloc, "AWS_SHARED_CREDENTIALS_FILE") orelse blk: {
+fn credentialsFromSharedFiles(alloc: std.mem.Allocator, profile: []const u8, explicit_path: ?[]const u8) !Credentials {
+    const path = if (explicit_path) |value| try alloc.dupe(u8, value) else getEnvOwned(alloc, "AWS_SHARED_CREDENTIALS_FILE") orelse blk: {
         const home = getEnvOwned(alloc, "HOME") orelse return error.MissingAwsCredentials;
         defer alloc.free(home);
         break :blk try std.fmt.allocPrint(alloc, "{s}/.aws/credentials", .{home});
@@ -564,9 +751,18 @@ fn parseProfileCredentials(alloc: std.mem.Allocator, data: []const u8, profile: 
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
-        if (std.mem.eql(u8, key, "aws_access_key_id")) access = try alloc.dupe(u8, value);
-        if (std.mem.eql(u8, key, "aws_secret_access_key")) secret = try alloc.dupe(u8, value);
-        if (std.mem.eql(u8, key, "aws_session_token")) token = try alloc.dupe(u8, value);
+        if (std.mem.eql(u8, key, "aws_access_key_id")) {
+            if (access != null) return error.DuplicateCredentialKey;
+            access = try alloc.dupe(u8, value);
+        }
+        if (std.mem.eql(u8, key, "aws_secret_access_key")) {
+            if (secret != null) return error.DuplicateCredentialKey;
+            secret = try alloc.dupe(u8, value);
+        }
+        if (std.mem.eql(u8, key, "aws_session_token")) {
+            if (token != null) return error.DuplicateCredentialKey;
+            token = try alloc.dupe(u8, value);
+        }
     }
     return .{
         .access_key_id = access orelse return error.MissingAccessKeyId,
@@ -575,40 +771,50 @@ fn parseProfileCredentials(alloc: std.mem.Allocator, data: []const u8, profile: 
     };
 }
 
-fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
+fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
     const role_arn = getEnvOwned(alloc, "AWS_ROLE_ARN") orelse return error.MissingAwsCredentials;
     defer alloc.free(role_arn);
     const token_file = getEnvOwned(alloc, "AWS_WEB_IDENTITY_TOKEN_FILE") orelse return error.MissingAwsCredentials;
     defer alloc.free(token_file);
     const session_name = getEnvOwned(alloc, "AWS_ROLE_SESSION_NAME") orelse try alloc.dupe(u8, "antfly-bedrock");
     defer alloc.free(session_name);
+    const sts_endpoint = getEnvOwned(alloc, "AWS_STS_ENDPOINT");
+    defer if (sts_endpoint) |value| alloc.free(value);
+    return try credentialsFromWebIdentity(alloc, http, region, .{
+        .role_arn = role_arn,
+        .token_file = token_file,
+        .session_name = session_name,
+        .sts_endpoint = sts_endpoint,
+    });
+}
 
+fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, identity: WebIdentityCredentialSource) !Credentials {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const token = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), token_file, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
+    const token = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), identity.token_file, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
     defer alloc.free(token);
 
-    const sts_endpoint = if (getEnvOwned(alloc, "AWS_STS_ENDPOINT")) |endpoint| endpoint else try std.fmt.allocPrint(alloc, "https://sts.{s}.amazonaws.com", .{region});
+    const sts_endpoint = if (identity.sts_endpoint) |endpoint| try alloc.dupe(u8, endpoint) else try std.fmt.allocPrint(alloc, "https://sts.{s}.amazonaws.com", .{region});
     defer alloc.free(sts_endpoint);
-    const encoded_role = try percentEncodeAlloc(alloc, role_arn);
+    const encoded_role = try percentEncodeAlloc(alloc, identity.role_arn);
     defer alloc.free(encoded_role);
-    const encoded_session = try percentEncodeAlloc(alloc, session_name);
+    const encoded_session = try percentEncodeAlloc(alloc, identity.session_name);
     defer alloc.free(encoded_session);
     const encoded_token = try percentEncodeAlloc(alloc, std.mem.trim(u8, token, " \t\r\n"));
     defer alloc.free(encoded_token);
-    const url = try std.fmt.allocPrint(alloc, "{s}/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={s}&RoleSessionName={s}&WebIdentityToken={s}", .{
-        sts_endpoint,
+    const body = try std.fmt.allocPrint(alloc, "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={s}&RoleSessionName={s}&WebIdentityToken={s}", .{
         encoded_role,
         encoded_session,
         encoded_token,
     });
-    defer alloc.free(url);
+    defer alloc.free(body);
 
-    var resp = http.request(.GET, url, .{}) catch return error.MissingAwsCredentials;
+    const headers = [_]HeaderPair{.{ "content-type", "application/x-www-form-urlencoded" }};
+    var resp = http.request(.POST, sts_endpoint, .{ .headers = &headers, .body = body }) catch return error.MissingAwsCredentials;
     defer resp.deinit();
     if (!resp.ok()) return error.MissingAwsCredentials;
-    const body = resp.body orelse return error.MissingAwsCredentials;
-    return try parseStsCredentials(alloc, body);
+    const response_body = resp.body orelse return error.MissingAwsCredentials;
+    return try parseStsCredentials(alloc, response_body);
 }
 
 fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client) !Credentials {
@@ -1227,12 +1433,51 @@ test "shared credentials profile parser" {
     try testSharedCredentialsProfileParser();
 }
 
+test "shared credentials profile parser rejects duplicate keys" {
+    try std.testing.expectError(error.DuplicateCredentialKey, parseProfileCredentials(
+        std.testing.allocator,
+        "[default]\naws_access_key_id = first\naws_access_key_id = second\naws_secret_access_key = secret\n",
+        "default",
+    ));
+}
+
 test "metadata credential parsers" {
     try testMetadataCredentialParsers();
 }
 
 test "credential url encoding" {
     try testCredentialUrlEncoding();
+}
+
+test "credential cache shutdown waits for an in-flight refresh" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var cache = CredentialCache{};
+    _ = try cache.bindIo(io);
+    cache.mutex.lockUncancelable(io);
+    cache.refreshing = true;
+    cache.mutex.unlock(io);
+
+    const Worker = struct {
+        fn run(target: *CredentialCache, worker_io: std.Io) void {
+            while (true) {
+                target.mutex.lockUncancelable(worker_io);
+                const closing = target.closing;
+                target.mutex.unlock(worker_io);
+                if (closing) break;
+                std.Thread.yield() catch {};
+            }
+            target.finishFailedRefresh(worker_io);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &cache, io });
+    cache.deinit(std.testing.allocator);
+    thread.join();
+    try std.testing.expect(cache.closing);
+    try std.testing.expect(!cache.refreshing);
+    try std.testing.expect(cache.cached == null);
+    try std.testing.expectError(error.CredentialCacheClosed, cache.bindIo(io));
 }
 
 test "request shape batches by provider request" {

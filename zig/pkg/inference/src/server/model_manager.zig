@@ -1073,6 +1073,32 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
         manifest.isClipclapGgufBundle();
 }
 
+pub const TransientModelLease = struct {
+    const State = enum { pending, active, released };
+
+    manager: *ModelManager,
+    request_id: u64,
+    state: State = .pending,
+
+    pub fn activate(self: *TransientModelLease) !void {
+        if (self.state != .pending) return error.InvalidTransientModelLease;
+        self.manager.activateTransientModelLoadForRequest(self.request_id) catch |err| {
+            self.state = .released;
+            return err;
+        };
+        self.state = .active;
+    }
+
+    pub fn deinit(self: *TransientModelLease) void {
+        switch (self.state) {
+            .pending => self.manager.abortTransientModelLoadForRequest(self.request_id),
+            .active => self.manager.releaseTransientModelForRequest(self.request_id),
+            .released => return,
+        }
+        self.state = .released;
+    }
+};
+
 pub const ModelManager = struct {
     pub const LifetimeStats = struct {
         evictions: u64,
@@ -1106,6 +1132,7 @@ pub const ModelManager = struct {
 
     const ActiveRequest = struct {
         models: std.ArrayListUnmanaged(RequestModel) = .empty,
+        transient_leases: usize = 0,
     };
 
     allocator: std.mem.Allocator,
@@ -1119,6 +1146,8 @@ pub const ModelManager = struct {
     latest_now_ms: u64 = 0,
     lru_tick: u64 = 0,
     pending_loads: usize = 0,
+    pending_transient_loads: usize = 0,
+    active_transient_models: usize = 0,
     state_lock: std.atomic.Mutex = .unlocked,
     pending_model_loads: std.StringHashMapUnmanaged(*PendingModelLoad) = .empty,
     pending_model_loads_lock: std.Io.Mutex = .init,
@@ -1154,6 +1183,8 @@ pub const ModelManager = struct {
         }
         self.loaded_aliases.deinit(self.allocator);
         std.debug.assert(self.active_requests.count() == 0);
+        std.debug.assert(self.pending_transient_loads == 0);
+        std.debug.assert(self.active_transient_models == 0);
         self.active_requests.deinit(self.allocator);
         std.debug.assert(self.pending_model_loads.count() == 0);
         self.pending_model_loads.deinit(self.allocator);
@@ -1283,6 +1314,7 @@ pub const ModelManager = struct {
         self.lockState();
         self.observeNowLocked(now_ms);
         var request = self.active_requests.fetchRemove(request_id).?.value;
+        std.debug.assert(request.transient_leases == 0);
         for (request.models.items) |entry| {
             const model = entry.model;
             std.debug.assert(model.manager_active_protections > 0);
@@ -1302,6 +1334,12 @@ pub const ModelManager = struct {
         self.lockState();
         defer self.unlockState();
         return self.loaded.count();
+    }
+
+    pub fn residentModelCount(self: *ModelManager) usize {
+        self.lockState();
+        defer self.unlockState();
+        return self.residentModelCountLocked();
     }
 
     /// Capture loaded-model pointers and associate each with the lifecycle
@@ -1461,33 +1499,41 @@ pub const ModelManager = struct {
         self.pending_model_loads_lock.unlock(io);
     }
 
-    fn reserveLoadSlot(self: *ModelManager) !void {
-        self.lockState();
-        const occupied = self.loaded.count() + self.pending_loads;
+    fn residentModelCountLocked(self: *const ModelManager) usize {
+        return self.loaded.count() +| self.active_transient_models;
+    }
+
+    fn pendingModelLoadCountLocked(self: *const ModelManager) usize {
+        return self.pending_loads +| self.pending_transient_loads;
+    }
+
+    fn ensureLoadCanStartLocked(self: *ModelManager) !void {
+        const resident = self.residentModelCountLocked();
+        const pending = self.pendingModelLoadCountLocked();
+        const occupied = resident +| pending;
         const can_add = !modelLimitReached(self.max_loaded_models, occupied);
         // At capacity, admit at most one replacement load when an idle victim
         // exists, but keep that healthy model alive until the replacement has
         // loaded successfully.
         const can_replace = self.max_loaded_models != 0 and
-            self.loaded.count() >= self.max_loaded_models and
-            self.pending_loads == 0 and
+            resident == self.max_loaded_models and
+            pending == 0 and
             self.findLruCandidateLocked(false) != null;
         if (!can_add and !can_replace) {
             _ = self.load_capacity_rejections.fetchAdd(1, .monotonic);
-            self.unlockState();
             return error.ModelCapacityReached;
         }
+    }
 
-        const loaded_capacity = std.math.cast(u32, occupied + 1) orelse {
-            self.unlockState();
+    fn reserveLoadSlot(self: *ModelManager) !void {
+        self.lockState();
+        defer self.unlockState();
+        try self.ensureLoadCanStartLocked();
+
+        const loaded_capacity = std.math.cast(u32, self.loaded.count() +| self.pending_loads +| 1) orelse
             return error.OutOfMemory;
-        };
-        self.loaded.ensureTotalCapacity(self.allocator, loaded_capacity) catch |err| {
-            self.unlockState();
-            return err;
-        };
+        try self.loaded.ensureTotalCapacity(self.allocator, loaded_capacity);
         self.pending_loads += 1;
-        self.unlockState();
     }
 
     fn releaseLoadSlot(self: *ModelManager) void {
@@ -1497,6 +1543,87 @@ pub const ModelManager = struct {
         self.pending_loads -= 1;
     }
 
+    pub fn beginTransientModelLoadForRequest(self: *ModelManager, request_id: u64) !TransientModelLease {
+        self.lockState();
+        defer self.unlockState();
+        const request = self.active_requests.getPtr(request_id) orelse return error.InvalidRequestLifecycle;
+        if (self.pending_transient_loads == std.math.maxInt(usize) or
+            request.transient_leases == std.math.maxInt(usize))
+        {
+            return error.RequestUseOverflow;
+        }
+        try self.ensureLoadCanStartLocked();
+        self.pending_transient_loads += 1;
+        request.transient_leases += 1;
+        return .{ .manager = self, .request_id = request_id };
+    }
+
+    fn activateTransientModelLoadForRequest(self: *ModelManager, request_id: u64) !void {
+        self.lockState();
+        const request = self.active_requests.getPtr(request_id) orelse {
+            self.unlockState();
+            return error.InvalidRequestLifecycle;
+        };
+        if (self.pending_transient_loads == 0 or request.transient_leases == 0) {
+            self.unlockState();
+            return error.InvalidTransientModelLease;
+        }
+        if (self.active_transient_models == std.math.maxInt(usize)) {
+            self.pending_transient_loads -= 1;
+            request.transient_leases -= 1;
+            self.unlockState();
+            return error.RequestUseOverflow;
+        }
+
+        var evicted: ?EvictedModel = null;
+        const resident = self.residentModelCountLocked();
+        if (modelLimitReached(self.max_loaded_models, resident)) {
+            const candidate = if (resident == self.max_loaded_models)
+                self.findLruCandidateLocked(false)
+            else
+                null;
+            if (candidate) |selected| {
+                const expired = modelTtlExpired(
+                    self.keep_alive_ms,
+                    self.latest_now_ms,
+                    selected.model.manager_last_used_ms,
+                );
+                evicted = self.removeCandidateLocked(selected, expired);
+            } else {
+                self.pending_transient_loads -= 1;
+                request.transient_leases -= 1;
+                _ = self.load_capacity_rejections.fetchAdd(1, .monotonic);
+                self.unlockState();
+                return error.ModelCapacityReached;
+            }
+        }
+
+        self.pending_transient_loads -= 1;
+        self.active_transient_models += 1;
+        self.unlockState();
+        if (evicted) |model| self.destroyEvicted(model);
+    }
+
+    fn abortTransientModelLoadForRequest(self: *ModelManager, request_id: u64) void {
+        self.lockState();
+        defer self.unlockState();
+        const request = self.active_requests.getPtr(request_id) orelse unreachable;
+        std.debug.assert(self.pending_transient_loads > 0);
+        std.debug.assert(request.transient_leases > 0);
+        self.pending_transient_loads -= 1;
+        request.transient_leases -= 1;
+    }
+
+    fn releaseTransientModelForRequest(self: *ModelManager, request_id: u64) void {
+        self.lockState();
+        defer self.unlockState();
+        const request = self.active_requests.getPtr(request_id) orelse unreachable;
+        std.debug.assert(self.active_transient_models > 0);
+        std.debug.assert(request.transient_leases > 0);
+        self.active_transient_models -= 1;
+        request.transient_leases -= 1;
+    }
+
     fn sweepModels(self: *ModelManager) void {
         while (true) {
             self.lockState();
@@ -1504,7 +1631,7 @@ pub const ModelManager = struct {
             var candidate = self.findLruCandidateLocked(true);
             if (candidate == null and modelLimitExceeded(
                 self.max_loaded_models,
-                self.loaded.count(),
+                self.residentModelCountLocked(),
             )) {
                 expired = false;
                 candidate = self.findLruCandidateLocked(false);
@@ -1966,8 +2093,12 @@ pub const ModelManager = struct {
 
         var eviction_candidate: ?EvictionCandidate = null;
         var eviction_expired = false;
-        if (modelLimitReached(self.max_loaded_models, self.loaded.count())) {
-            const candidate = self.findLruCandidateLocked(false) orelse {
+        const resident_models = self.residentModelCountLocked();
+        if (modelLimitReached(self.max_loaded_models, resident_models)) {
+            const candidate = (if (resident_models == self.max_loaded_models)
+                self.findLruCandidateLocked(false)
+            else
+                null) orelse {
                 _ = self.load_capacity_rejections.fetchAdd(1, .monotonic);
                 self.unlockState();
                 return error.ModelCapacityReached;
@@ -2150,6 +2281,176 @@ test "model manager loaded-model limit is hard and zero is unlimited" {
     try std.testing.expect(!modelLimitExceeded(0, std.math.maxInt(usize)));
     try std.testing.expect(!modelLimitExceeded(2, 2));
     try std.testing.expect(modelLimitExceeded(2, 3));
+}
+
+test "model manager transient lease consumes and releases request capacity" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    manager.configureModelLifetime(1, 0);
+
+    const first_request = try manager.beginRequest(1);
+    defer manager.endRequest(first_request, 4);
+    var first = try manager.beginTransientModelLoadForRequest(first_request);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_transient_loads);
+    try first.activate();
+    try std.testing.expectEqual(@as(usize, 0), manager.loadedModelCount());
+    try std.testing.expectEqual(@as(usize, 1), manager.residentModelCount());
+
+    const second_request = try manager.beginRequest(2);
+    defer manager.endRequest(second_request, 5);
+    try std.testing.expectError(
+        error.ModelCapacityReached,
+        manager.beginTransientModelLoadForRequest(second_request),
+    );
+    try std.testing.expectError(error.ModelCapacityReached, manager.reserveLoadSlot());
+
+    first.deinit();
+    var second = try manager.beginTransientModelLoadForRequest(second_request);
+    defer second.deinit();
+    try second.activate();
+    try std.testing.expectEqual(@as(usize, 1), manager.residentModelCount());
+}
+
+test "model manager transient pending lease aborts cleanly" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    manager.configureModelLifetime(1, 0);
+
+    try std.testing.expectError(
+        error.InvalidRequestLifecycle,
+        manager.beginTransientModelLoadForRequest(99),
+    );
+
+    const first_request = try manager.beginRequest(1);
+    defer manager.endRequest(first_request, 3);
+    var first = try manager.beginTransientModelLoadForRequest(first_request);
+    defer first.deinit();
+
+    const second_request = try manager.beginRequest(2);
+    defer manager.endRequest(second_request, 4);
+    try std.testing.expectError(
+        error.ModelCapacityReached,
+        manager.beginTransientModelLoadForRequest(second_request),
+    );
+
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.pending_transient_loads);
+    var second = try manager.beginTransientModelLoadForRequest(second_request);
+    defer second.deinit();
+    try second.activate();
+}
+
+test "model manager transient activation keeps a newly protected cached model" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    manager.configureModelLifetime(1, 0);
+
+    var cached: LoadedModel = undefined;
+    cached.manager_last_used_ms = 0;
+    cached.manager_lru_tick = 0;
+    cached.manager_active_protections = 0;
+    cached.manager_active_uses = 0;
+    try manager.loaded.put(std.testing.allocator, "cached", &cached);
+    defer _ = manager.loaded.remove("cached");
+
+    const loading_request = try manager.beginRequest(1);
+    defer manager.endRequest(loading_request, 4);
+    var transient = try manager.beginTransientModelLoadForRequest(loading_request);
+    defer transient.deinit();
+
+    const cached_request = try manager.beginRequest(2);
+    defer manager.endRequest(cached_request, 3);
+    _ = (try manager.lookupAndTouch("cached", cached_request)).?;
+
+    try std.testing.expectError(error.ModelCapacityReached, transient.activate());
+    try std.testing.expectEqual(@as(usize, 0), manager.pending_transient_loads);
+    try std.testing.expectEqual(@as(usize, 0), manager.active_transient_models);
+    try std.testing.expectEqual(@as(usize, 1), manager.loadedModelCount());
+}
+
+test "model manager transient activation evicts an idle cached model" {
+    const FakeSession = struct {
+        closed: bool = false,
+
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn run(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) anyerror![]backends.Tensor {
+            return error.TestSessionDoesNotRun;
+        }
+
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closed = true;
+        }
+
+        const vtable: backends.Session.VTable = .{
+            .run = run,
+            .inputInfo = inputInfo,
+            .outputInfo = outputInfo,
+            .backend = backend,
+            .close = close,
+        };
+    };
+
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    manager.configureModelLifetime(1, 0);
+
+    var fake_session: FakeSession = .{};
+    const cached = try allocator.create(LoadedModel);
+    const model_dir = try allocator.dupe(u8, "cached");
+    cached.* = .{
+        .manifest = .{ .allocator = allocator },
+        .hf_tok = null,
+        .sp_tok = null,
+        .session = fake_session.session(),
+        .session_manager = &manager.session_manager,
+        .model_dir = model_dir,
+        .allocator = allocator,
+        .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator),
+        .native_generation_graph_cache = graph_mod.cache.GraphCache.init(allocator),
+    };
+    const key = try allocator.dupe(u8, "cached");
+    var published = false;
+    defer if (!published) {
+        cached.deinit();
+        allocator.destroy(cached);
+        allocator.free(key);
+    };
+    try manager.loaded.put(allocator, key, cached);
+    published = true;
+    defer if (manager.loaded.fetchRemove("cached")) |removed| {
+        removed.value.deinit();
+        allocator.destroy(removed.value);
+        allocator.free(removed.key);
+    };
+
+    const request_id = try manager.beginRequest(1);
+    defer manager.endRequest(request_id, 2);
+    var transient = try manager.beginTransientModelLoadForRequest(request_id);
+    defer transient.deinit();
+
+    try transient.activate();
+    try std.testing.expectEqual(@as(usize, 0), manager.loadedModelCount());
+    try std.testing.expectEqual(@as(usize, 1), manager.residentModelCount());
+    try std.testing.expect(fake_session.closed);
+    try std.testing.expectEqual(@as(u64, 1), manager.lifetimeStats().evictions);
 }
 
 test "model manager cold-load flight key is shared across backend preferences" {

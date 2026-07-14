@@ -32,11 +32,13 @@ pub const TransitionAction = union(enum) {
         transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
+        destination_base_uri: ?[]const u8 = null,
     },
     catch_up_split_destination: struct {
         transition_id: u64,
         source_group_id: u64,
         destination_group_id: u64,
+        destination_base_uri: ?[]const u8 = null,
     },
     finalize_split_source: struct {
         transition_id: u64,

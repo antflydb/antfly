@@ -18,7 +18,7 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 
 - Go 1.21+
 - Zig 0.16.0+
-- Running Zig Antfly swarm with Antfly inference models
+- Running Zig Antfly standalone with Antfly inference models
 
 ### 1. Build and Start Zig Antfly
 
@@ -26,7 +26,7 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 # From the antfly root directory
 cd zig
 zig build install
-./zig-out/bin/antfly swarm
+./zig-out/bin/antfly standalone
 ```
 
 This starts a single-node Antfly cluster on `http://localhost:8080` with the

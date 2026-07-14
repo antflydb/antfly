@@ -1359,7 +1359,7 @@ demoCategories.brand.demos = [
               <span className="text-primary">can&apos;t touch.</span>
             </>
           }
-          description="Hybrid search. Local ML inference. Multimodal documents. One binary, zero glue code. Free to run in swarm mode, ready to scale with Antfly Cloud."
+          description="Hybrid search. Local ML inference. Multimodal documents. One binary, zero glue code. Free to run in standalone mode, ready to scale with Antfly Cloud."
           actions={
             <>
               <Button size="lg">Get Started</Button>

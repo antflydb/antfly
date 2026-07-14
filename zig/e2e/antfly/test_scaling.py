@@ -465,7 +465,10 @@ class MultiNodeScalingCluster:
             "max_shard_size_bytes": self.max_shard_size_bytes,
             "max_shards_per_table": 64,
             "default_shards_per_table": 1,
-            "storage": {"local": {"base_dir": str(self.root / "config-storage")}},
+            "storage": {
+                "engine": "local",
+                "local": {"base_dir": str(self.root / "config-storage")},
+            },
         }
         self.config_path.write_text(json.dumps(config), encoding="utf-8")
 
@@ -1121,7 +1124,7 @@ def _insert_docs(
             api_urls = _data_api_urls_for_table(
                 cluster,
                 table_name,
-                require_all_group_leaders=False,
+                require_all_group_leaders=True,
                 min_group_count=min_group_count,
             )
         except (AssertionError, requests.RequestException, ValueError):
@@ -1560,6 +1563,7 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
         f"node_to_stop: {node_to_stop}\n"
         f"last shutdown status: {complete_status}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
+        f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
     )
 

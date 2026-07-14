@@ -247,6 +247,7 @@ const GenerateBackendSelection = struct {
     compiled_partition_backend: ?ops.BackendKind = null,
     compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = .partitioned,
     graph_mode_requested: bool = false,
+    eager_mode_requested: bool = false,
 };
 
 fn parseGenerateBackendSelection(
@@ -260,8 +261,12 @@ fn parseGenerateBackendSelection(
         native_backend_choice.Choice.auto;
     try native_backend_choice.validate(choice);
 
+    var eager_mode_requested = false;
     const compiled_mode_requested = if (mode_value) |value| blk: {
-        if (std.mem.eql(u8, value, "eager")) break :blk false;
+        if (std.mem.eql(u8, value, "eager")) {
+            eager_mode_requested = true;
+            break :blk false;
+        }
         if (std.mem.eql(u8, value, "compiled")) break :blk true;
         return error.InvalidGenerateMode;
     } else false;
@@ -284,7 +289,23 @@ fn parseGenerateBackendSelection(
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
+        .eager_mode_requested = eager_mode_requested,
     };
+}
+
+fn shouldAutoUseMetalWholeModelGenerate(
+    loaded_backend: backends_mod.BackendType,
+    metal_executor_supported: bool,
+    deepseek_compressed_cache: bool,
+    prompt_cache_active: bool,
+    selection: GenerateBackendSelection,
+) bool {
+    if (!build_options.enable_metal) return false;
+    if (prompt_cache_active) return false;
+    if (selection.eager_mode_requested) return false;
+    if (selection.compiled_partition_backend != null) return false;
+    if (selection.native_choice == .native) return false;
+    return loaded_backend == .metal and metal_executor_supported and !deepseek_compressed_cache;
 }
 
 fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
@@ -2512,6 +2533,10 @@ pub const Node = struct {
             !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
             onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
         {
+            var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
+                return modelLoadFailure(ctx, err);
+            defer transient_lease.deinit();
+
             var prompt_override: ?[]u8 = null;
             defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
             if (tool_parser) |*parser| {
@@ -2527,6 +2552,7 @@ pub const Node = struct {
             var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
             defer pipeline.deinit();
+            transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
             if (config.grammar != null) {
@@ -2588,6 +2614,10 @@ pub const Node = struct {
             const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
             defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
             if (ort_model_dir) |prepared_model_dir| {
+                var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
+                    return modelLoadFailure(ctx, err);
+                defer transient_lease.deinit();
+
                 var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                 defer ort_manifest.deinit();
@@ -2628,6 +2658,7 @@ pub const Node = struct {
                 var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                 defer gen_model.deinit();
+                transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
 
                 var pipeline = generation.GenerationPipeline{
                     .allocator = ctx.allocator,
@@ -2878,6 +2909,7 @@ pub const Node = struct {
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
         if (config.prompt_cache_enabled and (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
+            !backend_selection.graph_mode_requested and
             backend_selection.compiled_partition_backend == null and
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
@@ -2967,15 +2999,31 @@ pub const Node = struct {
             }
         }
 
+        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
+            model.session.backend(),
+            graph_mod.metal_executor.supportsSession(model.session),
+            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
+            prompt_cache != null,
+            backend_selection,
+        );
+        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
+            .metal
+        else
+            backend_selection.compiled_partition_backend;
+        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
+            .whole_model
+        else
+            backend_selection.compiled_attachment_target;
+
         const graph_mode = backend_selection.graph_mode_requested or
-            backend_selection.compiled_partition_backend != null or
+            effective_compiled_partition_backend != null or
             graphModeEnabled();
         const use_scheduler = !graph_mode;
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
             model.session.backend() == .metal and
-            backend_selection.compiled_partition_backend == .metal and
-            backend_selection.compiled_attachment_target == .whole_model and
+            effective_compiled_partition_backend == .metal and
+            effective_compiled_attachment_target == .whole_model and
             graph_mod.metal_executor.supportsSession(model.session) and
             !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
         var request_graph_cache: ?graph_mod.cache.GraphCache = if (graph_mode and !use_model_graph_cache)
@@ -3018,8 +3066,8 @@ pub const Node = struct {
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
             .prompt_cache = prompt_cache,
             .graph_cache = graph_cache,
-            .compiled_partition_backend = backend_selection.compiled_partition_backend,
-            .compiled_attachment_target = backend_selection.compiled_attachment_target,
+            .compiled_partition_backend = effective_compiled_partition_backend,
+            .compiled_attachment_target = effective_compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
         };
 
@@ -4353,7 +4401,7 @@ pub const Node = struct {
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
-            return self.recognizeRebel(ctx, model_path, body);
+            return self.recognizeRebel(ctx, request_id, model_path, body);
         }
 
         const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
@@ -4394,7 +4442,7 @@ pub const Node = struct {
         return self.buildRecognizeResponse(ctx, body.model, entities_for_response, null, body.texts);
     }
 
-    fn recognizeRebel(self: *Node, ctx: *httpx.Context, model_path: []const u8, body: api.RecognizeRequest) !httpx.Response {
+    fn recognizeRebel(self: *Node, ctx: *httpx.Context, request_id: u64, model_path: []const u8, body: api.RecognizeRequest) !httpx.Response {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const hf_tokenizer = @import("inference_hf_tokenizer");
 
@@ -4420,6 +4468,10 @@ pub const Node = struct {
 
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
+
+        var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
+            return modelLoadFailure(ctx, err);
+        defer transient_lease.deinit();
 
         const sessions = blk: {
             var encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
@@ -4447,6 +4499,7 @@ pub const Node = struct {
             .config = config,
         };
         defer pipeline.deinit();
+        transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
 
         if (body.relation_labels) |relation_labels| {
             if (relation_labels.len > 0) {
@@ -4968,6 +5021,10 @@ pub const Node = struct {
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
+        var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
+            return modelLoadFailure(ctx, err);
+        defer transient_lease.deinit();
+
         // Load encoder and decoder sessions via the session manager.
         // Sessions are owned by this handler: a close flag guards all exit
         // paths (both error returns and ctx.status non-error returns), and
@@ -4987,6 +5044,7 @@ pub const Node = struct {
         decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         close_decoder = true;
+        transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
 
         // Parse decoder config
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
@@ -5257,6 +5315,8 @@ pub const Node = struct {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const tokenizer_mod = @import("inference_tokenizer");
         const hf_tokenizer = @import("inference_hf_tokenizer");
+        var transient_lease: ?model_manager_mod.TransientModelLease = null;
+        defer if (transient_lease) |*lease| lease.deinit();
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
         var close_encoder = false;
@@ -5271,6 +5331,9 @@ pub const Node = struct {
             defer ctx.allocator.free(paths.encoder);
             defer ctx.allocator.free(paths.decoder);
 
+            transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
+                return modelLoadFailure(ctx, err);
+
             encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
             close_encoder = true;
@@ -5278,6 +5341,7 @@ pub const Node = struct {
             decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
             close_decoder = true;
+            transient_lease.?.activate() catch |err| return modelLoadFailure(ctx, err);
 
             const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
@@ -5752,7 +5816,7 @@ pub const Node = struct {
     }
 
     /// Register inference API routes on an external server with a compile-time prefix.
-    /// Used by swarm mode to register on the unified httpx.Server.
+    /// Used by standalone mode to register on the unified httpx.Server.
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
@@ -5817,7 +5881,7 @@ pub const Node = struct {
         defer ctx.allocator.free(loaded_models);
 
         // Core metrics via prometheus lib
-        @constCast(&node.metrics).setModelsLoaded(loaded_models.len);
+        @constCast(&node.metrics).setModelsLoaded(node.model_manager.residentModelCount());
         try @constCast(&node.metrics).render(&writer.writer);
 
         const lifetime_stats = node.model_manager.lifetimeStats();
@@ -7133,6 +7197,19 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expectEqual(native_backend_choice.Choice.auto, auto_compiled.native_choice);
     try std.testing.expectEqual(@as(?ops.BackendKind, null), auto_compiled.compiled_partition_backend);
     try std.testing.expect(auto_compiled.graph_mode_requested);
+
+    const auto_default = try parseGenerateBackendSelection(null, null, null);
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_compiled));
+
+    const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
+    try std.testing.expect(metal_eager.eager_mode_requested);
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
+
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
 }

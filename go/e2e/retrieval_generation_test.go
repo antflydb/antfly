@@ -93,62 +93,62 @@ func executeSingleRetrievalQuery(
 }
 
 // TestE2E_RetrievalAgent_Suite runs all retrieval agent E2E tests under a single
-// swarm instance and shared table restore, dramatically reducing setup overhead.
+// standalone instance and shared table restore, dramatically reducing setup overhead.
 func TestE2E_RetrievalAgent_Suite(t *testing.T) {
 	skipUnlessML(t)
 	SkipIfProviderUnavailable(t)
 
-	// Single shared setup: one swarm, one table restore
+	// Single shared setup: one standalone, one table restore
 	setup := setupEvalTest(t, 40*time.Minute)
 	defer setup.Cleanup()
 
 	tableName := "antfly_docs_retrieval_suite_e2e"
 	backupID := "docsaf-test-backup"
-	setupTestTable(t, setup.Ctx, setup.Swarm.Client, tableName, backupID)
+	setupTestTable(t, setup.Ctx, setup.Standalone.Client, tableName, backupID)
 
-	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Inference.ApiUrl)
+	cfg := newTestQueryConfig(t, tableName, setup.Standalone.Config.Inference.ApiUrl)
 
-	// --- Subtests sharing the swarm + table ---
+	// --- Subtests sharing the standalone + table ---
 
 	t.Run("PipelineRetrieval", func(t *testing.T) {
-		testPipelineRetrieval(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testPipelineRetrieval(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("FullPipeline", func(t *testing.T) {
-		testFullPipeline(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testFullPipeline(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("Streaming", func(t *testing.T) {
-		testStreaming(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testStreaming(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("Agentic", func(t *testing.T) {
-		testAgentic(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testAgentic(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("ConfidenceAndFollowup", func(t *testing.T) {
-		testConfidenceAndFollowup(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testConfidenceAndFollowup(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("InlineEval", func(t *testing.T) {
-		testInlineEval(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testInlineEval(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("BM25Search", func(t *testing.T) {
-		testBM25Search(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testBM25Search(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("ErrorHandling", func(t *testing.T) {
-		testErrorHandling(t, setup.Ctx, setup.Swarm.Client, cfg)
+		testErrorHandling(t, setup.Ctx, setup.Standalone.Client, cfg)
 	})
 
 	t.Run("TreeSearch", func(t *testing.T) {
 		// TreeSearch needs its own table with hierarchy graph index
 		treeTableName := "antfly_docs_tree_suite_e2e"
 		treeBackupID := "docsaf-tree-backup"
-		setupTestTableWithHierarchy(t, setup.Ctx, setup.Swarm.Client, treeTableName, treeBackupID)
-		treeCfg := newTestQueryConfig(t, treeTableName, setup.Swarm.Config.Inference.ApiUrl)
-		testTreeSearch(t, setup.Ctx, setup.Swarm.Client, treeCfg)
+		setupTestTableWithHierarchy(t, setup.Ctx, setup.Standalone.Client, treeTableName, treeBackupID)
+		treeCfg := newTestQueryConfig(t, treeTableName, setup.Standalone.Config.Inference.ApiUrl)
+		testTreeSearch(t, setup.Ctx, setup.Standalone.Client, treeCfg)
 	})
 }
 

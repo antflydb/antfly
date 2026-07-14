@@ -22,6 +22,8 @@ const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig"
 const shard_mod = @import("../../storage/shard.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const shard_state_store = @import("shard_state_store.zig");
+const data_raft_batch = @import("../raft_batch.zig");
+const batch_shard_count: usize = 64;
 
 pub const AppliedDataBatch = struct {
     commit_index: u64,
@@ -30,8 +32,6 @@ pub const AppliedDataBatch = struct {
     admin_entry_count: usize,
     last_entry_term: u64,
     last_entry_index: u64,
-    last_normal_data: ?[]const u8,
-    entries_bytes: []const u8,
 };
 
 pub const AppliedNormalEntry = struct {
@@ -58,17 +58,12 @@ pub const RaftApplyStore = struct {
     path: []u8,
     backend: lsm_backend.BackendHandle,
     store: docstore.DocStore,
-    batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
+    batch_shards: [batch_shard_count]BatchShard = [_]BatchShard{.{}} ** batch_shard_count,
 
-    const OwnedBatch = struct {
-        commit_index: u64,
-        entry_count: usize,
-        normal_entry_count: usize,
-        admin_entry_count: usize,
-        last_entry_term: u64,
-        last_entry_index: u64,
-        last_normal_data: ?[]u8,
-        entries_bytes: []u8,
+    const OwnedBatch = AppliedDataBatch;
+    const BatchShard = struct {
+        mutex: std.Io.Mutex = .init,
+        batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
     };
 
     pub fn init(alloc: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
@@ -108,12 +103,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
-        var it = self.batches.valueIterator();
-        while (it.next()) |batch| {
-            self.alloc.free(batch.entries_bytes);
-            if (batch.last_normal_data) |data| self.alloc.free(data);
-        }
-        self.batches.deinit(self.alloc);
+        for (&self.batch_shards) |*shard| shard.batches.deinit(self.alloc);
         self.store.close();
         self.backend.close();
         self.alloc.free(self.path);
@@ -133,17 +123,12 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
-        const batch = (try self.ensureLoaded(group_id)) orelse return null;
-        return .{
-            .commit_index = batch.commit_index,
-            .entry_count = batch.entry_count,
-            .normal_entry_count = batch.normal_entry_count,
-            .admin_entry_count = batch.admin_entry_count,
-            .last_entry_term = batch.last_entry_term,
-            .last_entry_index = batch.last_entry_index,
-            .last_normal_data = batch.last_normal_data,
-            .entries_bytes = batch.entries_bytes,
-        };
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        const batch = (try self.ensureLoaded(shard, group_id)) orelse return null;
+        return batch.*;
     }
 
     pub fn appliedNormalEntries(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]AppliedNormalEntry {
@@ -176,6 +161,54 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.groupState(&self.store, alloc, group_id);
     }
 
+    /// Seeds a group that predates the data-Raft apply projection. Index zero is
+    /// reserved for this synthetic baseline so later real Raft entries retain
+    /// their original indexes. The per-group apply shard lock makes the
+    /// existence check atomic with normal apply. Snapshot data and its baseline
+    /// watermark are committed in one DocStore batch for crash-safe retry.
+    pub fn seedGroupSnapshotIfAbsent(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        byte_range: AppliedDataRange,
+        entries: []const AppliedDataKV,
+    ) !bool {
+        const encoded = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{
+            .term = 0,
+            .index = 0,
+            .entry_type = .normal,
+            .data = @constCast("snapshot_seed"),
+        }});
+        defer alloc.free(encoded);
+
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        if ((try self.ensureLoaded(shard, group_id)) != null) return false;
+        try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+
+        var key_buf: [128]u8 = undefined;
+        const key = try keyForGroup(&key_buf, group_id);
+        const value = try alloc.alloc(u8, @sizeOf(u64) + encoded.len);
+        defer alloc.free(value);
+        std.mem.writeInt(u64, value[0..8], 0, .little);
+        @memcpy(value[8..], encoded);
+        try shard_state_store.replaceGroupSnapshotWithMetadata(
+            &self.store,
+            alloc,
+            group_id,
+            byte_range,
+            entries,
+            &.{.{ .key = key, .value = value }},
+        );
+
+        var summary = try summarizeEntries(alloc, encoded);
+        summary.commit_index = 0;
+        shard.batches.putAssumeCapacity(group_id, summary);
+        return true;
+    }
+
     pub fn currentRange(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
         return try shard_state_store.currentRange(&self.store, alloc, group_id);
     }
@@ -186,6 +219,10 @@ pub const RaftApplyStore = struct {
 
     pub fn currentSplitDeltaSequence(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !u64 {
         return try shard_state_store.currentSplitDeltaSequence(&self.store, alloc, group_id);
+    }
+
+    pub fn currentSplitAcknowledgement(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?shard_state_store.SplitAcknowledgement {
+        return try shard_state_store.currentSplitAcknowledgement(&self.store, alloc, group_id);
     }
 
     pub fn captureSplitHandoff(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !SplitHandoff {
@@ -215,8 +252,41 @@ pub const RaftApplyStore = struct {
     }
 
     fn writeBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
-        const metadata = try describeEntries(self.alloc, entries_bytes);
-        defer if (metadata.last_normal_data) |data| self.alloc.free(data);
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.writeBatchLocked(shard, group_id, commit_index, entries_bytes);
+    }
+
+    fn writeBatchLocked(
+        self: *RaftApplyStore,
+        shard: *BatchShard,
+        group_id: u64,
+        commit_index: u64,
+        entries_bytes: []const u8,
+    ) !void {
+        const existing_batch = try self.ensureLoaded(shard, group_id);
+        if (existing_batch) |existing| {
+            if (commit_index < existing.commit_index) return error.OutOfOrderDataApplyBatch;
+            if (commit_index == existing.commit_index) {
+                try self.verifyPersistedBatch(group_id, commit_index, entries_bytes);
+                return;
+            }
+        } else {
+            // Reserve before the durable write so cache publication cannot fail
+            // after storage has advanced.
+            try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+        }
+        // A failed sibling state machine can leave this store ahead of Raft's
+        // shared applied watermark. Raft then legitimately presents an
+        // overlapping committed prefix. Apply effects only for entries newer
+        // than this store's own durable watermark.
+        const metadata = try describeEntries(
+            self.alloc,
+            entries_bytes,
+            if (existing_batch) |existing| existing.last_entry_index else 0,
+        );
         defer {
             for (metadata.normal_entries) |entry| self.alloc.free(entry.data);
             self.alloc.free(metadata.normal_entries);
@@ -232,7 +302,7 @@ pub const RaftApplyStore = struct {
                 },
                 .prepare_split => |split_key| self.alloc.free(split_key),
                 .start_split => |start| self.alloc.free(start.split_key),
-                .finalize_split, .rollback_split => {},
+                .acknowledge_split, .finalize_split, .rollback_split => {},
             };
             self.alloc.free(metadata.operations);
         }
@@ -245,61 +315,65 @@ pub const RaftApplyStore = struct {
         }
         var key_buf: [128]u8 = undefined;
         const key = try keyForGroup(&key_buf, group_id);
-        var value = try self.alloc.alloc(u8, @sizeOf(u64) + entries_bytes.len);
-        std.mem.writeInt(u64, value[0..8], commit_index, .little);
-        @memcpy(value[8..], entries_bytes);
-        try writes.append(self.alloc, .{
-            .key = try self.alloc.dupe(u8, key),
-            .value = value,
-        });
+        {
+            const owned_key = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(owned_key);
+            const value = try self.alloc.alloc(u8, @sizeOf(u64) + entries_bytes.len);
+            errdefer self.alloc.free(value);
+            std.mem.writeInt(u64, value[0..8], commit_index, .little);
+            @memcpy(value[8..], entries_bytes);
+            try writes.append(self.alloc, .{ .key = owned_key, .value = value });
+        }
 
         for (metadata.normal_entries) |entry| {
             var normal_key_buf: [160]u8 = undefined;
             const normal_key = try normalEntryKeyForGroup(&normal_key_buf, group_id, entry.index);
-            try writes.append(self.alloc, .{
-                .key = try self.alloc.dupe(u8, normal_key),
-                .value = try self.alloc.dupe(u8, entry.data),
-            });
+            const owned_key = try self.alloc.dupe(u8, normal_key);
+            errdefer self.alloc.free(owned_key);
+            const owned_value = try self.alloc.dupe(u8, entry.data);
+            errdefer self.alloc.free(owned_value);
+            try writes.append(self.alloc, .{ .key = owned_key, .value = owned_value });
         }
         try shard_state_store.appendOperationEffects(&self.store, self.alloc, group_id, metadata.operations, &writes, &deletes);
         try shard_state_store.putOwnedBatch(&self.store, self.alloc, writes.items, deletes.items);
 
-        const owned_entries = try self.alloc.dupe(u8, entries_bytes);
-        errdefer self.alloc.free(owned_entries);
-        const owned_last_normal_data = if (metadata.last_normal_data) |data|
-            try self.alloc.dupe(u8, data)
-        else
-            null;
-        errdefer if (owned_last_normal_data) |data| self.alloc.free(data);
-        if (self.batches.getPtr(group_id)) |existing| {
-            self.alloc.free(existing.entries_bytes);
-            if (existing.last_normal_data) |data| self.alloc.free(data);
-            existing.* = .{
-                .commit_index = commit_index,
-                .entry_count = metadata.entry_count,
-                .normal_entry_count = metadata.normal_entry_count,
-                .admin_entry_count = metadata.admin_entry_count,
-                .last_entry_term = metadata.last_entry_term,
-                .last_entry_index = metadata.last_entry_index,
-                .last_normal_data = owned_last_normal_data,
-                .entries_bytes = owned_entries,
-            };
-            return;
-        }
-        try self.batches.put(self.alloc, group_id, .{
+        const summary = AppliedDataBatch{
             .commit_index = commit_index,
             .entry_count = metadata.entry_count,
             .normal_entry_count = metadata.normal_entry_count,
             .admin_entry_count = metadata.admin_entry_count,
             .last_entry_term = metadata.last_entry_term,
             .last_entry_index = metadata.last_entry_index,
-            .last_normal_data = owned_last_normal_data,
-            .entries_bytes = owned_entries,
-        });
+        };
+        if (shard.batches.getPtr(group_id)) |existing| {
+            existing.* = summary;
+            return;
+        }
+        shard.batches.putAssumeCapacity(group_id, summary);
     }
 
-    fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?*OwnedBatch {
-        if (self.batches.getPtr(group_id)) |batch| return batch;
+    fn verifyPersistedBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
+        var key_buf: [128]u8 = undefined;
+        const key = try keyForGroup(&key_buf, group_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDataApplyBatch,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        if (encoded.len < @sizeOf(u64)) return error.InvalidDataApplyBatch;
+        if (std.mem.readInt(u64, encoded[0..8], .little) != commit_index or
+            !std.mem.eql(u8, encoded[8..], entries_bytes))
+        {
+            return error.ConflictingDataApplyBatch;
+        }
+    }
+
+    fn batchShard(self: *RaftApplyStore, group_id: u64) *BatchShard {
+        return &self.batch_shards[@as(usize, @intCast(group_id % batch_shard_count))];
+    }
+
+    fn ensureLoaded(self: *RaftApplyStore, shard: *BatchShard, group_id: u64) !?*OwnedBatch {
+        if (shard.batches.getPtr(group_id)) |batch| return batch;
 
         var key_buf: [128]u8 = undefined;
         const key = try keyForGroup(&key_buf, group_id);
@@ -311,45 +385,29 @@ pub const RaftApplyStore = struct {
         if (encoded.len < @sizeOf(u64)) return error.InvalidDataApplyBatch;
 
         const commit_index = std.mem.readInt(u64, encoded[0..8], .little);
-        const metadata = try describeEntries(self.alloc, encoded[8..]);
-        defer if (metadata.last_normal_data) |data| self.alloc.free(data);
-        defer {
-            for (metadata.normal_entries) |entry| self.alloc.free(entry.data);
-            self.alloc.free(metadata.normal_entries);
-            for (metadata.operations) |op| switch (op) {
-                .put => |put| {
-                    self.alloc.free(put.key);
-                    self.alloc.free(put.value);
-                },
-                .delete => |key_to_delete| self.alloc.free(key_to_delete),
-                .set_range => |range| {
-                    self.alloc.free(range.start);
-                    self.alloc.free(range.end);
-                },
-                .prepare_split => |split_key| self.alloc.free(split_key),
-                .start_split => |start| self.alloc.free(start.split_key),
-                .finalize_split, .rollback_split => {},
-            };
-            self.alloc.free(metadata.operations);
-        }
-        const owned_entries = try self.alloc.dupe(u8, encoded[8..]);
-        errdefer self.alloc.free(owned_entries);
-        const owned_last_normal_data = if (metadata.last_normal_data) |data|
-            try self.alloc.dupe(u8, data)
-        else
-            null;
-        errdefer if (owned_last_normal_data) |data| self.alloc.free(data);
-        try self.batches.put(self.alloc, group_id, .{
-            .commit_index = commit_index,
-            .entry_count = metadata.entry_count,
-            .normal_entry_count = metadata.normal_entry_count,
-            .admin_entry_count = metadata.admin_entry_count,
-            .last_entry_term = metadata.last_entry_term,
-            .last_entry_index = metadata.last_entry_index,
-            .last_normal_data = owned_last_normal_data,
-            .entries_bytes = owned_entries,
-        });
-        return self.batches.getPtr(group_id);
+        var summary = try summarizeEntries(self.alloc, encoded[8..]);
+        summary.commit_index = commit_index;
+        try shard.batches.put(self.alloc, group_id, summary);
+        return shard.batches.getPtr(group_id);
+    }
+
+    fn summarizeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8) !AppliedDataBatch {
+        const decoded = try raft_state_machine.decodeCommittedEntries(alloc, entries_bytes);
+        defer alloc.free(decoded);
+        var normal_entry_count: usize = 0;
+        var admin_entry_count: usize = 0;
+        for (decoded) |entry| switch (entry.entry_type) {
+            .normal => normal_entry_count += 1,
+            .conf_change, .conf_change_v2 => admin_entry_count += 1,
+        };
+        return .{
+            .commit_index = 0,
+            .entry_count = decoded.len,
+            .normal_entry_count = normal_entry_count,
+            .admin_entry_count = admin_entry_count,
+            .last_entry_term = if (decoded.len > 0) decoded[decoded.len - 1].term else 0,
+            .last_entry_index = if (decoded.len > 0) decoded[decoded.len - 1].index else 0,
+        };
     }
 
     const EntryMetadata = struct {
@@ -358,19 +416,17 @@ pub const RaftApplyStore = struct {
         admin_entry_count: usize,
         last_entry_term: u64,
         last_entry_index: u64,
-        last_normal_data: ?[]u8,
         normal_entries: []AppliedNormalEntry,
         operations: []DataOperation,
     };
 
     const DataOperation = shard_state_store.DataOperation;
 
-    fn describeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8) !EntryMetadata {
+    fn describeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8, after_index: u64) !EntryMetadata {
         const decoded = try raft_state_machine.decodeCommittedEntries(alloc, entries_bytes);
         defer alloc.free(decoded);
         var normal_entry_count: usize = 0;
         var admin_entry_count: usize = 0;
-        var last_normal_data: ?[]u8 = null;
         var normal_entries = std.ArrayListUnmanaged(AppliedNormalEntry).empty;
         var operations = std.ArrayListUnmanaged(DataOperation).empty;
         errdefer {
@@ -390,24 +446,20 @@ pub const RaftApplyStore = struct {
                 },
                 .prepare_split => |split_key| alloc.free(split_key),
                 .start_split => |start| alloc.free(start.split_key),
-                .finalize_split, .rollback_split => {},
+                .acknowledge_split, .finalize_split, .rollback_split => {},
             };
             operations.deinit(alloc);
         }
-        errdefer if (last_normal_data) |data| alloc.free(data);
         for (decoded) |entry| {
             switch (entry.entry_type) {
                 .normal => {
                     normal_entry_count += 1;
+                    if (entry.index <= after_index) continue;
                     try normal_entries.append(alloc, .{
                         .index = entry.index,
                         .data = try alloc.dupe(u8, entry.data),
                     });
-                    if (last_normal_data) |existing| alloc.free(existing);
-                    last_normal_data = try alloc.dupe(u8, entry.data);
-                    if (try parseDataOperation(alloc, entry.data)) |op| {
-                        try operations.append(alloc, op);
-                    }
+                    try appendDataOperations(alloc, entry.data, &operations);
                 },
                 .conf_change, .conf_change_v2 => admin_entry_count += 1,
             }
@@ -419,7 +471,6 @@ pub const RaftApplyStore = struct {
                 .admin_entry_count = 0,
                 .last_entry_term = 0,
                 .last_entry_index = 0,
-                .last_normal_data = null,
                 .normal_entries = try normal_entries.toOwnedSlice(alloc),
                 .operations = try operations.toOwnedSlice(alloc),
             };
@@ -431,7 +482,6 @@ pub const RaftApplyStore = struct {
             .admin_entry_count = admin_entry_count,
             .last_entry_term = last.term,
             .last_entry_index = last.index,
-            .last_normal_data = last_normal_data,
             .normal_entries = try normal_entries.toOwnedSlice(alloc),
             .operations = try operations.toOwnedSlice(alloc),
         };
@@ -517,6 +567,57 @@ pub const RaftApplyStore = struct {
         }
         return null;
     }
+
+    fn appendDataOperations(
+        alloc: std.mem.Allocator,
+        data: []const u8,
+        operations: *std.ArrayListUnmanaged(DataOperation),
+    ) !void {
+        if (!data_raft_batch.looksLikeEnvelope(data)) {
+            if (try parseDataOperation(alloc, data)) |op| try operations.append(alloc, op);
+            return;
+        }
+
+        var decoded = try data_raft_batch.decode(alloc, data);
+        defer decoded.deinit(alloc);
+        for (decoded.batch.req.writes) |write| {
+            const key = try alloc.dupe(u8, write.key);
+            errdefer alloc.free(key);
+            const value = try alloc.dupe(u8, write.value);
+            errdefer alloc.free(value);
+            try operations.append(alloc, .{ .put = .{ .key = key, .value = value } });
+        }
+        for (decoded.batch.req.deletes) |key| {
+            const owned_key = try alloc.dupe(u8, key);
+            errdefer alloc.free(owned_key);
+            try operations.append(alloc, .{ .delete = owned_key });
+        }
+        if (decoded.batch.req.split_transition) |transition| switch (transition.kind) {
+            .prepare => {
+                const split_key = try alloc.dupe(u8, transition.split_key);
+                errdefer alloc.free(split_key);
+                try operations.append(alloc, .{ .prepare_split = split_key });
+            },
+            .start => {
+                const split_key = try alloc.dupe(u8, transition.split_key);
+                errdefer alloc.free(split_key);
+                try operations.append(alloc, .{ .start_split = .{
+                    .new_shard_id = transition.destination_group_id,
+                    .split_key = split_key,
+                } });
+            },
+            .finalize => try operations.append(alloc, .finalize_split),
+            .rollback => try operations.append(alloc, .rollback_split),
+        };
+        if (decoded.batch.req.split_checkpoint) |checkpoint| {
+            if (checkpoint.kind == .source_ack) {
+                try operations.append(alloc, .{ .acknowledge_split = .{
+                    .destination_group_id = checkpoint.destination_group_id,
+                    .delta_sequence = checkpoint.delta_sequence,
+                } });
+            }
+        }
+    }
 };
 
 test "data raft apply store persists batches across reopen" {
@@ -551,10 +652,6 @@ test "data raft apply store persists batches across reopen" {
         try std.testing.expectEqual(@as(usize, 0), batch.admin_entry_count);
         try std.testing.expectEqual(@as(u64, 3), batch.last_entry_term);
         try std.testing.expectEqual(@as(u64, 15), batch.last_entry_index);
-        try std.testing.expectEqualStrings("put:b=", batch.last_normal_data orelse return error.MissingLastNormalData);
-        const decoded = try raft_state_machine.decodeCommittedEntries(std.testing.allocator, batch.entries_bytes);
-        defer std.testing.allocator.free(decoded);
-        try std.testing.expectEqualStrings("put:b=", decoded[1].data);
         const normal_entries = try store.appliedNormalEntries(std.testing.allocator, 31);
         defer {
             for (normal_entries) |entry| std.testing.allocator.free(entry.data);
@@ -607,8 +704,6 @@ test "data raft apply store separates normal and admin entries" {
     try std.testing.expectEqual(@as(usize, 4), batch.entry_count);
     try std.testing.expectEqual(@as(usize, 2), batch.normal_entry_count);
     try std.testing.expectEqual(@as(usize, 2), batch.admin_entry_count);
-    try std.testing.expectEqualStrings("put:y=2", batch.last_normal_data orelse return error.MissingLastNormalData);
-
     const normal_entries = try store.appliedNormalEntries(std.testing.allocator, 44);
     defer {
         for (normal_entries) |entry| std.testing.allocator.free(entry.data);
@@ -658,6 +753,7 @@ test "data raft apply store applies delete operations into group state" {
         .commit_index = 2,
         .entries_bytes = first,
     });
+    const first_snapshot = (try store.latestBatch(77)) orelse return error.MissingDataBatch;
 
     const second = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 2, .index = 3, .entry_type = .normal, .data = @constCast("del:k") },
@@ -668,6 +764,28 @@ test "data raft apply store applies delete operations into group state" {
         .commit_index = 3,
         .entries_bytes = second,
     });
+    try std.testing.expectEqual(@as(u64, 2), first_snapshot.commit_index);
+    const second_snapshot = (try store.latestBatch(77)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 3), second_snapshot.commit_index);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 77,
+        .commit_index = 3,
+        .entries_bytes = second,
+    });
+    const conflicting = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 3, .entry_type = .normal, .data = @constCast("put:z=10") },
+    });
+    defer std.testing.allocator.free(conflicting);
+    try std.testing.expectError(error.ConflictingDataApplyBatch, store.snapshotBuilder().applyBatch(.{
+        .group_id = 77,
+        .commit_index = 3,
+        .entries_bytes = conflicting,
+    }));
+    try std.testing.expectError(error.OutOfOrderDataApplyBatch, store.snapshotBuilder().applyBatch(.{
+        .group_id = 77,
+        .commit_index = 2,
+        .entries_bytes = first,
+    }));
 
     const group_state = try store.groupState(std.testing.allocator, 77);
     defer {
@@ -680,6 +798,56 @@ test "data raft apply store applies delete operations into group state" {
     try std.testing.expectEqual(@as(usize, 1), group_state.len);
     try std.testing.expectEqualStrings("z", group_state[0].key);
     try std.testing.expectEqualStrings("9", group_state[0].value);
+}
+
+test "data raft apply store orders independent groups through separate shards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-concurrent-groups", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.heap.page_allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expect(store.batchShard(1) != store.batchShard(2));
+    try std.testing.expect(store.batchShard(1) == store.batchShard(1 + batch_shard_count));
+
+    const Worker = struct {
+        store: *RaftApplyStore,
+        group_id: u64,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const entry = raft_state_machine.encodeCommittedEntries(std.heap.page_allocator, &.{.{
+                .term = 1,
+                .index = 1,
+                .entry_type = .normal,
+                .data = @constCast("put:k=1"),
+            }}) catch |err| {
+                self.result = err;
+                return;
+            };
+            defer std.heap.page_allocator.free(entry);
+            self.store.snapshotBuilder().applyBatch(.{
+                .group_id = self.group_id,
+                .commit_index = 1,
+                .entries_bytes = entry,
+            }) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+
+    var first = Worker{ .store = &store, .group_id = 1 };
+    var second = Worker{ .store = &store, .group_id = 2 };
+    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+    first_thread.join();
+    second_thread.join();
+    if (first.result) |err| return err;
+    if (second.result) |err| return err;
+    try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(1)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(2)).?.commit_index);
 }
 
 test "data raft apply store persists and enforces group range" {
@@ -880,6 +1048,150 @@ test "data raft apply store parses colon-delimited range keys correctly" {
     const split_state = (try store.currentSplitState(std.testing.allocator, 191)) orelse return error.MissingSplitState;
     defer shard_state_store.freeSplitState(std.testing.allocator, split_state);
     try std.testing.expectEqualStrings("doc:n", split_state.split_key);
+}
+
+test "data raft apply store persists split destination acknowledgements" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-ack", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const batch = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .source_group_id = 201,
+            .destination_group_id = 202,
+            .delta_sequence = 9,
+        },
+    });
+    defer std.testing.allocator.free(batch);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = batch },
+    });
+    defer std.testing.allocator.free(entries);
+
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 201,
+        .commit_index = 1,
+        .entries_bytes = entries,
+    });
+    const acknowledgement = (try store.currentSplitAcknowledgement(std.testing.allocator, 201)) orelse
+        return error.MissingSplitAcknowledgement;
+    try std.testing.expectEqual(@as(u64, 202), acknowledgement.destination_group_id);
+    try std.testing.expectEqual(@as(u64, 9), acknowledgement.delta_sequence);
+}
+
+test "data raft apply store skips persisted split commands in overlapping replay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-overlap", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .prepare,
+            .destination_group_id = 212,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(prepare);
+    const start = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .start,
+            .destination_group_id = 212,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(start);
+
+    const initial = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare },
+    });
+    defer std.testing.allocator.free(initial);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 211,
+        .commit_index = 2,
+        .entries_bytes = initial,
+    });
+
+    const overlapping = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = start },
+    });
+    defer std.testing.allocator.free(overlapping);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 211,
+        .commit_index = 3,
+        .entries_bytes = overlapping,
+    });
+
+    const split_state = (try store.currentSplitState(std.testing.allocator, 211)) orelse
+        return error.MissingSplitState;
+    defer shard_state_store.freeSplitState(std.testing.allocator, split_state);
+    try std.testing.expectEqual(shard_mod.SplitPhase.splitting, split_state.phase);
+    try std.testing.expectEqual(@as(u64, 212), split_state.new_shard_id);
+    try std.testing.expectEqualStrings("doc:m", split_state.split_key);
+}
+
+test "data raft apply store seeds pre-raft snapshots once at reserved index zero" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-seed", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+
+        try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+            std.testing.allocator,
+            311,
+            .{ .start = "doc:a", .end = "doc:z" },
+            &.{.{ .key = "doc:a", .value = "{\"v\":1}" }},
+        ));
+        const baseline = (try store.latestBatch(311)) orelse return error.MissingDataBatch;
+        try std.testing.expectEqual(@as(u64, 0), baseline.commit_index);
+        try std.testing.expectEqual(@as(u64, 0), baseline.last_entry_index);
+
+        try std.testing.expect(!try store.seedGroupSnapshotIfAbsent(
+            std.testing.allocator,
+            311,
+            .{ .start = "doc:m", .end = "" },
+            &.{.{ .key = "doc:replacement", .value = "{}" }},
+        ));
+    }
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const restored_baseline = (try store.latestBatch(311)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 0), restored_baseline.commit_index);
+    try std.testing.expectEqual(@as(u64, 0), restored_baseline.last_entry_index);
+
+    const real = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 1,
+        .entry_type = .normal,
+        .data = @constCast("put:doc:b={\"v\":2}"),
+    }});
+    defer std.testing.allocator.free(real);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 311,
+        .commit_index = 1,
+        .entries_bytes = real,
+    });
+
+    const state = try store.groupState(std.testing.allocator, 311);
+    defer shard_state_store.freeGroupStateEntries(std.testing.allocator, state);
+    try std.testing.expectEqual(@as(usize, 2), state.len);
+    try std.testing.expectEqualStrings("doc:a", state[0].key);
+    try std.testing.expectEqualStrings("doc:b", state[1].key);
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {

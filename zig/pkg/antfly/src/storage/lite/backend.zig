@@ -19,6 +19,8 @@ const db_mod = @import("../db/db.zig");
 const db_core = @import("../db/core.zig");
 const db_types = @import("../db/types.zig");
 const backend_erased = @import("../backend_erased.zig");
+const background_runtime = @import("../background_runtime.zig");
+const maintenance = @import("../maintenance.zig");
 const bridge = @import("bridge.zig");
 const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
@@ -28,6 +30,10 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const Allocator = std.mem.Allocator;
 const native_index_base_path = "__antfly_lite";
 const native_index_layout = "native_index_catalog_pages";
+const root_namespace_alias_catalog_key = "system/lite-root-namespace-alias";
+const artifact_profile_catalog_key = "system/lite-artifact-profile";
+const embedded_artifact_profile = "embedded-v1";
+const standalone_artifact_profile = "standalone-v1";
 
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
@@ -89,6 +95,7 @@ pub const StorageStatus = struct {
     active_checkpoint: ?u8 = null,
     checkpoint_sequence: ?u64 = null,
     page_count: ?u64 = null,
+    fsync: ?bool = null,
 };
 
 pub fn Status(comptime Stats: type) type {
@@ -121,12 +128,31 @@ pub fn copyStableSnapshotFile(allocator: Allocator, source_path: []const u8, des
 }
 
 pub const Handle = struct {
+    const NamespaceRuntime = struct {
+        name: []u8,
+        key_prefix: []u8,
+        index_base_path: []u8,
+        runtime_store: *backend_erased.Store,
+
+        fn deinit(self: *NamespaceRuntime, allocator: Allocator) void {
+            self.runtime_store.deinit();
+            allocator.destroy(self.runtime_store);
+            allocator.free(self.index_base_path);
+            allocator.free(self.key_prefix);
+            allocator.free(self.name);
+            self.* = undefined;
+        }
+    };
+
     allocator: Allocator,
     engine: EngineKind,
     bridge_storage: ?*bridge.ContainerStorage = null,
     native_docstore: ?*docstore.Store = null,
     native_index_storage: ?*index_storage.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
+    namespace_mutex: std.atomic.Mutex = .unlocked,
+    namespace_runtimes: std.StringHashMapUnmanaged(NamespaceRuntime) = .empty,
+    root_namespace_alias: ?[]u8 = null,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
@@ -153,6 +179,23 @@ pub const Handle = struct {
         return try createNativeSingleFile(allocator, path, opts);
     }
 
+    /// Opens an existing file or atomically creates it. Exclusive creation and
+    /// the retry close the check/create race when two processes start together;
+    /// the file's writer lock remains the final single-writer authority.
+    pub fn openOrCreate(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
+        return open(allocator, path, opts) catch |err| switch (err) {
+            error.FileNotFound => createWithOptions(allocator, path, .{
+                .exclusive = true,
+                .no_sync = opts.no_sync,
+                .resource_manager = opts.resource_manager,
+            }) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => try open(allocator, path, opts),
+                else => return create_err,
+            },
+            else => return err,
+        };
+    }
+
     pub fn deinit(self: *Handle) void {
         switch (self.engine) {
             .bridge_lsm_container => {
@@ -163,6 +206,10 @@ pub const Handle = struct {
                 }
             },
             .native_single_file => {
+                var runtimes = self.namespace_runtimes.valueIterator();
+                while (runtimes.next()) |runtime| runtime.deinit(self.allocator);
+                self.namespace_runtimes.deinit(self.allocator);
+                if (self.root_namespace_alias) |alias| self.allocator.free(alias);
                 if (self.native_index_storage) |storage| {
                     self.allocator.destroy(storage);
                     self.native_index_storage = null;
@@ -224,6 +271,163 @@ pub const Handle = struct {
         }
     }
 
+    /// Configures a DB instance to use an isolated logical namespace inside
+    /// this Lite file. Runtime stores and index paths are cached per namespace,
+    /// so repeated reader/writer opens allocate nothing after the first open.
+    pub fn configureDbOpenOptionsForNamespace(self: *Handle, opts: *db_mod.OpenOptions, namespace: []const u8) !void {
+        if (self.engine != .native_single_file or namespace.len == 0 or std.mem.indexOfScalar(u8, namespace, 0) != null) {
+            return error.InvalidArgument;
+        }
+        platform_sync.lockYielding(&self.namespace_mutex);
+        defer self.namespace_mutex.unlock();
+
+        const canonical_namespace = try canonicalDbNamespaceAlloc(self.allocator, namespace);
+        defer self.allocator.free(canonical_namespace);
+
+        var selected = self.namespace_runtimes.getPtr(canonical_namespace);
+        if (selected == null) {
+            const name = try self.allocator.dupe(u8, canonical_namespace);
+            errdefer self.allocator.free(name);
+            const root_alias = if (self.root_namespace_alias) |alias| std.mem.eql(u8, alias, canonical_namespace) else false;
+            const key_prefix = if (root_alias)
+                try self.allocator.dupe(u8, "")
+            else
+                try std.mem.concat(self.allocator, u8, &.{ "\x02db/", canonical_namespace, "\x00" });
+            errdefer self.allocator.free(key_prefix);
+            var namespace_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(canonical_namespace, &namespace_digest, .{});
+            const namespace_hex = std.fmt.bytesToHex(namespace_digest, .lower);
+            const index_base_path = if (root_alias)
+                try self.allocator.dupe(u8, native_index_base_path)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/tables/{s}", .{ native_index_base_path, namespace_hex });
+            errdefer self.allocator.free(index_base_path);
+            const runtime_store = try self.allocator.create(backend_erased.Store);
+            errdefer self.allocator.destroy(runtime_store);
+            runtime_store.* = try self.native_docstore.?.runtimeStoreWithPrefix(self.allocator, key_prefix);
+            errdefer runtime_store.deinit();
+            try self.namespace_runtimes.putNoClobber(self.allocator, name, .{
+                .name = name,
+                .key_prefix = key_prefix,
+                .index_base_path = index_base_path,
+                .runtime_store = runtime_store,
+            });
+            selected = self.namespace_runtimes.getPtr(name).?;
+        }
+
+        const runtime = selected.?;
+        if (opts.resource_manager == null) opts.resource_manager = self.native_docstore.?.resource_manager;
+        opts.primary_backend = .{ .mem = .{} };
+        opts.primary_runtime_store = runtime.runtime_store;
+        const storage = self.native_index_storage.?.storage();
+        opts.index_backends.text_main_backend = .lsm;
+        opts.index_backends.dense_storage_backend = .lsm;
+        opts.index_backends.sparse_backend = .lsm;
+        opts.index_backends.graph_reverse_backend = .lsm;
+        opts.index_backends.text_lsm_storage = storage;
+        opts.index_backends.dense_lsm_storage = storage;
+        opts.index_backends.sparse_lsm_storage = storage;
+        opts.index_backends.graph_lsm_storage = storage;
+        opts.index_backends.text_main_lsm_options.storage = storage;
+        opts.index_backends.text_wal_lsm_options.storage = storage;
+        opts.index_backends.dense_lsm_options.storage = storage;
+        opts.index_backends.sparse_lsm_options.storage = storage;
+        opts.index_backends.graph_reverse_lsm_options.storage = storage;
+        opts.index_base_path = runtime.index_base_path;
+        opts.index_open_parallelism = 1;
+        opts.external_derived_checkpoints = false;
+    }
+
+    /// Permanently maps an existing embedded root database to a standalone
+    /// table namespace. The alias is stored in the `.aflite` catalog, so moving
+    /// the file or changing the standalone data directory cannot orphan data.
+    pub fn adoptEmbeddedRootAsNamespace(self: *Handle, namespace: []const u8) !void {
+        if (self.engine != .native_single_file) return error.InvalidArgument;
+        const canonical = try canonicalDbNamespaceAlloc(self.allocator, namespace);
+        errdefer self.allocator.free(canonical);
+        platform_sync.lockYielding(&self.namespace_mutex);
+        defer self.namespace_mutex.unlock();
+        if (self.root_namespace_alias) |existing| {
+            if (!std.mem.eql(u8, existing, canonical)) return error.LiteRootNamespaceAlreadyAdopted;
+            self.allocator.free(canonical);
+            return;
+        }
+        // Changing the namespace mapping after a DB has opened would leave
+        // that caller bound to the old prefixed runtime. Fail closed instead
+        // of publishing an alias that only future opens observe.
+        if (self.namespace_runtimes.get(canonical)) |runtime| {
+            if (runtime.key_prefix.len != 0) return error.LiteNamespaceAlreadyOpened;
+        }
+        try self.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
+        self.root_namespace_alias = canonical;
+    }
+
+    pub fn embeddedRootHasUserDocuments(self: *Handle) !bool {
+        if (self.engine != .native_single_file) return false;
+        const docs = try self.native_docstore.?.file.snapshotDocumentsAlloc(self.allocator);
+        defer native.NativeFile.freeSnapshotDocuments(self.allocator, docs);
+        for (docs) |doc| {
+            if (!std.mem.startsWith(u8, doc.key, "\x02db/")) return true;
+        }
+        return false;
+    }
+
+    pub fn markEmbeddedArtifact(self: *Handle) !void {
+        if (self.engine != .native_single_file) return error.InvalidArgument;
+        if (try self.isEmbeddedArtifact()) return;
+        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
+    }
+
+    pub fn isEmbeddedArtifact(self: *const Handle) !bool {
+        return try self.artifactHasProfile(embedded_artifact_profile);
+    }
+
+    pub fn markStandaloneArtifact(self: *Handle) !void {
+        if (self.engine != .native_single_file) return error.InvalidArgument;
+        if (try self.isStandaloneArtifact()) return;
+        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
+    }
+
+    pub fn isStandaloneArtifact(self: *const Handle) !bool {
+        return try self.artifactHasProfile(standalone_artifact_profile);
+    }
+
+    fn artifactHasProfile(self: *const Handle, expected: []const u8) !bool {
+        if (self.engine != .native_single_file) return false;
+        const value = (try self.native_docstore.?.file.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
+        defer self.allocator.free(value);
+        return std.mem.eql(u8, value, expected);
+    }
+
+    pub fn hasStandaloneRootAdoption(self: *const Handle) bool {
+        return self.root_namespace_alias != null;
+    }
+
+    /// Installs this file as the storage provider for DBs opened by a composed
+    /// server runtime. The logical DB path is a stable namespace within the
+    /// file; repeated opens reuse the cached runtime and index storage objects.
+    pub fn dbOpenConfigurator(self: *Handle) background_runtime.DbOpenConfigurator {
+        return .{ .ptr = self, .configure_fn = configureDbOpenOpaque };
+    }
+
+    fn configureDbOpenOpaque(ptr: *anyopaque, path: []const u8, raw_options: *anyopaque) anyerror!void {
+        const self: *Handle = @ptrCast(@alignCast(ptr));
+        const opts: *db_mod.OpenOptions = @ptrCast(@alignCast(raw_options));
+        try self.configureDbOpenOptionsForNamespace(opts, path);
+    }
+
+    /// Returns a cached raw store for small system records such as the
+    /// standalone metadata catalog. The pointer remains valid until deinit.
+    pub fn runtimeStoreForNamespace(self: *Handle, namespace: []const u8) !*backend_erased.Store {
+        var opts: db_mod.OpenOptions = .{};
+        try self.configureDbOpenOptionsForNamespace(&opts, namespace);
+        const canonical_namespace = try canonicalDbNamespaceAlloc(self.allocator, namespace);
+        defer self.allocator.free(canonical_namespace);
+        platform_sync.lockYielding(&self.namespace_mutex);
+        defer self.namespace_mutex.unlock();
+        return self.namespace_runtimes.getPtr(canonical_namespace).?.runtime_store;
+    }
+
     pub fn storageStatus(self: *Handle) StorageStatus {
         return switch (self.engine) {
             .native_single_file => blk: {
@@ -240,6 +444,7 @@ pub const Handle = struct {
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
                     .page_count = checkpoint.page_count,
+                    .fsync = !file.no_sync,
                 };
             },
             .bridge_lsm_container => .{
@@ -266,16 +471,100 @@ pub const Handle = struct {
     }
 
     pub fn check(self: *Handle) !CheckReport {
+        return try self.checkWithCancel(null);
+    }
+
+    fn checkWithCancel(self: *Handle, cancel: ?*const maintenance.CancelToken) !CheckReport {
         return switch (self.engine) {
-            .bridge_lsm_container => toCheckReport(try self.bridge_storage.?.check()),
-            .native_single_file => try self.native_docstore.?.file.check(),
+            .bridge_lsm_container => blk: {
+                if (cancel) |token| try token.check();
+                const report = try self.bridge_storage.?.check();
+                if (cancel) |token| try token.check();
+                break :blk toCheckReport(report);
+            },
+            .native_single_file => blk: {
+                const store = self.native_docstore.?;
+                platform_sync.lockYielding(&store.mutex);
+                defer store.mutex.unlock();
+                break :blk try store.file.checkWithCancel(cancel);
+            },
+        };
+    }
+
+    pub fn maintenanceSource(self: *Handle) maintenance.Source {
+        return .{ .ptr = self, .vtable = &.{ .status = maintenanceStatus, .run = runMaintenance } };
+    }
+
+    fn maintenanceStatus(ptr: *anyopaque) maintenance.Status {
+        const self: *Handle = @ptrCast(@alignCast(ptr));
+        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
+        defer if (self.native_docstore) |store| store.mutex.unlock();
+        const status = self.storageStatus();
+        return .{
+            .engine = "lite",
+            .format = status.format,
+            .fsync = status.fsync,
+            // Native maintenance takes the file's exclusive maintenance gate.
+            // It is callable through the asynchronous admin surface, but is
+            // deliberately not advertised as availability-preserving.
+            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = false },
+        };
+    }
+
+    fn runMaintenance(ptr: *anyopaque, operation: maintenance.Operation, cancel: *const maintenance.CancelToken) anyerror!maintenance.Result {
+        const self: *Handle = @ptrCast(@alignCast(ptr));
+        try cancel.check();
+        return switch (operation) {
+            .check => blk: {
+                const report = try self.checkWithCancel(cancel);
+                break :blk .{
+                    .valid = report.valid,
+                    .issue = report.issue,
+                    .file_size = report.file_size,
+                    .valid_prefix_size = report.valid_prefix_size,
+                    .reclaimable_bytes = report.reclaimable_bytes,
+                    .live_file_count = report.live_file_count,
+                    .live_bytes = report.live_bytes,
+                };
+            },
+            .compact => blk: {
+                platform_sync.lockYielding(&self.namespace_mutex);
+                defer self.namespace_mutex.unlock();
+                var runtimes = self.namespace_runtimes.valueIterator();
+                while (runtimes.next()) |runtime| {
+                    try cancel.check();
+                    try runtime.runtime_store.sync(true);
+                }
+                const report = try self.vacuumWithCancel(cancel);
+                break :blk vacuumMaintenanceResult(report);
+            },
+            .vacuum => vacuumMaintenanceResult(try self.vacuumWithCancel(cancel)),
+        };
+    }
+
+    fn vacuumMaintenanceResult(report: VacuumReport) maintenance.Result {
+        return .{
+            .before_size = report.before_size,
+            .after_size = report.after_size,
+            .reclaimed_bytes = report.reclaimed_bytes,
+            .live_file_count = report.live_file_count,
+            .live_bytes = report.live_bytes,
         };
     }
 
     pub fn vacuum(self: *Handle) !VacuumReport {
+        return try self.vacuumWithCancel(null);
+    }
+
+    fn vacuumWithCancel(self: *Handle, cancel: ?*const maintenance.CancelToken) !VacuumReport {
         return switch (self.engine) {
-            .bridge_lsm_container => toVacuumReport(try self.bridge_storage.?.vacuum()),
-            .native_single_file => try nativeVacuumReport(self),
+            .bridge_lsm_container => blk: {
+                if (cancel) |token| try token.check();
+                const report = try self.bridge_storage.?.vacuum();
+                if (cancel) |token| try token.check();
+                break :blk toVacuumReport(report);
+            },
+            .native_single_file => try nativeVacuumReport(self, cancel),
         };
     }
 
@@ -366,14 +655,57 @@ fn initNativeSingleFile(
     runtime_store.* = try store.runtimeStore(allocator);
     errdefer runtime_store.deinit();
 
+    const artifact_profile = try store.file.getCatalogRecordAlloc(allocator, artifact_profile_catalog_key);
+    defer if (artifact_profile) |profile| allocator.free(profile);
+    if (artifact_profile) |profile| {
+        if (!std.mem.eql(u8, profile, embedded_artifact_profile) and
+            !std.mem.eql(u8, profile, standalone_artifact_profile))
+        {
+            return error.InvalidLiteArtifactProfile;
+        }
+    }
+    const root_namespace_alias = try store.file.getCatalogRecordAlloc(allocator, root_namespace_alias_catalog_key);
+    errdefer if (root_namespace_alias) |alias| allocator.free(alias);
+    if (root_namespace_alias) |alias| {
+        if (!isStableGroupNamespace(alias)) return error.InvalidLiteRootNamespaceAlias;
+    }
     return .{
         .allocator = allocator,
         .engine = .native_single_file,
         .native_docstore = store,
         .native_index_storage = native_index_storage,
         .native_runtime_store = runtime_store,
+        .root_namespace_alias = root_namespace_alias,
         .owned_resource_manager = owned_resource_manager,
     };
+}
+
+fn canonicalDbNamespaceAlloc(allocator: Allocator, namespace: []const u8) ![]u8 {
+    const table_suffix = "/table-db";
+    if (std.mem.endsWith(u8, namespace, table_suffix)) {
+        const before_table = namespace[0 .. namespace.len - table_suffix.len];
+        const component_start = if (std.mem.lastIndexOfScalar(u8, before_table, '/')) |index| index + 1 else 0;
+        const group_component = before_table[component_start..];
+        if (std.mem.startsWith(u8, group_component, "group-") and group_component.len > "group-".len) {
+            _ = std.fmt.parseUnsigned(u64, group_component["group-".len..], 10) catch return error.InvalidArgument;
+            return try std.fmt.allocPrint(allocator, "{s}{s}", .{ group_component, table_suffix });
+        }
+    }
+    return try allocator.dupe(u8, namespace);
+}
+
+fn isStableGroupNamespace(namespace: []const u8) bool {
+    const table_suffix = "/table-db";
+    if (!std.mem.endsWith(u8, namespace, table_suffix)) return false;
+    const group_component = namespace[0 .. namespace.len - table_suffix.len];
+    if (std.mem.indexOfScalar(u8, group_component, '/') != null or
+        !std.mem.startsWith(u8, group_component, "group-") or
+        group_component.len == "group-".len)
+    {
+        return false;
+    }
+    _ = std.fmt.parseUnsigned(u64, group_component["group-".len..], 10) catch return false;
+    return true;
 }
 
 fn toCheckReport(report: bridge.ContainerStorage.CheckReport) CheckReport {
@@ -401,8 +733,8 @@ fn toVacuumReport(report: bridge.ContainerStorage.VacuumReport) VacuumReport {
     };
 }
 
-fn nativeVacuumReport(handle: *Handle) !VacuumReport {
-    const report = try handle.native_docstore.?.vacuum();
+fn nativeVacuumReport(handle: *Handle, cancel: ?*const maintenance.CancelToken) !VacuumReport {
+    const report = try handle.native_docstore.?.vacuumWithCancel(cancel);
     return .{
         .before_size = report.before_size,
         .after_size = report.after_size,
@@ -988,6 +1320,129 @@ test "lite backend native engine can back db primary documents" {
         defer allocator.free(value);
         try std.testing.expectEqualStrings("{\"name\":\"native\"}", value);
     }
+}
+
+test "lite backend namespaced db options isolate tables in one file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-namespaced-db.aflite");
+    defer allocator.free(path);
+
+    var handle = try Handle.create(allocator, path, true);
+    defer handle.deinit();
+    var opts_a = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+    var opts_b = opts_a;
+    try handle.configureDbOpenOptionsForNamespace(&opts_a, "table/a");
+    try handle.configureDbOpenOptionsForNamespace(&opts_b, "table/b");
+    const runtime_a = try handle.runtimeStoreForNamespace("table/a");
+    try std.testing.expect(runtime_a == try handle.runtimeStoreForNamespace("table/a"));
+    try std.testing.expectEqual(@as(usize, 2), handle.namespace_runtimes.count());
+    var db_a = try db_mod.DB.open(allocator, "table/a", opts_a);
+    defer db_a.close();
+    var db_b = try db_mod.DB.open(allocator, "table/b", opts_b);
+    defer db_b.close();
+
+    try db_a.batch(.{ .writes = &.{.{ .key = "doc:same", .value = "{\"table\":\"a\"}" }}, .sync_level = .write });
+    try db_b.batch(.{ .writes = &.{.{ .key = "doc:same", .value = "{\"table\":\"b\"}" }}, .sync_level = .write });
+    const value_a = (try db_a.get(allocator, "doc:same")).?;
+    defer allocator.free(value_a);
+    const value_b = (try db_b.get(allocator, "doc:same")).?;
+    defer allocator.free(value_b);
+    try std.testing.expectEqualStrings("{\"table\":\"a\"}", value_a);
+    try std.testing.expectEqualStrings("{\"table\":\"b\"}", value_b);
+    try std.testing.expect(!std.mem.eql(u8, opts_a.index_base_path.?, opts_b.index_base_path.?));
+}
+
+test "lite backend adopts embedded root into a move-stable standalone namespace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "embedded-standalone.aflite");
+    defer allocator.free(path);
+
+    // Model data produced by `antfly lite batch` in the embedded root.
+    {
+        var handle = try Handle.create(allocator, path, true);
+        defer handle.deinit();
+        try handle.markEmbeddedArtifact();
+        var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+        try handle.configureDbOpenOptions(&opts);
+        var db = try db_mod.DB.open(allocator, path, opts);
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:portable", .value = "{\"source\":\"embedded\"}" }}, .sync_level = .write });
+    }
+
+    // The first standalone serve persists the logical table alias before it
+    // exposes catalog metadata.
+    {
+        var handle = try Handle.open(allocator, path, .{});
+        defer handle.deinit();
+        try std.testing.expect(try handle.isEmbeddedArtifact());
+        try handle.adoptEmbeddedRootAsNamespace("/var/lib/antfly/group-42/table-db");
+        var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+        try handle.configureDbOpenOptionsForNamespace(&opts, "/different/root/group-42/table-db");
+        try std.testing.expectEqualStrings(native_index_base_path, opts.index_base_path.?);
+        var db = try db_mod.DB.open(allocator, "group-42/table-db", opts);
+        defer db.close();
+        const value = (try db.get(allocator, "doc:portable")) orelse return error.MissingAdoptedEmbeddedDocument;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("{\"source\":\"embedded\"}", value);
+    }
+
+    // Reopen after a file move/data-directory change resolves the same stable
+    // group namespace from the artifact catalog rather than the host path.
+    {
+        var handle = try Handle.open(allocator, path, .{ .read_only = true });
+        defer handle.deinit();
+        try std.testing.expect(handle.hasStandaloneRootAdoption());
+        var opts = db_mod.OpenOptions{ .open_mode = .query_readonly, .start_index_workers = false, .start_optional_runtimes = false };
+        try handle.configureDbOpenOptionsForNamespace(&opts, "/mnt/restored/group-42/table-db");
+        var db = try db_mod.DB.open(allocator, "group-42/table-db", opts);
+        defer db.close();
+        const value = (try db.get(allocator, "doc:portable")) orelse return error.MissingReopenedAdoptedDocument;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("{\"source\":\"embedded\"}", value);
+    }
+}
+
+test "lite backend rejects root adoption after the target namespace opens" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "embedded-adoption-open.aflite");
+    defer allocator.free(path);
+
+    var handle = try Handle.create(allocator, path, true);
+    defer handle.deinit();
+    var opts = db_mod.OpenOptions{};
+    try handle.configureDbOpenOptionsForNamespace(&opts, "docs");
+    try std.testing.expectError(error.LiteNamespaceAlreadyOpened, handle.adoptEmbeddedRootAsNamespace("docs"));
+    try std.testing.expect(!handle.hasStandaloneRootAdoption());
+}
+
+test "lite backend fails closed on unknown artifact profile and invalid root alias" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const profile_path = try testPath(allocator, tmp, "invalid-profile.aflite");
+    defer allocator.free(profile_path);
+    {
+        var handle = try Handle.create(allocator, profile_path, true);
+        try handle.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, "future-unknown-profile");
+        handle.deinit();
+    }
+    try std.testing.expectError(error.InvalidLiteArtifactProfile, Handle.open(allocator, profile_path, .{}));
+
+    const alias_path = try testPath(allocator, tmp, "invalid-alias.aflite");
+    defer allocator.free(alias_path);
+    {
+        var handle = try Handle.create(allocator, alias_path, true);
+        try handle.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, "/host/path/group-1/table-db");
+        handle.deinit();
+    }
+    try std.testing.expectError(error.InvalidLiteRootNamespaceAlias, Handle.open(allocator, alias_path, .{}));
 }
 
 test "lite backend native open requires an existing file" {

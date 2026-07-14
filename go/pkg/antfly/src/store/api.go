@@ -461,7 +461,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 				}
 				// Don't cancel the download if the request context is canceled,
 				// it could take a while.
-				if err := downloadFromS3(context.Background(), h.logger, restoreConf.Location, backupFileName, destPath, &h.antflyConfig.Storage.S3); err != nil {
+				if err := downloadFromS3(context.Background(), h.logger, restoreConf.Location, backupFileName, destPath, &h.antflyConfig.Storage.Local.S3); err != nil {
 					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
 					if format == common.BackupFormatNative {
 						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
@@ -470,7 +470,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					if alternatePathErr != nil {
 						alternateDestPath = destPath
 					}
-					alternateErr := downloadFromS3(context.Background(), h.logger, restoreConf.Location, alternateName, alternateDestPath, &h.antflyConfig.Storage.S3)
+					alternateErr := downloadFromS3(context.Background(), h.logger, restoreConf.Location, alternateName, alternateDestPath, &h.antflyConfig.Storage.Local.S3)
 					if alternateErr != nil {
 						h.logger.Error(
 							"Failed to download backup from S3 for shard",
@@ -1136,7 +1136,7 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	_ = file.Close()
 
 	if strings.HasPrefix(req.Location, "s3://") {
-		if err := db.WriteBackupToBlobStore(context.Background(), req.Location, destPath, &h.antflyConfig.Storage.S3); err != nil {
+		if err := db.WriteBackupToBlobStore(context.Background(), req.Location, destPath, &h.antflyConfig.Storage.Local.S3); err != nil {
 			_ = os.Remove(destPath)
 			http.Error(w, fmt.Sprintf("Failed to upload portable backup: %v", err), http.StatusInternalServerError)
 			return

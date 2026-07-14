@@ -48,10 +48,7 @@ spec:
         "style": "json"
       },
       "cluster_name": "autoscaling-cluster",
-      "enable_metrics": true,
-      "storage": {
-        "cache_size": 536870912
-      }
+      "enable_metrics": true
     }
   
   storage:

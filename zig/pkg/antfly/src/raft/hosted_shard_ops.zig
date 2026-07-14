@@ -16,6 +16,7 @@ const std = @import("std");
 const api_http_client = @import("../api/http_client.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_router = @import("../api/table_router.zig");
+const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const http_common = @import("transport/http_common.zig");
@@ -110,12 +111,20 @@ pub const HostedShardOperationAdapter = struct {
 
     fn bootstrapSplitDestination(ptr: *anyopaque, op: BootstrapSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        try self.executeRouted(self.data_router, op.source_group_id, .{ .bootstrap_split_destination = op });
+        const destination_base_uri = try self.groupBaseUriAlloc(self.data_router, op.destination_group_id);
+        defer self.alloc.free(destination_base_uri);
+        var routed_op = op;
+        routed_op.destination_base_uri = destination_base_uri;
+        try self.executeRouted(self.data_router, op.source_group_id, .{ .bootstrap_split_destination = routed_op });
     }
 
     fn catchUpSplitDestination(ptr: *anyopaque, op: CatchUpSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        try self.executeRouted(self.data_router, op.source_group_id, .{ .catch_up_split_destination = op });
+        const destination_base_uri = try self.groupBaseUriAlloc(self.data_router, op.destination_group_id);
+        defer self.alloc.free(destination_base_uri);
+        var routed_op = op;
+        routed_op.destination_base_uri = destination_base_uri;
+        try self.executeRouted(self.data_router, op.source_group_id, .{ .catch_up_split_destination = routed_op });
     }
 
     fn finalizeSplitSource(ptr: *anyopaque, op: FinalizeSplitSource) !void {
@@ -196,7 +205,82 @@ pub const HostedShardOperationAdapter = struct {
             },
         }
     }
+
+    fn groupBaseUriAlloc(self: *HostedShardOperationAdapter, router: api_table_router.HostedGroupRouter, group_id: u64) ![]u8 {
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        if (!groupReadyForTransition(&snapshot, group_id)) return error.GroupLeaderUnavailable;
+
+        const leader_node_id = router.groupLeaderNodeId(group_id) orelse return error.GroupLeaderUnavailable;
+        if (leader_node_id == router.localNodeId()) {
+            if (router.localStatus(group_id) != .active) return error.GroupLeaderUnavailable;
+        } else if (router.nodeStatus(leader_node_id, group_id)) |status| {
+            if (status != .active) return error.GroupLeaderUnavailable;
+        }
+        return (try router.nodeBaseUriForGroup(self.alloc, group_id, leader_node_id)) orelse error.GroupLeaderUnavailable;
+    }
 };
+
+fn groupReadyForTransition(snapshot: *const metadata_api.AdminSnapshot, group_id: u64) bool {
+    var expected_voters: usize = 0;
+    for (snapshot.placement_intents) |intent| {
+        if (intent.record.group_id == group_id) expected_voters += 1;
+    }
+    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16)) return false;
+
+    const expected_voter_count: u16 = @intCast(expected_voters);
+    for (snapshot.merged_group_statuses) |status| {
+        if (status.group_id != group_id) continue;
+        return status.leader_known and
+            status.leader_store_id != 0 and
+            status.voter_count_known and
+            status.voter_count == expected_voter_count and
+            status.voter_count > 0 and
+            status.healthy_voter_reports >= status.voter_count and
+            !status.joint_consensus;
+    }
+    return false;
+}
+
+test "transition destination requires a stable healthy voter set" {
+    const metadata_table_manager = @import("../metadata/table_manager.zig");
+    const metadata_reconciler = @import("../metadata/reconciler.zig");
+    const raft_reconciler = @import("reconciler.zig");
+
+    var placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
+        .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
+        .{ .record = .{ .group_id = 77, .replica_id = 3, .local_node_id = 3 } },
+    };
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{.{
+        .group_id = 77,
+        .leader_known = true,
+        .leader_store_id = 1,
+        .voter_count_known = true,
+        .voter_count = 3,
+        .healthy_voter_reports = 3,
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = placements[0..],
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .merged_group_statuses = statuses[0..],
+    };
+
+    try std.testing.expect(groupReadyForTransition(&snapshot, 77));
+    statuses[0].healthy_voter_reports = 2;
+    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
+    statuses[0].healthy_voter_reports = 3;
+    statuses[0].joint_consensus = true;
+    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
+    statuses[0].joint_consensus = false;
+    statuses[0].voter_count = 2;
+    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
+}
 
 pub const HostedShardDbAdapter = struct {
     alloc: std.mem.Allocator,
@@ -332,7 +416,6 @@ pub const HostedShardDbAdapter = struct {
 };
 
 test "hosted shard operation adapter uses local shard ops when preferred leader is local" {
-    const metadata_api = @import("../metadata/api.zig");
     const metadata_table_manager = @import("../metadata/table_manager.zig");
     const raft_reconciler = @import("reconciler.zig");
 
@@ -502,7 +585,6 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
 
 test "hosted shard db adapter routes median key to remote leader" {
     const api_http_server = @import("../api/http_server.zig");
-    const metadata_api = @import("../metadata/api.zig");
     const metadata_table_manager = @import("../metadata/table_manager.zig");
     const raft_reconciler = @import("reconciler.zig");
     const std_http_executor = @import("transport/std_http_executor.zig");

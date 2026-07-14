@@ -73,6 +73,23 @@ such as store/operator flows beyond the public API.
 - Only bring backup/restore into serverless once the stateful public contract is
   stable.
 
+### Durable Restore Jobs
+
+- Restore creation returns a durable `RestoreJob`; `job_id` is an opaque decimal
+  string so every SDK can round-trip it without numeric precision loss.
+- `expires_at_ms` is absent while work is queued or running and is assigned only
+  when the job reaches a terminal phase.
+- Explicit idempotency keys are scoped by authenticated principal and restore
+  resource. Reusing a key for the same scoped request returns the original job;
+  unrelated users and tables cannot collide.
+- Explicit table lists are bounded at 256 entries to keep request and initial job
+  records bounded. Cluster-wide backup and restore support up to 4096 tables and
+  reject larger clusters before backup artifacts are created.
+- Publication and completion checkpoints are stored as canonical ordinal ranges.
+  Sequential cluster restores therefore retain constant-sized progress state;
+  even maximally fragmented progress remains below the durable 64 KiB job-record
+  limit.
+
 ## First-Cut Scope
 
 The first useful tranche should be table-scoped and local-filesystem only.
@@ -135,7 +152,7 @@ The production restore flow is:
    - backup location
    - per-range `snapshot_path`
    - restore phase/progress records
-4. return `202 {"restore":"triggered"}` once metadata has accepted the intent
+4. return `202 RestoreJob` once the durable job store has accepted the intent
 5. let placement/bootstrap workers restore shard snapshots into replica storage
 6. write a local per-shard `.restore-state` marker after primary data restore
    completes, then reopen restored DBs and rebuild/replay derived state in
@@ -376,6 +393,8 @@ Status:
 - `/backup`, `/restore`, and `/backups` are implemented for stateful backups
   over `file://`, `s3://`, and `gs://`
 - cluster backup writes a cluster manifest plus per-table manifests under the same location
+- backup IDs are immutable publication keys: generation-scoped payloads are
+  committed by a conditional public manifest, and reuse returns `409`
 - restore modes follow the Go cluster contract
 - unsupported table layouts still fail per-table instead of restoring
 
@@ -390,7 +409,7 @@ Deliverables:
 - local-filesystem backup/restore round-trip
 - cluster backup/list/restore round-trip
 - restore into missing target table
-- overwrite behavior
+- destructive overwrite rejection until atomic table-generation swap exists
 - index/search validation after restore
 - graph/text/sparse reopen checks as applicable
 
@@ -406,7 +425,7 @@ Status:
 - public Zig parity coverage now includes:
   - table backup/restore route coverage
   - cluster backup/list/restore round-trip
-  - cluster restore modes `fail_if_exists`, `skip_if_exists`, and `overwrite`
+  - cluster restore modes `fail_if_exists` and `skip_if_exists`; destructive overwrite fails closed
   - cluster partial success reporting for mixed valid and invalid table sets
   - cluster partial success reporting for unsupported multi-range tables
   - table backup rejection while schema migration is still rebuilding

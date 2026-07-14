@@ -248,6 +248,22 @@ const (
 	ReadCheckRequestConsistencyStaleOk    ReadCheckRequestConsistency = "stale_ok"
 )
 
+// Defines values for StorageMaintenanceOperation.
+const (
+	StorageMaintenanceOperationCheck   StorageMaintenanceOperation = "check"
+	StorageMaintenanceOperationCompact StorageMaintenanceOperation = "compact"
+	StorageMaintenanceOperationVacuum  StorageMaintenanceOperation = "vacuum"
+)
+
+// Defines values for StorageMaintenanceState.
+const (
+	StorageMaintenanceStateCanceled  StorageMaintenanceState = "canceled"
+	StorageMaintenanceStateFailed    StorageMaintenanceState = "failed"
+	StorageMaintenanceStateQueued    StorageMaintenanceState = "queued"
+	StorageMaintenanceStateRunning   StorageMaintenanceState = "running"
+	StorageMaintenanceStateSucceeded StorageMaintenanceState = "succeeded"
+)
+
 // Defines values for WriteCheckRequestRole.
 const (
 	WriteCheckRequestRolePrimary WriteCheckRequestRole = "primary"
@@ -937,6 +953,40 @@ type StandbyBootstrapRequest struct {
 	ManifestPath string `json:"manifest_path"`
 }
 
+// StorageMaintenanceJob defines model for StorageMaintenanceJob.
+type StorageMaintenanceJob struct {
+	CompletedAtMs int64  `json:"completed_at_ms,omitempty,omitzero"`
+	CreatedAtMs   int64  `json:"created_at_ms"`
+	Error         string `json:"error,omitempty,omitzero"`
+
+	// JobId Opaque non-sequential job identifier.
+	JobId       uint64                      `json:"job_id"`
+	Operation   StorageMaintenanceOperation `json:"operation"`
+	Result      StorageMaintenanceResult    `json:"result,omitempty,omitzero"`
+	StartedAtMs int64                       `json:"started_at_ms,omitempty,omitzero"`
+	State       StorageMaintenanceState     `json:"state"`
+}
+
+// StorageMaintenanceOperation defines model for StorageMaintenanceOperation.
+type StorageMaintenanceOperation string
+
+// StorageMaintenanceResult defines model for StorageMaintenanceResult.
+type StorageMaintenanceResult struct {
+	AfterSize        uint64 `json:"after_size,omitempty,omitzero"`
+	BeforeSize       uint64 `json:"before_size,omitempty,omitzero"`
+	FileSize         uint64 `json:"file_size,omitempty,omitzero"`
+	Issue            string `json:"issue,omitempty,omitzero"`
+	LiveBytes        uint64 `json:"live_bytes,omitempty,omitzero"`
+	LiveFileCount    uint64 `json:"live_file_count,omitempty,omitzero"`
+	ReclaimableBytes uint64 `json:"reclaimable_bytes,omitempty,omitzero"`
+	ReclaimedBytes   uint64 `json:"reclaimed_bytes,omitempty,omitzero"`
+	Valid            bool   `json:"valid,omitempty,omitzero"`
+	ValidPrefixSize  uint64 `json:"valid_prefix_size,omitempty,omitzero"`
+}
+
+// StorageMaintenanceState defines model for StorageMaintenanceState.
+type StorageMaintenanceState string
+
 // WriteCheckRequest defines model for WriteCheckRequest.
 type WriteCheckRequest struct {
 	ExpectedIdentity HAIdentity            `json:"expected_identity,omitempty,omitzero"`
@@ -945,6 +995,9 @@ type WriteCheckRequest struct {
 
 // WriteCheckRequestRole defines model for WriteCheckRequest.Role.
 type WriteCheckRequestRole string
+
+// IdempotencyKey defines model for IdempotencyKey.
+type IdempotencyKey = string
 
 // SlotName Stable standby replication slot name.
 type SlotName = HASlotName
@@ -989,6 +1042,24 @@ type GetHAPrimaryStatusParamsSyncFailure string
 type GetHAStandbyStatusParams struct {
 	// UpstreamLsn Current upstream primary LSN used to compute standby lag.
 	UpstreamLsn uint64 `form:"upstream_lsn,omitempty" json:"upstream_lsn,omitempty,omitzero"`
+}
+
+// StartStorageCheckParams defines parameters for StartStorageCheck.
+type StartStorageCheckParams struct {
+	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
+}
+
+// StartStorageCompactParams defines parameters for StartStorageCompact.
+type StartStorageCompactParams struct {
+	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
+}
+
+// StartStorageVacuumParams defines parameters for StartStorageVacuum.
+type StartStorageVacuumParams struct {
+	// IdempotencyKey Stable caller key used to return the original job on safe retries. Completed keys are retained for at least 24 hours within one server process. Job IDs are opaque 63-bit process-seeded values with retained history collision checks; callers must treat them as non-sequential.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key,omitempty,omitzero"`
 }
 
 // BeginHABaseBackupJSONRequestBody defines body for BeginHABaseBackup for application/json ContentType.
@@ -1207,6 +1278,21 @@ type ClientInterface interface {
 	CheckHAWriteWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	CheckHAWrite(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// StartStorageCheck request
+	StartStorageCheck(ctx context.Context, params *StartStorageCheckParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// StartStorageCompact request
+	StartStorageCompact(ctx context.Context, params *StartStorageCompactParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CancelStorageMaintenanceJob request
+	CancelStorageMaintenanceJob(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetStorageMaintenanceJob request
+	GetStorageMaintenanceJob(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// StartStorageVacuum request
+	StartStorageVacuum(ctx context.Context, params *StartStorageVacuumParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 }
 
 func (c *Client) BeginHABaseBackupWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -1655,6 +1741,66 @@ func (c *Client) CheckHAWriteWithBody(ctx context.Context, contentType string, b
 
 func (c *Client) CheckHAWrite(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewCheckHAWriteRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) StartStorageCheck(ctx context.Context, params *StartStorageCheckParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewStartStorageCheckRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) StartStorageCompact(ctx context.Context, params *StartStorageCompactParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewStartStorageCompactRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) CancelStorageMaintenanceJob(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCancelStorageMaintenanceJobRequest(c.Server, jobId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetStorageMaintenanceJob(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetStorageMaintenanceJobRequest(c.Server, jobId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) StartStorageVacuum(ctx context.Context, params *StartStorageVacuumParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewStartStorageVacuumRequest(c.Server, params)
 	if err != nil {
 		return nil, err
 	}
@@ -2622,6 +2768,194 @@ func NewCheckHAWriteRequestWithBody(server string, contentType string, body io.R
 	return req, nil
 }
 
+// NewStartStorageCheckRequest generates requests for StartStorageCheck
+func NewStartStorageCheckRequest(server string, params *StartStorageCheckParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/maintenance/check")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithLocation("simple", false, "Idempotency-Key", runtime.ParamLocationHeader, params.IdempotencyKey)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Idempotency-Key", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewStartStorageCompactRequest generates requests for StartStorageCompact
+func NewStartStorageCompactRequest(server string, params *StartStorageCompactParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/maintenance/compact")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithLocation("simple", false, "Idempotency-Key", runtime.ParamLocationHeader, params.IdempotencyKey)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Idempotency-Key", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewCancelStorageMaintenanceJobRequest generates requests for CancelStorageMaintenanceJob
+func NewCancelStorageMaintenanceJobRequest(server string, jobId uint64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithLocation("simple", false, "job_id", runtime.ParamLocationPath, jobId)
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/maintenance/jobs/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("DELETE", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetStorageMaintenanceJobRequest generates requests for GetStorageMaintenanceJob
+func NewGetStorageMaintenanceJobRequest(server string, jobId uint64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithLocation("simple", false, "job_id", runtime.ParamLocationPath, jobId)
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/maintenance/jobs/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewStartStorageVacuumRequest generates requests for StartStorageVacuum
+func NewStartStorageVacuumRequest(server string, params *StartStorageVacuumParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/maintenance/vacuum")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithLocation("simple", false, "Idempotency-Key", runtime.ParamLocationHeader, params.IdempotencyKey)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Idempotency-Key", headerParam0)
+
+	}
+
+	return req, nil
+}
+
 func (c *Client) applyEditors(ctx context.Context, req *http.Request, additionalEditors []RequestEditorFn) error {
 	for _, r := range c.RequestEditors {
 		if err := r(ctx, req); err != nil {
@@ -2763,6 +3097,21 @@ type ClientWithResponsesInterface interface {
 	CheckHAWriteWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error)
 
 	CheckHAWriteWithResponse(ctx context.Context, body CheckHAWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*CheckHAWriteResponse, error)
+
+	// StartStorageCheckWithResponse request
+	StartStorageCheckWithResponse(ctx context.Context, params *StartStorageCheckParams, reqEditors ...RequestEditorFn) (*StartStorageCheckResponse, error)
+
+	// StartStorageCompactWithResponse request
+	StartStorageCompactWithResponse(ctx context.Context, params *StartStorageCompactParams, reqEditors ...RequestEditorFn) (*StartStorageCompactResponse, error)
+
+	// CancelStorageMaintenanceJobWithResponse request
+	CancelStorageMaintenanceJobWithResponse(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*CancelStorageMaintenanceJobResponse, error)
+
+	// GetStorageMaintenanceJobWithResponse request
+	GetStorageMaintenanceJobWithResponse(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*GetStorageMaintenanceJobResponse, error)
+
+	// StartStorageVacuumWithResponse request
+	StartStorageVacuumWithResponse(ctx context.Context, params *StartStorageVacuumParams, reqEditors ...RequestEditorFn) (*StartStorageVacuumResponse, error)
 }
 
 type BeginHABaseBackupResponse struct {
@@ -3271,6 +3620,116 @@ func (r CheckHAWriteResponse) StatusCode() int {
 	return 0
 }
 
+type StartStorageCheckResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON202      *StorageMaintenanceJob
+}
+
+// Status returns HTTPResponse.Status
+func (r StartStorageCheckResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r StartStorageCheckResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type StartStorageCompactResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON202      *StorageMaintenanceJob
+}
+
+// Status returns HTTPResponse.Status
+func (r StartStorageCompactResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r StartStorageCompactResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type CancelStorageMaintenanceJobResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON202      *StorageMaintenanceJob
+}
+
+// Status returns HTTPResponse.Status
+func (r CancelStorageMaintenanceJobResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CancelStorageMaintenanceJobResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetStorageMaintenanceJobResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *StorageMaintenanceJob
+}
+
+// Status returns HTTPResponse.Status
+func (r GetStorageMaintenanceJobResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetStorageMaintenanceJobResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type StartStorageVacuumResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON202      *StorageMaintenanceJob
+}
+
+// Status returns HTTPResponse.Status
+func (r StartStorageVacuumResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r StartStorageVacuumResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 // BeginHABaseBackupWithBodyWithResponse request with arbitrary body returning *BeginHABaseBackupResponse
 func (c *ClientWithResponses) BeginHABaseBackupWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*BeginHABaseBackupResponse, error) {
 	rsp, err := c.BeginHABaseBackupWithBody(ctx, contentType, body, reqEditors...)
@@ -3596,6 +4055,51 @@ func (c *ClientWithResponses) CheckHAWriteWithResponse(ctx context.Context, body
 		return nil, err
 	}
 	return ParseCheckHAWriteResponse(rsp)
+}
+
+// StartStorageCheckWithResponse request returning *StartStorageCheckResponse
+func (c *ClientWithResponses) StartStorageCheckWithResponse(ctx context.Context, params *StartStorageCheckParams, reqEditors ...RequestEditorFn) (*StartStorageCheckResponse, error) {
+	rsp, err := c.StartStorageCheck(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseStartStorageCheckResponse(rsp)
+}
+
+// StartStorageCompactWithResponse request returning *StartStorageCompactResponse
+func (c *ClientWithResponses) StartStorageCompactWithResponse(ctx context.Context, params *StartStorageCompactParams, reqEditors ...RequestEditorFn) (*StartStorageCompactResponse, error) {
+	rsp, err := c.StartStorageCompact(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseStartStorageCompactResponse(rsp)
+}
+
+// CancelStorageMaintenanceJobWithResponse request returning *CancelStorageMaintenanceJobResponse
+func (c *ClientWithResponses) CancelStorageMaintenanceJobWithResponse(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*CancelStorageMaintenanceJobResponse, error) {
+	rsp, err := c.CancelStorageMaintenanceJob(ctx, jobId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCancelStorageMaintenanceJobResponse(rsp)
+}
+
+// GetStorageMaintenanceJobWithResponse request returning *GetStorageMaintenanceJobResponse
+func (c *ClientWithResponses) GetStorageMaintenanceJobWithResponse(ctx context.Context, jobId uint64, reqEditors ...RequestEditorFn) (*GetStorageMaintenanceJobResponse, error) {
+	rsp, err := c.GetStorageMaintenanceJob(ctx, jobId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetStorageMaintenanceJobResponse(rsp)
+}
+
+// StartStorageVacuumWithResponse request returning *StartStorageVacuumResponse
+func (c *ClientWithResponses) StartStorageVacuumWithResponse(ctx context.Context, params *StartStorageVacuumParams, reqEditors ...RequestEditorFn) (*StartStorageVacuumResponse, error) {
+	rsp, err := c.StartStorageVacuum(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseStartStorageVacuumResponse(rsp)
 }
 
 // ParseBeginHABaseBackupResponse parses an HTTP response from a BeginHABaseBackupWithResponse call
@@ -4196,115 +4700,261 @@ func ParseCheckHAWriteResponse(rsp *http.Response) (*CheckHAWriteResponse, error
 	return response, nil
 }
 
+// ParseStartStorageCheckResponse parses an HTTP response from a StartStorageCheckWithResponse call
+func ParseStartStorageCheckResponse(rsp *http.Response) (*StartStorageCheckResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &StartStorageCheckResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest StorageMaintenanceJob
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseStartStorageCompactResponse parses an HTTP response from a StartStorageCompactWithResponse call
+func ParseStartStorageCompactResponse(rsp *http.Response) (*StartStorageCompactResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &StartStorageCompactResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest StorageMaintenanceJob
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseCancelStorageMaintenanceJobResponse parses an HTTP response from a CancelStorageMaintenanceJobWithResponse call
+func ParseCancelStorageMaintenanceJobResponse(rsp *http.Response) (*CancelStorageMaintenanceJobResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CancelStorageMaintenanceJobResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest StorageMaintenanceJob
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetStorageMaintenanceJobResponse parses an HTTP response from a GetStorageMaintenanceJobWithResponse call
+func ParseGetStorageMaintenanceJobResponse(rsp *http.Response) (*GetStorageMaintenanceJobResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetStorageMaintenanceJobResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest StorageMaintenanceJob
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseStartStorageVacuumResponse parses an HTTP response from a StartStorageVacuumWithResponse call
+func ParseStartStorageVacuumResponse(rsp *http.Response) (*StartStorageVacuumResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &StartStorageVacuumResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest StorageMaintenanceJob
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	}
+
+	return response, nil
+}
+
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"x0+P/xcAAP//zGwWTmauAAA=",
+	"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",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

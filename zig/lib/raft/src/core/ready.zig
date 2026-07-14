@@ -19,6 +19,9 @@ const std = @import("std");
 pub const Ready = struct {
     soft_state: ?types.SoftState = null,
     hard_state: ?types.HardState = null,
+    // Set by the runtime after applying committed configuration entries. The
+    // slices are borrowed from the group and must be consumed synchronously.
+    conf_state: ?types.ConfState = null,
     snapshot: ?types.Snapshot = null,
     entries: []const types.Entry = &.{},
     committed_entries: []const types.Entry = &.{},
@@ -28,6 +31,7 @@ pub const Ready = struct {
     pub fn isEmpty(self: Ready) bool {
         return self.soft_state == null and
             self.hard_state == null and
+            self.conf_state == null and
             self.snapshot == null and
             self.entries.len == 0 and
             self.committed_entries.len == 0 and
@@ -37,6 +41,7 @@ pub const Ready = struct {
 
     pub fn requiresPersistence(self: Ready) bool {
         return self.hard_state != null or
+            self.conf_state != null or
             self.snapshot != null or
             self.entries.len > 0;
     }
@@ -51,6 +56,7 @@ test "ready persistence predicate only includes durable raft state" {
     }} }).requiresPersistence());
     try std.testing.expect(!(Ready{ .committed_entries = &.{.{ .term = 1, .index = 1 }} }).requiresPersistence());
     try std.testing.expect(!(Ready{ .read_states = &.{.{ .index = 1, .request_ctx = &request_ctx }} }).requiresPersistence());
+    try std.testing.expect((Ready{ .conf_state = .{ .voters = @constCast((&[_]u64{1})[0..]) } }).requiresPersistence());
     try std.testing.expect((Ready{ .hard_state = .{ .current_term = 2 } }).requiresPersistence());
     try std.testing.expect((Ready{ .entries = &.{.{ .term = 2, .index = 3 }} }).requiresPersistence());
     try std.testing.expect((Ready{ .snapshot = .{} }).requiresPersistence());

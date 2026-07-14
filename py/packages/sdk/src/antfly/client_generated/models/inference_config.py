@@ -108,7 +108,7 @@ class InferenceConfig:
             startup loading.
              Example: {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}.
         allow_downloads (bool | Unset): Whether the dashboard should show model download commands.
-            Defaults to true for standalone/swarm mode. Set to false in managed
+            Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
             deployments (e.g., Kubernetes operator) where models are managed externally.
              Default: True.
         log (InferenceschemasConfig | Unset): Logging configuration for inference services

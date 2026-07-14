@@ -352,6 +352,7 @@ fn shouldPreferBlasBeforeGpuForBytes(total_bytes: u64, max_eager_dense_bytes: u6
 fn shouldPreferBlasBeforeGpu(allocator: std.mem.Allocator, manifest: ?manifest_mod.ModelManifest) bool {
     if (build_options.enable_wasm) return false;
     const man = manifest orelse return false;
+    if (man.model_type == .generator) return false;
     const gguf_path = man.gguf_path orelse return false;
     const total_bytes = c_file.fileSize(allocator, gguf_path) catch return true;
     return shouldPreferBlasBeforeGpuForBytes(total_bytes, gpuEagerDenseMaxBytes());
@@ -408,13 +409,13 @@ fn effectiveBackendOrderForPreference(
         scratch[idx] = backend;
         idx += 1;
     }
-    scratch[idx] = .native;
-    idx += 1;
     for (preferred) |backend| {
         if (!backend.usesGpuHostedSession()) continue;
         scratch[idx] = backend;
         idx += 1;
     }
+    scratch[idx] = .native;
+    idx += 1;
     return scratch[0..idx];
 }
 
@@ -467,18 +468,23 @@ test "shouldPreferBlasBeforeGpuForBytes prefers native only above eager dense th
     try std.testing.expect(!shouldPreferBlasBeforeGpuForBytes(256 * 1024 * 1024, 1024 * 1024 * 1024));
 }
 
-test "effective backend order prefers native before gpu for large gguf generators" {
+test "effective backend order keeps gpu before native for large gguf generators" {
     const preferred = [_]BackendType{ .onnx, .metal, .native };
     var scratch: [backend_order_capacity]BackendType = undefined;
-    const effective = effectiveBackendOrderForPreference(&scratch, &preferred, true);
-    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .native, .metal }, effective);
+    const manifest: manifest_mod.ModelManifest = .{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+        .gguf_path = "missing-large-generator.gguf",
+    };
+    const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
+    try std.testing.expectEqualSlices(BackendType, &preferred, effective);
 }
 
 test "effective backend order handles four backend preference lists" {
     const preferred = [_]BackendType{ .cuda, .onnx, .metal, .native };
     var scratch: [backend_order_capacity]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, true);
-    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .native, .cuda, .metal }, effective);
+    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .cuda, .metal, .native }, effective);
 }
 
 test "effective backend order preserves gpu preference for small gguf generators" {

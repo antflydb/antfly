@@ -24,15 +24,84 @@ const build_options = @import("build_options");
 
 pub const link_libc = build_options.link_libc;
 
-pub const c = if (build_options.link_libc) @cImport({
-    // glibc's _FORTIFY_SOURCE wrappers (bits/fcntl2.h) fail under translate-c
-    @cUndef("_FORTIFY_SOURCE");
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-    @cInclude("sys/stat.h");
-    @cInclude("sys/mman.h");
-    @cInclude("dirent.h");
-}) else struct {};
+pub const c = if (build_options.link_libc) PosixC else struct {};
+
+const PosixC = struct {
+    pub const DIR = std.c.DIR;
+    pub const mode_t = std.c.mode_t;
+    pub const struct_stat = std.c.Stat;
+
+    pub const struct_dirent = switch (builtin.os.tag) {
+        .linux => extern struct {
+            ino: std.c.ino_t,
+            off: std.c.off_t,
+            reclen: c_ushort,
+            type: u8,
+            d_name: [256]u8,
+        },
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
+            ino: u64,
+            seekoff: u64,
+            reclen: u16,
+            namlen: u16,
+            type: u8,
+            d_name: [1024]u8,
+        },
+        else => std.c.dirent,
+    };
+
+    fn flag(o: std.c.O) c_int {
+        return @bitCast(o);
+    }
+
+    pub const O_RDONLY = flag(.{ .ACCMODE = .RDONLY });
+    pub const O_WRONLY = flag(.{ .ACCMODE = .WRONLY });
+    pub const O_RDWR = flag(.{ .ACCMODE = .RDWR });
+    pub const O_CREAT = flag(.{ .CREAT = true });
+    pub const O_EXCL = flag(.{ .EXCL = true });
+    pub const O_TRUNC = flag(.{ .TRUNC = true });
+
+    pub const MADV_RANDOM = std.c.MADV.RANDOM;
+    pub const MADV_SEQUENTIAL = std.c.MADV.SEQUENTIAL;
+
+    pub const POSIX_FADV_NORMAL = std.os.linux.POSIX_FADV.NORMAL;
+    pub const POSIX_FADV_SEQUENTIAL = std.os.linux.POSIX_FADV.SEQUENTIAL;
+    pub const POSIX_FADV_RANDOM = std.os.linux.POSIX_FADV.RANDOM;
+    pub const POSIX_FADV_WILLNEED = std.os.linux.POSIX_FADV.WILLNEED;
+    pub const POSIX_FADV_DONTNEED = std.os.linux.POSIX_FADV.DONTNEED;
+    pub const POSIX_FADV_NOREUSE = std.os.linux.POSIX_FADV.NOREUSE;
+
+    pub extern "c" fn open(path: [*:0]const u8, oflag: c_int, ...) c_int;
+    pub extern "c" fn lstat(path: [*:0]const u8, buf: *struct_stat) c_int;
+    pub extern "c" fn posix_fadvise(fd: std.c.fd_t, offset: std.c.off_t, len: std.c.off_t, advice: c_int) c_int;
+
+    pub const close = std.c.close;
+    pub const fstat = std.c.fstat;
+    pub const ftruncate = std.c.ftruncate;
+    pub const getcwd = std.c.getcwd;
+    pub const getpid = std.c.getpid;
+    pub const link = std.c.link;
+    pub const madvise = std.c.madvise;
+    pub const mkdir = std.c.mkdir;
+    pub const pread = std.c.pread;
+    pub const pwrite = std.c.pwrite;
+    pub const symlink = std.c.symlink;
+    pub const unlink = std.c.unlink;
+    pub const write = std.c.write;
+
+    pub fn opendir(pathname: [*:0]const u8) ?*DIR {
+        return std.c.opendir(pathname);
+    }
+
+    pub fn closedir(dp: ?*DIR) c_int {
+        return std.c.closedir(dp.?);
+    }
+
+    pub fn readdir(dp: ?*DIR) ?*struct_dirent {
+        const entry = std.c.readdir(dp.?) orelse return null;
+        return @ptrCast(@alignCast(entry));
+    }
+};
 
 var mmap_temp_counter: std.atomic.Value(u64) = .init(0);
 
@@ -208,11 +277,12 @@ pub const FileAdvice = enum { normal, sequential, random, will_need, dont_need, 
 
 pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize, advice: FileAdvice) void {
     if (!comptime build_options.link_libc) return;
+    if (comptime builtin.os.tag != .linux) return;
     const path_z = allocator.dupeZ(u8, path) catch return;
     defer allocator.free(path_z);
     const fd = openReadOnlyZ(path_z) catch return;
     defer closeFd(fd);
-    const c_advice = switch (advice) {
+    const c_advice: c_int = switch (advice) {
         .normal => c.POSIX_FADV_NORMAL,
         .sequential => c.POSIX_FADV_SEQUENTIAL,
         .random => c.POSIX_FADV_RANDOM,
@@ -254,7 +324,7 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
     } else if (comptime build_options.link_libc) {
         var stat_buf: c.struct_stat = undefined;
         if (c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
-        return @intCast(stat_buf.st_size);
+        return @intCast(statSize(stat_buf));
     } else {
         const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
         const stat = try file.stat(std.Options.debug_io);
@@ -262,11 +332,16 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
     }
 }
 
+fn statSize(stat: c.struct_stat) std.c.off_t {
+    if (@hasField(c.struct_stat, "st_size")) return stat.st_size;
+    return stat.size;
+}
+
 const Advice = enum { sequential, random };
 
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
     if (comptime build_options.link_libc) {
-        const fd = c.open(path_z.ptr, c.O_RDONLY);
+        const fd = c.open(path_z.ptr, c.O_RDONLY, @as(c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
         return @intCast(fd);
     }
@@ -328,11 +403,17 @@ fn writeAllAt(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
 
 fn advise(ptr: [*]u8, len: usize, advice: Advice) void {
     if (comptime build_options.link_libc) {
-        const c_advice = switch (advice) {
+        const c_advice: u32 = switch (advice) {
             .sequential => c.MADV_SEQUENTIAL,
             .random => c.MADV_RANDOM,
         };
-        _ = c.madvise(ptr, len, c_advice);
+        const page_size = std.heap.page_size_min;
+        const start = @intFromPtr(ptr);
+        const aligned_start = std.mem.alignBackward(usize, start, page_size);
+        const prefix = start - aligned_start;
+        const advised_len = len + prefix;
+        const aligned_ptr: *align(page_size) anyopaque = @ptrFromInt(aligned_start);
+        _ = c.madvise(aligned_ptr, advised_len, c_advice);
     }
 }
 

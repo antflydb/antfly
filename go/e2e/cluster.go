@@ -193,17 +193,17 @@ func (c *TestCluster) startMetadataNode(ctx context.Context, logger *zap.Logger,
 
 	// Create config
 	config := &common.Config{
-		SwarmMode:             false, // Not swarm mode - multi-node cluster
+		DeploymentMode:        common.ConfigDeploymentModeDistributed,
 		DisableShardAlloc:     cfg.DisableShardAlloc,
 		ReplicationFactor:     uint64(cfg.ReplicationFactor), //nolint:gosec // G115: bounded value, cannot overflow in practice
 		DefaultShardsPerTable: uint64(cfg.NumShards),         //nolint:gosec // G115: bounded value, cannot overflow in practice
 		HealthPort:            GetFreePort(c.T),
 		Storage: common.StorageConfig{
 			Local: common.LocalStorageConfig{
-				BaseDir: c.DataDir,
+				BaseDir:  c.DataDir,
+				Data:     common.StorageBackendLocal,
+				Metadata: common.StorageBackendLocal,
 			},
-			Data:     common.StorageBackendLocal,
-			Metadata: common.StorageBackendLocal,
 		},
 		Metadata: common.MetadataInfo{
 			OrchestrationUrls: map[string]string{

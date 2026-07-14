@@ -67,6 +67,10 @@ const lean_sim_http_listener_cfg = std_http_listener.StdHttpListenerConfig{
     .thread_stack_size = lean_sim_thread_stack_size,
 };
 
+fn leanSimHttpAllocator() std.mem.Allocator {
+    return std.heap.smp_allocator;
+}
+
 const SimSplitRuntime = struct {
     const Entry = struct {
         source_group_id: u64,
@@ -1308,8 +1312,8 @@ fn verifySplitPublicTraffic(
     cfg: SplitPublicVerificationConfig,
 ) !void {
     const groups = try waitForSplitResolvedGroups(cluster, catalog, table_name, cfg.route_rounds);
-    try std.testing.expect(try cluster.waitForGroupStatusCount(groups.left_group, .active, cfg.left_active_count, cfg.active_rounds));
-    try std.testing.expect(try cluster.waitForGroupStatusCount(groups.right_group, .active, cfg.right_active_count, cfg.active_rounds));
+    try std.testing.expect(try cluster.waitForGroupStatusCountAtLeast(groups.left_group, .active, cfg.left_active_count, cfg.active_rounds));
+    try std.testing.expect(try cluster.waitForGroupStatusCountAtLeast(groups.right_group, .active, cfg.right_active_count, cfg.active_rounds));
 
     // The public batch is forwarded through the pre-split route map, so repair the per-group mirrors
     // before validating post-split reads.
@@ -2740,17 +2744,29 @@ pub const MetadataHttpNodeSimulation = struct {
             const encoded = try metadata_storage.encodeTransitionCommand(self.cluster.alloc, command);
             defer self.cluster.alloc.free(encoded);
 
+            const recovery_candidate_index = bestMetadataElectionCandidateIndex(self.cluster) orelse self.index;
             var attempts: usize = 0;
-            while (attempts < 32) : (attempts += 1) {
+            command_retry: while (attempts < 8) : (attempts += 1) {
                 const target_index = self.cluster.currentMetadataLeaderIndex() orelse {
-                    self.campaignMetadataGroup() catch |err| switch (err) {
+                    // A single, up-to-date candidate breaks synchronized
+                    // election ties without continuously advancing terms on
+                    // different replicas.
+                    self.cluster.node(recovery_candidate_index).campaignMetadataGroup() catch |err| switch (err) {
                         error.UnknownGroup => {},
                         else => return err,
                     };
-                    try self.cluster.stepAll();
+                    for (0..16) |_| {
+                        try self.cluster.stepAll();
+                        if (self.cluster.currentMetadataLeaderIndex() != null) continue :command_retry;
+                    }
                     continue;
                 };
 
+                const leader_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse {
+                    try self.cluster.stepAll();
+                    continue;
+                };
+                const proposal_index = leader_status.last_index + 1;
                 self.cluster.node(target_index).sim().propose(self.cluster.metadata_group_id, encoded) catch |err| switch (err) {
                     error.NotLeader => {
                         try self.cluster.stepAll();
@@ -2758,8 +2774,30 @@ pub const MetadataHttpNodeSimulation = struct {
                     },
                     else => return err,
                 };
-                break;
-            } else return error.NotLeader;
+
+                // `propose` only appends locally. Do not report success until
+                // the exact index assigned by that leader is committed and
+                // applied; otherwise a stale leader can acknowledge a command
+                // that is subsequently overwritten.
+                for (0..16) |_| {
+                    try self.cluster.stepAll();
+                    const raft_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse break;
+                    if (raft_status.soft.role != .leader or raft_status.hard.current_term != leader_status.hard.current_term) break;
+                    if (raft_status.hard.commit_index >= proposal_index and raft_status.applied_index >= proposal_index) break :command_retry;
+                }
+            } else {
+                for (self.cluster.cluster.nodes, 0..) |*node, index| {
+                    if (node.raftStatus(self.cluster.metadata_group_id)) |raft_status| {
+                        std.debug.print(
+                            "metadata proposal exhausted node={d} id={d} role={s} term={d} leader={?d} commit={d} applied={d} voters={any}\n",
+                            .{ index, raft_status.id, @tagName(raft_status.soft.role), raft_status.hard.current_term, raft_status.soft.leader_id, raft_status.hard.commit_index, raft_status.applied_index, raft_status.conf_state.voters },
+                        );
+                    } else {
+                        std.debug.print("metadata proposal exhausted node={d} status=absent\n", .{index});
+                    }
+                }
+                return error.NotLeader;
+            }
         }
 
         const settle_rounds = if (commandsOnlyReconcileLease(commands))
@@ -2827,6 +2865,12 @@ const MetadataGroupStatusCountProgressContext = struct {
     group_id: u64,
     desired: raft_host.HostedReplicaStatus,
     expected_count: usize,
+};
+
+const MetadataGroupStatusMinimumProgressContext = struct {
+    group_id: u64,
+    desired: raft_host.HostedReplicaStatus,
+    minimum_count: usize,
 };
 
 const MetadataSplitTransitionProgressContext = struct {
@@ -3124,12 +3168,7 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     fn currentMetadataLeaderIndex(self: *MetadataHttpClusterSimulation) ?usize {
-        for (self.cluster.nodes, 0..) |*sim, index| {
-            if (sim.raftStatus(self.metadata_group_id)) |status| {
-                if (status.soft.role == .leader) return index;
-            }
-        }
-        return null;
+        return bestMetadataLeaderIndex(self);
     }
 
     fn currentMetadataLeaseHolderIndex(self: *MetadataHttpClusterSimulation) ?usize {
@@ -3190,6 +3229,21 @@ pub const MetadataHttpClusterSimulation = struct {
             .expected_count = expected_count,
         };
         return try self.runUntil(max_rounds, &ctx, metadataGroupStatusCountProgressPredicate);
+    }
+
+    pub fn waitForGroupStatusCountAtLeast(
+        self: *MetadataHttpClusterSimulation,
+        group_id: u64,
+        desired: raft_host.HostedReplicaStatus,
+        minimum_count: usize,
+        max_rounds: usize,
+    ) !bool {
+        var ctx = MetadataGroupStatusMinimumProgressContext{
+            .group_id = group_id,
+            .desired = desired,
+            .minimum_count = minimum_count,
+        };
+        return try self.runUntil(max_rounds, &ctx, metadataGroupStatusMinimumProgressPredicate);
     }
 
     pub fn bootstrapMetadataReplicas(self: *MetadataHttpClusterSimulation) !void {
@@ -3527,6 +3581,11 @@ fn metadataGroupStatusCountProgressPredicate(cluster: *MetadataHttpClusterSimula
     return cluster.countGroupStatus(ctx.group_id, ctx.desired) == ctx.expected_count;
 }
 
+fn metadataGroupStatusMinimumProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+    const ctx: *MetadataGroupStatusMinimumProgressContext = @ptrCast(@alignCast(ptr));
+    return cluster.countGroupStatus(ctx.group_id, ctx.desired) >= ctx.minimum_count;
+}
+
 fn metadataSplitTransitionProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataSplitTransitionProgressContext = @ptrCast(@alignCast(ptr));
     if (anyNodeSteppedSplitTransitions(cluster)) return true;
@@ -3780,12 +3839,61 @@ fn anyNodeSteppedMergeTransitions(cluster: *MetadataHttpClusterSimulation) bool 
 }
 
 fn currentMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+    return bestMetadataLeaderIndex(cluster);
+}
+
+fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+    var best_index: ?usize = null;
+    var best_support: usize = 0;
+    var best_term: u64 = 0;
+    var best_commit: u64 = 0;
+    var best_applied: u64 = 0;
     for (cluster.cluster.nodes, 0..) |*sim, index| {
-        if (sim.raftStatus(cluster.metadata_group_id)) |status| {
-            if (status.soft.role == .leader) return index;
+        const status = sim.raftStatus(cluster.metadata_group_id) orelse continue;
+        if (status.soft.role != .leader) continue;
+        var support: usize = 0;
+        for (cluster.cluster.nodes) |*peer| {
+            const peer_status = peer.raftStatus(cluster.metadata_group_id) orelse continue;
+            if (peer_status.hard.current_term == status.hard.current_term and peer_status.soft.leader_id == status.id) support += 1;
+        }
+        if (best_index == null or
+            support > best_support or
+            (support == best_support and status.hard.current_term > best_term) or
+            (support == best_support and status.hard.current_term == best_term and status.hard.commit_index > best_commit) or
+            (support == best_support and status.hard.current_term == best_term and status.hard.commit_index == best_commit and status.applied_index > best_applied))
+        {
+            best_index = index;
+            best_support = support;
+            best_term = status.hard.current_term;
+            best_commit = status.hard.commit_index;
+            best_applied = status.applied_index;
         }
     }
-    return null;
+    return best_index;
+}
+
+fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+    var best_index: ?usize = null;
+    var best_last_index: u64 = 0;
+    var best_commit: u64 = 0;
+    var best_applied: u64 = 0;
+    var best_term: u64 = 0;
+    for (cluster.cluster.nodes, 0..) |*sim, index| {
+        const status = sim.raftStatus(cluster.metadata_group_id) orelse continue;
+        if (best_index == null or
+            status.last_index > best_last_index or
+            (status.last_index == best_last_index and status.hard.commit_index > best_commit) or
+            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index > best_applied) or
+            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index == best_applied and status.hard.current_term > best_term))
+        {
+            best_index = index;
+            best_last_index = status.last_index;
+            best_commit = status.hard.commit_index;
+            best_applied = status.applied_index;
+            best_term = status.hard.current_term;
+        }
+    }
+    return best_index;
 }
 
 fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterSimulation, group_id: u64) ?usize {
@@ -4402,6 +4510,7 @@ fn startPublicApiServers(
     options: PublicApiServerOptions(N),
     api_base_uris: *[N][]const u8,
 ) !void {
+    const http_alloc = leanSimHttpAllocator();
     var started: usize = 0;
     errdefer {
         for (0..started) |i| listeners[i].deinit();
@@ -4431,14 +4540,15 @@ fn startPublicApiServers(
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
         } else .{};
-        servers[i] = api_http_server.ApiHttpServer.init(
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             alloc,
+            http_alloc,
             server_config,
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
         try listeners[i].start();
         started += 1;
     }
@@ -4547,7 +4657,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         ) !void {
             self.* = .{
                 .alloc = alloc,
-                .http_io = std.Io.Threaded.init(alloc, .{ .stack_size = lean_sim_thread_stack_size }),
+                .http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size }),
             };
             self.forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &self.http_io);
             errdefer self.forward_executor.deinit();
@@ -4876,6 +4986,30 @@ fn voprStoreDrainProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr:
     return store.drain_requested == ctx.expected_drain_requested;
 }
 
+fn reportMetadataVoprDrainState(cluster: *MetadataHttpClusterSimulation, store_id: u64) void {
+    for (cluster.cluster.nodes, 0..) |*node, index| {
+        if (node.raftStatus(cluster.metadata_group_id)) |status| {
+            std.debug.print(
+                "metadata drain state node={d} id={d} role={s} term={d} leader={?d} commit={d} applied={d}\n",
+                .{ index, status.id, @tagName(status.soft.role), status.hard.current_term, status.soft.leader_id, status.hard.commit_index, status.applied_index },
+            );
+        }
+        const stores = cluster.node(index).listProjectedStores(cluster.alloc) catch |err| {
+            std.debug.print("metadata drain state node={d} stores error={s}\n", .{ index, @errorName(err) });
+            continue;
+        };
+        defer cluster.node(index).freeProjectedStores(cluster.alloc, stores);
+        for (stores) |store| {
+            if (store.store_id == store_id) {
+                std.debug.print(
+                    "metadata drain state node={d} store={d} owner={d} live={} drain={}\n",
+                    .{ index, store.store_id, store.node_id, store.live, store.drain_requested },
+                );
+            }
+        }
+    }
+}
+
 fn metadataVoprCreateActiveTable(
     cluster: *MetadataHttpClusterSimulation,
     workflow: *metadata_table_workflow.TableWorkflow,
@@ -5107,9 +5241,11 @@ fn metadataVoprRunExpandedLivenessWorkload(
     const shutdown_leader_index = try metadataVoprLeaderIndex(cluster);
     const shutdown_node_id = metadataVoprNodeId(cluster, (shutdown_leader_index + 1) % cluster.cluster.nodes.len);
     var drain_ctx = VoprStoreDrainProgressContext{ .store_id = shutdown_node_id, .expected_drain_requested = true };
-    try cluster.node(shutdown_leader_index).upsertNode(.{ .node_id = shutdown_node_id, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_draining });
-    try cluster.node(shutdown_leader_index).upsertStore(.{ .store_id = shutdown_node_id, .node_id = shutdown_node_id, .role = "data", .live = true, .drain_requested = true });
-    try cluster.assertProgress("metadata-vopr-store-drain-requested", 48, &drain_ctx, voprStoreDrainProgressPredicate);
+    try cluster.node(shutdown_leader_index).requestNodeShutdown(shutdown_node_id);
+    cluster.assertProgress("metadata-vopr-store-drain-requested", 48, &drain_ctx, voprStoreDrainProgressPredicate) catch |err| {
+        reportMetadataVoprDrainState(cluster, shutdown_node_id);
+        return err;
+    };
     try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
     try metadataVoprHealAll(cluster, state);
     try cluster.assertProgress("metadata-vopr-store-drain-requested", 48, &drain_ctx, voprStoreDrainProgressPredicate);
@@ -5210,6 +5346,7 @@ fn startMetadataAdminServers(
     sources: *[N]MetadataAdminSimSource,
     base_uris: *[N][]const u8,
 ) !void {
+    const http_alloc = leanSimHttpAllocator();
     var started: usize = 0;
     errdefer {
         for (0..started) |i| listeners[i].deinit();
@@ -5219,7 +5356,7 @@ fn startMetadataAdminServers(
     for (0..N) |i| {
         sources[i] = .{ .node = cluster.node(i) };
         servers[i] = metadata_http_server.MetadataHttpServer.init(alloc, .{}, sources[i].iface());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
         try listeners[i].start();
         started += 1;
     }
@@ -5653,7 +5790,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(sim_alloc, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
@@ -5854,7 +5991,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(sim_alloc, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
@@ -9285,7 +9422,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     const client_index: usize = if (actual_host_index == 0) 1 else 0;
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4831));
 
-    var http_io = std.Io.Threaded.init(std.testing.allocator, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]std_http_listener.StdHttpListener = undefined;
@@ -9302,6 +9439,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
 
+    const http_alloc = leanSimHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -9321,14 +9459,15 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.init(
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             std.testing.allocator,
+            http_alloc,
             .{},
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(std.testing.allocator, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -9569,7 +9708,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         if (i != left and i != right) break i;
     } else return error.TestExpectedEqual;
 
-    var http_io = std.Io.Threaded.init(std.testing.allocator, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]std_http_listener.StdHttpListener = undefined;
@@ -9585,6 +9724,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     var forward_executor: std_http_executor.StdHttpExecutor = undefined;
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
+    const http_alloc = leanSimHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -9604,8 +9744,8 @@ test "metadata http cluster simulation forwards public table io across split ran
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.init(std.testing.allocator, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(std.testing.allocator, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -9852,7 +9992,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4851));
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4852));
 
-    var http_io = std.Io.Threaded.init(std.testing.allocator, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]std_http_listener.StdHttpListener = undefined;
@@ -9868,6 +10008,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     var forward_executor: std_http_executor.StdHttpExecutor = undefined;
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
+    const http_alloc = leanSimHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -9887,8 +10028,8 @@ test "metadata http cluster simulation forwards public table io after merge fina
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.init(std.testing.allocator, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(std.testing.allocator, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);

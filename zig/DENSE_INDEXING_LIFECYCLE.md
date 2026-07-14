@@ -1,0 +1,1432 @@
+# Dense Indexing Lifecycle
+
+## Status
+
+Design and implementation plan.
+
+This document defines how ordinary dense replay, explicit bulk construction,
+and interrupted HBC publication should differ. The immediate objective is to
+make normal writes crash-replayable without giving up the batching and LSM
+coalescing that make dense ingest fast.
+
+The core decision is:
+
+- normal asynchronous dense indexing uses a streaming replay session
+- true bulk construction uses a bulk publication session
+- only bulk publication may leave cross-batch HBC state that requires an
+  incomplete-publication marker
+- generation replacement is reserved for explicit import/rebuild operations,
+  not used for every ordinary write burst
+
+## Problem
+
+Normal API writes do not automatically enter an explicit table bulk-ingest
+window. The public write layer reserves those windows for rebuild and import
+paths; ordinary writes use the normal DB/storage batching path.
+
+Dense derived replay currently has a different behavior. The asynchronous dense
+worker opens an HBC bulk-ingest session while catching up normal writes. A dense
+session may be reused across a burst, and a replay window may contain a large
+number of vector operations. Opening the HBC session durably writes:
+
+```text
+__bulk_publish_state = incomplete
+```
+
+HBC refuses to reopen an index while that marker exists. This is correct when a
+session has deferred structural mutations that are unsafe until final
+publication. It is unnecessarily strong for normal replay when every committed
+batch can instead be made structurally reopenable.
+
+The resulting failure mode is disproportionate:
+
+```text
+normal writes
+    -> asynchronous dense replay
+    -> long-lived HBC bulk session
+    -> process interruption
+    -> IncompleteBulkPublish
+    -> index quarantined until explicit reconstruction
+```
+
+The primary documents and embedding artifacts remain durable, so the dense
+index is reconstructible. The problem is the write-session contract, not loss
+of source data.
+
+## Terminology
+
+"Bulk ingest" currently covers several independent optimizations and safety
+properties. This design separates them.
+
+### Bulk-optimized batch
+
+One bounded apply call using write optimizations such as:
+
+- grouped centroid routing
+- coalesced leaf mutation
+- batch-finish leaf splitting
+- quantized routing
+- reduced flush and manifest overhead
+- empty-index bulk building when the batch is large enough
+
+A bulk-optimized batch does not inherently require an index-wide incomplete
+publication marker.
+
+### Streaming replay session
+
+A short-lived sequence of bulk-optimized, independently valid batches. The LSM
+backend may coalesce work and defer flush/maintenance across the session, but
+each committed HBC batch leaves a structurally valid state.
+
+An interrupted streaming replay session is recovered by replaying from the last
+durable applied sequence.
+
+### Bulk publication session
+
+A construction session allowed to defer HBC structural state across committed
+transactions until a final publication boundary. An interrupted session may be
+unsafe to reopen and therefore requires either:
+
+- an incomplete-publication marker and artifact reconstruction, or
+- isolation in a shadow generation that has not yet become active
+
+This mode is for explicit import, rebuild, or true bulk construction.
+
+## Current Code Shape
+
+The relevant paths are:
+
+- `pkg/antfly/src/api/table_writes.zig`
+  - ordinary API uploads do not automatically start explicit table bulk windows
+- `pkg/antfly/src/storage/db/derived/catch_up_policy.zig`
+  - dense replay coalescing, session reuse, and window limits
+- `pkg/antfly/src/storage/db/derived/async_runtime.zig`
+  - opens and closes per-index catch-up state
+- `pkg/antfly/src/storage/db/db.zig`
+  - `beginDerivedCatchUpSessionAsync`
+  - `finishDerivedCatchUpSessionAsync`
+  - `applyDerivedBatchToIndexContextProfiled`
+- `pkg/antfly/src/storage/db/catalog/index_manager.zig`
+  - maps storage batch mode to HBC batch options
+- `pkg/antfly/src/storage/hbc_adapter.zig`
+  - owns the HBC session depth, deferred state, and
+    `__bulk_publish_state`
+
+The dense apply path already distinguishes batch-level optimizations from some
+session-finish deferrals:
+
+- leaf splits may finish at the batch boundary
+- leaf splits are not deferred to the bulk-session finish by default
+- quantized rebuild is not deferred to the bulk-session finish by default
+
+That makes it plausible to retain the useful batch and LSM behavior while
+removing the index-wide incomplete-publication state from ordinary replay. The
+claim must still be established by crash tests and benchmarks before rollout.
+
+## Required Contracts
+
+### Normal write contract
+
+For ordinary writes:
+
+1. The primary document and derived replay record are the durability source of
+   truth.
+2. Dense application is asynchronous unless the requested sync level requires
+   dense visibility.
+3. Every committed dense replay batch leaves HBC structurally valid and
+   reopenable.
+4. The applied sequence never advances beyond durably reopenable HBC state.
+5. A crash may cause a replay batch to be applied again.
+6. Reapplication must be idempotent for inserts, overwrites, and deletes.
+7. A normal replay interruption must not create `IncompleteBulkPublish`.
+8. Every committed batch atomically publishes the topology, node keys,
+   quantized state, and metadata required to reopen that batch.
+9. A failed or aborted session may leave the index ahead of its persisted
+   applied sequence, but it must never leave the index structurally invalid.
+
+### Bulk publication contract
+
+For a true bulk publication:
+
+1. Cross-batch structural deferral must be explicit in the session type.
+2. The active generation must never be presented as complete while deferred
+   publication state remains.
+3. An in-place interrupted publication is quarantined.
+4. Durable primary artifacts must be sufficient to reconstruct supported index
+   kinds.
+5. If a previous generation must remain searchable, construction occurs in a
+   shadow generation and activation is an atomic pointer swap.
+
+### Applied-sequence ordering
+
+The required successful finish order for streaming replay is:
+
+```text
+apply one or more structurally valid HBC batches
+    -> flush/checkpoint the HBC LSM state
+    -> persist the dense applied sequence
+    -> permit replay-log truncation
+```
+
+If the process stops before applied-sequence persistence, restart replays work
+that may already be present in HBC. That is safe only if replay application is
+idempotent.
+
+### Durability modes
+
+"Durably reopenable" means reopenable after the durability guarantees of the
+configured backend have actually been satisfied. A successful HBC batch or
+session finish is not always such a boundary. In particular,
+`relaxed_split_durability` may run the destination HBC LSM with durability
+disabled during construction; the split path is safe only because it performs
+an explicit durable `syncAll(true)` before publishing the destination.
+
+The applied-sequence and replay-truncation rules are therefore mode-aware:
+
+| Backend durability | Batch/session finish means | Applied-sequence rule |
+| --- | --- | --- |
+| Full durability | Reopen-critical data and checkpoint are stable | May publish the watermark after the finish succeeds |
+| Relaxed or `none` construction | Structurally complete in the current process, but not crash durable | Must not publish a durable watermark or release replay until an explicit durable sync succeeds |
+| Memory-only | No process-crash durability contract | Must not use index progress alone to authorize durable replay truncation |
+
+LMDB `no_sync` and any future relaxed backend mode follow the same rule as
+relaxed HBC construction: a logical commit is not a durable projection
+checkpoint. The backend interface used by dense replay should expose whether a
+finish established a durable checkpoint rather than asking callers to infer it
+from configuration.
+
+If an explicit sync fails, the index may remain structurally usable in the
+current process, but its pending applied sequence is not published and its
+replay-retention requirement remains. A split or candidate generation using a
+relaxed construction mode must likewise remain unpublished until the final
+durable sync succeeds.
+
+## Proposed Session Model
+
+Introduce an explicit HBC write-session kind:
+
+```zig
+pub const WriteSessionKind = enum {
+    streaming_replay,
+    bulk_publication,
+};
+```
+
+The implementation may use one tagged session state or separate depth fields.
+Mixed nested session kinds should be rejected rather than silently combined.
+
+The behavioral matrix is:
+
+| Behavior | Streaming replay | Bulk publication |
+| --- | --- | --- |
+| Bulk-optimized HBC batches | yes | yes |
+| LSM session coalescing | yes | yes |
+| Defer commit flush within the session | yes | yes |
+| Defer routine maintenance | yes | yes |
+| Stage HBC node-key mutations across committed batches | no | allowed |
+| Defer leaf topology to session finish | no | allowed |
+| Defer quantized state to session finish | no | allowed |
+| Defer reopen-critical HBC metadata to session finish | no | allowed |
+| Persist `__bulk_publish_state` | no | yes for in-place publication |
+| Recovery mechanism | replay | rebuild or shadow activation |
+
+## HBC Changes
+
+### Split LSM batching from publication safety
+
+`bulk_ingest_session_depth` currently influences both LSM batching and HBC
+cross-batch deferred state. Split those concerns.
+
+The target state should track at least:
+
+```zig
+write_session_depth: usize,
+write_session_kind: ?WriteSessionKind,
+```
+
+Do not translate raw depth checks one-for-one. Introduce capability predicates
+that state why behavior differs:
+
+```zig
+fn lsmSessionBatchingActive(self: *const HBCIndex) bool;
+fn crossBatchPublicationActive(self: *const HBCIndex) bool;
+fn mustPublishMetadataPerBatch(self: *const HBCIndex) bool;
+fn shouldPublishSearchStatePerBatch(self: *const HBCIndex) bool;
+fn shouldSuppressRoutineMaintenance(self: *const HBCIndex) bool;
+```
+
+The required classification is:
+
+- LSM batch mode, mutable-state coalescing, deferred commit flush, and bounded
+  routine-maintenance deferral may be enabled for either session kind.
+- `stageNodeKeyPut` and `stageNodeKeyDelete` operate only while
+  `crossBatchPublicationActive()`.
+- `shouldDeferQuantizedRebuildToBulkFinish` and
+  `shouldDeferLeafSplitToBulkFinish` are true only while
+  `crossBatchPublicationActive()`.
+- `persistBulkPublishState` and `clearBulkPublishStateTxn` are used only for an
+  in-place `bulk_publication`.
+- `flushMetadata` must publish reopen-critical metadata in every streaming
+  batch. It may suppress that publication only when the matching topology and
+  node-key changes are also isolated behind a bulk publication boundary.
+- Flat-RaBitQ centroid-directory node keys must publish at streaming batch
+  finish rather than being held until session finish.
+- Search caches, published root/count state, workspace clearing, and
+  maintenance suppression must each be classified independently. They must not
+  inherit publication semantics merely because LSM coalescing is active.
+
+Before implementation, inventory every `bulk_ingest_session_depth` read in
+`hbc_adapter.zig` and assign it to one of these capabilities. Acceptance
+requires that no safety decision outside session begin/finish code depends
+directly on the raw depth.
+
+### Add explicit streaming APIs
+
+Add APIs with names that describe their recovery contract:
+
+```zig
+pub fn beginStreamingReplaySession(self: *HBCIndex) !void;
+
+pub fn finishStreamingReplaySessionWithOptions(
+    self: *HBCIndex,
+    options: backend_types.BulkIngestFinishOptions,
+) !void;
+
+pub fn abortStreamingReplaySession(self: *HBCIndex) void;
+```
+
+The streaming finish should:
+
+1. finish any batch-local HBC work
+2. flush the LSM session to a durable reopenable boundary
+3. refresh published search state
+4. release bounded session workspace
+
+It must not clear an incomplete marker because it must never create one.
+
+`abortStreamingReplaySession` closes the LSM batching scope, releases session
+workspace, and republishes a consistent view of already committed batches. It
+does not roll back committed batches and does not advance the applied sequence.
+Restart or the next catch-up pass may therefore reapply those batches.
+
+The existing `beginBulkIngestSession` family retains the stronger publication
+semantics for explicit bulk construction.
+
+## IndexManager Changes
+
+Expose the session distinction by index name:
+
+```zig
+pub fn beginDenseStreamingReplaySessionByName(
+    self: *IndexManager,
+    name: []const u8,
+) !void;
+
+pub fn finishDenseStreamingReplaySessionByNameWithOptions(
+    self: *IndexManager,
+    name: []const u8,
+    options: backend_types.BulkIngestFinishOptions,
+) !void;
+
+pub fn abortDenseStreamingReplaySessionByName(
+    self: *IndexManager,
+    name: []const u8,
+) void;
+```
+
+Keep `BatchOptions.mode = .bulk_ingest` for replay batches where benchmarks
+show it is beneficial. That flag selects batch algorithms; it must no longer
+implicitly mean that the index is in an unsafe publication window.
+
+## Derived Replay Changes
+
+Change `beginDerivedCatchUpSessionAsync` and
+`finishDerivedCatchUpSessionAsync` to use the streaming APIs.
+
+Session reuse remains useful:
+
+- coalesce small tails briefly
+- amortize LSM flush and manifest work
+- apply a bounded number of replay windows
+- finish after the configured idle period or a forced visibility boundary
+
+The dense replay window remains bounded by records, items, bytes, and resource
+manager pressure. These limits are operational backpressure controls, not
+durability boundaries.
+
+### Session resource bounds
+
+Streaming sessions require both per-index and node-wide bounds. The current
+dense LSM defaults combine a 128 MiB mutable threshold with a four-times bulk
+multiplier, so retaining bulk-style LSM batching can otherwise permit a large
+mutable working set per active dense index.
+
+Force a streaming finish when any configured bound is reached:
+
+- maximum session records or vector items
+- maximum session input bytes
+- maximum estimated HBC and LSM workspace bytes
+- maximum session age or idle time
+- maximum dense replay lag
+- WAL retention soft or hard pressure
+- resource-manager memory or I/O pressure
+- a synchronous dense-visibility waiter
+
+Add a node-wide admission limit for concurrently active dense replay sessions.
+The resource manager may shorten a window or force a finish, but it must never
+turn a streaming session into cross-batch publication.
+
+At streaming finish, retain the current safety ordering:
+
+1. durably finish the dense session
+2. flush the pending applied sequence for that index
+3. notify query visibility
+4. allow replay truncation only after all managed indexes have persisted their
+   required watermarks
+
+## Idempotency Audit
+
+Removing the incomplete marker from streaming replay depends on safe
+reapplication. Before enabling the new mode, audit and test:
+
+- inserting an already-present vector ID with the same value
+- overwriting an existing vector ID
+- moving a vector between leaves on overwrite
+- deleting an already-absent vector ID
+- delete followed by insert in one coalesced window
+- multiple writes to one document collapsed to the final value
+- coverage accounting when a batch is replayed
+- applied-sequence sidecar and embedded HBC checkpoint agreement
+
+If any operation is not idempotent, fix that operation or add a durable
+per-batch commit identity before removing the marker.
+
+## Interrupted Streaming Recovery
+
+Expected restart behavior by interruption point:
+
+| Interruption point | Required restart behavior |
+| --- | --- |
+| Before first HBC batch commit | replay the whole window |
+| After one HBC batch commit | open successfully and replay from the old applied sequence |
+| After several commits, before session flush | recover committed/WAL state and replay from the old applied sequence |
+| After HBC flush, before applied-sequence persistence | open successfully and idempotently replay the window |
+| After applied-sequence persistence | continue after the persisted sequence |
+| During replay truncation | retain or recover enough replay history to honor every persisted index watermark |
+
+None of these cases may produce `IncompleteBulkPublish`.
+
+## Automatic Repair For True Incomplete Publications
+
+Streaming replay prevents new ordinary-write incidents but does not remove the
+need to recover:
+
+- indexes created by older builds
+- interrupted explicit bulk publications
+- interrupted in-place rebuilds
+
+Automatic restart repair is an independently landable track. It can ship before
+the streaming-session change to eliminate wipe/re-ingest as the operational
+recovery procedure, or after it as recovery for legacy and explicit-publication
+state. It must not be confused with the generation-publication project: the
+affected index remains unavailable while this repair runs.
+
+### Recovery owner
+
+Managed startup catch-up, rather than the HTTP repair-job store, owns automatic
+restart repair.
+
+Startup catch-up already:
+
+- runs outside request handling in a background thread
+- selects locally owned groups from placement and leadership state
+- serializes group operations through the local write owner
+- publishes startup, progress, and degraded status
+- detects zero-progress retries and applies bounded exponential backoff
+
+The HTTP repair-job store remains the operator-facing mechanism for explicit
+repair, cancellation, and observability. Making it the correctness mechanism
+for startup would introduce a second ownership and scheduling system, and its
+table-scoped job shape does not currently identify the locally owned group that
+startup is repairing.
+
+Automatic and operator-triggered repair must call the same DB repair engine and
+use the same durable repair intent. They differ only in scheduling and policy.
+
+### Load-failure classification
+
+Startup should classify index load failures narrowly:
+
+```zig
+pub const IndexLoadRecoveryAction = enum {
+    retry_open,
+    rebuild_from_artifacts,
+    manual_intervention,
+};
+
+pub fn loadFailureRecoveryAction(
+    err_name: []const u8,
+) IndexLoadRecoveryAction {
+    if (std.mem.eql(u8, err_name, "IncompleteBulkPublish")) {
+        return .rebuild_from_artifacts;
+    }
+    if (std.mem.eql(u8, err_name, "TableReadChurn")) {
+        return .retry_open;
+    }
+    return .manual_intervention;
+}
+```
+
+The initial automatic rebuild allowlist should contain only
+`IncompleteBulkPublish`. Unknown corruption, unsupported versions, invalid
+configuration, and missing source artifacts remain terminally degraded until
+an operator intervenes.
+
+The error classification authorizes a rebuild attempt; it does not by itself
+authorize deleting any index root. Before creating a candidate, run a rebuild
+capability preflight that verifies:
+
+- the configured index kind has a deterministic artifact reprocessor
+- the current configuration hash matches the intent or starts a new intent
+- the required primary embedding or other derived artifact source is
+  configured and its durable coverage metadata is consistent enough to start;
+  full per-artifact validation remains part of the build
+- sufficient local disk and resource-manager budget is available
+- the local process still owns the group and is permitted to publish it
+
+An allowlisted trigger with missing source artifacts becomes terminal repair
+debt without modifying the quarantined root.
+
+Transient open failures continue through the existing open-retry path; they do
+not authorize deleting or rebuilding an index root.
+
+### Durable repair intent
+
+Before starting reconstruction, persist an index repair intent in the DB's
+replica-local system-metadata store. It must share the local durability and
+transaction boundary needed by replay pins, but it is not user data and is not
+emitted by logical table replication:
+
+```zig
+pub const IndexRepairIntent = struct {
+    version: u8 = 1,
+    repair_id: u128,
+    db_identity: u128,
+    group_id: u64,
+    replica_id: u128,
+    root_generation: u64,
+    index_name: []const u8,
+    kind: types.IndexKind,
+    config_hash: u64,
+    trigger: enum {
+        incomplete_bulk_publish,
+    },
+    candidate_relative_path: ?[]const u8 = null,
+    detected_sequence: u64,
+    build_floor_sequence: u64 = 0,
+    candidate_applied_sequence: u64 = 0,
+    target_sequence: u64,
+    phase: enum {
+        detected,
+        preflight,
+        building,
+        catching_up,
+        ready,
+        waiting_for_convergence,
+        activating,
+        validating,
+        cleanup,
+        terminal,
+    },
+    attempt_count: u32 = 0,
+    next_retry_at_ms: u64 = 0,
+    started_at_ms: u64,
+    updated_at_ms: u64,
+    owner_epoch: u64,
+    automation: enum {
+        enabled,
+        paused,
+    } = .enabled,
+    last_error: ?[]const u8 = null,
+};
+```
+
+Suggested key:
+
+```text
+\x00\x00__metadata__:index_repair_intent:<index-name>
+```
+
+The internal prefix keeps repair state out of the user-document namespace.
+Persisted string fields use owned encoding with length and total-size limits;
+unknown intent versions or enum values fail closed.
+
+The intent is authoritative across restart of the same replica.
+`db_identity`, `group_id`, `replica_id`, and `root_generation` bind it to the
+local derived-state root that owns the candidate; `repair_id` and
+`candidate_relative_path` identify exactly which shadow may be resumed or
+discarded. Persisted retry metadata prevents repeated process restart from
+resetting a failing repair loop. Candidate paths must be canonical relative
+paths below the DB repair-shadow root; absolute paths, `..`, and paths outside
+that root are rejected before filesystem access.
+
+Repair intents, replay pins, candidate paths, and active-root pointers are
+durable replica-local projection metadata, not replicated table data. They are
+excluded from logical HA replication, split/move payloads, and logical backups.
+On leadership promotion, the new local owner discovers and advances only the
+intents already belonging to that replica. A new replica, a moved/split group,
+or a logical restore reconstructs its own projection and creates a new repair
+intent if its local load state requires one.
+
+A physical restore may retain an intent only when all four identity fields and
+the active root-generation marker match. Any mismatch invalidates the candidate
+path without opening it; safe cleanup is restricted to the restored repair
+shadow namespace, and reconstruction starts with a new local identity. Status
+aggregation reports repair state per group/replica so a healthy replica cannot
+mask another replica's unavailable projection.
+
+Replica lifecycle handling is explicit:
+
+| Event | Required behavior |
+| --- | --- |
+| Restart with matching identity | Reload intent and pin before truncation; resume by phase |
+| Leadership/placement loss | Fence and stop local execution; retain local intent for possible return, but forbid activation |
+| Promotion of another existing replica | Discover that replica's own load state and intent; never open the former owner's candidate |
+| Replica replacement or root-generation change | Invalidate old candidates and create a new local repair identity |
+| Group move or split | Do not copy repair state or candidate files; fence source work and build destination/children from their durable logical state |
+| Logical backup/restore | Omit repair state and rebuild derived indexes under new identities |
+| Physical backup/restore | Resume only after exact identity, generation, config, checkpoint, and candidate validation |
+| Index/group deletion | Atomically make the pin non-authoritative with deletion, then clean local candidates asynchronously |
+
+The durable sequence is:
+
+```text
+detect IncompleteBulkPublish
+    -> persist repair intent in replica-local system metadata
+    -> mark the projection repair_required
+    -> preflight source artifacts, reserve disk/resources, and verify ownership/configuration
+    -> leave the poisoned root and load failure quarantined
+    -> create and persist the candidate path
+    -> atomically acquire a pinned primary snapshot and its replay floor
+    -> build a shadow replacement from a primary snapshot
+    -> catch the shadow up to the current derived sequence
+    -> durably mark the candidate ready
+    -> converge below the bounded activation thresholds
+    -> revalidate ownership and configuration under a time-bounded apply barrier
+    -> perform bounded final catch-up
+    -> atomically swap the active-root pointer
+    -> open and validate the replacement
+    -> persist a clean projection checkpoint and clear the load failure
+    -> atomically release the replay-retention pin and delete the repair intent
+    -> garbage-collect the poisoned root and unused candidates
+```
+
+Do not call `reopenQuarantinedIndexForArtifactRebuild` on this path. The shadow
+builder must be able to register a replacement directly from the status-only
+configuration. Until validation succeeds, explicit queries against the index
+continue to fail with the quarantined-index error; they must never observe an
+empty replacement opened only to facilitate rebuilding.
+
+Manual index repair must use the same intent. An interrupted operator repair
+therefore becomes eligible for safe automatic continuation after restart.
+
+If startup finds both a healthy active replacement and a stale intent from a
+crash after pointer activation, it validates the configuration hash and clean
+checkpoint, then clears the intent without rebuilding again.
+
+If startup finds an intent and a candidate path:
+
+- a valid ready candidate resumes at activation or validation
+- a valid building candidate resumes only when its checkpoint and artifact
+  format explicitly support resumption
+- an incomplete or corrupt candidate is deleted and rebuilt
+- a candidate not referenced by an active intent is garbage-collected after a
+  bounded grace period
+
+### Repair availability gate
+
+Load-failure state alone is not sufficient to gate queries because pointer
+activation and process restart can make a candidate openable before the repair
+state machine has validated it. Index serviceability is therefore:
+
+```text
+runtime index loaded
+    and no quarantined load failure
+    and no repair intent in detected..validating
+    and clean projection checkpoint matches the active config and generation
+```
+
+An intent in `cleanup` does not block queries after the replacement has passed
+validation and the clean checkpoint is durable. A crash after pointer swap but
+before validation leaves the intent in `activating` or `validating`, so restart
+continues to return `index_rebuilding` even if the candidate opens successfully.
+If candidate validation fails, pointer activation is rolled back when a prior
+valid pointer exists; otherwise the index remains quarantined and the intent is
+retried or marked terminal.
+
+The serviceability decision is cached in the index manager and updated on load
+failure, intent, pointer, and checkpoint transitions. Queries must not read the
+primary metadata store on every request merely to evaluate this gate.
+
+### Replay retention during repair
+
+The quarantined index is intentionally absent from normal managed replay, so
+its old applied sequence cannot protect the replay journal. Before releasing
+the primary snapshot used for shadow construction, persist a replay-retention
+pin:
+
+```zig
+pub const IndexRepairReplayPin = struct {
+    version: u8 = 1,
+    repair_id: u128,
+    db_identity: u128,
+    replica_id: u128,
+    root_generation: u64,
+    index_name: []const u8,
+    retain_after_sequence: u64,
+};
+```
+
+Capturing a snapshot floor and then persisting a pin is racy: truncation could
+advance between those operations. Callers must not hand-roll that sequence.
+Provide one DB primitive:
+
+```zig
+pub fn beginPinnedIndexRepairSnapshot(
+    self: *DB,
+    repair_id: u128,
+) !PinnedIndexRepairSnapshot;
+```
+
+It performs this protocol under the same exclusion used to calculate and
+advance the replay truncation floor:
+
+1. Persist a provisional pin with `retain_after_sequence = 0` for the bound
+   replica and root generation. Zero explicitly means retain the entire
+   available replay journal; it is not interpreted as "no pin."
+2. Make that pin visible to the in-memory truncation registry before releasing
+   the metadata transaction.
+3. Open the primary snapshot and read its replay/build floor.
+4. In one primary-store transaction, update the intent's
+   `build_floor_sequence` and raise the pin from zero to that exact floor.
+5. Refresh the truncation registry, then release the exclusion and return the
+   pinned snapshot handle.
+
+Replay truncation acquires the same exclusion and clamps to the minimum
+sequence required by managed index watermarks, enrichment/resolution stages,
+and both provisional and finalized repair pins. A crash at any point leaves
+either the conservative zero pin or the finalized pin durable; startup reloads
+all pins before enabling truncation. The pin is released only after successful
+replacement activation or explicit terminal abandonment with candidate
+cleanup. Pin and intent removal are one durable transition.
+
+This permits foreground writes to continue while the shadow is built. If a
+deployment cannot provide the durable pin, it must block writes to the group
+for the entire snapshot-build and activation window and report that reduced
+availability explicitly; that is a fallback, not the target contract.
+
+Snapshots themselves can retain MVCC versions independently of replay bytes.
+The resource manager therefore budgets snapshot age and pinned-version bytes as
+well as replay-pin bytes. A repair that exceeds either soft budget yields and
+reopens from a resumable checkpoint where supported; exceeding a hard budget
+enters write backpressure or pauses the repair rather than allowing unbounded
+disk growth.
+
+### Repair state transitions
+
+Every transition is idempotent and compare-and-swaps the expected `repair_id`,
+phase, configuration hash, root generation, and ownership epoch. Filesystem
+effects happen before the durable phase that claims they are complete; restart
+validates those effects before advancing.
+
+| Phase | Required durable facts | Allowed next phase | Restart action |
+| --- | --- | --- | --- |
+| `detected` | Bound intent exists; quarantined root is untouched | `preflight`, `terminal` | Reclassify trigger and identity |
+| `preflight` | Source, ownership, reservation, and config checks recorded | `building`, `terminal` | Re-run checks; release stale reservations |
+| `building` | Provisional/final replay pin and candidate identity exist | `catching_up`, `terminal` | Resume a validated build checkpoint or discard only the candidate |
+| `catching_up` | Candidate checkpoint and applied sequence are durable | `ready`, `waiting_for_convergence`, `terminal` | Reopen candidate and replay from its checkpoint |
+| `ready` | Candidate is durable, reopenable, and snapshot-complete | `waiting_for_convergence`, `activating` | Validate candidate and current ownership |
+| `waiting_for_convergence` | Ready candidate and replay pin remain valid | `catching_up`, `activating`, `terminal` | Continue bounded catch-up outside the apply barrier |
+| `activating` | Fenced activation intent and previous pointer are recorded | `validating` | Determine which pointer is active; complete or roll back idempotently |
+| `validating` | New pointer is active; serviceability gate remains closed | `cleanup`, `terminal` | Reopen, validate, and publish the clean checkpoint |
+| `cleanup` | Clean checkpoint is durable and index is serviceable | intent deletion | Remove pin/intent atomically, then garbage-collect asynchronously |
+| `terminal` | Stable error and operator action are recorded | `detected` after explicit retry, or deletion | Remain fail-closed; do no automatic destructive work |
+
+`automation = paused` is orthogonal to phase. It prevents the automatic
+executor from claiming the intent while preserving all durable safety state.
+Drop and configuration replacement use explicit terminal cleanup transitions;
+they do not skip pin or candidate cleanup.
+
+### Bounded convergence and activation
+
+Foreground writes remain available during reconstruction, so activation must
+not assume that a busy group will naturally become idle. Candidate catch-up
+runs outside the final apply barrier until all configured admission thresholds
+are satisfied:
+
+- remaining replay sequences
+- remaining replay bytes
+- measured catch-up throughput relative to foreground write throughput
+- estimated final catch-up time
+- configured maximum write-pause duration
+
+Only then may the executor acquire the final apply barrier. Under the barrier
+it rechecks ownership, root generation, configuration, candidate durability,
+and the current replay target. If the new estimate exceeds the maximum pause,
+it releases the barrier without swapping, records
+`waiting_for_convergence`, and continues background catch-up. No repair may
+hold the write/apply barrier for an unbounded corpus scan or wait.
+
+If sustained writes prevent convergence, the resource manager may apply
+bounded dense-replay prioritization and then explicit write admission control.
+At the hard replay-retention or disk-reservation limit, writes that would grow
+the protected backlog fail with a stable retryable response:
+
+```text
+HTTP 429
+code = dense_repair_backpressure
+index_name
+repair_id
+retry_after_ms
+```
+
+The response is removed automatically after pressure falls below the recovery
+threshold. It must not be reported as a generic timeout or allow storage
+exhaustion. Deployments may map node-wide emergency unavailability to HTTP 503,
+but the structured code and retry contract remain the same.
+
+Activation metrics include convergence lag in sequences and bytes, estimated
+pause, actual barrier hold time, convergence retries, throttled writes, and
+backpressure rejections.
+
+### Repair engine and scheduler
+
+Startup catch-up owns detection and policy, but it must not synchronously run a
+multi-minute rebuild inside the serial table/group inspection loop. Separate
+cheap discovery from expensive execution.
+
+Add a bounded DB discovery pass:
+
+```zig
+pub const StartupIndexRepairDiscovery = struct {
+    discovered: usize = 0,
+    already_pending: usize = 0,
+    terminal: usize = 0,
+};
+
+pub fn discoverRecoverableStartupIndexFailures(
+    self: *DB,
+    alloc: Allocator,
+    limit: usize,
+) !StartupIndexRepairDiscovery;
+```
+
+Discovery enumerates configured indexes, classifies load failures, validates or
+creates durable intents, and publishes repair debt. It performs no corpus scan
+and returns quickly so one broken group cannot head-of-line block inspection of
+all later groups on the node.
+
+A node-local repair executor consumes intents selected by the managed startup
+owner. Notifications are latency hints, not a correctness mechanism: the
+executor scans durable intents at startup and periodically thereafter, so a
+lost notification, executor restart, or temporarily closed DB cannot strand
+repair debt. It reopens the DB through the managed owner for each claim and
+does not retain an unsafe raw DB pointer across placement or lifecycle changes.
+It calls the same refactored DB repair state machine used by explicit operator
+repair:
+
+```zig
+pub fn advanceIndexRepairIntent(
+    self: *DB,
+    alloc: Allocator,
+    repair_id: u128,
+    options: types.ArtifactRepairRunOptions,
+) !IndexRepairAdvanceResult;
+```
+
+The existing repair engine supplies useful shadow creation, snapshot rebuild,
+catch-up, final apply barrier, and pointer-swap code. Before reuse, refactor out
+its destructive quarantined-root reopen and add the durable intent, candidate,
+and replay-pin transitions defined above.
+
+Start with these scheduler limits:
+
+- at most one active index reconstruction per node
+- at most one active reconstruction per group
+- size-aware fair selection across tables and groups, with aging so a large
+  repair cannot starve indefinitely
+- resource-manager admission for memory, disk I/O, compaction, and background
+  CPU
+- a durable or reconstructible disk-reservation token that accounts for the
+  candidate, retained poisoned root, WAL/replay growth, and cleanup reserve;
+  free-space preflight alone is not admission because concurrent repairs can
+  consume the same bytes
+- cancellation and a final fencing check when placement or leadership changes
+
+The concurrency limit may become configurable after qualification, but
+unbounded per-group concurrency is never allowed. A future resumable scanner
+may time-slice large builds; the first implementation may run one admitted
+build to completion on the dedicated executor only if capacity tests show that
+the largest supported repair meets queue-age and startup SLOs. Otherwise,
+resumable checkpoints and cooperative yielding are required before GA.
+
+The scheduler publishes queue depth, oldest-intent age, admitted and reserved
+bytes, per-resource wait reason, estimated remaining bytes, and projected
+completion time. Initial concurrency is one reconstruction per node. Higher
+configurable concurrency is enabled only after multi-group qualification proves
+that memory, disk, replay retention, query latency, and activation-pause budgets
+remain bounded. The periodic rescan interval and repair-capacity SLO are
+configuration with conservative defaults, not hard-coded operational policy.
+
+### Startup integration
+
+After primary/derived startup replay stabilizes and before converting remaining
+failures to `terminal_degraded`, startup performs discovery and wakes the repair
+executor:
+
+```zig
+if (initial_index_load_failure or
+    try db.hasPendingIndexRepairIntents(alloc))
+{
+    const discovery = try db.discoverRecoverableStartupIndexFailures(
+        alloc,
+        1,
+    );
+    repair_executor.notify(group_id);
+
+    if (discovery.discovered != 0 or
+        discovery.already_pending != 0)
+    {
+        return .{
+            .had_debt = true,
+            .made_progress = discovery.discovered != 0,
+        };
+    }
+}
+```
+
+The terminal branch applies only to failures that have no runnable repair
+intent or whose intent is terminal:
+
+```zig
+if (try managedDbHasUnrecoverableIndexLoadFailure(alloc, db)) {
+    return .{
+        .had_debt = true,
+        .terminal_degraded = true,
+        .made_progress = made_progress,
+    };
+}
+```
+
+This preserves the policy distinction:
+
+- `IncompleteBulkPublish` with valid source artifacts becomes scheduled repair
+  debt
+- a transient open race is retried without reconstruction
+- unknown, corrupt, unsupported, or unreconstructible state remains fail-closed
+
+### Exclusion, fencing, and backoff
+
+Existing group-operation exclusion and the index repair lease remain useful,
+but they are not sufficient as the durable state machine. The executor must:
+
+- claim only a locally owned group
+- hold the per-index repair lease while advancing an intent
+- hold broad group-operation exclusion only for bounded claim/open and final
+  activation transitions, not for the full corpus scan
+- capture an ownership/fencing epoch and revalidate it before pointer activation
+- translate an active writer or repair lease into retryable `busy` debt
+- persist `attempt_count`, `last_error`, and `next_retry_at_ms` on failure
+- apply exponential backoff with bounded jitter across process restarts
+- mark deterministic preflight or policy failures terminal immediately
+- clear retry state after successful activation and validation
+
+The startup catch-up backoff continues to protect discovery. The persisted
+intent backoff protects expensive reconstruction and prevents restart thrash.
+
+### Status and metrics
+
+Automatic repair should report more than generic startup catch-up:
+
+```text
+index_repair_trigger = IncompleteBulkPublish
+index_repair_id
+index_repair_phase = detected | preflight | building | catching_up | ready |
+                     waiting_for_convergence | activating | validating |
+                     cleanup | terminal
+index_repair_automation = enabled | paused
+index_repair_attempts
+index_repair_documents_reprocessed
+index_repair_started_at
+index_repair_updated_at
+index_repair_build_floor_sequence
+index_repair_applied_sequence
+index_repair_target_sequence
+index_repair_next_retry_at
+index_repair_last_error
+index_repair_wait_reason = none | backoff | resource | convergence | paused
+index_repair_queue_age
+index_repair_estimated_completion
+index_repair_replay_bytes_retained
+index_repair_snapshot_age
+index_repair_snapshot_bytes_pinned
+index_repair_disk_bytes_reserved
+```
+
+These fields belong in the per-index status API and structured logs. Prometheus
+metrics use bounded phase/outcome labels and aggregate counts or durations;
+`repair_id`, index names, candidate paths, and error strings must not become
+unbounded metric labels.
+
+While rebuilding:
+
+- primary document reads and ordinary writes remain available, subject to the
+  explicit hard-pressure contract below
+- unrelated indexes remain searchable
+- the affected index returns a stable `index_rebuilding` error mapped to the
+  existing `IndexUnavailable` class
+- runnable or retryable startup status reports `artifact_rebuild`, not terminal
+  degradation; a paused or terminal intent is reported distinctly
+- process and node readiness remain healthy unless primary storage itself is
+  unavailable. Table/index health still reports degradation, and deployments
+  that require every configured index may opt into a strict readiness policy
+
+Only a completed clean checkpoint and cleared load failure return the index to
+service.
+
+### Query and operator experience
+
+The API must expose repair state through the normal table/index status response,
+not only logs and Prometheus. An explicit query against the affected index
+returns a structured retryable error containing:
+
+```text
+code = index_rebuilding
+index_name
+repair_id
+phase
+retry_after_ms, when known
+```
+
+Composed or hybrid searches fail the complete request when a required index is
+rebuilding. Partial results are allowed only through an explicit request option
+and must identify every omitted index; silent partial search is forbidden.
+
+Writes continue to append primary data and replay records. A request requiring
+dense visibility for the rebuilding index waits only up to its normal deadline,
+then returns `index_rebuilding`; it does not wait for an unbounded corpus rebuild.
+Replay retention and write backpressure continue to apply if the repair cannot
+keep up with foreground traffic.
+
+Operator actions follow these rules:
+
+- an explicit repair request attaches to the existing intent instead of
+  creating a competing rebuild
+- `cancel_current_attempt` stops candidate work at a safe boundary, preserves
+  the quarantined root and replay pin, releases admitted resources, records
+  retryable debt, and permits the automatic executor to try again later
+- `pause_automatic_repair` durably sets `automation = paused`; it stops the
+  current attempt at a safe boundary and prevents automatic reclaim across
+  restart until `resume_automatic_repair` clears the pause
+- operator status distinguishes a paused repair from backoff, resource waiting,
+  terminal failure, and active cancellation
+- dropping the index cancels its repair, removes its replay pin and intent, and
+  garbage-collects candidates
+- changing the index configuration cancels the old intent and starts a new
+  repair only after the new configuration is durable
+- a leadership or placement change cancels local execution; the next eligible
+  owner resumes from durable state
+- a terminal repair remains visible with a documented operator retry or
+  drop/recreate action
+
+These actions are idempotent and scoped by `repair_id`. A stale action for an
+old repair cannot pause, resume, cancel, or delete its replacement.
+
+### Automatic repair test matrix
+
+The minimum deterministic test matrix is:
+
+1. Create an external dense index, persist vectors, leave
+   `__bulk_publish_state`, run managed startup catch-up, and verify the index is
+   automatically searchable without an API repair request.
+2. Stop after intent persistence and before candidate creation; restart must
+   retain the quarantined root and resume.
+3. Stop during snapshot construction; restart must either resume a validated
+   checkpoint or discard only the candidate and rebuild it.
+4. Write documents after the snapshot floor while the shadow is building;
+   replay truncation must remain pinned and the final index must include them.
+5. Stop after candidate readiness but before pointer swap; restart must validate
+   and activate the identified candidate without rebuilding it.
+6. Stop after pointer swap but before replacement validation, checkpoint
+   publication, replay-pin removal, and intent deletion. Each restart must
+   deterministically finish the remaining transition without losing the new
+   active root.
+7. Inject `UnsupportedVersion` and structural corruption; both must remain
+   terminally degraded and must not delete the root automatically.
+8. Remove or corrupt required source artifacts; preflight must become terminal
+   without creating or activating a candidate.
+9. Verify only the active local owner repairs a group, then transfer leadership
+   during build and immediately before activation.
+10. Fill the filesystem during candidate creation, build, readiness publication,
+    activation, and cleanup. The active/quarantined state and intent must remain
+    coherent after every failure.
+11. Corrupt or truncate the intent and candidate marker. Unknown versions and
+    malformed data must fail closed.
+12. Cancel repair, drop the index, and replace its configuration during each
+    long-running phase; verify replay-pin and candidate cleanup.
+13. Run multiple broken indexes across multiple groups and verify the node-wide
+    concurrency limit, fairness, and absence of startup inspection head-of-line
+    blocking.
+14. Reproduce a 100,000-document interrupted external-vector ingest; restart
+   without an API call and verify document count, dense count, search results,
+   zero remaining load failures, and removal of the repair intent.
+15. Run at least one million documents with concurrent writes and queries,
+    repeated forced termination, bounded memory/WAL/disk growth, and recall
+    comparison against a clean build.
+16. Pause truncation immediately before pinned-snapshot acquisition, race the
+    truncator against snapshot creation, and verify that either the provisional
+    zero pin or final floor protects every required replay record across crash.
+17. Exercise every transition in the state table twice and crash between its
+    filesystem effect and durable phase update; restart must converge without
+    activating an unvalidated candidate or deleting the active root.
+18. Run full durability and relaxed/`none` durability modes, including LMDB
+    `no_sync`; verify no applied watermark or truncation advances before the
+    explicit durable sync and that sync failure preserves replay debt.
+19. Replace replica identity and root generation, promote an HA replica, move
+    and split a group, and perform logical and physical restore. A local
+    candidate may resume only on an exact identity match.
+20. Sustain writes above and below candidate catch-up throughput. Barrier hold
+    time must remain below the configured maximum; non-convergence must return
+    to `waiting_for_convergence` and eventually apply documented backpressure.
+21. Drop executor notifications and restart the executor while intents exist;
+    periodic durable discovery must reclaim each eligible intent within the
+    configured scan SLO without duplicate execution.
+22. Cancel the current attempt, durably pause automatic repair, restart, and
+    resume. Only cancel permits automatic retry; pause survives restart.
+23. Exhaust soft and hard replay, snapshot-pin, and disk budgets. Verify
+    reservation fairness, the stable `dense_repair_backpressure` response with
+    `Retry-After`, hysteretic recovery, and absence of filesystem exhaustion.
+24. Queue differently sized repairs long enough to exercise size-aware
+    selection and aging. Assert bounded oldest-intent age and no starvation.
+
+This track prevents wipe/re-ingest and does not require changing the successful
+normal-ingest path. The streaming-session track separately prevents ordinary
+replay from creating this failure state in the first place.
+
+## Generation Publication
+
+Generation replacement is not the normal replay mechanism. It is appropriate
+when an explicit operation needs both:
+
+- permission to build cross-transaction structural state, and
+- continued service from a previous complete index
+
+Examples include a full rebuild of a live index or a large import replacing an
+existing index.
+
+Bulk publication defaults to an isolated candidate. In-place publication is
+allowed only for a brand-new root that has never been advertised, an explicitly
+offline index with no prior searchable generation, or a legacy compatibility
+path. A live active index is never placed into an in-place incomplete
+publication window.
+
+The generation flow is:
+
+```text
+keep generation N active
+    -> build generation N+1 in a shadow root
+    -> catch it up to the current derived sequence
+    -> durably mark it ready
+    -> satisfy bounded convergence thresholds
+    -> acquire the final apply barrier for at most the configured pause
+    -> perform bounded final catch-up
+    -> atomically update the active-root pointer
+    -> retire generation N after readers release it
+```
+
+The existing repair shadow build and active-root pointer swap should be
+refactored into reusable build and publication primitives before adding a
+second generation implementation.
+
+A correctness-first implementation may rebuild a candidate from all primary
+artifacts. That is acceptable for explicit rebuild/import but too expensive for
+ordinary write bursts. An optimized implementation may later add a cheap LSM
+generation fork that shares immutable runs while keeping separate manifests,
+mutable state, and WAL ownership.
+
+Generation publication uses the same pinned-snapshot, durability-mode,
+identity/fencing, disk-reservation, and bounded-activation primitives as repair.
+It must not introduce a parallel implementation of those correctness rules.
+
+## Implementation Plan
+
+The numbered phases describe dependencies, not a mandatory release order.
+There are three independently reviewable workstreams:
+
+- automatic restart repair may land before streaming replay, but its durable
+  repair core and node-local scheduling/UX should be separate focused PRs
+- streaming replay prevents new normal-write incidents and requires crash and
+  performance qualification
+- generation publication is a separate project for explicit rebuild/import
+  continuity
+
+### Phase 0: Prove and classify the current invariants
+
+1. Inventory every HBC branch controlled by `bulk_ingest_session_depth`.
+2. Classify each branch as LSM batching, cross-batch publication, metadata
+   publication, search visibility, cache behavior, workspace lifetime, or
+   maintenance behavior.
+3. Add deterministic reopen tests at individual HBC batch boundaries.
+4. Complete the insert, overwrite, move, delete, and coverage idempotency audit.
+
+Acceptance:
+
+- every raw depth decision has an explicit owner and recovery rationale
+- a normal non-session HBC batch is proven structurally reopenable
+- any failed idempotency case is fixed or has an approved durable batch-ID
+  design before streaming rollout
+
+### Phase 1: Establish the streaming contract
+
+1. Add `WriteSessionKind` and capability predicates to HBC.
+2. Separate LSM session batching from cross-batch HBC deferred state.
+3. Make metadata, topology, Flat-RaBitQ node keys, and required quantized state
+   publish atomically at streaming batch finish.
+4. Add streaming replay begin/finish/abort APIs.
+5. Add corresponding `IndexManager` APIs.
+6. Switch asynchronous dense catch-up to streaming replay sessions.
+7. Keep batch-level bulk optimizations enabled initially.
+8. Add per-session and node-wide resource bounds.
+9. Make the backend report whether finish established a durable checkpoint;
+   preserve durable-finish-before-applied-sequence ordering in every mode.
+
+Acceptance:
+
+- normal dense catch-up never writes `__bulk_publish_state`
+- every committed streaming batch is reopenable
+- abort leaves a query-consistent, replayable state
+- a killed process resumes through replay without rebuilding the index
+- relaxed/`none` durability never advances a durable watermark until explicit
+  sync succeeds
+- existing dense visibility and sync-level tests continue to pass
+
+### Phase 2: Crash and idempotency qualification
+
+Add deterministic hooks and tests for every interruption point in the recovery
+table. Exercise inserts, overwrites, deletes, mixed operations, external vectors,
+managed vectors, full durability, and relaxed/`none` durability.
+
+Acceptance:
+
+- no duplicates or lost deletes after restart
+- durable document and dense counts converge
+- applied sequence never skips unapplied work
+- nearest-neighbor results and recall match a clean ingest
+- no streaming interruption yields `IncompleteBulkPublish`
+
+### Phase 3: Performance qualification
+
+Compare:
+
+1. the current long-lived HBC bulk session
+2. the proposed streaming session with LSM coalescing
+3. independent durable replay batches with no session reuse
+
+Measure:
+
+- documents and vectors per second
+- write p50, p95, and p99
+- dense replay lag and maximum lag
+- HBC apply and finish time
+- LSM manifest writes and WAL bytes
+- L0 run count and maintenance debt
+- peak dense apply workspace
+- restart and replay duration
+- search latency and recall after ingest
+
+Use at least:
+
+- a 100,000-document external-vector ingest
+- a one-million-document sustained-ingest and restart workload
+- mixed overwrite/delete traffic
+- small steady-state writes
+- bursty writes below and above the replay coalescing threshold
+- multiple dense indexes and multiple active groups per node
+- forced termination during an active session
+
+Record the baseline and candidate commit IDs, build mode, backend and durability
+configuration, dataset/version and random seeds, CPU model/count, memory, disk,
+filesystem, and kernel. Run each reported workload at least five times after a
+documented warm-up; retain raw results and report median plus dispersion or a
+confidence interval. Compare on the same isolated hardware, and explain rather
+than silently discard outliers.
+
+Acceptance:
+
+- streaming throughput is within 10% of the current bulk session and write p99
+  is within 15%, unless an explicitly reviewed result accepts a different
+  tradeoff
+- it materially outperforms fully independent durable batches, or the simpler
+  independent-batch design is selected instead
+- peak memory, WAL growth, and L0 debt remain inside configured node budgets
+- unpaced ingest cannot create a permanently unloadable dense index
+
+### Phase 4: Durable automatic repair core
+
+1. Add load-failure recovery classification.
+2. Add rebuildability, artifact, disk, configuration, and ownership preflight.
+3. Add the durable repair intent, candidate identity, and replay-retention pin.
+   Bind all local artifacts to DB, group, replica, and root-generation identity
+   and acquire snapshots through the atomic pinned-snapshot primitive.
+4. Refactor shadow construction so it builds directly from a status-only
+   quarantined configuration without deleting or reopening the poisoned root.
+5. Add the complete restart transition table, ready, bounded convergence,
+   activation, validation, cleanup, and stale-candidate recovery.
+6. Make operator repair use the same state machine.
+7. Add crash tests for every durable transition.
+
+Acceptance:
+
+- an existing `IncompleteBulkPublish` index can be repaired through the shared
+  durable engine without wipe/re-ingest
+- queries never observe an empty or incomplete replacement
+- concurrent writes after the build floor are retained and included
+- the quarantined root remains untouched until a validated replacement is
+  active
+- unknown failures remain fail-closed
+- malformed intents, missing artifacts, and insufficient disk fail safely
+- replica replacement, move/split, promotion, and backup/restore cannot resume
+  a candidate belonging to a different local root
+
+### Phase 5: Repair scheduling and production UX
+
+1. Add fast startup discovery and the bounded node-local repair executor.
+2. Add fair scheduling, node-wide resource admission, persistent retry/backoff,
+   disk reservation, periodic lost-wakeup discovery, and ownership fencing.
+3. Add structured query errors, status API fields, metrics, and readiness rules.
+4. Add cancel-attempt, durable pause/resume, drop, configuration-change,
+   leadership-transfer, and hard-backpressure handling.
+5. Qualify multiple broken indexes across multiple tables and groups.
+
+Acceptance:
+
+- one long repair does not block startup inspection of later groups
+- default concurrency is one reconstruction per node and never exceeds the
+  configured resource budget
+- every durable intent is rediscovered within the configured scan SLO even if
+  its notification is lost
+- queue age and projected completion remain within the qualified repair
+  capacity SLO, with no starvation
+- process restart does not reset retry backoff or duplicate a repair
+- an existing `IncompleteBulkPublish` index repairs after restart without an
+  explicit API call
+- primary reads and ordinary writes remain available during repair
+- the affected index consistently returns `index_rebuilding` until validation
+- all repair state, candidates, and replay pins are eventually cleaned up
+- activation never exceeds the configured write-pause budget
+
+### Phase 6: Shadow generation publication
+
+1. Refactor repair shadow construction into reusable replacement-generation
+   APIs.
+2. Add a durable candidate-generation manifest and ready marker.
+3. Retain the previous generation until active readers release it.
+4. Add crash tests before and after candidate readiness and pointer activation.
+5. Use this path only for explicit operations that require continued service.
+
+Acceptance:
+
+- the previous complete generation remains searchable until activation
+- restart deterministically chooses the active complete generation
+- incomplete candidates never become active
+- retired generations are garbage-collected safely
+
+## Rollout
+
+The session-kind change should be guarded initially so both paths can be tested
+against the same workloads. Emit counters for:
+
+- streaming sessions opened, finished, and aborted
+- bulk publication sessions opened, finished, and aborted
+- streaming replay batches reapplied after restart
+- incomplete publication quarantines
+- automatic reconstruction attempts and outcomes
+- repair executor queue depth, oldest age, admission delay, projected
+  completion, durable-rescan recoveries, and active count
+- repair replay-pin age and retained replay bytes
+- repair snapshot age and pinned-version bytes
+- candidate actual/reserved bytes, stale candidates removed, and cleanup
+  failures
+- repair phase duration, retry count, and terminal outcomes
+- convergence lag, estimated and actual activation pause, and barrier retries
+- dense-repair throttling and backpressure rejections
+- session finish latency and maximum replay lag
+
+Rollout order:
+
+1. tests and local benchmarks
+2. opt-in streaming mode in benchmark and canary environments
+3. fault-injection canary with forced process termination
+4. default streaming mode for ordinary dense replay
+5. removal of the legacy ordinary-replay bulk-session path after qualification
+
+Automatic repair rolls out separately:
+
+1. classification and status reporting without automatic execution
+2. operator-triggered execution through the new state machine
+3. automatic execution in fault-injection and canary environments
+4. automatic execution by default with concurrency one
+5. higher concurrency only after multi-group resource qualification
+
+General availability requires the deterministic crash matrix to pass on every
+supported durable backend mode, no unresolved correctness-severity failures,
+reproducible performance results within the accepted thresholds, and evidence
+that the largest supported incident stays within memory, disk, replay,
+snapshot, activation-pause, queue-age, and projected-recovery SLOs. If a
+nonpreemptive repair cannot meet those bounds, resumable scan checkpoints are a
+GA requirement rather than deferred follow-up work.
+
+## Non-Goals
+
+This work does not:
+
+- make external-vector query embedding a server responsibility
+- remove the derived replay log or add a second per-index WAL
+- make every index load error automatically repairable
+- use full generation replacement for routine writes
+- guarantee synchronous dense visibility for `sync_level: write`
+- eliminate resource backpressure or bounded replay windows
+- keep a previously broken in-place generation searchable while it is repaired
+
+## Final Architecture
+
+```text
+ordinary write
+    -> durable primary document + derived replay record
+    -> bounded dense streaming replay session
+    -> structurally valid batch commits
+    -> backend-confirmed durable finish or explicit sync
+    -> applied-sequence publication
+    -> crash recovery by idempotent replay
+
+explicit import/rebuild
+    -> bulk publication in an isolated candidate when prior service matters
+    -> bounded convergence and final catch-up
+    -> atomic active-generation swap
+    -> retired-generation cleanup
+
+legacy/interrupted in-place bulk publication
+    -> quarantine
+    -> allowlisted discovery + rebuildability preflight
+    -> replica-bound durable repair intent + atomic pinned snapshot
+    -> resource-admitted shadow reconstruction
+    -> bounded convergence + time-bounded fenced pointer activation
+    -> replacement validation
+    -> pin/intent/candidate cleanup
+```
+
+The design keeps bulk algorithms where they provide throughput, but removes the
+assumption that ordinary write batching is an all-or-nothing index publication.
+It also keeps a damaged generation quarantined until a complete replacement is
+durably active, so automatic recovery cannot turn an explicit unavailable error
+into silent empty or partial search results.

@@ -195,7 +195,7 @@ func (ca *ClusterApi) clusterStatus() (ClusterStatus, map[string]any) {
 			health = ClusterHealthDegraded
 			message = fmt.Sprintf("shard %s is in a transition state", id)
 		}
-		if !ca.ln.config.SwarmMode {
+		if !ca.ln.config.IsStandalone() {
 
 			if status.RaftStatus == nil {
 				health = ClusterHealthDegraded
@@ -233,10 +233,10 @@ func (ca *ClusterApi) clusterStatus() (ClusterStatus, map[string]any) {
 	}
 	authEnabled := ca.ln.config.EnableAuth
 	status := ClusterStatus{
-		Health:      health,
-		Message:     message,
-		AuthEnabled: authEnabled,
-		SwarmMode:   ca.ln.config.SwarmMode,
+		Health:         health,
+		Message:        message,
+		AuthEnabled:    authEnabled,
+		DeploymentMode: ClusterStatusDeploymentMode(ca.ln.config.EffectiveDeploymentMode()),
 	}
 	legacyStatus := map[string]any{
 		"shards":        shards,
@@ -263,7 +263,7 @@ func (ca *ClusterApi) GetCluster(w http.ResponseWriter, r *http.Request) {
 		Health:               status.Health,
 		Message:              status.Message,
 		AuthEnabled:          status.AuthEnabled,
-		SwarmMode:            status.SwarmMode,
+		DeploymentMode:       ClusterTopologyDeploymentMode(status.DeploymentMode),
 		SecretStore:          status.SecretStore,
 		Data:                 ClusterDataStatus{},
 		AdditionalProperties: legacyStatus,

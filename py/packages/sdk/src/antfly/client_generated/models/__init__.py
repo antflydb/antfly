@@ -90,7 +90,9 @@ from .cluster_restore_request_restore_mode import ClusterRestoreRequestRestoreMo
 from .cluster_restore_response import ClusterRestoreResponse
 from .cluster_restore_response_status import ClusterRestoreResponseStatus
 from .cluster_status import ClusterStatus
+from .cluster_status_deployment_mode import ClusterStatusDeploymentMode
 from .cluster_topology import ClusterTopology
+from .cluster_topology_deployment_mode import ClusterTopologyDeploymentMode
 from .cohere_embedder_config import CohereEmbedderConfig
 from .cohere_embedder_config_input_type import CohereEmbedderConfigInputType
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
@@ -114,6 +116,10 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
+from .derived_coverage_policy import DerivedCoveragePolicy
+from .derived_coverage_status import DerivedCoverageStatus
+from .derived_coverage_status_policy import DerivedCoverageStatusPolicy
 from .disjunction_query import DisjunctionQuery
 from .distance_metric import DistanceMetric
 from .distance_range import DistanceRange
@@ -432,6 +438,8 @@ from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
+from .list_restore_jobs_phase import ListRestoreJobsPhase
+from .list_restore_jobs_scope import ListRestoreJobsScope
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
@@ -524,7 +532,16 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
-from .restore_table_response_202 import RestoreTableResponse202
+from .restore_job import RestoreJob
+from .restore_job_list import RestoreJobList
+from .restore_job_phase import RestoreJobPhase
+from .restore_job_result import RestoreJobResult
+from .restore_job_result_durability import RestoreJobResultDurability
+from .restore_job_result_failure_details_item import RestoreJobResultFailureDetailsItem
+from .restore_job_result_restore import RestoreJobResultRestore
+from .restore_job_result_status import RestoreJobResultStatus
+from .restore_job_scope import RestoreJobScope
+from .restore_request import RestoreRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
@@ -563,6 +580,9 @@ from .sse_step_progress import SSEStepProgress
 from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
+from .storage_maintenance_capabilities import StorageMaintenanceCapabilities
+from .storage_runtime_status import StorageRuntimeStatus
+from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
@@ -737,7 +757,9 @@ __all__ = (
     "ClusterRestoreResponse",
     "ClusterRestoreResponseStatus",
     "ClusterStatus",
+    "ClusterStatusDeploymentMode",
     "ClusterTopology",
+    "ClusterTopologyDeploymentMode",
     "CohereEmbedderConfig",
     "CohereEmbedderConfigInputType",
     "CohereEmbedderConfigTruncate",
@@ -761,6 +783,10 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DerivedCoverageObservationIncompleteReason",
+    "DerivedCoveragePolicy",
+    "DerivedCoverageStatus",
+    "DerivedCoverageStatusPolicy",
     "DisjunctionQuery",
     "DistanceMetric",
     "DistanceRange",
@@ -1077,6 +1103,8 @@ __all__ = (
     "LinkupSearchConfigDepth",
     "LinkupSearchConfigOutputType",
     "ListDocumentArtifactManifestsDetail",
+    "ListRestoreJobsPhase",
+    "ListRestoreJobsScope",
     "ListUsersResponse200Item",
     "LookupKeyConsistency",
     "LookupKeyResponse200",
@@ -1169,7 +1197,16 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
-    "RestoreTableResponse202",
+    "RestoreJob",
+    "RestoreJobList",
+    "RestoreJobPhase",
+    "RestoreJobResult",
+    "RestoreJobResultDurability",
+    "RestoreJobResultFailureDetailsItem",
+    "RestoreJobResultRestore",
+    "RestoreJobResultStatus",
+    "RestoreJobScope",
+    "RestoreRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",
@@ -1208,6 +1245,9 @@ __all__ = (
     "SSEStepStarted",
     "SSEToolMode",
     "SSEToolModeMode",
+    "StorageMaintenanceCapabilities",
+    "StorageRuntimeStatus",
+    "StorageRuntimeStatusEngine",
     "StorageStatus",
     "SuccessMessage",
     "SyncLevel",

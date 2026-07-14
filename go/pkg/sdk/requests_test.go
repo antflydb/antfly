@@ -52,3 +52,21 @@ func TestGenerateRequestMarshalPreservesDisabledPromptCache(t *testing.T) {
 		t.Fatalf("Marshal omitted disabled prompt cache: %s", body)
 	}
 }
+
+func TestInferenceConfigMarshalPreservesUnlimitedLimits(t *testing.T) {
+	body, err := json.Marshal(oapi.InferenceConfig{
+		MaxLoadedModels:       new(0),
+		MaxConcurrentRequests: new(0),
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, field := range [][]byte{
+		[]byte(`"max_loaded_models":0`),
+		[]byte(`"max_concurrent_requests":0`),
+	} {
+		if !bytes.Contains(body, field) {
+			t.Fatalf("Marshal omitted unlimited limit %s: %s", field, body)
+		}
+	}
+}
