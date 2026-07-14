@@ -53,19 +53,28 @@ pub const LoadedVisionReader = struct {
         model_path: []const u8,
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
+        request_id: ?u64,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-        const preproc = loadPreprocessorConfig(allocator, model_path);
 
         if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
-            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, preproc, session_manager);
+            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), session_manager);
         } else |_| {}
 
-        const model = try model_manager.loadFromDir(model_path);
-        _ = session_factory.getFlorenceConfig(model.session) orelse return error.InvalidModelForReading;
+        const model = if (request_id) |id|
+            try model_manager.loadFromDirForRequest(id, model_path)
+        else
+            try model_manager.loadFromDir(model_path);
+        const florence_config = session_factory.getFlorenceConfig(model.session) orelse return error.InvalidModelForReading;
+        const preproc_path = model.manifest.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
+        const preproc = try loadPreprocessorConfigFile(allocator, preproc_path);
+        if (preproc.image_size != @as(usize, florence_config.image_size)) {
+            std.log.err("Florence preprocessor image size {d} does not match model image size {d}", .{ preproc.image_size, florence_config.image_size });
+            return error.InvalidPreprocessorConfig;
+        }
 
         return .{
             .allocator = allocator,
@@ -139,28 +148,30 @@ pub const LoadedVisionReader = struct {
     }
 
     pub fn readRaw(self: *LoadedVisionReader, image_data: []const u8, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
-        var reader_pipeline = self.pipeline(options);
+        var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.read(image_data);
     }
 
     pub fn readRawBatch(self: *LoadedVisionReader, image_datas: []const []const u8, options: reader_types.ReadOptions) ![]reading_pipeline_mod.ReadResult {
-        var reader_pipeline = self.pipeline(options);
+        var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.readBatch(image_datas);
     }
 
     pub fn readDecodedRaw(self: *LoadedVisionReader, img: image.Image, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
-        var reader_pipeline = self.pipeline(options);
+        var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.readDecoded(img);
     }
 
-    fn pipeline(self: *LoadedVisionReader, options: reader_types.ReadOptions) reading_pipeline_mod.ReadingPipeline {
+    fn pipeline(self: *LoadedVisionReader, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadingPipeline {
+        const prefix_len: usize = if (self.dec_config.forced_bos_token_id == null) 1 else 2;
+        const max_length = try resolveMaxLength(self.dec_config.max_length, options.max_tokens, prefix_len);
         return reading_pipeline_mod.ReadingPipeline.init(
             self.allocator,
             self.encoder_session,
             self.decoder_session,
             self.tokenizer(),
             .{
-                .max_length = options.max_tokens orelse self.dec_config.max_length,
+                .max_length = max_length,
                 .decoder_start_token_id = self.dec_config.decoder_start_token_id,
                 .eos_token_id = self.dec_config.eos_token_id,
                 .pad_token_id = self.dec_config.pad_token_id,
@@ -188,6 +199,16 @@ pub const LoadedVisionReader = struct {
     }
 };
 
+pub fn resolveMaxLength(model_max: usize, requested: ?usize, prefix_len: usize) !usize {
+    if (prefix_len == 0 or prefix_len > model_max) return error.InvalidMaxTokens;
+    const max_length = if (requested) |max_tokens|
+        std.math.add(usize, prefix_len, max_tokens) catch return error.InvalidMaxTokens
+    else
+        model_max;
+    if (max_length == prefix_len or max_length > model_max) return error.InvalidMaxTokens;
+    return max_length;
+}
+
 pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) bool {
     if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
         allocator.free(paths.encoder);
@@ -206,13 +227,17 @@ pub fn loadPreprocessorConfig(allocator: std.mem.Allocator, model_dir: []const u
     const path = std.fmt.allocPrint(allocator, "{s}/preprocessor_config.json", .{model_dir}) catch return .{};
     defer allocator.free(path);
 
-    const data = c_file.readFile(allocator, path) catch return .{};
+    return loadPreprocessorConfigFile(allocator, path) catch .{};
+}
+
+fn loadPreprocessorConfigFile(allocator: std.mem.Allocator, path: []const u8) !PreprocessorConfig {
+    const data = try c_file.readFile(allocator, path);
     defer allocator.free(data);
 
     var config = PreprocessorConfig{};
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return config;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return config;
+    if (parsed.value != .object) return error.InvalidPreprocessorConfig;
 
     const obj = parsed.value.object;
     if (obj.get("size")) |size_val| {

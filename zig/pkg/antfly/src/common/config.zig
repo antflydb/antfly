@@ -131,7 +131,8 @@ pub const Config = struct {
         preload: []WarmModelConfig = &.{},
         query_embedding_cache: QueryEmbeddingCacheConfig = .{},
         keep_alive_ms: u64 = 300_000,
-        max_loaded_models: usize = 0,
+        max_loaded_models: usize = 10,
+        max_concurrent_requests: usize = 32,
         pool_size: usize = 1,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
@@ -401,9 +402,13 @@ pub const Config = struct {
         else
             300_000;
         const inference_max_loaded_models = if (validated.value.inference) |inference|
-            try nonNegativeUsize(inference.max_loaded_models orelse 0)
+            try nonNegativeUsize(inference.max_loaded_models orelse 10)
         else
-            0;
+            10;
+        const inference_max_concurrent_requests = if (validated.value.inference) |inference|
+            try nonNegativeUsize(inference.max_concurrent_requests orelse 32)
+        else
+            32;
         const inference_pool_size = if (validated.value.inference) |inference|
             try positiveUsize(inference.pool_size orelse 1)
         else
@@ -443,6 +448,7 @@ pub const Config = struct {
                 .query_embedding_cache = query_embedding_cache,
                 .keep_alive_ms = inference_keep_alive_ms,
                 .max_loaded_models = inference_max_loaded_models,
+                .max_concurrent_requests = inference_max_concurrent_requests,
                 .pool_size = inference_pool_size,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
@@ -1326,6 +1332,7 @@ test "common config extracts antfly settings" {
         \\    "ml_dir": "/tmp/ml",
         \\    "keep_alive": "1h30m",
         \\    "max_loaded_models": 3,
+        \\    "max_concurrent_requests": 4,
         \\    "pool_size": 2,
         \\    "query_embedding_cache": {
         \\      "enabled": false,
@@ -1360,6 +1367,7 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
     try std.testing.expectEqual(@as(u64, 5_400_000), cfg.inference.keep_alive_ms);
     try std.testing.expectEqual(@as(usize, 3), cfg.inference.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 4), cfg.inference.max_concurrent_requests);
     try std.testing.expectEqual(@as(usize, 2), cfg.inference.pool_size);
     try std.testing.expect(!cfg.inference.query_embedding_cache.enabled);
     try std.testing.expectEqual(@as(usize, 128), cfg.inference.query_embedding_cache.max_bytes_mb);
@@ -2027,6 +2035,8 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+    try std.testing.expectEqual(@as(usize, 10), cfg.inference.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 32), cfg.inference.max_concurrent_requests);
     try std.testing.expectEqual(@as(usize, 16), cfg.inference.query_embedding_cache.max_inflight);
 }
 

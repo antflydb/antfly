@@ -539,7 +539,7 @@ test "template remote applies remote content security to http urls" {
     try std.testing.expectEqual(@as(?u64, default_remote_fetch_max_download_size_bytes), resolved.security.max_download_size_bytes);
 }
 
-test "template remote renders remotePDF extract with injected pdf backend" {
+test "template remote preserves PDF content type across a multi-megabyte download" {
     const alloc = std.testing.allocator;
 
     const FakePdfBackend = struct {
@@ -572,10 +572,12 @@ test "template remote renders remotePDF extract with injected pdf backend" {
         fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("raft/transport/http_common.zig").HttpRequest) !@import("raft/transport/http_common.zig").HttpResponse {
             try std.testing.expectEqual(@import("raft/transport/http_common.zig").Method.GET, req.method);
             if (std.mem.endsWith(u8, req.uri, "/doc.pdf")) {
+                const body = try req_alloc.alloc(u8, 3_062_180);
+                @memset(body, 'x');
                 return .{
                     .status = 200,
                     .content_type = try req_alloc.dupe(u8, "application/pdf"),
-                    .body = try req_alloc.dupe(u8, "%PDF-fake"),
+                    .body = body,
                 };
             }
             return .{

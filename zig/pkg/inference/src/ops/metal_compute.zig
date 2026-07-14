@@ -7487,10 +7487,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const entry = weight_buf.lazy_entry orelse return null;
         // Only one provider per model may retain embedding tables. This keeps
         // concurrent pool slots from each admitting a full copy against their
-        // own request-local budget. Long-lived whole-model runtimes have no
-        // request budget, so they deliberately use the non-persistent path.
+        // own request-local budget. Session.run has no request budget, so the
+        // primary provider falls back to its immutable model cache budget.
         if (self.provider_pool_slot != 0) return null;
-        const budget = self.run_budget orelse return null;
         const table_bytes = std.math.mul(usize, rows, dim) catch return null;
         const table_f32_bytes = std.math.mul(usize, table_bytes, @sizeOf(f32)) catch return null;
         const cache_key = @intFromPtr(entry);
@@ -7502,15 +7501,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             table_f32_bytes,
         )) return cache_key;
 
-        const limit_bytes = budget.limits.backend_limit_bytes;
+        const limit_bytes = if (self.run_budget) |budget|
+            budget.limits.backend_limit_bytes
+        else if (self.data.tier_cache) |tier_cache|
+            tier_cache.budget.backend_limit_bytes
+        else
+            return null;
         if (limit_bytes == 0) return cache_key;
         const snapshot = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         const current_bytes = std.math.cast(usize, snapshot.total_bytes) orelse limit_bytes;
         if (persistentEmbeddingCacheFits(limit_bytes, current_bytes, table_f32_bytes)) return cache_key;
 
         if (!self.embedding_cache_budget_denial_noted) {
-            const reported_current = @min(current_bytes, std.math.maxInt(usize) - table_f32_bytes);
-            budget.noteSharedCacheDenial(.backend, table_f32_bytes, reported_current, limit_bytes);
+            if (self.run_budget) |budget| {
+                const reported_current = @min(current_bytes, std.math.maxInt(usize) - table_f32_bytes);
+                budget.noteSharedCacheDenial(.backend, table_f32_bytes, reported_current, limit_bytes);
+            }
             self.embedding_cache_budget_denial_noted = true;
         }
         return null;
@@ -20174,13 +20180,16 @@ test "metal_compute: no-Io provider pool fails closed when full" {
     try std.testing.expectError(error.MetalProviderPoolExhausted, MetalCompute.init(allocator, &metal_ws, null));
 }
 
-test "metal_compute: f32 embedding cache uses loaded weight identity" {
+test "metal_compute: f32 embedding cache uses loaded weight identity without run budget" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const metal_runtime_mod = @import("../backends/metal_runtime.zig");
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     var metal_ws = testMetalWeightStoreInit(allocator);
+    metal_ws.tier_cache = runtime_root.tier.cache.SharedCache.init(.{
+        .backend_limit_bytes = std.math.maxInt(usize),
+    });
     defer {
         deinitSharedNativeProvider(&metal_ws);
         metal_ws.lazy_weights.deinit(allocator);
@@ -20200,14 +20209,14 @@ test "metal_compute: f32 embedding cache uses loaded weight identity" {
     var cache_identity: gpu_hosted_store_mod.LazyWeightEntry = .{
         .tensor_ref = .{ .name = "test.embedding.weight" },
     };
-    var run_budget = runtime_root.tier.memory.RunBudget.init(.{});
-
     const first_data = try allocator.dupe(f32, &weight_data);
     defer allocator.free(first_data);
     var first_provider: usize = 0;
     var first_snapshot: metal_runtime_mod.RawRuntimeMemoryStats = undefined;
     {
-        var first = try MetalCompute.initWithIo(allocator, &metal_ws, &run_budget, std.testing.io);
+        // Session.run, including the production embed and warm paths, creates
+        // its Metal backend without a request-local RunBudget.
+        var first = try MetalCompute.initWithIo(allocator, &metal_ws, null, std.testing.io);
         defer first.deinit();
         first_provider = @intFromPtr(first.provider_impl);
 
@@ -20226,6 +20235,7 @@ test "metal_compute: f32 embedding cache uses loaded weight identity" {
     }
     try std.testing.expect(first_snapshot.embedding_bytes > 0);
 
+    var run_budget = runtime_root.tier.memory.RunBudget.init(.{});
     run_budget.limits.backend_limit_bytes = 1;
     var second = try MetalCompute.initWithIo(allocator, &metal_ws, &run_budget, std.testing.io);
     defer second.deinit();

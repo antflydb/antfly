@@ -753,8 +753,8 @@ pub const LoadedModel = struct {
     cleanup_head_loaded: bool = false,
     manager_last_used_ms: u64 = 0,
     manager_lru_tick: u64 = 0,
-    manager_protected_through_request_id: u64 = 0,
-    manager_used_through_request_id: u64 = 0,
+    manager_active_protections: usize = 0,
+    manager_active_uses: usize = 0,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
@@ -1099,15 +1099,23 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType = &.{},
     };
 
+    const RequestModel = struct {
+        model: *LoadedModel,
+        used: bool,
+    };
+
+    const ActiveRequest = struct {
+        models: std.ArrayListUnmanaged(RequestModel) = .empty,
+    };
+
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
     max_loaded_models: usize = 0,
     keep_alive_ms: u64 = 0,
-    active_request_ids: std.ArrayListUnmanaged(u64) = .empty,
+    active_requests: std.AutoHashMapUnmanaged(u64, ActiveRequest) = .empty,
     next_request_id: u64 = 0,
-    oldest_active_request_id: ?u64 = null,
     latest_now_ms: u64 = 0,
     lru_tick: u64 = 0,
     pending_loads: usize = 0,
@@ -1145,7 +1153,8 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
-        self.active_request_ids.deinit(self.allocator);
+        std.debug.assert(self.active_requests.count() == 0);
+        self.active_requests.deinit(self.allocator);
         std.debug.assert(self.pending_model_loads.count() == 0);
         self.pending_model_loads.deinit(self.allocator);
     }
@@ -1157,7 +1166,7 @@ pub const ModelManager = struct {
         while (true) {
             const coordination_io = lockIoMutexWithoutIo(&self.pending_model_loads_lock);
             self.lockState();
-            if (self.active_request_ids.items.len == 0 and self.pending_model_loads.count() == 0) {
+            if (self.active_requests.count() == 0 and self.pending_model_loads.count() == 0) {
                 self.session_manager.io = io;
                 var it = self.loaded.iterator();
                 while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
@@ -1210,7 +1219,8 @@ pub const ModelManager = struct {
     }
 
     /// Model-manager map access is serialized, but callers still own the raw
-    /// LoadedModel pointer contract: bracket request use with beginRequest/endRequest.
+    /// LoadedModel pointer contract: bracket use with beginRequest/endRequest
+    /// and load through the matching request-aware API.
     pub fn lockState(self: *ModelManager) void {
         spinLock(&self.state_lock);
     }
@@ -1231,14 +1241,40 @@ pub const ModelManager = struct {
         self.configureModelLifetime(max_loaded_models, self.keep_alive_ms);
     }
 
+    fn protectModelForRequestLocked(self: *ModelManager, request_id: u64, model: *LoadedModel, used: bool) !void {
+        const request = self.active_requests.getPtr(request_id) orelse return error.InvalidRequestLifecycle;
+        for (request.models.items) |*entry| {
+            if (entry.model != model) continue;
+            if (used and !entry.used) {
+                if (model.manager_active_uses == std.math.maxInt(usize)) return error.RequestUseOverflow;
+                model.manager_active_uses += 1;
+                entry.used = true;
+            }
+            return;
+        }
+        if (model.manager_active_protections == std.math.maxInt(usize) or
+            (used and model.manager_active_uses == std.math.maxInt(usize)))
+        {
+            return error.RequestUseOverflow;
+        }
+        try request.models.append(self.allocator, .{ .model = model, .used = used });
+        model.manager_active_protections += 1;
+        if (used) model.manager_active_uses += 1;
+    }
+
+    pub fn touchModelForRequest(self: *ModelManager, request_id: u64, model: *LoadedModel) !void {
+        self.lockState();
+        defer self.unlockState();
+        _ = try self.touchLocked(model, request_id);
+    }
+
     pub fn beginRequest(self: *ModelManager, now_ms: u64) !u64 {
         self.lockState();
         errdefer self.unlockState();
         self.observeNowLocked(now_ms);
         const request_id = std.math.add(u64, self.next_request_id, 1) catch return error.RequestIdExhausted;
-        try self.active_request_ids.append(self.allocator, request_id);
+        try self.active_requests.put(self.allocator, request_id, .{});
         self.next_request_id = request_id;
-        if (self.oldest_active_request_id == null) self.oldest_active_request_id = request_id;
         self.unlockState();
         return request_id;
     }
@@ -1246,28 +1282,18 @@ pub const ModelManager = struct {
     pub fn endRequest(self: *ModelManager, request_id: u64, now_ms: u64) void {
         self.lockState();
         self.observeNowLocked(now_ms);
-        const previous_oldest = self.oldest_active_request_id orelse unreachable;
-        var request_index: ?usize = null;
-        for (self.active_request_ids.items, 0..) |active_id, index| {
-            if (active_id == request_id) {
-                request_index = index;
-                break;
+        var request = self.active_requests.fetchRemove(request_id).?.value;
+        for (request.models.items) |entry| {
+            const model = entry.model;
+            std.debug.assert(model.manager_active_protections > 0);
+            model.manager_active_protections -= 1;
+            if (entry.used) {
+                std.debug.assert(model.manager_active_uses > 0);
+                model.manager_active_uses -= 1;
+                if (model.manager_active_uses == 0) model.manager_last_used_ms = self.latest_now_ms;
             }
         }
-        _ = self.active_request_ids.swapRemove(request_index orelse unreachable);
-        if (request_id == previous_oldest) {
-            self.oldest_active_request_id = oldestRequestId(self.active_request_ids.items);
-            const next_oldest = self.oldest_active_request_id;
-            var it = self.loaded.iterator();
-            while (it.next()) |entry| {
-                const model = entry.value_ptr.*;
-                if (!modelEvictionSafe(previous_oldest, model.manager_used_through_request_id) and
-                    modelEvictionSafe(next_oldest, model.manager_used_through_request_id))
-                {
-                    model.manager_last_used_ms = self.latest_now_ms;
-                }
-            }
-        }
+        request.models.deinit(self.allocator);
         self.unlockState();
         self.sweepModels();
     }
@@ -1278,8 +1304,8 @@ pub const ModelManager = struct {
         return self.loaded.count();
     }
 
-    /// Capture loaded-model pointers for an active lifecycle request. The
-    /// request watermark keeps every pointer alive after the map lock drops.
+    /// Capture loaded-model pointers and associate each with the lifecycle
+    /// request before the map lock drops.
     pub fn snapshotLoadedModelsForRequest(
         self: *ModelManager,
         allocator: std.mem.Allocator,
@@ -1287,14 +1313,15 @@ pub const ModelManager = struct {
     ) ![]*LoadedModel {
         self.lockState();
         defer self.unlockState();
-        std.debug.assert(std.mem.indexOfScalar(u64, self.active_request_ids.items, request_id) != null);
+        if (!self.active_requests.contains(request_id)) return error.InvalidRequestLifecycle;
 
         const models = try allocator.alloc(*LoadedModel, self.loaded.count());
+        errdefer allocator.free(models);
         var index: usize = 0;
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
-            model.manager_protected_through_request_id = @max(model.manager_protected_through_request_id, request_id);
+            try self.protectModelForRequestLocked(request_id, model, false);
             models[index] = model;
             index += 1;
         }
@@ -1317,20 +1344,19 @@ pub const ModelManager = struct {
         self.latest_now_ms = @max(self.latest_now_ms, now_ms);
     }
 
-    fn touchLocked(self: *ModelManager, model: *LoadedModel) *LoadedModel {
+    fn touchLocked(self: *ModelManager, model: *LoadedModel, request_id: ?u64) !*LoadedModel {
+        if (request_id) |id| try self.protectModelForRequestLocked(id, model, true);
         self.lru_tick +|= 1;
         model.manager_last_used_ms = self.latest_now_ms;
         model.manager_lru_tick = self.lru_tick;
-        model.manager_protected_through_request_id = self.next_request_id;
-        model.manager_used_through_request_id = self.next_request_id;
         return model;
     }
 
-    fn lookupAndTouch(self: *ModelManager, key: []const u8) ?*LoadedModel {
+    fn lookupAndTouch(self: *ModelManager, key: []const u8, request_id: ?u64) !?*LoadedModel {
         self.lockState();
         defer self.unlockState();
-        if (self.loaded.get(key)) |model| return self.touchLocked(model);
-        if (self.loaded_aliases.get(key)) |model| return self.touchLocked(model);
+        if (self.loaded.get(key)) |model| return try self.touchLocked(model, request_id);
+        if (self.loaded_aliases.get(key)) |model| return try self.touchLocked(model, request_id);
         return null;
     }
 
@@ -1338,12 +1364,13 @@ pub const ModelManager = struct {
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
+        request_id: ?u64,
     ) !?*LoadedModel {
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             const variant_key = try backendVariantCacheKey(self.allocator, model_dir, backend);
             defer self.allocator.free(variant_key);
-            if (self.lookupAndTouch(variant_key)) |model| return model;
+            if (try self.lookupAndTouch(variant_key, request_id)) |model| return model;
         }
         return null;
     }
@@ -1359,6 +1386,11 @@ pub const ModelManager = struct {
             return;
         }
         try self.loaded_aliases.put(self.allocator, alias_key, model);
+    }
+
+    fn ensureAliasPublicationCapacityLocked(self: *ModelManager) !void {
+        const capacity = std.math.cast(u32, self.loaded_aliases.count() + 1) orelse return error.OutOfMemory;
+        try self.loaded_aliases.ensureTotalCapacity(self.allocator, capacity);
     }
 
     fn pendingLoadKey(
@@ -1454,17 +1486,6 @@ pub const ModelManager = struct {
             self.unlockState();
             return err;
         };
-        const alias_capacity = std.math.cast(u32, self.loaded_aliases.count() + self.pending_loads + 1) orelse {
-            self.unlockState();
-            return error.OutOfMemory;
-        };
-        self.loaded_aliases.ensureTotalCapacity(
-            self.allocator,
-            alias_capacity,
-        ) catch |err| {
-            self.unlockState();
-            return err;
-        };
         self.pending_loads += 1;
         self.unlockState();
     }
@@ -1503,7 +1524,7 @@ pub const ModelManager = struct {
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
-            if (!modelEvictionSafe(self.oldest_active_request_id, model.manager_protected_through_request_id)) continue;
+            if (model.manager_active_protections != 0) continue;
             if (expired_only and !modelTtlExpired(
                 self.keep_alive_ms,
                 self.latest_now_ms,
@@ -1548,22 +1569,22 @@ pub const ModelManager = struct {
         self.allocator.free(evicted.key);
     }
 
-    /// Counts loaded models participating in the prompt-cache accounting target.
-    /// Used to split that target evenly across active model caches.
-    /// `include` is always counted even if its cache has not activated yet.
-    fn activePromptCacheCountLocked(self: *ModelManager, include: *LoadedModel) usize {
+    /// Split the node target across every cache participating in the budget.
+    /// configure() is the reservation, so a peer is counted even before it
+    /// creates its pool or device storage.
+    fn promptCacheParticipantCountLocked(self: *ModelManager, include: *LoadedModel) usize {
         var count: usize = 0;
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
             if (model == include) continue;
-            if (model.prompt_prefix_cache.isActive()) count += 1;
+            if (model.prompt_prefix_cache.participatesInBudget()) count += 1;
         }
         return count + 1;
     }
 
     /// Apply one node-wide prompt-cache target to the cache being activated and
-    /// every cache that is already active. configure() synchronously evicts
+    /// every participating cache. configure() synchronously evicts
     /// entries against their estimated logical cache bytes.
     pub fn rebalancePromptCaches(
         self: *ModelManager,
@@ -1589,22 +1610,7 @@ pub const ModelManager = struct {
         defer self.prompt_cache_rebalance_lock.unlock(io);
         self.lockState();
         var per_cache = node_config;
-        per_cache.max_bytes /= self.activePromptCacheCountLocked(include);
-
-        // Tests and explicit administrative calls may run without a lifecycle
-        // ticket. Keep the conservative locked behavior for that rare path.
-        if (self.oldest_active_request_id == null) {
-            defer self.unlockState();
-            include.prompt_prefix_cache.configure(per_cache);
-            var unlocked_it = self.loaded.iterator();
-            while (unlocked_it.next()) |entry| {
-                const model = entry.value_ptr.*;
-                if (model != include and model.prompt_prefix_cache.isActive()) {
-                    model.prompt_prefix_cache.configure(per_cache);
-                }
-            }
-            return;
-        }
+        per_cache.max_bytes /= self.promptCacheParticipantCountLocked(include);
 
         var targets = std.ArrayListUnmanaged(*LoadedModel).empty;
         defer targets.deinit(self.allocator);
@@ -1613,30 +1619,56 @@ pub const ModelManager = struct {
             std.log.warn("prompt cache rebalance skipped: out of memory", .{});
             return;
         };
-        include.manager_protected_through_request_id = self.next_request_id;
         targets.appendAssumeCapacity(include);
 
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
-            if (model != include and model.prompt_prefix_cache.isActive()) {
-                // The current request ticket keeps every captured pointer alive
-                // after the global manager lock is released.
-                model.manager_protected_through_request_id = self.next_request_id;
+            if (model != include and model.prompt_prefix_cache.participatesInBudget()) {
                 targets.appendAssumeCapacity(model);
             }
         }
+        for (targets.items) |model| {
+            if (model.manager_active_protections == std.math.maxInt(usize)) {
+                self.unlockState();
+                std.log.warn("prompt cache rebalance skipped: model pin overflow", .{});
+                return;
+            }
+        }
+        for (targets.items) |model| model.manager_active_protections += 1;
         self.unlockState();
+        defer {
+            self.lockState();
+            for (targets.items) |model| {
+                std.debug.assert(model.manager_active_protections > 0);
+                model.manager_active_protections -= 1;
+            }
+            self.unlockState();
+        }
 
         // configure() owns its cache-local mutex and may synchronously evict;
         // never do that work while blocking unrelated model lookups/lifecycle.
         for (targets.items) |model| model.prompt_prefix_cache.configure(per_cache);
     }
 
-    /// Load a model from a directory path. Returns a cached model if already loaded.
+    /// Standalone/quiescent load path. Servers with lifetime eviction enabled
+    /// must use loadFromDirForRequest so the returned pointer stays resident.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
-        if (self.lookupAndTouch(model_dir)) |model| return model;
-        return self.loadFromDirWithPreferredBackends(model_dir, self.session_manager.preferred_backends, true);
+        return self.loadFromDirTracked(null, model_dir);
+    }
+
+    pub fn loadFromDirForRequest(self: *ModelManager, request_id: u64, model_dir: []const u8) !*LoadedModel {
+        return self.loadFromDirTracked(request_id, model_dir);
+    }
+
+    fn loadFromDirTracked(self: *ModelManager, request_id: ?u64, model_dir: []const u8) !*LoadedModel {
+        if (try self.lookupAndTouch(model_dir, request_id)) |model| return model;
+        return self.loadFromDirWithPreferredBackendsTracked(
+            request_id,
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+        );
     }
 
     pub fn loadFromDirWithPreferredBackends(
@@ -1645,11 +1677,41 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !*LoadedModel {
+        return self.loadFromDirWithPreferredBackendsTracked(
+            null,
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+        );
+    }
+
+    pub fn loadFromDirWithPreferredBackendsForRequest(
+        self: *ModelManager,
+        request_id: u64,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
+        return self.loadFromDirWithPreferredBackendsTracked(
+            request_id,
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+        );
+    }
+
+    fn loadFromDirWithPreferredBackendsTracked(
+        self: *ModelManager,
+        request_id: ?u64,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
         const pending_key = try self.pendingLoadKey(model_dir, preferred_backends);
         defer self.allocator.free(pending_key);
 
         while (true) {
-            if (try self.lookupPreferredAndTouch(model_dir, preferred_backends)) |model| {
+            if (try self.lookupPreferredAndTouch(model_dir, preferred_backends, request_id)) |model| {
                 if (cache_default_alias) try self.ensureDefaultAlias(model_dir, model);
                 return model;
             }
@@ -1675,7 +1737,7 @@ pub const ModelManager = struct {
 
             // Close the cache-miss/flight-claim race while holding the flight
             // map lock. Publication never takes this lock while holding state.
-            const cached = self.lookupPreferredAndTouch(model_dir, preferred_backends) catch |err| {
+            const cached = self.lookupPreferredAndTouch(model_dir, preferred_backends, request_id) catch |err| {
                 self.pending_model_loads_lock.unlock(coordination_io);
                 return err;
             };
@@ -1715,7 +1777,7 @@ pub const ModelManager = struct {
                 return err;
             };
             var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
-            const loaded = self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias) catch |err| {
+            const loaded = self.loadFromDirUncached(request_id, model_dir, &session_manager, cache_default_alias) catch |err| {
                 self.releaseLoadSlot();
                 self.finishPendingModelLoad(pending_key, null, err);
                 return err;
@@ -1729,6 +1791,7 @@ pub const ModelManager = struct {
 
     fn loadFromDirUncached(
         self: *ModelManager,
+        request_id: ?u64,
         model_dir: []const u8,
         sm: *backends.SessionManager,
         cache_default_alias: bool,
@@ -1882,7 +1945,10 @@ pub const ModelManager = struct {
         self.lockState();
         std.debug.assert(self.pending_loads > 0);
         if (self.loaded.get(variant_key) orelse self.loaded_aliases.get(variant_key)) |cached| {
-            const result = self.touchLocked(cached);
+            const result = self.touchLocked(cached, request_id) catch |err| {
+                self.unlockState();
+                return err;
+            };
             self.unlockState();
             self.allocator.free(variant_key);
             if (alias_key) |key| self.allocator.free(key);
@@ -1891,7 +1957,15 @@ pub const ModelManager = struct {
             return result;
         }
 
-        var evicted: ?EvictedModel = null;
+        if (alias_key != null) {
+            self.ensureAliasPublicationCapacityLocked() catch |err| {
+                self.unlockState();
+                return err;
+            };
+        }
+
+        var eviction_candidate: ?EvictionCandidate = null;
+        var eviction_expired = false;
         if (modelLimitReached(self.max_loaded_models, self.loaded.count())) {
             const candidate = self.findLruCandidateLocked(false) orelse {
                 _ = self.load_capacity_rejections.fetchAdd(1, .monotonic);
@@ -1903,9 +1977,18 @@ pub const ModelManager = struct {
                 self.latest_now_ms,
                 candidate.model.manager_last_used_ms,
             );
-            evicted = self.removeCandidateLocked(candidate, expired);
+            eviction_candidate = candidate;
+            eviction_expired = expired;
         }
 
+        const result = self.touchLocked(model, request_id) catch |err| {
+            self.unlockState();
+            return err;
+        };
+        const evicted = if (eviction_candidate) |candidate|
+            self.removeCandidateLocked(candidate, eviction_expired)
+        else
+            null;
         self.loaded.putAssumeCapacity(variant_key, model);
         var alias_inserted = false;
         if (alias_key) |key| {
@@ -1914,7 +1997,6 @@ pub const ModelManager = struct {
                 alias_inserted = true;
             }
         }
-        const result = self.touchLocked(model);
         self.unlockState();
         if (evicted) |victim| self.destroyEvicted(victim);
         if (alias_key) |key| if (!alias_inserted) self.allocator.free(key);
@@ -1929,18 +2011,6 @@ fn modelLimitReached(max_loaded_models: usize, loaded_models: usize) bool {
 
 fn modelLimitExceeded(max_loaded_models: usize, loaded_models: usize) bool {
     return max_loaded_models != 0 and loaded_models > max_loaded_models;
-}
-
-fn oldestRequestId(request_ids: []const u64) ?u64 {
-    if (request_ids.len == 0) return null;
-    var oldest = request_ids[0];
-    for (request_ids[1..]) |request_id| oldest = @min(oldest, request_id);
-    return oldest;
-}
-
-fn modelEvictionSafe(oldest_active_request_id: ?u64, protected_through_request_id: u64) bool {
-    const oldest = oldest_active_request_id orelse return true;
-    return protected_through_request_id < oldest;
 }
 
 fn modelTtlExpired(keep_alive_ms: u64, now_ms: u64, last_used_ms: u64) bool {
@@ -2094,13 +2164,87 @@ test "model manager cold-load flight key is shared across backend preferences" {
     try std.testing.expectEqualStrings(automatic, explicit);
 }
 
-test "model manager eviction follows the oldest active request watermark" {
-    try std.testing.expect(modelEvictionSafe(null, std.math.maxInt(u64)));
-    try std.testing.expect(!modelEvictionSafe(7, 7));
-    try std.testing.expect(!modelEvictionSafe(7, 8));
-    try std.testing.expect(modelEvictionSafe(8, 7));
-    try std.testing.expectEqual(@as(?u64, 3), oldestRequestId(&.{ 9, 3, 7 }));
-    try std.testing.expectEqual(@as(?u64, null), oldestRequestId(&.{}));
+test "model manager refreshes alias capacity when publishing a cold load" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+
+    try manager.reserveLoadSlot();
+    defer manager.releaseLoadSlot();
+
+    var concurrent_model: LoadedModel = undefined;
+    try manager.ensureDefaultAlias("concurrent", &concurrent_model);
+
+    const alias_key = try std.testing.allocator.dupe(u8, "published");
+    var published_model: LoadedModel = undefined;
+    manager.lockState();
+    defer manager.unlockState();
+    try manager.ensureAliasPublicationCapacityLocked();
+    manager.loaded_aliases.putAssumeCapacity(alias_key, &published_model);
+}
+
+test "model manager evicts a completed request model while an older request remains active" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    manager.configureModelLifetime(2, 0);
+
+    var first_model: LoadedModel = undefined;
+    first_model.manager_last_used_ms = 0;
+    first_model.manager_lru_tick = 0;
+    first_model.manager_active_protections = 0;
+    first_model.manager_active_uses = 0;
+    var second_model: LoadedModel = undefined;
+    second_model.manager_last_used_ms = 0;
+    second_model.manager_lru_tick = 0;
+    second_model.manager_active_protections = 0;
+    second_model.manager_active_uses = 0;
+    try manager.loaded.put(std.testing.allocator, "first", &first_model);
+    defer _ = manager.loaded.remove("first");
+    try manager.loaded.put(std.testing.allocator, "second", &second_model);
+    defer _ = manager.loaded.remove("second");
+
+    const first_request = try manager.beginRequest(1);
+    _ = (try manager.lookupAndTouch("first", first_request)).?;
+    _ = (try manager.lookupAndTouch("first", first_request)).?;
+    try std.testing.expectEqual(@as(usize, 1), first_model.manager_active_protections);
+    try std.testing.expectEqual(@as(usize, 1), first_model.manager_active_uses);
+
+    const second_request = try manager.beginRequest(2);
+    _ = (try manager.lookupAndTouch("second", second_request)).?;
+    manager.endRequest(second_request, 3);
+
+    manager.lockState();
+    const candidate = manager.findLruCandidateLocked(false);
+    manager.unlockState();
+    try std.testing.expectEqual(&second_model, candidate.?.model);
+    try manager.reserveLoadSlot();
+    manager.releaseLoadSlot();
+    manager.endRequest(first_request, 4);
+}
+
+test "model manager outer request protects a configured preload batch" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    manager.configureModelLifetime(1, 0);
+
+    var model: LoadedModel = undefined;
+    model.manager_last_used_ms = 0;
+    model.manager_lru_tick = 0;
+    model.manager_active_protections = 0;
+    model.manager_active_uses = 0;
+    try manager.loaded.put(std.testing.allocator, "first", &model);
+    defer _ = manager.loaded.remove("first");
+
+    const outer = try manager.beginRequest(1);
+    const inner = try manager.beginRequest(2);
+    _ = (try manager.lookupAndTouch("first", inner)).?;
+    const protected = try manager.snapshotLoadedModelsForRequest(std.testing.allocator, outer);
+    std.testing.allocator.free(protected);
+    manager.endRequest(inner, 3);
+    try std.testing.expectError(error.ModelCapacityReached, manager.reserveLoadSlot());
+
+    manager.endRequest(outer, 4);
+    try manager.reserveLoadSlot();
+    manager.releaseLoadSlot();
 }
 
 test "model manager TTL is disabled by zero and handles monotonic ages" {
@@ -2117,34 +2261,34 @@ test "model manager LRU selection is stable across equal ticks" {
     try std.testing.expect(!lruCandidateComesFirst(2, "b", 2, "a"));
 }
 
-test "model manager advances the oldest request watermark under rolling overlap" {
+test "model manager tracks rolling request lifecycles" {
     var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
     defer manager.deinit();
 
     const first = try manager.beginRequest(10);
     const second = try manager.beginRequest(11);
-    try std.testing.expectEqual(@as(?u64, first), manager.oldest_active_request_id);
+    try std.testing.expectEqual(@as(usize, 2), manager.active_requests.count());
     manager.endRequest(first, 12);
-    try std.testing.expectEqual(@as(?u64, second), manager.oldest_active_request_id);
+    try std.testing.expectEqual(@as(usize, 1), manager.active_requests.count());
 
     const third = try manager.beginRequest(9);
-    try std.testing.expectEqual(@as(?u64, second), manager.oldest_active_request_id);
+    try std.testing.expect(third > second);
     manager.endRequest(second, 13);
-    try std.testing.expectEqual(@as(?u64, third), manager.oldest_active_request_id);
+    try std.testing.expect(manager.active_requests.contains(third));
     try std.testing.expectEqual(@as(u64, 13), manager.latest_now_ms);
     manager.endRequest(third, 14);
-    try std.testing.expectEqual(@as(?u64, null), manager.oldest_active_request_id);
+    try std.testing.expectEqual(@as(usize, 0), manager.active_requests.count());
 }
 
-test "model manager snapshots loaded pointers under an active request watermark" {
+test "model manager snapshots protect pointers without refreshing model use" {
     var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
     defer manager.deinit();
 
     var model: LoadedModel = undefined;
     model.manager_last_used_ms = 7;
     model.manager_lru_tick = 0;
-    model.manager_protected_through_request_id = 0;
-    model.manager_used_through_request_id = 0;
+    model.manager_active_protections = 0;
+    model.manager_active_uses = 0;
     try manager.loaded.put(std.testing.allocator, "model", &model);
     defer _ = manager.loaded.remove("model");
 
@@ -2154,7 +2298,8 @@ test "model manager snapshots loaded pointers under an active request watermark"
 
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqual(&model, models[0]);
-    try std.testing.expectEqual(request_id, model.manager_protected_through_request_id);
+    try std.testing.expectEqual(@as(usize, 1), model.manager_active_protections);
+    try std.testing.expectEqual(@as(usize, 0), model.manager_active_uses);
     manager.endRequest(request_id, 11);
     try std.testing.expectEqual(@as(u64, 7), model.manager_last_used_ms);
 }
@@ -2491,6 +2636,56 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     var pipeline = model.glinerPipeline(allocator);
     try std.testing.expectEqualStrings("gliner2", pipeline.config.model_type);
     try std.testing.expectError(error.MissingSpecialTokenIds, pipeline.recognizeBatch(&.{"hello"}, &.{"person"}));
+}
+
+test "Metal encoder Session.run reuses prepared embedding table without a run budget" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = @import("../backends/metal_runtime.zig");
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"model_type":"deberta-v2","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        ,
+    });
+    try writeTinyDebertaEncoderGgufForModelManagerTest(tmp.dir, allocator, "model.gguf");
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+
+    var session = try session_factory.createMetalSession(allocator, dir_path);
+    defer session.close();
+    session_factory.attachIo(session, std.testing.io);
+
+    var input_ids = try backends.Tensor.initInt64(allocator, "input_ids", &.{ 1, 1 }, &.{1});
+    defer input_ids.deinit();
+    var attention_mask = try backends.Tensor.initInt64(allocator, "attention_mask", &.{ 1, 1 }, &.{1});
+    defer attention_mask.deinit();
+
+    const before = session_factory.getMetalEmbeddingCacheProcessStats();
+    const first_outputs = try session.run(&.{ input_ids, attention_mask }, allocator);
+    defer {
+        for (first_outputs) |*output| output.deinit();
+        allocator.free(first_outputs);
+    }
+    const after_first = session_factory.getMetalEmbeddingCacheProcessStats();
+    const pool_after_first = session_factory.getMetalNativeProviderPoolStats(session).?;
+    try std.testing.expect(after_first.misses_total > before.misses_total);
+    try std.testing.expect(pool_after_first.embedding_cache_bytes > 0);
+
+    const second_outputs = try session.run(&.{ input_ids, attention_mask }, allocator);
+    defer {
+        for (second_outputs) |*output| output.deinit();
+        allocator.free(second_outputs);
+    }
+    const after_second = session_factory.getMetalEmbeddingCacheProcessStats();
+    try std.testing.expect(after_second.hits_total > after_first.hits_total);
+    try std.testing.expectEqual(after_first.misses_total, after_second.misses_total);
 }
 
 test "shouldPreferSentencePieceOverride still prefers sentencepiece for multimodal gemma" {

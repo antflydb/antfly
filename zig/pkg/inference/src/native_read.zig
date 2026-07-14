@@ -89,6 +89,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         opts.model_dir,
         &model_manager.session_manager,
         &model_manager,
+        null,
     );
     const load_ns = nowNs() - load_start_ns;
     if (debug_cuda_session) std.log.info("read: load reader done model={s}", .{opts.model_dir});
@@ -113,7 +114,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     });
     if (debug_cuda_session) std.log.info("read: inference done model={s}", .{opts.model_dir});
     defer result.deinit();
-    try writeResultJson(allocator, opts.model_dir, result);
+    try writeResultJson(allocator, io, opts.model_dir, result);
 }
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -193,15 +194,24 @@ fn runWarmBenchmark(
     defer allocator.free(samples);
 
     var last_text: []const u8 = "";
-    errdefer if (last_text.len > 0) allocator.free(last_text);
-    for (samples, 0..) |*sample, i| {
+    var telemetry: reading_pipeline.ReadTelemetry = undefined;
+    var have_baseline = false;
+    errdefer if (have_baseline) allocator.free(last_text);
+    for (samples) |*sample| {
         const start = nowNs();
         var result = try reader.read(image_data, read_opts);
+        defer result.deinit();
         sample.* = nowNs() - start;
-        if (i + 1 == measure_iters) {
+        const current_telemetry = reading_pipeline.lastReadTelemetry();
+        if (!have_baseline) {
             last_text = try allocator.dupe(u8, result.text);
+            telemetry = current_telemetry;
+            have_baseline = true;
+        } else if (!std.mem.eql(u8, last_text, result.text)) {
+            return error.BenchmarkOutputDrift;
+        } else if (!readTelemetryEql(telemetry, current_telemetry)) {
+            return error.BenchmarkTelemetryDrift;
         }
-        result.deinit();
     }
 
     return .{
@@ -209,8 +219,25 @@ fn runWarmBenchmark(
         .timing = try timingFromSamples(allocator, samples),
         .image_bytes = image_data.len,
         .last_text = last_text,
-        .telemetry = reading_pipeline.lastReadTelemetry(),
+        .telemetry = telemetry,
     };
+}
+
+fn readTelemetryEql(a: reading_pipeline.ReadTelemetry, b: reading_pipeline.ReadTelemetry) bool {
+    return a.resident_decoder == b.resident_decoder and
+        a.kv_cache == b.kv_cache and
+        optionalStringEql(a.kv_cache_mode, b.kv_cache_mode) and
+        optionalStringEql(a.lm_head_path, b.lm_head_path) and
+        a.cuda_graph_replay == b.cuda_graph_replay and
+        optionalStringEql(a.cuda_graph_fallback_reason, b.cuda_graph_fallback_reason) and
+        a.cuda_graph_capture_steps == b.cuda_graph_capture_steps and
+        a.cuda_graph_replay_steps == b.cuda_graph_replay_steps and
+        a.generated_tokens == b.generated_tokens;
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |value| return if (b) |other| std.mem.eql(u8, value, other) else false;
+    return b == null;
 }
 
 fn timingFromSamples(allocator: std.mem.Allocator, samples: []const u64) !Timing {
@@ -294,7 +321,7 @@ fn parseJsonFloatArray(data: []const u8, key: []const u8) ?[3]f32 {
     return result;
 }
 
-fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, result: readers_mod.Result) !void {
+fn writeResultJson(allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, result: readers_mod.Result) !void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
 
@@ -338,7 +365,14 @@ fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, result:
     }
     try buf.appendSlice(allocator, "}\n");
 
-    print("{s}", .{buf.items});
+    try writeToStdout(io, buf.items);
+}
+
+fn writeToStdout(io: std.Io, data: []const u8) !void {
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+    try stdout_writer.interface.writeAll(data);
+    try stdout_writer.interface.flush();
 }
 
 fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, opts: Options, result: ReadBenchmarkResult) !void {
@@ -374,6 +408,7 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []co
     try appendIntJson(&buf, allocator, opts.warmup_iters);
     try buf.appendSlice(allocator, ",\"measure_iters\":");
     try appendIntJson(&buf, allocator, result.timing.iters);
+    try buf.appendSlice(allocator, ",\"iterations_consistent\":true");
     try buf.appendSlice(allocator, ",\"load_ms\":");
     try appendFloatJson(&buf, allocator, nsToMs(result.load_ns));
     try buf.appendSlice(allocator, ",\"avg_ms\":");
@@ -429,7 +464,7 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []co
     if (opts.json_timing_path) |path| {
         try compat.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
     }
-    print("{s}", .{buf.items});
+    try writeToStdout(io, buf.items);
 }
 
 fn appendFloatJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: anytype) !void {
@@ -565,4 +600,18 @@ test "parseBackendChoice accepts onnx" {
 
 test "parseBackendChoice accepts cuda" {
     try std.testing.expectEqual(BackendChoice.cuda, parseBackendChoice("cuda").?);
+}
+
+test "benchmark telemetry equality detects drift" {
+    const baseline = reading_pipeline.ReadTelemetry{
+        .resident_decoder = true,
+        .kv_cache = true,
+        .kv_cache_mode = "preallocated",
+        .generated_tokens = 8,
+    };
+    try std.testing.expect(readTelemetryEql(baseline, baseline));
+
+    var drifted = baseline;
+    drifted.generated_tokens = 7;
+    try std.testing.expect(!readTelemetryEql(baseline, drifted));
 }

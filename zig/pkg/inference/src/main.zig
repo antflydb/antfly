@@ -120,10 +120,8 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     };
 }
 
-fn parsePositiveUsize(value: []const u8) !usize {
-    const parsed = try std.fmt.parseInt(usize, value, 10);
-    if (parsed == 0) return error.InvalidArguments;
-    return parsed;
+fn parseNonNegativeUsize(value: []const u8) !usize {
+    return std.fmt.parseInt(usize, value, 10);
 }
 
 fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
@@ -267,7 +265,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             config_path = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
-            max_concurrent_requests_override = try parsePositiveUsize(args[i + 1]);
+            max_concurrent_requests_override = try parseNonNegativeUsize(args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
             try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
@@ -468,7 +466,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
-        \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
+        \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503 (0 = unlimited)
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\
         \\Pull options:
@@ -531,8 +529,8 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
 }
 
-test "run max concurrent request parser rejects zero" {
-    try std.testing.expectEqual(@as(usize, 6), try parsePositiveUsize("6"));
-    try std.testing.expectError(error.InvalidArguments, parsePositiveUsize("0"));
-    try std.testing.expectError(error.InvalidCharacter, parsePositiveUsize("six"));
+test "run max concurrent request parser accepts zero as unlimited" {
+    try std.testing.expectEqual(@as(usize, 6), try parseNonNegativeUsize("6"));
+    try std.testing.expectEqual(@as(usize, 0), try parseNonNegativeUsize("0"));
+    try std.testing.expectError(error.InvalidCharacter, parseNonNegativeUsize("six"));
 }

@@ -172,7 +172,7 @@ pub const Config = struct {
     s3_credentials: ?Credentials = null,
     /// Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that support idle eviction may unload a model after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to keep loaded models resident without idle eviction. For compatibility, some runtimes also eagerly load discovered models in this mode. Use `preload` when startup loading must be deterministic.
     keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited.
     max_loaded_models: ?i64 = null,
     /// Number of reusable inference execution slots per model. Some runtimes realize each slot as a complete pipeline, increasing both possible concurrency and per-model memory; others pool lightweight backend providers, so memory and throughput effects are backend-dependent. Generation and backends with shared runtime state may remain serialized even when this is greater than one. Model residency is controlled separately by `max_loaded_models`.
     pool_size: ?i64 = null,
@@ -180,15 +180,15 @@ pub const Config = struct {
     prompt_cache: ?PromptCacheConfig = null,
     /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const BackendPriorityEntry = null,
-    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
+    /// Maximum weighted inference work admitted concurrently by the Zig runtime. Requests beyond the limit receive 503 Service Unavailable with Retry-After; they are not held in an in-process wait queue. Set to 0 for unlimited.
     max_concurrent_requests: ?i64 = null,
-    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+    /// Compatibility field retained for older configs. The Zig runtime does not keep an in-process request wait queue and ignores this value; use max_concurrent_requests to configure immediate backpressure.
     max_queue_size: ?i64 = null,
-    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
+    /// Compatibility field retained for older configs. The Zig runtime does not currently apply a global request timeout from this value.
     request_timeout: ?[]const u8 = null,
     /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
     preload: ?[]const ModelRef = null,
-    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
+    /// Compatibility field for a future aggregate loaded-model memory limit. The Zig runtime does not currently enforce this value; use max_loaded_models for a hard residency bound. Set to 0 when unused (default).
     max_memory_mb: ?i64 = null,
     /// Per-model loading strategy overrides for runtimes that support them. Maps model names to their loading strategy. Models not in this map follow `keep_alive`: positive durations permit idle eviction, while "0" keeps a model resident after it is loaded. Some compatibility runtimes also eagerly load models for "0". When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) Strategy support varies by runtime. Use `preload` for portable, deterministic startup loading.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,

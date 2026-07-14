@@ -11547,8 +11547,8 @@ export interface components {
             /**
              * @description Maximum total models loaded across all registry types (embedders, rerankers,
              *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
-             *     idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-             * @default 0
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             * @default 10
              * @example 3
              */
             max_loaded_models?: number;
@@ -11589,25 +11589,26 @@ export interface components {
              */
             backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
             /**
-             * @description Maximum number of concurrent inference requests allowed.
-             *     Additional requests will be queued up to max_queue_size.
-             *     Set to 0 for unlimited (default).
-             * @default 0
+             * @description Maximum weighted inference work admitted concurrently by the Zig runtime.
+             *     Requests beyond the limit receive 503 Service Unavailable with Retry-After;
+             *     they are not held in an in-process wait queue. Set to 0 for unlimited.
+             * @default 32
              * @example 4
              */
             max_concurrent_requests?: number;
             /**
-             * @description Maximum number of requests to queue when max_concurrent_requests is reached.
-             *     When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
-             *     Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+             * @deprecated
+             * @description Compatibility field retained for older configs. The Zig runtime does not keep
+             *     an in-process request wait queue and ignores this value; use
+             *     max_concurrent_requests to configure immediate backpressure.
              * @default 0
              * @example 100
              */
             max_queue_size?: number;
             /**
-             * @description Maximum time to wait for a request to complete, including queue wait time.
-             *     Use Go duration format: "30s", "1m", "0" (no timeout, default).
-             *     Requests exceeding this timeout receive 504 Gateway Timeout.
+             * @deprecated
+             * @description Compatibility field retained for older configs. The Zig runtime does not
+             *     currently apply a global request timeout from this value.
              * @default 0
              * @example 30s
              */
@@ -11629,11 +11630,10 @@ export interface components {
              */
             preload?: components["schemas"]["InferenceModelRef"][];
             /**
-             * @description Maximum memory (in MB) to use for loaded models.
-             *     When this limit is approached, least recently used models are unloaded.
-             *     Set to 0 for unlimited (default). This is an advisory limit - actual memory
-             *     usage depends on model sizes and may temporarily exceed this value.
-             *     Works alongside max_loaded_models for fine-grained control.
+             * @deprecated
+             * @description Compatibility field for a future aggregate loaded-model memory limit. The Zig
+             *     runtime does not currently enforce this value; use max_loaded_models for a hard
+             *     residency bound. Set to 0 when unused (default).
              * @default 0
              * @example 4096
              */

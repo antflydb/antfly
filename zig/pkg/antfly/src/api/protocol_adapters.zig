@@ -355,7 +355,15 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes", .{ routes.Routes.tables, table_name });
-            return try ctx.simpleRoute(alloc, .GET, uri, "");
+            var result = try ctx.simpleRoute(alloc, .GET, uri, "");
+            if (result.structured) |structured| {
+                if (structured == .array) {
+                    var wrapped = std.json.ObjectMap.empty;
+                    try wrapped.put(alloc, "indexes", structured);
+                    result.structured = .{ .object = wrapped };
+                }
+            }
+            return result;
         }
 
         fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {

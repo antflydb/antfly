@@ -16462,6 +16462,19 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer describe_indexes_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_indexes_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"full_text_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
+
+    var list_indexes_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"list_indexes\",\"arguments\":{\"tableName\":\"docs\"}}}",
+    });
+    defer list_indexes_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), list_indexes_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"full_text_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
 
     var sample_documents_resp = try server.handle(.{
         .method = .POST,

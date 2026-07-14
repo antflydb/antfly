@@ -19824,6 +19824,8 @@ components:
         max_tokens:
           type: integer
           description: Maximum tokens to generate
+          minimum: 1
+          maximum: 1024
           default: 256
           example: 256
     InferenceTextRegion:
@@ -20848,8 +20850,8 @@ components:
 
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
 
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+          default: 10
           example: 3
         pool_size:
           type: integer
@@ -20902,32 +20904,34 @@ components:
             - native
         max_concurrent_requests:
           type: integer
+          minimum: 0
           description: >
-            Maximum number of concurrent inference requests allowed.
+            Maximum weighted inference work admitted concurrently by the Zig runtime.
 
-            Additional requests will be queued up to max_queue_size.
+            Requests beyond the limit receive 503 Service Unavailable with Retry-After;
 
-            Set to 0 for unlimited (default).
-          default: 0
+            they are not held in an in-process wait queue. Set to 0 for unlimited.
+          default: 32
           example: 4
         max_queue_size:
           type: integer
+          minimum: 0
+          deprecated: true
           description: >
-            Maximum number of requests to queue when max_concurrent_requests is reached.
+            Compatibility field retained for older configs. The Zig runtime does not keep
 
-            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
+            an in-process request wait queue and ignores this value; use
 
-            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+            max_concurrent_requests to configure immediate backpressure.
           default: 0
           example: 100
         request_timeout:
           type: string
+          deprecated: true
           description: >
-            Maximum time to wait for a request to complete, including queue wait time.
+            Compatibility field retained for older configs. The Zig runtime does not
 
-            Use Go duration format: "30s", "1m", "0" (no timeout, default).
-
-            Requests exceeding this timeout receive 504 Gateway Timeout.
+            currently apply a global request timeout from this value.
           default: '0'
           example: 30s
         preload:
@@ -20950,16 +20954,14 @@ components:
               quantization: q4_k
         max_memory_mb:
           type: integer
+          minimum: 0
+          deprecated: true
           description: >
-            Maximum memory (in MB) to use for loaded models.
+            Compatibility field for a future aggregate loaded-model memory limit. The Zig
 
-            When this limit is approached, least recently used models are unloaded.
+            runtime does not currently enforce this value; use max_loaded_models for a hard
 
-            Set to 0 for unlimited (default). This is an advisory limit - actual memory
-
-            usage depends on model sizes and may temporarily exceed this value.
-
-            Works alongside max_loaded_models for fine-grained control.
+            residency bound. Set to 0 when unused (default).
           default: 0
           example: 4096
         model_strategies:

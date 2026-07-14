@@ -110,7 +110,7 @@ pub const PromptCacheConfig = struct {
     ttl_ms: u64 = 300_000,
 
     /// max_bytes_mb is a node-wide accounting target. ModelManager divides it
-    /// across active caches and reconfigures them together.
+    /// across participating caches and configures them together.
     pub fn runtimeConfig(
         self: @This(),
         resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver,
@@ -131,7 +131,7 @@ test "prompt cache config reports node target in bytes" {
     try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null).max_bytes);
 }
 
-test "model manager rebalances every active prompt cache" {
+test "model manager rebalances active and reserved prompt caches" {
     const allocator = std.testing.allocator;
     var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
     defer manager.loaded.deinit(allocator);
@@ -139,12 +139,22 @@ test "model manager rebalances every active prompt cache" {
 
     var first: model_manager_mod.LoadedModel = undefined;
     first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    first.manager_active_protections = 0;
+    first.manager_active_uses = 0;
     defer first.prompt_prefix_cache.deinit();
     var second: model_manager_mod.LoadedModel = undefined;
     second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    second.manager_active_protections = 0;
+    second.manager_active_uses = 0;
     defer second.prompt_prefix_cache.deinit();
+    var reserved: model_manager_mod.LoadedModel = undefined;
+    reserved.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    reserved.manager_active_protections = 0;
+    reserved.manager_active_uses = 0;
+    defer reserved.prompt_prefix_cache.deinit();
     try manager.loaded.put(allocator, "first", &first);
     try manager.loaded.put(allocator, "second", &second);
+    try manager.loaded.put(allocator, "reserved", &reserved);
 
     first.prompt_prefix_cache.configure(.{
         .enabled = true,
@@ -165,15 +175,26 @@ test "model manager rebalances every active prompt cache" {
     try first.prompt_prefix_cache.storeFromSequence("", &.{ 1, 2 }, first_sequence_id);
     try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.stats().live_entries);
 
+    // Configuration reserves budget before pool/storage creation, closing the
+    // concurrent first-activation window.
+    reserved.prompt_prefix_cache.configure(.{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+    });
+    try std.testing.expect(!reserved.prompt_prefix_cache.isActive());
+
     manager.rebalancePromptCaches(&second, .{
         .enabled = true,
         .mode = .simple,
         .min_tokens = 2,
-        .max_bytes = 2,
+        .max_bytes = 3,
     });
 
     try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.config.max_bytes);
     try std.testing.expectEqual(@as(usize, 1), second.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), reserved.prompt_prefix_cache.config.max_bytes);
     try std.testing.expectEqual(@as(usize, 0), first.prompt_prefix_cache.stats().live_entries);
 }
 
@@ -184,7 +205,7 @@ pub const NodeConfig = struct {
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     preload: []const WarmModel = &.{},
     keep_alive_ms: u64 = 300_000,
-    max_loaded_models: usize = 0,
+    max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
     pool_size: usize = 1,
     generation_budget_overrides: BudgetOverrides = .{},
@@ -217,6 +238,8 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
+const default_read_queue_max_tokens: usize = 256;
+const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 
 const GenerateBackendSelection = struct {
@@ -698,7 +721,7 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const model = try self.model_manager.loadFromDir(model_path);
+        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try model.ensureEmbeddingAssetsWithIo(io, true, false, false);
@@ -731,7 +754,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
-        const model = try self.model_manager.loadFromDir(model_path);
+        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
         if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const serialize_imported = model.usesImportedOnnxRuntime();
         if (serialize_imported) model.lockImportedPipeline(io_impl.io());
@@ -762,7 +785,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
-        const model = try self.model_manager.loadFromDir(model_path);
+        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
         const serialize_imported = model.usesImportedOnnxRuntime();
         if (serialize_imported) model.lockImportedPipeline(io_impl.io());
         defer if (serialize_imported) model.unlockImportedPipeline(io_impl.io());
@@ -789,7 +812,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, null);
     }
 
     pub fn generateMessagesDirect(
@@ -798,7 +821,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, null);
     }
 
     const DirectGenerateTiming = struct {
@@ -844,6 +867,7 @@ pub const Node = struct {
         max_tokens: i32,
         preferred_backends: ?[]const backends_mod.BackendType,
         timing: ?*DirectGenerateTiming,
+        warm_request_id: ?u64,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
@@ -861,9 +885,10 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
         const resolved_at_ns = embedTimingNowNs();
         const model = if (preferred_backends) |backends|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, false)
+            try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, backends, false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.loadFromDirForRequest(request_id, model_path);
+        if (warm_request_id) |id| try self.model_manager.touchModelForRequest(id, model);
         const loaded_at_ns = embedTimingNowNs();
         model.lockNativeGenerationWithIo(io);
         defer model.unlockNativeGenerationWithIo(io);
@@ -997,7 +1022,13 @@ pub const Node = struct {
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
-        for (self.config.preload) |model| try self.warmModel(allocator, model);
+        if (self.config.preload.len == 0) return;
+        // Keep earlier preloads protected until the full configured set is
+        // warm. A contradictory residency limit must fail startup instead of
+        // silently evicting models that startup reported as preloaded.
+        const request_id = try self.model_manager.beginRequest(modelLifecycleNowMs());
+        defer self.model_manager.endRequest(request_id, modelLifecycleNowMs());
+        for (self.config.preload) |model| try self.warmModelForRequest(allocator, model, request_id);
     }
 
     pub fn warmConfiguredModelsWithIo(self: *Node, allocator: std.mem.Allocator, io: std.Io) !void {
@@ -1015,24 +1046,29 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
-        // Keep each warm operation alive independently. A single ticket around
-        // the whole preload list would pin earlier models and make a valid
-        // preload sequence fail when max_loaded_models is smaller than it.
+        // Public single-model warmups need their own lifecycle ticket. The
+        // configured batch adds an outer ticket to protect the full preload.
         const request_id = try self.model_manager.beginRequest(modelLifecycleNowMs());
         defer self.model_manager.endRequest(request_id, modelLifecycleNowMs());
+        try self.warmModelForRequest(allocator, model, request_id);
+    }
+
+    fn warmModelForRequest(self: *Node, allocator: std.mem.Allocator, model: WarmModel, request_id: u64) !void {
         switch (model.kind) {
-            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend),
-            .embedder => try self.warmEmbedder(allocator, model.name, model.backend),
-            .reranker => try self.warmReranker(allocator, model.name, model.backend),
-            .chunker, .classifier, .recognizer, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
+            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, request_id),
+            .embedder => try self.warmEmbedder(allocator, model.name, model.backend, request_id),
+            .reranker => try self.warmReranker(allocator, model.name, model.backend, request_id),
+            .chunker, .classifier, .recognizer, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model, request_id),
         }
     }
 
     pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
-        try self.warmGeneratorWithBackend(allocator, model_name, null);
+        const request_id = try self.model_manager.beginRequest(modelLifecycleNowMs());
+        defer self.model_manager.endRequest(request_id, modelLifecycleNowMs());
+        try self.warmGeneratorWithBackend(allocator, model_name, null, request_id);
     }
 
-    fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType, request_id: u64) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference generator model={s}", .{model_name});
@@ -1042,7 +1078,7 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing);
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing, request_id);
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
@@ -1058,7 +1094,7 @@ pub const Node = struct {
         );
     }
 
-    fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType, request_id: u64) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference embedder model={s}", .{model_name});
@@ -1068,9 +1104,9 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
         const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+            try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, singleBackendPreference(value), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.loadFromDirForRequest(request_id, model_path);
 
         if (model.manifest.hasCapability("sparse")) {
             const serialize_imported = model.usesImportedOnnxRuntime();
@@ -1102,7 +1138,7 @@ pub const Node = struct {
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
-    fn warmReranker(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmReranker(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType, request_id: u64) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference reranker model={s}", .{model_name});
@@ -1111,9 +1147,9 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "rerankers");
         const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+            try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, singleBackendPreference(value), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.loadFromDirForRequest(request_id, model_path);
         const serialize_imported = model.usesImportedOnnxRuntime();
         if (serialize_imported) model.lockImportedPipeline(io_impl.io());
         defer if (serialize_imported) model.unlockImportedPipeline(io_impl.io());
@@ -1123,7 +1159,7 @@ pub const Node = struct {
         std.log.info("warmed inference reranker model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
-    fn warmLoadOnlyModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+    fn warmLoadOnlyModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel, request_id: u64) !void {
         if (model.name.len == 0) return error.InvalidGenerationRequest;
         const task_dir = switch (model.kind) {
             .chunker => "chunkers",
@@ -1141,9 +1177,9 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
         _ = if (model.backend) |backend|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
+            try self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, singleBackendPreference(backend), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.loadFromDirForRequest(request_id, model_path);
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -1174,7 +1210,7 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const model = try self.model_manager.loadFromDir(model_path);
+        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
@@ -1202,8 +1238,10 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
-        const request_id = try self.acquireDirectSlot();
-        defer self.releaseSlot(request_id);
+        const max_tokens = try validateReadMaxTokens(request.max_tokens);
+        const queue_units = estimateReadQueueUnits(request.images.len, max_tokens);
+        const request_id = try self.acquireDirectSlotUnits(queue_units);
+        defer self.releaseSlotUnits(request_id, queue_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
@@ -1211,7 +1249,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
-        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
+        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager, request_id);
         defer reader.deinit();
 
         const out = try allocator.alloc(readers_api.Result, request.images.len);
@@ -1243,7 +1281,7 @@ pub const Node = struct {
 
         const results = try reader.readBatch(image_datas, .{
             .prompt = request.prompt,
-            .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
+            .max_tokens = max_tokens,
         });
         defer {
             for (results) |result| {
@@ -1282,7 +1320,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
-        const model = try self.model_manager.loadFromDir(model_path);
+        const model = try self.model_manager.loadFromDirForRequest(request_id, model_path);
         if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
@@ -1314,7 +1352,11 @@ pub const Node = struct {
         request: extracting_api.Request,
     ) !extracting_api.Response {
         const request_id = try self.acquireDirectSlot();
-        defer self.releaseSlot(request_id);
+        var queue_units: usize = 1;
+        defer if (queue_units > 0)
+            self.releaseSlotUnits(request_id, queue_units)
+        else
+            self.model_manager.endRequest(request_id, modelLifecycleNowMs());
         self.metrics.incRequest("extract.local");
         defer self.metrics.decActive();
 
@@ -1340,6 +1382,21 @@ pub const Node = struct {
 
         var parsed_inputs = try parseDirectExtractionInputs(self, allocator, request.inputs, options.prompt, options.max_tokens);
         defer parsed_inputs.deinit();
+        const required_units = if (parsed_inputs.images.items.len > 0) blk: {
+            if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
+            if (parsed_inputs.max_tokens) |max_tokens| {
+                if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
+            }
+            break :blk estimateReadQueueUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens);
+        } else 1;
+        if (required_units > queue_units) {
+            self.request_queue.releaseUnits(queue_units);
+            queue_units = 0;
+            self.updateQueueMetrics();
+            try self.request_queue.acquireUnits(required_units);
+            queue_units = required_units;
+            self.updateQueueMetrics();
+        }
 
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
@@ -1350,6 +1407,7 @@ pub const Node = struct {
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
+            .request_id = request_id,
         };
         var extractor = try extractors_mod.resolve(extractor_ctx, model_name, parsed_inputs.images.items.len > 0);
         defer extractor.deinit(allocator);
@@ -1602,10 +1660,11 @@ pub const Node = struct {
     }
 
     fn updateQueueMetrics(self: *Node) void {
+        const queue = self.request_queue.snapshot();
         self.metrics.setQueueState(
-            self.request_queue.depth(),
-            self.request_queue.max_concurrent,
-            self.request_queue.requests(),
+            queue.active_units,
+            queue.capacity,
+            queue.active_requests,
         );
     }
 
@@ -1737,7 +1796,7 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
             return modelLoadFailure(ctx, err);
 
         if (model.manifest.hasCapability("sparse")) {
@@ -1981,7 +2040,7 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
             return modelLoadFailure(ctx, err);
 
         const serialize_imported = model.usesImportedOnnxRuntime();
@@ -2020,7 +2079,7 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
             return modelLoadFailure(ctx, err);
 
         var parsed_docs = std.ArrayListUnmanaged(ParsedMultimodalRerankDocument).empty;
@@ -2635,9 +2694,9 @@ pub const Node = struct {
         const model = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
-            break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
+            break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, model_path, request_session_manager.preferred_backends, false) catch |err|
                 return modelLoadFailure(ctx, err);
-        } else self.model_manager.loadFromDir(model_path) catch |err|
+        } else self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
             return modelLoadFailure(ctx, err);
         model.lockNativeGenerationWithIo(ctx.io);
         defer model.unlockNativeGenerationWithIo(ctx.io);
@@ -2742,9 +2801,9 @@ pub const Node = struct {
                     const draft_model = if (backend_selection.native_choice != .auto) blk: {
                         var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                         configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                        break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
+                        break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(request_id, draft_model_path, request_session_manager.preferred_backends, false) catch |err|
                             return modelLoadFailure(ctx, err);
-                    } else self.model_manager.loadFromDir(draft_model_path) catch |err|
+                    } else self.model_manager.loadFromDirForRequest(request_id, draft_model_path) catch |err|
                         return modelLoadFailure(ctx, err);
                     const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
                         return ctx.status(400).json(.{
@@ -3394,7 +3453,7 @@ pub const Node = struct {
             const model = if (selection.native_choice != .auto) blk: {
                 var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                 configureGenerateBackendPreference(&request_session_manager, selection);
-                break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
+                break :blk self.model_manager.loadFromDirWithPreferredBackendsForRequest(group_request_id, model_path, request_session_manager.preferred_backends, false) catch |err| {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = .{
                             .code = if (err == error.ModelCapacityReached) "MODEL_CAPACITY_REACHED" else "MODEL_LOAD_FAILED",
@@ -3405,7 +3464,7 @@ pub const Node = struct {
                     }
                     continue;
                 };
-            } else self.model_manager.loadFromDir(model_path) catch |err| {
+            } else self.model_manager.loadFromDirForRequest(group_request_id, model_path) catch |err| {
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = .{
                         .code = if (err == error.ModelCapacityReached) "MODEL_CAPACITY_REACHED" else "MODEL_LOAD_FAILED",
@@ -4297,7 +4356,7 @@ pub const Node = struct {
             return self.recognizeRebel(ctx, model_path, body);
         }
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
             return modelLoadFailure(ctx, err);
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
@@ -4575,7 +4634,7 @@ pub const Node = struct {
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
+            const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
                 return modelLoadFailure(ctx, err);
 
             // Detect entailment index from id2label (varies by NLI model)
@@ -4610,7 +4669,7 @@ pub const Node = struct {
         } else |_| {}
 
         if (self.resolveModelPath(ctx.io, model_name, "recognizers")) |model_path| {
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
+            const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
                 return modelLoadFailure(ctx, err);
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
@@ -5003,12 +5062,6 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        var request_id: u64 = undefined;
-        if (try self.acquireSlot(ctx, &request_id)) |resp| return resp;
-        defer self.releaseSlot(request_id);
-        self.metrics.incRequest("read");
-        defer self.metrics.decActive();
-
         if (body.images.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'images' must not be empty" });
         }
@@ -5018,6 +5071,17 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = validateReadMaxTokens(body.max_tokens) catch
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' must be between 1 and 1024",
+            });
+        const queue_units = estimateReadQueueUnits(body.images.len, max_tokens);
+        var request_id: u64 = undefined;
+        if (try self.acquireSlotUnits(ctx, queue_units, &request_id)) |resp| return resp;
+        defer self.releaseSlotUnits(request_id, queue_units);
+        self.metrics.incRequest("read");
+        defer self.metrics.decActive();
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -5029,6 +5093,7 @@ pub const Node = struct {
             model_path,
             &self.session_manager,
             &self.model_manager,
+            request_id,
         ) catch |err| switch (err) {
             error.ModelCapacityReached => return modelLoadFailure(ctx, err),
             error.InvalidModelForReading => return ctx.status(400).json(.{
@@ -5098,9 +5163,14 @@ pub const Node = struct {
 
         const results = reader.readBatch(image_datas, .{
             .prompt = body.prompt,
-            .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
-        }) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            .max_tokens = max_tokens,
+        }) catch |err| switch (err) {
+            error.InvalidMaxTokens => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' exceeds the selected model's context limit",
+            }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+        };
         defer {
             for (results) |result| {
                 var tmp = result;
@@ -5223,7 +5293,7 @@ pub const Node = struct {
                 tokenizer = hf_tok.tokenizer();
             }
         } else |_| {
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
+            const model = self.model_manager.loadFromDirForRequest(request_id, model_path) catch |err|
                 return modelLoadFailure(ctx, err);
             if (session_factory.getWhisperConfig(model.session) == null) {
                 return ctx.status(400).json(.{
@@ -5309,12 +5379,6 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        var request_id: u64 = undefined;
-        if (try self.acquireSlot(ctx, &request_id)) |resp| return resp;
-        defer self.releaseSlot(request_id);
-        self.metrics.incRequest("extract");
-        defer self.metrics.decActive();
-
         if (body.model.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
         }
@@ -5338,6 +5402,23 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = if (has_images)
+            validateReadMaxTokens(body.max_tokens) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "'max_tokens' must be between 1 and 1024",
+                })
+        else
+            null;
+        const queue_units = if (has_images)
+            estimateReadQueueUnits(images.len, max_tokens)
+        else
+            1;
+        var request_id: u64 = undefined;
+        if (try self.acquireSlotUnits(ctx, queue_units, &request_id)) |resp| return resp;
+        defer self.releaseSlotUnits(request_id, queue_units);
+        self.metrics.incRequest("extract");
+        defer self.metrics.decActive();
         const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch |err| {
             const message = try std.fmt.allocPrint(ctx.allocator, "invalid schema: {s}", .{@errorName(err)});
             defer ctx.allocator.free(message);
@@ -5361,6 +5442,7 @@ pub const Node = struct {
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
+            .request_id = request_id,
         };
         var extractor = extractors_mod.resolve(extractor_ctx, body.model, has_images) catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
@@ -5376,10 +5458,14 @@ pub const Node = struct {
             }
             break :blk extractor.extractImages(extractor_ctx, schemas, config, image_datas, .{
                 .prompt = body.prompt,
-                .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
+                .max_tokens = max_tokens,
             });
         }) catch |err| switch (err) {
             error.ModelCapacityReached => return modelLoadFailure(ctx, err),
+            error.InvalidMaxTokens => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' exceeds the selected model's context limit",
+            }),
             error.UnsupportedInput => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
                 .message = if (has_images)
@@ -6863,6 +6949,23 @@ test "read batch downloaded byte accounting enforces aggregate cap" {
     try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
 }
 
+test "read max tokens preserves omission and rejects unsafe signed values" {
+    try std.testing.expectEqual(@as(?usize, null), try validateReadMaxTokens(null));
+    try std.testing.expectEqual(@as(?usize, 1), try validateReadMaxTokens(1));
+    try std.testing.expectEqual(@as(?usize, max_read_tokens), try validateReadMaxTokens(@intCast(max_read_tokens)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(-1));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(0));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(@intCast(max_read_tokens + 1)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(std.math.maxInt(i64)));
+}
+
+test "read queue units scale with image batch and decode length" {
+    try std.testing.expectEqual(@as(usize, 1), estimateReadQueueUnits(1, null));
+    try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, null));
+    try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_queue_max_tokens + 1));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
+}
+
 test "registerRoutesOn prefixes embed aliases and metrics route" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -6897,6 +7000,7 @@ test "configured warmup attaches io before loading models" {
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.active_requests.count());
 }
 
 test "configured warmup keeps the allocator-only public API" {
@@ -8863,6 +8967,18 @@ fn downloadReadBatchContent(
 
 fn readBatchMaxBytes() usize {
     return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_BYTES") orelse default_max_read_batch_bytes);
+}
+
+fn validateReadMaxTokens(value: ?i64) !?usize {
+    const requested = value orelse return null;
+    if (requested < 1 or requested > @as(i64, @intCast(max_read_tokens))) return error.InvalidMaxTokens;
+    return @intCast(requested);
+}
+
+fn estimateReadQueueUnits(image_count: usize, max_tokens: ?usize) usize {
+    const estimated_max_tokens = max_tokens orelse default_read_queue_max_tokens;
+    const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / default_read_queue_max_tokens);
+    return std.math.mul(usize, @max(image_count, 1), token_units) catch std.math.maxInt(usize);
 }
 
 fn addReadBatchDownloadedBytes(current: usize, item: scraping.DownloadedContent, max_bytes: usize) !usize {

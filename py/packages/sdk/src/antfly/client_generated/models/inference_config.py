@@ -52,8 +52,8 @@ class InferenceConfig:
              Default: '5m'. Example: 5m.
         max_loaded_models (int | Unset): Maximum total models loaded across all registry types (embedders, rerankers,
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-             Default: 0. Example: 3.
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             Default: 10. Example: 3.
         pool_size (int | Unset): Number of reusable inference execution slots per model. Some runtimes realize
             each slot as a complete pipeline, increasing both possible concurrency and
             per-model memory; others pool lightweight backend providers, so memory and
@@ -72,17 +72,16 @@ class InferenceConfig:
             - `["native", "onnx", "xla"]` - Try backends with auto device detection
             - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
              Example: ['cuda', 'onnx:cuda', 'xla:tpu', 'native'].
-        max_concurrent_requests (int | Unset): Maximum number of concurrent inference requests allowed.
-            Additional requests will be queued up to max_queue_size.
-            Set to 0 for unlimited (default).
-             Default: 0. Example: 4.
-        max_queue_size (int | Unset): Maximum number of requests to queue when max_concurrent_requests is reached.
-            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
-            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+        max_concurrent_requests (int | Unset): Maximum weighted inference work admitted concurrently by the Zig runtime.
+            Requests beyond the limit receive 503 Service Unavailable with Retry-After;
+            they are not held in an in-process wait queue. Set to 0 for unlimited.
+             Default: 32. Example: 4.
+        max_queue_size (int | Unset): Compatibility field retained for older configs. The Zig runtime does not keep
+            an in-process request wait queue and ignores this value; use
+            max_concurrent_requests to configure immediate backpressure.
              Default: 0. Example: 100.
-        request_timeout (str | Unset): Maximum time to wait for a request to complete, including queue wait time.
-            Use Go duration format: "30s", "1m", "0" (no timeout, default).
-            Requests exceeding this timeout receive 504 Gateway Timeout.
+        request_timeout (str | Unset): Compatibility field retained for older configs. The Zig runtime does not
+            currently apply a global request timeout from this value.
              Default: '0'. Example: 30s.
         preload (list[InferenceModelRef] | Unset): Models to preload and warm at startup. Generators run a tiny
             generation
@@ -91,11 +90,9 @@ class InferenceConfig:
             best available warm path for that kind.
              Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal', 'format': 'gguf',
             'quantization': 'q4_k'}].
-        max_memory_mb (int | Unset): Maximum memory (in MB) to use for loaded models.
-            When this limit is approached, least recently used models are unloaded.
-            Set to 0 for unlimited (default). This is an advisory limit - actual memory
-            usage depends on model sizes and may temporarily exceed this value.
-            Works alongside max_loaded_models for fine-grained control.
+        max_memory_mb (int | Unset): Compatibility field for a future aggregate loaded-model memory limit. The Zig
+            runtime does not currently enforce this value; use max_loaded_models for a hard
+            residency bound. Set to 0 when unused (default).
              Default: 0. Example: 4096.
         model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides for runtimes
             that support them. Maps model
@@ -124,11 +121,11 @@ class InferenceConfig:
     content_security: InferenceContentSecurityConfig | Unset = UNSET
     s3_credentials: InferenceCredentials | Unset = UNSET
     keep_alive: str | Unset = "5m"
-    max_loaded_models: int | Unset = 0
+    max_loaded_models: int | Unset = 10
     pool_size: int | Unset = 1
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[str] | Unset = UNSET
-    max_concurrent_requests: int | Unset = 0
+    max_concurrent_requests: int | Unset = 32
     max_queue_size: int | Unset = 0
     request_timeout: str | Unset = "0"
     preload: list[InferenceModelRef] | Unset = UNSET

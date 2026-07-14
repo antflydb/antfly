@@ -29,6 +29,7 @@ pub const Context = struct {
     models_dir: []const u8,
     session_manager: *backends_mod.SessionManager,
     model_manager: *model_manager_mod.ModelManager,
+    request_id: u64,
 };
 
 pub const Extractor = union(enum) {
@@ -110,7 +111,7 @@ const RecognizerExtractor = struct {
         config: extraction_mod.ExtractionConfig,
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        const model = try ctx.model_manager.loadFromDirForRequest(ctx.request_id, self.model_path);
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
@@ -128,7 +129,7 @@ const RecognizerExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        const model = try ctx.model_manager.loadFromDirForRequest(ctx.request_id, self.model_path);
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
@@ -161,6 +162,7 @@ const ReaderExtractor = struct {
             self.model_path,
             ctx.session_manager,
             ctx.model_manager,
+            ctx.request_id,
         );
         defer reader.deinit();
 
@@ -217,6 +219,7 @@ fn readTextsForExtraction(
         model_path,
         ctx.session_manager,
         ctx.model_manager,
+        ctx.request_id,
     );
     defer reader.deinit();
 
@@ -368,6 +371,7 @@ test "resolve prefers reader for image extraction when both exist" {
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, "acme/doc-extract", true);
     defer extractor.deinit(allocator);
 
@@ -390,6 +394,7 @@ test "resolveNamedReaderPath supports flat default model layout" {
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, "Xenova/trocr-base-printed");
     defer allocator.free(path);
 
@@ -413,6 +418,7 @@ test "resolve prefers recognizer for text extraction when both exist" {
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, "acme/doc-extract", false);
     defer extractor.deinit(allocator);
 
@@ -430,5 +436,6 @@ test "reader extractor does not accept text input" {
         .models_dir = ".",
         .session_manager = undefined,
         .model_manager = undefined,
+        .request_id = 0,
     }, &.{}, .{}, &.{}));
 }

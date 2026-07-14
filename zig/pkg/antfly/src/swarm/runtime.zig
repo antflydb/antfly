@@ -913,6 +913,7 @@ pub fn runFromIterator(
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
         antfly_node_cfg.keep_alive_ms = cfg.inference.keep_alive_ms;
         antfly_node_cfg.max_loaded_models = cfg.inference.max_loaded_models;
+        antfly_node_cfg.max_concurrent_requests = cfg.inference.max_concurrent_requests;
         antfly_node_cfg.pool_size = cfg.inference.pool_size;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);

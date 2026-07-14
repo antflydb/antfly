@@ -102,8 +102,8 @@ pub const Metrics = struct {
             .cache_hits = prometheus.Counter(u64).init("antfly_inference_cache_hits_total", .{ .help = "Cache hits" }, .{}),
             .cache_misses = prometheus.Counter(u64).init("antfly_inference_cache_misses_total", .{ .help = "Cache misses" }, .{}),
             .queue_depth = prometheus.Gauge(i64).init("antfly_inference_request_queue_depth", .{ .help = "Current request queue depth" }, .{}),
-            .queue_capacity = prometheus.Gauge(i64).init("antfly_inference_request_queue_capacity", .{ .help = "Configured weighted request queue capacity" }, .{}),
-            .queue_available = prometheus.Gauge(i64).init("antfly_inference_request_queue_available", .{ .help = "Available weighted request queue capacity" }, .{}),
+            .queue_capacity = prometheus.Gauge(i64).init("antfly_inference_request_queue_capacity", .{ .help = "Configured weighted request queue capacity (-1 means unlimited)" }, .{}),
+            .queue_available = prometheus.Gauge(i64).init("antfly_inference_request_queue_available", .{ .help = "Available weighted request queue capacity (-1 means unlimited)" }, .{}),
             .queue_active_requests = prometheus.Gauge(i64).init("antfly_inference_request_queue_active_requests", .{ .help = "Currently admitted requests in the request queue" }, .{}),
             .queue_rejections_total = prometheus.Counter(u64).init("antfly_inference_request_queue_rejections_total", .{ .help = "Requests rejected because the request queue was at capacity" }, .{}),
             .queue_rejected_units_total = prometheus.Counter(u64).init("antfly_inference_request_queue_rejected_units_total", .{ .help = "Weighted request queue units rejected because the request queue was at capacity" }, .{}),
@@ -193,8 +193,13 @@ pub const Metrics = struct {
 
     pub fn setQueueState(self: *Metrics, active_units: usize, capacity: usize, active_requests: usize) void {
         self.queue_depth.set(@intCast(active_units));
-        self.queue_capacity.set(@intCast(capacity));
-        self.queue_available.set(@intCast(capacity - @min(active_units, capacity)));
+        if (capacity == 0) {
+            self.queue_capacity.set(-1);
+            self.queue_available.set(-1);
+        } else {
+            self.queue_capacity.set(@intCast(capacity));
+            self.queue_available.set(@intCast(capacity - @min(active_units, capacity)));
+        }
         self.queue_active_requests.set(@intCast(active_requests));
     }
 
@@ -236,6 +241,15 @@ test "metrics render" {
     try std.testing.expect(std.mem.indexOf(u8, queue_output, "antfly_inference_request_queue_active_requests 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, queue_output, "antfly_inference_request_queue_rejections_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, queue_output, "antfly_inference_request_queue_rejected_units_total 4\n") != null);
+
+    m.setQueueState(5, 0, 2);
+    var unlimited_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer unlimited_writer.deinit();
+    try m.render(&unlimited_writer.writer);
+    const unlimited_output = unlimited_writer.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, unlimited_output, "antfly_inference_request_queue_depth 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlimited_output, "antfly_inference_request_queue_capacity -1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlimited_output, "antfly_inference_request_queue_available -1\n") != null);
 
     m.recordEmbedBatch(3, 12, 1000);
     m.recordEmbedBatch(2, 20, 2000);
