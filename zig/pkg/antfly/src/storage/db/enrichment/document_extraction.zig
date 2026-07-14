@@ -301,7 +301,10 @@ pub const OcrQuality = struct {
     }
 
     pub fn failureCount(self: OcrQuality) u8 {
-        return @intFromBool(self.too_short) + @intFromBool(self.garbled) + @intFromBool(self.font_corrupted) + @intFromBool(self.replacement_corrupted);
+        return @as(u8, @intFromBool(self.too_short)) +
+            @as(u8, @intFromBool(self.garbled)) +
+            @as(u8, @intFromBool(self.font_corrupted)) +
+            @as(u8, @intFromBool(self.replacement_corrupted));
     }
 };
 
@@ -3204,6 +3207,13 @@ test "OCR quality fallback covers born digital scanned garbled and encoding fail
 
     const replacement = assessOcrQuality("Readable source text that is long enough but contains replacement markers \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd}.", config);
     try std.testing.expect(replacement.replacement_corrupted);
+
+    try std.testing.expectEqual(@as(u8, 4), (OcrQuality{
+        .too_short = true,
+        .garbled = true,
+        .font_corrupted = true,
+        .replacement_corrupted = true,
+    }).failureCount());
 }
 
 test "OCR text selection retains embedded text on ties and chooses a better transcription" {
