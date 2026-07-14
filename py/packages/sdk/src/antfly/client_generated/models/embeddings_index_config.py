@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..types import UNSET, Unset
 
@@ -26,6 +27,8 @@ class EmbeddingsIndexConfig:
     omitted if an embedder is configured — it will be auto-detected.
 
         Attributes:
+            coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
+                completeness.
             external (bool | Unset): When true, embeddings are supplied externally via _embeddings and the index does not
                 derive prompts from a field or template. Default: False.
             sparse (bool | Unset): When true, creates a sparse (SPLADE) inverted index. When false (default), creates a
@@ -229,6 +232,7 @@ class EmbeddingsIndexConfig:
                 namespaces with runtime effects are accepted.
     """
 
+    coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
     sparse: bool | Unset = False
     dimension: int | Unset = UNSET
@@ -248,6 +252,10 @@ class EmbeddingsIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        coverage_policy: str | Unset = UNSET
+        if not isinstance(self.coverage_policy, Unset):
+            coverage_policy = self.coverage_policy.value
+
         external = self.external
 
         sparse = self.sparse
@@ -293,6 +301,8 @@ class EmbeddingsIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if coverage_policy is not UNSET:
+            field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
             field_dict["external"] = external
         if sparse is not UNSET:
@@ -336,6 +346,13 @@ class EmbeddingsIndexConfig:
         from ..models.index_execution_config import IndexExecutionConfig
 
         d = dict(src_dict)
+        _coverage_policy = d.pop("coverage_policy", UNSET)
+        coverage_policy: DerivedCoveragePolicy | Unset
+        if isinstance(_coverage_policy, Unset):
+            coverage_policy = UNSET
+        else:
+            coverage_policy = DerivedCoveragePolicy(_coverage_policy)
+
         external = d.pop("external", UNSET)
 
         sparse = d.pop("sparse", UNSET)
@@ -394,6 +411,7 @@ class EmbeddingsIndexConfig:
             execution = IndexExecutionConfig.from_dict(_execution)
 
         embeddings_index_config = cls(
+            coverage_policy=coverage_policy,
             external=external,
             sparse=sparse,
             dimension=dimension,

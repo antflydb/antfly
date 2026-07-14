@@ -88,11 +88,11 @@ func TestE2E_LocalBypassLatency(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
+		standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{
 			DisableInference: true,
 			LocalBypass:      localBypass,
 		})
-		defer swarm.Cleanup()
+		defer standalone.Cleanup()
 
 		// Create table.
 		embIdx := antfly.IndexConfig{Name: indexName, Type: "aknn_v0"}
@@ -102,12 +102,12 @@ func TestE2E_LocalBypassLatency(t *testing.T) {
 			External:       true,
 		})
 		require.NoError(t, err)
-		err = swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+		err = standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 			NumShards: 1,
 			Indexes:   map[string]antfly.IndexConfig{indexName: embIdx},
 		})
 		require.NoError(t, err)
-		waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+		waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 
 		// Insert.
 		insertStart := time.Now()
@@ -120,7 +120,7 @@ func TestE2E_LocalBypassLatency(t *testing.T) {
 					"_embeddings": map[string]any{indexName: vector.T(dataset.At(i))},
 				}
 			}
-			_, batchErr := swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
+			_, batchErr := standalone.Client.Batch(ctx, tableName, antfly.BatchRequest{
 				Inserts:   inserts,
 				SyncLevel: antfly.SyncLevelFullIndex,
 			})
@@ -130,7 +130,7 @@ func TestE2E_LocalBypassLatency(t *testing.T) {
 
 		// Wait for index readiness.
 		require.Eventually(t, func() bool {
-			resp, qErr := swarm.Client.Query(ctx, antfly.QueryRequest{
+			resp, qErr := standalone.Client.Query(ctx, antfly.QueryRequest{
 				Table:      tableName,
 				Limit:      1,
 				Embeddings: map[string]antfly.Embedding{indexName: queryEmbeddings[0]},
@@ -141,7 +141,7 @@ func TestE2E_LocalBypassLatency(t *testing.T) {
 
 		// Warmup.
 		for i := range min(10, queryCount) {
-			_, err := swarm.Client.Query(ctx, antfly.QueryRequest{
+			_, err := standalone.Client.Query(ctx, antfly.QueryRequest{
 				Table:      tableName,
 				Limit:      topK,
 				Embeddings: map[string]antfly.Embedding{indexName: queryEmbeddings[i]},
@@ -154,7 +154,7 @@ func TestE2E_LocalBypassLatency(t *testing.T) {
 		var recallSum float64
 		for i := range queryCount {
 			start := time.Now()
-			resp, qErr := swarm.Client.Query(ctx, antfly.QueryRequest{
+			resp, qErr := standalone.Client.Query(ctx, antfly.QueryRequest{
 				Table:      tableName,
 				Limit:      topK,
 				Embeddings: map[string]antfly.Embedding{indexName: queryEmbeddings[i]},

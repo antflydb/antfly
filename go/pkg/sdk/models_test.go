@@ -75,6 +75,24 @@ func TestSortProfileUsesClosedPublicDiagnosticShape(t *testing.T) {
 	}
 }
 
+func TestDerivedCoveragePendingDistinguishesUnknownFromZero(t *testing.T) {
+	var unknown oapi.DerivedCoverageStatus
+	if err := json.Unmarshal([]byte(`{"pending":null}`), &unknown); err != nil {
+		t.Fatalf("unmarshal unknown coverage pending: %v", err)
+	}
+	if unknown.Pending != nil {
+		t.Fatalf("Pending = %v, want nil for incomplete observation", *unknown.Pending)
+	}
+
+	var complete oapi.DerivedCoverageStatus
+	if err := json.Unmarshal([]byte(`{"pending":0}`), &complete); err != nil {
+		t.Fatalf("unmarshal complete coverage pending: %v", err)
+	}
+	if complete.Pending == nil || *complete.Pending != 0 {
+		t.Fatalf("Pending = %v, want pointer to zero for complete coverage", complete.Pending)
+	}
+}
+
 func TestPullHuggingFaceModelSelectsClipclapQ4K(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

@@ -217,6 +217,8 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
+const default_read_queue_max_tokens: usize = 256;
+const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 
 const GenerateBackendSelection = struct {
@@ -224,6 +226,7 @@ const GenerateBackendSelection = struct {
     compiled_partition_backend: ?ops.BackendKind = null,
     compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = .partitioned,
     graph_mode_requested: bool = false,
+    eager_mode_requested: bool = false,
 };
 
 fn parseGenerateBackendSelection(
@@ -237,8 +240,12 @@ fn parseGenerateBackendSelection(
         native_backend_choice.Choice.auto;
     try native_backend_choice.validate(choice);
 
+    var eager_mode_requested = false;
     const compiled_mode_requested = if (mode_value) |value| blk: {
-        if (std.mem.eql(u8, value, "eager")) break :blk false;
+        if (std.mem.eql(u8, value, "eager")) {
+            eager_mode_requested = true;
+            break :blk false;
+        }
         if (std.mem.eql(u8, value, "compiled")) break :blk true;
         return error.InvalidGenerateMode;
     } else false;
@@ -261,7 +268,21 @@ fn parseGenerateBackendSelection(
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
+        .eager_mode_requested = eager_mode_requested,
     };
+}
+
+fn shouldAutoUseMetalWholeModelGenerate(
+    loaded_backend: backends_mod.BackendType,
+    metal_executor_supported: bool,
+    deepseek_compressed_cache: bool,
+    selection: GenerateBackendSelection,
+) bool {
+    if (!build_options.enable_metal) return false;
+    if (selection.eager_mode_requested) return false;
+    if (selection.compiled_partition_backend != null) return false;
+    if (selection.native_choice == .native) return false;
+    return loaded_backend == .metal and metal_executor_supported and !deepseek_compressed_cache;
 }
 
 fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
@@ -1147,9 +1168,11 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
-        try self.request_queue.acquire();
+        const max_tokens = try validateReadMaxTokens(request.max_tokens);
+        const queue_units = estimateReadQueueUnits(request.images.len, max_tokens);
+        try self.request_queue.acquireUnits(queue_units);
         self.updateQueueMetrics();
-        defer self.releaseSlot();
+        defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
@@ -1189,7 +1212,7 @@ pub const Node = struct {
 
         const results = try reader.readBatch(image_datas, .{
             .prompt = request.prompt,
-            .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
+            .max_tokens = max_tokens,
         });
         defer {
             for (results) |result| {
@@ -1262,7 +1285,8 @@ pub const Node = struct {
     ) !extracting_api.Response {
         try self.request_queue.acquire();
         self.updateQueueMetrics();
-        defer self.releaseSlot();
+        var queue_units: usize = 1;
+        defer if (queue_units > 0) self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("extract.local");
         defer self.metrics.decActive();
 
@@ -1288,6 +1312,20 @@ pub const Node = struct {
 
         var parsed_inputs = try parseDirectExtractionInputs(self, allocator, request.inputs, options.prompt, options.max_tokens);
         defer parsed_inputs.deinit();
+        const required_units = if (parsed_inputs.images.items.len > 0) blk: {
+            if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
+            if (parsed_inputs.max_tokens) |max_tokens| {
+                if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
+            }
+            break :blk estimateReadQueueUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens);
+        } else 1;
+        if (required_units > queue_units) {
+            self.releaseSlotUnits(queue_units);
+            queue_units = 0;
+            try self.request_queue.acquireUnits(required_units);
+            queue_units = required_units;
+            self.updateQueueMetrics();
+        }
 
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
@@ -2814,15 +2852,30 @@ pub const Node = struct {
             }
         }
 
+        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
+            model.session.backend(),
+            graph_mod.metal_executor.supportsSession(model.session),
+            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
+            backend_selection,
+        );
+        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
+            .metal
+        else
+            backend_selection.compiled_partition_backend;
+        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
+            .whole_model
+        else
+            backend_selection.compiled_attachment_target;
+
         const graph_mode = backend_selection.graph_mode_requested or
-            backend_selection.compiled_partition_backend != null or
+            effective_compiled_partition_backend != null or
             graphModeEnabled();
         const use_scheduler = !graph_mode;
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
             model.session.backend() == .metal and
-            backend_selection.compiled_partition_backend == .metal and
-            backend_selection.compiled_attachment_target == .whole_model and
+            effective_compiled_partition_backend == .metal and
+            effective_compiled_attachment_target == .whole_model and
             graph_mod.metal_executor.supportsSession(model.session) and
             !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
         var request_graph_cache: ?graph_mod.cache.GraphCache = if (graph_mode and !use_model_graph_cache)
@@ -2865,8 +2918,8 @@ pub const Node = struct {
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
             .prompt_cache = prompt_cache,
             .graph_cache = graph_cache,
-            .compiled_partition_backend = backend_selection.compiled_partition_backend,
-            .compiled_attachment_target = backend_selection.compiled_attachment_target,
+            .compiled_partition_backend = effective_compiled_partition_backend,
+            .compiled_attachment_target = effective_compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
         };
 
@@ -4886,11 +4939,6 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
-        self.metrics.incRequest("read");
-        defer self.metrics.decActive();
-
         if (body.images.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'images' must not be empty" });
         }
@@ -4900,6 +4948,16 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = validateReadMaxTokens(body.max_tokens) catch
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' must be between 1 and 1024",
+            });
+        const queue_units = estimateReadQueueUnits(body.images.len, max_tokens);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("read");
+        defer self.metrics.decActive();
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -4979,9 +5037,14 @@ pub const Node = struct {
 
         const results = reader.readBatch(image_datas, .{
             .prompt = body.prompt,
-            .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
-        }) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            .max_tokens = max_tokens,
+        }) catch |err| switch (err) {
+            error.InvalidMaxTokens => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' exceeds the selected model's context limit",
+            }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+        };
         defer {
             for (results) |result| {
                 var tmp = result;
@@ -5189,11 +5252,6 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
-        self.metrics.incRequest("extract");
-        defer self.metrics.decActive();
-
         if (body.model.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
         }
@@ -5217,6 +5275,22 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = if (has_images)
+            validateReadMaxTokens(body.max_tokens) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "'max_tokens' must be between 1 and 1024",
+                })
+        else
+            null;
+        const queue_units = if (has_images)
+            estimateReadQueueUnits(images.len, max_tokens)
+        else
+            1;
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("extract");
+        defer self.metrics.decActive();
         const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch |err| {
             const message = try std.fmt.allocPrint(ctx.allocator, "invalid schema: {s}", .{@errorName(err)});
             defer ctx.allocator.free(message);
@@ -5255,9 +5329,13 @@ pub const Node = struct {
             }
             break :blk extractor.extractImages(extractor_ctx, schemas, config, image_datas, .{
                 .prompt = body.prompt,
-                .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
+                .max_tokens = max_tokens,
             });
         }) catch |err| switch (err) {
+            error.InvalidMaxTokens => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' exceeds the selected model's context limit",
+            }),
             error.UnsupportedInput => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
                 .message = if (has_images)
@@ -5540,7 +5618,7 @@ pub const Node = struct {
     }
 
     /// Register inference API routes on an external server with a compile-time prefix.
-    /// Used by swarm mode to register on the unified httpx.Server.
+    /// Used by standalone mode to register on the unified httpx.Server.
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
@@ -6685,6 +6763,23 @@ test "read batch downloaded byte accounting enforces aggregate cap" {
     try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
 }
 
+test "read max tokens preserves omission and rejects unsafe signed values" {
+    try std.testing.expectEqual(@as(?usize, null), try validateReadMaxTokens(null));
+    try std.testing.expectEqual(@as(?usize, 1), try validateReadMaxTokens(1));
+    try std.testing.expectEqual(@as(?usize, max_read_tokens), try validateReadMaxTokens(@intCast(max_read_tokens)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(-1));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(0));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(@intCast(max_read_tokens + 1)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(std.math.maxInt(i64)));
+}
+
+test "read queue units scale with image batch and decode length" {
+    try std.testing.expectEqual(@as(usize, 1), estimateReadQueueUnits(1, null));
+    try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, null));
+    try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_queue_max_tokens + 1));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
+}
+
 test "registerRoutesOn prefixes embed aliases and metrics route" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -6839,6 +6934,17 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expectEqual(native_backend_choice.Choice.auto, auto_compiled.native_choice);
     try std.testing.expectEqual(@as(?ops.BackendKind, null), auto_compiled.compiled_partition_backend);
     try std.testing.expect(auto_compiled.graph_mode_requested);
+
+    const auto_default = try parseGenerateBackendSelection(null, null, null);
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, auto_default));
+
+    const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
+    try std.testing.expect(metal_eager.eager_mode_requested);
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
 }
@@ -8673,6 +8779,18 @@ fn downloadReadBatchContent(
 
 fn readBatchMaxBytes() usize {
     return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_BYTES") orelse default_max_read_batch_bytes);
+}
+
+fn validateReadMaxTokens(value: ?i64) !?usize {
+    const requested = value orelse return null;
+    if (requested < 1 or requested > @as(i64, @intCast(max_read_tokens))) return error.InvalidMaxTokens;
+    return @intCast(requested);
+}
+
+fn estimateReadQueueUnits(image_count: usize, max_tokens: ?usize) usize {
+    const estimated_max_tokens = max_tokens orelse default_read_queue_max_tokens;
+    const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / default_read_queue_max_tokens);
+    return std.math.mul(usize, @max(image_count, 1), token_units) catch std.math.maxInt(usize);
 }
 
 fn addReadBatchDownloadedBytes(current: usize, item: scraping.DownloadedContent, max_bytes: usize) !usize {

@@ -31,7 +31,10 @@ class Connection:
         status (ConnectionStatus): Connection status. "connected" means a live probe or listing succeeded,
             "error" means the probe failed (see the error field), "configured" means
             the connection is present but was not probed, and "unsupported" means
-            no probe is available for this connection kind or provider.
+            no probe is available for this connection kind or provider. For S3,
+            connected means an authenticated HeadBucket request succeeded for every
+            explicitly allowlisted bucket. It verifies bucket discovery permission,
+            not mutation permissions such as PutObject.
         capabilities (list[str]): Namespaced actions and workflow uses this connection supports, such as models.embed,
             content.fetch, objects.read, or cdc.read_stream.
         display_name (str | Unset): Optional display name for UIs.

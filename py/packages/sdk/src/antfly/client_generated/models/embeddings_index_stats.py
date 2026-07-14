@@ -10,6 +10,7 @@ from ..models.embeddings_index_stats_index_type import EmbeddingsIndexStatsIndex
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.derived_coverage_status import DerivedCoverageStatus
     from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
     from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
     from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
@@ -38,7 +39,9 @@ class EmbeddingsIndexStats:
         backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
         backfill_items_processed (int | Unset): Total items processed during backfill
         backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
-        doc_count (int | Unset): Number of documents visible to the index.
+        doc_count (int | Unset): Number of physical vectors or sparse entries visible to the index; chunked indexes may
+            contain multiple entries per source document.
+        coverage (DerivedCoverageStatus | Unset):
         query_visible_doc_count (int | Unset): Documents currently visible to queries.
         published_doc_count (int | Unset):
         published_node_count (int | Unset):
@@ -105,6 +108,7 @@ class EmbeddingsIndexStats:
     backfill_items_processed: int | Unset = UNSET
     backfill_state: str | Unset = UNSET
     doc_count: int | Unset = UNSET
+    coverage: DerivedCoverageStatus | Unset = UNSET
     query_visible_doc_count: int | Unset = UNSET
     published_doc_count: int | Unset = UNSET
     published_node_count: int | Unset = UNSET
@@ -177,6 +181,10 @@ class EmbeddingsIndexStats:
         backfill_state = self.backfill_state
 
         doc_count = self.doc_count
+
+        coverage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.coverage, Unset):
+            coverage = self.coverage.to_dict()
 
         query_visible_doc_count = self.query_visible_doc_count
 
@@ -309,6 +317,8 @@ class EmbeddingsIndexStats:
             field_dict["backfill_state"] = backfill_state
         if doc_count is not UNSET:
             field_dict["doc_count"] = doc_count
+        if coverage is not UNSET:
+            field_dict["coverage"] = coverage
         if query_visible_doc_count is not UNSET:
             field_dict["query_visible_doc_count"] = query_visible_doc_count
         if published_doc_count is not UNSET:
@@ -402,6 +412,7 @@ class EmbeddingsIndexStats:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.derived_coverage_status import DerivedCoverageStatus
         from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
         from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
         from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
@@ -435,6 +446,13 @@ class EmbeddingsIndexStats:
         backfill_state = d.pop("backfill_state", UNSET)
 
         doc_count = d.pop("doc_count", UNSET)
+
+        _coverage = d.pop("coverage", UNSET)
+        coverage: DerivedCoverageStatus | Unset
+        if isinstance(_coverage, Unset):
+            coverage = UNSET
+        else:
+            coverage = DerivedCoverageStatus.from_dict(_coverage)
 
         query_visible_doc_count = d.pop("query_visible_doc_count", UNSET)
 
@@ -568,6 +586,7 @@ class EmbeddingsIndexStats:
             backfill_items_processed=backfill_items_processed,
             backfill_state=backfill_state,
             doc_count=doc_count,
+            coverage=coverage,
             query_visible_doc_count=query_visible_doc_count,
             published_doc_count=published_doc_count,
             published_node_count=published_node_count,

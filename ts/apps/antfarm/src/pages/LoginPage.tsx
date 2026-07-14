@@ -77,7 +77,7 @@ export function LoginPage() {
                   {error.includes("Failed to fetch user info") && (
                     <span className="mt-2 block text-xs">
                       Antfarm could not reach the Antfly API at <code>{apiTarget}</code>. Run{" "}
-                      <code>./antfly swarm</code>, or restart Vite with{" "}
+                      <code>./antfly standalone</code>, or restart Vite with{" "}
                       <code>ANTFARM_API_PROXY_TARGET</code> set to a running backend.
                     </span>
                   )}

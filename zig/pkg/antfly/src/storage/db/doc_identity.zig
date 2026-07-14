@@ -772,10 +772,18 @@ pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {
     var txn = try store.beginProbeTxn();
     defer txn.abort();
     const next = try readNextOrdinalTxn(&txn);
-    return .{
+    var stats = Stats{
         .next_ordinal = next,
         .allocated_ordinals = if (next > 0) next - 1 else 0,
     };
+    if (try readVisibilitySummaryTxn(&txn)) |summary| {
+        stats.live_ordinals = summary.live_ordinals;
+        stats.tombstone_ordinals = summary.tombstone_ordinals;
+        stats.max_created_generation = summary.max_created_generation;
+        stats.min_deleted_generation = summary.min_deleted_generation;
+        stats.max_deleted_generation = summary.max_deleted_generation;
+    }
+    return stats;
 }
 
 pub fn allVisibleFromSummaryFast(store: *docstore_mod.DocStore, generation: ?u64) !?bool {
@@ -1009,6 +1017,13 @@ pub fn visibilitySummaryFromWrites(writes: []const docstore_mod.KVPair) !?Visibi
 
 pub fn fullStatsFromStore(store: *docstore_mod.DocStore) !Stats {
     var stats = try fastStatsFromStore(store);
+    stats.state_rows = 0;
+    stats.live_ordinals = 0;
+    stats.tombstone_ordinals = 0;
+    stats.min_created_generation = 0;
+    stats.max_created_generation = 0;
+    stats.min_deleted_generation = 0;
+    stats.max_deleted_generation = 0;
     const State = struct {
         stats: *Stats,
 

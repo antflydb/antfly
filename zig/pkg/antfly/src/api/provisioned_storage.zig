@@ -234,8 +234,7 @@ pub const ProvisionedGroupStorage = struct {
         _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
         read_source.primary_lookup_db = write_source.primaryLookupDbSource();
         write_source.read_cache = &self.read_cache;
-        write_source.write_cache = &self.write_cache;
-        write_source.startup_write_cache = &self.startup_write_cache;
+        write_source.bindWriteCaches(&self.write_cache, &self.startup_write_cache);
         write_source.runtime_status_cache = &self.runtime_status_cache;
         _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
     }
@@ -368,7 +367,6 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
         resource_manager_mod.Slice.lite_native_page_cache,
         resource_manager_mod.Slice.lite_native_link_cache,
-        resource_manager_mod.Slice.lite_docstore_snapshot_cache,
     }) |slice| {
         const stats = storage.resource_manager.sliceStats(slice);
         try std.testing.expect(stats.hard_limit_bytes > 0);

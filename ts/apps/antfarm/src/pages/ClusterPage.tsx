@@ -429,7 +429,7 @@ const ClusterPage: React.FC = () => {
                 shardCount={getStoreShardCount(cluster.shards, store.id)}
               />
             ))}
-            {!cluster.swarmMode && cluster.metadataInfo && (
+            {!cluster.standaloneMode && cluster.metadataInfo && (
               <MetadataRaftCard metadataInfo={cluster.metadataInfo} />
             )}
           </div>

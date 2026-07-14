@@ -3119,7 +3119,7 @@ test "document mapper full text projection omits vector-like stored payloads" {
 
     var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
     defer reader.deinit();
-    const stored = (try reader.storedDocDecompressed(0)).?;
+    const stored = (try reader.storedDocDecompressed(alloc, 0)).?;
     defer alloc.free(stored.data);
 
     try std.testing.expect(std.mem.indexOf(u8, source, "\"embedding\"") != null);
@@ -3156,7 +3156,7 @@ test "document mapper full text projection uses configured vector fields before 
 
     var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
     defer reader.deinit();
-    const stored = (try reader.storedDocDecompressed(0)).?;
+    const stored = (try reader.storedDocDecompressed(alloc, 0)).?;
     defer alloc.free(stored.data);
 
     try std.testing.expect(std.mem.indexOf(u8, stored.data, "\"embedding\"") == null);

@@ -17,7 +17,6 @@
 const std = @import("std");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
-const platform_time = antfly_platform.time;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_erased = @import("../backend_erased.zig");
 const backend_types = @import("../backend_types.zig");
@@ -27,6 +26,7 @@ const native = @import("native.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
+const bounded_cursor_test_documents: usize = 512;
 
 pub const OpenOptions = struct {
     read_only: bool = false,
@@ -40,60 +40,18 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
-/// Immutable, refcounted materialized view of the document store at one
-/// checkpoint. The store caches the latest snapshot so transactions can share
-/// it instead of re-walking the document page chain per transaction; open
-/// transactions keep their snapshot alive after newer ones are published,
-/// preserving the existing pinned-snapshot semantics.
-const SharedSnapshot = struct {
-    allocator: Allocator,
-    refs: std.atomic.Value(usize),
-    commit_sequence: u64,
-    document_root_page: u64,
-    docs: []native.OwnedDocument,
-    resource_reservation: ?resource_manager_mod.Reservation = null,
-
-    fn create(
-        allocator: Allocator,
-        docs: []native.OwnedDocument,
-        commit_sequence: u64,
-        document_root_page: u64,
-        initial_refs: usize,
-        resource_reservation: ?resource_manager_mod.Reservation,
-    ) !*SharedSnapshot {
-        const snap = try allocator.create(SharedSnapshot);
-        snap.* = .{
-            .allocator = allocator,
-            .refs = .init(initial_refs),
-            .commit_sequence = commit_sequence,
-            .document_root_page = document_root_page,
-            .docs = docs,
-            .resource_reservation = resource_reservation,
-        };
-        return snap;
-    }
-
-    fn retain(self: *SharedSnapshot) void {
-        _ = self.refs.fetchAdd(1, .monotonic);
-    }
-
-    fn release(self: *SharedSnapshot) void {
-        if (self.refs.fetchSub(1, .acq_rel) == 1) {
-            const allocator = self.allocator;
-            if (self.resource_reservation) |*reservation| reservation.release();
-            native.NativeFile.freeSnapshotDocuments(allocator, self.docs);
-            allocator.destroy(self);
-        }
-    }
-};
-
 pub const Store = struct {
     allocator: Allocator,
     file: native.NativeFile,
     read_only: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
+    writer_mutex: std.Io.Mutex = .init,
+    writer_ready: std.Io.Condition = .init,
+    generation_lock: std.Io.RwLock = .init,
     writer_active: bool = false,
-    cached_snapshot: ?*SharedSnapshot = null,
+    writer_ticketed: bool = false,
+    next_writer_ticket: u64 = 0,
+    serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !Store {
@@ -133,7 +91,6 @@ pub const Store = struct {
     }
 
     pub fn close(self: *Store) void {
-        if (self.cached_snapshot) |snap| snap.release();
         self.file.close();
         self.* = undefined;
     }
@@ -146,43 +103,65 @@ pub const Store = struct {
         return try backend_erased.storeFrom(allocator, RuntimeStore{ .store = self });
     }
 
+    /// Returns a DB runtime store isolated under a caller-owned key prefix, or
+    /// the embedded root when `prefix` is empty. Non-empty prefixes must remain
+    /// alive for the erased store's lifetime and end in a zero byte so range
+    /// scans have an unambiguous namespace boundary.
+    pub fn runtimeStoreWithPrefix(self: *Store, allocator: Allocator, prefix: []const u8) !backend_erased.Store {
+        if (prefix.len > 0 and prefix[prefix.len - 1] != 0) return error.InvalidArgument;
+        return try backend_erased.storeFrom(allocator, RuntimeStore{ .store = self, .prefix = prefix });
+    }
+
     pub fn vacuum(self: *Store) !native.VacuumReport {
+        return try self.vacuumWithCancel(null);
+    }
+
+    pub fn vacuumWithCancel(self: *Store, cancel: ?*const @import("../maintenance.zig").CancelToken) !native.VacuumReport {
         try self.reserveWriterSlot();
         defer self.releaseWriterSlot();
 
+        const io = self.file.io_impl.io();
+        self.generation_lock.lockUncancelable(io);
+        defer self.generation_lock.unlock(io);
+
         lockStore(self);
         defer self.mutex.unlock();
-        const report = try self.file.vacuum();
-        clearCachedSnapshotLocked(self);
-        return report;
+        return try self.file.vacuumWithCancel(cancel);
     }
 
     pub fn reserveWriterSlot(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        lockStore(self);
-        defer self.mutex.unlock();
-        if (self.writer_active) return error.FileBusy;
+        const io = self.file.io_impl.io();
+        self.writer_mutex.lockUncancelable(io);
+        defer self.writer_mutex.unlock(io);
+        if (self.writer_active or self.next_writer_ticket != self.serving_writer_ticket) return error.FileBusy;
         self.writer_active = true;
+        self.writer_ticketed = false;
     }
 
     pub fn reserveWriterSlotYielding(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        while (true) {
-            lockStore(self);
-            if (!self.writer_active) {
-                self.writer_active = true;
-                self.mutex.unlock();
-                return;
-            }
-            self.mutex.unlock();
-            platform_time.yieldBriefly();
+        const io = self.file.io_impl.io();
+        self.writer_mutex.lockUncancelable(io);
+        defer self.writer_mutex.unlock(io);
+        const ticket = self.next_writer_ticket;
+        self.next_writer_ticket +%= 1;
+        while (self.writer_active or ticket != self.serving_writer_ticket) {
+            self.writer_ready.waitUncancelable(io, &self.writer_mutex);
         }
+        self.writer_active = true;
+        self.writer_ticketed = true;
     }
 
     pub fn releaseWriterSlot(self: *Store) void {
-        lockStore(self);
-        defer self.mutex.unlock();
+        const io = self.file.io_impl.io();
+        self.writer_mutex.lockUncancelable(io);
+        defer self.writer_mutex.unlock(io);
+        std.debug.assert(self.writer_active);
         self.writer_active = false;
+        if (self.writer_ticketed) self.serving_writer_ticket +%= 1;
+        self.writer_ticketed = false;
+        self.writer_ready.broadcast(io);
     }
 
     const NativeBackendStore = backend_adapter.Store(Store, Txn, Txn, Txn, .{
@@ -390,41 +369,70 @@ pub const Store = struct {
 
 const RuntimeStore = struct {
     store: *Store,
+    prefix: []const u8 = "",
 
     pub fn capabilities(self: *RuntimeStore) backend_types.Capabilities {
         return Store.capabilities(self.store);
     }
 
     pub fn beginRead(self: *RuntimeStore) !Txn {
-        return try self.store.beginRead();
+        return try Txn.openReadWithPrefix(self.store, self.prefix);
     }
 
     pub fn beginWrite(self: *RuntimeStore) !Txn {
-        return try self.store.beginWriteYielding();
+        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
     }
 
     pub fn beginBatch(self: *RuntimeStore) !Txn {
-        return try self.store.beginBatchYielding();
+        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
     }
 
     pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
-        return try self.store.beginBatchWithOptionsYielding(options);
+        _ = options;
+        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
     }
 
     pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
-        return self.store.lastReplaySequence(fallback_last);
+        const next = self.nextReplaySequence(fallback_last + 1);
+        return if (next <= 1) 0 else next - 1;
     }
 
     pub fn nextReplaySequence(self: *RuntimeStore, fallback_next: u64) u64 {
-        return self.store.nextReplaySequence(fallback_next);
+        var read = self.beginRead() catch return fallback_next;
+        defer read.abort();
+        const raw = read.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        if (raw.len != 8) return fallback_next;
+        return std.mem.readInt(u64, raw[0..8], .little);
     }
 
     pub fn appendReplayOpaque(self: *RuntimeStore, alloc: Allocator, sequence: u64, payload: []const u8) !void {
-        return try self.store.appendReplayOpaqueYielding(alloc, sequence, payload);
+        _ = alloc;
+        var txn = try self.beginWrite();
+        errdefer txn.abort();
+        try txn.setReplayOpaque(sequence, payload);
+        try txn.commit();
     }
 
     pub fn iterateReplayFrom(self: *RuntimeStore, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
-        return try self.store.iterateReplayFrom(alloc, from_sequence);
+        var entries = std.ArrayListUnmanaged(backend_types.ReplayEntry).empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(alloc);
+            entries.deinit(alloc);
+        }
+        const Context = struct {
+            allocator: Allocator,
+            entries: *std.ArrayListUnmanaged(backend_types.ReplayEntry),
+            fn handle(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                try ctx.entries.append(ctx.allocator, .{
+                    .sequence = sequence,
+                    .payload = try ctx.allocator.dupe(u8, payload),
+                });
+            }
+        };
+        var ctx = Context{ .allocator = alloc, .entries = &entries };
+        _ = try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Context.handle);
+        return try entries.toOwnedSlice(alloc);
     }
 
     pub fn forEachReplayLaneFrom(
@@ -435,11 +443,50 @@ const RuntimeStore = struct {
         callback_ctx: *anyopaque,
         callback: backend_erased.Store.ReplayCallback,
     ) !backend_types.ReplayLaneIterationStats {
-        return try self.store.forEachReplayLaneFrom(kind_ordinal, from_sequence, max_entries, callback_ctx, callback);
+        var read = try self.beginRead();
+        defer read.abort();
+        _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return error.ReplayIndexUnavailable;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(kind_ordinal, from_sequence);
+        const upper = internal_keys.replayRangeUpper(kind_ordinal);
+        cursor.setUpperBound(upper[0..]);
+        var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+        var entry = cursor.seekAtOrAfter(lower[0..]) catch return stats;
+        while (true) {
+            if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
+            const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind_ordinal) orelse break;
+            try callback(callback_ctx, sequence, entry.value);
+            stats.scanned_entries += 1;
+            stats.matched_entries += 1;
+            stats.last_sequence = sequence;
+            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
+            entry = cursor.next() catch break;
+        }
+        return stats;
     }
 
     pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
-        return try self.store.truncateReplayUpToYielding(alloc, up_to_sequence);
+        if (up_to_sequence == 0) return;
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+        {
+            var read = try self.beginRead();
+            defer read.abort();
+            _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return;
+            try collectReplayDeletes(alloc, &read, internal_keys.replay_all_kind, up_to_sequence, &deletes);
+            for (replay_hints) |hint| {
+                try collectReplayDeletes(alloc, &read, replayHintOrdinal(hint), up_to_sequence, &deletes);
+            }
+        }
+        if (deletes.items.len == 0) return;
+        var write = try self.beginWrite();
+        errdefer write.abort();
+        for (deletes.items) |key| try write.delete(key);
+        try write.commit();
     }
 };
 
@@ -448,208 +495,90 @@ const PendingMutation = struct {
     value: ?[]u8 = null,
 };
 
-fn clearCachedSnapshotLocked(store: *Store) void {
-    if (store.cached_snapshot) |old| old.release();
-    store.cached_snapshot = null;
-}
-
-fn snapshotByteCost(docs: []const native.OwnedDocument) u64 {
-    var total: u64 = @sizeOf(SharedSnapshot) + @as(u64, @intCast(docs.len)) * @as(u64, @sizeOf(native.OwnedDocument));
-    for (docs) |doc| {
-        total +|= @intCast(doc.key.len);
-        total +|= @intCast(doc.value.len);
-    }
-    return total;
-}
-
-fn createCachedSnapshotLocked(
-    store: *Store,
-    docs: []native.OwnedDocument,
-    commit_sequence: u64,
-    document_root_page: u64,
-    initial_refs: usize,
-) !?*SharedSnapshot {
-    var reservation: ?resource_manager_mod.Reservation = null;
-    if (store.resource_manager) |manager| {
-        reservation = manager.reserve(.lite_docstore_snapshot_cache, snapshotByteCost(docs)) catch return null;
-    }
-    errdefer if (reservation) |*reserved| reserved.release();
-    return try SharedSnapshot.create(store.allocator, docs, commit_sequence, document_root_page, initial_refs, reservation);
-}
-
-fn createUncachedSnapshot(
-    store: *Store,
-    docs: []native.OwnedDocument,
-    commit_sequence: u64,
-    document_root_page: u64,
-) !*SharedSnapshot {
-    return try SharedSnapshot.create(store.allocator, docs, commit_sequence, document_root_page, 1, null);
-}
-
-/// Returns a retained snapshot for the store's active checkpoint, reusing the
-/// cached one when it is still current. Must be called with `store.mutex`
-/// held.
-fn acquireSnapshotLocked(store: *Store) !*SharedSnapshot {
-    const checkpoint = store.file.activeCheckpoint();
-    if (store.cached_snapshot) |snap| {
-        if (snap.commit_sequence == checkpoint.commit_sequence and
-            snap.document_root_page == checkpoint.document_root_page)
-        {
-            snap.retain();
-            return snap;
-        }
-    }
-
-    const docs = try store.file.snapshotDocumentsAlloc(store.allocator);
-    errdefer native.NativeFile.freeSnapshotDocuments(store.allocator, docs);
-    if (store.cached_snapshot) |_| clearCachedSnapshotLocked(store);
-    // Two refs: one owned by the store cache, one handed to the caller.
-    if (try createCachedSnapshotLocked(store, docs, checkpoint.commit_sequence, checkpoint.document_root_page, 2)) |snap| {
-        store.cached_snapshot = snap;
-        return snap;
-    }
-    return try createUncachedSnapshot(store, docs, checkpoint.commit_sequence, checkpoint.document_root_page);
-}
-
-/// After a successful `putDocumentBatch`, publish the committing
-/// transaction's mutations applied to its base snapshot as the store's cached
-/// snapshot for the new checkpoint. The document chain cannot have moved
-/// between the base snapshot and this commit because the committer held the
-/// writer slot throughout. Failure just drops the cache; the next transaction
-/// rebuilds from disk. Must be called with `store.mutex` held.
-fn publishAppliedSnapshotLocked(store: *Store, base: []const native.OwnedDocument, pending: []const PendingMutation) void {
-    const applied = buildAppliedSnapshotDocs(store.allocator, base, pending) catch return clearCachedSnapshotLocked(store);
-    const checkpoint = store.file.activeCheckpoint();
-    clearCachedSnapshotLocked(store);
-    const maybe_snap = createCachedSnapshotLocked(
-        store,
-        applied,
-        checkpoint.commit_sequence,
-        checkpoint.document_root_page,
-        1,
-    ) catch {
-        native.NativeFile.freeSnapshotDocuments(store.allocator, applied);
-        return clearCachedSnapshotLocked(store);
-    };
-    if (maybe_snap) |snap| {
-        store.cached_snapshot = snap;
-    } else {
-        native.NativeFile.freeSnapshotDocuments(store.allocator, applied);
-    }
-}
-
-/// Builds the sorted post-commit document set from a base snapshot plus the
-/// commit's pending mutations. Later mutations win over earlier ones for the
-/// same key and deletes drop the key, matching both `Txn.get` overlay
-/// semantics and what a fresh chain walk would materialize after
-/// `putDocumentBatch` appended the same mutations in order.
-fn buildAppliedSnapshotDocs(
-    allocator: Allocator,
-    base: []const native.OwnedDocument,
-    pending: []const PendingMutation,
-) ![]native.OwnedDocument {
-    var updates = std.StringHashMapUnmanaged(?[]const u8).empty;
-    defer updates.deinit(allocator);
-    for (pending) |mutation| {
-        try updates.put(allocator, mutation.key, mutation.value);
-    }
-
-    var docs = std.ArrayListUnmanaged(native.OwnedDocument).empty;
-    errdefer {
-        for (docs.items) |doc| {
-            allocator.free(doc.key);
-            allocator.free(doc.value);
-        }
-        docs.deinit(allocator);
-    }
-    try docs.ensureTotalCapacity(allocator, base.len + updates.count());
-
-    for (base) |doc| {
-        if (updates.contains(doc.key)) continue;
-        const key = try allocator.dupe(u8, doc.key);
-        errdefer allocator.free(key);
-        const value = try allocator.dupe(u8, doc.value);
-        docs.appendAssumeCapacity(.{ .key = key, .value = value });
-    }
-
-    var it = updates.iterator();
-    while (it.next()) |entry| {
-        const value_src = entry.value_ptr.* orelse continue;
-        const key = try allocator.dupe(u8, entry.key_ptr.*);
-        errdefer allocator.free(key);
-        const value = try allocator.dupe(u8, value_src);
-        docs.appendAssumeCapacity(.{ .key = key, .value = value });
-    }
-
-    const owned = try docs.toOwnedSlice(allocator);
-    std.mem.sort(native.OwnedDocument, owned, {}, struct {
-        fn lessThan(_: void, lhs: native.OwnedDocument, rhs: native.OwnedDocument) bool {
-            return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-        }
-    }.lessThan);
-    return owned;
-}
-
 pub const Txn = struct {
     allocator: Allocator,
     store: ?*Store = null,
-    snapshot: ?*SharedSnapshot = null,
-    docs: []native.OwnedDocument = &.{},
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
+    pending_generation: u64 = 0,
     read_only: bool = true,
     writer_reserved: bool = false,
+    prefix: []const u8 = "",
+    owned_reads: std.ArrayListUnmanaged([]u8) = .empty,
+    generation_read_locked: bool = false,
+    checkpoint: native.CheckpointSlot = .{},
 
     pub fn openRead(store: *Store) !Txn {
+        return try openReadWithPrefix(store, "");
+    }
+
+    pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
+        try validatePrefix(prefix);
+        const io = store.file.io_impl.io();
+        store.generation_lock.lockSharedUncancelable(io);
+        errdefer store.generation_lock.unlockShared(io);
         lockStore(store);
         defer store.mutex.unlock();
-        const snapshot = try acquireSnapshotLocked(store);
+        const checkpoint = store.file.activeCheckpoint();
         return .{
             .allocator = store.allocator,
-            .snapshot = snapshot,
-            .docs = snapshot.docs,
+            .store = store,
             .read_only = true,
+            .prefix = prefix,
+            .generation_read_locked = true,
+            .checkpoint = checkpoint,
         };
     }
 
     pub fn openWrite(store: *Store) !Txn {
+        return try openWriteWithPrefix(store, "");
+    }
+
+    pub fn openWriteWithPrefix(store: *Store, prefix: []const u8) !Txn {
+        try validatePrefix(prefix);
         try store.reserveWriterSlot();
         errdefer store.releaseWriterSlot();
 
         lockStore(store);
         defer store.mutex.unlock();
 
-        const snapshot = try acquireSnapshotLocked(store);
+        const checkpoint = store.file.activeCheckpoint();
         return .{
             .allocator = store.allocator,
             .store = store,
-            .snapshot = snapshot,
-            .docs = snapshot.docs,
             .read_only = false,
             .writer_reserved = true,
+            .prefix = prefix,
+            .checkpoint = checkpoint,
         };
     }
 
     pub fn openWriteYielding(store: *Store) !Txn {
+        return try openWriteYieldingWithPrefix(store, "");
+    }
+
+    pub fn openWriteYieldingWithPrefix(store: *Store, prefix: []const u8) !Txn {
+        try validatePrefix(prefix);
         try store.reserveWriterSlotYielding();
         errdefer store.releaseWriterSlot();
 
         lockStore(store);
         defer store.mutex.unlock();
 
-        const snapshot = try acquireSnapshotLocked(store);
+        const checkpoint = store.file.activeCheckpoint();
         return .{
             .allocator = store.allocator,
             .store = store,
-            .snapshot = snapshot,
-            .docs = snapshot.docs,
             .read_only = false,
             .writer_reserved = true,
+            .prefix = prefix,
+            .checkpoint = checkpoint,
         };
     }
 
     pub fn abort(self: *Txn) void {
         self.freePending();
-        if (self.snapshot) |snap| snap.release();
+        self.freeOwnedReads();
+        self.releaseGenerationReadLock();
         self.releaseWriterSlot();
         self.* = undefined;
     }
@@ -671,55 +600,63 @@ pub const Txn = struct {
         defer store.mutex.unlock();
         errdefer {
             if (self.writer_reserved) {
-                store.writer_active = false;
+                store.releaseWriterSlot();
                 self.writer_reserved = false;
             }
         }
         try store.file.putDocumentBatch(mutations);
-        // An empty batch publishes no new checkpoint, so the existing cached
-        // snapshot is still current.
-        if (self.pending.items.len > 0) {
-            publishAppliedSnapshotLocked(store, self.docs, self.pending.items);
-        }
         if (self.writer_reserved) {
-            store.writer_active = false;
+            store.releaseWriterSlot();
             self.writer_reserved = false;
         }
 
         self.freePending();
-        if (self.snapshot) |snap| snap.release();
+        self.freeOwnedReads();
         self.* = undefined;
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
+        const lookup_key = try self.prefixedKey(key);
+        defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
         if (self.pending.items.len > 0) {
             var i = self.pending.items.len;
             while (i > 0) {
                 i -= 1;
                 const pending = self.pending.items[i];
-                if (!std.mem.eql(u8, pending.key, key)) continue;
+                if (!std.mem.eql(u8, pending.key, lookup_key)) continue;
                 return pending.value orelse error.NotFound;
             }
         }
-        const idx = lowerBoundDocs(self.docs, key);
-        if (idx >= self.docs.len or !std.mem.eql(u8, self.docs[idx].key, key)) return error.NotFound;
-        return self.docs[idx].value;
+        const store = self.store orelse return error.InvalidTransactionState;
+        const value = try store.file.getDocumentAtCheckpointAlloc(self.allocator, self.checkpoint, lookup_key);
+        const owned = value orelse return error.NotFound;
+        errdefer self.allocator.free(owned);
+        try self.owned_reads.append(self.allocator, owned);
+        return owned;
     }
 
     pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
-        const owned_key = try self.allocator.dupe(u8, key);
+        const owned_key = if (self.prefix.len == 0)
+            try self.allocator.dupe(u8, key)
+        else
+            try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
         try self.pending.append(self.allocator, .{ .key = owned_key, .value = owned_value });
+        self.pending_generation +%= 1;
     }
 
     pub fn delete(self: *Txn, key: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
-        const owned_key = try self.allocator.dupe(u8, key);
+        const owned_key = if (self.prefix.len == 0)
+            try self.allocator.dupe(u8, key)
+        else
+            try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         try self.pending.append(self.allocator, .{ .key = owned_key });
+        self.pending_generation +%= 1;
     }
 
     pub fn setReplayOpaque(self: *Txn, sequence: u64, payload: []const u8) !void {
@@ -727,7 +664,11 @@ pub const Txn = struct {
     }
 
     pub fn openCursor(self: *Txn) !Cursor {
-        return .{ .txn = self };
+        const store = self.store orelse return error.InvalidTransactionState;
+        return .{
+            .txn = self,
+            .index_cursor = native.DocumentIndexCursor.init(&store.file, self.checkpoint),
+        };
     }
 
     fn freePending(self: *Txn) void {
@@ -739,94 +680,369 @@ pub const Txn = struct {
         self.pending = .empty;
     }
 
+    fn freeOwnedReads(self: *Txn) void {
+        for (self.owned_reads.items) |value| self.allocator.free(value);
+        self.owned_reads.deinit(self.allocator);
+        self.owned_reads = .empty;
+    }
+
+    fn releaseGenerationReadLock(self: *Txn) void {
+        if (!self.generation_read_locked) return;
+        const store = self.store orelse return;
+        store.generation_lock.unlockShared(store.file.io_impl.io());
+        self.generation_read_locked = false;
+    }
+
     fn releaseWriterSlot(self: *Txn) void {
         if (!self.writer_reserved) return;
         const store = self.store orelse return;
         store.releaseWriterSlot();
         self.writer_reserved = false;
     }
+
+    fn prefixedKey(self: *Txn, key: []const u8) ![]const u8 {
+        if (self.prefix.len == 0) return key;
+        return try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
+    }
 };
 
-pub const Cursor = struct {
-    txn: *Txn,
-    current: ?usize = null,
-    upper_bound: ?[]const u8 = null,
+fn validatePrefix(prefix: []const u8) !void {
+    if (prefix.len > 0 and prefix[prefix.len - 1] != 0) return error.InvalidArgument;
+}
 
-    pub fn close(_: *Cursor) void {}
+pub const Cursor = struct {
+    const OverlayEntry = struct {
+        key: []const u8,
+        value: ?[]const u8,
+    };
+    const Direction = enum { forward, backward };
+
+    txn: *Txn,
+    index_cursor: native.DocumentIndexCursor,
+    current_key: ?[]u8 = null,
+    upper_bound: ?[]const u8 = null,
+    owned_value: ?[]u8 = null,
+    overlay: []OverlayEntry = &.{},
+    overlay_generation: u64 = std.math.maxInt(u64),
+    disk_candidate: ?native.DocumentIndexEntry = null,
+    last_direction: ?Direction = null,
+
+    pub fn close(self: *Cursor) void {
+        self.index_cursor.deinit();
+        if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
+        if (self.current_key) |key| self.txn.allocator.free(key);
+        if (self.owned_value) |value| self.txn.allocator.free(value);
+        if (self.overlay.len > 0) self.txn.allocator.free(self.overlay);
+        self.current_key = null;
+        self.owned_value = null;
+        self.disk_candidate = null;
+        self.overlay = &.{};
+    }
 
     pub fn first(self: *Cursor) !backend_adapter.Entry {
-        if (self.txn.docs.len == 0) return error.NotFound;
-        self.current = 0;
-        return self.entryAt(0);
+        try self.ensureOverlay();
+        self.clearBufferedDisk();
+        const disk = if (self.txn.prefix.len == 0)
+            try self.index_cursor.first()
+        else
+            try self.index_cursor.seekAtOrAfter(self.txn.prefix, false);
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(self.txn.prefix, false), .forward);
     }
 
     pub fn last(self: *Cursor) !backend_adapter.Entry {
-        if (self.txn.docs.len == 0) return error.NotFound;
-        const idx = self.txn.docs.len - 1;
-        self.current = idx;
-        return self.entryAt(idx);
+        try self.ensureOverlay();
+        self.clearBufferedDisk();
+        if (self.upper_bound) |upper_bound| {
+            const upper = try self.txn.prefixedKey(upper_bound);
+            defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
+            return try self.resolveMerged(
+                try self.index_cursor.seekAtOrBefore(upper, true),
+                self.overlayAtOrBefore(upper, true),
+                .backward,
+            );
+        }
+        if (self.txn.prefix.len == 0) {
+            return try self.resolveMerged(
+                try self.index_cursor.last(),
+                if (self.overlay.len == 0) null else self.overlay.len - 1,
+                .backward,
+            );
+        } else {
+            const upper = try self.namespaceUpperBound();
+            defer self.txn.allocator.free(upper);
+            return try self.resolveMerged(
+                try self.index_cursor.seekAtOrBefore(upper, true),
+                self.overlayAtOrBefore(upper, true),
+                .backward,
+            );
+        }
     }
 
     pub fn next(self: *Cursor) !backend_adapter.Entry {
-        const current = self.current orelse return error.NotFound;
-        const next_idx = current + 1;
-        if (next_idx >= self.txn.docs.len) return error.NotFound;
-        self.current = next_idx;
-        return self.entryAt(next_idx);
+        try self.ensureOverlay();
+        const current = self.current_key orelse return error.NotFound;
+        const disk = if (self.last_direction == .forward)
+            self.takeBufferedDisk() orelse try self.index_cursor.next()
+        else blk: {
+            self.clearBufferedDisk();
+            break :blk try self.index_cursor.seekAtOrAfter(current, true);
+        };
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(current, true), .forward);
     }
 
     pub fn prev(self: *Cursor) !backend_adapter.Entry {
-        const current = self.current orelse return error.NotFound;
-        if (current == 0) return error.NotFound;
-        const prev_idx = current - 1;
-        self.current = prev_idx;
-        return self.entryAt(prev_idx);
+        try self.ensureOverlay();
+        const current = self.current_key orelse return error.NotFound;
+        const disk = if (self.last_direction == .backward)
+            self.takeBufferedDisk() orelse try self.index_cursor.prev()
+        else blk: {
+            self.clearBufferedDisk();
+            break :blk try self.index_cursor.seekAtOrBefore(current, true);
+        };
+        return try self.resolveMerged(disk, self.overlayAtOrBefore(current, true), .backward);
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        const idx = lowerBoundDocs(self.txn.docs, key);
-        if (idx >= self.txn.docs.len) return error.NotFound;
-        self.current = idx;
-        return self.entryAt(idx);
+        try self.ensureOverlay();
+        const lookup_key = try self.txn.prefixedKey(key);
+        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
+        self.clearBufferedDisk();
+        return try self.resolveMerged(
+            try self.index_cursor.seekAtOrAfter(lookup_key, false),
+            self.overlayAtOrAfter(lookup_key, false),
+            .forward,
+        );
     }
 
     pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        const idx = lowerBoundDocs(self.txn.docs, key);
-        if (idx < self.txn.docs.len and std.mem.eql(u8, self.txn.docs[idx].key, key)) {
-            self.current = idx;
-            return self.entryAt(idx);
+        try self.ensureOverlay();
+        const lookup_key = try self.txn.prefixedKey(key);
+        defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
+        self.clearBufferedDisk();
+        if (self.upper_bound) |upper_bound| {
+            const upper = try self.txn.prefixedKey(upper_bound);
+            defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
+            if (std.mem.order(u8, lookup_key, upper) != .lt) {
+                return try self.resolveMerged(
+                    try self.index_cursor.seekAtOrBefore(upper, true),
+                    self.overlayAtOrBefore(upper, true),
+                    .backward,
+                );
+            }
         }
-        if (idx == 0) return error.NotFound;
-        self.current = idx - 1;
-        return self.entryAt(idx - 1);
+        return try self.resolveMerged(
+            try self.index_cursor.seekAtOrBefore(lookup_key, false),
+            self.overlayAtOrBefore(lookup_key, false),
+            .backward,
+        );
     }
 
     pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
+        self.clearBufferedDisk();
+        self.last_direction = null;
         self.upper_bound = upper;
     }
 
-    fn entryAt(self: *Cursor, idx: usize) !backend_adapter.Entry {
-        const doc = self.txn.docs[idx];
-        if (self.upper_bound) |upper| {
-            if (std.mem.order(u8, doc.key, upper) != .lt) return error.NotFound;
+    fn resolveMerged(
+        self: *Cursor,
+        initial_disk: ?native.DocumentIndexEntry,
+        initial_overlay_index: ?usize,
+        direction: Direction,
+    ) !backend_adapter.Entry {
+        const store = self.txn.store orelse return error.InvalidTransactionState;
+        var disk = initial_disk;
+        errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        var overlay_index = initial_overlay_index;
+
+        while (true) {
+            if (disk) |candidate| {
+                if (!self.keyInRange(candidate.key)) {
+                    var out_of_range = candidate;
+                    out_of_range.deinit(self.txn.allocator);
+                    disk = null;
+                }
+            }
+            const overlay_candidate = if (overlay_index) |index| blk: {
+                const candidate = self.overlay[index];
+                if (!self.keyInRange(candidate.key)) {
+                    overlay_index = null;
+                    break :blk null;
+                }
+                break :blk candidate;
+            } else null;
+
+            const choose_overlay = if (overlay_candidate) |pending| blk: {
+                const indexed = disk orelse break :blk true;
+                const order = std.mem.order(u8, pending.key, indexed.key);
+                break :blk switch (direction) {
+                    .forward => order != .gt,
+                    .backward => order != .lt,
+                };
+            } else false;
+
+            if (choose_overlay) {
+                const pending = overlay_candidate.?;
+                if (disk) |indexed| {
+                    if (std.mem.eql(u8, pending.key, indexed.key)) {
+                        var consumed = indexed;
+                        consumed.deinit(self.txn.allocator);
+                        disk = null;
+                        disk = try self.advanceDisk(direction);
+                    }
+                }
+                overlay_index = self.advanceOverlayIndex(overlay_index.?, direction);
+                const value = pending.value orelse continue;
+                const buffered_disk = disk;
+                disk = null;
+                return try self.installPending(pending.key, value, buffered_disk, direction);
+            }
+
+            if (disk) |indexed| {
+                var consumed = indexed;
+                disk = null;
+                const value = store.file.documentValueAtIndexEntryAlloc(self.txn.allocator, self.txn.checkpoint, consumed) catch |err| {
+                    consumed.deinit(self.txn.allocator);
+                    return err;
+                };
+                if (value) |owned_value| return self.installDisk(consumed, owned_value, direction);
+                consumed.deinit(self.txn.allocator);
+                disk = try self.advanceDisk(direction);
+                continue;
+            }
+            return error.NotFound;
         }
-        return .{ .key = doc.key, .value = doc.value };
+    }
+
+    fn ensureOverlay(self: *Cursor) !void {
+        if (self.overlay_generation == self.txn.pending_generation) return;
+        const alloc = self.txn.allocator;
+        const indices = try alloc.alloc(usize, self.txn.pending.items.len);
+        defer alloc.free(indices);
+        for (indices, 0..) |*index, i| index.* = i;
+        std.mem.sort(usize, indices, self.txn, struct {
+            fn lessThan(txn: *Txn, lhs: usize, rhs: usize) bool {
+                const order = std.mem.order(u8, txn.pending.items[lhs].key, txn.pending.items[rhs].key);
+                return order == .lt or (order == .eq and lhs < rhs);
+            }
+        }.lessThan);
+
+        var rebuilt = std.ArrayListUnmanaged(OverlayEntry).empty;
+        defer rebuilt.deinit(alloc);
+        var i: usize = 0;
+        while (i < indices.len) {
+            var latest = indices[i];
+            i += 1;
+            while (i < indices.len and std.mem.eql(u8, self.txn.pending.items[latest].key, self.txn.pending.items[indices[i]].key)) : (i += 1) {
+                latest = indices[i];
+            }
+            const mutation = self.txn.pending.items[latest];
+            try rebuilt.append(alloc, .{ .key = mutation.key, .value = mutation.value });
+        }
+        const owned = try rebuilt.toOwnedSlice(alloc);
+        if (self.overlay.len > 0) alloc.free(self.overlay);
+        self.overlay = owned;
+        self.overlay_generation = self.txn.pending_generation;
+    }
+
+    fn overlayAtOrAfter(self: *const Cursor, key: []const u8, strict: bool) ?usize {
+        var left: usize = 0;
+        var right = self.overlay.len;
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            const order = std.mem.order(u8, self.overlay[mid].key, key);
+            if (order == .lt or (strict and order == .eq)) left = mid + 1 else right = mid;
+        }
+        return if (left < self.overlay.len) left else null;
+    }
+
+    fn overlayAtOrBefore(self: *const Cursor, key: []const u8, strict: bool) ?usize {
+        var left: usize = 0;
+        var right = self.overlay.len;
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            const order = std.mem.order(u8, self.overlay[mid].key, key);
+            if (order == .lt or (!strict and order == .eq)) left = mid + 1 else right = mid;
+        }
+        return if (left == 0) null else left - 1;
+    }
+
+    fn advanceOverlayIndex(self: *const Cursor, index: usize, direction: Direction) ?usize {
+        return switch (direction) {
+            .forward => if (index + 1 < self.overlay.len) index + 1 else null,
+            .backward => if (index > 0) index - 1 else null,
+        };
+    }
+
+    fn advanceDisk(self: *Cursor, direction: Direction) !?native.DocumentIndexEntry {
+        return switch (direction) {
+            .forward => try self.index_cursor.next(),
+            .backward => try self.index_cursor.prev(),
+        };
+    }
+
+    fn keyInRange(self: *const Cursor, full_key: []const u8) bool {
+        if (!std.mem.startsWith(u8, full_key, self.txn.prefix)) return false;
+        if (self.upper_bound) |upper| {
+            if (std.mem.order(u8, full_key[self.txn.prefix.len..], upper) != .lt) return false;
+        }
+        return true;
+    }
+
+    fn installPending(
+        self: *Cursor,
+        full_key: []const u8,
+        value: []const u8,
+        buffered_disk: ?native.DocumentIndexEntry,
+        direction: Direction,
+    ) !backend_adapter.Entry {
+        var disk = buffered_disk;
+        errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        const owned_key = try self.txn.allocator.dupe(u8, full_key);
+        errdefer self.txn.allocator.free(owned_key);
+        const owned_value = try self.txn.allocator.dupe(u8, value);
+        errdefer self.txn.allocator.free(owned_value);
+        self.clearCurrent();
+        self.current_key = owned_key;
+        self.owned_value = owned_value;
+        self.disk_candidate = disk;
+        disk = null;
+        self.last_direction = direction;
+        return .{ .key = owned_key[self.txn.prefix.len..], .value = owned_value };
+    }
+
+    fn installDisk(self: *Cursor, indexed: native.DocumentIndexEntry, value: []u8, direction: Direction) backend_adapter.Entry {
+        self.clearCurrent();
+        self.current_key = indexed.key;
+        self.owned_value = value;
+        self.last_direction = direction;
+        return .{ .key = indexed.key[self.txn.prefix.len..], .value = value };
+    }
+
+    fn clearCurrent(self: *Cursor) void {
+        if (self.current_key) |key| self.txn.allocator.free(key);
+        if (self.owned_value) |value| self.txn.allocator.free(value);
+        self.current_key = null;
+        self.owned_value = null;
+    }
+
+    fn clearBufferedDisk(self: *Cursor) void {
+        if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
+        self.disk_candidate = null;
+    }
+
+    fn takeBufferedDisk(self: *Cursor) ?native.DocumentIndexEntry {
+        const candidate = self.disk_candidate;
+        self.disk_candidate = null;
+        return candidate;
+    }
+
+    fn namespaceUpperBound(self: *Cursor) ![]u8 {
+        const upper = try self.txn.allocator.dupe(u8, self.txn.prefix);
+        std.debug.assert(upper.len > 0 and upper[upper.len - 1] == 0);
+        upper[upper.len - 1] = 1;
+        return upper;
     }
 };
-
-fn lowerBoundDocs(docs: []const native.OwnedDocument, key: []const u8) usize {
-    var low: usize = 0;
-    var high: usize = docs.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        if (std.mem.order(u8, docs[mid].key, key) == .lt) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    return low;
-}
 
 const replay_hints = [_]change_journal_mod.TargetHint{
     .enrichment,
@@ -1023,6 +1239,87 @@ test "lite native docstore runtime persists atomic batch" {
     try std.testing.expectError(error.NotFound, read.get("doc:c"));
 }
 
+test "lite native docstore prefixed runtimes isolate keys cursors and replay" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-prefixed.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    const prefix_a = [_]u8{ 't', 'a', 0 };
+    const prefix_b = [_]u8{ 't', 'b', 0 };
+    var runtime_a = try store.runtimeStoreWithPrefix(allocator, &prefix_a);
+    defer runtime_a.deinit();
+    var runtime_b = try store.runtimeStoreWithPrefix(allocator, &prefix_b);
+    defer runtime_b.deinit();
+
+    var write_a = try runtime_a.beginBatch();
+    try write_a.put("doc:same", "a");
+    try write_a.put("doc:only-a", "a-only");
+    try write_a.commit();
+    var write_b = try runtime_b.beginBatch();
+    try write_b.put("doc:same", "b");
+    try write_b.commit();
+
+    var read_a = try runtime_a.beginRead();
+    defer read_a.abort();
+    try std.testing.expectEqualStrings("a", try read_a.get("doc:same"));
+    var cursor_a = try read_a.openCursor();
+    defer cursor_a.close();
+    try std.testing.expectEqualStrings("doc:only-a", (try cursor_a.first()).?.key);
+    try std.testing.expectEqualStrings("doc:same", (try cursor_a.next()).?.key);
+    try std.testing.expect((try cursor_a.next()) == null);
+
+    var read_b = try runtime_b.beginRead();
+    defer read_b.abort();
+    try std.testing.expectEqualStrings("b", try read_b.get("doc:same"));
+    try std.testing.expectError(error.NotFound, read_b.get("doc:only-a"));
+
+    try runtime_a.appendReplayOpaque(allocator, 7, "a-replay");
+    try runtime_b.appendReplayOpaque(allocator, 2, "b-replay");
+    try std.testing.expectEqual(@as(u64, 8), runtime_a.nextReplaySequence(0));
+    try std.testing.expectEqual(@as(u64, 3), runtime_b.nextReplaySequence(0));
+}
+
+test "lite native docstore keeps disjoint namespace cursors isolated without snapshots" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-namespace-cache.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    const prefix_a = [_]u8{ 't', 'a', 0 };
+    const prefix_b = [_]u8{ 't', 'b', 0 };
+
+    var write_a = try Txn.openWriteYieldingWithPrefix(&store, &prefix_a);
+    try write_a.put("doc:a", "a1");
+    try write_a.commit();
+    var write_b = try Txn.openWriteYieldingWithPrefix(&store, &prefix_b);
+    try write_b.put("doc:b", "b1");
+    try write_b.commit();
+
+    var read_b = try Txn.openReadWithPrefix(&store, &prefix_b);
+    var cursor_b = try read_b.openCursor();
+    try std.testing.expectEqualStrings("doc:b", (try cursor_b.first()).key);
+    cursor_b.close();
+    read_b.abort();
+
+    write_a = try Txn.openWriteYieldingWithPrefix(&store, &prefix_a);
+    try write_a.put("doc:a", "a2");
+    try write_a.commit();
+
+    read_b = try Txn.openReadWithPrefix(&store, &prefix_b);
+    defer read_b.abort();
+    cursor_b = try read_b.openCursor();
+    defer cursor_b.close();
+    try std.testing.expectEqualStrings("doc:b", (try cursor_b.first()).key);
+    try std.testing.expectEqualStrings("b1", try read_b.get("doc:b"));
+}
+
 test "lite native docstore runtime scans ordered snapshot" {
     const allocator = std.testing.allocator;
 
@@ -1057,6 +1354,86 @@ test "lite native docstore runtime scans ordered snapshot" {
     try std.testing.expectEqualStrings("doc:b", next.key);
     const seek = (try cursor.seekAtOrAfter("doc:bb")).?;
     try std.testing.expectEqualStrings("doc:c", seek.key);
+}
+
+test "lite native write cursors merge pending writes and deletes in order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-write-cursor.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var seed = try Txn.openWrite(&store);
+    try seed.put("doc:a", "disk-a");
+    try seed.put("doc:c", "disk-c");
+    try seed.put("doc:e", "disk-e");
+    try seed.commit();
+
+    var write = try Txn.openWrite(&store);
+    defer write.abort();
+    try write.put("doc:b", "pending-b");
+    try write.put("doc:c", "pending-c-old");
+    try write.put("doc:c", "pending-c");
+    try write.delete("doc:e");
+    try write.put("doc:d", "pending-d-old");
+    try write.delete("doc:d");
+    try write.put("doc:d", "pending-d");
+
+    var cursor = try write.openCursor();
+    defer cursor.close();
+    var entry = try cursor.first();
+    try std.testing.expectEqualStrings("doc:a", entry.key);
+    try std.testing.expectEqualStrings("disk-a", entry.value);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    try std.testing.expectEqualStrings("pending-b", entry.value);
+    entry = try cursor.prev();
+    try std.testing.expectEqualStrings("doc:a", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    try std.testing.expectEqualStrings("pending-c", entry.value);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+    try std.testing.expectEqualStrings("pending-d", entry.value);
+    try std.testing.expectError(error.NotFound, cursor.next());
+
+    entry = try cursor.last();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+    entry = try cursor.prev();
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    entry = try cursor.seekAtOrAfter("doc:bb");
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    entry = try cursor.seekAtOrBefore("doc:bb");
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    cursor.setUpperBound("doc:d");
+    entry = try cursor.seekAtOrAfter("doc:c");
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    try std.testing.expectError(error.NotFound, cursor.next());
+    entry = try cursor.last();
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    entry = try cursor.seekAtOrBefore("doc:z");
+    try std.testing.expectEqualStrings("doc:c", entry.key);
+    cursor.setUpperBound(null);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+
+    // A cursor opened before later mutations refreshes only its small sorted
+    // overlay; it does not rematerialize the durable namespace.
+    try write.put("doc:aa", "pending-aa");
+    try write.delete("doc:c");
+    entry = try cursor.seekAtOrAfter("doc:a");
+    try std.testing.expectEqualStrings("doc:a", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:aa", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:b", entry.key);
+    entry = try cursor.next();
+    try std.testing.expectEqualStrings("doc:d", entry.key);
+    try std.testing.expectError(error.NotFound, cursor.next());
 }
 
 test "lite native docstore persists replay lanes across reopen and truncation" {
@@ -1192,25 +1569,26 @@ test "lite native docstore reserves one writer until abort or commit" {
     try std.testing.expectEqualStrings("committed", try next_writer.get("doc:a"));
 }
 
-fn expectCachedSnapshotMatchesDiskRebuild(store: *Store) !void {
+fn expectIndexCursorMatchesDiskRebuild(store: *Store) !void {
     const allocator = std.testing.allocator;
-    const cached = store.cached_snapshot orelse return error.TestUnexpectedResult;
-
-    const checkpoint = store.file.activeCheckpoint();
-    try std.testing.expectEqual(checkpoint.commit_sequence, cached.commit_sequence);
-    try std.testing.expectEqual(checkpoint.document_root_page, cached.document_root_page);
+    var read = try store.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
 
     const rebuilt = try store.file.snapshotDocumentsAlloc(allocator);
     defer native.NativeFile.freeSnapshotDocuments(allocator, rebuilt);
-
-    try std.testing.expectEqual(rebuilt.len, cached.docs.len);
-    for (rebuilt, cached.docs) |expected, actual| {
+    if (rebuilt.len == 0) {
+        try std.testing.expectError(error.NotFound, cursor.first());
+    } else for (rebuilt, 0..) |expected, i| {
+        const actual = if (i == 0) try cursor.first() else try cursor.next();
         try std.testing.expectEqualStrings(expected.key, actual.key);
         try std.testing.expectEqualStrings(expected.value, actual.value);
     }
+    if (rebuilt.len > 0) try std.testing.expectError(error.NotFound, cursor.next());
 }
 
-test "lite native docstore applied snapshot matches disk rebuild across mixed commits" {
+test "lite native docstore disk index matches rebuild across mixed commits" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1230,7 +1608,7 @@ test "lite native docstore applied snapshot matches disk rebuild across mixed co
         try batch.put("doc:b", "b2-last-wins");
         try batch.commit();
     }
-    try expectCachedSnapshotMatchesDiskRebuild(&store);
+    try expectIndexCursorMatchesDiskRebuild(&store);
 
     {
         var batch = try store.beginWrite();
@@ -1240,7 +1618,7 @@ test "lite native docstore applied snapshot matches disk rebuild across mixed co
         try batch.put("doc:a", "a2");
         try batch.commit();
     }
-    try expectCachedSnapshotMatchesDiskRebuild(&store);
+    try expectIndexCursorMatchesDiskRebuild(&store);
 
     {
         // Put-then-delete and delete-then-put of the same key in one batch.
@@ -1251,7 +1629,7 @@ test "lite native docstore applied snapshot matches disk rebuild across mixed co
         try batch.put("doc:d", "d2-resurrected");
         try batch.commit();
     }
-    try expectCachedSnapshotMatchesDiskRebuild(&store);
+    try expectIndexCursorMatchesDiskRebuild(&store);
 
     // A large value that spills to external value pages.
     {
@@ -1262,14 +1640,14 @@ test "lite native docstore applied snapshot matches disk rebuild across mixed co
         try batch.put("doc:big", big);
         try batch.commit();
     }
-    try expectCachedSnapshotMatchesDiskRebuild(&store);
+    try expectIndexCursorMatchesDiskRebuild(&store);
 
     // Empty commit publishes nothing and keeps the cache current.
     {
         var batch = try store.beginWrite();
         try batch.commit();
     }
-    try expectCachedSnapshotMatchesDiskRebuild(&store);
+    try expectIndexCursorMatchesDiskRebuild(&store);
 
     var read = try store.beginRead();
     defer read.abort();
@@ -1278,6 +1656,43 @@ test "lite native docstore applied snapshot matches disk rebuild across mixed co
     try std.testing.expectError(error.NotFound, read.get("doc:c"));
     try std.testing.expectEqualStrings("d2-resurrected", try read.get("doc:d"));
     try std.testing.expectError(error.NotFound, read.get("doc:e"));
+}
+
+test "lite native docstore disk cursor loads values lazily" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-shared-payloads.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    {
+        var batch = try store.beginWrite();
+        errdefer batch.abort();
+        try batch.put("doc:a", "a-value-that-must-not-be-copied");
+        try batch.put("doc:b", "b-v1");
+        try batch.commit();
+    }
+    {
+        var read = try store.beginRead();
+        var cursor = try read.openCursor();
+        cursor.close();
+        read.abort();
+    }
+    {
+        var batch = try store.beginWrite();
+        errdefer batch.abort();
+        try batch.put("doc:b", "b-v2");
+        try batch.commit();
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("a-value-that-must-not-be-copied", try read.get("doc:a"));
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    try std.testing.expectEqualStrings("doc:a", (try cursor.first()).key);
+    try std.testing.expectEqualStrings("a-value-that-must-not-be-copied", (try cursor.first()).value);
 }
 
 test "lite native docstore read transactions pin their snapshot across commits" {
@@ -1320,7 +1735,7 @@ test "lite native docstore read transactions pin their snapshot across commits" 
     try std.testing.expectEqualStrings("n1", try fresh.get("doc:new"));
 }
 
-test "lite native docstore snapshot cache survives out-of-band catalog commits and vacuum" {
+test "lite native docstore disk index survives out-of-band catalog commits and vacuum" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1346,7 +1761,7 @@ test "lite native docstore snapshot cache survives out-of-band catalog commits a
         defer read.abort();
         try std.testing.expectEqualStrings("v1", try read.get("doc:oob"));
     }
-    try expectCachedSnapshotMatchesDiskRebuild(&store);
+    try expectIndexCursorMatchesDiskRebuild(&store);
 
     // Update churn then vacuum: the file is rewritten in place and the cache
     // key changes with the vacuum checkpoint.
@@ -1364,81 +1779,66 @@ test "lite native docstore snapshot cache survives out-of-band catalog commits a
         defer read.abort();
         try std.testing.expectEqualStrings("churn-9", try read.get("doc:oob"));
     }
-    try expectCachedSnapshotMatchesDiskRebuild(&store);
+    try expectIndexCursorMatchesDiskRebuild(&store);
 }
 
-test "lite native docstore snapshot cache reports usage to resource manager" {
+test "lite native docstore cold writes and large disk-index cursors stay bounded" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try testPath(allocator, tmp, "native-docstore-snapshot-resource.aflite");
+    const path = try testPath(allocator, tmp, "native-docstore-lazy-writes.aflite");
     defer allocator.free(path);
 
-    var manager = resource_manager_mod.ResourceManager.init(.{});
-    var store = try Store.createWithOptions(allocator, path, .{
-        .no_sync = true,
-        .resource_manager = &manager,
-    });
-
-    {
-        var batch = try store.beginWrite();
-        try batch.put("doc:resource", "tracked");
-        try batch.commit();
-    }
-    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
-
-    _ = try store.vacuum();
-    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
-
-    {
-        var read = try store.beginRead();
-        defer read.abort();
-        try std.testing.expectEqualStrings("tracked", try read.get("doc:resource"));
-        try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
-    }
-
-    store.close();
-    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
-}
-
-test "lite native docstore snapshot cache budget rejection does not fail transactions" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try testPath(allocator, tmp, "native-docstore-snapshot-budget.aflite");
-    defer allocator.free(path);
-
-    var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lite_docstore_snapshot_cache)] = .{
-        .soft_limit_bytes = 1,
-        .hard_limit_bytes = 1,
-    };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
-    var store = try Store.createWithOptions(allocator, path, .{
-        .no_sync = true,
-        .resource_manager = &manager,
-    });
+    var store = try Store.createWithOptions(allocator, path, .{ .no_sync = true });
     defer store.close();
 
-    {
-        var batch = try store.beginWrite();
-        try batch.put("doc:budget", "uncached");
-        try batch.commit();
+    var seed = try store.beginWrite();
+    var key_buffer: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < bounded_cursor_test_documents) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc:{d:0>5}", .{i});
+        try seed.put(key, "v1");
     }
-    try std.testing.expect(store.cached_snapshot == null);
+    try seed.commit();
 
+    // Point reads and ordered cursors both use the disk-resident index.
     {
         var read = try store.beginRead();
         defer read.abort();
-        try std.testing.expectEqualStrings("uncached", try read.get("doc:budget"));
+        try std.testing.expectEqualStrings("v1", try read.get("doc:00000"));
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var count: usize = 1;
+        try std.testing.expectEqualStrings("doc:00000", (try cursor.first()).key);
+        while (true) {
+            _ = cursor.next() catch |err| switch (err) {
+                error.NotFound => break,
+                else => return err,
+            };
+            count += 1;
+        }
+        try std.testing.expectEqual(bounded_cursor_test_documents, count);
+        try std.testing.expectEqualStrings("doc:00511", (try cursor.last()).key);
+        var reverse_count: usize = 1;
+        while (true) {
+            _ = cursor.prev() catch |err| switch (err) {
+                error.NotFound => break,
+                else => return err,
+            };
+            reverse_count += 1;
+        }
+        try std.testing.expectEqual(bounded_cursor_test_documents, reverse_count);
+        try std.testing.expectEqualStrings("doc:00256", (try cursor.seekAtOrAfter("doc:00256")).key);
     }
-    try std.testing.expect(store.cached_snapshot == null);
 
-    const stats = manager.sliceStats(.lite_docstore_snapshot_cache);
-    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
-    try std.testing.expect(stats.hard_limit_rejections > 0);
+    // Publishing a small write does not rebuild or retain a table-sized cache.
+    var update = try store.beginWrite();
+    try update.put("doc:00000", "v2");
+    try update.commit();
+
+    var verify = try store.beginRead();
+    defer verify.abort();
+    try std.testing.expectEqualStrings("v2", try verify.get("doc:00000"));
 }

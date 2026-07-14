@@ -1,7 +1,7 @@
 # Hot-Standby HA
 
 This runbook covers operator-managed Postgres-style hot standby for Antfly
-clusters running in Swarm mode. It is separate from the Raft metadata HA path:
+clusters running in Standalone mode. It is separate from the Raft metadata HA path:
 hot standby is a single-primary data-plane strategy with one or more standby
 processes receiving and applying HA WAL records.
 
@@ -54,7 +54,7 @@ token Secret is missing. This field is a pod/Job `SecretKeySelector`; the
 operator does not read the Secret value from the Kubernetes API. Operator status
 probes and typed HA admin actions still require the token to be injected into
 the operator pod through `spec.highAvailability.admin.tokenEnvVar`. Use
-`spec.swarm.envFrom` only when the same Secret is already being injected for
+`spec.standalone.envFrom` only when the same Secret is already being injected for
 other runtime configuration.
 
 When using CLI commands, pass `--ha-token-env ANTFLY_HA_ADMIN_TOKEN`. Do not

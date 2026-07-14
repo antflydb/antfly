@@ -618,6 +618,22 @@ pub const RoaringBitmap = struct {
         }
     }
 
+    /// Remove without changing the container representation. This is used by
+    /// rollback paths that must not allocate while undoing a failed mutation.
+    pub fn removeRetainingStorage(self: *RoaringBitmap, val: u32) void {
+        self.invalidateRankCache();
+        const key: u16 = @intCast(val >> 16);
+        const low: u16 = @truncate(val);
+        const idx = self.findChunk(key) orelse return;
+        switch (self.containers.items[idx]) {
+            .array => |*values| {
+                const pos = arraySearchPos(values.items, low);
+                if (pos < values.items.len and values.items[pos] == low) _ = values.orderedRemove(pos);
+            },
+            .bitmap => |bitmap| bitmapUnset(bitmap, low),
+        }
+    }
+
     pub fn contains(self: *const RoaringBitmap, val: u32) bool {
         const key: u16 = @intCast(val >> 16);
         const low: u16 = @truncate(val);
@@ -815,6 +831,8 @@ pub const RoaringBitmap = struct {
 
         const n = std.mem.readInt(u16, data[0..2], .little);
         var pos: usize = 2;
+        const header_len = pos + @as(usize, n) * 4;
+        if (data.len < header_len) return error.InvalidRoaringBitmap;
 
         var bm = RoaringBitmap.init(alloc);
         errdefer bm.deinit();
@@ -850,6 +868,7 @@ pub const RoaringBitmap = struct {
             running += card;
             if (card > array_max) {
                 // Bitmap container
+                if (data.len - pos < bitmap_words * @sizeOf(u64)) return error.InvalidRoaringBitmap;
                 const words = try alloc.alloc(u64, bitmap_words);
                 for (0..bitmap_words) |w| {
                     words[w] = std.mem.readInt(u64, data[pos..][0..8], .little);
@@ -858,6 +877,7 @@ pub const RoaringBitmap = struct {
                 bm.containers.appendAssumeCapacity(.{ .bitmap = words });
             } else {
                 // Array container
+                if (data.len - pos < card * @sizeOf(u16)) return error.InvalidRoaringBitmap;
                 var arr = std.ArrayListUnmanaged(u16).empty;
                 try arr.ensureTotalCapacity(alloc, card);
                 for (0..card) |_| {

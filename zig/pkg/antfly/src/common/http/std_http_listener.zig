@@ -22,6 +22,41 @@ pub const default_request_stack_size: usize = 8 * 1024 * 1024;
 pub const default_header_read_timeout_ms: u32 = 30_000;
 pub const default_body_read_timeout_ms: u32 = 120_000;
 
+const ProcessIo = struct {
+    var lock: std.atomic.Mutex = .unlocked;
+    var runtime: ?*std.Io.Threaded = null;
+    var ref_count: usize = 0;
+
+    fn acquire() *std.Io.Threaded {
+        platform_sync.lockYielding(&lock);
+        defer lock.unlock();
+
+        if (runtime == null) {
+            const io_impl = std.heap.page_allocator.create(std.Io.Threaded) catch @panic("OOM");
+            io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{
+                .stack_size = default_request_stack_size,
+            });
+            runtime = io_impl;
+        }
+        ref_count += 1;
+        return runtime.?;
+    }
+
+    fn release(io_impl: *std.Io.Threaded) void {
+        platform_sync.lockYielding(&lock);
+        defer lock.unlock();
+
+        std.debug.assert(runtime == io_impl);
+        std.debug.assert(ref_count > 0);
+        ref_count -= 1;
+        if (ref_count != 0) return;
+
+        io_impl.deinit();
+        std.heap.page_allocator.destroy(io_impl);
+        runtime = null;
+    }
+};
+
 fn sleepMs(ms: u64) void {
     var req = std.posix.timespec{
         .sec = @intCast(ms / std.time.ms_per_s),
@@ -52,7 +87,7 @@ pub const StdHttpListenerConfig = struct {
 
 pub const StdHttpListener = struct {
     const IoOwner = enum {
-        owned,
+        process_shared,
         shared,
     };
 
@@ -74,14 +109,12 @@ pub const StdHttpListener = struct {
         cfg: StdHttpListenerConfig,
         app: common.RequestExecutor,
     ) StdHttpListener {
-        const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
-        io_impl.* = std.Io.Threaded.init(alloc, .{ .stack_size = cfg.connection_thread_stack_size });
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .app = app,
-            .io_impl = io_impl,
-            .io_owner = .owned,
+            .io_impl = ProcessIo.acquire(),
+            .io_owner = .process_shared,
         };
     }
 
@@ -107,10 +140,7 @@ pub const StdHttpListener = struct {
     pub fn deinit(self: *StdHttpListener) void {
         self.stop();
         self.active_streams.deinit(self.alloc);
-        if (self.io_owner == .owned) {
-            self.io_impl.deinit();
-            self.alloc.destroy(self.io_impl);
-        }
+        if (self.io_owner == .process_shared) ProcessIo.release(self.io_impl);
         self.* = undefined;
     }
 
@@ -822,6 +852,93 @@ test "std http executor enforces request timeout while waiting for response" {
         .uri = uri,
         .timeout_ms = 5,
     }));
+}
+
+test "std http executor deinit drains the complete timed operation" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const App = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            sleepMs(50);
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    const RequestThread = struct {
+        executor: common.RequestExecutor,
+        uri: []const u8,
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.heap.page_allocator, .{
+                .method = .GET,
+                .uri = self.uri,
+                .timeout_ms = 1_000,
+            }) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+        }
+    };
+
+    const DeinitThread = struct {
+        executor: *std_http_executor.StdHttpExecutor,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.executor.deinit();
+            self.done.store(true, .release);
+        }
+    };
+
+    var app = App{};
+    var listener = StdHttpListener.init(std.testing.allocator, .{}, app.iface());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    var request = RequestThread{ .executor = executor.executor(), .uri = base_uri };
+    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request});
+    defer request_thread.join();
+
+    var entered = false;
+    for (0..1_000) |_| {
+        if (app.entered.load(.acquire)) {
+            entered = true;
+            break;
+        }
+        sleepMs(1);
+    }
+    try std.testing.expect(entered);
+
+    var shutdown = DeinitThread{ .executor = &executor };
+    const shutdown_thread = try std.Thread.spawn(.{}, DeinitThread.run, .{&shutdown});
+    defer shutdown_thread.join();
+
+    for (0..1_000) |_| {
+        if (shutdown.done.load(.acquire)) break;
+        sleepMs(1);
+    }
+    try std.testing.expect(shutdown.done.load(.acquire));
+    try std.testing.expect(!request.failed.load(.acquire));
 }
 
 test "HA hostname requests survive successful connect cleanup" {
@@ -1828,7 +1945,7 @@ test "std http listener stop returns while saturated with a headerless connectio
     try std.testing.expect(stopped);
 }
 
-test "std http listener connection handoff serves fast request while slow request is blocked" {
+test "std http executor runs timed requests concurrently" {
     const std_http_executor = @import("std_http_executor.zig");
 
     const App = struct {
@@ -1881,6 +1998,7 @@ test "std http listener connection handoff serves fast request while slow reques
             var response = self.executor.execute(std.heap.page_allocator, .{
                 .method = .GET,
                 .uri = self.uri,
+                .timeout_ms = 5_000,
             }) catch {
                 self.failed.store(true, .release);
                 self.done.store(true, .release);

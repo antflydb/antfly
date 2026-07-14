@@ -116,7 +116,7 @@ pub const Config = struct {
     max_memory_mb: ?i64 = null,
     /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?antfly_logging_openapi.Config = null,
 };

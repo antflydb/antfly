@@ -19,7 +19,7 @@ should not add to them.
   "health": "healthy",
   "message": null,
   "auth_enabled": false,
-  "swarm_mode": true,
+  "deployment_mode": "standalone",
   "secret_store": null
 }
 ```
@@ -44,7 +44,7 @@ Example:
 ```json
 {
   "health": "healthy",
-  "swarm_mode": true,
+  "deployment_mode": "standalone",
   "auth_enabled": false,
   "data": {
     "nodes": [
@@ -101,7 +101,7 @@ Example:
 
 The TypeScript dashboard should handle three states:
 
-- summary only: render cluster health/auth/swarm information and empty topology;
+- summary only: render cluster health/auth/standalone information and empty topology;
 - Zig topology: use `data.nodes`, `data.ranges`, and `data.replicas`;
 - legacy topology: fall back to `stores.statuses` and `shards.statuses`.
 

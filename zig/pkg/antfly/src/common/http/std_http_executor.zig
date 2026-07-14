@@ -50,6 +50,7 @@ pub const StdHttpExecutor = struct {
     idle_cond: std.Io.Condition,
     closing: bool,
     in_flight: usize,
+    client_mutex: std.Io.Mutex,
     reuse_mutex: std.Io.Mutex,
     requests_on_current_connection: u32,
 
@@ -68,6 +69,7 @@ pub const StdHttpExecutor = struct {
             .idle_cond = .init,
             .closing = false,
             .in_flight = 0,
+            .client_mutex = .init,
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
@@ -93,6 +95,7 @@ pub const StdHttpExecutor = struct {
             .idle_cond = .init,
             .closing = false,
             .in_flight = 0,
+            .client_mutex = .init,
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
@@ -140,11 +143,10 @@ pub const StdHttpExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const self: *StdHttpExecutor = @ptrCast(@alignCast(ptr));
-        if (self.cfg.resolve_before_connect) {
-            try self.beginRequest();
-            defer self.endRequest();
-            return try self.executeResolved(alloc, req);
-        }
+        try self.beginRequest();
+        defer self.endRequest();
+
+        if (self.cfg.resolve_before_connect) return try self.executeResolved(alloc, req);
         if (req.timeout_ms) |timeout_ms| {
             return try self.executeWithTimeout(alloc, req, timeout_ms);
         }
@@ -261,8 +263,8 @@ pub const StdHttpExecutor = struct {
                 return http_executor.executeDirect(request_alloc, request);
             }
 
-            fn timeoutTask(io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
-                return timeout.sleep(io);
+            fn timeoutTask(task_io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
+                return timeout.sleep(task_io);
             }
 
             fn drainLateResult(result: SelectResult, response_alloc: std.mem.Allocator) void {
@@ -305,8 +307,21 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        try self.beginRequest();
-        defer self.endRequest();
+        const io = self.io_impl.io();
+        if (self.cfg.keep_alive) self.client_mutex.lockUncancelable(io);
+        defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
+
+        // std.http.Client owns mutable connection and resolver state. A pooled
+        // client must be serialized; non-persistent requests use request-local
+        // state so callers can execute concurrently without sacrificing reuse.
+        var local_client: std.http.Client = .{
+            .allocator = self.alloc,
+            .io = io,
+            .read_buffer_size = self.cfg.read_buffer_size,
+            .write_buffer_size = self.cfg.write_buffer_size,
+        };
+        defer if (!self.cfg.keep_alive) local_client.deinit();
+        const client = if (self.cfg.keep_alive) &self.client else &local_client;
 
         const uri = try std.Uri.parse(req.uri);
         const method = switch (req.method) {
@@ -338,7 +353,7 @@ pub const StdHttpExecutor = struct {
         }
 
         const request_keep_alive = self.reserveRequestKeepAlive();
-        var request = try std.http.Client.request(&self.client, method, uri, .{
+        var request = try std.http.Client.request(client, method, uri, .{
             .extra_headers = extra_headers.items,
             .keep_alive = request_keep_alive,
         });

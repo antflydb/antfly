@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
+const utf8_text = @import("utf8_text.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
@@ -48,7 +49,9 @@ pub const DenseEmbedder = struct {
     deinit_fn: ?DenseEmbedDeinitFn = null,
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
-        return try self.dense_embed_fn(self.ptr, alloc, embedding_name, text, dims);
+        var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
+        defer sanitized.deinit(alloc);
+        return try self.dense_embed_fn(self.ptr, alloc, embedding_name, sanitized.text, dims);
     }
 
     pub fn embedDenseBatch(
@@ -58,8 +61,11 @@ pub const DenseEmbedder = struct {
         texts: []const []const u8,
         dims: u32,
     ) ![]const []const f32 {
-        const dense_embed_batch_fn = self.dense_embed_batch_fn orelse return try fallbackDenseBatch(self, alloc, embedding_name, texts, dims);
-        return try dense_embed_batch_fn(self.ptr, alloc, embedding_name, texts, dims);
+        var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
+        defer sanitized.deinit(alloc);
+        const safe_texts = sanitized.texts();
+        const dense_embed_batch_fn = self.dense_embed_batch_fn orelse return try fallbackDenseBatch(self, alloc, embedding_name, safe_texts, dims);
+        return try dense_embed_batch_fn(self.ptr, alloc, embedding_name, safe_texts, dims);
     }
 
     pub fn supportsParts(self: DenseEmbedder) bool {
@@ -74,7 +80,9 @@ pub const DenseEmbedder = struct {
         dims: u32,
     ) ![]f32 {
         const dense_embed_parts_fn = self.dense_embed_parts_fn orelse return error.UnsupportedEmbeddingProvider;
-        return try dense_embed_parts_fn(self.ptr, alloc, embedding_name, parts, dims);
+        var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, parts);
+        defer sanitized.deinit(alloc);
+        return try dense_embed_parts_fn(self.ptr, alloc, embedding_name, sanitized.partsSlice(), dims);
     }
 
     pub fn deinit(self: DenseEmbedder, alloc: Allocator) void {
@@ -90,7 +98,9 @@ pub const SparseEmbedder = struct {
     deinit_fn: ?SparseEmbedDeinitFn = null,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
-        return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, text);
+        var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
+        defer sanitized.deinit(alloc);
+        return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, sanitized.text);
     }
 
     pub fn embedSparseBatch(
@@ -99,8 +109,11 @@ pub const SparseEmbedder = struct {
         embedding_name: []const u8,
         texts: []const []const u8,
     ) ![]SparseEmbedding {
-        const sparse_embed_batch_fn = self.sparse_embed_batch_fn orelse return try fallbackSparseBatch(self, alloc, embedding_name, texts);
-        return try sparse_embed_batch_fn(self.ptr, alloc, embedding_name, texts);
+        var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
+        defer sanitized.deinit(alloc);
+        const safe_texts = sanitized.texts();
+        const sparse_embed_batch_fn = self.sparse_embed_batch_fn orelse return try fallbackSparseBatch(self, alloc, embedding_name, safe_texts);
+        return try sparse_embed_batch_fn(self.ptr, alloc, embedding_name, safe_texts);
     }
 
     pub fn deinit(self: SparseEmbedder, alloc: Allocator) void {
@@ -108,6 +121,134 @@ pub const SparseEmbedder = struct {
         deinit_fn(self.ptr, alloc);
     }
 };
+
+const SanitizedTextBatch = struct {
+    original: []const []const u8,
+    sanitized: ?[][]const u8 = null,
+    owned: ?[]?[]u8 = null,
+
+    fn texts(self: @This()) []const []const u8 {
+        return self.sanitized orelse self.original;
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.owned) |owned| {
+            for (owned) |maybe_text| {
+                if (maybe_text) |text| alloc.free(text);
+            }
+            alloc.free(owned);
+        }
+        if (self.sanitized) |sanitized| alloc.free(sanitized);
+        self.* = undefined;
+    }
+};
+
+const SanitizedContentParts = struct {
+    original: []const template_mod.ContentPart,
+    parts: ?[]template_mod.ContentPart = null,
+    owned_texts: ?[]?[]u8 = null,
+
+    fn partsSlice(self: @This()) []const template_mod.ContentPart {
+        return self.parts orelse self.original;
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.owned_texts) |owned_texts| {
+            for (owned_texts) |maybe_text| {
+                if (maybe_text) |text| alloc.free(text);
+            }
+            alloc.free(owned_texts);
+        }
+        if (self.parts) |parts| alloc.free(parts);
+        self.* = undefined;
+    }
+};
+
+fn sanitizeUtf8BatchForEmbeddingAlloc(alloc: Allocator, texts: []const []const u8) !SanitizedTextBatch {
+    var has_invalid = false;
+    for (texts) |text| {
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            has_invalid = true;
+            break;
+        }
+    }
+    if (!has_invalid) return .{ .original = texts };
+
+    const sanitized = try alloc.alloc([]const u8, texts.len);
+    errdefer alloc.free(sanitized);
+    const owned = try alloc.alloc(?[]u8, texts.len);
+    @memset(owned, null);
+    errdefer {
+        for (owned) |maybe_text| {
+            if (maybe_text) |text| alloc.free(text);
+        }
+        alloc.free(owned);
+    }
+
+    for (texts, 0..) |text, i| {
+        if (std.unicode.utf8ValidateSlice(text)) {
+            sanitized[i] = text;
+            continue;
+        }
+        const safe_text = try utf8_text.replacementAlloc(alloc, text, "embedding batch");
+        owned[i] = safe_text;
+        sanitized[i] = safe_text;
+    }
+
+    return .{
+        .original = texts,
+        .sanitized = sanitized,
+        .owned = owned,
+    };
+}
+
+fn sanitizeContentPartsForEmbeddingAlloc(alloc: Allocator, parts: []const template_mod.ContentPart) !SanitizedContentParts {
+    var has_invalid = false;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                if (!std.unicode.utf8ValidateSlice(text)) {
+                    has_invalid = true;
+                    break;
+                }
+            },
+            .media_url, .binary => {},
+        }
+    }
+    if (!has_invalid) return .{ .original = parts };
+
+    const sanitized_parts = try alloc.alloc(template_mod.ContentPart, parts.len);
+    errdefer alloc.free(sanitized_parts);
+    const owned_texts = try alloc.alloc(?[]u8, parts.len);
+    @memset(owned_texts, null);
+    errdefer {
+        for (owned_texts) |maybe_text| {
+            if (maybe_text) |text| alloc.free(text);
+        }
+        alloc.free(owned_texts);
+    }
+
+    for (parts, 0..) |part, i| {
+        switch (part) {
+            .text => |text| {
+                if (std.unicode.utf8ValidateSlice(text)) {
+                    sanitized_parts[i] = part;
+                    continue;
+                }
+                const safe_text = try utf8_text.replacementAlloc(alloc, text, "embedding content parts");
+                owned_texts[i] = safe_text;
+                sanitized_parts[i] = .{ .text = safe_text };
+            },
+            .media_url, .binary => sanitized_parts[i] = part,
+        }
+    }
+
+    return .{
+        .original = parts,
+        .parts = sanitized_parts,
+        .owned_texts = owned_texts,
+    };
+}
 
 pub fn freeDenseEmbeddingBatch(alloc: Allocator, batch: []const []const f32) void {
     for (batch) |vector| alloc.free(@constCast(vector));
@@ -285,4 +426,108 @@ test "deterministic sparse embedder batch fallback is stable" {
     defer single.deinit(alloc);
     try std.testing.expectEqualSlices(u32, single.indices, batch[0].indices);
     try std.testing.expectEqualSlices(f32, single.values, batch[0].values);
+}
+
+const Utf8AssertingEmbedder = struct {
+    saw_replacement: bool = false,
+
+    fn dense(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
+        const self: *Utf8AssertingEmbedder = @ptrCast(@alignCast(ptr));
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+        if (std.mem.indexOf(u8, text, &std.unicode.replacement_character_utf8) != null) self.saw_replacement = true;
+        const vector = try alloc.alloc(f32, dims);
+        @memset(vector, 1.0);
+        return vector;
+    }
+
+    fn sparseBatch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8) ![]SparseEmbedding {
+        const self: *Utf8AssertingEmbedder = @ptrCast(@alignCast(ptr));
+        const out = try alloc.alloc(SparseEmbedding, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*embedding| embedding.deinit(alloc);
+            alloc.free(out);
+        }
+        for (texts, 0..) |text, i| {
+            try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+            if (std.mem.indexOf(u8, text, &std.unicode.replacement_character_utf8) != null) self.saw_replacement = true;
+            const indices = try alloc.dupe(u32, &.{1});
+            const values = alloc.dupe(f32, &.{1.0}) catch |err| {
+                alloc.free(indices);
+                return err;
+            };
+            out[i] = .{
+                .indices = indices,
+                .values = values,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn denseParts(ptr: *anyopaque, alloc: Allocator, _: []const u8, parts: []const template_mod.ContentPart, dims: u32) ![]f32 {
+        const self: *Utf8AssertingEmbedder = @ptrCast(@alignCast(ptr));
+        for (parts) |part| {
+            switch (part) {
+                .text => |text| {
+                    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+                    if (std.mem.indexOf(u8, text, &std.unicode.replacement_character_utf8) != null) self.saw_replacement = true;
+                },
+                .media_url, .binary => {},
+            }
+        }
+        const vector = try alloc.alloc(f32, dims);
+        @memset(vector, 1.0);
+        return vector;
+    }
+
+    fn denseInterface(self: *Utf8AssertingEmbedder) DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = dense,
+            .dense_embed_parts_fn = denseParts,
+        };
+    }
+
+    fn sparseInterface(self: *Utf8AssertingEmbedder) SparseEmbedder {
+        return .{
+            .ptr = self,
+            .sparse_embed_fn = sparse,
+            .sparse_embed_batch_fn = sparseBatch,
+        };
+    }
+
+    fn sparse(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
+        const batch = try sparseBatch(ptr, alloc, embedding_name, &.{text});
+        defer alloc.free(batch);
+        return batch[0];
+    }
+};
+
+test "enrichment dense embedder replaces invalid utf8 before provider call" {
+    const alloc = std.testing.allocator;
+    var embedder = Utf8AssertingEmbedder{};
+    const vector = try embedder.denseInterface().embedDense(alloc, "", "alpha\xc2 beta", 1);
+    defer alloc.free(vector);
+
+    try std.testing.expect(embedder.saw_replacement);
+}
+
+test "enrichment sparse batch embedder replaces invalid utf8 before provider call" {
+    const alloc = std.testing.allocator;
+    var embedder = Utf8AssertingEmbedder{};
+    const batch = try embedder.sparseInterface().embedSparseBatch(alloc, "", &.{ "valid", "alpha\xc2 beta" });
+    defer freeSparseEmbeddingBatch(alloc, batch);
+
+    try std.testing.expect(embedder.saw_replacement);
+}
+
+test "enrichment dense parts embedder replaces invalid text part utf8 before provider call" {
+    const alloc = std.testing.allocator;
+    var embedder = Utf8AssertingEmbedder{};
+    const parts = [_]template_mod.ContentPart{.{ .text = "alpha\xc2 beta" }};
+    const vector = try embedder.denseInterface().embedDenseParts(alloc, "", &parts, 1);
+    defer alloc.free(vector);
+
+    try std.testing.expect(embedder.saw_replacement);
 }

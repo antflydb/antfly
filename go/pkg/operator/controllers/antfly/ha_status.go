@@ -89,6 +89,7 @@ const (
 	haAdminBaseBackupsFinishPath           = adminsdk.HABaseBackupsFinishPath
 	haAdminBaseBackupsCapturePath          = adminsdk.HABaseBackupsCapturePath
 	haAdminBaseBackupsActivatePath         = adminsdk.HABaseBackupsActivatePath
+	haAdminSeedLifecycleReceiptsPath       = adminsdk.HASeedLifecycleReceiptsPath
 	haAdminStandbyBootstrapPath            = adminsdk.HAStandbyBootstrapPath
 	haAdminFencePath                       = adminsdk.HAFencePath
 	haAdminFenceCurrentPath                = adminsdk.HAFenceCurrentPath

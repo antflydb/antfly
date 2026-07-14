@@ -110,7 +110,7 @@ pub const metadata_table_workflow = @import("metadata/table_workflow.zig");
 pub const metadata_replication_backfill = @import("metadata/replication_backfill.zig");
 pub const metadata_placement_planner = @import("metadata/placement_planner.zig");
 pub const data = @import("data/mod.zig");
-pub const swarm = @import("swarm/mod.zig");
+pub const standalone = @import("standalone/mod.zig");
 pub const inference_runtime = @import("inference_runtime/runtime.zig");
 pub const usermgr = @import("usermgr/mod.zig");
 
@@ -136,6 +136,7 @@ pub const platform_clock = @import("platform/clock.zig");
 pub const platform_time = @import("platform/time.zig");
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const storage_backend_scan = @import("storage/backend_scan.zig");
 pub const storage_sim_runtime = @import("storage/sim_runtime.zig");
 pub const object_storage = @import("storage/object_storage.zig");
@@ -168,8 +169,8 @@ pub const schema = @import("storage/schema.zig");
 pub const db = @import("storage/db/mod.zig");
 
 test {
-    if (comptime build_options.swarm_runtime_focused_test) {
-        _ = swarm;
+    if (comptime build_options.standalone_runtime_focused_test) {
+        _ = standalone;
         return;
     }
 
@@ -237,6 +238,7 @@ test {
 
     // Inference
     _ = inference;
+    _ = @import("chunking/mod.zig");
     _ = pdf;
 
     // Serverless
@@ -270,7 +272,7 @@ test {
     _ = metadata_replication_backfill;
     _ = metadata_placement_planner;
     _ = data;
-    _ = swarm;
+    _ = standalone;
     _ = inference_runtime;
 
     // Template
@@ -312,6 +314,7 @@ test {
     _ = storage_backend_scan;
     _ = mem_backend;
     _ = lsm_backend;
+    _ = storage_maintenance;
     _ = backend_conformance_test;
     _ = lsm_backend_sim_test;
     _ = db;

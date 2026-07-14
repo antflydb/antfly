@@ -90,18 +90,32 @@ pub const MemoryClient = struct {
         const etag = try sha256HexAlloc(alloc, body);
         errdefer alloc.free(etag);
 
-        if (existing) |value| {
-            value.deinit(self.alloc);
-            _ = object_map.remove(key);
-        }
+        const owned_body = try self.alloc.dupe(u8, body);
+        errdefer self.alloc.free(owned_body);
+        const owned_etag = try self.alloc.dupe(u8, etag);
+        errdefer self.alloc.free(owned_etag);
+        const owned_content_type = if (opts.content_type) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_content_type) |value| self.alloc.free(value);
+        const replacement = StoredObject{
+            .body = owned_body,
+            .etag = owned_etag,
+            .content_type = owned_content_type,
+        };
 
+        // Fully construct before swapping the published value. Allocation
+        // failure therefore leaves the old object intact and cannot leak a
+        // partially built replacement. Reuse the existing owned map key and
+        // capacity on overwrite.
+        if (existing) |value| {
+            var previous = value.*;
+            value.* = replacement;
+            previous.deinit(self.alloc);
+            return .{ .etag = etag };
+        }
         const owned_key = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(owned_key);
-        try object_map.put(self.alloc, owned_key, .{
-            .body = try self.alloc.dupe(u8, body),
-            .etag = try self.alloc.dupe(u8, etag),
-            .content_type = if (opts.content_type) |value| try self.alloc.dupe(u8, value) else null,
-        });
+        try object_map.ensureUnusedCapacity(self.alloc, 1);
+        object_map.putAssumeCapacity(owned_key, replacement);
 
         return .{ .etag = etag };
     }
@@ -202,6 +216,8 @@ pub const MemoryClient = struct {
         }
 
         var count: u32 = 0;
+        var last_cursor_key: ?[]const u8 = null;
+        var truncated = false;
         const continuation = opts.continuation_token orelse opts.start_after;
         for (keys.items) |key| {
             if (!std.mem.startsWith(u8, key, opts.prefix)) continue;
@@ -213,28 +229,40 @@ pub const MemoryClient = struct {
                 if (std.mem.indexOf(u8, key[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
                     const prefix_end = opts.prefix.len + delimiter_offset + opts.delimiter.len;
                     const common_prefix = key[0..prefix_end];
-                    if (!containsPrefix(prefixes.items, common_prefix)) {
-                        if (count >= opts.max_keys) break;
-                        try prefixes.append(alloc, try alloc.dupe(u8, common_prefix));
-                        count += 1;
+                    if (containsPrefix(prefixes.items, common_prefix)) {
+                        // Advance beyond every object collapsed into the last
+                        // emitted common prefix before issuing a page token.
+                        last_cursor_key = key;
+                        continue;
                     }
+                    if (count >= opts.max_keys) {
+                        truncated = true;
+                        break;
+                    }
+                    try prefixes.append(alloc, try alloc.dupe(u8, common_prefix));
+                    count += 1;
+                    last_cursor_key = key;
                     continue;
                 }
             }
-            if (count >= opts.max_keys) break;
+            if (count >= opts.max_keys) {
+                truncated = true;
+                break;
+            }
             try out.append(alloc, .{
                 .key = try alloc.dupe(u8, key),
                 .etag = try alloc.dupe(u8, object.etag),
                 .size = @intCast(object.body.len),
             });
             count += 1;
+            last_cursor_key = key;
         }
         std.mem.sort(types.ListEntry, out.items, {}, lessEntry);
         return .{
             .entries = try out.toOwnedSlice(alloc),
             .common_prefixes = try prefixes.toOwnedSlice(alloc),
-            .next_continuation_token = if (count >= opts.max_keys and keys.items.len > count)
-                try alloc.dupe(u8, keys.items[count - 1])
+            .next_continuation_token = if (truncated and last_cursor_key != null)
+                try alloc.dupe(u8, last_cursor_key.?)
             else
                 null,
         };
@@ -377,4 +405,66 @@ test "memory client supports non-recursive listing with common prefixes" {
     defer listed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), listed.entries.len);
     try std.testing.expectEqual(@as(usize, 2), listed.common_prefixes.len);
+}
+
+test "memory client continuation tokens advance across filtered recursive pages" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryClient.init(alloc);
+    var client = memory.client();
+    defer client.deinit();
+
+    inline for (&.{ "other/zero", "snap/a", "snap/b", "snap/c", "snap/d", "tail/zero" }) |key| {
+        var put = try client.putObject("bucket", key, key, .{});
+        put.deinit(alloc);
+    }
+
+    var token: ?[]u8 = null;
+    defer if (token) |value| alloc.free(value);
+    var seen = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (seen.items) |key| alloc.free(key);
+        seen.deinit(alloc);
+    }
+    while (true) {
+        var page = try client.listObjects("bucket", .{
+            .prefix = "snap/",
+            .max_keys = 2,
+            .continuation_token = token,
+        });
+        defer page.deinit(alloc);
+        for (page.entries) |entry| try seen.append(alloc, try alloc.dupe(u8, entry.key));
+        const next = if (page.next_continuation_token) |value| try alloc.dupe(u8, value) else null;
+        if (token) |value| alloc.free(value);
+        token = next;
+        if (token == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen.items.len);
+    try std.testing.expectEqualStrings("snap/a", seen.items[0]);
+    try std.testing.expectEqualStrings("snap/d", seen.items[3]);
+}
+
+test "memory client continuation tokens do not repeat collapsed prefixes" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryClient.init(alloc);
+    var client = memory.client();
+    defer client.deinit();
+
+    inline for (&.{ "logs/2025/a", "logs/2025/b", "logs/2026/a", "logs/2026/b" }) |key| {
+        var put = try client.putObject("bucket", key, key, .{});
+        put.deinit(alloc);
+    }
+    var first = try client.listObjects("bucket", .{ .prefix = "logs/", .recursive = false, .max_keys = 1 });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.common_prefixes.len);
+    try std.testing.expectEqualStrings("logs/2025/", first.common_prefixes[0]);
+    var second = try client.listObjects("bucket", .{
+        .prefix = "logs/",
+        .recursive = false,
+        .max_keys = 1,
+        .continuation_token = first.next_continuation_token,
+    });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second.common_prefixes.len);
+    try std.testing.expectEqualStrings("logs/2026/", second.common_prefixes[0]);
+    try std.testing.expect(second.next_continuation_token == null);
 }

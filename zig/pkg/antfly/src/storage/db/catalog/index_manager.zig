@@ -29,6 +29,7 @@ const apply_state = @import("../derived/apply_state.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const coverage_identity = @import("../../coverage_identity.zig");
 const enrichment_catalog = @import("enrichment_catalog.zig");
 const resolver_catalog = @import("resolver_catalog.zig");
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
@@ -919,6 +920,7 @@ pub const IndexManager = struct {
         dims: u32,
         metric: vector_mod.DistanceMetric,
         external: bool,
+        managed_direct_field: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         index: hbc_mod.HBCIndex,
@@ -1237,6 +1239,8 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         field_name: []u8,
+        external: bool = false,
+        managed_direct_field: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         rebuild_root_path: []u8,
@@ -1408,6 +1412,22 @@ pub const IndexManager = struct {
                 break :blk entry.apply_mutex;
             },
         };
+        lockAtomicWithBackoff(mutex);
+        return .{
+            .manager = self,
+            .mutex = mutex,
+        };
+    }
+
+    pub fn lockVectorIndexApply(self: *IndexManager, index_name: []const u8) !ManagedIndexApplyGuard {
+        self.catalog_mutex.lockShared();
+        errdefer self.catalog_mutex.unlockShared();
+        const mutex = if (self.denseIndex(index_name)) |entry|
+            entry.apply_mutex
+        else if (self.sparseIndex(index_name)) |entry|
+            entry.apply_mutex
+        else
+            return error.IndexNotFound;
         lockAtomicWithBackoff(mutex);
         return .{
             .manager = self,
@@ -2252,6 +2272,9 @@ pub const IndexManager = struct {
     }
 
     pub fn checkpointLsmWalForManagedIndex(self: *IndexManager, index_ref: ManagedIndexRef) !void {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
         switch (index_ref.kind) {
             .full_text => {
                 const entry = self.textIndex(index_ref.name) orelse return error.IndexNotFound;
@@ -2819,7 +2842,7 @@ pub const IndexManager = struct {
                 };
             }
         } else {
-            parallelism = self.resolvedLoadParallelism(configs.len);
+            parallelism = self.resolvedLoadParallelism(configs.len, allow_backfill, read_only);
             if (parallelism <= 1) {
                 for (configs) |cfg| {
                     self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
@@ -2836,7 +2859,7 @@ pub const IndexManager = struct {
                 for (configs) |cfg| {
                     try self.ensureConfiguredIndexDir(cfg);
                 }
-                try self.loadConfiguredIndexesParallel(store, configs, parallelism, allow_backfill, read_only);
+                try self.loadConfiguredIndexesParallel(store, configs, parallelism);
             }
         }
         try self.refreshGeneratedEnrichmentTargetCache();
@@ -2876,8 +2899,17 @@ pub const IndexManager = struct {
         self.status_only_index_configs = configs;
     }
 
-    fn resolvedLoadParallelism(self: *const IndexManager, config_count: usize) usize {
-        if (config_count <= 1 or builtin.single_threaded) return 1;
+    fn resolvedLoadParallelism(
+        self: *const IndexManager,
+        config_count: usize,
+        allow_backfill: bool,
+        read_only: bool,
+    ) usize {
+        // Detached index construction is only parallel-safe when it cannot
+        // mutate the shared primary store. Writable opens can publish lexical
+        // registry entries and backfills persist checkpoints, so serialize
+        // them even when no backfill is ultimately needed.
+        if (config_count <= 1 or builtin.single_threaded or allow_backfill or !read_only) return 1;
         if (self.load_parallelism) |value| return @min(@max(value, 1), config_count);
 
         var parallelism = std.Thread.getCpuCount() catch 1;
@@ -2892,8 +2924,6 @@ pub const IndexManager = struct {
         store: anytype,
         configs: []const types.IndexConfig,
         parallelism: usize,
-        allow_backfill: bool,
-        read_only: bool,
     ) !void {
         var marked_loading: usize = 0;
         errdefer {
@@ -2913,15 +2943,13 @@ pub const IndexManager = struct {
             store: Store,
             configs: []const types.IndexConfig,
             results: []OpenResult,
-            allow_backfill: bool,
-            read_only: bool,
             next_index: std.atomic.Value(usize) = .init(0),
 
             fn run(state: *@This()) void {
                 while (true) {
                     const index = state.next_index.fetchAdd(1, .monotonic);
                     if (index >= state.configs.len) return;
-                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], state.allow_backfill, state.read_only) catch |err| {
+                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true) catch |err| {
                         std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
                             state.configs[index].name,
                             @tagName(state.configs[index].kind),
@@ -2947,8 +2975,6 @@ pub const IndexManager = struct {
             .store = store,
             .configs = configs,
             .results = results,
-            .allow_backfill = allow_backfill,
-            .read_only = read_only,
         };
 
         const spawned_count = parallelism - 1;
@@ -2979,7 +3005,7 @@ pub const IndexManager = struct {
         // deferred results cleanup releases any other opened indexes).
         for (results, 0..) |*result, i| {
             if (result.err) |err| {
-                if (read_only and indexOpenErrorIsTransientRead(err)) return err;
+                if (indexOpenErrorIsTransientRead(err)) return err;
                 try self.recordFailedIndexLoad(configs[i], err);
             }
         }
@@ -2998,7 +3024,7 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
-        var stored_cfg = try indexConfigWithFreshCoverageGeneration(self.alloc, cfg);
+        var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, cfg);
         defer stored_cfg.deinit(self.alloc);
 
         const enrichment_checkpoint = self.enrichments.items.len;
@@ -5537,19 +5563,105 @@ pub const IndexManager = struct {
         return try names.toOwnedSlice(alloc);
     }
 
-    pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
-        for (self.dense_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return coverageGenerationForConfig(entry.config);
-        }
-        for (self.sparse_indexes.items) |entry| {
-            if (std.mem.eql(u8, entry.config.name, index_name)) return coverageGenerationForConfig(entry.config);
-        }
-        for (self.status_only_index_configs) |cfg| {
-            if (std.mem.eql(u8, cfg.name, index_name) and (cfg.kind == .dense_vector or cfg.kind == .sparse_vector)) {
-                return coverageGenerationForConfig(cfg);
+    pub fn vectorIndexesForChunk(self: *const IndexManager, alloc: Allocator, chunk_name: []const u8) ![][]u8 {
+        return self.vectorIndexesDependingOnArtifact(alloc, chunk_name);
+    }
+
+    pub fn vectorIndexesDependingOnArtifact(self: *const IndexManager, alloc: Allocator, artifact_name: []const u8) ![][]u8 {
+        var dependent_artifacts = std.StringHashMapUnmanaged(void).empty;
+        defer dependent_artifacts.deinit(alloc);
+        try dependent_artifacts.put(alloc, artifact_name, {});
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.enrichments.items) |enrichment| {
+                if (enrichment.source_artifact_name.len == 0 or !dependent_artifacts.contains(enrichment.source_artifact_name)) continue;
+                if (dependent_artifacts.contains(enrichment.name)) continue;
+                try dependent_artifacts.put(alloc, enrichment.name, {});
+                changed = true;
             }
         }
-        return null;
+
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        for (self.dense_indexes.items) |entry| {
+            const depends = (if (entry.chunk_name) |name| dependent_artifacts.contains(name) else false) or
+                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false);
+            if (!depends) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+        for (self.sparse_indexes.items) |entry| {
+            const depends = (if (entry.chunk_name) |name| dependent_artifacts.contains(name) else false) or
+                (if (entry.embedding_name) |name| dependent_artifacts.contains(name) else false);
+            if (!depends) continue;
+            if (containsOwnedString(names.items, entry.config.name)) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+        return try names.toOwnedSlice(alloc);
+    }
+
+    pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
+        const cfg = self.get(index_name) orelse return null;
+        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return null;
+        return coverageGenerationForConfig(cfg.*);
+    }
+
+    pub const CoverageIdentity = struct {
+        generation: u64,
+        config_fingerprint: ?u64,
+    };
+
+    pub fn coverageIdentityMapAlloc(self: *const IndexManager, alloc: Allocator) !std.StringHashMapUnmanaged(CoverageIdentity) {
+        var identities = std.StringHashMapUnmanaged(CoverageIdentity).empty;
+        errdefer identities.deinit(alloc);
+        const vector_count = self.dense_indexes.items.len + self.sparse_indexes.items.len + self.status_only_index_configs.len;
+        try identities.ensureTotalCapacity(alloc, @intCast(vector_count));
+        for (self.dense_indexes.items) |entry| {
+            identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
+        }
+        for (self.sparse_indexes.items) |entry| {
+            identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
+        }
+        for (self.status_only_index_configs) |cfg| {
+            if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) continue;
+            identities.putAssumeCapacity(cfg.name, coverageIdentityForConfig(cfg));
+        }
+        return identities;
+    }
+
+    pub fn denseIndexUsesManagedDirectField(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.dense_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.managed_direct_field;
+        }
+        return false;
+    }
+
+    pub fn denseIndexUsesExternalCoverage(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.dense_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.external;
+        }
+        return false;
+    }
+
+    pub fn sparseIndexUsesManagedDirectField(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.sparse_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.managed_direct_field;
+        }
+        return false;
+    }
+
+    pub fn sparseIndexUsesExternalCoverage(self: *const IndexManager, index_name: []const u8) bool {
+        for (self.sparse_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+            return entry.external;
+        }
+        return false;
     }
 
     pub fn sparseIndex(self: *IndexManager, name: ?[]const u8) ?*SparseIndex {
@@ -7211,8 +7323,10 @@ pub const IndexManager = struct {
         try self.appendOpenedIndex(opened);
     }
 
-    fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
+    fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg_input: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
         if (test_inject_index_open_error) |err| return err;
+        var cfg = cfg_input;
+        try populateCoverageConfigFingerprint(self.alloc, &cfg);
         try self.ensureConfiguredIndexDir(cfg);
         switch (cfg.kind) {
             .full_text => {
@@ -7446,6 +7560,7 @@ pub const IndexManager = struct {
                     .dims = dense_cfg.dims,
                     .metric = dense_cfg.metric,
                     .external = dense_cfg.external,
+                    .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null,
                     .chunk_name = if (dense_generator) |generator|
                         if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
                     else if (referenced_embedding) |embedding_cfg|
@@ -7518,6 +7633,8 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
+                    .external = sparse_cfg.external,
+                    .managed_direct_field = !sparse_cfg.external and sparse_generator == null and referenced_embedding == null,
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
@@ -12918,7 +13035,7 @@ fn buildSplitSegment(
             if (bitmap.contains(doc_idx)) continue;
         }
 
-        const stored = (try reader.storedDocDecompressed(doc_idx)) orelse continue;
+        const stored = (try reader.storedDocDecompressed(alloc, doc_idx)) orelse continue;
         errdefer alloc.free(stored.data);
 
         const keep = switch (side) {
@@ -13003,31 +13120,43 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
 }
 
 fn newCoverageGeneration() !u64 {
-    var generation: u64 = 0;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    while (generation == 0) try io_impl.io().randomSecure(std.mem.asBytes(&generation));
-    return generation;
+    return try coverage_identity.generate(io_impl.io());
 }
 
 fn indexConfigWithCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
     var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
     errdefer stored_cfg.deinit(alloc);
-    if (stored_cfg.coverage_generation == 0) stored_cfg.coverage_generation = try newCoverageGeneration();
+    if (stored_cfg.coverage_generation == 0) {
+        stored_cfg.coverage_generation = try newCoverageGeneration();
+    } else if (!coverage_identity.isValid(stored_cfg.coverage_generation)) {
+        return error.InvalidIndexConfig;
+    }
+    stored_cfg.coverage_config_fingerprint = null;
+    try populateCoverageConfigFingerprint(alloc, &stored_cfg);
     return stored_cfg;
 }
 
-fn indexConfigWithFreshCoverageGeneration(alloc: Allocator, cfg: types.IndexConfig) !types.IndexConfig {
-    var stored_cfg = try types.IndexConfig.clone(alloc, cfg);
-    errdefer stored_cfg.deinit(alloc);
-    while (stored_cfg.coverage_generation == cfg.coverage_generation) {
-        stored_cfg.coverage_generation = try newCoverageGeneration();
+fn populateCoverageConfigFingerprint(alloc: Allocator, cfg: *types.IndexConfig) !void {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) {
+        cfg.coverage_config_fingerprint = null;
+        return;
     }
-    return stored_cfg;
+    if (cfg.coverage_config_fingerprint == null) {
+        cfg.coverage_config_fingerprint = try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json);
+    }
 }
 
 fn coverageGenerationForConfig(cfg: types.IndexConfig) u64 {
     return internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json);
+}
+
+fn coverageIdentityForConfig(cfg: types.IndexConfig) IndexManager.CoverageIdentity {
+    return .{
+        .generation = coverageGenerationForConfig(cfg),
+        .config_fingerprint = cfg.coverage_config_fingerprint,
+    };
 }
 
 fn appendCatalogConfig(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, cfg: types.IndexConfig) !void {
@@ -13114,6 +13243,12 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
             .config_json = config_json,
             .coverage_generation = coverage_generation,
         };
+        populateCoverageConfigFingerprint(alloc, &configs[i]) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // Preserve malformed persisted configs so the regular open path
+            // can quarantine only that index instead of taking down the table.
+            else => {},
+        };
         initialized += 1;
     }
 
@@ -13180,6 +13315,10 @@ test "index catalog preserves coverage generation and migrates legacy generation
     defer types.freeIndexConfigs(alloc, decoded);
     try std.testing.expectEqual(@as(usize, 1), decoded.len);
     try std.testing.expectEqual(generation, decoded[0].coverage_generation);
+    try std.testing.expectEqual(
+        try internal_keys.derivedCoverageConfigFingerprint(alloc, config_json),
+        decoded[0].coverage_config_fingerprint orelse return error.TestUnexpectedResult,
+    );
 
     var legacy = std.ArrayListUnmanaged(u8).empty;
     defer legacy.deinit(alloc);
@@ -13194,9 +13333,10 @@ test "index catalog preserves coverage generation and migrates legacy generation
     defer types.freeIndexConfigs(alloc, legacy_decoded);
     try std.testing.expectEqual(@as(usize, 1), legacy_decoded.len);
     try std.testing.expectEqual(internal_keys.derivedCoverageGeneration(config_json), legacy_decoded[0].coverage_generation);
+    try std.testing.expect(legacy_decoded[0].coverage_config_fingerprint != null);
 }
 
-test "index create ignores caller supplied coverage generation" {
+test "index create preserves authoritative coverage generation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -13214,18 +13354,72 @@ test "index create ignores caller supplied coverage generation" {
 
     const caller_generation: u64 = 0x1234_5678_9abc_def0;
     try manager.add(&store, .{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\"}",
         .coverage_generation = caller_generation,
     });
 
     const configs = try manager.listIndexesPublic(alloc);
     defer types.freeIndexConfigs(alloc, configs);
     try std.testing.expectEqual(@as(usize, 1), configs.len);
-    const stored_generation = configs[0].coverage_generation;
-    try std.testing.expect(stored_generation != 0);
-    try std.testing.expect(stored_generation != caller_generation);
+    try std.testing.expectEqual(caller_generation, configs[0].coverage_generation);
+    try std.testing.expect(configs[0].coverage_config_fingerprint != null);
+}
+
+test "index create rejects coverage generation outside metadata persistence domain" {
+    try std.testing.expectError(error.InvalidIndexConfig, indexConfigWithCoverageGeneration(std.testing.allocator, .{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+        .coverage_generation = std.math.maxInt(u64),
+    }));
+}
+
+test "vector coverage and derived replay share one index apply lock" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "coverage-apply-lock");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.add(&store, .{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+
+    const expected_mutex = manager.denseIndex("external_v1").?.apply_mutex;
+    var coverage_guard = try manager.lockVectorIndexApply("external_v1");
+    try std.testing.expectEqual(expected_mutex, coverage_guard.mutex);
+    coverage_guard.unlock();
+
+    var replay_guard = try manager.lockManagedIndexApply(.{ .name = "external_v1", .kind = .dense_vector });
+    try std.testing.expectEqual(expected_mutex, replay_guard.mutex);
+    replay_guard.unlock();
+}
+
+test "index catalog preserves malformed vector config for quarantine" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, "AIDX");
+    try appendU32(&encoded, alloc, 2);
+    try appendU32(&encoded, alloc, 1);
+    try appendStr(&encoded, alloc, "bad_dense");
+    try encoded.append(alloc, @intFromEnum(types.IndexKind.dense_vector));
+    try appendStr(&encoded, alloc, "{");
+    try appendU64(&encoded, alloc, 42);
+
+    const decoded = try deserializeCatalog(alloc, encoded.items);
+    defer types.freeIndexConfigs(alloc, decoded);
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqual(@as(u64, 42), decoded[0].coverage_generation);
+    try std.testing.expectEqual(@as(?u64, null), decoded[0].coverage_config_fingerprint);
 }
 
 const DenseConfig = struct {
@@ -13294,6 +13488,7 @@ const GeneratorConfig = struct {
 
 const SparseConfig = struct {
     field_name: []u8,
+    external: bool = false,
 
     fn deinit(self: *const SparseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
@@ -13913,6 +14108,10 @@ fn parseSparseConfig(alloc: Allocator, raw: []const u8) !SparseConfig {
     const field = root.object.get("field") orelse return error.InvalidIndexConfig;
     return .{
         .field_name = try alloc.dupe(u8, field.string),
+        .external = if (root.object.get("external")) |value|
+            if (value == .bool) value.bool else return error.InvalidIndexConfig
+        else
+            false,
     };
 }
 
@@ -16487,6 +16686,13 @@ test "parseDenseConfig accepts external embedding indexes" {
     try std.testing.expect(cfg.external);
 }
 
+test "parseSparseConfig accepts external embedding indexes" {
+    const cfg = try parseSparseConfig(std.testing.allocator, "{\"field\":\"sparse\",\"external\":true}");
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("sparse", cfg.field_name);
+    try std.testing.expect(cfg.external);
+}
+
 test "parseDenseGeneratorConfig parses source_template" {
     const alloc = std.testing.allocator;
     const json =
@@ -18083,6 +18289,19 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
     try std.testing.expectEqualStrings("doc:inline", metadata);
 }
 
+test "configured index loading only parallelizes read-only construction" {
+    var manager = try IndexManager.init(std.testing.allocator, ".");
+    defer manager.deinit();
+    manager.setLoadParallelism(3);
+
+    try std.testing.expectEqual(@as(usize, 1), manager.resolvedLoadParallelism(4, true, false));
+    try std.testing.expectEqual(@as(usize, 1), manager.resolvedLoadParallelism(4, false, false));
+    try std.testing.expectEqual(
+        @as(usize, if (builtin.single_threaded) 1 else 3),
+        manager.resolvedLoadParallelism(4, false, true),
+    );
+}
+
 test "loadConfiguredIndexesParallel quarantines worker errors without double-joining threads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -18095,10 +18314,6 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
-
-    var manager = try IndexManager.init(alloc, path);
-    defer manager.deinit();
-    manager.updateRange(.{ .start = "", .end = "" });
 
     const configs = [_]types.IndexConfig{
         .{
@@ -18113,6 +18328,20 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
         },
     };
 
+    // Materialize the healthy index before exercising the read-only parallel
+    // reopen path. Parallel construction deliberately cannot create or
+    // backfill indexes because those operations mutate the primary store.
+    {
+        var setup_manager = try IndexManager.init(alloc, path);
+        defer setup_manager.deinit();
+        setup_manager.updateRange(.{ .start = "", .end = "" });
+        try setup_manager.openConfiguredIndex(&store, configs[0], false, false);
+    }
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
     for (configs) |cfg| {
         try manager.ensureConfiguredIndexDir(cfg);
     }
@@ -18120,7 +18349,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
     // A worker error no longer fails the load: the failing index is
     // quarantined (config retained, error recorded) while the healthy one
     // loads normally — and the worker threads still join exactly once.
-    try manager.loadConfiguredIndexesParallel(&store, &configs, 2, true, false);
+    try manager.loadConfiguredIndexesParallel(&store, &configs, 2);
     try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
     try std.testing.expect(manager.denseIndex("dv_bad") == null);
     const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;

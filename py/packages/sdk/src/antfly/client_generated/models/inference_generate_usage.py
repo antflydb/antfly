@@ -6,6 +6,8 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 T = TypeVar("T", bound="InferenceGenerateUsage")
 
 
@@ -16,11 +18,13 @@ class InferenceGenerateUsage:
         prompt_tokens (int): Number of tokens in the prompt
         completion_tokens (int): Number of tokens in the completion
         total_tokens (int): Total tokens used (prompt + completion)
+        cached_prompt_tokens (int | Unset): Prompt tokens served from inference-native prefix KV cache
     """
 
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cached_prompt_tokens: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -29,6 +33,8 @@ class InferenceGenerateUsage:
         completion_tokens = self.completion_tokens
 
         total_tokens = self.total_tokens
+
+        cached_prompt_tokens = self.cached_prompt_tokens
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -39,6 +45,8 @@ class InferenceGenerateUsage:
                 "total_tokens": total_tokens,
             }
         )
+        if cached_prompt_tokens is not UNSET:
+            field_dict["cached_prompt_tokens"] = cached_prompt_tokens
 
         return field_dict
 
@@ -51,10 +59,13 @@ class InferenceGenerateUsage:
 
         total_tokens = d.pop("total_tokens")
 
+        cached_prompt_tokens = d.pop("cached_prompt_tokens", UNSET)
+
         inference_generate_usage = cls(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            cached_prompt_tokens=cached_prompt_tokens,
         )
 
         inference_generate_usage.additional_properties = d

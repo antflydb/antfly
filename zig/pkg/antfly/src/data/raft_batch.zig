@@ -60,7 +60,7 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     errdefer alloc.free(table_name);
     const batch_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(batch_value, .{})});
     defer alloc.free(batch_json);
-    var batch = try batch_api.parseBatchRequest(alloc, batch_json);
+    var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
     errdefer batch.deinit(alloc);
 
     return .{
@@ -93,4 +93,48 @@ test "raft batch round trips table batch payload" {
     try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.deletes.len);
     try std.testing.expectEqualStrings("doc:b", decoded.batch.req.deletes[0]);
     try std.testing.expectEqual(db_mod.types.SyncLevel.write, decoded.batch.req.sync_level);
+}
+
+test "raft batch round trips internal split checkpoint" {
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .split_checkpoint = .{
+            .kind = .destination,
+            .source_group_id = 41,
+            .destination_group_id = 42,
+            .range_start = "doc:m",
+            .range_end = "doc:z",
+            .delta_sequence = 7,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const checkpoint = decoded.batch.req.split_checkpoint orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination, checkpoint.kind);
+    try std.testing.expectEqual(@as(u64, 41), checkpoint.source_group_id);
+    try std.testing.expectEqual(@as(u64, 42), checkpoint.destination_group_id);
+    try std.testing.expectEqualStrings("doc:m", checkpoint.range_start);
+    try std.testing.expectEqualStrings("doc:z", checkpoint.range_end);
+    try std.testing.expectEqual(@as(u64, 7), checkpoint.delta_sequence);
+}
+
+test "raft batch round trips internal split replication identity" {
+    const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 41, .range_id = 4100 };
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .writes = &.{.{ .key = "doc:m", .value = "{}" }},
+        .split_replication = .{
+            .source_group_id = 41,
+            .destination_group_id = 42,
+            .identity_namespace = namespace,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const replication = decoded.batch.req.split_replication orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
+    try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
+    try std.testing.expect(replication.identity_namespace.eql(namespace));
 }

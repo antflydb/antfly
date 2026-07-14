@@ -12,10 +12,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const batch = @import("api/batch.zig");
+const http_client = @import("api/http_client.zig");
 const provisioned_storage = @import("api/provisioned_storage.zig");
 const table_writes = @import("api/table_writes.zig");
 
 test {
+    _ = batch;
+    _ = http_client;
     _ = provisioned_storage;
     _ = table_writes;
 }

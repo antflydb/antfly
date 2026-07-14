@@ -9,7 +9,7 @@ The desired end state is closer to "Hypura-style" execution:
 - model weights stay mmap-backed on disk by default
 - the runtime promotes only a bounded hot set into host RAM and backend memory
 - backend pressure causes eviction and smaller staged execution, not immediate request failure
-- embedded antfly inference and swarm expose enough knobs to tune budgets when heuristics are wrong
+- embedded antfly inference and standalone expose enough knobs to tune budgets when heuristics are wrong
 
 ## Progress
 
@@ -32,7 +32,7 @@ The desired end state is closer to "Hypura-style" execution:
 
 - Embedded antfly inference now has server-side generation budget overrides in:
   - [server.zig](pkg/inference/src/server/server.zig)
-- `antfly antfly inference run` and `antfly swarm` now accept budget overrides for embedded antfly inference generation:
+- `antfly antfly inference run` and `antfly standalone` now accept budget overrides for embedded antfly inference generation:
   - `--host-budget-mb`
   - `--backend-budget-mb`
   - `--combined-budget-mb`
@@ -43,8 +43,8 @@ The desired end state is closer to "Hypura-style" execution:
   - `--termite-combined-budget-mb`
   - `--termite-kv-budget-mb`
   - `--termite-scratch-budget-mb`
-- The live swarm e2e fixture now passes these via environment-backed defaults for the pulled `ggml-org/gemma-4-e2b-it-gguf` path:
-  - [test_swarm.py](../../e2e/antfly/test_swarm.py)
+- The live standalone e2e fixture now passes these via environment-backed defaults for the pulled `ggml-org/gemma-4-e2b-it-gguf` path:
+  - [test_standalone.py](../../e2e/antfly/test_standalone.py)
 - MLX eager resident-weight reservation is now capped to a bounded hot set instead of reserving the full eager estimate up front:
   - [mlx_compute.zig](pkg/inference/src/ops/mlx_compute.zig)
 - MLX quantized linear execution now degrades on backend budget pressure for non-expert weights by falling back to the existing wrapper path instead of surfacing an immediate `MemoryBudgetExceeded`:
@@ -135,12 +135,12 @@ The runtime does retry smaller prefill chunks in [generation.zig](pkg/inference/
 
 ### 5. Embedded antfly inference does not expose enough override controls
 
-`antfly swarm` and embedded antfly inference do not currently provide a clean way to override generation budgets for live runs, so the default heuristic can block otherwise viable models.
+`antfly standalone` and embedded antfly inference do not currently provide a clean way to override generation budgets for live runs, so the default heuristic can block otherwise viable models.
 
 Relevant paths:
 
 - [pkg/antfly/src/termite/runtime.zig](pkg/antfly/src/termite/runtime.zig)
-- [pkg/antfly/src/swarm/runtime.zig](pkg/antfly/src/swarm/runtime.zig)
+- [pkg/antfly/src/standalone/runtime.zig](pkg/antfly/src/standalone/runtime.zig)
 
 ## Practical Constraints
 
@@ -156,7 +156,7 @@ We already mmap GGUF weights, which is good. But mmap alone does not give us "ru
 
 ## Phase 1: Make The Current Design Usable
 
-### 1.1 Expose budget overrides in embedded antfly inference and swarm
+### 1.1 Expose budget overrides in embedded antfly inference and standalone
 
 Add CLI/config/env support for:
 
@@ -169,7 +169,7 @@ Add CLI/config/env support for:
 Targets:
 
 - [pkg/antfly/src/termite/runtime.zig](pkg/antfly/src/termite/runtime.zig)
-- [pkg/antfly/src/swarm/runtime.zig](pkg/antfly/src/swarm/runtime.zig)
+- [pkg/antfly/src/standalone/runtime.zig](pkg/antfly/src/standalone/runtime.zig)
 
 Outcome:
 
@@ -337,7 +337,7 @@ Targets:
 
 - antfly inference smoke tests
 - unit tests in tier/cache/planner
-- live e2e swarm coverage
+- live e2e standalone coverage
 
 ### 4.2 Add stress profiles
 
@@ -355,7 +355,7 @@ Outcome:
 
 ## Suggested Immediate Work Order
 
-1. Add embedded termite/swarm budget overrides.
+1. Add embedded termite/standalone budget overrides.
 2. Stop reserving oversized resident-weight estimates.
 3. Force large GGUF generators down the lazy path by default.
 4. Add non-fatal fallback on backend promotion denial.
@@ -395,8 +395,8 @@ That is a stricter requirement than the current behavior.
 This work is done when all of the following are true:
 
 - large GGUF generator models default to lazy disk-backed loading
-- embedded antfly inference in swarm can run quantized generators without manual model repacking
+- embedded antfly inference in standalone can run quantized generators without manual model repacking
 - backend pressure causes eviction and degraded execution instead of immediate failure in common cases
 - host RAM and backend memory both behave like bounded caches
-- live e2e tests cover the embedded swarm path with pulled models from the default antfly inference models directory
+- live e2e tests cover the embedded standalone path with pulled models from the default antfly inference models directory
 - runtime logs explain why it demoted, evicted, or failed

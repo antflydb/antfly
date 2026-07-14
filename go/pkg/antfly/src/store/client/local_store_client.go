@@ -37,7 +37,7 @@ import (
 var _ StoreRPC = (*LocalStoreClient)(nil)
 
 // LocalStoreClient implements StoreRPC by calling the store directly in-process,
-// bypassing HTTP. Used in swarm mode where metadata and store share a process.
+// bypassing HTTP. Used in standalone mode where metadata and store share a process.
 type LocalStoreClient struct {
 	nodeID types.ID
 	store  func() (store.StoreIface, error)

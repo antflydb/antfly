@@ -816,28 +816,29 @@ pub const SegmentReader = struct {
         return .{ .id = id, .data = compressed_data };
     }
 
-    /// Read and decompress stored document data. Caller owns returned data.
-    pub fn storedDocDecompressed(self: *const SegmentReader, doc_idx: u32) !?struct { id: []const u8, data: []u8 } {
+    /// Read and decompress stored document data into `alloc`. The caller owns
+    /// and must free the returned data with that same allocator.
+    pub fn storedDocDecompressed(self: *const SegmentReader, alloc: Allocator, doc_idx: u32) !?struct { id: []const u8, data: []u8 } {
         const raw = self.storedDoc(doc_idx) orelse return null;
         const ver = self.data[@intCast(self.stored_offset)];
         if (ver == stored_fields_version_block_compressed) {
             const loc = self.v4StoredDocLocation(@intCast(self.stored_offset + 1 + 4), doc_idx) orelse return null;
             const compressed = self.data[loc.block_start..loc.block_end];
-            const block = try snappy.decode(self.alloc, compressed);
-            defer self.alloc.free(block);
+            const block = try snappy.decode(alloc, compressed);
+            defer alloc.free(block);
             if (loc.doc_offset > block.len or block.len - loc.doc_offset < 4) return error.InvalidSegment;
             const data_len = std.mem.readInt(u32, block[loc.doc_offset..][0..4], .little);
             const data_start = loc.doc_offset + 4;
             if (data_start > block.len or data_len > block.len - data_start) return error.InvalidSegment;
             if (data_len != loc.raw_len) return error.InvalidSegment;
-            return .{ .id = loc.id, .data = try self.alloc.dupe(u8, block[data_start..][0..data_len]) };
+            return .{ .id = loc.id, .data = try alloc.dupe(u8, block[data_start..][0..data_len]) };
         }
         if (ver == stored_fields_version_compressed_per_doc) {
-            const decompressed = try snappy.decode(self.alloc, raw.data);
+            const decompressed = try snappy.decode(alloc, raw.data);
             return .{ .id = raw.id, .data = decompressed };
         } else {
             // v1/v3: data is not compressed, dupe for consistent ownership.
-            return .{ .id = raw.id, .data = try self.alloc.dupe(u8, raw.data) };
+            return .{ .id = raw.id, .data = try alloc.dupe(u8, raw.data) };
         }
     }
 
@@ -1500,7 +1501,7 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
                 }
             }
 
-            const stored = (try input.reader.storedDocDecompressed(doc_id)) orelse {
+            const stored = (try input.reader.storedDocDecompressed(alloc, doc_id)) orelse {
                 doc_id_usize += 1;
                 continue;
             };
@@ -1567,7 +1568,7 @@ fn writeMergedStoredFieldsInOrder(
     defer chunk.deinit(alloc);
 
     for (records, 0..) |record, out_doc_id| {
-        const stored = (try inputs[record.ref.input_idx].reader.storedDocDecompressed(record.ref.doc_id)) orelse return error.InvalidSegment;
+        const stored = (try inputs[record.ref.input_idx].reader.storedDocDecompressed(alloc, record.ref.doc_id)) orelse return error.InvalidSegment;
         defer alloc.free(stored.data);
         if (chunk.items.len > 0 and (docs_in_block >= stored_fields_block_doc_target or chunk.items.len +| 4 +| stored.data.len > stored_fields_block_raw_target)) {
             try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, data_start, block_idx);
@@ -1594,7 +1595,7 @@ fn countStoredBlocksInOrder(alloc: Allocator, inputs: []const MergeInput, record
     var docs_in_block: u32 = 0;
     var raw_bytes: usize = 0;
     for (records) |record| {
-        const stored = (try inputs[record.ref.input_idx].reader.storedDocDecompressed(record.ref.doc_id)) orelse return error.InvalidSegment;
+        const stored = (try inputs[record.ref.input_idx].reader.storedDocDecompressed(alloc, record.ref.doc_id)) orelse return error.InvalidSegment;
         const doc_raw_bytes = 4 +| stored.data.len;
         alloc.free(stored.data);
         if (raw_bytes > 0 and (docs_in_block >= stored_fields_block_doc_target or raw_bytes +| doc_raw_bytes > stored_fields_block_raw_target)) {
@@ -1632,7 +1633,7 @@ fn countMergedStoredBlocks(alloc: Allocator, inputs: []const MergeInput) !u32 {
                 }
             }
 
-            const stored = (try input.reader.storedDocDecompressed(doc_id)) orelse {
+            const stored = (try input.reader.storedDocDecompressed(alloc, doc_id)) orelse {
                 doc_id_usize += 1;
                 continue;
             };
@@ -2485,14 +2486,37 @@ test "segment roundtrip" {
     try std.testing.expectEqual(@as(u32, 1), world.docFreq());
 
     // Read stored docs (decompressed)
-    const doc0 = (try reader.storedDocDecompressed(0)) orelse return error.TestExpectedEqual;
+    const doc0 = (try reader.storedDocDecompressed(alloc, 0)) orelse return error.TestExpectedEqual;
     defer alloc.free(doc0.data);
     try std.testing.expectEqualStrings("doc-1", doc0.id);
     try std.testing.expectEqualStrings("Hello world", doc0.data);
 
-    const doc1 = (try reader.storedDocDecompressed(1)) orelse return error.TestExpectedEqual;
+    const doc1 = (try reader.storedDocDecompressed(alloc, 1)) orelse return error.TestExpectedEqual;
     defer alloc.free(doc1.data);
     try std.testing.expectEqualStrings("doc-2", doc1.id);
+}
+
+test "segment stored document decompression honors the caller allocator" {
+    var reader_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(reader_gpa.deinit() == .ok);
+    const reader_alloc = reader_gpa.allocator();
+
+    var output_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(output_gpa.deinit() == .ok);
+    const output_alloc = output_gpa.allocator();
+
+    var writer = SegmentWriter.init(reader_alloc);
+    defer writer.deinit();
+    try writer.addStoredDoc("doc-1", "allocator-owned output");
+
+    const segment = try writer.build();
+    defer reader_alloc.free(segment);
+    var reader = try SegmentReader.init(reader_alloc, segment);
+    defer reader.deinit();
+
+    const stored = (try reader.storedDocDecompressed(output_alloc, 0)) orelse return error.TestExpectedEqual;
+    defer output_alloc.free(stored.data);
+    try std.testing.expectEqualStrings("allocator-owned output", stored.data);
 }
 
 test "segment layout stats ignores invalid inverted section slice" {
@@ -2659,13 +2683,13 @@ test "segment block-compressed stored fields cross block boundary" {
     try std.testing.expectEqualStrings("doc-0", first_ref.id);
     try std.testing.expectEqual(@as(usize, 0), first_ref.data.len);
 
-    const boundary = (try reader.storedDocDecompressed(@intCast(stored_fields_block_doc_target))) orelse return error.TestExpectedEqual;
+    const boundary = (try reader.storedDocDecompressed(alloc, @intCast(stored_fields_block_doc_target))) orelse return error.TestExpectedEqual;
     defer alloc.free(boundary.data);
     try std.testing.expectEqualStrings("doc-128", boundary.id);
     try std.testing.expect(std.mem.indexOf(u8, boundary.data, "\"ordinal\":128") != null);
 
     const last_doc_id: u32 = @intCast(stored_fields_block_doc_target + 6);
-    const last = (try reader.storedDocDecompressed(last_doc_id)) orelse return error.TestExpectedEqual;
+    const last = (try reader.storedDocDecompressed(alloc, last_doc_id)) orelse return error.TestExpectedEqual;
     defer alloc.free(last.data);
     try std.testing.expectEqualStrings("doc-134", last.id);
     try std.testing.expect(std.mem.indexOf(u8, last.data, "\"ordinal\":134") != null);
@@ -2737,11 +2761,11 @@ test "merge copies aligned stored field blocks without recompressing" {
     const merged_block = merged_reader.data[merged_loc.block_start..merged_loc.block_end];
     try std.testing.expectEqualSlices(u8, src_block, merged_block);
 
-    const last_copied = (try merged_reader.storedDocDecompressed(@intCast(stored_fields_block_doc_target - 1))) orelse return error.TestExpectedEqual;
+    const last_copied = (try merged_reader.storedDocDecompressed(alloc, @intCast(stored_fields_block_doc_target - 1))) orelse return error.TestExpectedEqual;
     defer alloc.free(last_copied.data);
     try std.testing.expectEqualStrings("a-127", last_copied.id);
 
-    const tail = (try merged_reader.storedDocDecompressed(@intCast(stored_fields_block_doc_target))) orelse return error.TestExpectedEqual;
+    const tail = (try merged_reader.storedDocDecompressed(alloc, @intCast(stored_fields_block_doc_target))) orelse return error.TestExpectedEqual;
     defer alloc.free(tail.data);
     try std.testing.expectEqualStrings("b-0", tail.id);
 }

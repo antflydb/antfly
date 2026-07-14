@@ -153,29 +153,29 @@ pub const Primary = struct {
         return primary;
     }
 
-    /// Convert a live promoted standby into a primary without reopening its
-    /// receive log. The receive log has an exclusive writer lock, so attempting
-    /// to open the same path while the standby still owns it can never succeed.
-    /// All fallible validation and slot-store setup happens before ownership is
-    /// transferred; a failure therefore leaves the standby intact and retryable.
-    pub fn takePromotedStandby(
+    /// Converts the promoted standby's live receive-log owner into the primary
+    /// log owner. The slot store is opened and the handoff is fully validated
+    /// before consuming `standby`, so every error leaves the standby usable.
+    pub fn adoptPromotedStandby(
         alloc: Allocator,
         standby: *standby_mod.Standby,
         slot_store_path: [*:0]const u8,
         handoff: standby_mod.PromotionHandoff,
         options: OpenOptions,
     ) !Primary {
-        const current_handoff = try standby.promotedPrimaryHandoff();
-        if (!std.meta.eql(current_handoff, handoff)) return error.PromotedLogMismatch;
-        try validatePromotedLog(alloc, &standby.receive_log, handoff);
+        if (handoff.switch_lsn == 0) return error.InvalidPromotionHandoff;
+        if (handoff.next_lsn != handoff.switch_lsn + 1) return error.InvalidPromotionHandoff;
+        if (!std.meta.eql(standby.identity, handoff.identity)) return error.InvalidPromotionHandoff;
 
         var slots = try slot_store.SlotStore.open(alloc, slot_store_path, options.slot_store_options);
         errdefer slots.close();
+        try validatePromotedLog(alloc, &standby.receive_log, handoff);
 
-        // Nothing below this point can fail. Close the standby-only progress
-        // WAL and move the still-open receive log into the new primary.
+        const standby_alloc = standby.alloc;
         standby.progress_wal.close();
         const log = standby.receive_log;
+        standby_alloc.free(standby.progress_wal_path);
+        standby_alloc.free(standby.receive_log_path);
         standby.* = undefined;
         return .{
             .alloc = alloc,
@@ -183,6 +183,18 @@ pub const Primary = struct {
             .log = log,
             .slots = slots,
         };
+    }
+
+    /// Compatibility spelling retained for callers built against the original
+    /// HA hardening API. Both names use the same ownership-safe implementation.
+    pub fn takePromotedStandby(
+        alloc: Allocator,
+        standby: *standby_mod.Standby,
+        slot_store_path: [*:0]const u8,
+        handoff: standby_mod.PromotionHandoff,
+        options: OpenOptions,
+    ) !Primary {
+        return adoptPromotedStandby(alloc, standby, slot_store_path, handoff, options);
     }
 
     pub fn close(self: *Primary) void {

@@ -20,6 +20,10 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const tables_api = @import("tables.zig");
 const runtime_status = @import("runtime_status.zig");
+const coverage_policy_mod = @import("coverage_policy.zig");
+const json_helpers = @import("json_helpers.zig");
+const managed_embedder = @import("../inference/managed_embedder.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -30,6 +34,7 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8
         .object => {},
         else => return error.InvalidCreateIndexRequest,
     }
+    coverage_policy_mod.validateIndexConfig(parsed.value) catch return error.InvalidCreateIndexRequest;
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
 
@@ -49,6 +54,13 @@ pub fn addIndexToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
+    const stored_config = storedIndexConfigForMutationAlloc(
+        alloc,
+        index_name,
+        root.get(index_name),
+        config.value,
+    ) catch return error.InvalidCreateIndexRequest;
+    defer alloc.free(stored_config);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -70,11 +82,72 @@ pub fn addIndexToTableIndexesJson(
     if (!first) try out.append(alloc, ',');
     try appendJsonString(alloc, &out, index_name);
     try out.append(alloc, ':');
-    const encoded_config = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(config.value, .{})});
-    defer alloc.free(encoded_config);
-    try out.appendSlice(alloc, encoded_config);
+    try out.appendSlice(alloc, stored_config);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn storedIndexConfigForMutationAlloc(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    existing: ?std.json.Value,
+    requested: std.json.Value,
+) ![]u8 {
+    try coverage_policy_mod.validateStoredIndexConfig(requested);
+    if (coverage_policy_mod.incarnation(requested) != null) {
+        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(requested, .{})});
+    }
+    if (existing) |current| {
+        if (coverage_policy_mod.incarnation(current)) |current_incarnation| {
+            const exact_match = try equivalentIndexConfigValues(alloc, index_name, current, requested);
+            const output_match = if (exact_match)
+                true
+            else
+                equivalentDerivedOutputConfig(alloc, index_name, current, requested);
+            if (output_match) {
+                return try coverage_policy_mod.withIncarnationAlloc(alloc, requested, current_incarnation);
+            }
+        }
+    }
+    return try coverage_policy_mod.withFreshIncarnationAlloc(alloc, requested);
+}
+
+fn equivalentDerivedOutputConfig(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    lhs: std.json.Value,
+    rhs: std.json.Value,
+) bool {
+    const lhs_fingerprint = expectedCoverageConfigHash(alloc, index_name, lhs) catch return false;
+    const rhs_fingerprint = expectedCoverageConfigHash(alloc, index_name, rhs) catch return false;
+    return lhs_fingerprint == rhs_fingerprint;
+}
+
+fn equivalentIndexConfigValues(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    lhs: std.json.Value,
+    rhs: std.json.Value,
+) !bool {
+    const lhs_json = try canonicalIndexConfigJson(alloc, index_name, lhs);
+    defer alloc.free(lhs_json);
+    const rhs_json = try canonicalIndexConfigJson(alloc, index_name, rhs);
+    defer alloc.free(rhs_json);
+    var lhs_parsed = try std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{});
+    defer lhs_parsed.deinit();
+    var rhs_parsed = try std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{});
+    defer rhs_parsed.deinit();
+    return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
+}
+
+pub fn storedIndexConfigJsonAlloc(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    index_name: []const u8,
+) !?[]u8 {
+    var lookup = (try lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return null;
+    defer lookup.deinit();
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(lookup.config, .{})});
 }
 
 pub fn removeIndexFromTableIndexesJson(
@@ -412,6 +485,8 @@ pub fn encodeIndexList(
     };
     const expected_group_ids = try expectedTableGroupIds(alloc, snapshot, table.table_id);
     defer if (expected_group_ids.len > 0) alloc.free(expected_group_ids);
+    var status_lookup = try RuntimeStatusLookup.init(alloc, expected_group_ids, local_statuses);
+    defer status_lookup.deinit();
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -422,7 +497,7 @@ pub fn encodeIndexList(
         if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
-        try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses);
+        try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses, &status_lookup);
     }
     try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
@@ -479,10 +554,12 @@ fn encodeSingleIndexLookupWithTopology(
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) ![]u8 {
     if (config != .object) return error.InvalidTableIndexMetadata;
+    var status_lookup = try RuntimeStatusLookup.init(alloc, expected_group_ids, local_statuses);
+    defer status_lookup.deinit();
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendIndexStatus(alloc, &out, index_name, config, expected_group_ids, local_statuses);
+    try appendIndexStatus(alloc, &out, index_name, config, expected_group_ids, local_statuses, &status_lookup);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -595,11 +672,7 @@ pub fn equivalentIndexConfigJson(
     var it = lhs_object.iterator();
     while (it.next()) |entry| {
         const rhs_value = rhs_object.get(entry.key_ptr.*) orelse return false;
-        const lhs_config = try canonicalIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
-        defer alloc.free(lhs_config);
-        const rhs_config = try canonicalIndexConfigJson(alloc, entry.key_ptr.*, rhs_value);
-        defer alloc.free(rhs_config);
-        if (!std.mem.eql(u8, lhs_config, rhs_config)) return false;
+        if (!try equivalentIndexConfigValues(alloc, entry.key_ptr.*, entry.value_ptr.*, rhs_value)) return false;
     }
     return true;
 }
@@ -640,6 +713,55 @@ fn expectedTableGroupIds(
     return group_ids;
 }
 
+const RuntimeStatusLookup = struct {
+    const IndexMap = std.StringHashMapUnmanaged(*const db_mod.types.DBIndexStats);
+
+    alloc: std.mem.Allocator,
+    expected_group_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    runtime_indexes: []IndexMap = &.{},
+
+    fn init(
+        alloc: std.mem.Allocator,
+        expected_group_ids: []const u64,
+        local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    ) !RuntimeStatusLookup {
+        var lookup = RuntimeStatusLookup{ .alloc = alloc };
+        errdefer lookup.deinit();
+        try lookup.expected_group_indexes.ensureTotalCapacity(alloc, @intCast(expected_group_ids.len));
+        for (expected_group_ids, 0..) |group_id, i| {
+            lookup.expected_group_indexes.putAssumeCapacity(group_id, i);
+        }
+
+        const statuses = if (local_statuses) |runtime| runtime.items else &.{};
+        if (statuses.len == 0) return lookup;
+        lookup.runtime_indexes = try alloc.alloc(IndexMap, statuses.len);
+        @memset(lookup.runtime_indexes, .empty);
+        for (statuses, 0..) |*status, runtime_index| {
+            const map = &lookup.runtime_indexes[runtime_index];
+            try map.ensureTotalCapacity(alloc, @intCast(status.stats.indexes.len));
+            for (status.stats.indexes) |*item| map.putAssumeCapacity(item.name, item);
+        }
+        return lookup;
+    }
+
+    fn deinit(self: *RuntimeStatusLookup) void {
+        for (self.runtime_indexes) |*map| map.deinit(self.alloc);
+        if (self.runtime_indexes.len > 0) self.alloc.free(self.runtime_indexes);
+        self.expected_group_indexes.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn expectedGroupIndex(self: *const RuntimeStatusLookup, expected_group_ids: []const u64, group_id: u64) ?usize {
+        if (expected_group_ids.len == 0) return null;
+        return self.expected_group_indexes.get(group_id);
+    }
+
+    fn findIndex(self: *const RuntimeStatusLookup, runtime_index: usize, index_name: []const u8) ?db_mod.types.DBIndexStats {
+        if (runtime_index >= self.runtime_indexes.len) return null;
+        return (self.runtime_indexes[runtime_index].get(index_name) orelse return null).*;
+    }
+};
+
 fn appendIndexStatus(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -647,6 +769,7 @@ fn appendIndexStatus(
     config: std.json.Value,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    status_lookup: *const RuntimeStatusLookup,
 ) !void {
     const index_type = inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata;
     const embeddings_coverage_policy = if (index_type == .embeddings)
@@ -661,12 +784,20 @@ fn appendIndexStatus(
         graphSourceStatus(config)
     else
         null;
+    const coverage_generation = if (index_type == .embeddings)
+        coverage_policy_mod.incarnation(config) orelse 0
+    else
+        0;
+    const coverage_config_hash = if (coverage_generation != 0)
+        try expectedCoverageConfigHash(alloc, index_name, config)
+    else
+        0;
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, false);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, status_lookup, false);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, true);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, status_lookup, true);
     try out.append(alloc, '}');
 }
 
@@ -697,7 +828,8 @@ fn appendIndexConfig(
 
     var it = config.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "name") or
+            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field)) continue;
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
@@ -750,12 +882,13 @@ fn canonicalIndexConfigJson(
     return try out.toOwnedSlice(alloc);
 }
 
-const EmbeddingsCoveragePolicy = enum {
-    strict,
-    partial,
-    best_effort,
-    external,
-};
+const EmbeddingsCoveragePolicy = coverage_policy_mod.Policy;
+
+fn expectedCoverageConfigHash(alloc: std.mem.Allocator, index_name: []const u8, config: std.json.Value) !u64 {
+    const stored = try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, config);
+    defer alloc.free(stored);
+    return try internal_keys.derivedCoverageConfigFingerprint(alloc, stored);
+}
 
 fn embeddingsCoveragePolicyName(policy: EmbeddingsCoveragePolicy) []const u8 {
     return switch (policy) {
@@ -774,15 +907,6 @@ fn embeddingsCoveragePolicyRequiresTableCoverage(policy: EmbeddingsCoveragePolic
     return policy == .strict;
 }
 
-fn parseEmbeddingsCoveragePolicy(value: std.json.Value) ?EmbeddingsCoveragePolicy {
-    if (value != .string) return null;
-    if (std.mem.eql(u8, value.string, "strict")) return .strict;
-    if (std.mem.eql(u8, value.string, "full")) return .strict;
-    if (std.mem.eql(u8, value.string, "partial")) return .partial;
-    if (std.mem.eql(u8, value.string, "best_effort")) return .best_effort;
-    return null;
-}
-
 fn embeddingsCoveragePolicy(config: std.json.Value) EmbeddingsCoveragePolicy {
     if (config != .object) return .strict;
     if (config.object.get("external")) |external| {
@@ -791,17 +915,8 @@ fn embeddingsCoveragePolicy(config: std.json.Value) EmbeddingsCoveragePolicy {
             else => {},
         }
     }
-    if (config.object.get("partial")) |partial| {
-        switch (partial) {
-            .bool => |value| if (value) return .partial,
-            else => {},
-        }
-    }
     if (config.object.get("coverage_policy")) |policy| {
-        if (parseEmbeddingsCoveragePolicy(policy)) |parsed| return parsed;
-    }
-    if (config.object.get("coverage")) |policy| {
-        if (parseEmbeddingsCoveragePolicy(policy)) |parsed| return parsed;
+        return coverage_policy_mod.parse(policy) catch .strict;
     }
     return .strict;
 }
@@ -968,9 +1083,12 @@ fn appendIndexRuntimeStatus(
     index_type: ApiIndexType,
     embeddings_coverage_policy: EmbeddingsCoveragePolicy,
     embeddings_sparse: bool,
+    coverage_generation: u64,
+    coverage_config_hash: u64,
     graph_source_status: ?GraphSourceStatus,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    status_lookup: *const RuntimeStatusLookup,
     shard_view: bool,
 ) !void {
     if (shard_view) {
@@ -984,12 +1102,12 @@ fn appendIndexRuntimeStatus(
         defer if (emitted_expected.len > 0) alloc.free(emitted_expected);
 
         if (local_statuses) |runtime| {
-            for (runtime.items) |item_runtime| {
+            for (runtime.items, 0..) |item_runtime, runtime_index| {
                 const expected_index = if (expected_group_ids.len > 0)
-                    expectedGroupIndex(expected_group_ids, item_runtime.group_id) orelse continue
+                    status_lookup.expectedGroupIndex(expected_group_ids, item_runtime.group_id) orelse continue
                 else
                     null;
-                const item = findIndexStatus(item_runtime.stats.indexes, index_name) orelse continue;
+                const item = status_lookup.findIndex(runtime_index, index_name) orelse continue;
                 if (expected_index) |i| emitted_expected[i] = true;
                 if (emitted) try out.append(alloc, ',');
                 emitted = true;
@@ -1000,7 +1118,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_coverage_policy, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.source_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -1013,7 +1131,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_coverage_policy, embeddings_sparse, graph_source_status, .{}, null, null, null, .{}, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, .{}, null, null, null, .{}, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -1024,7 +1142,7 @@ fn appendIndexRuntimeStatus(
     }
 
     const aggregate = if (local_statuses) |runtime|
-        aggregateIndexStatus(runtime.items, index_name, expected_group_ids) orelse
+        aggregateIndexStatusIndexed(runtime.items, index_name, expected_group_ids, coverage_generation, coverage_config_hash, status_lookup) orelse
             if (expected_group_ids.len > 0) missingAggregateIndexStatus(expected_group_ids.len) else null
     else if (expected_group_ids.len > 0)
         missingAggregateIndexStatus(expected_group_ids.len)
@@ -1034,7 +1152,7 @@ fn appendIndexRuntimeStatus(
         try appendMinimalIndexRuntimeStatus(alloc, out, index_type);
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
 fn appendMinimalIndexRuntimeStatus(
@@ -1063,8 +1181,14 @@ const AggregatedIndexStatus = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    coverage_generation: u64 = 0,
+    coverage_config_hash: u64 = 0,
+    coverage_identity_ready: bool = false,
+    coverage_summary_ready: bool = true,
+    coverage_config_mismatch_count: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
@@ -1086,6 +1210,7 @@ const AggregatedIndexStatus = struct {
     stale_group_count: u64 = 0,
     missing_group_count: u64 = 0,
     remote_unknown_group_count: u64 = 0,
+    unknown_group_count: u64 = 0,
     runtime_present: bool = false,
     runtime_fresh: bool = false,
     algebraic_parse_error_count: u64 = 0,
@@ -1136,10 +1261,7 @@ fn missingAggregateIndexStatus(expected_group_count: usize) AggregatedIndexStatu
 }
 
 fn statusFreshnessCountsAsFresh(metadata: runtime_status.RuntimeStatusMetadata) bool {
-    return switch (metadata.freshness) {
-        .fresh, .unknown => true,
-        else => false,
-    };
+    return metadata.freshness == .fresh;
 }
 
 fn statusFreshnessName(freshness: runtime_status.RuntimeStatusFreshness) []const u8 {
@@ -1158,16 +1280,35 @@ fn aggregateIndexStatus(
     runtimes: []const runtime_status.LocalTableRuntimeStatus,
     index_name: []const u8,
     expected_group_ids: []const u64,
+    coverage_config_hash: u64,
 ) ?AggregatedIndexStatus {
-    var aggregate: AggregatedIndexStatus = .{};
+    return aggregateIndexStatusIndexed(runtimes, index_name, expected_group_ids, 0, coverage_config_hash, null);
+}
+
+fn aggregateIndexStatusIndexed(
+    runtimes: []const runtime_status.LocalTableRuntimeStatus,
+    index_name: []const u8,
+    expected_group_ids: []const u64,
+    coverage_generation: u64,
+    coverage_config_hash: u64,
+    status_lookup: ?*const RuntimeStatusLookup,
+) ?AggregatedIndexStatus {
+    var aggregate: AggregatedIndexStatus = .{ .coverage_config_hash = coverage_config_hash };
     var found = false;
     var runtime_count: usize = 0;
     var active_count: usize = 0;
     var active_progress_sum: f64 = 0.0;
 
-    for (runtimes) |runtime| {
-        if (!expectedGroupAllowsStatus(expected_group_ids, runtime.group_id)) continue;
-        const item = findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
+    for (runtimes, 0..) |runtime, runtime_index| {
+        const expected = if (status_lookup) |lookup|
+            expected_group_ids.len == 0 or lookup.expectedGroupIndex(expected_group_ids, runtime.group_id) != null
+        else
+            expectedGroupAllowsStatus(expected_group_ids, runtime.group_id);
+        if (!expected) continue;
+        const item = if (status_lookup) |lookup|
+            lookup.findIndex(runtime_index, index_name) orelse continue
+        else
+            findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
         if (aggregate.kind == null) aggregate.kind = item.kind;
         if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
@@ -1181,21 +1322,31 @@ fn aggregateIndexStatus(
             aggregate.runtime_fresh = true;
         } else if (statusFreshnessCountsAsRemoteUnknown(runtime.metadata)) {
             aggregate.remote_unknown_group_count += 1;
+        } else if (runtime.metadata.freshness == .unknown) {
+            aggregate.unknown_group_count += 1;
         } else {
             aggregate.stale_group_count += 1;
         }
-        // DBStats.doc_count is intentionally query-visible cardinality, not a
-        // primary-store scan count. Managed embedding coverage uses it as an
-        // efficient approximation until table cardinality is maintained as a
-        // durable counter.
-        aggregate.table_doc_count += runtime.stats.doc_count;
+        // Coverage is projected only from current observations. Stale groups
+        // remain visible in diagnostics but cannot contribute cardinality or
+        // outcomes to a complete aggregate.
+        if (statusFreshnessCountsAsFresh(runtime.metadata)) {
+            aggregate.table_doc_count +|= runtime.stats.source_doc_count;
+            if (!coverageIdentityMatches(item, coverage_generation, coverage_config_hash)) {
+                aggregate.coverage_config_mismatch_count += 1;
+            } else if (!item.coverage_summary_ready) {
+                aggregate.coverage_summary_ready = false;
+            } else {
+                aggregate.coverage_produced_count +|= item.coverage_produced_count;
+                aggregate.coverage_skipped_count +|= item.coverage_skipped_count;
+                aggregate.coverage_terminal_failed_count +|= item.coverage_terminal_failed_count;
+            }
+        }
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
         aggregate.node_count += item.node_count;
         aggregate.root_node = if (runtime_count == 1) item.root_node else 0;
-        aggregate.coverage_skipped_count += item.coverage_skipped_count;
-        aggregate.coverage_terminal_failed_count += item.coverage_terminal_failed_count;
         aggregate.replay_applied_sequence += item.replay_applied_sequence;
         aggregate.replay_target_sequence += item.replay_target_sequence;
         if (item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
@@ -1259,6 +1410,11 @@ fn aggregateIndexStatus(
         @intCast(expected_group_ids.len)
     else
         aggregate.reported_group_count;
+    if (aggregate.fresh_group_count > 0 and aggregate.coverage_config_mismatch_count == 0) {
+        aggregate.coverage_generation = coverage_generation;
+        aggregate.coverage_config_hash = coverage_config_hash;
+        aggregate.coverage_identity_ready = coverage_generation != 0;
+    }
     aggregate.missing_group_count = aggregate.expected_group_count -| aggregate.reported_group_count;
     if (aggregate.missing_group_count > 0 or aggregate.stale_group_count > 0 or aggregate.remote_unknown_group_count > 0) {
         aggregate.backfill_active = true;
@@ -1272,10 +1428,19 @@ fn aggregateIndexStatus(
     return aggregate;
 }
 
+fn coverageIdentityMatches(item: anytype, expected_generation: u64, expected_config_hash: u64) bool {
+    if (@hasField(@TypeOf(item), "coverage_config_hash") and item.coverage_config_hash != expected_config_hash) return false;
+    if (expected_generation != 0) {
+        if (!@hasField(@TypeOf(item), "coverage_identity_ready") or !item.coverage_identity_ready) return false;
+        if (!@hasField(@TypeOf(item), "coverage_generation") or item.coverage_generation != expected_generation) return false;
+    }
+    return true;
+}
+
 fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
     const kind = aggregate.kind orelse return;
     if (kind != .full_text) return;
-    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.stale_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
     if (aggregate.replay_target_sequence == 0 or aggregate.replay_applied_sequence < aggregate.replay_target_sequence) return;
     if (aggregate.table_doc_count == 0 or aggregate.doc_count < aggregate.table_doc_count) return;
 
@@ -1288,11 +1453,23 @@ fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
 fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
     const kind = aggregate.kind orelse return;
     if (kind != .dense_vector and kind != .sparse_vector) return;
-    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.reported_group_count == 0 or
+        aggregate.missing_group_count > 0 or
+        aggregate.stale_group_count > 0 or
+        aggregate.unknown_group_count > 0 or
+        aggregate.remote_unknown_group_count > 0 or
+        aggregate.expected_group_count != aggregate.fresh_group_count) return;
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
-    if (aggregate.catch_up_active or aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence) return;
+    const complete_dense_coverage = aggregate.coverage_identity_ready and
+        aggregate.coverage_summary_ready and
+        aggregate.coverage_config_mismatch_count == 0 and
+        aggregate.coverage_produced_count == aggregate.table_doc_count and
+        aggregate.coverage_skipped_count == 0 and
+        aggregate.coverage_terminal_failed_count == 0;
+    if (aggregate.catch_up_active or
+        (aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence and !complete_dense_coverage)) return;
     if (!embeddingsArtifactPublishComplete(aggregate.*, kind == .sparse_vector, aggregate.table_doc_count)) return;
     if (aggregate.table_doc_count > 0 and aggregate.doc_count < aggregate.table_doc_count) return;
 
@@ -1462,7 +1639,254 @@ const EmbeddingsRuntimeView = struct {
     replay_catch_up_required: bool,
 };
 
-fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, enrichment: ?db_mod.types.EnrichmentStats) EmbeddingsRuntimeView {
+const CoverageEvaluation = struct {
+    covered: u64,
+    pending: ?u64,
+    complete: bool,
+    healthy: bool,
+    degraded: bool,
+    source_visible: bool,
+    counters_valid: bool,
+};
+
+const CoverageIncompleteReason = enum {
+    runtime_unavailable,
+    missing_group,
+    unknown_group,
+    remote_unknown_group,
+    stale_group,
+    summary_unavailable,
+    config_mismatch,
+    counter_mismatch,
+};
+
+fn coverageOutcomeTotal(produced: u64, skipped: u64, terminal_failed: u64) ?u64 {
+    const produced_and_skipped = std.math.add(u64, produced, skipped) catch return null;
+    return std.math.add(u64, produced_and_skipped, terminal_failed) catch null;
+}
+
+fn coverageCountersValid(source_total: u64, produced: u64, skipped: u64, terminal_failed: u64) bool {
+    return (coverageOutcomeTotal(produced, skipped, terminal_failed) orelse return false) <= source_total;
+}
+
+fn coverageReplayCurrent(applied_sequence: u64, target_sequence: u64, catch_up_required: bool) bool {
+    return !catch_up_required and applied_sequence >= target_sequence;
+}
+
+fn evaluateCoverage(
+    policy: EmbeddingsCoveragePolicy,
+    source_total: u64,
+    produced: u64,
+    skipped: u64,
+    terminal_failed: u64,
+    observation_complete: bool,
+    replay_current: bool,
+) CoverageEvaluation {
+    const policy_covered = switch (policy) {
+        .strict => produced,
+        .partial => produced +| skipped,
+        .best_effort => produced +| skipped +| terminal_failed,
+        .external => produced,
+    };
+    const outcome_total = coverageOutcomeTotal(produced, skipped, terminal_failed);
+    const counters_valid = if (outcome_total) |total| total <= source_total else false;
+    const all_sources_terminal = if (outcome_total) |total| total == source_total else false;
+    const complete = observation_complete and replay_current and counters_valid and all_sources_terminal and policy_covered == source_total;
+    return .{
+        .covered = policy_covered,
+        .pending = if (observation_complete and counters_valid) source_total -| policy_covered else null,
+        .complete = complete,
+        .healthy = complete and terminal_failed == 0,
+        .degraded = complete and terminal_failed > 0,
+        .source_visible = source_total == 0 or policy_covered > 0,
+        .counters_valid = counters_valid,
+    };
+}
+
+test "derived coverage evaluation is policy exact and observation gated" {
+    const strict = evaluateCoverage(.strict, 3, 1, 1, 1, true, true);
+    try std.testing.expectEqual(@as(u64, 1), strict.covered);
+    try std.testing.expectEqual(@as(?u64, 2), strict.pending);
+    try std.testing.expect(!strict.complete);
+
+    const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true, true);
+    try std.testing.expectEqual(@as(u64, 3), partial.covered);
+    try std.testing.expect(partial.complete);
+    try std.testing.expect(partial.healthy);
+
+    const replay_pending = evaluateCoverage(.partial, 3, 1, 2, 0, true, false);
+    try std.testing.expect(!replay_pending.complete);
+    try std.testing.expect(!replay_pending.healthy);
+
+    const best_effort = evaluateCoverage(.best_effort, 3, 1, 1, 1, true, true);
+    try std.testing.expect(best_effort.complete);
+    try std.testing.expect(!best_effort.healthy);
+    try std.testing.expect(best_effort.degraded);
+
+    const incomplete_observation = evaluateCoverage(.partial, 3, 1, 2, 0, false, true);
+    try std.testing.expectEqual(@as(?u64, null), incomplete_observation.pending);
+    try std.testing.expect(!incomplete_observation.complete);
+    try std.testing.expect(!incomplete_observation.healthy);
+
+    const excess_outcomes = evaluateCoverage(.partial, 2, 2, 1, 0, true, true);
+    try std.testing.expectEqual(@as(u64, 3), excess_outcomes.covered);
+    try std.testing.expectEqual(@as(?u64, null), excess_outcomes.pending);
+    try std.testing.expect(!excess_outcomes.counters_valid);
+    try std.testing.expect(!excess_outcomes.complete);
+
+    const external_partial = evaluateCoverage(.external, 3, 1, 0, 0, true, true);
+    try std.testing.expectEqual(@as(u64, 1), external_partial.covered);
+    try std.testing.expectEqual(@as(?u64, 2), external_partial.pending);
+    try std.testing.expect(!external_partial.complete);
+
+    const external_complete = evaluateCoverage(.external, 3, 3, 0, 0, true, true);
+    try std.testing.expect(external_complete.complete);
+    try std.testing.expect(external_complete.healthy);
+}
+
+test "derived coverage aggregation rejects mixed config observations" {
+    var indexes_a = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_produced_count = 1,
+        .coverage_config_hash = 41,
+    }};
+    var indexes_b = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_produced_count = 99,
+        .coverage_config_hash = 42,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{
+        .{ .group_id = 1, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{ .source_doc_count = 1, .index_count = 1, .indexes = indexes_a[0..] } },
+        .{ .group_id = 2, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{ .source_doc_count = 1, .index_count = 1, .indexes = indexes_b[0..] } },
+    };
+
+    const aggregate = aggregateIndexStatus(&runtimes, "visual", &.{ 1, 2 }, 41) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), aggregate.table_doc_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_config_mismatch_count);
+    try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 0, 41));
+
+    var reasons = std.ArrayListUnmanaged(u8).empty;
+    defer reasons.deinit(std.testing.allocator);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 0, 41, true, null, 2);
+    try std.testing.expectEqualStrings("[\"config_mismatch\"]", reasons.items);
+
+    var missing_status = std.ArrayListUnmanaged(u8).empty;
+    defer missing_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &missing_status,
+        .embeddings,
+        missingAggregateIndexStatus(1),
+        0,
+        .partial,
+        false,
+        0,
+        41,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        false,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"observation_incomplete_reasons\":[\"runtime_unavailable\",\"missing_group\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"pending\":null") != null);
+}
+
+test "derived coverage aggregation rejects stale index incarnations" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_produced_count = 1,
+        .coverage_generation = 41,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .remote_store, .freshness = .fresh },
+        .stats = .{ .source_doc_count = 1, .index_count = 1, .indexes = indexes[0..] },
+    }};
+
+    const aggregate = aggregateIndexStatusIndexed(&runtimes, "visual", &.{1}, 42, 99, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), aggregate.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_config_mismatch_count);
+    try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 42, 99));
+}
+
+test "derived coverage rejects unknown freshness for aggregate and shard views" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_produced_count = 1,
+        .coverage_config_hash = 41,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .remote_store, .freshness = .unknown },
+        .stats = .{ .source_doc_count = 1, .index_count = 1, .indexes = indexes[0..] },
+    }};
+
+    const aggregate = aggregateIndexStatus(&runtimes, "visual", &.{1}, 41) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.unknown_group_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.table_doc_count);
+    try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 0, 41));
+
+    var shard_status = std.ArrayListUnmanaged(u8).empty;
+    defer shard_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &shard_status,
+        .embeddings,
+        indexes[0],
+        1,
+        .partial,
+        false,
+        0,
+        41,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        runtimes[0].metadata,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"observation_complete\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"observation_incomplete_reasons\":[\"unknown_group\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"pending\":null") != null);
+}
+
+test "derived coverage semantic fingerprint ignores execution policy" {
+    var first = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3,\"execution\":{\"embedding\":{\"batch_items\":16}}}",
+        .{},
+    );
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"execution\":{\"embedding\":{\"batch_items\":1024}},\"dimension\":3,\"external\":true,\"type\":\"embeddings\"}",
+        .{},
+    );
+    defer second.deinit();
+
+    try std.testing.expectEqual(
+        try expectedCoverageConfigHash(std.testing.allocator, "external_idx", first.value),
+        try expectedCoverageConfigHash(std.testing.allocator, "external_idx", second.value),
+    );
+}
+
+fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, coverage_generation: u64, coverage_config_hash: u64, enrichment: ?db_mod.types.EnrichmentStats, runtime_present: bool) EmbeddingsRuntimeView {
     var view: EmbeddingsRuntimeView = .{
         .backfill_active = item.backfill_active,
         .backfill_progress = item.backfill_progress,
@@ -1470,20 +1894,33 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         .replay_target_sequence = item.replay_target_sequence,
         .replay_catch_up_required = item.replay_catch_up_required,
     };
-    const coverage_incomplete = aggregateRuntimeCoverageIncomplete(item);
+    const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
     const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
     const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
-    const covered_source_count = item.doc_count +| skipped_count +| if (coverage_policy == .best_effort) terminal_failed_count else 0;
+    const replay_current = coverageReplayCurrent(view.replay_applied_sequence, view.replay_target_sequence, view.replay_catch_up_required);
+    const coverage_incomplete = !runtime_present or
+        aggregateRuntimeCoverageIncomplete(item, coverage_generation, coverage_config_hash) or
+        !coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
+    const coverage = evaluateCoverage(
+        coverage_policy,
+        table_doc_count,
+        produced_count,
+        skipped_count,
+        terminal_failed_count,
+        !coverage_incomplete,
+        replay_current,
+    );
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
-    const source_coverage_visible = item.doc_count > 0 or (embeddingsCoveragePolicyAllowsSkips(coverage_policy) and skipped_count > 0);
-    const dense_coverage_complete = if (coverage_policy == .external)
-        true
-    else if (require_table_coverage)
-        table_doc_count > 0 and item.doc_count >= table_doc_count
-    else if (embeddingsCoveragePolicyAllowsSkips(coverage_policy) and table_doc_count > 0)
-        covered_source_count >= table_doc_count
+    const source_coverage_visible = coverage.source_visible;
+    const dense_coverage_complete = coverage.complete;
+    // External indexes are query-ready once their published artifacts and
+    // replay are current. Their coverage remains independently observable and
+    // may be incomplete because callers are not required to supply a vector
+    // for every source document.
+    const policy_readiness_complete = if (coverage_policy == .external)
+        !coverage_incomplete and replay_current
     else
-        true;
+        dense_coverage_complete;
     if (enrichment) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
@@ -1511,7 +1948,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
     else
         false;
-    if (!coverage_incomplete and dense_coverage_complete and source_coverage_visible and !enrichment_pending) {
+    if (policy_readiness_complete and source_coverage_visible and !enrichment_pending) {
         view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
         view.replay_catch_up_required = false;
         view.backfill_active = false;
@@ -1527,7 +1964,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         view.backfill_progress = 0.0;
         return view;
     }
-    if (!coverage_incomplete and dense_coverage_complete and source_coverage_visible and !enrichment_pending) {
+    if (policy_readiness_complete and source_coverage_visible and !enrichment_pending) {
         view.backfill_active = false;
         view.backfill_progress = 1.0;
     } else if (!coverage_incomplete and replay_ready and source_coverage_visible and (!require_table_coverage or table_doc_count == 0) and !enrichment_pending) {
@@ -1541,18 +1978,109 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         }
         view.backfill_progress = @min(
             1.0,
-            @as(f64, @floatFromInt(if (require_table_coverage) item.doc_count else covered_source_count)) /
+            @as(f64, @floatFromInt(coverage.covered)) /
                 @as(f64, @floatFromInt(table_doc_count)),
         );
     }
     return view;
 }
 
-fn aggregateRuntimeCoverageIncomplete(item: anytype) bool {
+fn aggregateRuntimeCoverageIncomplete(item: anytype, expected_generation: u64, expected_config_hash: u64) bool {
     const Item = @TypeOf(item);
     if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0) return true;
     if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0) return true;
+    if (@hasField(Item, "unknown_group_count") and item.unknown_group_count > 0) return true;
+    if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0) return true;
+    if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count") and
+        item.expected_group_count != item.fresh_group_count) return true;
+    if (@hasField(Item, "coverage_summary_ready") and !item.coverage_summary_ready) return true;
+    if (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) return true;
+    if (!coverageIdentityMatches(item, expected_generation, expected_config_hash)) return true;
     return false;
+}
+
+fn appendCoverageIncompleteReasons(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    item: anytype,
+    expected_generation: u64,
+    expected_config_hash: u64,
+    runtime_present: bool,
+    metadata: ?runtime_status.RuntimeStatusMetadata,
+    source_total: u64,
+) !void {
+    const Item = @TypeOf(item);
+    const observation_current = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
+    var reasons = std.EnumSet(CoverageIncompleteReason).initEmpty();
+
+    if (!runtime_present) reasons.insert(.runtime_unavailable);
+    if (@hasField(Item, "missing_group_count") and item.missing_group_count > 0)
+        reasons.insert(.missing_group);
+    if ((@hasField(Item, "unknown_group_count") and item.unknown_group_count > 0) or
+        (metadata != null and metadata.?.freshness == .unknown))
+        reasons.insert(.unknown_group);
+    if (@hasField(Item, "remote_unknown_group_count") and item.remote_unknown_group_count > 0)
+        reasons.insert(.remote_unknown_group);
+    if (metadata != null and metadata.?.freshness == .remote_unknown)
+        reasons.insert(.remote_unknown_group);
+    if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0)
+        reasons.insert(.stale_group);
+    if (metadata != null and metadata.?.freshness != .fresh and metadata.?.freshness != .unknown and metadata.?.freshness != .remote_unknown)
+        reasons.insert(.stale_group);
+    if (@hasField(Item, "coverage_summary_ready") and !item.coverage_summary_ready)
+        reasons.insert(.summary_unavailable);
+    const config_mismatch = (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) or
+        (observation_current and !coverageIdentityMatches(item, expected_generation, expected_config_hash));
+    if (config_mismatch) reasons.insert(.config_mismatch);
+    const summary_ready = if (@hasField(Item, "coverage_summary_ready")) item.coverage_summary_ready else false;
+    const produced = if (@hasField(Item, "coverage_produced_count")) item.coverage_produced_count else 0;
+    const skipped = if (@hasField(Item, "coverage_skipped_count")) item.coverage_skipped_count else 0;
+    const terminal_failed = if (@hasField(Item, "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+    if (observation_current and !config_mismatch and summary_ready and !coverageCountersValid(source_total, produced, skipped, terminal_failed))
+        reasons.insert(.counter_mismatch);
+
+    try out.append(alloc, '[');
+    var emitted = false;
+    for (std.meta.tags(CoverageIncompleteReason)) |reason| {
+        if (!reasons.contains(reason)) continue;
+        if (emitted) try out.append(alloc, ',');
+        emitted = true;
+        try appendJsonString(alloc, out, @tagName(reason));
+    }
+    try out.append(alloc, ']');
+}
+
+test "derived coverage reasons expose counter mismatch" {
+    const aggregate = AggregatedIndexStatus{
+        .coverage_config_hash = 41,
+        .coverage_produced_count = 2,
+        .coverage_skipped_count = 1,
+        .coverage_summary_ready = true,
+    };
+    var reasons = std.ArrayListUnmanaged(u8).empty;
+    defer reasons.deinit(std.testing.allocator);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 0, 41, true, null, 2);
+    try std.testing.expectEqualStrings("[\"counter_mismatch\"]", reasons.items);
+}
+
+test "derived coverage reasons deduplicate overlapping freshness signals" {
+    const aggregate = AggregatedIndexStatus{
+        .coverage_config_hash = 41,
+        .coverage_summary_ready = true,
+        .remote_unknown_group_count = 1,
+    };
+    var reasons = std.ArrayListUnmanaged(u8).empty;
+    defer reasons.deinit(std.testing.allocator);
+    try appendCoverageIncompleteReasons(std.testing.allocator, &reasons, aggregate, 0, 41, true, .{
+        .freshness = .remote_unknown,
+    }, 0);
+    try std.testing.expectEqualStrings("[\"remote_unknown_group\"]", reasons.items);
+}
+
+fn appendCoverageFingerprint(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), fingerprint: u64) !void {
+    var buf: [16]u8 = undefined;
+    const encoded = std.fmt.bufPrint(&buf, "{x:0>16}", .{fingerprint}) catch unreachable;
+    try appendJsonString(alloc, out, encoded);
 }
 
 fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
@@ -1660,6 +2188,8 @@ fn appendSingleIndexRuntimeStatus(
     table_doc_count: u64,
     embeddings_coverage_policy: EmbeddingsCoveragePolicy,
     embeddings_sparse: bool,
+    coverage_generation: u64,
+    coverage_config_hash: u64,
     graph_source_status: ?GraphSourceStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
@@ -1669,8 +2199,9 @@ fn appendSingleIndexRuntimeStatus(
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
+    const coverage_runtime_present = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
     const embeddings_view = if (index_type == .embeddings)
-        embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, enrichment)
+        embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
     else
         null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
@@ -1783,17 +2314,22 @@ fn appendSingleIndexRuntimeStatus(
     if (index_type == .embeddings) {
         const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
         const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
-        const produced_count = item.doc_count;
-        const counted_terminal_failed = if (embeddings_coverage_policy == .best_effort) terminal_failed_count else 0;
-        const covered_source_count = produced_count +| skipped_count +| counted_terminal_failed;
-        const coverage_complete = if (embeddings_coverage_policy == .external)
-            !backfill_active
-        else if (embeddingsCoveragePolicyRequiresTableCoverage(embeddings_coverage_policy))
-            table_doc_count > 0 and produced_count >= table_doc_count
-        else if (table_doc_count > 0)
-            covered_source_count >= table_doc_count
-        else
-            !backfill_active;
+        const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
+        const counters_valid = coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
+        const replay_current = coverageReplayCurrent(replay_applied_sequence, replay_target_sequence, replay_catch_up_required);
+        const observation_complete = coverage_runtime_present and
+            !aggregateRuntimeCoverageIncomplete(item, coverage_generation, coverage_config_hash) and
+            counters_valid;
+        const coverage = evaluateCoverage(
+            embeddings_coverage_policy,
+            table_doc_count,
+            produced_count,
+            skipped_count,
+            terminal_failed_count,
+            observation_complete,
+            replay_current,
+        );
+        const coverage_complete = coverage.complete;
         const artifact_publish_pending = replay_target_sequence > 0 and
             !embeddingsArtifactPublishComplete(item, embeddings_sparse, table_doc_count) and
             !coverage_complete;
@@ -1817,6 +2353,18 @@ fn appendSingleIndexRuntimeStatus(
         try appendJsonString(alloc, out, "policy");
         try out.append(alloc, ':');
         try appendJsonString(alloc, out, embeddingsCoveragePolicyName(embeddings_coverage_policy));
+        try out.appendSlice(alloc, ",\"observation_complete\":");
+        try out.appendSlice(alloc, if (observation_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"observation_incomplete_reasons\":");
+        try appendCoverageIncompleteReasons(alloc, out, item, coverage_generation, coverage_config_hash, runtime_present, metadata, table_doc_count);
+        try out.appendSlice(alloc, ",\"config_fingerprint\":");
+        try appendCoverageFingerprint(alloc, out, coverage_config_hash);
+        try out.appendSlice(alloc, ",\"summary_ready\":");
+        const coverage_summary_ready = coverage_runtime_present and if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
+        try out.appendSlice(alloc, if (coverage_summary_ready) "true" else "false");
+        try out.appendSlice(alloc, ",\"config_mismatch_group_count\":");
+        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) item.coverage_config_mismatch_count else @intFromBool(coverage_runtime_present and @hasField(@TypeOf(item), "coverage_config_hash") and item.coverage_config_hash != coverage_config_hash);
+        try appendIntValue(alloc, out, config_mismatch_group_count);
         try out.appendSlice(alloc, ",\"source_total\":");
         try appendIntValue(alloc, out, table_doc_count);
         try out.appendSlice(alloc, ",\"produced\":");
@@ -1826,15 +2374,19 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"terminal_failed\":");
         try appendIntValue(alloc, out, terminal_failed_count);
         try out.appendSlice(alloc, ",\"covered\":");
-        try appendIntValue(alloc, out, covered_source_count);
+        try appendIntValue(alloc, out, coverage.covered);
         try out.appendSlice(alloc, ",\"pending\":");
-        try appendIntValue(alloc, out, table_doc_count -| covered_source_count);
+        if (coverage.pending) |pending| {
+            try appendIntValue(alloc, out, pending);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
         try out.appendSlice(alloc, ",\"complete\":");
         try out.appendSlice(alloc, if (coverage_complete) "true" else "false");
         try out.appendSlice(alloc, ",\"healthy\":");
-        try out.appendSlice(alloc, if (coverage_complete and terminal_failed_count == 0) "true" else "false");
+        try out.appendSlice(alloc, if (coverage.healthy) "true" else "false");
         try out.appendSlice(alloc, ",\"degraded\":");
-        try out.appendSlice(alloc, if (terminal_failed_count > 0) "true" else "false");
+        try out.appendSlice(alloc, if (coverage.degraded) "true" else "false");
         try out.append(alloc, '}');
     }
     if (index_type == .graph) {
@@ -2448,6 +3000,63 @@ test "index config map encoder injects canonical name and type" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384}") != null);
 }
 
+test "public index config encoders redact coverage incarnation" {
+    const indexes_json =
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"_coverage_incarnation":42}}
+    ;
+    const encoded_map = try encodeIndexConfigMap(std.testing.allocator, indexes_json);
+    defer std.testing.allocator.free(encoded_map);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_map, coverage_policy_mod.incarnation_field) == null);
+
+    const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
+    defer std.testing.allocator.free(encoded_single);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_single, coverage_policy_mod.incarnation_field) == null);
+}
+
+test "identical index mutation retries preserve coverage incarnation" {
+    const alloc = std.testing.allocator;
+    const requested = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":384}";
+    const first = try addIndexToTableIndexesJson(alloc, tables_api.default_indexes_json, "embed_idx", requested);
+    defer alloc.free(first);
+    const retried = try addIndexToTableIndexesJson(
+        alloc,
+        first,
+        "embed_idx",
+        "{\"dimension\":384,\"external\":true,\"type\":\"embeddings\"}",
+    );
+    defer alloc.free(retried);
+
+    var first_lookup = (try lookupSingleIndexConfig(alloc, first, "embed_idx")).?;
+    defer first_lookup.deinit();
+    var retried_lookup = (try lookupSingleIndexConfig(alloc, retried, "embed_idx")).?;
+    defer retried_lookup.deinit();
+    const first_incarnation = coverage_policy_mod.incarnation(first_lookup.config) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(first_incarnation, coverage_policy_mod.incarnation(retried_lookup.config).?);
+
+    const tuned = try addIndexToTableIndexesJson(
+        alloc,
+        retried,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":384,\"execution\":{\"embedding\":{\"batch_items\":64}}}",
+    );
+    defer alloc.free(tuned);
+    var tuned_lookup = (try lookupSingleIndexConfig(alloc, tuned, "embed_idx")).?;
+    defer tuned_lookup.deinit();
+    try std.testing.expectEqual(first_incarnation, coverage_policy_mod.incarnation(tuned_lookup.config).?);
+    try std.testing.expect(tuned_lookup.config.object.get("execution") != null);
+
+    const changed = try addIndexToTableIndexesJson(
+        alloc,
+        tuned,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":768}",
+    );
+    defer alloc.free(changed);
+    var changed_lookup = (try lookupSingleIndexConfig(alloc, changed, "embed_idx")).?;
+    defer changed_lookup.deinit();
+    try std.testing.expect(first_incarnation != coverage_policy_mod.incarnation(changed_lookup.config).?);
+}
+
 test "index status encoder projects inline enrichment configs as names" {
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
@@ -2983,7 +3592,7 @@ test "index status aggregation preserves most severe algebraic capability lifecy
         },
     };
 
-    const aggregate = aggregateIndexStatus(runtimes[0..], "alg", &.{}) orelse return error.TestUnexpectedResult;
+    const aggregate = aggregateIndexStatus(runtimes[0..], "alg", &.{}, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("rebuild_required", aggregate.algebraic_capability_lifecycle_status.?);
 }
 
@@ -3031,7 +3640,7 @@ test "index status aggregation reports selected algebraic progress summary shard
         },
     };
 
-    const aggregate = aggregateIndexStatus(runtimes[0..], "alg", &.{}) orelse return error.TestUnexpectedResult;
+    const aggregate = aggregateIndexStatus(runtimes[0..], "alg", &.{}, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("recommendation:high-progress", aggregate.algebraic_active_progress.?.recommendation);
 }
 
@@ -3135,7 +3744,7 @@ test "full text aggregate clears stale completed replay backfill flag" {
         },
     }};
 
-    const aggregate = aggregateIndexStatus(runtimes[0..], "full_text_index_v1", &.{7}) orelse return error.TestUnexpectedResult;
+    const aggregate = aggregateIndexStatus(runtimes[0..], "full_text_index_v1", &.{7}, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 1), aggregate.replay_target_sequence);
@@ -3746,6 +4355,10 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
 }
 
 test "external embeddings index readiness does not require table doc coverage" {
+    const config_json = "{\"type\":\"embeddings\",\"dimension\":1536,\"external\":true,\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "vec", parsed_config.value);
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -3753,6 +4366,10 @@ test "external embeddings index readiness does not require table doc coverage" {
         .kind = .dense_vector,
         .doc_count = 50_000,
         .node_count = 24,
+        .coverage_produced_count = 50_000,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 502,
         .replay_target_sequence = 502,
         .replay_catch_up_required = false,
@@ -3765,7 +4382,9 @@ test "external embeddings index readiness does not require table doc coverage" {
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
+            .source_doc_count = 50_001,
             .doc_count = 50_001,
             .index_count = 1,
             .indexes = indexes,
@@ -3778,7 +4397,7 @@ test "external embeddings index readiness does not require table doc coverage" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":1536,\"external\":true}}",
+            .indexes_json = "{\"vec\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -3796,6 +4415,9 @@ test "external embeddings index readiness does not require table doc coverage" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_indexed\":50000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_visible_doc_count\":50000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"published_doc_count\":50000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"external\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":false") != null);
 }
 
 test "embeddings index status reports dense catch-up phase separately from published visibility" {
@@ -3924,6 +4546,10 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
 }
 
 test "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -3932,6 +4558,10 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
         .doc_count = 3,
         .node_count = 1,
         .root_node = 1,
+        .coverage_produced_count = 3,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 4,
         .replay_target_sequence = 8,
         .replay_catch_up_required = true,
@@ -3948,7 +4578,9 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
+            .source_doc_count = 3,
             .doc_count = 3,
             .index_count = 1,
             .indexes = indexes,
@@ -3967,7 +4599,7 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -3992,6 +4624,10 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
 }
 
 test "partial coverage embeddings readiness counts skipped source units" {
+    const config_json = "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "visual_idx", parsed_config.value);
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4000,7 +4636,11 @@ test "partial coverage embeddings readiness counts skipped source units" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .coverage_produced_count = 1,
         .coverage_skipped_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 2,
         .replay_target_sequence = 2,
         .replay_catch_up_required = false,
@@ -4013,7 +4653,9 @@ test "partial coverage embeddings readiness counts skipped source units" {
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
+            .source_doc_count = 2,
             .doc_count = 2,
             .index_count = 1,
             .indexes = indexes,
@@ -4032,7 +4674,7 @@ test "partial coverage embeddings readiness counts skipped source units" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"visual_idx\":{\"type\":\"embeddings\",\"coverage\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512}}",
+            .indexes_json = "{\"visual_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4047,12 +4689,20 @@ test "partial coverage embeddings readiness counts skipped source units" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"partial\",\"source_total\":2,\"produced\":1,\"skipped\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"partial\",\"observation_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"observation_incomplete_reasons\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"config_fingerprint\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"summary_ready\":true,\"config_mismatch_group_count\":0,\"source_total\":2,\"produced\":1,\"skipped\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"skipped_source_count\":1") != null);
 }
 
 test "partial coverage embeddings readiness does not mask pending enrichment" {
+    const config_json = "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "visual_idx", parsed_config.value);
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4061,7 +4711,11 @@ test "partial coverage embeddings readiness does not mask pending enrichment" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .coverage_produced_count = 1,
         .coverage_skipped_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 1,
         .replay_target_sequence = 3,
         .replay_catch_up_required = true,
@@ -4074,7 +4728,9 @@ test "partial coverage embeddings readiness does not mask pending enrichment" {
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
+            .source_doc_count = 2,
             .doc_count = 2,
             .index_count = 1,
             .indexes = indexes,
@@ -4093,7 +4749,7 @@ test "partial coverage embeddings readiness does not mask pending enrichment" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"visual_idx\":{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"template\":\"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}\",\"dimension\":512}}",
+            .indexes_json = "{\"visual_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4109,7 +4765,8 @@ test "partial coverage embeddings readiness does not mask pending enrichment" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"partial\",\"source_total\":2,\"produced\":1,\"skipped\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"coverage\":{\"policy\":\"partial\",\"observation_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"summary_ready\":true,\"config_mismatch_group_count\":0,\"source_total\":2,\"produced\":1,\"skipped\":1") != null);
 }
 
 test "managed embeddings readiness prefers replay completion once docs are indexed" {

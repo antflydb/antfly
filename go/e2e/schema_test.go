@@ -38,20 +38,20 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
-	// Start a single-node swarm without Antfly inference (only full-text indexing needed).
-	t.Log("Starting Antfly swarm (no Antfly inference)...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
-	defer swarm.Cleanup()
+	// Start a single-node standalone without Antfly inference (only full-text indexing needed).
+	t.Log("Starting Antfly standalone (no Antfly inference)...")
+	standalone := startAntflyStandaloneWithOptions(t, ctx, StandaloneOptions{DisableInference: true})
+	defer standalone.Cleanup()
 
 	tableName := "schema_migration_test"
 
 	// Create table — this auto-creates full_text_index_v0.
 	t.Log("Creating table...")
-	err := swarm.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
+	err := standalone.Client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
 		NumShards: 1,
 	})
 	require.NoError(t, err, "Failed to create table")
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 	t.Log("Table created with full_text_index_v0")
 
 	// Ingest exactly 1000 documents — the regression case.
@@ -72,7 +72,7 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 				"content": fmt.Sprintf("This is the content of document number %d with some searchable text.", j),
 			}
 		}
-		_, err := swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
+		_, err := standalone.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   inserts,
 			SyncLevel: antfly.SyncLevelFullText,
 		})
@@ -82,11 +82,11 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 
 	// Wait for full_text_index_v0 to finish initial indexing.
 	t.Log("Waiting for full_text_index_v0 to complete initial build...")
-	waitForFullTextIndex(t, ctx, swarm.Client, tableName, "full_text_index_v0", numDocs, 2*time.Minute)
+	waitForFullTextIndex(t, ctx, standalone.Client, tableName, "full_text_index_v0", numDocs, 2*time.Minute)
 	t.Log("full_text_index_v0 build complete")
 
 	// Update schema via oapi client (AntflyClient doesn't wrap UpdateSchema).
-	apiURL := antfly.NormalizeBaseURL(swarm.MetadataAPIURL)
+	apiURL := antfly.NormalizeBaseURL(standalone.MetadataAPIURL)
 	oapiClient, err := oapi.NewClient(apiURL, oapi.WithHTTPClient(&http.Client{Timeout: 30 * time.Second}))
 	require.NoError(t, err, "Failed to create oapi client")
 
@@ -118,7 +118,7 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 	require.Less(t, resp.StatusCode, 300, "UpdateSchema returned error status %d", resp.StatusCode)
 	t.Log("Schema updated, full_text_index_v1 should now be created")
 
-	tableStatus, err := swarm.Client.GetTable(ctx, tableName)
+	tableStatus, err := standalone.Client.GetTable(ctx, tableName)
 	require.NoError(t, err, "GetTable after schema update failed")
 	require.NotNil(t, tableStatus.Migration, "migration should be present during rebuild")
 	require.Equal(t, "rebuilding", string(tableStatus.Migration.State))
@@ -126,7 +126,7 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 	require.Equal(t, uint32(1), tableStatus.Schema.Version, "schema should advance to v1")
 
 	// Verify both index versions now exist.
-	indexes, err := swarm.Client.ListIndexes(ctx, tableName)
+	indexes, err := standalone.Client.ListIndexes(ctx, tableName)
 	require.NoError(t, err)
 	require.Contains(t, indexes, "full_text_index_v0", "v0 should still exist during migration")
 	require.Contains(t, indexes, "full_text_index_v1", "v1 should be created after schema update")
@@ -134,27 +134,27 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 
 	// Wait for full_text_index_v1 rebuild to complete.
 	t.Log("Waiting for full_text_index_v1 rebuild to complete...")
-	waitForFullTextIndex(t, ctx, swarm.Client, tableName, "full_text_index_v1", numDocs, 2*time.Minute)
+	waitForFullTextIndex(t, ctx, standalone.Client, tableName, "full_text_index_v1", numDocs, 2*time.Minute)
 	t.Log("full_text_index_v1 rebuild complete")
 
 	// Wait for the reconciler to drop the old full_text_index_v0 via DropReadSchema.
 	t.Log("Waiting for reconciler to drop full_text_index_v0...")
-	waitForOldIndexDropped(t, ctx, swarm.Client, tableName, "full_text_index_v0", 2*time.Minute)
+	waitForOldIndexDropped(t, ctx, standalone.Client, tableName, "full_text_index_v0", 2*time.Minute)
 	t.Log("full_text_index_v0 successfully dropped by reconciler")
 
 	// Verify only v1 remains.
-	indexes, err = swarm.Client.ListIndexes(ctx, tableName)
+	indexes, err = standalone.Client.ListIndexes(ctx, tableName)
 	require.NoError(t, err)
 	require.NotContains(t, indexes, "full_text_index_v0", "v0 should be dropped")
 	require.Contains(t, indexes, "full_text_index_v1", "v1 should remain")
 
-	tableStatus, err = swarm.Client.GetTable(ctx, tableName)
+	tableStatus, err = standalone.Client.GetTable(ctx, tableName)
 	require.NoError(t, err, "GetTable after reconciler cleanup failed")
 	require.Nil(t, tableStatus.Migration, "migration should be absent when stable")
 	require.Equal(t, uint32(1), tableStatus.Schema.Version, "schema should remain on v1")
 
 	// Verify data integrity: a specific document is still accessible.
-	doc, err := swarm.Client.LookupKey(ctx, tableName, "doc-0500")
+	doc, err := standalone.Client.LookupKey(ctx, tableName, "doc-0500")
 	require.NoError(t, err, "LookupKey for doc-0500 failed")
 	require.Equal(t, "Document 500", doc["title"], "Document title should match")
 

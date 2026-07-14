@@ -372,6 +372,14 @@ components:
         When sparse is false (default), creates a dense vector index (HNSW).
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
       properties:
+        coverage_policy:
+          $ref: "#/components/schemas/DerivedCoveragePolicy"
+          description: >-
+            Source-unit completeness policy for managed embeddings. `strict`
+            requires one produced outcome per source document; `partial` permits
+            intentional skips; `best_effort` also treats terminal failures as
+            complete while reporting the index unhealthy. External indexes use
+            `external: true` and must not set this field.
         external:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -442,6 +450,112 @@ components:
         execution:
           $ref: "#/components/schemas/IndexExecutionConfig"
           description: "Non-semantic execution policy for shorthand-created chunking or embedding producers."
+    DerivedCoveragePolicy:
+      type: string
+      enum:
+        - strict
+        - partial
+        - best_effort
+      default: strict
+      description: "How generation-scoped source outcomes determine derived-index completeness."
+    DerivedCoverageStatusPolicy:
+      type: string
+      enum:
+        - strict
+        - partial
+        - best_effort
+        - external
+    DerivedCoverageObservationIncompleteReason:
+      type: string
+      enum:
+        - runtime_unavailable
+        - missing_group
+        - unknown_group
+        - remote_unknown_group
+        - stale_group
+        - summary_unavailable
+        - config_mismatch
+        - counter_mismatch
+      description: "A structured reason why the coverage projection cannot be treated as globally complete."
+    DerivedCoverageStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - policy
+        - observation_complete
+        - observation_incomplete_reasons
+        - config_fingerprint
+        - summary_ready
+        - config_mismatch_group_count
+        - source_total
+        - produced
+        - skipped
+        - terminal_failed
+        - covered
+        - pending
+        - complete
+        - healthy
+        - degraded
+      properties:
+        policy:
+          $ref: "#/components/schemas/DerivedCoverageStatusPolicy"
+        observation_complete:
+          type: boolean
+          description: "Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality."
+        observation_incomplete_reasons:
+          type: array
+          items:
+            $ref: "#/components/schemas/DerivedCoverageObservationIncompleteReason"
+          description: "Empty when observation_complete is true; otherwise identifies every known reason the projection is incomplete."
+        config_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{16}$"
+          description: "Versioned semantic configuration fingerprint encoded as fixed-width hexadecimal. Non-semantic execution tuning does not affect it."
+        summary_ready:
+          type: boolean
+          description: "Whether all observed shard-local coverage summaries were read atomically and completely."
+        config_mismatch_group_count:
+          type: integer
+          format: uint64
+          description: "Freshly observed shard groups reporting a different semantic configuration fingerprint."
+        source_total:
+          type: integer
+          format: uint64
+          description: >-
+            Source documents observed across fresh shard reports. This is the
+            exact table total only when observation_complete is true; otherwise
+            it is a lower bound and all outcome counts are partial observations.
+        produced:
+          type: integer
+          format: uint64
+          description: "Source documents with a durable produced outcome for this index generation."
+        skipped:
+          type: integer
+          format: uint64
+          description: "Source documents intentionally producing no indexable output."
+        terminal_failed:
+          type: integer
+          format: uint64
+          description: "Source documents whose generation failed non-retryably."
+        covered:
+          type: integer
+          format: uint64
+          description: "Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch."
+        pending:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint64
+          nullable: true
+          description: "Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown."
+        complete:
+          type: boolean
+          description: "Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy."
+        healthy:
+          type: boolean
+          description: "Whether coverage is complete without terminal failures."
+        degraded:
+          type: boolean
+          description: "Whether coverage is complete under best_effort but includes terminal failures."
     EmbeddingsIndexStats:
       type: object
       description: "Statistics for an embeddings index (dense or sparse)"
@@ -509,7 +623,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
-          description: "Number of documents visible to the index."
+          description: "Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document."
+        coverage:
+          $ref: "#/components/schemas/DerivedCoverageStatus"
+          description: "Generation-scoped source-document coverage, separate from physical index cardinality."
         query_visible_doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer

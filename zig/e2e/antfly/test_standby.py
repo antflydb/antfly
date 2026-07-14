@@ -12,7 +12,7 @@
 # the Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""Hot-standby HA E2E tests for the supported Zig swarm runtime."""
+"""Hot-standby HA E2E tests for the supported Zig standalone runtime."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ import requests
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     _read_log_tail,
-    _swarm_stateful_command,
+    _standalone_stateful_command,
     find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
@@ -54,7 +54,7 @@ HA_BACKUP_FILE_KIND_METADATA = 3
 pytestmark = pytest.mark.ha_standby
 
 
-class HASwarmNode:
+class HAStandaloneNode:
     def __init__(
         self,
         *,
@@ -107,7 +107,7 @@ class HASwarmNode:
 
     def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
-        command = _swarm_stateful_command(self.binary, host=self.host, port=self.port, root=self.node_root)
+        command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.node_root)
         command.extend(["--health-port", str(self.health_port)])
         if self.role == "primary":
             command.extend(
@@ -160,7 +160,7 @@ class HASwarmNode:
         )
         env = os.environ.copy()
         if self.admin_token_env is not None:
-            command.extend(["--ha-admin-token-env", self.admin_token_env])
+            command.extend(["--admin-token-env", self.admin_token_env])
             assert self.admin_token is not None
             env[self.admin_token_env] = self.admin_token
 
@@ -278,7 +278,7 @@ class HACluster:
         self.root = Path(self.tempdir.name).resolve()
         self.admin_token_env = "ANTFLY_HA_E2E_ADMIN_TOKEN"
         self.admin_token = "ha-e2e-secret-token"
-        self.primary = HASwarmNode(
+        self.primary = HAStandaloneNode(
             binary=binary,
             root=self.root,
             role="primary",
@@ -289,7 +289,7 @@ class HACluster:
             admin_token_env=self.admin_token_env,
             admin_token=self.admin_token,
         )
-        self.standby = HASwarmNode(
+        self.standby = HAStandaloneNode(
             binary=binary,
             root=self.root,
             role="standby",
@@ -394,8 +394,8 @@ def ha_cluster() -> HACluster:
         pytest.skip(f"Antfly binary not found: {binary}")
     if Path(binary).name != "antfly":
         pytest.skip("HA standby e2e requires the supported Zig antfly binary")
-    if not _binary_supports_ha_swarm(binary):
-        pytest.skip(f"Antfly binary does not expose HA swarm flags; rebuild current Zig binary: {binary}")
+    if not _binary_supports_ha_standalone(binary):
+        pytest.skip(f"Antfly binary does not expose HA standalone flags; rebuild current Zig binary: {binary}")
 
     cluster = HACluster(binary)
     try:
@@ -422,6 +422,38 @@ def _wait_for_standby_applied(cluster: HACluster, lsn: int, *, timeout_s: float 
         time.sleep(0.25)
     raise AssertionError(
         f"standby did not apply through LSN {lsn}; last={last_snapshot}; last_error={last_error}\n"
+        f"{cluster.debug_logs()}"
+    )
+
+
+def _wait_for_promoted_write_check(
+    cluster: HACluster,
+    payload: dict[str, Any],
+    *,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    last_response: str | None = None
+    while time.monotonic() < deadline:
+        if cluster.standby.proc is not None and cluster.standby.proc.poll() is not None:
+            break
+        try:
+            response = cluster.standby.admin_post_response("/write/check", payload)
+        except requests.RequestException as err:
+            last_error = err
+            time.sleep(0.1)
+            continue
+        if response.ok:
+            return cluster.standby._check(response)
+        last_response = f"{response.status_code}: {response.text}"
+        if response.status_code not in {409, 503}:
+            return cluster.standby._check(response)
+        time.sleep(0.1)
+    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    raise AssertionError(
+        "promoted standby did not expose its write decision before the deadline; "
+        f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
         f"{cluster.debug_logs()}"
     )
 
@@ -483,7 +515,7 @@ def _wait_for_primary_slot_applied(
     )
 
 
-def _table_identity_from_catalog(node: HASwarmNode, table_name: str) -> tuple[int, int]:
+def _table_identity_from_catalog(node: HAStandaloneNode, table_name: str) -> tuple[int, int]:
     catalog = json.loads(node.catalog_path.read_text())
     table = next(table for table in catalog["tables"] if table["name"] == table_name)
     table_id = int(table["table_id"])
@@ -593,9 +625,9 @@ def _assert_action_receipt(
     return action
 
 
-def _binary_supports_ha_swarm(binary: str) -> bool:
+def _binary_supports_ha_standalone(binary: str) -> bool:
     result = subprocess.run(
-        [binary, "swarm", "--help"],
+        [binary, "standalone", "--help"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -605,7 +637,7 @@ def _binary_supports_ha_swarm(binary: str) -> bool:
     return "--ha-primary-log" in result.stdout and "--ha-standby-log" in result.stdout
 
 
-def _assert_admin_requires_bearer(node: HASwarmNode, path: str) -> None:
+def _assert_admin_requires_bearer(node: HAStandaloneNode, path: str) -> None:
     missing = requests.get(f"{node.url}{HA_ADMIN_ROOT}{path}", timeout=10)
     assert missing.status_code == 401
     wrong = requests.get(
@@ -859,8 +891,8 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert promoted["fence_generation"] == fence["receipt"]["generation"]
     assert promoted["fence_token"] == fence["receipt"]["token"]
 
-    promoted_write_check = ha_cluster.standby.admin_post(
-        "/write/check",
+    promoted_write_check = _wait_for_promoted_write_check(
+        ha_cluster,
         {
             "role": "standby",
             "expected_identity": {
@@ -956,9 +988,16 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert rejected.status_code >= 400, rejected.text
     with pytest.raises(requests.HTTPError) as missing_old_primary_doc:
-        ha_cluster.primary.lookup_key(table_name, "doc:old-primary")
+        # The fenced node is no longer authoritative. Ask explicitly for its
+        # retained local generation to verify that the rejected write did not
+        # reach storage; the default read-index mode must remain unavailable.
+        ha_cluster.primary.lookup_key(table_name, "doc:old-primary", consistency="stale")
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
+    with pytest.raises(requests.HTTPError) as missing_promoted_primary_doc:
+        ha_cluster.standby.lookup_key(table_name, "doc:old-primary")
+    assert missing_promoted_primary_doc.value.response is not None
+    assert missing_promoted_primary_doc.value.response.status_code == 404
 
 
 def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):

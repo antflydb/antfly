@@ -150,6 +150,26 @@ def main():
         if first_event != "InitState":
             print(f"  SKIP nseg-{i} ({len(seg)} events, starts with {first_event})")
             continue
+        # Traceetcdraft currently models one-at-a-time membership changes.
+        # Keep joint-consensus traces visible but do not validate them against
+        # the narrower simple-change action as if they were ordinary values.
+        unsupported_conf_changes = []
+        for l in seg:
+            event = json.loads(l)["event"]
+            if event["name"] != "ChangeConf":
+                continue
+            cc = event.get("prop", {}).get("cc", {})
+            changes = cc.get("changes", [])
+            transition = cc.get("transition", "auto")
+            if len(changes) != 1 or transition != "auto":
+                unsupported_conf_changes.append((transition, len(changes)))
+        if unsupported_conf_changes:
+            details = ", ".join(
+                f"{transition}/{count}-change"
+                for transition, count in unsupported_conf_changes
+            )
+            print(f"  SKIP nseg-{i} ({len(seg)} events, unsupported joint config: {details})")
+            continue
         # Skip segments where the bootstrap config references nodes not in
         # the trace. The TLA+ spec (BootstrappedConfig) uses the LAST
         # bootstrap event per node to derive the initial config.

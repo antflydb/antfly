@@ -175,6 +175,9 @@ func (r *AntflyBackupReconciler) buildCronJobSpec(backup *antflyv1.AntflyBackup,
 	cmd := "/antfly backup" +
 		" --backup-id " + shellQuote(backup.Name) + "-$(date +%Y%m%d%H%M%S)" +
 		" --location " + shellQuote(backup.Spec.Destination.Location)
+	if backup.Spec.Destination.Connection != "" {
+		cmd += " --connection " + shellQuote(backup.Spec.Destination.Connection)
+	}
 
 	// Add table filter if specified
 	if len(backup.Spec.Tables) > 0 {

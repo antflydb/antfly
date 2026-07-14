@@ -55,15 +55,15 @@ export function ConnectionStatusBanner() {
       : "Antfly inference is not connected";
   const description = bothDisconnected ? (
     <>
-      Run <code>./antfly swarm</code>, or use Settings to connect to another API.
+      Run <code>./antfly standalone</code>, or use Settings to connect to another API.
     </>
   ) : disconnectedServers.includes("antfly") ? (
     <>
-      Checking <code>{antflyTarget}</code>. Run <code>./antfly swarm</code> or update Settings.
+      Checking <code>{antflyTarget}</code>. Run <code>./antfly standalone</code> or update Settings.
     </>
   ) : (
     <>
-      Checking <code>{inferenceTarget}</code>. Run <code>./antfly swarm</code> or update Settings.
+      Checking <code>{inferenceTarget}</code>. Run <code>./antfly standalone</code> or update Settings.
     </>
   );
 

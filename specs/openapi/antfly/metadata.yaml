@@ -1526,12 +1526,14 @@ components:
           type: boolean
           description: Indicates whether authentication is enabled for the cluster
           x-omitzero: false
-        swarm_mode:
-          type: boolean
-          description: Indicates whether the cluster is running in single-node swarm mode
-          x-omitzero: false
+        deployment_mode:
+          type: string
+          enum: [embedded, distributed, standalone, serverless]
+          description: Runtime deployment topology
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
+        storage:
+          $ref: "#/components/schemas/StorageRuntimeStatus"
     ClusterTopology:
       type: object
       required:
@@ -1548,14 +1550,40 @@ components:
           type: boolean
           description: Indicates whether authentication is enabled for the cluster
           x-omitzero: false
-        swarm_mode:
-          type: boolean
-          description: Indicates whether the cluster is running in single-node swarm mode
-          x-omitzero: false
+        deployment_mode:
+          type: string
+          enum: [embedded, distributed, standalone, serverless]
+          description: Runtime deployment topology
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
+        storage:
+          $ref: "#/components/schemas/StorageRuntimeStatus"
         data:
           $ref: "#/components/schemas/ClusterDataStatus"
+    StorageMaintenanceCapabilities:
+      type: object
+      required: [check, compact, vacuum, online, asynchronous]
+      additionalProperties: false
+      properties:
+        check: { type: boolean }
+        compact: { type: boolean }
+        vacuum: { type: boolean }
+        online: { type: boolean }
+        asynchronous: { type: boolean }
+    StorageRuntimeStatus:
+      type: object
+      required: [engine, maintenance]
+      additionalProperties: false
+      properties:
+        engine:
+          type: string
+          enum: [lite, local, object]
+        format:
+          type: string
+        fsync:
+          type: boolean
+        maintenance:
+          $ref: "#/components/schemas/StorageMaintenanceCapabilities"
     ClusterDataStatus:
       type: object
       description: Typed Zig status view for table data topology and range placement.
@@ -1595,7 +1623,10 @@ components:
         Connection status. "connected" means a live probe or listing succeeded,
         "error" means the probe failed (see the error field), "configured" means
         the connection is present but was not probed, and "unsupported" means
-        no probe is available for this connection kind or provider.
+        no probe is available for this connection kind or provider. For S3,
+        connected means an authenticated HeadBucket request succeeded for every
+        explicitly allowlisted bucket. It verifies bucket discovery permission,
+        not mutation permissions such as PutObject.
     InferenceProviderType:
       type: string
       enum:
@@ -2909,7 +2940,7 @@ components:
     SecretStatus:
       type: string
       enum:
-        - configured_keystore
+        - configured_file
         - configured_env
         - configured_both
       description: Source of the secret configuration
@@ -2949,7 +2980,7 @@ components:
       properties:
         value:
           type: string
-          description: "Secret value (stored encrypted, never returned)"
+          description: "Secret value (stored in the configured protected secret store and never returned)"
     ByteRange:
       type: array
       items:
@@ -4477,25 +4508,41 @@ components:
           format: int64
     BackupRequest:
       type: object
+      additionalProperties: false
       required:
         - backup_id
         - location
+        - connection
       properties:
         backup_id:
           type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
           description: |
             Unique identifier for this backup. Used to reference the backup for restore operations.
             Choose a meaningful name that includes date/version information.
           example: "backup-2025-01-15-v2"
         location:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Local filesystem: `file:///path/to/backup`
+            - Scoped filesystem connection: `file:///logical/path`
             - Amazon S3: `s3://bucket-name/path/to/backup`
+            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
             The backup includes all table data, indexes, and metadata for the specified table.
           example: "s3://mybucket/antfly-backups/users-table/2025-01-15"
+        connection:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: |
+            ID of a configured `external_io` connection. Required for every
+            network API backup and restore. Object locations enforce bucket and
+            prefix scopes; filesystem URI paths resolve beneath the connection root.
         format:
           type: string
           enum: [native, portable]
@@ -4508,29 +4555,70 @@ components:
             On restore, the format is auto-detected from file magic bytes.
           example: "portable"
     RestoreRequest:
-      allOf: # Identical to BackupRequest
-        - $ref: "#/components/schemas/BackupRequest"
-    ClusterBackupRequest:
       type: object
+      additionalProperties: false
       required:
         - backup_id
         - location
+        - connection
       properties:
         backup_id:
           type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+          description: Identifier of the published backup to restore.
+          example: "backup-2025-01-15-v2"
+        location:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: |
+            Storage location containing the backup. The server detects the
+            native or portable format from the published manifest and artifact.
+          example: "s3://mybucket/antfly-backups/users-table/2025-01-15"
+        connection:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: |
+            ID of a configured `external_io` connection with `restore.read`.
+            Object locations enforce bucket and prefix scopes; filesystem URI
+            paths resolve beneath the connection root.
+    ClusterBackupRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - backup_id
+        - location
+        - connection
+      properties:
+        backup_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
           description: |
             Unique identifier for this backup. Used to reference the backup for restore operations.
             Choose a meaningful name that includes date/version information.
           example: "cluster-backup-2025-01-15"
         location:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Local filesystem: `file:///path/to/backup`
+            - Scoped filesystem connection: `file:///logical/path`
             - Amazon S3: `s3://bucket-name/path/to/backup`
+            - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
             The backup includes all table data, indexes, and metadata.
           example: "s3://mybucket/antfly-backups/cluster/2025-01-15"
+        connection:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Required configured `external_io` connection with the `backup.write` capability.
         format:
           type: string
           enum: [native, portable]
@@ -4544,10 +4632,16 @@ components:
           example: "portable"
         table_names:
           type: array
+          maxItems: 256
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
           description: |
-            Optional list of tables to backup. If omitted, all tables are backed up.
+            Optional list of tables to backup. If omitted, all tables are backed up,
+            up to the cluster backup limit of 4096 tables. Requests above that limit
+            fail before any table backup is created.
           example: ["users", "products"]
     ClusterBackupResponse:
       type: object
@@ -4590,26 +4684,44 @@ components:
           description: Error message if backup failed
     ClusterRestoreRequest:
       type: object
+      additionalProperties: false
       required:
         - backup_id
         - location
+        - connection
       properties:
         backup_id:
           type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
           description: |
             Unique identifier of the backup to restore from.
           example: "cluster-backup-2025-01-15"
         location:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: |
             Storage location where the backup is stored.
           example: "s3://mybucket/antfly-backups/cluster/2025-01-15"
+        connection:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Required configured `external_io` connection with the `restore.read` capability.
         table_names:
           type: array
+          maxItems: 256
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
           description: |
-            Optional list of tables to restore. If omitted, all tables in the backup are restored.
+            Optional list of tables to restore. If omitted, all tables in the backup are restored,
+            up to the cluster restore limit of 4096 tables. Larger backups must be restored
+            in explicit batches of at most 256 tables.
           example: ["users", "products"]
         restore_mode:
           type: string
@@ -4619,8 +4731,108 @@ components:
             How to handle existing tables:
             - `fail_if_exists`: Abort if any table already exists (default)
             - `skip_if_exists`: Skip existing tables, restore others
-            - `overwrite`: Drop and recreate existing tables
+            - `overwrite`: Atomically replace existing table generations after staging and validation
           example: "skip_if_exists"
+    RestoreJob:
+      type: object
+      required: [job_id, attempt_id, scope, backup_id, phase, cancel_requested, durability_pending_table_count, published_table_count, completed_table_count, created_at_ms, updated_at_ms]
+      properties:
+        job_id:
+          type: string
+          minLength: 1
+          maxLength: 19
+          pattern: '^[1-9][0-9]{0,18}$'
+          description: Opaque durable restore-job identifier. Clients must not parse it as a number.
+        attempt_id: { type: integer, format: int64 }
+        scope: { type: string, enum: [table, cluster] }
+        table_name: { type: string }
+        backup_id: { type: string }
+        phase: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        cancel_requested: { type: boolean }
+        durability_pending_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+        published_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+        completed_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
+        total_table_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Requested table count when known before execution.
+        result:
+          type: object
+          additionalProperties: false
+          description: |
+            Bounded terminal result. A committed result with durability pending means publication is visible but
+            parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed,
+            durability-pending, skipped, and failed table counts plus a bounded sample of failure details.
+            `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted.
+            Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress
+            and use a new idempotency key when retrying a changed request.
+          properties:
+            restore:
+              type: string
+              enum: [triggered, committed]
+              description: Present for a single-table restore result.
+            durability:
+              type: string
+              enum: [pending]
+              description: Present when table publication is visible but filesystem durability could not be confirmed.
+            status:
+              type: string
+              enum: [completed, durability_pending, partial, failed]
+              description: Aggregate terminal status for a cluster restore.
+            triggered_table_count: { type: integer, format: int64, minimum: 0 }
+            committed_table_count: { type: integer, format: int64, minimum: 0 }
+            durability_pending_table_count: { type: integer, format: int64, minimum: 0 }
+            skipped_table_count: { type: integer, format: int64, minimum: 0 }
+            failed_table_count: { type: integer, format: int64, minimum: 0 }
+            failure_details:
+              type: array
+              maxItems: 8
+              items:
+                type: object
+                additionalProperties: false
+                required: [table_name, error, table_name_truncated]
+                properties:
+                  table_name: { type: string, maxLength: 256 }
+                  error: { type: string, maxLength: 256 }
+                  table_name_truncated: { type: boolean }
+            failure_details_truncated:
+              type: boolean
+              description: True when additional failed tables or part of a long table name or error were omitted.
+        error: { type: string }
+        created_at_ms: { type: integer, format: int64 }
+        updated_at_ms: { type: integer, format: int64 }
+        expires_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+    RestoreJobList:
+      type: object
+      additionalProperties: false
+      required: [jobs]
+      properties:
+        jobs:
+          type: array
+          maxItems: 100
+          items: { $ref: "#/components/schemas/RestoreJob" }
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 20
+          pattern: '^[1-9][0-9]{0,19}$'
+          description: Opaque newest-first continuation cursor. A page can be empty and still include a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted.
     ClusterRestoreResponse:
       type: object
       required:
@@ -4634,9 +4846,9 @@ components:
           description: Status of each table restore
         status:
           type: string
-          enum: [triggered, partial, failed]
+          enum: [completed, triggered, durability_pending, partial, failed]
           description: Overall restore status
-          example: "triggered"
+          example: "completed"
     TableRestoreStatus:
       type: object
       required:
@@ -4649,7 +4861,7 @@ components:
           example: "users"
         status:
           type: string
-          enum: [triggered, skipped, failed]
+          enum: [triggered, committed, durability_pending, skipped, failed]
           description: Restore status for this table
           example: "triggered"
         error:
@@ -4700,7 +4912,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BackupInfo"
-          description: List of available backups
+          maxItems: 1000
+          description: One page of available backups in stable manifest-key order.
+        next_cursor:
+          type: string
+          description: Opaque continuation cursor. Omitted when no additional backups remain.
     QueryBuilderRequest:
       type: object
       required:
@@ -7011,7 +7227,7 @@ components:
           type: string
           description: |
             Data source name (connection string) for the foreign database.
-            Supports `${secret:key_name}` references that resolve from the Antfly keystore
+            Supports `${secret:key_name}` references that resolve from the Antfly secret store
             or environment variables.
           example: "${secret:pg_dsn}"
         postgres_table:
@@ -7064,7 +7280,7 @@ components:
           type: string
           description: |
             Data source name (connection string) for the PostgreSQL database.
-            Supports `${secret:key_name}` references that resolve from the Antfly keystore
+            Supports `${secret:key_name}` references that resolve from the Antfly secret store
             or environment variables. Requires `wal_level=logical` on the source.
           example: "${secret:pg_dsn}"
         postgres_table:
@@ -7409,17 +7625,20 @@ paths:
           in: query
           required: false
           description: |
-            Comma-separated list of expansions. Supported value: "models" —
-            live-query each inference provider's model listing API.
+            Comma-separated list of expansions. Supported values: `models` to
+            live-query inference model listings and `status` to live-probe
+            external connections. Live work is opt-in and single-flight per
+            server.
           schema:
             type: string
         - name: refresh
           in: query
           required: false
           description: |
-            Set to "true" to bypass the short server-side cache for live
-            provider model listings and probes. This does not force a node
-            config or metadata reload.
+            Set to "true" to bypass the short server-side cache for requested
+            live expansions. Live expansion passes are serialized to prevent
+            concurrent refresh amplification. This does not force a node config
+            or metadata reload.
           schema:
             type: string
       responses:
@@ -7443,7 +7662,7 @@ paths:
       tags:
         - cluster_management
       description: |
-        List all configured secret names and their status (keystore, env var, or both).
+        List all configured secret names and their status (secret-store file, env var, or both).
         Never returns secret values — only names and configuration status.
       operationId: listSecrets
       responses:
@@ -7475,7 +7694,7 @@ paths:
       tags:
         - cluster_management
       description: |
-        Store a secret in the keystore. Only available in swarm (single-node) mode.
+        Store a secret in the configured writable secret-store file. Only available in standalone mode.
         Returns 503 in multi-node mode.
       operationId: putSecret
       requestBody:
@@ -7510,7 +7729,7 @@ paths:
       tags:
         - cluster_management
       description: |
-        Remove a secret from the keystore. Only available in swarm (single-node) mode.
+        Remove a secret from the configured writable secret-store file. Only available in standalone mode.
         Returns 503 in multi-node mode.
       operationId: deleteSecret
       responses:
@@ -7939,6 +8158,9 @@ paths:
         The backup creates a cluster-level manifest that tracks all included tables
         and their individual backup locations.
 
+        Backup IDs are immutable. Reusing an ID that already has a published
+        cluster manifest returns `409` and leaves the existing backup unchanged.
+
         **Storage Locations:**
         - Local filesystem: `file:///path/to/backup`
         - Amazon S3: `s3://bucket-name/path/to/backup`
@@ -7947,11 +8169,7 @@ paths:
         ```
         {location}/
         ├── {backup_id}-cluster-metadata.json   (cluster manifest)
-        ├── {table1}-{backup_id}-metadata.json  (table metadata)
-        ├── shard-1-{table1}-{backup_id}.tar.zst
-        ├── shard-2-{table1}-{backup_id}.tar.zst
-        ├── {table2}-{backup_id}-metadata.json
-        └── ...
+        └── generation-scoped table manifests and payloads
         ```
       operationId: backup
       requestBody:
@@ -7962,13 +8180,18 @@ paths:
               $ref: "#/components/schemas/ClusterBackupRequest"
       responses:
         "200":
-          description: Backup completed successfully
+          description: |
+            Backup attempt completed. Inspect the response `status`: `completed`
+            is fully successful, while `partial` or `failed` reports per-table
+            failures even though the request itself was processed successfully.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClusterBackupResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /restore:
@@ -7982,12 +8205,32 @@ paths:
         **Restore Modes:**
         - `fail_if_exists`: Abort if any target table already exists (default)
         - `skip_if_exists`: Skip existing tables and restore the rest
-        - `overwrite`: Drop existing tables and restore from backup
+        - `overwrite`: Stage and validate replacement generations, then atomically publish them over existing tables.
 
-        The restore is asynchronous - this endpoint triggers the restore process
-        and returns immediately. The actual data restoration happens via the
-        reconciliation loop as shards are started.
+        The restore is a durable asynchronous job. The request returns after the
+        job record is persisted and both a durable job store and asynchronous
+        worker are available. Poll the restore job resource for progress.
+        Catalog publication is durably checkpointed per table and is not
+        repeated after restart. If leadership changes before that checkpoint,
+        recovery adopts only an exact, still-active restore intent for the same
+        backup and location; unrelated or ambiguous existing tables fail closed.
+        A job reaches `succeeded` only after all placement replicas report the
+        restore complete and metadata clears the restore intent. Cancellation is
+        cooperative between table publication boundaries. Remote transfer and
+        staging occur before the per-table write fence. Publication stops new
+        admission and drains current readers and writers before swapping the
+        direct-path generation.
       operationId: restore
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            x-go-type-skip-optional-pointer: false
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -7996,24 +8239,111 @@ paths:
               $ref: "#/components/schemas/ClusterRestoreRequest"
       responses:
         "202":
-          description: Restore triggered successfully
+          description: Restore job durably accepted
+          headers:
+            Location:
+              description: Relative URL of the durable restore job resource.
+              schema: { type: string }
+            Retry-After:
+              description: Suggested polling delay in seconds.
+              schema: { type: integer, minimum: 1 }
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ClusterRestoreResponse"
+                $ref: "#/components/schemas/RestoreJob"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /restore/jobs:
+    get:
+      summary: List durable restore jobs
+      description: Returns a newest-first, authorization-filtered page of retained restore jobs from the metadata leader.
+      operationId: listRestoreJobs
+      tags: [cluster_management]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 20
+            pattern: '^[1-9][0-9]{0,19}$'
+          description: Opaque cursor returned by the preceding page.
+        - name: phase
+          in: query
+          schema: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        - name: scope
+          in: query
+          schema: { type: string, enum: [table, cluster] }
+      responses:
+        "200":
+          description: Authorized restore jobs
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreJobList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /restore/jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 19
+          pattern: '^[1-9][0-9]{0,18}$'
+    get:
+      summary: Get durable restore job status
+      description: |
+        Returns replicated restore-job state. A metadata follower may return
+        the retryable metadata-not-leader `503` until a newly committed job has
+        applied locally; clients should retry instead of treating that response
+        as job absence.
+      operationId: getRestoreJob
+      tags: [cluster_management]
+      responses:
+        "200":
+          description: Restore job status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreJob" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+    delete:
+      summary: Request cooperative restore cancellation
+      description: |
+        Requests best-effort cancellation. Queued work is cancelled immediately
+        and running work stops at its next safe boundary. If irreversible restore
+        publication completes before cancellation is observed, the job remains
+        `succeeded` with `cancel_requested: true`.
+      operationId: cancelRestoreJob
+      tags: [cluster_management]
+      responses:
+        "200":
+          description: Updated restore job status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreJob" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /backups:
     get:
       summary: List available backups
       tags:
         - cluster_management
       description: |
-        Lists all cluster-level backups available at the specified location.
-        Returns metadata about each backup including the tables included,
-        timestamp, and Antfly version.
+        Lists one bounded page of cluster-level backups in stable manifest-key
+        order at the specified location. Returns metadata about each backup
+        including the tables included, timestamp, and Antfly version. Pass the
+        returned `next_cursor` unchanged to retrieve the next page.
       operationId: listBackups
       parameters:
         - name: location
@@ -8026,6 +8356,32 @@ paths:
           schema:
             type: string
           example: "s3://mybucket/antfly-backups/"
+        - name: connection
+          in: query
+          required: true
+          description: Named `external_io` connection authorized for reading this backup location.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum backups returned in one page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+            x-go-type-skip-optional-pointer: false
+        - name: cursor
+          in: query
+          required: false
+          description: Continuation cursor returned by the preceding page.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+            x-go-type-skip-optional-pointer: false
       responses:
         "200":
           description: List of available backups
@@ -8631,6 +8987,7 @@ paths:
           type: string
     post:
       summary: Backup a table
+      description: Backup IDs are immutable. Reusing an already published ID returns `409` without changing the existing backup.
       tags:
         - data_operations
       operationId: backupTable
@@ -8655,6 +9012,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/restore:
@@ -8670,6 +9029,16 @@ paths:
       tags:
         - data_operations
       operationId: restoreTable
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            x-go-type-skip-optional-pointer: false
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -8677,18 +9046,25 @@ paths:
             schema:
               $ref: "#/components/schemas/RestoreRequest"
       responses:
-        "202": # Corrected to 202 as per handler
-          description: Restore process triggered successfully
+        "202":
+          description: Durable restore job accepted
+          headers:
+            Location:
+              description: Relative URL of the durable restore job resource.
+              schema: { type: string }
+            Retry-After:
+              description: Suggested polling delay in seconds.
+              schema: { type: integer, minimum: 1 }
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  restore:
-                    type: string
-                    example: triggered
+                $ref: "#/components/schemas/RestoreJob"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/schema:

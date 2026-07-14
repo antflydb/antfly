@@ -75,7 +75,7 @@ spec:
             - |
               ORDINAL=${HOSTNAME##*-}
               ID=$((ORDINAL + 1))
-              exec /antfly metadata --id $ID --config /config/config.yaml \
+              exec /antfly metadata --id $ID --config /config/config.json \
                 --api http://0.0.0.0:12377 \
                 --raft http://0.0.0.0:9017 \
                 --public-api http://0.0.0.0:12277 \

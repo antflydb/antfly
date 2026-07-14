@@ -20,6 +20,11 @@ const test_support = @import("test_support.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
+const multipart_upload_threshold: u64 = 64 * 1024 * 1024;
+const multipart_upload_min_part_bytes: u64 = 16 * 1024 * 1024;
+const multipart_upload_max_part_bytes: u64 = 512 * 1024 * 1024;
+const multipart_upload_part_alignment: u64 = 1024 * 1024;
+const max_multipart_parts: u64 = 10_000;
 
 pub const Scheme = s3_compat.Scheme;
 pub const AddressingStyle = s3_compat.AddressingStyle;
@@ -31,6 +36,14 @@ pub const S3Path = s3_compat.S3Path;
 pub const Config = struct {
     credentials: Credentials,
     addressing_style: AddressingStyle = .virtual_hosted,
+    credential_provider: ?CredentialProvider = null,
+    /// Optional hard ceiling for one object-store HTTP request. Production
+    /// clients normally use the transport defaults; health probes set this so
+    /// an unreachable endpoint cannot monopolize an API worker.
+    request_timeout_ms: ?u64 = null,
+    /// Optional borrowed application runtime. When absent, the client owns a
+    /// threaded fallback for standalone library use.
+    io: ?std.Io = null,
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         self.credentials.deinit(alloc);
@@ -50,10 +63,49 @@ pub const Config = struct {
     }
 };
 
+pub const DynamicCredentials = struct {
+    pub const Borrowed = struct {
+        ctx: *anyopaque,
+        release: *const fn (*anyopaque) void,
+    };
+
+    pub const Ownership = union(enum) {
+        owned,
+        borrowed: Borrowed,
+    };
+
+    access_key_id: []u8,
+    secret_access_key: []u8,
+    session_token: ?[]u8 = null,
+    ownership: Ownership = .owned,
+
+    pub fn deinit(self: *DynamicCredentials, alloc: Allocator) void {
+        switch (self.ownership) {
+            .owned => {
+                alloc.free(self.access_key_id);
+                alloc.free(self.secret_access_key);
+                if (self.session_token) |value| alloc.free(value);
+            },
+            .borrowed => |borrowed| borrowed.release(borrowed.ctx),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CredentialProvider = struct {
+    ptr: *anyopaque,
+    get_fn: *const fn (*anyopaque, Allocator) anyerror!DynamicCredentials,
+
+    pub fn get(self: CredentialProvider, alloc: Allocator) !DynamicCredentials {
+        return try self.get_fn(self.ptr, alloc);
+    }
+};
+
 pub const HeaderPair = [2][]const u8;
 
 pub const HttpMethod = enum {
     GET,
+    POST,
     PUT,
     DELETE,
     HEAD,
@@ -61,6 +113,7 @@ pub const HttpMethod = enum {
     fn toHttpx(self: HttpMethod) httpx.Method {
         return switch (self) {
             .GET => .GET,
+            .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
             .HEAD => .HEAD,
@@ -70,6 +123,7 @@ pub const HttpMethod = enum {
     fn asBytes(self: HttpMethod) []const u8 {
         return switch (self) {
             .GET => "GET",
+            .POST => "POST",
             .PUT => "PUT",
             .DELETE => "DELETE",
             .HEAD => "HEAD",
@@ -100,22 +154,42 @@ const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []c
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator) HttpxTransport {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        errdefer io_impl.deinit();
+    fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
+        errdefer if (io_impl) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
+        };
+        const client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
+            .timeouts = .{
+                .connect_ms = timeout_ms,
+                .read_ms = timeout_ms,
+                .write_ms = timeout_ms,
+                .keep_alive_ms = timeout_ms,
+                .idle_ms = timeout_ms,
+                .request_ms = timeout_ms,
+            },
+        } else .{};
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = httpx.Client.init(alloc, io_impl.io()),
+            .client = httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), client_config),
         };
     }
 
     fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
-        self.io_impl.deinit();
+        if (self.io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.* = undefined;
     }
 
@@ -155,6 +229,20 @@ const HttpxTransport = struct {
     }
 };
 
+test "s3 http transport borrows a shared io runtime" {
+    const alloc = std.testing.allocator;
+    var shared = std.Io.Threaded.init(alloc, .{});
+    defer shared.deinit();
+    var transport = try HttpxTransport.init(alloc, null, shared.io());
+    defer transport.deinit();
+    try std.testing.expect(transport.io_impl == null);
+
+    var fallback = try HttpxTransport.init(alloc, null, null);
+    defer fallback.deinit();
+    try std.testing.expect(fallback.io_impl != null);
+    try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
+}
+
 pub const Client = struct {
     alloc: Allocator,
     cfg: Config,
@@ -165,7 +253,7 @@ pub const Client = struct {
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = HttpxTransport.init(alloc);
+        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -214,7 +302,9 @@ pub const Client = struct {
         var response = try self.perform(.HEAD, target, &.{}, null, null);
         defer response.deinit(self.alloc);
         return switch (response.status) {
-            200, 204, 301, 403 => true,
+            200, 204 => true,
+            301 => error.BucketRegionMismatch,
+            401, 403 => error.AccessDenied,
             404 => false,
             else => return unexpectedStatusError(response.status),
         };
@@ -261,6 +351,138 @@ pub const Client = struct {
             .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
             .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
         };
+    }
+
+    fn putFile(
+        self: *Client,
+        alloc: Allocator,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        src_path: []const u8,
+        opts: types.PutOptions,
+    ) !types.PutResult {
+        return try self.putFileWithThreshold(alloc, io, bucket, key, src_path, opts, multipart_upload_threshold);
+    }
+
+    fn putFileWithThreshold(
+        self: *Client,
+        alloc: Allocator,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        src_path: []const u8,
+        opts: types.PutOptions,
+        multipart_threshold: u64,
+    ) !types.PutResult {
+        const source = try openFilePath(io, src_path);
+        defer source.close(io);
+        const stat = try source.stat(io);
+        if (stat.size <= multipart_threshold) {
+            const body = try alloc.alloc(u8, @intCast(stat.size));
+            defer alloc.free(body);
+            if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+            var extra: [1]u8 = undefined;
+            if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
+            return try self.putObject(alloc, bucket, key, body, opts);
+        }
+        if (opts.if_match_etag != null or opts.if_none_match) return error.ConditionalMultipartUnsupported;
+        const required_part_bytes = ((stat.size - 1) / max_multipart_parts) + 1;
+        const aligned_part_bytes = std.mem.alignForward(u64, required_part_bytes, multipart_upload_part_alignment);
+        const part_bytes = @max(multipart_upload_min_part_bytes, aligned_part_bytes);
+        if (part_bytes > multipart_upload_max_part_bytes) return error.ObjectTooLarge;
+        const part_count = ((stat.size - 1) / part_bytes) + 1;
+        if (part_count > max_multipart_parts) return error.ObjectTooLarge;
+
+        var initiate_query = std.ArrayListUnmanaged(QueryPair).empty;
+        errdefer deinitQueryList(alloc, &initiate_query);
+        try appendQueryPair(alloc, &initiate_query, "uploads", "");
+        const initiate_pairs = try initiate_query.toOwnedSlice(alloc);
+        defer freeQueryPairs(alloc, initiate_pairs);
+        var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_pairs);
+        defer initiate_target.deinit(alloc);
+        var initiated = try self.perform(.POST, initiate_target, &.{}, null, opts.content_type);
+        defer initiated.deinit(alloc);
+        if (initiated.status != 200) return unexpectedStatusError(initiated.status);
+        const upload_id = try requiredTagAlloc(alloc, initiated.body, "UploadId");
+        defer alloc.free(upload_id);
+
+        var completed = false;
+        defer if (!completed) self.abortMultipartUpload(bucket, key, upload_id) catch {};
+        var etags = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (etags.items) |etag| alloc.free(etag);
+            etags.deinit(alloc);
+        }
+        const buffer = try alloc.alloc(u8, @intCast(part_bytes));
+        defer alloc.free(buffer);
+        var offset: u64 = 0;
+        var part_number: u32 = 1;
+        while (offset < stat.size) : (part_number += 1) {
+            const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
+            if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
+            const current_stat = try source.stat(io);
+            if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
+            const part_number_text = try std.fmt.allocPrint(alloc, "{d}", .{part_number});
+            defer alloc.free(part_number_text);
+            var query = std.ArrayListUnmanaged(QueryPair).empty;
+            errdefer deinitQueryList(alloc, &query);
+            try appendQueryPair(alloc, &query, "partNumber", part_number_text);
+            try appendQueryPair(alloc, &query, "uploadId", upload_id);
+            const query_pairs = try query.toOwnedSlice(alloc);
+            defer freeQueryPairs(alloc, query_pairs);
+            var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query_pairs);
+            defer target.deinit(alloc);
+            var response = try self.perform(.PUT, target, &.{}, buffer[0..wanted], null);
+            defer response.deinit(alloc);
+            if (response.status != 200) return unexpectedStatusError(response.status);
+            const etag = response.etag orelse return error.MissingMultipartEtag;
+            try etags.append(alloc, try alloc.dupe(u8, etag));
+            offset += wanted;
+        }
+        var extra: [1]u8 = undefined;
+        if (try source.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
+
+        const completion_xml = try completeMultipartXmlAlloc(alloc, etags.items);
+        defer alloc.free(completion_xml);
+        var complete_query = std.ArrayListUnmanaged(QueryPair).empty;
+        errdefer deinitQueryList(alloc, &complete_query);
+        try appendQueryPair(alloc, &complete_query, "uploadId", upload_id);
+        const complete_pairs = try complete_query.toOwnedSlice(alloc);
+        defer freeQueryPairs(alloc, complete_pairs);
+        var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_pairs);
+        defer complete_target.deinit(alloc);
+        var response = try self.perform(.POST, complete_target, &.{}, completion_xml, "application/xml");
+        defer response.deinit(alloc);
+        if (response.status != 200) return unexpectedStatusError(response.status);
+        if (findBlock(response.body, "Error", 0) != null) return error.MultipartCompletionFailed;
+        completed = true;
+        const result_etag = if (response.etag) |value|
+            try alloc.dupe(u8, stripQuotes(value))
+        else if (try optionalTagAlloc(alloc, response.body, "ETag")) |value| blk: {
+            defer alloc.free(value);
+            break :blk try alloc.dupe(u8, stripQuotes(value));
+        } else null;
+        return .{
+            .etag = result_etag,
+            .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
+        };
+    }
+
+    fn abortMultipartUpload(self: *Client, bucket: []const u8, key: []const u8, upload_id: []const u8) !void {
+        var query = std.ArrayListUnmanaged(QueryPair).empty;
+        errdefer deinitQueryList(self.alloc, &query);
+        try appendQueryPair(self.alloc, &query, "uploadId", upload_id);
+        const query_pairs = try query.toOwnedSlice(self.alloc);
+        defer freeQueryPairs(self.alloc, query_pairs);
+        var target = try objectTargetAllocWithQuery(self.alloc, self.cfg, bucket, key, query_pairs);
+        defer target.deinit(self.alloc);
+        var response = try self.perform(.DELETE, target, &.{}, null, null);
+        defer response.deinit(self.alloc);
+        if (response.status != 200 and response.status != 204 and response.status != 404)
+            return unexpectedStatusError(response.status);
     }
 
     fn getObject(
@@ -411,6 +633,14 @@ pub const Client = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
     ) !TransportResponse {
+        var dynamic_credentials = if (self.cfg.credential_provider) |provider| try provider.get(self.alloc) else null;
+        defer if (dynamic_credentials) |*credentials| credentials.deinit(self.alloc);
+        var signing_config = self.cfg;
+        if (dynamic_credentials) |credentials| {
+            signing_config.credentials.access_key_id = credentials.access_key_id;
+            signing_config.credentials.secret_access_key = credentials.secret_access_key;
+            signing_config.credentials.session_token = credentials.session_token;
+        }
         const timestamp = currentUnixSeconds();
         const payload_hash = try sha256HexAlloc(self.alloc, body orelse "");
         defer self.alloc.free(payload_hash);
@@ -422,7 +652,7 @@ pub const Client = struct {
 
         const signed = try signHeadersAlloc(
             self.alloc,
-            self.cfg,
+            signing_config,
             method,
             target.host,
             target.canonical_uri,
@@ -443,6 +673,7 @@ pub const Client = struct {
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
         .put_object = erasedPutObject,
+        .put_file = erasedPutFile,
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
@@ -468,6 +699,11 @@ pub const Client = struct {
     fn erasedPutObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return try self.putObject(alloc, bucket, key, body, opts);
+    }
+
+    fn erasedPutFile(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return try self.putFile(alloc, io, bucket, key, src_path, opts);
     }
 
     fn erasedGetObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
@@ -633,27 +869,27 @@ fn objectTargetAllocWithQuery(alloc: Allocator, cfg: Config, bucket: []const u8,
 
 fn buildObjectQueryAlloc(alloc: Allocator, version_id: ?[]const u8, part_number: ?u32) ![]QueryPair {
     var query = std.ArrayListUnmanaged(QueryPair).empty;
-    errdefer freeQueryPairs(alloc, query.items);
+    errdefer deinitQueryList(alloc, &query);
 
     if (version_id) |value| try appendQueryPair(alloc, &query, "versionId", value);
     if (part_number) |value| {
         const encoded = try std.fmt.allocPrint(alloc, "{d}", .{value});
-        errdefer alloc.free(encoded);
-        try query.append(alloc, .{ .name = try alloc.dupe(u8, "partNumber"), .value = encoded });
+        defer alloc.free(encoded);
+        try appendQueryPair(alloc, &query, "partNumber", encoded);
     }
     return try query.toOwnedSlice(alloc);
 }
 
 fn buildDeleteQueryAlloc(alloc: Allocator, version_id: ?[]const u8) ![]QueryPair {
     var query = std.ArrayListUnmanaged(QueryPair).empty;
-    errdefer freeQueryPairs(alloc, query.items);
+    errdefer deinitQueryList(alloc, &query);
     if (version_id) |value| try appendQueryPair(alloc, &query, "versionId", value);
     return try query.toOwnedSlice(alloc);
 }
 
 fn buildListQueryAlloc(alloc: Allocator, opts: types.ListOptions) ![]QueryPair {
     var query = std.ArrayListUnmanaged(QueryPair).empty;
-    errdefer freeQueryPairs(alloc, query.items);
+    errdefer deinitQueryList(alloc, &query);
 
     try appendQueryPair(alloc, &query, "list-type", "2");
     if (opts.prefix.len > 0) try appendQueryPair(alloc, &query, "prefix", opts.prefix);
@@ -662,35 +898,46 @@ fn buildListQueryAlloc(alloc: Allocator, opts: types.ListOptions) ![]QueryPair {
     if (opts.continuation_token) |value| try appendQueryPair(alloc, &query, "continuation-token", value);
     if (opts.max_keys != 1000) {
         const value = try std.fmt.allocPrint(alloc, "{d}", .{opts.max_keys});
-        errdefer alloc.free(value);
-        try query.append(alloc, .{ .name = try alloc.dupe(u8, "max-keys"), .value = value });
+        defer alloc.free(value);
+        try appendQueryPair(alloc, &query, "max-keys", value);
     }
     return try query.toOwnedSlice(alloc);
 }
 
 fn appendQueryPair(alloc: Allocator, list: *std.ArrayListUnmanaged(QueryPair), name: []const u8, value: []const u8) !void {
-    try list.append(alloc, .{
-        .name = try alloc.dupe(u8, name),
-        .value = try alloc.dupe(u8, value),
-    });
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try list.append(alloc, .{ .name = owned_name, .value = owned_value });
 }
 
 fn cloneQueryPairsAlloc(alloc: Allocator, pairs: []const QueryPair) ![]QueryPair {
     const out = try alloc.alloc(QueryPair, pairs.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..@min(out.len, pairs.len)]) |pair| {
+        for (out[0..initialized]) |pair| {
             alloc.free(pair.name);
             alloc.free(pair.value);
         }
         alloc.free(out);
     }
     for (pairs, 0..) |pair, idx| {
-        out[idx] = .{
-            .name = try alloc.dupe(u8, pair.name),
-            .value = try alloc.dupe(u8, pair.value),
-        };
+        const name = try alloc.dupe(u8, pair.name);
+        errdefer alloc.free(name);
+        const value = try alloc.dupe(u8, pair.value);
+        out[idx] = .{ .name = name, .value = value };
+        initialized += 1;
     }
     return out;
+}
+
+fn deinitQueryList(alloc: Allocator, list: *std.ArrayListUnmanaged(QueryPair)) void {
+    for (list.items) |pair| {
+        alloc.free(pair.name);
+        alloc.free(pair.value);
+    }
+    list.deinit(alloc);
 }
 
 fn freeQueryPairs(alloc: Allocator, pairs: []const QueryPair) void {
@@ -715,37 +962,38 @@ fn signHeadersAlloc(
     content_type: ?[]const u8,
 ) ![]HeaderPair {
     var headers = std.ArrayListUnmanaged(HeaderPair).empty;
-    errdefer freeHeaderPairs(alloc, headers.items);
+    errdefer deinitHeaderList(alloc, &headers);
 
-    try headers.append(alloc, .{ try alloc.dupe(u8, "Host"), try alloc.dupe(u8, host) });
-    try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-date"), try alloc.dupe(u8, amz_date) });
-    try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-content-sha256"), try alloc.dupe(u8, payload_hash) });
+    try appendHeaderCopy(alloc, &headers, "Host", host);
+    try appendHeaderCopy(alloc, &headers, "x-amz-date", amz_date);
+    try appendHeaderCopy(alloc, &headers, "x-amz-content-sha256", payload_hash);
     if (cfg.credentials.session_token) |token| {
-        try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-security-token"), try alloc.dupe(u8, token) });
+        try appendHeaderCopy(alloc, &headers, "x-amz-security-token", token);
     }
     if (content_type) |value| {
-        try headers.append(alloc, .{ try alloc.dupe(u8, "Content-Type"), try alloc.dupe(u8, value) });
+        try appendHeaderCopy(alloc, &headers, "Content-Type", value);
     }
     for (extra_headers) |pair| {
-        try headers.append(alloc, .{
-            try alloc.dupe(u8, pair[0]),
-            try alloc.dupe(u8, pair[1]),
-        });
+        try appendHeaderCopy(alloc, &headers, pair[0], pair[1]);
     }
 
-    const signature = try authorizationValueAlloc(
-        alloc,
-        cfg,
-        method,
-        canonical_uri,
-        query_pairs,
-        headers.items,
-        payload_hash,
-        amz_date,
-        scope_date,
-    );
-    errdefer alloc.free(signature);
-    try headers.append(alloc, .{ try alloc.dupe(u8, "Authorization"), signature });
+    {
+        const signature = try authorizationValueAlloc(
+            alloc,
+            cfg,
+            method,
+            canonical_uri,
+            query_pairs,
+            headers.items,
+            payload_hash,
+            amz_date,
+            scope_date,
+        );
+        errdefer alloc.free(signature);
+        const authorization_name = try alloc.dupe(u8, "Authorization");
+        errdefer alloc.free(authorization_name);
+        try headers.append(alloc, .{ authorization_name, signature });
+    }
     return try headers.toOwnedSlice(alloc);
 }
 
@@ -836,8 +1084,9 @@ const CanonicalHeader = struct {
 
 fn canonicalHeadersAlloc(alloc: Allocator, headers: []const HeaderPair) !CanonicalHeaders {
     const entries = try alloc.alloc(CanonicalHeader, headers.len);
+    var initialized: usize = 0;
     errdefer {
-        for (entries[0..headers.len]) |entry| {
+        for (entries[0..initialized]) |entry| {
             alloc.free(entry.name);
             alloc.free(entry.value);
         }
@@ -845,10 +1094,11 @@ fn canonicalHeadersAlloc(alloc: Allocator, headers: []const HeaderPair) !Canonic
     }
 
     for (headers, 0..) |pair, idx| {
-        entries[idx] = .{
-            .name = try asciiLowerAlloc(alloc, std.mem.trim(u8, pair[0], " ")),
-            .value = try alloc.dupe(u8, std.mem.trim(u8, pair[1], " ")),
-        };
+        const name = try asciiLowerAlloc(alloc, std.mem.trim(u8, pair[0], " "));
+        errdefer alloc.free(name);
+        const value = try alloc.dupe(u8, std.mem.trim(u8, pair[1], " "));
+        entries[idx] = .{ .name = name, .value = value };
+        initialized += 1;
     }
     std.mem.sort(CanonicalHeader, entries, {}, lessCanonicalHeader);
 
@@ -867,36 +1117,33 @@ fn canonicalHeadersAlloc(alloc: Allocator, headers: []const HeaderPair) !Canonic
         try signed.appendSlice(alloc, entry.name);
     }
 
+    const header_block = try block.toOwnedSlice(alloc);
+    errdefer alloc.free(header_block);
+    const signed_headers = try signed.toOwnedSlice(alloc);
     return .{
         .entries = entries,
-        .header_block = try block.toOwnedSlice(alloc),
-        .signed_headers = try signed.toOwnedSlice(alloc),
+        .header_block = header_block,
+        .signed_headers = signed_headers,
     };
 }
 
 fn canonicalQueryStringAlloc(alloc: Allocator, pairs: []const QueryPair) ![]u8 {
     const encoded = try alloc.alloc(QueryPair, pairs.len);
+    var initialized: usize = 0;
     errdefer {
-        for (encoded[0..pairs.len]) |pair| {
+        for (encoded[0..initialized]) |pair| {
             alloc.free(pair.name);
             alloc.free(pair.value);
         }
         alloc.free(encoded);
     }
     for (pairs, 0..) |pair, idx| {
-        encoded[idx] = .{
-            .name = try encodeUriComponentAlloc(alloc, pair.name, true),
-            .value = try encodeUriComponentAlloc(alloc, pair.value, true),
-        };
+        const name = try encodeUriComponentAlloc(alloc, pair.name, true);
+        errdefer alloc.free(name);
+        const value = try encodeUriComponentAlloc(alloc, pair.value, true);
+        encoded[idx] = .{ .name = name, .value = value };
+        initialized += 1;
     }
-    defer {
-        for (encoded) |pair| {
-            alloc.free(pair.name);
-            alloc.free(pair.value);
-        }
-        alloc.free(encoded);
-    }
-
     std.mem.sort(QueryPair, encoded, {}, lessQueryPair);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -906,7 +1153,13 @@ fn canonicalQueryStringAlloc(alloc: Allocator, pairs: []const QueryPair) ![]u8 {
         try out.append(alloc, '=');
         try out.appendSlice(alloc, pair.value);
     }
-    return try out.toOwnedSlice(alloc);
+    const result = try out.toOwnedSlice(alloc);
+    for (encoded) |pair| {
+        alloc.free(pair.name);
+        alloc.free(pair.value);
+    }
+    alloc.free(encoded);
+    return result;
 }
 
 fn signingKeyAlloc(alloc: Allocator, secret: []const u8, scope_date: []const u8, region: []const u8) ![]u8 {
@@ -1067,6 +1320,22 @@ fn freeHeaderPairs(alloc: Allocator, headers: []const HeaderPair) void {
     alloc.free(headers);
 }
 
+fn deinitHeaderList(alloc: Allocator, headers: *std.ArrayListUnmanaged(HeaderPair)) void {
+    for (headers.items) |pair| {
+        alloc.free(pair[0]);
+        alloc.free(pair[1]);
+    }
+    headers.deinit(alloc);
+}
+
+fn appendHeaderCopy(alloc: Allocator, headers: *std.ArrayListUnmanaged(HeaderPair), name: []const u8, value: []const u8) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try headers.append(alloc, .{ owned_name, owned_value });
+}
+
 fn unexpectedStatusError(status: u16) anyerror {
     return switch (status) {
         400 => error.InvalidRequest,
@@ -1094,31 +1363,56 @@ fn parseListResponse(alloc: Allocator, xml: []const u8) !types.ListResult {
     var search_from: usize = 0;
     while (findBlock(xml, "Contents", search_from)) |block| {
         search_from = block.end;
-        const key = try decodeXmlAlloc(alloc, block.inner, "Key");
-        errdefer alloc.free(key);
-        const etag_raw = try optionalTagAlloc(alloc, block.inner, "ETag");
-        errdefer if (etag_raw) |value| alloc.free(value);
         const size_raw = try requiredTagAlloc(alloc, block.inner, "Size");
         defer alloc.free(size_raw);
-        try entries.append(alloc, .{
+        const size = try std.fmt.parseInt(u64, size_raw, 10);
+        const key = try decodeXmlAlloc(alloc, block.inner, "Key");
+        const etag_raw = optionalTagAlloc(alloc, block.inner, "ETag") catch |err| {
+            alloc.free(key);
+            return err;
+        };
+        defer if (etag_raw) |value| alloc.free(value);
+        const etag = if (etag_raw) |value| alloc.dupe(u8, stripQuotes(value)) catch |err| {
+            alloc.free(key);
+            return err;
+        } else null;
+        var entry = types.ListEntry{
             .key = key,
-            .etag = if (etag_raw) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
-            .size = try std.fmt.parseInt(u64, size_raw, 10),
+            .etag = etag,
+            .size = size,
             .last_modified_unix_ms = null,
-        });
-        if (etag_raw) |value| alloc.free(value);
+        };
+        entries.append(alloc, entry) catch |err| {
+            entry.deinit(alloc);
+            return err;
+        };
     }
 
     search_from = 0;
     while (findBlock(xml, "CommonPrefixes", search_from)) |block| {
         search_from = block.end;
-        try prefixes.append(alloc, try decodeXmlAlloc(alloc, block.inner, "Prefix"));
+        const prefix = try decodeXmlAlloc(alloc, block.inner, "Prefix");
+        prefixes.append(alloc, prefix) catch |err| {
+            alloc.free(prefix);
+            return err;
+        };
     }
 
+    const owned_entries = try entries.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_entries) |*entry| entry.deinit(alloc);
+        alloc.free(owned_entries);
+    }
+    const owned_prefixes = try prefixes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_prefixes) |prefix| alloc.free(prefix);
+        alloc.free(owned_prefixes);
+    }
+    const next_token = try optionalTagAlloc(alloc, xml, "NextContinuationToken");
     return .{
-        .entries = try entries.toOwnedSlice(alloc),
-        .common_prefixes = try prefixes.toOwnedSlice(alloc),
-        .next_continuation_token = if (try optionalTagAlloc(alloc, xml, "NextContinuationToken")) |value| value else null,
+        .entries = owned_entries,
+        .common_prefixes = owned_prefixes,
+        .next_continuation_token = next_token,
     };
 }
 
@@ -1149,6 +1443,41 @@ fn requiredTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) ![]u8 {
 fn optionalTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
     const block = findBlock(xml, tag, 0) orelse return null;
     return try alloc.dupe(u8, block.inner);
+}
+
+fn completeMultipartXmlAlloc(alloc: Allocator, etags: []const []u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "<CompleteMultipartUpload>");
+    for (etags, 1..) |etag, part_number| {
+        try out.appendSlice(alloc, "<Part><PartNumber>");
+        var number_buf: [16]u8 = undefined;
+        const number = try std.fmt.bufPrint(&number_buf, "{d}", .{part_number});
+        try out.appendSlice(alloc, number);
+        try out.appendSlice(alloc, "</PartNumber><ETag>");
+        try appendXmlEscaped(alloc, &out, etag);
+        try out.appendSlice(alloc, "</ETag></Part>");
+    }
+    try out.appendSlice(alloc, "</CompleteMultipartUpload>");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendXmlEscaped(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '&' => try out.appendSlice(alloc, "&amp;"),
+        '<' => try out.appendSlice(alloc, "&lt;"),
+        '>' => try out.appendSlice(alloc, "&gt;"),
+        '"' => try out.appendSlice(alloc, "&quot;"),
+        '\'' => try out.appendSlice(alloc, "&apos;"),
+        else => try out.append(alloc, byte),
+    };
+}
+
+fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
 fn decodeXmlAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) ![]u8 {
@@ -1279,6 +1608,122 @@ test "s3 object query includes version and part selectors" {
     try std.testing.expectEqualStrings("partNumber=7&versionId=v123", rendered);
 }
 
+test "s3 multipart completion preserves ordered quoted etags" {
+    const alloc = std.testing.allocator;
+    const etags = [_][]u8{ @constCast("\"etag-one\""), @constCast("\"etag-two\"") };
+    const xml = try completeMultipartXmlAlloc(alloc, &etags);
+    defer alloc.free(xml);
+    try std.testing.expectEqualStrings(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;etag-one&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;etag-two&quot;</ETag></Part></CompleteMultipartUpload>",
+        xml,
+    );
+}
+
+test "s3 query and signing builders clean up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const query = try buildListQueryAlloc(alloc, .{
+                .prefix = "backup/",
+                .continuation_token = "cursor",
+                .max_keys = 17,
+            });
+            defer freeQueryPairs(alloc, query);
+            const cfg = Config{
+                .credentials = .{
+                    .endpoint = @constCast("example.invalid"),
+                    .use_ssl = true,
+                    .access_key_id = @constCast("key"),
+                    .secret_access_key = @constCast("secret"),
+                    .session_token = @constCast("token"),
+                    .region = @constCast("us-east-1"),
+                },
+                .addressing_style = .path,
+            };
+            const headers = try signHeadersAlloc(
+                alloc,
+                cfg,
+                .GET,
+                "example.invalid",
+                "/bucket/key",
+                query,
+                &.{.{ "If-Match", "etag" }},
+                "00",
+                "20260712T000000Z",
+                "20260712",
+                "application/octet-stream",
+            );
+            defer freeHeaderPairs(alloc, headers);
+            var listed = try parseListResponse(
+                alloc,
+                "<ListBucketResult><Contents><Key>backup/a</Key><ETag>\"a\"</ETag><Size>1</Size></Contents><Contents><Key>backup/b</Key><ETag>\"b\"</ETag><Size>2</Size></Contents><CommonPrefixes><Prefix>backup/nested/</Prefix></CommonPrefixes><NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
+            );
+            defer listed.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "s3 file upload completes a multipart lifecycle with bounded parts" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const source_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-s3-multipart-{d}", .{test_support.integrationNonce()});
+    defer alloc.free(source_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, source_path) catch {};
+    {
+        var source = try std.Io.Dir.createFileAbsolute(io, source_path, .{ .truncate = true });
+        defer source.close(io);
+        try source.writePositionalAll(io, "multipart-payload", 0);
+        try source.sync(io);
+    }
+
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            defer self.calls += 1;
+            return switch (self.calls) {
+                0 => blk: {
+                    try std.testing.expectEqual(HttpMethod.POST, method);
+                    try std.testing.expect(std.mem.endsWith(u8, url, "?uploads="));
+                    break :blk .{ .status = 200, .body = try request_alloc.dupe(u8, "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>") };
+                },
+                1 => blk: {
+                    try std.testing.expectEqual(HttpMethod.PUT, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "partNumber=1&uploadId=upload-1") != null);
+                    try std.testing.expectEqualStrings("multipart-payload", body.?);
+                    break :blk .{ .status = 200, .body = try request_alloc.alloc(u8, 0), .etag = try request_alloc.dupe(u8, "\"part-1\"") };
+                },
+                2 => blk: {
+                    try std.testing.expectEqual(HttpMethod.POST, method);
+                    try std.testing.expect(std.mem.endsWith(u8, url, "?uploadId=upload-1"));
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "<PartNumber>1</PartNumber>") != null);
+                    break :blk .{ .status = 200, .body = try request_alloc.dupe(u8, "<CompleteMultipartUploadResult><ETag>\"final-etag\"</ETag></CompleteMultipartUploadResult>") };
+                },
+                else => error.UnexpectedCall,
+            };
+        }
+    };
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "127.0.0.1:9000"),
+            .use_ssl = false,
+            .access_key_id = try alloc.dupe(u8, "key"),
+            .secret_access_key = try alloc.dupe(u8, "secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var state = State{};
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = s3_client.client();
+    defer client.deinit();
+    var result = try s3_client.putFileWithThreshold(alloc, io, "bucket", "backup/segment", source_path, .{}, 0);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("final-etag", result.etag.?);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+}
+
 test "s3 client signs and issues object operations through request fn" {
     const alloc = std.testing.allocator;
 
@@ -1385,6 +1830,123 @@ test "s3 client signs and issues object operations through request fn" {
 
     try client.deleteObject("bucket", "docs/a.txt", .{});
     try std.testing.expectEqual(steps.len, fake.index);
+}
+
+test "s3 client refreshes dynamic credentials for every signed request" {
+    const alloc = std.testing.allocator;
+
+    const Provider = struct {
+        calls: usize = 0,
+
+        fn get(ptr: *anyopaque, request_alloc: Allocator) !DynamicCredentials {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const access_key = try std.fmt.allocPrint(request_alloc, "rotating-key-{d}", .{self.calls});
+            errdefer request_alloc.free(access_key);
+            return .{
+                .access_key_id = access_key,
+                .secret_access_key = try request_alloc.dupe(u8, "rotating-secret"),
+                .session_token = try request_alloc.dupe(u8, "rotating-session"),
+            };
+        }
+    };
+    const Fake = struct {
+        requests: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            _: HttpMethod,
+            _: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.requests += 1;
+            const expected = try std.fmt.allocPrint(request_alloc, "Credential=rotating-key-{d}/", .{self.requests});
+            defer request_alloc.free(expected);
+            var found = false;
+            for (headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header[0], "Authorization") and std.mem.indexOf(u8, header[1], expected) != null) {
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+            return .{ .status = 200, .body = try request_alloc.alloc(u8, 0) };
+        }
+    };
+
+    var provider = Provider{};
+    var fake = Fake{};
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.us-west-2.amazonaws.com"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "placeholder"),
+            .secret_access_key = try alloc.dupe(u8, "placeholder"),
+            .region = try alloc.dupe(u8, "us-west-2"),
+        },
+        .credential_provider = .{ .ptr = &provider, .get_fn = Provider.get },
+    };
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &fake, Fake.request);
+    var client = s3_client.client();
+    defer client.deinit();
+
+    try std.testing.expect(try client.bucketExists("bucket"));
+    try std.testing.expect(try client.bucketExists("bucket"));
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.requests);
+}
+
+test "s3 bucket existence fails closed on access denied" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        fn request(
+            _: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+        ) !TransportResponse {
+            try std.testing.expectEqual(HttpMethod.HEAD, method);
+            return .{ .status = 403, .body = try request_alloc.alloc(u8, 0) };
+        }
+    };
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.example.invalid"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "denied"),
+            .secret_access_key = try alloc.dupe(u8, "denied"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+    };
+    var s3_client = Client.initWithRequestFn(alloc, cfg, null, Fake.request);
+    var client = s3_client.client();
+    defer client.deinit();
+    try std.testing.expectError(error.AccessDenied, client.bucketExists("private-bucket"));
+}
+
+test "borrowed dynamic credentials release through tagged ownership" {
+    const alloc = std.testing.allocator;
+    const Release = struct {
+        fn call(ptr: *anyopaque) void {
+            const released: *bool = @ptrCast(@alignCast(ptr));
+            released.* = true;
+        }
+    };
+    var released = false;
+    var credentials = DynamicCredentials{
+        .access_key_id = @constCast("borrowed-key"),
+        .secret_access_key = @constCast("borrowed-secret"),
+        .ownership = .{ .borrowed = .{ .ctx = &released, .release = Release.call } },
+    };
+    credentials.deinit(alloc);
+    try std.testing.expect(released);
 }
 
 test "s3 client round-trips against env-configured endpoint" {

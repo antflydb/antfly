@@ -266,7 +266,7 @@ func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
 		Spec: antflyv1.AntflyBackupSpec{
 			ClusterRef:  antflyv1.ClusterReference{Name: "my-cluster"},
 			Schedule:    "0 2 * * *",
-			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
+			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups", Connection: "archive-writer"},
 		},
 	}
 	cluster := &antflyv1.AntflyCluster{
@@ -299,6 +299,9 @@ func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
 	// Location should be shell-quoted
 	if !strings.Contains(cmd, "--location 's3://my-bucket/backups'") {
 		t.Errorf("location not properly quoted: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--connection 'archive-writer'") {
+		t.Errorf("named backup connection not passed to CLI: %s", cmd)
 	}
 
 	// $(date ...) should be present for shell expansion
@@ -396,22 +399,22 @@ func TestBuildCronJobSpec_WithTables(t *testing.T) {
 	}
 }
 
-func TestBuildCronJobSpec_SwarmStillUsesPublicAPIService(t *testing.T) {
+func TestBuildCronJobSpec_StandaloneStillUsesPublicAPIService(t *testing.T) {
 	r := &AntflyBackupReconciler{}
 	backup := &antflyv1.AntflyBackup{
-		ObjectMeta: metav1.ObjectMeta{Name: "swarm-backup", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone-backup", Namespace: "default"},
 		Spec: antflyv1.AntflyBackupSpec{
-			ClusterRef:  antflyv1.ClusterReference{Name: "swarm-cluster"},
+			ClusterRef:  antflyv1.ClusterReference{Name: "standalone-cluster"},
 			Schedule:    "0 2 * * *",
 			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
 		},
 	}
 	cluster := &antflyv1.AntflyCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "swarm-cluster", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone-cluster", Namespace: "default"},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode:  antflyv1.ClusterModeSwarm,
+			Mode:  antflyv1.ClusterModeStandalone,
 			Image: "antfly:latest",
-			Swarm: &antflyv1.SwarmSpec{
+			Standalone: &antflyv1.StandaloneSpec{
 				Replicas:     1,
 				NodeID:       1,
 				MetadataAPI:  antflyv1.APISpec{Port: 8080},
@@ -421,8 +424,8 @@ func TestBuildCronJobSpec_SwarmStillUsesPublicAPIService(t *testing.T) {
 				Health:       antflyv1.APISpec{Port: 4200},
 			},
 			Storage: antflyv1.StorageSpec{
-				StorageClass: "standard",
-				SwarmStorage: "1Gi",
+				StorageClass:      "standard",
+				StandaloneStorage: "1Gi",
 			},
 		},
 	}
@@ -434,8 +437,8 @@ func TestBuildCronJobSpec_SwarmStillUsesPublicAPIService(t *testing.T) {
 	if strings.Contains(cmd, "--url") {
 		t.Fatalf("expected backup command to use ANTFLY_URL instead of --url, got: %s", cmd)
 	}
-	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://swarm-cluster-public-api.default.svc.cluster.local" {
-		t.Fatalf("expected backup URL to continue using public-api service in swarm mode, got: %q", got)
+	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://standalone-cluster-public-api.default.svc.cluster.local" {
+		t.Fatalf("expected backup URL to continue using public-api service in standalone mode, got: %q", got)
 	}
 }
 
@@ -477,7 +480,7 @@ func TestRequestsForClusterEnqueuesReferencingBackups(t *testing.T) {
 	requests := r.requestsForCluster(context.Background(), cluster)
 	got := make(map[string]bool, len(requests))
 	for _, req := range requests {
-		got[req.NamespacedName.String()] = true
+		got[req.String()] = true
 	}
 
 	if len(got) != 2 {
@@ -505,7 +508,7 @@ func TestBackupClusterDependencyChangedPredicate(t *testing.T) {
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			Image: "antfly:v1",
-			Mode:  antflyv1.ClusterModeClustered,
+			Mode:  antflyv1.ClusterModeDistributed,
 		},
 	}
 
@@ -528,7 +531,7 @@ func TestBackupClusterDependencyChangedPredicate(t *testing.T) {
 
 	unrelatedSpec := base.DeepCopy()
 	unrelatedSpec.Generation = base.Generation + 1
-	unrelatedSpec.Spec.Mode = antflyv1.ClusterModeSwarm
+	unrelatedSpec.Spec.Mode = antflyv1.ClusterModeStandalone
 	if pred.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: unrelatedSpec}) {
 		t.Fatalf("expected non-image spec update to be filtered")
 	}

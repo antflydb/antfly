@@ -16,14 +16,31 @@ const std = @import("std");
 const build_options = @import("build_options");
 const linalg = @import("inference_linalg");
 
-// Optional system BLAS bindings — uses vecLib/cblas on macOS, OpenBLAS elsewhere.
-const c = if (build_options.enable_system_blas) @cImport({
-    if (@import("builtin").os.tag == .macos) {
-        @cInclude("vecLib/cblas.h");
-    } else {
-        @cInclude("cblas.h");
-    }
-}) else struct {};
+// Optional system BLAS bindings. CBLAS enum values are stable across vecLib
+// and OpenBLAS; declaring the small surface we use avoids translate-c in
+// optimized builds.
+const c = if (build_options.enable_system_blas) struct {
+    pub const CblasRowMajor: c_int = 101;
+    pub const CblasNoTrans: c_int = 111;
+    pub const CblasTrans: c_int = 112;
+
+    pub extern "c" fn cblas_sgemm(
+        layout: c_int,
+        transa: c_int,
+        transb: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: f32,
+        a: [*]const f32,
+        lda: c_int,
+        b: [*]const f32,
+        ldb: c_int,
+        beta: f32,
+        c_out: [*]f32,
+        ldc: c_int,
+    ) void;
+} else struct {};
 
 pub const Io = std.Io;
 pub const Cancelable = std.Io.Cancelable;

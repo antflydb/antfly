@@ -3,7 +3,7 @@ services:
     build:
       context: ../..
       dockerfile: go/Dockerfile
-    command: ["swarm"]
+    command: ["standalone"]
     ports:
       - "8080:8080" # Public API port
       # - "9090:9090" # MCP port
@@ -11,7 +11,7 @@ services:
     volumes:
       - ./antfly-data:/antflydb
       - ./config.json:/config.json
-    container_name: antfly-swarm
+    container_name: antfly-standalone
     environment:
       - ANTFLY_LOG_LEVEL=info
     restart: always

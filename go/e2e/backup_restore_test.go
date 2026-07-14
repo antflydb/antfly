@@ -34,46 +34,46 @@ func TestE2E_BackupRestore_Embeddings(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Step 1: Start Antfly swarm
-	t.Log("Starting Antfly swarm...")
-	swarm := startAntflySwarm(t, ctx)
-	defer swarm.Cleanup()
+	// Step 1: Start Antfly standalone
+	t.Log("Starting Antfly standalone...")
+	standalone := startAntflyStandalone(t, ctx)
+	defer standalone.Cleanup()
 
 	tableName := "backup_restore_test"
 	backupID := "backup-restore-e2e"
 
 	// Step 2: Create table with embedding index
 	t.Log("Creating table with embedding index...")
-	createTestTableWithEmbeddings(t, ctx, swarm.Client, tableName)
+	createTestTableWithEmbeddings(t, ctx, standalone.Client, tableName)
 
 	// Step 3: Insert test documents
 	t.Log("Inserting test documents...")
 	testDocs := getTestDocuments()
-	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelFullIndex)
+	insertTestDocuments(t, ctx, standalone.Client, tableName, testDocs, antfly.SyncLevelFullIndex)
 
 	// Step 4: Wait for embeddings to be generated
 	t.Log("Waiting for embeddings to be generated...")
-	waitForEmbeddings(t, ctx, swarm.Client, tableName, "embeddings", len(testDocs), 5*time.Minute)
+	waitForEmbeddings(t, ctx, standalone.Client, tableName, "embeddings", len(testDocs), 5*time.Minute)
 
 	// Step 5: Get embedding count before backup
-	embeddingCountBefore := getEmbeddingCount(t, ctx, swarm.Client, tableName)
+	embeddingCountBefore := getEmbeddingCount(t, ctx, standalone.Client, tableName)
 	t.Logf("Embedding count before backup: %d", embeddingCountBefore)
 	require.Positive(t, embeddingCountBefore, "Expected embeddings to be generated before backup")
 
 	// Step 6: Verify semantic search works before backup
 	t.Log("Verifying semantic search works before backup...")
-	searchResultsBefore := doSemanticSearch(t, ctx, swarm.Client, tableName, "distributed database")
+	searchResultsBefore := doSemanticSearch(t, ctx, standalone.Client, tableName, "distributed database")
 	require.NotEmpty(t, searchResultsBefore, "Expected search results before backup")
 	t.Logf("Search returned %d results before backup", len(searchResultsBefore))
 
 	// Step 7: Create backup
 	t.Log("Creating backup...")
-	err := BackupTestDatabase(t, ctx, swarm.Client, tableName, backupID)
+	err := BackupTestDatabase(t, ctx, standalone.Client, tableName, backupID)
 	require.NoError(t, err, "Failed to create backup")
 
 	// Step 8: Delete the table
 	t.Log("Deleting table to simulate fresh restore...")
-	err = swarm.Client.DropTable(ctx, tableName)
+	err = standalone.Client.DropTable(ctx, tableName)
 	require.NoError(t, err, "Failed to delete table")
 
 	// Wait a moment for table to be fully deleted
@@ -81,20 +81,20 @@ func TestE2E_BackupRestore_Embeddings(t *testing.T) {
 
 	// Step 9: Restore from backup
 	t.Log("Restoring from backup...")
-	err = RestoreTestDatabase(t, ctx, swarm.Client, tableName, backupID)
+	err = RestoreTestDatabase(t, ctx, standalone.Client, tableName, backupID)
 	require.NoError(t, err, "Failed to restore from backup")
 
 	// Step 10: Wait for shards to be ready after restore
 	t.Log("Waiting for shards to be ready after restore...")
-	waitForShardsReady(t, ctx, swarm.Client, tableName, 30*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, tableName, 30*time.Second)
 
 	// Step 11: Wait for embeddings to be indexed after restore
 	// After restore, the vector index needs to rebuild from Pebble data
 	t.Log("Waiting for embeddings to be indexed after restore...")
-	waitForEmbeddings(t, ctx, swarm.Client, tableName, "embeddings", len(testDocs), 5*time.Minute)
+	waitForEmbeddings(t, ctx, standalone.Client, tableName, "embeddings", len(testDocs), 5*time.Minute)
 
 	// Step 12: Get embedding count after restore
-	embeddingCountAfter := getEmbeddingCount(t, ctx, swarm.Client, tableName)
+	embeddingCountAfter := getEmbeddingCount(t, ctx, standalone.Client, tableName)
 	t.Logf("Embedding count after restore: %d", embeddingCountAfter)
 
 	// Step 13: Verify embedding count matches
@@ -104,7 +104,7 @@ func TestE2E_BackupRestore_Embeddings(t *testing.T) {
 
 	// Step 14: Verify semantic search still works after restore
 	t.Log("Verifying semantic search works after restore...")
-	searchResultsAfter := doSemanticSearch(t, ctx, swarm.Client, tableName, "distributed database")
+	searchResultsAfter := doSemanticSearch(t, ctx, standalone.Client, tableName, "distributed database")
 	require.NotEmpty(t, searchResultsAfter, "Expected search results after restore")
 	t.Logf("Search returned %d results after restore", len(searchResultsAfter))
 
@@ -240,10 +240,10 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Step 1: Start Antfly swarm
-	t.Log("Starting Antfly swarm...")
-	swarm := startAntflySwarm(t, ctx)
-	defer swarm.Cleanup()
+	// Step 1: Start Antfly standalone
+	t.Log("Starting Antfly standalone...")
+	standalone := startAntflyStandalone(t, ctx)
+	defer standalone.Cleanup()
 
 	table1Name := "cluster_backup_table1"
 	table2Name := "cluster_backup_table2"
@@ -251,8 +251,8 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 
 	// Step 2: Create two simple tables
 	t.Log("Creating test tables...")
-	createSimpleTable(t, ctx, swarm.Client, table1Name)
-	createSimpleTable(t, ctx, swarm.Client, table2Name)
+	createSimpleTable(t, ctx, standalone.Client, table1Name)
+	createSimpleTable(t, ctx, standalone.Client, table2Name)
 
 	// Step 3: Insert test documents into both tables
 	t.Log("Inserting test documents...")
@@ -264,12 +264,12 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 		"docA": {"title": "Table 2 Doc A", "content": "Content for table 2 document A"},
 		"docB": {"title": "Table 2 Doc B", "content": "Content for table 2 document B"},
 	}
-	insertTestDocuments(t, ctx, swarm.Client, table1Name, table1Docs, antfly.SyncLevelFullText)
-	insertTestDocuments(t, ctx, swarm.Client, table2Name, table2Docs, antfly.SyncLevelFullText)
+	insertTestDocuments(t, ctx, standalone.Client, table1Name, table1Docs, antfly.SyncLevelFullText)
+	insertTestDocuments(t, ctx, standalone.Client, table2Name, table2Docs, antfly.SyncLevelFullText)
 
 	// Step 4: Verify document counts before backup
-	count1Before := getDocumentCount(t, ctx, swarm.Client, table1Name)
-	count2Before := getDocumentCount(t, ctx, swarm.Client, table2Name)
+	count1Before := getDocumentCount(t, ctx, standalone.Client, table1Name)
+	count2Before := getDocumentCount(t, ctx, standalone.Client, table2Name)
 	t.Logf("Document counts before backup: table1=%d, table2=%d", count1Before, count2Before)
 	require.Equal(t, 2, count1Before, "Expected 2 documents in table1")
 	require.Equal(t, 2, count2Before, "Expected 2 documents in table2")
@@ -279,14 +279,16 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 	backupDir := GetBackupDir(t)
 	location := "file://" + backupDir
 
-	result, err := swarm.Client.ClusterBackup(ctx, backupID, location, nil) // nil means all tables
+	result, err := standalone.Client.ClusterBackup(ctx, backupID, location, "e2e-backups", nil) // nil means all tables
 	require.NoError(t, err, "Failed to create cluster backup")
 	require.Equal(t, "completed", result.Status, "Backup status should be completed")
 	t.Logf("Cluster backup completed with status: %s, tables: %d", result.Status, len(result.Tables))
 
 	// Step 6: List backups and verify
 	t.Log("Listing backups...")
-	backups, err := swarm.Client.ListBackups(ctx, location)
+	backups, err := standalone.Client.ListBackups(ctx, antfly.BackupListOptions{
+		Location: location, Connection: "e2e-backups",
+	})
 	require.NoError(t, err, "Failed to list backups")
 	require.NotEmpty(t, backups, "Expected at least one backup")
 
@@ -302,9 +304,9 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 
 	// Step 7: Drop both tables
 	t.Log("Dropping tables...")
-	err = swarm.Client.DropTable(ctx, table1Name)
+	err = standalone.Client.DropTable(ctx, table1Name)
 	require.NoError(t, err, "Failed to drop table1")
-	err = swarm.Client.DropTable(ctx, table2Name)
+	err = standalone.Client.DropTable(ctx, table2Name)
 	require.NoError(t, err, "Failed to drop table2")
 
 	// Wait for tables to be fully deleted
@@ -312,18 +314,20 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 
 	// Step 8: Restore from cluster backup
 	t.Log("Restoring from cluster backup...")
-	restoreResult, err := swarm.Client.ClusterRestore(ctx, backupID, location, nil, "fail_if_exists")
+	restoreResult, err := standalone.Client.ClusterRestore(ctx, antfly.ClusterRestoreOptions{
+		BackupID: backupID, Location: location, Connection: "e2e-backups", RestoreMode: "fail_if_exists",
+	})
 	require.NoError(t, err, "Failed to restore from cluster backup")
 	t.Logf("Cluster restore triggered with status: %s", restoreResult.Status)
 
 	// Step 9: Wait for tables to be ready
 	t.Log("Waiting for tables to be ready after restore...")
-	waitForShardsReady(t, ctx, swarm.Client, table1Name, 60*time.Second)
-	waitForShardsReady(t, ctx, swarm.Client, table2Name, 60*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, table1Name, 60*time.Second)
+	waitForShardsReady(t, ctx, standalone.Client, table2Name, 60*time.Second)
 
 	// Step 10: Verify document counts after restore
-	count1After := getDocumentCount(t, ctx, swarm.Client, table1Name)
-	count2After := getDocumentCount(t, ctx, swarm.Client, table2Name)
+	count1After := getDocumentCount(t, ctx, standalone.Client, table1Name)
+	count2After := getDocumentCount(t, ctx, standalone.Client, table2Name)
 	t.Logf("Document counts after restore: table1=%d, table2=%d", count1After, count2After)
 	require.Equal(t, count1Before, count1After, "Document count mismatch in table1")
 	require.Equal(t, count2Before, count2After, "Document count mismatch in table2")

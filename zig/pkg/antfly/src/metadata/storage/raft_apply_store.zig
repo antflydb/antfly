@@ -117,6 +117,16 @@ pub const TransitionCommand = union(enum) {
     remove_shuffle_join_lease: struct {
         job_id: u64,
     },
+    upsert_restore_job: struct {
+        key: []const u8,
+        value: []const u8,
+    },
+    remove_restore_job: struct {
+        key: []const u8,
+    },
+    remove_restore_jobs: struct {
+        keys: []const []const u8,
+    },
     upsert_reallocation_request: metadata.ReallocationRequestRecord,
     remove_reallocation_request: struct {},
     upsert_extension_package: extension_domain.PackageManifest,
@@ -195,6 +205,15 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.required_extension_name);
                 alloc.free(record.package_name);
             },
+            .upsert_restore_job => |record| {
+                alloc.free(record.key);
+                alloc.free(record.value);
+            },
+            .remove_restore_job => |record| alloc.free(record.key),
+            .remove_restore_jobs => |record| {
+                for (record.keys) |key| alloc.free(key);
+                alloc.free(record.keys);
+            },
             .apply_extension_lifecycle => |*delta| freeExtensionLifecycleDelta(alloc, delta.*),
             else => {},
         }
@@ -219,8 +238,22 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             try group_ids.requireDataGroupId(record.receiver_group_id);
         },
         .upsert_shuffle_join_lease => |record| try group_ids.requireDataGroupId(record.owner_group_id),
+        .upsert_restore_job => |record| {
+            try validateRestoreJobLogicalKey(record.key);
+            if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
+        },
+        .remove_restore_job => |record| try validateRestoreJobLogicalKey(record.key),
+        .remove_restore_jobs => |record| {
+            if (record.keys.len == 0 or record.keys.len > 4096) return error.InvalidRestoreJobRecord;
+            for (record.keys) |key| try validateRestoreJobLogicalKey(key);
+        },
         else => {},
     }
+}
+
+fn validateRestoreJobLogicalKey(key: []const u8) !void {
+    if (key.len <= restore_job_logical_prefix.len or key.len > max_restore_job_logical_key_bytes or
+        !std.mem.startsWith(u8, key, restore_job_logical_prefix)) return error.InvalidRestoreJobRecord;
 }
 
 test "transition command validation rejects metadata group ids in data group fields" {
@@ -241,6 +274,85 @@ test "transition command validation rejects metadata group ids in data group fie
     for (commands) |command| {
         try std.testing.expectError(error.ReservedGroupId, validateTransitionCommandDataGroupIds(command));
     }
+}
+
+test "metadata raft apply store restore job transition encoding is append-only compatible" {
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{
+            .key = "\x00\x00__api_restore_jobs__:000000000000002a",
+            .value = "{\"job_id\":42}",
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)).?;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded == .upsert_restore_job);
+    try std.testing.expectEqualStrings("\x00\x00__api_restore_jobs__:000000000000002a", decoded.upsert_restore_job.key);
+    try std.testing.expectEqualStrings("{\"job_id\":42}", decoded.upsert_restore_job.value);
+
+    const keys = [_][]const u8{
+        "\x00\x00__api_restore_jobs__:000000000000002a",
+        "\x00\x00__api_restore_jobs__:000000000000002b",
+    };
+    const batch_encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_restore_jobs = .{ .keys = &keys },
+    });
+    defer std.testing.allocator.free(batch_encoded);
+    var batch_decoded = (try decodeTransitionCommand(std.testing.allocator, batch_encoded)).?;
+    defer batch_decoded.deinit(std.testing.allocator);
+    try std.testing.expect(batch_decoded == .remove_restore_jobs);
+    try std.testing.expectEqual(@as(usize, 2), batch_decoded.remove_restore_jobs.keys.len);
+    try std.testing.expectEqualStrings(keys[0], batch_decoded.remove_restore_jobs.keys[0]);
+    try std.testing.expectEqualStrings(keys[1], batch_decoded.remove_restore_jobs.keys[1]);
+}
+
+test "metadata raft apply store replicates restore job records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-job-store", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const group_id = group_ids.main_metadata_group_id;
+    const logical_key = "\x00\x00__api_restore_jobs__:000000000000002a";
+    const value = "{\"job_id\":42,\"phase\":\"queued\"}";
+
+    const upsert = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_restore_job = .{ .key = logical_key, .value = value },
+    });
+    defer std.testing.allocator.free(upsert);
+    const upsert_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = upsert },
+    });
+    defer std.testing.allocator.free(upsert_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 1,
+        .entries_bytes = upsert_entries,
+    });
+    const loaded = (try store.getRestoreJobValue(std.testing.allocator, group_id, logical_key)).?;
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings(value, loaded);
+    const rows = try store.listRestoreJobRows(std.testing.allocator, group_id);
+    defer store.freeRestoreJobRows(std.testing.allocator, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings(logical_key, rows[0].key);
+
+    const remove = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_restore_job = .{ .key = logical_key },
+    });
+    defer std.testing.allocator.free(remove);
+    const remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = remove },
+    });
+    defer std.testing.allocator.free(remove_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 2,
+        .entries_bytes = remove_entries,
+    });
+    try std.testing.expect((try store.getRestoreJobValue(std.testing.allocator, group_id, logical_key)) == null);
 }
 
 pub const RaftApplyStoreConfig = struct {
@@ -265,6 +377,7 @@ pub const ProjectionSignalKind = enum {
     merge_transition,
     schema_progress,
     restore_progress,
+    restore_job,
     replication_source_status,
 };
 
@@ -956,6 +1069,57 @@ pub const RaftApplyStore = struct {
         return try readShuffleJoinLeaseRecord(encoded, &pos);
     }
 
+    pub const RestoreJobRow = struct {
+        key: []u8,
+        value: []u8,
+    };
+
+    pub fn listRestoreJobRows(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]RestoreJobRow {
+        var prefix_buf: [192]u8 = undefined;
+        const prefix = try restoreJobPrefixForGroup(&prefix_buf, group_id);
+        var rows = std.ArrayListUnmanaged(RestoreJobRow).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| alloc.free(key);
+        while (true) {
+            const page = try self.store.scanPrefixPage(alloc, prefix, after_key, 512);
+            defer docstore.DocStore.freeResults(alloc, page);
+            if (page.len == 0) break;
+            for (page) |row| try rows.append(alloc, .{
+                .key = try alloc.dupe(u8, row.key[prefix.len..]),
+                .value = try alloc.dupe(u8, row.value),
+            });
+            if (page.len < 512) break;
+            const next = try alloc.dupe(u8, page[page.len - 1].key);
+            if (after_key) |key| alloc.free(key);
+            after_key = next;
+        }
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
+        var key_buf: [256]u8 = undefined;
+        const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+        return self.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
+    pub fn freeRestoreJobRows(_: *RaftApplyStore, alloc: std.mem.Allocator, rows: []RestoreJobRow) void {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
         const batch = try self.ensureLoaded(group_id) orelse return error.MissingAppliedBatch;
@@ -1439,6 +1603,44 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
+            .upsert_restore_job => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                try txn.put(key, record.value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .restore_job,
+                    .metadata_group_id = group_id,
+                });
+            },
+            .remove_restore_job => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .restore_job,
+                    .metadata_group_id = group_id,
+                });
+            },
+            .remove_restore_jobs => |record| {
+                for (record.keys) |logical_key| {
+                    var key_buf: [256]u8 = undefined;
+                    const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
+                    txn.delete(key) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                    self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                }
+                self.notifyProjectionListeners(.{
+                    .kind = .restore_job,
+                    .metadata_group_id = group_id,
+                });
+            },
             .upsert_reallocation_request => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
@@ -1859,7 +2061,8 @@ pub const RaftApplyStore = struct {
 };
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 4;
+const runtime_status_record_version: u16 = 7;
+const group_status_record_version: u16 = 1;
 
 const TransitionTag = enum(u8) {
     upsert_node = 1,
@@ -1902,6 +2105,9 @@ const TransitionTag = enum(u8) {
     upsert_extension_dependency = 38,
     remove_extension_dependency = 39,
     apply_extension_lifecycle = 40,
+    upsert_restore_job = 41,
+    remove_restore_job = 42,
+    remove_restore_jobs = 43,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -2078,6 +2284,20 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle));
             try appendJsonRecord(alloc, &out, delta);
         },
+        .upsert_restore_job => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_restore_job));
+            try appendRequiredString(alloc, &out, record.key);
+            try appendRequiredString(alloc, &out, record.value);
+        },
+        .remove_restore_job => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job));
+            try appendRequiredString(alloc, &out, record.key);
+        },
+        .remove_restore_jobs => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_jobs));
+            try appendInt(alloc, &out, u32, @intCast(record.keys.len));
+            for (record.keys) |key| try appendRequiredString(alloc, &out, key);
+        },
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -2246,6 +2466,18 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .apply_extension_lifecycle => .{
             .apply_extension_lifecycle = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
+        },
+        .upsert_restore_job => .{
+            .upsert_restore_job = .{
+                .key = try readRequiredString(alloc, encoded, &pos),
+                .value = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
+        .remove_restore_job => .{
+            .remove_restore_job = .{ .key = try readRequiredString(alloc, encoded, &pos) },
+        },
+        .remove_restore_jobs => .{
+            .remove_restore_jobs = .{ .keys = try readRequiredStrings(alloc, encoded, &pos, 4096) },
         },
     };
 }
@@ -2637,7 +2869,7 @@ fn readRuntimeGroupStatusRecord(
     pos: *usize,
 ) !metadata.RuntimeGroupStatusReport {
     const version = try readInt(encoded, pos, u16);
-    if (version != 1 and version != 2 and version != 3 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const table_id = try readInt(encoded, pos, u64);
     const table_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(table_name);
@@ -2685,7 +2917,7 @@ fn readRuntimeGroupStatusRecord(
         if (indexes.len > 0) alloc.free(indexes);
     }
     while (initialized < runtime_index_count) : (initialized += 1) {
-        indexes[initialized] = try readRuntimeIndexStatusRecord(alloc, encoded, pos);
+        indexes[initialized] = try readRuntimeIndexStatusRecord(alloc, encoded, pos, version);
     }
     return .{
         .table_id = table_id,
@@ -2852,6 +3084,13 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.edge_count);
     try appendInt(alloc, out, u64, record.node_count);
     try appendInt(alloc, out, u64, record.root_node);
+    try appendInt(alloc, out, u64, record.coverage_produced_count);
+    try appendInt(alloc, out, u64, record.coverage_skipped_count);
+    try appendInt(alloc, out, u64, record.coverage_terminal_failed_count);
+    try appendInt(alloc, out, u64, record.coverage_generation);
+    try appendInt(alloc, out, u64, record.coverage_config_hash);
+    try out.append(alloc, if (record.coverage_identity_ready) 1 else 0);
+    try out.append(alloc, if (record.coverage_summary_ready) 1 else 0);
     try out.append(alloc, if (record.backfill_active) 1 else 0);
     try appendInt(alloc, out, u16, record.backfill_progress_millis);
     try appendInt(alloc, out, u64, record.replay_applied_sequence);
@@ -2863,6 +3102,7 @@ fn readRuntimeIndexStatusRecord(
     alloc: std.mem.Allocator,
     encoded: []const u8,
     pos: *usize,
+    version: u16,
 ) !metadata.RuntimeIndexStatusReport {
     const name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(name);
@@ -2873,6 +3113,23 @@ fn readRuntimeIndexStatusRecord(
     const edge_count = try readInt(encoded, pos, u64);
     const node_count = try readInt(encoded, pos, u64);
     const root_node = try readInt(encoded, pos, u64);
+    const coverage_produced_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
+    const coverage_skipped_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
+    const coverage_terminal_failed_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
+    const coverage_generation = if (version >= 7) try readInt(encoded, pos, u64) else 0;
+    const coverage_config_hash = if (version >= 6) try readInt(encoded, pos, u64) else 0;
+    const coverage_identity_ready = if (version >= 7) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const ready = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk ready;
+    } else false;
+    const coverage_summary_ready = if (version >= 6) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const ready = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk ready;
+    } else false;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const backfill_active = encoded[pos.*] != 0;
     pos.* += 1;
@@ -2890,6 +3147,13 @@ fn readRuntimeIndexStatusRecord(
         .edge_count = edge_count,
         .node_count = node_count,
         .root_node = root_node,
+        .coverage_produced_count = coverage_produced_count,
+        .coverage_skipped_count = coverage_skipped_count,
+        .coverage_terminal_failed_count = coverage_terminal_failed_count,
+        .coverage_generation = coverage_generation,
+        .coverage_config_hash = coverage_config_hash,
+        .coverage_identity_ready = coverage_identity_ready,
+        .coverage_summary_ready = coverage_summary_ready,
         .backfill_active = backfill_active,
         .backfill_progress_millis = backfill_progress_millis,
         .replay_applied_sequence = replay_applied_sequence,
@@ -2903,6 +3167,7 @@ fn appendGroupStatusRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.GroupStatusReport,
 ) !void {
+    try appendInt(alloc, out, u16, group_status_record_version);
     try appendInt(alloc, out, u64, record.group_id);
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
@@ -2919,6 +3184,8 @@ fn appendGroupStatusRecord(
     try out.append(alloc, if (record.local_voter) 1 else 0);
     try appendInt(alloc, out, u16, record.voter_count);
     try out.append(alloc, if (record.joint_consensus) 1 else 0);
+    try out.append(alloc, if (record.voter_set_known) 1 else 0);
+    try out.appendSlice(alloc, &record.voter_set_fingerprint);
 }
 
 fn readGroupStatusRecord(
@@ -2927,6 +3194,8 @@ fn readGroupStatusRecord(
     pos: *usize,
 ) !metadata.GroupStatusReport {
     _ = alloc;
+    const version = try readInt(encoded, pos, u16);
+    if (version != group_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const group_id = try readInt(encoded, pos, u64);
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = try readInt(encoded, pos, u64);
@@ -2982,6 +3251,15 @@ fn readGroupStatusRecord(
         pos.* += 1;
         break :blk value;
     } else false;
+    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const voter_set_known = encoded[pos.*] != 0;
+    pos.* += 1;
+    if (pos.* + metadata_table_manager.voter_set_fingerprint_len > encoded.len) {
+        return error.InvalidMetadataTransitionEncoding;
+    }
+    var voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = undefined;
+    @memcpy(&voter_set_fingerprint, encoded[pos.* .. pos.* + metadata_table_manager.voter_set_fingerprint_len]);
+    pos.* += metadata_table_manager.voter_set_fingerprint_len;
     return .{
         .group_id = group_id,
         .doc_count = doc_count,
@@ -2992,6 +3270,8 @@ fn readGroupStatusRecord(
         .local_leader = local_leader,
         .local_voter = local_voter,
         .voter_count = voter_count,
+        .voter_set_known = voter_set_known,
+        .voter_set_fingerprint = voter_set_fingerprint,
         .joint_consensus = joint_consensus,
         .transition_pending = transition_pending,
         .replay_required = replay_required,
@@ -3100,6 +3380,8 @@ fn appendRestoreProgressRecord(
     try appendInt(alloc, out, u64, record.group_id);
     try appendInt(alloc, out, u32, @intCast(record.backup_id.len));
     try out.appendSlice(alloc, record.backup_id);
+    try appendInt(alloc, out, u32, @intCast(record.location.len));
+    try out.appendSlice(alloc, record.location);
     try appendInt(alloc, out, u32, @intCast(record.snapshot_path.len));
     try out.appendSlice(alloc, record.snapshot_path);
     try out.append(alloc, if (record.primary_restored) 1 else 0);
@@ -3414,6 +3696,27 @@ fn readRequiredString(
     return value;
 }
 
+fn readRequiredStrings(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+    max_count: usize,
+) ![]const []const u8 {
+    const count = try readInt(encoded, pos, u32);
+    if (count == 0 or count > max_count) return error.InvalidMetadataTransitionEncoding;
+    const values = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |value| alloc.free(value);
+        alloc.free(values);
+    }
+    for (values) |*value| {
+        value.* = try readRequiredString(alloc, encoded, pos);
+        initialized += 1;
+    }
+    return values;
+}
+
 fn readJsonRecord(comptime T: type, alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !T {
     const json = try readRequiredString(alloc, encoded, pos);
     defer alloc.free(json);
@@ -3551,6 +3854,8 @@ fn readRestoreProgressRecord(
     const group_id = try readInt(encoded, pos, u64);
     const backup_id = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(backup_id);
+    const location = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(location);
     const snapshot_path = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(snapshot_path);
     if (pos.* >= encoded.len) return error.InvalidRestoreProgressRecord;
@@ -3577,6 +3882,7 @@ fn readRestoreProgressRecord(
         .node_id = node_id,
         .group_id = group_id,
         .backup_id = backup_id,
+        .location = location,
         .snapshot_path = snapshot_path,
         .primary_restored = primary_restored,
         .runtime_repair_complete = runtime_repair_complete,
@@ -3905,6 +4211,18 @@ pub fn extensionDependencyPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
 
 pub fn shuffleJoinLeasePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_shuffle_join_lease:{d}:", .{group_id});
+}
+
+pub fn restoreJobPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_restore_job:{d}:", .{group_id});
+}
+
+fn restoreJobKeyForGroup(buf: []u8, group_id: u64, logical_key: []const u8) ![]const u8 {
+    try validateRestoreJobLogicalKey(logical_key);
+    const prefix = try restoreJobPrefixForGroup(buf, group_id);
+    if (prefix.len + logical_key.len > buf.len) return error.NoSpaceLeft;
+    @memcpy(buf[prefix.len .. prefix.len + logical_key.len], logical_key);
+    return buf[0 .. prefix.len + logical_key.len];
 }
 
 pub fn rangePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
@@ -5096,6 +5414,7 @@ test "metadata restore progress transition command round-trips" {
             .node_id = 7,
             .group_id = 4101,
             .backup_id = "snap1",
+            .location = "s3://archive/snap1",
         },
     };
 
@@ -5111,6 +5430,7 @@ test "metadata restore progress transition command round-trips" {
     try std.testing.expectEqual(@as(u64, 7), decoded.?.upsert_restore_progress.node_id);
     try std.testing.expectEqual(@as(u64, 4101), decoded.?.upsert_restore_progress.group_id);
     try std.testing.expectEqualStrings("snap1", decoded.?.upsert_restore_progress.backup_id);
+    try std.testing.expectEqualStrings("s3://archive/snap1", decoded.?.upsert_restore_progress.location);
 }
 
 test "metadata replication source status transition command round-trips" {
@@ -5345,6 +5665,37 @@ test "metadata raft apply store projects replication source status records from 
     }
 }
 
+test "metadata raft apply store transition codec preserves exact raft voter identity" {
+    const fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
+    var group_statuses = [_]metadata.GroupStatusReport{.{
+        .group_id = 5101,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = fingerprint,
+    }};
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .group_statuses = group_statuses[0..],
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded == .upsert_store);
+    const statuses = decoded.upsert_store.group_statuses;
+    try std.testing.expectEqual(@as(usize, 1), statuses.len);
+    try std.testing.expect(statuses[0].voter_set_known);
+    try std.testing.expectEqual(@as(u16, 3), statuses[0].voter_count);
+    try std.testing.expectEqualSlices(u8, &fingerprint, &statuses[0].voter_set_fingerprint);
+}
+
 test "metadata raft apply store projects placement intents from committed entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5555,6 +5906,17 @@ test "metadata raft apply store runtime status codec preserves document identity
             .missing_ordinal_coverage_count = 6,
             .stale_identity_generation_rejection_count = 5,
         },
+        .indexes = @constCast((&[_]metadata.RuntimeIndexStatusReport{.{
+            .name = "visual_idx",
+            .kind = "dense_vector",
+            .coverage_produced_count = 31,
+            .coverage_skipped_count = 7,
+            .coverage_terminal_failed_count = 2,
+            .coverage_generation = 0x5678,
+            .coverage_config_hash = 0x1234,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        }})[0..]),
     }};
 
     const encoded = try encodeStoreRecord(alloc, .{
@@ -5581,6 +5943,14 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 7), status.doc_set_planning.ordinal_list_docs);
     try std.testing.expectEqual(@as(u64, 6), status.doc_set_planning.missing_ordinal_coverage_count);
     try std.testing.expectEqual(@as(u64, 5), status.doc_set_planning.stale_identity_generation_rejection_count);
+    try std.testing.expectEqual(@as(usize, 1), status.indexes.len);
+    try std.testing.expectEqual(@as(u64, 31), status.indexes[0].coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 7), status.indexes[0].coverage_skipped_count);
+    try std.testing.expectEqual(@as(u64, 2), status.indexes[0].coverage_terminal_failed_count);
+    try std.testing.expectEqual(@as(u64, 0x5678), status.indexes[0].coverage_generation);
+    try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
+    try std.testing.expect(status.indexes[0].coverage_identity_ready);
+    try std.testing.expect(status.indexes[0].coverage_summary_ready);
 }
 
 test "metadata apply store replay is idempotent when applied watermark lags WAL state" {
@@ -5674,3 +6044,6 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
         try std.testing.expectEqual(@as(u64, 52), splits[0].destination_group_id);
     }
 }
+const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
+const max_restore_job_logical_key_bytes: usize = 128;
+const max_restore_job_value_bytes: usize = 64 * 1024;

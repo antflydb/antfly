@@ -30,9 +30,79 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
 const table_reads = @import("table_reads.zig");
+const coverage_policy_mod = @import("coverage_policy.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
+
+fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: bool) !void {
+    if (value != .object) return error.InvalidCreateTableRequest;
+    var index_it = value.object.iterator();
+    while (index_it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (trusted_catalog) {
+            coverage_policy_mod.validateStoredIndexConfig(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
+        } else {
+            coverage_policy_mod.validateIndexConfig(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
+        }
+    }
+}
+
+pub fn validateIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
+    defer parsed.deinit();
+    try validateIndexesValue(parsed.value, false);
+}
+
+/// Validates metadata read from Antfly-owned durable catalogs or backup
+/// manifests. Public request paths must use validateIndexesJson instead.
+pub fn validateStoredIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
+    defer parsed.deinit();
+    try validateIndexesValue(parsed.value, true);
+}
+
+fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    if (value != .object) return error.InvalidCreateTableRequest;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, default_indexes_json);
+
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const config = entry.value_ptr.*;
+        const is_catalog_metadata = std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+        if (!is_catalog_metadata) {
+            const index_type = if (config == .object) config.object.get("type") else null;
+            const is_full_text = index_type == null or
+                (index_type.? == .string and std.mem.eql(u8, index_type.?.string, "full_text"));
+            if (std.mem.eql(u8, name, "full_text_index_v0")) {
+                // Public creates are normalized once by the data API and again
+                // by metadata. Accept the canonical entry on that second hop,
+                // but never let its reserved name select another index kind.
+                if (!is_full_text) return error.InvalidCreateTableRequest;
+                continue;
+            }
+            if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
+            if (is_full_text) continue;
+        }
+
+        // Replace the closing brace, append the caller-owned entry, then close
+        // the object again. This preserves type-specific fields that generated
+        // OpenAPI structs may not yet understand.
+        out.items.len -= 1;
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, name);
+        try out.append(alloc, ':');
+        const encoded = try stringifyJsonValue(alloc, config);
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+        try out.append(alloc, '}');
+    }
+    return try out.toOwnedSlice(alloc);
+}
 pub const default_schema_json = "{\"version\":0,\"default_type\":\"doc\",\"enforce_types\":false,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"x-antfly-dynamic-indexing\":{\"mode\":\"infer_types\"}}}}}";
 
 pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
@@ -567,6 +637,14 @@ pub const CreateTableRequest = struct {
 };
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !CreateTableRequest {
+    return parseCreateTableRequestWithOptions(alloc, body, false);
+}
+
+pub fn parseStoredCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !CreateTableRequest {
+    return parseCreateTableRequestWithOptions(alloc, body, true);
+}
+
+fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8, comptime allow_private_index_fields: bool) !CreateTableRequest {
     if (body.len == 0) return .{};
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -590,10 +668,12 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
         };
     }
     if (root.get("indexes")) |value| {
-        if (value != .null)
-            req.indexes_json = try stringifyJsonValue(alloc, value)
-        else
-            req.indexes_json = try alloc.dupe(u8, default_indexes_json);
+        if (value != .null) {
+            try validateIndexesValue(value, allow_private_index_fields);
+            const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(alloc, value);
+            defer alloc.free(normalized_indexes_json);
+            req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
+        } else req.indexes_json = try alloc.dupe(u8, default_indexes_json);
     } else {
         req.indexes_json = try alloc.dupe(u8, default_indexes_json);
     }
@@ -3649,8 +3729,52 @@ test "create table parser preserves supported metadata fields" {
     try std.testing.expectEqual(@as(?u32, 1), parsed.num_shards);
     try std.testing.expectEqualStrings("docs table", parsed.description.?);
     try std.testing.expectEqualStrings("{\"version\":0,\"kind\":\"demo\"}", parsed.schema_json.?);
-    try std.testing.expectEqualStrings("{\"default\":{}}", parsed.indexes_json.?);
+    try std.testing.expectEqualStrings(default_indexes_json, parsed.indexes_json.?);
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
+}
+
+test "create table raw parser merges default full text with quickstart embedding index" {
+    var parsed = try parseCreateTableRequest(std.testing.allocator,
+        \\{
+        \\  "indexes": {
+        \\    "title_body": {
+        \\      "type": "embeddings",
+        \\      "template": "{{title}} {{body}}",
+        \\      "embedder": {"provider":"antfly","model":"antflydb/clipclap"},
+        \\      "chunker": {"provider":"antfly","text":{"target_tokens":200,"overlap_tokens":25}}
+        \\    }
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"title_body\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"_coverage_incarnation\":") != null);
+}
+
+test "create table raw parser accepts its canonical full text output" {
+    var first = try parseCreateTableRequest(std.testing.allocator,
+        \\{"num_shards":6,"indexes":{"title_body":{"type":"embeddings","field":"body","dimension":3}}}
+    );
+    defer first.deinit(std.testing.allocator);
+
+    const forwarded = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"num_shards\":6,\"indexes\":{s}}}",
+        .{first.indexes_json.?},
+    );
+    defer std.testing.allocator.free(forwarded);
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(std.testing.allocator, forwarded),
+    );
+    var second = try parseStoredCreateTableRequest(std.testing.allocator, forwarded);
+    defer second.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?u32, 6), second.num_shards);
+    try std.testing.expect(std.mem.indexOf(u8, second.indexes_json.?, "\"full_text_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.indexes_json.?, "\"title_body\"") != null);
 }
 
 test "create table parser rejects schemas that cannot derive runtime mappings" {

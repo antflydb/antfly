@@ -16,6 +16,7 @@ const std = @import("std");
 const objectstore = @import("objectstore");
 const artifact_store = @import("store.zig");
 const remote_uri = @import("../remote_uri.zig");
+const object_store_support = @import("../object_store_support.zig");
 
 pub const ObjectStore = struct {
     alloc: std.mem.Allocator,
@@ -28,6 +29,14 @@ pub const ObjectStore = struct {
     prefix: []u8,
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
+        return try initRemoteUriWithS3Options(alloc, uri, null);
+    }
+
+    pub fn initRemoteUriWithS3Options(
+        alloc: std.mem.Allocator,
+        uri: []const u8,
+        s3_options: ?object_store_support.S3Options,
+    ) !ObjectStore {
         var parsed = try remote_uri.parseAlloc(alloc, uri);
         defer switch (parsed) {
             .file => |value| alloc.free(value),
@@ -42,7 +51,7 @@ pub const ObjectStore = struct {
                 break :blk try initFileUri(alloc, file_uri);
             },
             .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix),
-            .s3 => |value| try initS3Uri(alloc, value.bucket, value.prefix),
+            .s3 => |value| try initS3UriWithOptions(alloc, value.bucket, value.prefix, s3_options),
         };
     }
 
@@ -82,9 +91,18 @@ pub const ObjectStore = struct {
     }
 
     pub fn initS3Uri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8) !ObjectStore {
+        return try initS3UriWithOptions(alloc, bucket, prefix, null);
+    }
+
+    pub fn initS3UriWithOptions(
+        alloc: std.mem.Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ?object_store_support.S3Options,
+    ) !ObjectStore {
         const s3 = try alloc.create(objectstore.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try objectstore.S3.fromEnvAlloc(alloc, null, true, null, null, null, null, .path);
+        const cfg = try object_store_support.s3ConfigAlloc(alloc, options);
         s3.* = try objectstore.S3.Client.init(alloc, cfg);
 
         var owned_client = s3.client();

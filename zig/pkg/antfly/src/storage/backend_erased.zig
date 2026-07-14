@@ -33,9 +33,99 @@ fn Box(comptime T: type) type {
     };
 }
 
+fn ParentBox(comptime T: type) type {
+    return struct {
+        allocator: Allocator,
+        handle: T,
+        mutex: std.atomic.Mutex = .unlocked,
+        child_count: usize = 0,
+        owner_closed: bool = false,
+        finalizing: bool = false,
+
+        fn retainChild(self: *@This()) !void {
+            platform.sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.owner_closed or self.finalizing) return error.TransactionClosed;
+            self.child_count += 1;
+        }
+
+        fn requestAbort(self: *@This()) void {
+            platform.sync.lockYielding(&self.mutex);
+            std.debug.assert(!self.owner_closed);
+            self.owner_closed = true;
+            const finalize = self.child_count == 0;
+            if (finalize) self.finalizing = true;
+            self.mutex.unlock();
+            if (finalize) self.finalizeAbort();
+        }
+
+        fn releaseChild(self: *@This()) void {
+            platform.sync.lockYielding(&self.mutex);
+            std.debug.assert(self.child_count > 0);
+            self.child_count -= 1;
+            const finalize = self.owner_closed and self.child_count == 0 and !self.finalizing;
+            if (finalize) self.finalizing = true;
+            self.mutex.unlock();
+            if (finalize) self.finalizeAbort();
+        }
+
+        fn commit(self: *@This()) !void {
+            platform.sync.lockYielding(&self.mutex);
+            if (self.owner_closed or self.finalizing) {
+                self.mutex.unlock();
+                return error.TransactionClosed;
+            }
+            if (self.child_count != 0) {
+                self.mutex.unlock();
+                return error.TransactionCursorActive;
+            }
+            self.finalizing = true;
+            self.mutex.unlock();
+
+            self.handle.commit() catch |err| {
+                platform.sync.lockYielding(&self.mutex);
+                self.finalizing = false;
+                self.mutex.unlock();
+                return err;
+            };
+            const allocator = self.allocator;
+            allocator.destroy(self);
+        }
+
+        fn finalizeAbort(self: *@This()) void {
+            const allocator = self.allocator;
+            self.handle.abort();
+            allocator.destroy(self);
+        }
+    };
+}
+
+const ParentRelease = struct {
+    ptr: *anyopaque,
+    release: *const fn (*anyopaque) void,
+};
+
+fn parentReleaseFor(parent: anytype) ParentRelease {
+    const Parent = @TypeOf(parent.*);
+    const release = struct {
+        fn run(ptr: *anyopaque) void {
+            const typed: *Parent = @ptrCast(@alignCast(ptr));
+            typed.releaseChild();
+        }
+    }.run;
+    return .{ .ptr = parent, .release = release };
+}
+
 fn allocBox(allocator: Allocator, value: anytype) !*Box(@TypeOf(value)) {
     const T = @TypeOf(value);
     const box = try allocator.create(Box(T));
+    box.* = .{ .allocator = allocator, .handle = value };
+    return box;
+}
+
+fn allocParentBox(allocator: Allocator, value: anytype) !*ParentBox(@TypeOf(value)) {
+    const T = @TypeOf(value);
+    const box = try allocator.create(ParentBox(T));
     box.* = .{ .allocator = allocator, .handle = value };
     return box;
 }
@@ -731,19 +821,35 @@ pub const NamespaceStore = struct {
 };
 
 pub fn cursorFrom(allocator: Allocator, handle: anytype) !Cursor {
+    return try cursorFromWithParent(allocator, handle, null);
+}
+
+fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRelease) !Cursor {
     const Handle = @TypeOf(handle);
     const cursor_box_allocator = wrapperBoxAllocator(allocator);
-    const box_ptr = try allocBox(cursor_box_allocator, handle);
+    const CursorBox = struct {
+        allocator: Allocator,
+        handle: Handle,
+        parent: ?ParentRelease,
+    };
+    const box_ptr = try cursor_box_allocator.create(CursorBox);
+    box_ptr.* = .{
+        .allocator = cursor_box_allocator,
+        .handle = handle,
+        .parent = parent,
+    };
 
     const vt = struct {
-        fn unbox(ptr: *anyopaque) *Box(Handle) {
+        fn unbox(ptr: *anyopaque) *CursorBox {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn close(alloc: Allocator, ptr: *anyopaque) void {
+        fn close(_: Allocator, ptr: *anyopaque) void {
             const state = unbox(ptr);
+            const box_allocator = state.allocator;
             state.handle.close();
-            alloc.destroy(state);
+            if (state.parent) |retained_parent| retained_parent.release(retained_parent.ptr);
+            box_allocator.destroy(state);
         }
 
         fn first(ptr: *anyopaque) anyerror!?Entry {
@@ -812,17 +918,15 @@ pub fn cursorFrom(allocator: Allocator, handle: anytype) !Cursor {
 pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
-    const box_ptr = try allocBox(wrapper_box_allocator, handle);
+    const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
 
     const vt = struct {
-        fn unbox(ptr: *anyopaque) *Box(Handle) {
+        fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
-            const state = unbox(ptr);
-            state.handle.abort();
-            alloc.destroy(state);
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            unbox(ptr).requestAbort();
         }
 
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
@@ -843,7 +947,12 @@ pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
         }
 
         fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
-            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor());
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursor();
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
     };
 
@@ -869,10 +978,11 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
+        fn abort(_: Allocator, ptr: *anyopaque) void {
             const state = unbox(ptr);
+            const box_allocator = state.allocator;
             state.handle.abort();
-            alloc.destroy(state);
+            box_allocator.destroy(state);
         }
 
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
@@ -907,21 +1017,24 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
 pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
-    const box_ptr = try allocBox(wrapper_box_allocator, handle);
+    const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
 
     const vt = struct {
-        fn unbox(ptr: *anyopaque) *Box(Handle) {
+        fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
-            const state = unbox(ptr);
-            state.handle.abort();
-            alloc.destroy(state);
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            unbox(ptr).requestAbort();
         }
 
         fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
-            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor());
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursor();
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
     };
 
@@ -943,17 +1056,15 @@ pub fn namespaceReadTxnFrom(
 ) !NamespaceReadTxn {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
-    const box_ptr = try allocBox(wrapper_box_allocator, handle);
+    const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
 
     const vt = struct {
-        fn unbox(ptr: *anyopaque) *Box(Handle) {
+        fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
-            const state = unbox(ptr);
-            state.handle.abort();
-            alloc.destroy(state);
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            unbox(ptr).requestAbort();
         }
 
         fn get(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror![]const u8 {
@@ -974,7 +1085,12 @@ pub fn namespaceReadTxnFrom(
         }
 
         fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace) anyerror!Cursor {
-            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor(try mapNamespace(namespace)));
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursor(try mapNamespace(namespace));
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
     };
 
@@ -993,23 +1109,19 @@ pub fn namespaceReadTxnFrom(
 pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
-    const box_ptr = try allocBox(wrapper_box_allocator, handle);
+    const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
 
     const vt = struct {
-        fn unbox(ptr: *anyopaque) *Box(Handle) {
+        fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
-            const state = unbox(ptr);
-            state.handle.abort();
-            alloc.destroy(state);
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            unbox(ptr).requestAbort();
         }
 
-        fn commit(alloc: Allocator, ptr: *anyopaque) anyerror!void {
-            const state = unbox(ptr);
-            try state.handle.commit();
-            alloc.destroy(state);
+        fn commit(_: Allocator, ptr: *anyopaque) anyerror!void {
+            try unbox(ptr).commit();
         }
 
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
@@ -1038,7 +1150,12 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
         }
 
         fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
-            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor());
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursor();
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
     };
 
@@ -1065,23 +1182,19 @@ pub fn namespaceWriteTxnFrom(
 ) !NamespaceWriteTxn {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
-    const box_ptr = try allocBox(wrapper_box_allocator, handle);
+    const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
 
     const vt = struct {
-        fn unbox(ptr: *anyopaque) *Box(Handle) {
+        fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
-            const state = unbox(ptr);
-            state.handle.abort();
-            alloc.destroy(state);
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            unbox(ptr).requestAbort();
         }
 
-        fn commit(alloc: Allocator, ptr: *anyopaque) anyerror!void {
-            const state = unbox(ptr);
-            try state.handle.commit();
-            alloc.destroy(state);
+        fn commit(_: Allocator, ptr: *anyopaque) anyerror!void {
+            try unbox(ptr).commit();
         }
 
         fn get(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror![]const u8 {
@@ -1101,7 +1214,12 @@ pub fn namespaceWriteTxnFrom(
         }
 
         fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace) anyerror!Cursor {
-            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor(try mapNamespace(namespace)));
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursor(try mapNamespace(namespace));
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
     };
 
@@ -1123,23 +1241,19 @@ pub fn namespaceWriteTxnFrom(
 pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
-    const box_ptr = try allocBox(wrapper_box_allocator, handle);
+    const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
 
     const vt = struct {
-        fn unbox(ptr: *anyopaque) *Box(Handle) {
+        fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
-            const state = unbox(ptr);
-            state.handle.abort();
-            alloc.destroy(state);
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            unbox(ptr).requestAbort();
         }
 
-        fn commit(alloc: Allocator, ptr: *anyopaque) anyerror!void {
-            const state = unbox(ptr);
-            try state.handle.commit();
-            alloc.destroy(state);
+        fn commit(_: Allocator, ptr: *anyopaque) anyerror!void {
+            try unbox(ptr).commit();
         }
 
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
@@ -1171,7 +1285,12 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
         }
 
         fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
-            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor());
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursor();
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
 
         fn setReplayOpaque(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
@@ -1214,16 +1333,18 @@ pub fn namespaceBatchFrom(
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn abort(alloc: Allocator, ptr: *anyopaque) void {
+        fn abort(_: Allocator, ptr: *anyopaque) void {
             const state = unbox(ptr);
+            const box_allocator = state.allocator;
             state.handle.abort();
-            alloc.destroy(state);
+            box_allocator.destroy(state);
         }
 
-        fn commit(alloc: Allocator, ptr: *anyopaque) anyerror!void {
+        fn commit(_: Allocator, ptr: *anyopaque) anyerror!void {
             const state = unbox(ptr);
+            const box_allocator = state.allocator;
             try state.handle.commit();
-            alloc.destroy(state);
+            box_allocator.destroy(state);
         }
 
         fn get(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror![]const u8 {
@@ -1267,8 +1388,10 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn deinit(alloc: Allocator, ptr: *anyopaque) void {
-            alloc.destroy(unbox(ptr));
+        fn deinit(_: Allocator, ptr: *anyopaque) void {
+            const state = unbox(ptr);
+            const box_allocator = state.allocator;
+            box_allocator.destroy(state);
         }
 
         fn capabilities(ptr: *anyopaque) backend_types.Capabilities {
@@ -1546,8 +1669,10 @@ pub fn namespaceStoreFrom(
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn deinit(alloc: Allocator, ptr: *anyopaque) void {
-            alloc.destroy(unbox(ptr));
+        fn deinit(_: Allocator, ptr: *anyopaque) void {
+            const state = unbox(ptr);
+            const box_allocator = state.allocator;
+            box_allocator.destroy(state);
         }
 
         fn capabilities(ptr: *anyopaque) backend_types.Capabilities {
@@ -1947,4 +2072,113 @@ test "runtime namespace store forwards batch options" {
     try batch.commit();
     try std.testing.expect(shared.saw_batch_options);
     try std.testing.expectEqual(backend_types.BatchMode.bulk_ingest, shared.last_mode);
+}
+
+test "erased cursor retains read transaction until cursor close" {
+    const Shared = struct {
+        aborted: bool = false,
+        cursor_closed: bool = false,
+    };
+    const MockCursor = struct {
+        shared: *Shared,
+
+        pub fn close(self: *@This()) void {
+            self.shared.cursor_closed = true;
+        }
+        pub fn first(self: *@This()) !?Entry {
+            if (self.shared.aborted) return error.TransactionClosed;
+            return .{ .key = "key", .value = "value" };
+        }
+        pub fn last(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn next(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn prev(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
+            return null;
+        }
+    };
+    const MockRead = struct {
+        shared: *Shared,
+
+        pub fn abort(self: *@This()) void {
+            self.shared.aborted = true;
+        }
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.NotFound;
+        }
+        pub fn openCursor(self: *@This()) !MockCursor {
+            return .{ .shared = self.shared };
+        }
+    };
+
+    var shared = Shared{};
+    var txn = try readTxnFrom(std.testing.allocator, MockRead{ .shared = &shared });
+    var cursor = try txn.openCursor();
+    txn.abort();
+
+    try std.testing.expect(!shared.aborted);
+    try std.testing.expectEqualStrings("key", (try cursor.first()).?.key);
+    cursor.close();
+    try std.testing.expect(shared.cursor_closed);
+    try std.testing.expect(shared.aborted);
+}
+
+test "erased write transaction rejects commit while cursor retains snapshot" {
+    const Shared = struct {
+        committed: bool = false,
+    };
+    const MockCursor = struct {
+        pub fn close(_: *@This()) void {}
+        pub fn first(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn last(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn next(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn prev(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
+            return null;
+        }
+    };
+    const MockWrite = struct {
+        shared: *Shared,
+
+        pub fn abort(_: *@This()) void {}
+        pub fn commit(self: *@This()) !void {
+            self.shared.committed = true;
+        }
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.NotFound;
+        }
+        pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {}
+        pub fn delete(_: *@This(), _: []const u8) !void {}
+        pub fn openCursor(_: *@This()) !MockCursor {
+            return .{};
+        }
+    };
+
+    var shared = Shared{};
+    var txn = try writeTxnFrom(std.testing.allocator, MockWrite{ .shared = &shared });
+    var cursor = try txn.openCursor();
+    try std.testing.expectError(error.TransactionCursorActive, txn.commit());
+    try std.testing.expect(!shared.committed);
+    cursor.close();
+    try txn.commit();
+    try std.testing.expect(shared.committed);
 }

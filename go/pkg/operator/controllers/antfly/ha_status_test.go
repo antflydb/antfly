@@ -1710,6 +1710,7 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 		{method: "POST", path: haAdminBaseBackupsFinishPath, operationID: "finishHABaseBackup"},
 		{method: "POST", path: haAdminBaseBackupsCapturePath, operationID: "captureHASeedArtifact"},
 		{method: "POST", path: haAdminBaseBackupsActivatePath, operationID: "activateHASeededSlot"},
+		{method: "GET", path: haAdminSeedLifecycleReceiptsPath, operationID: "getHASeedLifecycleReceipts"},
 		{method: "POST", path: haAdminStandbyBootstrapPath, operationID: "bootstrapHAStandby"},
 		{method: "POST", path: haAdminFencePath, operationID: "acquireHAFence"},
 		{method: "GET", path: haAdminFenceCurrentPath, operationID: "getHACurrentFence"},

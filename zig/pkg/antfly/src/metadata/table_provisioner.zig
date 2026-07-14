@@ -23,6 +23,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const coverage_policy = @import("../api/coverage_policy.zig");
 const indexes_api = @import("../api/indexes.zig");
 const table_reads = @import("../api/table_reads.zig");
 const table_catalog = @import("../api/table_catalog.zig");
@@ -414,17 +415,24 @@ pub fn collectLocalRestoreProgress(
         if (restore.snapshot_path.len > 0 and !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path)) continue;
         if (state.group_id != group_id) continue;
 
-        var record = table_manager.RestoreProgressRecord{
-            .table_id = table.table_id,
-            .node_id = local_node_id,
-            .group_id = group_id,
-            .backup_id = try alloc.dupe(u8, restore.backup_id),
-            .snapshot_path = &.{},
-            .primary_restored = state.primary_restored,
-            .runtime_repair_complete = state.runtime_repair_complete,
-            .phase = &.{},
-            .last_error = &.{},
-            .updated_at_ms = 0,
+        var record: table_manager.RestoreProgressRecord = blk: {
+            const progress_backup_id = try alloc.dupe(u8, restore.backup_id);
+            errdefer alloc.free(progress_backup_id);
+            const progress_location = try alloc.dupe(u8, restore.location);
+            errdefer alloc.free(progress_location);
+            break :blk .{
+                .table_id = table.table_id,
+                .node_id = local_node_id,
+                .group_id = group_id,
+                .backup_id = progress_backup_id,
+                .location = progress_location,
+                .snapshot_path = &.{},
+                .primary_restored = state.primary_restored,
+                .runtime_repair_complete = state.runtime_repair_complete,
+                .phase = &.{},
+                .last_error = &.{},
+                .updated_at_ms = 0,
+            };
         };
         var appended = false;
         errdefer if (!appended) table_manager.freeRestoreProgress(alloc, record);
@@ -565,11 +573,6 @@ fn ensureIndexDefinition(
     config_value: std.json.Value,
     storage_config: bool,
 ) !void {
-    const existing = findIndexConfig(current, name);
-    if (existing) |existing_cfg| {
-        if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) return;
-    }
-
     const config_json = if (storage_config)
         try extractStoredIndexConfigJson(alloc, config_value)
     else
@@ -579,7 +582,16 @@ fn ensureIndexDefinition(
         .name = name,
         .kind = kind,
         .config_json = config_json,
+        .coverage_generation = coverage_policy.incarnation(config_value) orelse 0,
     };
+    const existing = findIndexConfig(current, name);
+    if (existing) |existing_cfg| {
+        if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) {
+            if (kind == .graph or
+                (existing_cfg.coverage_generation == desired.coverage_generation and
+                    try indexConfigsEqual(alloc, existing_cfg, desired))) return;
+        }
+    }
     if (existing) |existing_cfg| {
         if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
         if (try db.deleteIndex(desired.name)) summary.removed += 1;
@@ -588,6 +600,7 @@ fn ensureIndexDefinition(
         .name = desired.name,
         .kind = desired.kind,
         .config_json = desired.config_json,
+        .coverage_generation = desired.coverage_generation,
     });
     summary.added += 1;
 }
@@ -638,6 +651,8 @@ fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: d
     if (a.kind != b.kind) return false;
     if (a.kind == .full_text) return fullTextIndexConfigsEqual(alloc, a.config_json, b.config_json);
     if (a.kind == .algebraic) return algebraicIndexConfigsEqual(alloc, a.config_json, b.config_json);
+    if ((a.kind == .dense_vector or a.kind == .sparse_vector) and
+        a.coverage_generation != b.coverage_generation) return false;
     return std.mem.eql(u8, a.config_json, b.config_json);
 }
 
@@ -1288,6 +1303,37 @@ test "table provisioner materializes array-form metadata indexes" {
     try std.testing.expect(findIndexConfig(configs, "dense_idx").?.kind == .dense_vector);
     try std.testing.expect(findIndexConfig(configs, "sparse_idx").?.kind == .sparse_vector);
     try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
+}
+
+test "table provisioner replaces embedding index when metadata incarnation changes" {
+    const path = "/tmp/antfly-metadata-table-provisioner-coverage-incarnation";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const first =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:1"},"_coverage_incarnation":41}}
+    ;
+    const second =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:1"},"_coverage_incarnation":42}}
+    ;
+    const initial = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, first, .{});
+    try std.testing.expectEqual(@as(usize, 1), initial.indexes_added);
+
+    const replaced = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
+    try std.testing.expectEqual(@as(usize, 1), replaced.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 1), replaced.indexes_added);
+
+    const configs = try db.listIndexes(std.testing.allocator);
+    defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+    try std.testing.expectEqual(@as(u64, 42), findIndexConfig(configs, "semantic_idx").?.coverage_generation);
 }
 
 test "table provisioner reconciliation is non-mutating for query read-only dbs" {
@@ -2406,6 +2452,17 @@ test "table provisioner reconcile does not replay pending derived batches" {
     defer std.testing.allocator.free(db_path);
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
+    const public_index_json = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}";
+    var parsed_public_index = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, public_index_json, .{});
+    defer parsed_public_index.deinit();
+    const stored_index_json = try managed_embedder.translateEmbeddingsIndexConfigJson(
+        std.testing.allocator,
+        "embed_idx",
+        parsed_public_index.value,
+    );
+    defer std.testing.allocator.free(stored_index_json);
+
+    var coverage_incarnation: u64 = 0;
     {
         var db = try db_mod.DB.open(std.testing.allocator, db_path, .{
             .start_index_workers = false,
@@ -2414,8 +2471,13 @@ test "table provisioner reconcile does not replay pending derived batches" {
         try db.addIndex(.{
             .name = "embed_idx",
             .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+            .config_json = stored_index_json,
         });
+        const configs = try db.listIndexes(std.testing.allocator);
+        defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+        try std.testing.expectEqual(@as(usize, 1), configs.len);
+        coverage_incarnation = configs[0].coverage_generation;
+        try std.testing.expect(coverage_incarnation != 0);
         const stored_key = try db_mod.internal_keys.documentKeyAlloc(std.testing.allocator, "doc:a");
         defer std.testing.allocator.free(stored_key);
         try db.core.store.putBatch(&.{
@@ -2450,6 +2512,19 @@ test "table provisioner reconcile does not replay pending derived batches" {
         try db.core.store.appendReplayOpaque(std.testing.allocator, sequence, encoded);
     }
 
+    const index_config_with_incarnation = try coverage_policy.withIncarnationAlloc(
+        std.testing.allocator,
+        parsed_public_index.value,
+        coverage_incarnation,
+    );
+    defer std.testing.allocator.free(index_config_with_incarnation);
+    const indexes_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"embed_idx\":{s}}}",
+        .{index_config_with_incarnation},
+    );
+    defer std.testing.allocator.free(indexes_json);
+
     const summary = try reconcileReplicaRoot(
         std.testing.allocator,
         path,
@@ -2458,7 +2533,7 @@ test "table provisioner reconcile does not replay pending derived batches" {
         &.{.{
             .table_id = 11,
             .name = "docs",
-            .indexes_json = "{\"embed_idx\":{\"type\":\"embeddings\",\"field\":\"embedding\",\"dims\":2}}",
+            .indexes_json = indexes_json,
         }},
         &.{.{
             .group_id = 2006,
@@ -2469,6 +2544,8 @@ test "table provisioner reconcile does not replay pending derived batches" {
     );
     try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
     try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_added);
 
     {
         var reopened_without_replay = try db_mod.DB.open(std.testing.allocator, db_path, .{

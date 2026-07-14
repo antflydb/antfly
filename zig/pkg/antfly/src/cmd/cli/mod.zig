@@ -35,6 +35,73 @@ pub const GlobalConfig = struct {
     output: OutputFormat = .json,
 };
 
+pub fn isHelpArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help");
+}
+
+pub fn commandUsage(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "query")) return
+    \\usage: antfly query --table <table> [search options]
+    \\
+    \\  --full-text-search <query>       Full-text query string
+    \\  --full-text-search-json <json>   Full-text query object
+    \\  --semantic-search <text>         Semantic query text
+    \\  --indexes <names>                Comma-separated semantic indexes
+    \\  --fields <names>                 Comma-separated response fields
+    \\  --filter-query <json>             Filter query
+    \\  --exclusion-query <json>          Exclusion query
+    \\  --aggregations <json>             Named aggregations
+    \\  --reranker <json>                 Reranker configuration
+    \\  --pruner <json>                   Result pruner configuration
+    \\  --limit <n>                       Result limit
+    \\  --offset <n>                      Result offset
+    \\
+    ;
+    if (std.mem.eql(u8, command, "load")) return
+    \\usage: antfly load --table <table> --file <ndjson> [options]
+    \\
+    \\  --size <n>                 Documents per batch
+    \\  --batches <n>              Maximum in-flight batches
+    \\  --batch-bytes <n>          Maximum bytes per batch
+    \\  --id-field <field>         Source field used as document ID
+    \\  --id-template <template>   Template used as document ID
+    \\  --sync-level <level>       Write synchronization level
+    \\  --checkpoint <path>        Checkpoint file path
+    \\  --resume                   Resume from a checkpoint
+    \\  --no-checkpoint            Disable checkpointing
+    \\  --dry-run                  Validate input without writing
+    \\  --max-errors <n>           Maximum rejected records
+    \\  --strict                   Fail on the first rejected record
+    \\
+    ;
+    if (std.mem.eql(u8, command, "table")) return "usage: antfly table <create|drop|list|get> [options]\n";
+    if (std.mem.eql(u8, command, "index")) return "usage: antfly index <create|drop|list|get> --table <table> [options]\n";
+    if (std.mem.eql(u8, command, "artifact")) return "usage: antfly artifact <list|get|put|delete|reprocess|job> [options]\n";
+    if (std.mem.eql(u8, command, "lookup")) return "usage: antfly lookup --table <table> --key <key> [options]\n";
+    if (std.mem.eql(u8, command, "insert")) return "usage: antfly insert --table <table> --key <key> --document <json> [options]\n";
+    if (std.mem.eql(u8, command, "delete")) return "usage: antfly delete --table <table> --key <key> [options]\n";
+    if (std.mem.eql(u8, command, "agents")) return "usage: antfly agents <retrieval|query-builder> [options]\n";
+    if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n";
+    if (std.mem.eql(u8, command, "restore")) return "usage: antfly restore --location <uri> [options]\n";
+    if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
+    if (std.mem.eql(u8, command, "internal")) return "usage: antfly internal metadata status\n";
+    return null;
+}
+
+pub fn printCommandUsage(command: []const u8) void {
+    const usage = commandUsage(command) orelse return;
+    std.debug.print("{s}", .{usage});
+}
+
+test "client commands expose help without a server" {
+    try std.testing.expect(isHelpArg("--help"));
+    try std.testing.expect(isHelpArg("-h"));
+    try std.testing.expect(commandUsage("query") != null);
+    try std.testing.expect(commandUsage("load") != null);
+    try std.testing.expect(commandUsage("auth") != null);
+    try std.testing.expect(commandUsage("unknown") == null);
+}
+
 /// Build global CLI config from environment variables.
 ///
 /// Supported env vars:

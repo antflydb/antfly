@@ -17,6 +17,12 @@ const Allocator = std.mem.Allocator;
 const openapi = @import("antfly_admin_openapi");
 
 pub const base = "/admin/v1";
+pub const maintenance = base ++ "/maintenance";
+pub const maintenance_check = maintenance ++ "/check";
+pub const maintenance_compact = maintenance ++ "/compact";
+pub const maintenance_vacuum = maintenance ++ "/vacuum";
+pub const maintenance_jobs = maintenance ++ "/jobs";
+pub const maintenance_jobs_prefix = maintenance_jobs ++ "/";
 pub const ha = base ++ "/ha";
 pub const ha_primary_status = ha ++ "/primary/status";
 pub const ha_standby_status = ha ++ "/standby/status";
@@ -165,6 +171,13 @@ test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/reseed", ha_rejoin_reseed);
 }
 
+test "admin routes define storage-neutral maintenance paths" {
+    try std.testing.expectEqualStrings("/admin/v1/maintenance/check", maintenance_check);
+    try std.testing.expectEqualStrings("/admin/v1/maintenance/compact", maintenance_compact);
+    try std.testing.expectEqualStrings("/admin/v1/maintenance/vacuum", maintenance_vacuum);
+    try std.testing.expectEqualStrings("/admin/v1/maintenance/jobs/", maintenance_jobs_prefix);
+}
+
 test "admin routes match generated OpenAPI HA operations" {
     for (expected_ha_routes) |route| {
         try expectGeneratedRoute(route.operation_id, route.method, route.full_path);
@@ -178,7 +191,7 @@ test "admin routes own HA admin path literals consumed by Zig runtime code" {
     try expectNoHardCodedHAAdminPath("../storage/ha/http_admin.zig", @embedFile("../storage/ha/http_admin.zig"));
     try expectNoHardCodedHAAdminPath("../storage/ha/http_client.zig", @embedFile("../storage/ha/http_client.zig"));
     try expectNoHardCodedHAAdminPath("../storage/ha/operator.zig", @embedFile("../storage/ha/operator.zig"));
-    try expectNoHardCodedHAAdminPath("../swarm/runtime.zig", @embedFile("../swarm/runtime.zig"));
+    try expectNoHardCodedHAAdminPath("../standalone/runtime.zig", @embedFile("../standalone/runtime.zig"));
 }
 
 test "admin routes build and match replication slot lifecycle paths" {

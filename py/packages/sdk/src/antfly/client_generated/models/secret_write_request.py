@@ -13,7 +13,7 @@ T = TypeVar("T", bound="SecretWriteRequest")
 class SecretWriteRequest:
     """
     Attributes:
-        value (str): Secret value (stored encrypted, never returned)
+        value (str): Secret value (stored in the configured protected secret store and never returned)
     """
 
     value: str

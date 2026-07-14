@@ -521,15 +521,19 @@ pub const BackupInfo = struct {
 };
 
 pub const BackupListResponse = struct {
-    /// List of available backups
+    /// One page of available backups in stable manifest-key order.
     backups: []const BackupInfo,
+    /// Opaque continuation cursor. Omitted when no additional backups remain.
+    next_cursor: ?[]const u8 = null,
 };
 
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
+    /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
 };
@@ -627,11 +631,13 @@ pub const CdcConnection = struct {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
+    /// Required configured `external_io` connection with the `backup.write` capability.
+    connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
-    /// Optional list of tables to backup. If omitted, all tables are backed up.
+    /// Optional list of tables to backup. If omitted, all tables are backed up, up to the cluster backup limit of 4096 tables. Requests above that limit fail before any table backup is created.
     table_names: ?[]const []const u8 = null,
 };
 
@@ -755,9 +761,11 @@ pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
     /// Storage location where the backup is stored.
     location: []const u8,
-    /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
+    /// Required configured `external_io` connection with the `restore.read` capability.
+    connection: []const u8,
+    /// Optional list of tables to restore. If omitted, all tables in the backup are restored, up to the cluster restore limit of 4096 tables. Larger backups must be restored in explicit batches of at most 256 tables.
     table_names: ?[]const []const u8 = null,
-    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
     restore_mode: ?[]const u8 = null,
 };
 
@@ -774,9 +782,10 @@ pub const ClusterStatus = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?StorageRuntimeStatus = null,
 };
 
 pub const ClusterTopology = struct {
@@ -785,9 +794,10 @@ pub const ClusterTopology = struct {
     message: ?[]const u8 = null,
     /// Indicates whether authentication is enabled for the cluster
     auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
+    /// Runtime deployment topology
+    deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
 };
 
@@ -910,7 +920,7 @@ pub const ConnectionKind = enum {
     }
 };
 
-/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider.
+/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider. For S3, connected means an authenticated HeadBucket request succeeded for every explicitly allowlisted bucket. It verifies bucket discovery permission, not mutation permissions such as PutObject.
 pub const ConnectionStatus = enum {
     connected,
     @"error",
@@ -1361,7 +1371,7 @@ pub const ForeignColumn = struct {
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
     type: []const u8,
-    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
+    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables.
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
     postgres_table: []const u8,
@@ -2077,7 +2087,7 @@ pub const ReplicationRoute = struct {
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
     type: []const u8,
-    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
+    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly secret store or environment variables. Requires `wal_level=logical` on the source.
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
@@ -2153,13 +2163,45 @@ pub const RerankerProfile = struct {
     duration_ms: ?i64 = null,
 };
 
-pub const RestoreRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
+pub const RestoreJob = struct {
+    /// Opaque durable restore-job identifier. Clients must not parse it as a number.
+    job_id: []const u8,
+    attempt_id: i64,
+    scope: []const u8,
+    table_name: ?[]const u8 = null,
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    phase: []const u8,
+    cancel_requested: bool,
+    /// Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
+    durability_pending_table_count: i64,
+    /// Number of table restore intents durably published. Published tables are adopted, not republished, after failover.
+    published_table_count: i64,
+    /// Number of published tables whose placement replicas completed restore and whose completion checkpoint is durable.
+    completed_table_count: i64,
+    /// Requested table count when known before execution.
+    total_table_count: ?i64 = null,
+    /// Bounded terminal result. A committed result with durability pending means publication is visible but parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed, durability-pending, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
+    result: ?std.json.Value = null,
+    @"error": ?[]const u8 = null,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
+    expires_at_ms: ?i64 = null,
+};
+
+pub const RestoreJobList = struct {
+    jobs: []const RestoreJob,
+    /// Opaque newest-first continuation cursor. A page can be empty and still include a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted.
+    next_cursor: ?[]const u8 = null,
+};
+
+pub const RestoreRequest = struct {
+    /// Identifier of the published backup to restore.
+    backup_id: []const u8,
+    /// Storage location containing the backup. The server detects the native or portable format from the published manifest and artifact.
     location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    /// ID of a configured `external_io` connection with `restore.read`. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
+    connection: []const u8,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
@@ -2526,13 +2568,13 @@ pub const SecretList = struct {
 
 /// Source of the secret configuration
 pub const SecretStatus = enum {
-    configured_keystore,
+    configured_file,
     configured_env,
     configured_both,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .configured_keystore => "configured_keystore",
+            .configured_file => "configured_file",
             .configured_env => "configured_env",
             .configured_both => "configured_both",
         };
@@ -2545,7 +2587,7 @@ pub const SecretStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "configured_keystore", .configured_keystore },
+            .{ "configured_file", .configured_file },
             .{ "configured_env", .configured_env },
             .{ "configured_both", .configured_both },
         });
@@ -2560,7 +2602,7 @@ pub const SecretStoreStatus = struct {
 };
 
 pub const SecretWriteRequest = struct {
-    /// Secret value (stored encrypted, never returned)
+    /// Secret value (stored in the configured protected secret store and never returned)
     value: []const u8,
 };
 
@@ -2660,6 +2702,21 @@ pub const SortProfile = struct {
     sort_rejection_detail: ?[]const u8 = null,
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: ?[]const u8 = null,
+};
+
+pub const StorageMaintenanceCapabilities = struct {
+    check: bool,
+    compact: bool,
+    vacuum: bool,
+    online: bool,
+    asynchronous: bool,
+};
+
+pub const StorageRuntimeStatus = struct {
+    engine: []const u8,
+    format: ?[]const u8 = null,
+    fsync: ?bool = null,
+    maintenance: StorageMaintenanceCapabilities,
 };
 
 pub const StorageStatus = struct {
