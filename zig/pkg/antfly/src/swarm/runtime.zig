@@ -69,6 +69,7 @@ const CliConfig = struct {
     ha_primary_log: ?[]const u8 = null,
     ha_primary_slots: ?[]const u8 = null,
     ha_primary_node_id: ?[]const u8 = null,
+    ha_seed_capture_root: ?[]const u8 = null,
     ha_fence_wal: ?[]const u8 = null,
     ha_former_primary_log: ?[]const u8 = null,
     ha_admin_token_env: ?[]const u8 = null,
@@ -1054,6 +1055,7 @@ pub fn runFromIterator(
             },
             .standby_owner = if (ha_standby != null) &ha_standby else null,
             .admin_bearer_token = ha_admin_bearer_token,
+            .seed_capture_root = cli.ha_seed_capture_root,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,
             .primary_sync_policy = ha_sync_policy.policy,
@@ -2344,6 +2346,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_primary_node_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-seed-capture-root")) {
+            cfg.ha_seed_capture_root = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-fence-wal")) {
             cfg.ha_fence_wal = args.next() orelse return error.InvalidArguments;
             continue;
@@ -2675,6 +2681,7 @@ fn validateHARole(cli: CliConfig) !void {
     if (cli.ha_fence_wal != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_admin_token_env != null and !primary_requested and !standby_requested) return error.HARoleMissing;
+    if (cli.ha_seed_capture_root != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_former_primary_log != null) {
         _ = try requireHAPath(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
@@ -2750,6 +2757,9 @@ fn validateHAPathsUnderRoot(cli: CliConfig, data_root: []const u8) !void {
     }
     if (haPrimaryRequested(cli) or haStandbyRequested(cli)) {
         _ = try requireHAPathWithinRoot(cli.ha_fence_wal, data_root, error.HAFenceWalMissing, error.HAFenceWalInvalid);
+        if (cli.ha_seed_capture_root != null) {
+            _ = try requireHAPathWithinRoot(cli.ha_seed_capture_root, data_root, error.HASeedCaptureRootMissing, error.HASeedCaptureRootInvalid);
+        }
     }
     if (haPrimaryRequested(cli)) {
         _ = try requireHAPathWithinRoot(cli.ha_primary_log, data_root, error.HAPrimaryLogMissing, error.HAPrimaryLogInvalid);
@@ -3050,6 +3060,7 @@ fn printUsage() void {
         \\  --ha-primary-log <path>               Enable HA primary WAL/admin API with this replication log path
         \\  --ha-primary-slots <path>             HA primary replication slot store path
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
+        \\  --ha-seed-capture-root <path>          Durable runtime-owned immutable seed generation root
         \\  --ha-fence-wal <path>                 Durable HA promotion fence WAL path
         \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
         \\  --ha-admin-token-env <name>           Require Authorization: Bearer token from this environment variable for {s}
@@ -3469,6 +3480,8 @@ test "parse cli accepts HA primary runtime flags" {
         "/tmp/ha-slots.wal",
         "--ha-primary-node-id",
         "primary-a",
+        "--ha-seed-capture-root",
+        "/tmp/ha-seed-captures",
         "--ha-fence-wal",
         "/tmp/ha-fence.wal",
         "--ha-former-primary-log",
@@ -3499,6 +3512,7 @@ test "parse cli accepts HA primary runtime flags" {
     try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_primary_log.?);
     try std.testing.expectEqualStrings("/tmp/ha-slots.wal", cfg.ha_primary_slots.?);
     try std.testing.expectEqualStrings("primary-a", cfg.ha_primary_node_id.?);
+    try std.testing.expectEqualStrings("/tmp/ha-seed-captures", cfg.ha_seed_capture_root.?);
     try std.testing.expectEqualStrings("/tmp/ha-fence.wal", cfg.ha_fence_wal.?);
     try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_former_primary_log.?);
     try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cfg.ha_admin_token_env.?);
@@ -3642,6 +3656,8 @@ test "parse cli accepts HA standby runtime flags" {
         "/tmp/ha-standby-progress.wal",
         "--ha-standby-node-id",
         "standby-a",
+        "--ha-seed-capture-root",
+        "/tmp/ha-seed-captures",
         "--ha-fence-wal",
         "/tmp/ha-fence.wal",
         "--ha-standby-upstream-url",
@@ -3668,6 +3684,7 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqualStrings("/tmp/ha-standby.log", cfg.ha_standby_log.?);
     try std.testing.expectEqualStrings("/tmp/ha-standby-progress.wal", cfg.ha_standby_progress.?);
     try std.testing.expectEqualStrings("standby-a", cfg.ha_standby_node_id.?);
+    try std.testing.expectEqualStrings("/tmp/ha-seed-captures", cfg.ha_seed_capture_root.?);
     try std.testing.expectEqualStrings("/tmp/ha-fence.wal", cfg.ha_fence_wal.?);
     try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", cfg.ha_standby_upstream_url.?);
     try std.testing.expectEqualStrings("standby-a", cfg.ha_standby_slot.?);

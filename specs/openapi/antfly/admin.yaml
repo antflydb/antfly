@@ -390,6 +390,54 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/base-backups/capture:
+    post:
+      tags: [ha]
+      operationId: captureHASeedArtifact
+      summary: Capture an immutable seed from runtime-owned primary storage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SeedArtifactCaptureRequest"
+      responses:
+        "200":
+          description: The runtime-owned seed generation is durably complete.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HASeedArtifactCaptureResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/base-backups/activate:
+    post:
+      tags: [ha]
+      operationId: activateHASeededSlot
+      summary: Activate a seeded slot after durable target-generation publication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SeededSlotActivateRequest"
+      responses:
+        "200":
+          description: The verified seed checkpoint is now streamable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HASeededSlotActivateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/standby/bootstrap:
     post:
       tags: [ha]
@@ -696,6 +744,61 @@ components:
           type: string
           nullable: true
           description: Optional absolute normalized pod-local directory containing files referenced by the manifest.
+    SeededSlotActivateRequest:
+      type: object
+      required:
+        - slot_name
+        - generation
+        - manifest_id
+        - timeline_id
+        - checkpoint_lsn
+        - seed_receipt_sha256
+        - manifest_sha256
+        - aggregate_sha256
+      additionalProperties: false
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        manifest_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        seed_receipt_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        manifest_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        aggregate_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    SeedArtifactCaptureRequest:
+      type: object
+      required:
+        - slot_name
+        - generation
+      additionalProperties: false
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: "^[A-Za-z0-9_.:-]+$"
     HASyncPolicy:
       type: object
       required: [mode]
@@ -1107,6 +1210,8 @@ components:
             - replication_slot_drop
             - base_backup_begin
             - base_backup_finish
+            - seed_capture
+            - seeded_slot_activate
             - standby_bootstrap
             - fence_acquire
             - promotion_assess
@@ -1229,6 +1334,149 @@ components:
           format: uint64
           minimum: 1
           description: Standby checkpoint LSN after manifest validation.
+    HASeededSlotActivateResponse:
+      type: object
+      required:
+        - schema_version
+        - action
+        - slot_name
+        - generation
+        - manifest_id
+        - timeline_id
+        - checkpoint_lsn
+        - seed_receipt_sha256
+        - manifest_sha256
+        - aggregate_sha256
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+        manifest_id:
+          type: string
+          minLength: 1
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        seed_receipt_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        manifest_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        aggregate_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    HASeedArtifactCaptureResponse:
+      type: object
+      required:
+        - schema_version
+        - action
+        - slot_name
+        - generation
+        - cluster_id
+        - shard_id
+        - table_id
+        - timeline_id
+        - epoch
+        - manifest_id
+        - source_plan_sha256
+        - backup_lsn
+        - checkpoint_lsn
+        - end_record_lsn
+        - manifest_sha256
+        - file_count
+        - total_bytes
+        - generation_root
+        - content_root
+        - manifest_path
+        - already_captured
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+        cluster_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+        table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        manifest_id:
+          type: string
+          minLength: 1
+        source_plan_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        end_record_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        manifest_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        file_count:
+          type: integer
+          format: uint64
+          minimum: 1
+        total_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+        generation_root:
+          type: string
+          pattern: "^/.*"
+        content_root:
+          type: string
+          pattern: "^/.*"
+        manifest_path:
+          type: string
+          pattern: "^/.*"
+        already_captured:
+          type: boolean
     HAFenceResponse:
       type: object
       required: [schema_version, action, receipt]

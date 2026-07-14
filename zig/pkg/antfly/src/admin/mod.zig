@@ -22,7 +22,9 @@ pub const ServerRouter = openapi.ServerRouter;
 pub const ReplicationSlotCreateRequest = openapi.ReplicationSlotCreateRequest;
 pub const BaseBackupStartRequest = openapi.BaseBackupStartRequest;
 pub const BaseBackupManifestPathRequest = openapi.BaseBackupManifestPathRequest;
+pub const SeedArtifactCaptureRequest = openapi.SeedArtifactCaptureRequest;
 pub const StandbyBootstrapRequest = openapi.StandbyBootstrapRequest;
+pub const SeededSlotActivateRequest = openapi.SeededSlotActivateRequest;
 pub const HASyncPolicy = openapi.HASyncPolicy;
 pub const CommitCheckRequest = openapi.CommitCheckRequest;
 pub const CommitAppendRequest = openapi.CommitAppendRequest;
@@ -46,7 +48,9 @@ pub const HAReplicationSlotActionResponse = openapi.HAReplicationSlotActionRespo
 pub const HAReplicationSlotListResponse = openapi.HAReplicationSlotListResponse;
 pub const HABaseBackupBeginResponse = openapi.HABaseBackupBeginResponse;
 pub const HABaseBackupFinishResponse = openapi.HABaseBackupFinishResponse;
+pub const HASeedArtifactCaptureResponse = openapi.HASeedArtifactCaptureResponse;
 pub const HAStandbyBootstrapResponse = openapi.HAStandbyBootstrapResponse;
+pub const HASeededSlotActivateResponse = openapi.HASeededSlotActivateResponse;
 pub const HAFenceResponse = openapi.HAFenceResponse;
 pub const HACurrentFenceResponse = openapi.HACurrentFenceResponse;
 pub const HAPromotionAssessResponse = openapi.HAPromotionAssessResponse;
@@ -226,6 +230,7 @@ const ha_contract_type_names = [_][]const u8{
     "BaseBackupStartRequest",
     "BaseBackupManifestPathRequest",
     "StandbyBootstrapRequest",
+    "SeededSlotActivateRequest",
     "HASyncPolicy",
     "CommitCheckRequest",
     "CommitAppendRequest",
@@ -249,6 +254,7 @@ const ha_contract_type_names = [_][]const u8{
     "HABaseBackupBeginResponse",
     "HABaseBackupFinishResponse",
     "HAStandbyBootstrapResponse",
+    "HASeededSlotActivateResponse",
     "HAFenceResponse",
     "HACurrentFenceResponse",
     "HAPromotionAssessResponse",

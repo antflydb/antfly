@@ -1091,7 +1091,7 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 			"--generation", "base-standby-a-10",
 			"--slot", "standby-a",
 			"--staging-root", "/target/seed/staging",
-			"--target-root", "/target",
+			"--target-root", "/target/.antfly-ha/active",
 			"--ha-cluster-id", "100",
 			"--ha-shard-id", "0",
 			"--ha-table-id", "0",
@@ -1141,6 +1141,10 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 			Location:         "s3://ha-seeds/cluster-a",
 			GenerationPrefix: "base",
 			StagingRoot:      "/target/.antfly-ha/staging",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{
+				ClaimName: "primary-a-data",
+				MountPath: "/antflydb",
+			},
 			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{
 				ClaimName: "standby-a-data",
 				MountPath: "/target",
@@ -1151,14 +1155,11 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 	actions := cluster.Status.HAStatus.PlannedActions
 	wantKinds := []string{
-		string(haActionCreateSlot),
-		string(haActionSeedStandby),
-		"CaptureSeedArtifact",
-		string(haActionFinishStandbySeed),
+		string(haActionCaptureSeedArtifact),
 		string(haActionPublishSeedArtifact),
 		string(haActionRestoreSeedArtifact),
-		"ActivateSeedArtifact",
-		string(haActionBootstrapStandbySeed),
+		string(haActionActivateSeedArtifact),
+		string(haActionActivateSeededSlot),
 		string(haActionPruneSeedArtifacts),
 	}
 	gotKinds := make([]string, len(actions))
@@ -1168,13 +1169,60 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 	if !reflect.DeepEqual(gotKinds, wantKinds) {
 		t.Fatalf("SEED_CAPTURE_MISSING: runtime-owned seed workflow requires %v without caller-provided manifest/content paths, got %v (%#v)", wantKinds, gotKinds, actions)
 	}
-	if actions[2].Executor != string(haActionExecutorAdminAPI) ||
-		actions[2].AdminURL != "http://primary-ha.default.svc:8081" {
-		t.Fatalf("SEED_CAPTURE_NOT_RUNTIME_OWNED: capture must execute in the mounted primary runtime, got %#v", actions[2])
+	if actions[0].Executor != string(haActionExecutorAdminAPI) ||
+		actions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
+		actions[0].AdminPath != "/admin/v1/ha/base-backups/capture" {
+		t.Fatalf("SEED_CAPTURE_NOT_RUNTIME_OWNED: capture must execute atomically in the mounted primary runtime, got %#v", actions[0])
 	}
-	if actions[6].Executor != string(haActionExecutorCLIJob) ||
-		actions[6].SeedArtifactGeneration != "base-standby-a-10" {
-		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[6])
+	if actions[3].Executor != string(haActionExecutorCLIJob) ||
+		actions[3].SeedArtifactGeneration != "base-standby-a-10" {
+		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[3])
+	}
+	digest := strings.Repeat("a", 64)
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = haAdminDirectAPIName
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion:          1,
+		ActionID:               "seed_capture:base-standby-a-10",
+		ActionKind:             "seed_capture",
+		ActionTarget:           "base-standby-a-10",
+		ActionState:            "applied",
+		ActionNodeID:           "primary-a",
+		SlotName:               "standby-a",
+		ManifestID:             "base-standby-a-10",
+		BackupLSN:              10,
+		CheckpointLSN:          10,
+		EndRecordLSN:           11,
+		SeedArtifactGeneration: "base-standby-a-10",
+		ManifestSHA256:         digest,
+		SeedClusterID:          100,
+		SeedTimelineID:         4,
+		SeedEpoch:              6,
+		SeedSourcePlanSHA256:   digest,
+		SeedFileCount:          2,
+		SeedTotalBytes:         20,
+		SeedGenerationRoot:     "/antflydb/ha/seed-captures/generations/base-standby-a-10",
+		SeedContentRoot:        "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
+		SeedManifestPath:       "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
+		SeedAlreadyCaptured:    false,
+	}
+	// Keep the synthetic planner fixture in the missing-standby state across the
+	// second reconcile; mergeConfiguredStandbys otherwise creates a placeholder
+	// observation that correctly plans ResumeSlot instead.
+	cluster.Status.HAStatus.Standbys = nil
+	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
+	publish := cluster.Status.HAStatus.PlannedActions[1]
+	if publish.SeedManifestPath != "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha" ||
+		publish.SeedContentRoot != "/antflydb/ha/seed-captures/generations/base-standby-a-10/content" ||
+		!reflect.DeepEqual(publish.AdminCommand, []string{
+			"artifact", "publish",
+			"--location", "s3://ha-seeds/cluster-a",
+			"--generation", "base-standby-a-10",
+			"--slot", "standby-a",
+			"--manifest", "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
+			"--content-root", "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
+		}) {
+		t.Fatalf("CAPTURE_OUTPUT_NOT_PUBLISHED: publish must consume exact runtime capture paths, got %#v", publish)
 	}
 }
 
@@ -1387,6 +1435,12 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 			operationID: "finishHABaseBackup",
 		},
 		{
+			name:        "activate seeded slot",
+			action:      haPlannedAction{Kind: haActionActivateSeededSlot, StandbyName: "standby-a", SlotName: "standby-a", SeedArtifactGeneration: "seed-standby-a-10"},
+			openAPIPath: "/ha/base-backups/activate",
+			operationID: "activateHASeededSlot",
+		},
+		{
 			name:        "bootstrap standby seed",
 			action:      haPlannedAction{Kind: haActionBootstrapStandbySeed, StandbyName: "standby-a"},
 			openAPIPath: "/ha/standby/bootstrap",
@@ -1470,6 +1524,8 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 		{method: "PUT", path: haAdminReplicationSlotPathPrefix + "{slot_name}" + haAdminReplicationSlotResumePathSuffix, operationID: "resumeHAReplicationSlot"},
 		{method: "POST", path: haAdminBaseBackupsPath, operationID: "beginHABaseBackup"},
 		{method: "POST", path: haAdminBaseBackupsFinishPath, operationID: "finishHABaseBackup"},
+		{method: "POST", path: haAdminBaseBackupsCapturePath, operationID: "captureHASeedArtifact"},
+		{method: "POST", path: haAdminBaseBackupsActivatePath, operationID: "activateHASeededSlot"},
 		{method: "POST", path: haAdminStandbyBootstrapPath, operationID: "bootstrapHAStandby"},
 		{method: "POST", path: haAdminFencePath, operationID: "acquireHAFence"},
 		{method: "GET", path: haAdminFenceCurrentPath, operationID: "getHACurrentFence"},

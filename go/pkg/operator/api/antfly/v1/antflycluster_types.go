@@ -735,6 +735,13 @@ type HARuntimeSpec struct {
 	// +optional
 	FormerPrimaryLogPath string `json:"formerPrimaryLogPath,omitempty"`
 
+	// SeedCaptureRoot is the durable node-local root used for immutable,
+	// runtime-owned point-in-time seed generations. It is configured on both
+	// primary and standby roles so an in-place promoted standby can seed its
+	// replacement without restarting. Defaults to /antflydb/ha/seed-captures.
+	// +optional
+	SeedCaptureRoot string `json:"seedCaptureRoot,omitempty"`
+
 	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
 	// When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
 	// Populate it with adminTokenSecretRef or spec.swarm.envFrom for Antfly runtime pods and CLI fallback Jobs.
@@ -1837,6 +1844,10 @@ type HAPlannedActionStatus struct {
 	// +optional
 	SeedContentRoot string `json:"seedContentRoot,omitempty"`
 
+	// SeedArtifactTargetRoot is the target PVC root that owns immutable activated generations.
+	// +optional
+	SeedArtifactTargetRoot string `json:"seedArtifactTargetRoot,omitempty"`
+
 	// SeedArtifactLocation is the object-store URI used by portable seed actions.
 	// +optional
 	SeedArtifactLocation string `json:"seedArtifactLocation,omitempty"`
@@ -1875,23 +1886,25 @@ type HAPlannedActionStatus struct {
 
 // HASeedArtifactReceiptStatus summarizes a durable portable seed receipt.
 type HASeedArtifactReceiptStatus struct {
-	FormatVersion   int32  `json:"formatVersion"`
-	Generation      string `json:"generation"`
-	SlotName        string `json:"slotName"`
-	ClusterID       uint64 `json:"clusterID,omitempty"`
-	ShardID         uint64 `json:"shardID,omitempty"`
-	TableID         uint64 `json:"tableID,omitempty"`
-	TimelineID      uint64 `json:"timelineID,omitempty"`
-	Epoch           uint64 `json:"epoch,omitempty"`
-	ManifestID      string `json:"manifestID,omitempty"`
-	BackupLSN       uint64 `json:"backupLSN,omitempty"`
-	CheckpointLSN   uint64 `json:"checkpointLSN,omitempty"`
-	ManifestSHA256  string `json:"manifestSHA256,omitempty"`
-	AggregateSHA256 string `json:"aggregateSHA256,omitempty"`
-	TotalBytes      uint64 `json:"totalBytes,omitempty"`
-	FileCount       int32  `json:"fileCount,omitempty"`
-	RetainedCount   int32  `json:"retainedCount,omitempty"`
-	DeletedCount    int32  `json:"deletedCount,omitempty"`
+	FormatVersion     int32  `json:"formatVersion"`
+	Generation        string `json:"generation"`
+	SlotName          string `json:"slotName"`
+	ClusterID         uint64 `json:"clusterID,omitempty"`
+	ShardID           uint64 `json:"shardID,omitempty"`
+	TableID           uint64 `json:"tableID,omitempty"`
+	TimelineID        uint64 `json:"timelineID,omitempty"`
+	Epoch             uint64 `json:"epoch,omitempty"`
+	ManifestID        string `json:"manifestID,omitempty"`
+	BackupLSN         uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN     uint64 `json:"checkpointLSN,omitempty"`
+	ManifestSHA256    string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256   string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256 string `json:"seedReceiptSHA256,omitempty"`
+	GenerationPath    string `json:"generationPath,omitempty"`
+	TotalBytes        uint64 `json:"totalBytes,omitempty"`
+	FileCount         int32  `json:"fileCount,omitempty"`
+	RetainedCount     int32  `json:"retainedCount,omitempty"`
+	DeletedCount      int32  `json:"deletedCount,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
@@ -1947,6 +1960,47 @@ type HAAdminActionResultStatus struct {
 	// CheckpointLSN is the standby checkpoint LSN returned by seed bootstrap.
 	// +optional
 	CheckpointLSN uint64 `json:"checkpointLSN,omitempty"`
+
+	// SeedArtifactGeneration binds a slot activation receipt to an immutable target generation.
+	// +optional
+	SeedArtifactGeneration string `json:"seedArtifactGeneration,omitempty"`
+
+	// SeedReceiptSHA256 binds slot activation to the durable target activation receipt.
+	// +optional
+	SeedReceiptSHA256 string `json:"seedReceiptSHA256,omitempty"`
+
+	// ManifestSHA256 and AggregateSHA256 preserve the verified artifact digest evidence.
+	// +optional
+	ManifestSHA256 string `json:"manifestSHA256,omitempty"`
+	// +optional
+	AggregateSHA256 string `json:"aggregateSHA256,omitempty"`
+
+	// Runtime-owned seed capture evidence and the primary-PVC paths consumed by
+	// the dependent publish action.
+	// +optional
+	SeedClusterID uint64 `json:"seedClusterID,omitempty"`
+	// +optional
+	SeedShardID uint64 `json:"seedShardID,omitempty"`
+	// +optional
+	SeedTableID uint64 `json:"seedTableID,omitempty"`
+	// +optional
+	SeedTimelineID uint64 `json:"seedTimelineID,omitempty"`
+	// +optional
+	SeedEpoch uint64 `json:"seedEpoch,omitempty"`
+	// +optional
+	SeedSourcePlanSHA256 string `json:"seedSourcePlanSHA256,omitempty"`
+	// +optional
+	SeedFileCount uint64 `json:"seedFileCount,omitempty"`
+	// +optional
+	SeedTotalBytes uint64 `json:"seedTotalBytes,omitempty"`
+	// +optional
+	SeedGenerationRoot string `json:"seedGenerationRoot,omitempty"`
+	// +optional
+	SeedContentRoot string `json:"seedContentRoot,omitempty"`
+	// +optional
+	SeedManifestPath string `json:"seedManifestPath,omitempty"`
+	// +optional
+	SeedAlreadyCaptured bool `json:"seedAlreadyCaptured,omitempty"`
 
 	// PromotionRequiredLSN is the minimum LSN checked by a promotion assessment.
 	// +optional

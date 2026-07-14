@@ -312,8 +312,20 @@ pub const Primary = struct {
         const state = self.slots.get(name) orelse return error.SlotNotFound;
         if (state.timeline_id != timeline_id) return error.WrongTimeline;
         if (received_lsn > self.lastLsn()) return error.StandbyAheadOfPrimary;
+        if (state.lifecycle == .streaming) {
+            if (!state.active or state.reseed_required or
+                state.received_lsn < received_lsn or
+                state.applied_lsn < applied_lsn or
+                state.safe_read_lsn < safe_read_lsn)
+            {
+                return error.SeedActivationMismatch;
+            }
+            return;
+        }
         const checkpoint_lsn = try self.completedSeedCheckpoint(state, name);
-        if (received_lsn < checkpoint_lsn or applied_lsn < checkpoint_lsn) return error.SeedBehindCheckpoint;
+        if (received_lsn != checkpoint_lsn or applied_lsn != checkpoint_lsn or safe_read_lsn != checkpoint_lsn) {
+            return error.SeedCheckpointMismatch;
+        }
         try self.slots.activateSeeded(name, received_lsn, applied_lsn, safe_read_lsn);
     }
 
@@ -1303,7 +1315,7 @@ test "storage.ha primary ends base backup with decodable manifest payload" {
     // Verification of the restored checkpoint, not backup publication, is the
     // event that makes this slot streamable.
     try std.testing.expectError(
-        error.SeedBehindCheckpoint,
+        error.SeedCheckpointMismatch,
         primary.activateSeededSlot("standby-a", identity.timeline_id, 2, 1, 1),
     );
     try primary.activateSeededSlot("standby-a", identity.timeline_id, 2, 2, 2);

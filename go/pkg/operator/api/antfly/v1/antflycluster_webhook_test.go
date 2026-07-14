@@ -1937,6 +1937,33 @@ func TestValidateCreate_HighAvailabilityAllowsPortableSeedArtifact(t *testing.T)
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRolePrimary, NodeID: "primary-a",
+			SeedCaptureRoot: "/antflydb/ha/seed-captures",
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location:    "s3://ha-seeds/cluster-a",
+				StagingRoot: "/target/.antfly-ha/staging",
+				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb"},
+				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected runtime-owned seed capture configuration to be valid, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsUnsafeSeedArtifact(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
@@ -1964,8 +1991,8 @@ func TestValidateCreate_HighAvailabilityRejectsUnsafeSeedArtifact(t *testing.T) 
 		"seedArtifact.credentialsSecretRef.name must not have leading or trailing whitespace",
 		"seedArtifact.targetPVC.claimName must not have leading or trailing whitespace",
 		"seedArtifact.targetPVC.mountPath must be an absolute normalized path",
-		"seedManifestPath is required when seedArtifact is set",
-		"seedContentRoot is required when seedArtifact is set",
+		"runtime-owned seed capture requires runtime.role Primary",
+		"seedArtifact.sourcePVC is required for runtime-owned seed publication",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("expected portable seed validation error containing %q, got: %v", want, err)

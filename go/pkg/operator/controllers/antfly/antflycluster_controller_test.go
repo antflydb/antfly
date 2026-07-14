@@ -3521,6 +3521,144 @@ func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials
 	g.Expect(activateJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
 }
 
+func TestExecuteActivateSeededSlotUsesExactTargetActivationReceipt(t *testing.T) {
+	g := NewWithT(t)
+	digest := strings.Repeat("a", 64)
+	dependency := antflyv1.HAPlannedActionStatus{
+		Kind:                   string(haActionActivateSeedArtifact),
+		Executor:               string(haActionExecutorCLIJob),
+		SlotName:               "standby-a",
+		TargetLSN:              10,
+		SeedArtifactGeneration: "seed-standby-a-10",
+		AdminJobName:           "activation-job",
+		AdminJobPhase:          haAdminJobPhaseSucceeded,
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion:     1,
+			Generation:        "seed-standby-a-10",
+			SlotName:          "standby-a",
+			ClusterID:         100,
+			TimelineID:        4,
+			Epoch:             6,
+			ManifestID:        "base-standby-a-10",
+			BackupLSN:         10,
+			CheckpointLSN:     12,
+			SeedReceiptSHA256: digest,
+			ManifestSHA256:    digest,
+			AggregateSHA256:   digest,
+			GenerationPath:    "generations/seed-standby-a-10",
+		},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:                   string(haActionActivateSeededSlot),
+		Executor:               string(haActionExecutorAdminAPI),
+		DependsOn:              string(haActionActivateSeedArtifact),
+		SlotName:               "standby-a",
+		TargetLSN:              10,
+		SeedArtifactGeneration: "seed-standby-a-10",
+		AdminURL:               "http://primary-ha.default.svc:8081",
+		AdminNodeID:            "primary-a",
+		AdminMethod:            http.MethodPost,
+		AdminPath:              haAdminBaseBackupsActivatePath,
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Identity: &antflyv1.HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a"},
+		}},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{dependency, action}}},
+	}
+	requests := 0
+	reconciler := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		g.Expect(req.Method).To(Equal(http.MethodPost))
+		g.Expect(req.URL.Path).To(Equal(haAdminBaseBackupsActivatePath))
+		var body adminsdk.SeededSlotActivateRequest
+		g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
+		g.Expect(body.SlotName).To(Equal("standby-a"))
+		g.Expect(body.Generation).To(Equal("seed-standby-a-10"))
+		g.Expect(body.ManifestId).To(Equal("base-standby-a-10"))
+		g.Expect(body.TimelineId).To(Equal(uint64(4)))
+		g.Expect(body.CheckpointLsn).To(Equal(uint64(12)))
+		g.Expect(body.SeedReceiptSha256).To(Equal(digest))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"schema_version":1,"action":{"action_id":"seeded_slot_activate:seed-standby-a-10","action_kind":"seeded_slot_activate","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","manifest_id":"base-standby-a-10","timeline_id":4,"checkpoint_lsn":12,"seed_receipt_sha256":"%s","manifest_sha256":"%s","aggregate_sha256":"%s"}`,
+				digest, digest, digest,
+			))),
+		}, nil
+	})}}
+
+	handled, err := reconciler.executeHAPlannedActionTyped(context.Background(), cluster, &action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(handled).To(BeTrue())
+	g.Expect(requests).To(Equal(1))
+	g.Expect(action.AdminResult).NotTo(BeNil())
+	g.Expect(action.AdminResult.CheckpointLSN).To(Equal(uint64(12)))
+	g.Expect(action.AdminResult.SeedArtifactGeneration).To(Equal("seed-standby-a-10"))
+
+	cluster.Status.HAStatus.PlannedActions[0].SeedArtifactReceipt.TimelineID = 5
+	requests = 0
+	action.AdminResult = nil
+	handled, err = reconciler.executeHAPlannedActionTyped(context.Background(), cluster, &action)
+	g.Expect(handled).To(BeTrue())
+	g.Expect(err).To(MatchError(ContainSubstring("requires matching durable target activation evidence")))
+	g.Expect(requests).To(Equal(0))
+}
+
+func TestExecuteCaptureSeedArtifactUsesRuntimeOwnedTypedEndpoint(t *testing.T) {
+	g := NewWithT(t)
+	digest := strings.Repeat("a", 64)
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:                   string(haActionCaptureSeedArtifact),
+		Executor:               string(haActionExecutorAdminAPI),
+		StandbyName:            "standby-a",
+		SlotName:               "standby-a",
+		TargetLSN:              10,
+		SeedArtifactGeneration: "seed-standby-a-10",
+		AdminURL:               "http://primary-ha.default.svc:8081",
+		AdminNodeID:            "primary-a",
+		AdminMethod:            http.MethodPost,
+		AdminPath:              haAdminBaseBackupsCapturePath,
+	}
+	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{HighAvailability: &antflyv1.HighAvailabilitySpec{
+		Identity: &antflyv1.HAReplicationIdentitySpec{ClusterID: 100, ShardID: 2, TableID: 3, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a"},
+	}}}
+	requests := 0
+	timeline := uint64(4)
+	reconciler := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		g.Expect(req.Method).To(Equal(http.MethodPost))
+		g.Expect(req.URL.Path).To(Equal(haAdminBaseBackupsCapturePath))
+		var body adminsdk.SeedArtifactCaptureRequest
+		g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
+		g.Expect(body).To(Equal(adminsdk.SeedArtifactCaptureRequest{SlotName: "standby-a", Generation: "seed-standby-a-10"}))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"schema_version":1,"action":{"action_id":"seed_capture:seed-standby-a-10","action_kind":"seed_capture","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","cluster_id":100,"shard_id":2,"table_id":3,"timeline_id":%d,"epoch":6,"manifest_id":"seed-standby-a-10","source_plan_sha256":"%s","backup_lsn":10,"checkpoint_lsn":10,"end_record_lsn":11,"manifest_sha256":"%s","file_count":2,"total_bytes":20,"generation_root":"/antflydb/ha/seed-captures/generations/seed-standby-a-10","content_root":"/antflydb/ha/seed-captures/generations/seed-standby-a-10/content","manifest_path":"/antflydb/ha/seed-captures/generations/seed-standby-a-10/manifest.afha","already_captured":false}`,
+				timeline, digest, digest,
+			))),
+		}, nil
+	})}}
+
+	handled, err := reconciler.executeHAPlannedActionTyped(context.Background(), cluster, &action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(handled).To(BeTrue())
+	g.Expect(requests).To(Equal(1))
+	g.Expect(action.AdminResult).NotTo(BeNil())
+	g.Expect(action.AdminResult.SeedManifestPath).To(Equal("/antflydb/ha/seed-captures/generations/seed-standby-a-10/manifest.afha"))
+	g.Expect(action.AdminResult.SeedContentRoot).To(Equal("/antflydb/ha/seed-captures/generations/seed-standby-a-10/content"))
+
+	timeline = 5
+	action.AdminResult = nil
+	handled, err = reconciler.executeHAPlannedActionTyped(context.Background(), cluster, &action)
+	g.Expect(handled).To(BeTrue())
+	g.Expect(err).To(MatchError(ContainSubstring("does not match the planned runtime-owned generation and identity")))
+	g.Expect(action.AdminResult).To(BeNil())
+}
+
 func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	g := NewWithT(t)
 
@@ -5257,6 +5395,25 @@ func TestHAAdminSDKActionResultsSatisfyOperatorEvidenceGates(t *testing.T) {
 	})
 	g.Expect(requireHADirectAdminActionResultStatus(&finishAction, seedFinish)).To(Succeed())
 	g.Expect(finishAction.AdminResult.EndRecordLSN).To(Equal(uint64(7)))
+
+	digest := strings.Repeat("a", 64)
+	activateAction := directPrimaryAction(haActionActivateSeededSlot)
+	activateAction.SeedArtifactGeneration = "seed-standby-a-5"
+	activation := haAdminActionResultFromSeededSlotActivateSDK(adminsdk.HASeededSlotActivateResponse{
+		SchemaVersion:     1,
+		Action:            receipt(adminsdk.HAActionKindSeededSlotActivate, "seed-standby-a-5", string(adminsdk.HAActionStateApplied), "primary-a"),
+		SlotName:          "standby-a",
+		Generation:        "seed-standby-a-5",
+		ManifestId:        "base-standby-a-5",
+		TimelineId:        4,
+		CheckpointLsn:     7,
+		SeedReceiptSha256: digest,
+		ManifestSha256:    digest,
+		AggregateSha256:   digest,
+	})
+	g.Expect(requireHADirectAdminActionResultStatus(&activateAction, activation)).To(Succeed())
+	g.Expect(activateAction.AdminResult.CheckpointLSN).To(Equal(uint64(7)))
+	g.Expect(activateAction.AdminResult.SeedArtifactGeneration).To(Equal("seed-standby-a-5"))
 
 	bootstrapAction := directPrimaryAction(haActionBootstrapStandbySeed)
 	bootstrapAction.AdminNodeID = "standby-a"
@@ -10179,6 +10336,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/primary.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/slots'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id 'primary-a'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/ha/seed-captures'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/ha/fence.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/primary.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
@@ -10235,6 +10393,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/standby.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id 'standby-a'`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/ha/seed-captures'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/custom/fence.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/custom/former-primary.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))

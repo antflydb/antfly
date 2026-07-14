@@ -35,6 +35,7 @@ const read_gate = @import("read_gate.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const rejoin = @import("rejoin.zig");
+const seed_capture = @import("seed_capture.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
@@ -91,10 +92,44 @@ pub const Server = struct {
         }
     };
 
+    /// Runtime-owned capture deliberately bypasses the generic state-mutex
+    /// wrapper below. Its callback acquires the mutation barrier first and the
+    /// HA state mutex second, preserving the process-wide lock order.
+    pub const SeedCaptureResult = struct {
+        capture: seed_capture.CaptureResult,
+        node_id: []u8,
+
+        pub fn deinit(self: *SeedCaptureResult, alloc: Allocator) void {
+            self.capture.deinit(alloc);
+            alloc.free(self.node_id);
+            self.* = undefined;
+        }
+    };
+
+    pub const SeedCaptureHook = struct {
+        ptr: *anyopaque,
+        run_fn: *const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            slot_name: []const u8,
+            generation: []const u8,
+        ) anyerror!SeedCaptureResult,
+
+        pub fn run(
+            self: SeedCaptureHook,
+            alloc: Allocator,
+            slot_name: []const u8,
+            generation: []const u8,
+        ) !SeedCaptureResult {
+            return self.run_fn(self.ptr, alloc, slot_name, generation);
+        }
+    };
+
     pub const AuthOptions = struct {
         bearer_token: ?[]const u8 = null,
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
+        seed_capture: ?SeedCaptureHook = null,
         primary_fence_started: ?StateChangedHook = null,
         state_changed: ?StateChangedHook = null,
     };
@@ -131,6 +166,10 @@ pub const Server = struct {
         }
         if (req.method == .GET and std.mem.eql(u8, path, Routes.health)) {
             return try textResponse(self.alloc, 200, "ok");
+        }
+        if (req.method == .POST and std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture)) {
+            defer if (self.auth.state_changed) |hook| hook.run();
+            return try self.handleAdminCaptureSeedArtifact(req);
         }
         if (self.auth.state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
@@ -187,6 +226,9 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish)) {
                     return try self.handleAdminFinishBaseBackup(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate)) {
+                    return try self.handleAdminActivateSeededSlot(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap)) {
                     return try self.handleAdminBootstrapStandby(req);
@@ -638,6 +680,132 @@ pub const Server = struct {
             },
             else => unreachable,
         };
+    }
+
+    fn handleAdminCaptureSeedArtifact(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const hook = self.auth.seed_capture orelse return try textResponse(self.alloc, 409, "SeedCaptureUnavailable");
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA seed capture request");
+        var parsed = admin_api.server.parseCaptureHASeedArtifactBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA seed capture request");
+        defer parsed.deinit();
+        if (!validation.isIdentifier(parsed.value.slot_name) or
+            !validation.isIdentifier(parsed.value.generation))
+        {
+            return try textResponse(self.alloc, 400, "invalid HA seed capture identity");
+        }
+
+        var result = hook.run(
+            self.alloc,
+            parsed.value.slot_name,
+            parsed.value.generation,
+        ) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        defer result.deinit(self.alloc);
+        var receipt = std.json.parseFromSlice(
+            seed_capture.CaptureReceipt,
+            self.alloc,
+            result.capture.receipt_json,
+            .{ .ignore_unknown_fields = true },
+        ) catch return try textResponse(self.alloc, 500, "InvalidSeedCaptureReceipt");
+        defer receipt.deinit();
+        const value = receipt.value;
+        if (!std.mem.eql(u8, value.slot_name, parsed.value.slot_name) or
+            !std.mem.eql(u8, value.generation, parsed.value.generation) or
+            !validSha256Hex(value.source_plan_sha256) or
+            !validSha256Hex(value.manifest_sha256))
+        {
+            return try textResponse(self.alloc, 500, "InvalidSeedCaptureReceipt");
+        }
+
+        const action_id = try std.fmt.allocPrint(self.alloc, "seed_capture:{s}", .{value.generation});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HASeedArtifactCaptureResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "seed_capture",
+                .target = value.generation,
+                .state = if (result.capture.already_captured) "already_applied" else "applied",
+                .node_id = result.node_id,
+            },
+            .slot_name = value.slot_name,
+            .generation = value.generation,
+            .cluster_id = try adminI64(value.cluster_id),
+            .shard_id = try adminI64(value.shard_id),
+            .table_id = try adminI64(value.table_id),
+            .timeline_id = try adminI64(value.timeline_id),
+            .epoch = try adminI64(value.epoch),
+            .manifest_id = value.manifest_id,
+            .source_plan_sha256 = value.source_plan_sha256,
+            .backup_lsn = try adminI64(value.backup_lsn),
+            .checkpoint_lsn = try adminI64(value.checkpoint_lsn),
+            .end_record_lsn = try adminI64(value.end_record_lsn),
+            .manifest_sha256 = value.manifest_sha256,
+            .file_count = try adminI64(@intCast(value.file_count)),
+            .total_bytes = try adminI64(value.total_bytes),
+            .generation_root = result.capture.generation_root,
+            .content_root = result.capture.content_root,
+            .manifest_path = result.capture.manifest_path,
+            .already_captured = result.capture.already_captured,
+        });
+    }
+
+    fn handleAdminActivateSeededSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA seeded slot activation request");
+        var parsed = admin_api.server.parseActivateHASeededSlotBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA seeded slot activation request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (!validation.isIdentifier(request.slot_name) or
+            !validation.isIdentifier(request.generation) or
+            request.manifest_id.len == 0 or
+            !validSha256Hex(request.seed_receipt_sha256) or
+            !validSha256Hex(request.manifest_sha256) or
+            !validSha256Hex(request.aggregate_sha256))
+        {
+            return try textResponse(self.alloc, 400, "invalid HA seeded slot activation evidence");
+        }
+        const timeline_id = positiveUint64FromJson(request.timeline_id) catch
+            return try textResponse(self.alloc, 400, "invalid HA seeded slot activation timeline");
+        const checkpoint_lsn = positiveUint64FromJson(request.checkpoint_lsn) catch
+            return try textResponse(self.alloc, 400, "invalid HA seeded slot activation checkpoint");
+        const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
+        const already_applied = if (primary.slot(request.slot_name)) |slot|
+            slot.lifecycle == .streaming and slot.active and !slot.reseed_required and
+                slot.timeline_id == timeline_id and slot.received_lsn >= checkpoint_lsn and
+                slot.applied_lsn >= checkpoint_lsn and slot.safe_read_lsn >= checkpoint_lsn
+        else
+            false;
+
+        ha_admin.activateSeededSlot(primary, request.slot_name, timeline_id, checkpoint_lsn) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        const action_id = try std.fmt.allocPrint(self.alloc, "seeded_slot_activate:{s}", .{request.generation});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HASeededSlotActivateResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "seeded_slot_activate",
+                .target = request.generation,
+                .state = if (already_applied) "already_applied" else "applied",
+                .node_id = node_id,
+            },
+            .slot_name = request.slot_name,
+            .generation = request.generation,
+            .manifest_id = request.manifest_id,
+            .timeline_id = request.timeline_id,
+            .checkpoint_lsn = request.checkpoint_lsn,
+            .seed_receipt_sha256 = request.seed_receipt_sha256,
+            .manifest_sha256 = request.manifest_sha256,
+            .aggregate_sha256 = request.aggregate_sha256,
+        });
     }
 
     fn handleAdminBootstrapStandby(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -1531,6 +1699,8 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_replication_slots) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish) or
+        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture) or
+        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or
@@ -1870,6 +2040,14 @@ fn hexValue(byte: u8) ?u8 {
         'A'...'F' => byte - 'A' + 10,
         else => null,
     };
+}
+
+fn validSha256Hex(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
+    }
+    return true;
 }
 
 fn uint64Text(raw: []const u8) !u64 {
@@ -3215,6 +3393,40 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try expectContains(typed_finish.body, "\"action_id\":\"base_backup_finish:base-http\"");
     try expectContains(typed_finish.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_finish.body, "\"end_record_lsn\":3");
+
+    const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const activate_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"slot_name\":\"standby-seed\",\"generation\":\"seed-standby-seed-1\",\"manifest_id\":\"base-http\",\"timeline_id\":1,\"checkpoint_lsn\":2,\"seed_receipt_sha256\":\"{s}\",\"manifest_sha256\":\"{s}\",\"aggregate_sha256\":\"{s}\"}}",
+        .{ digest, digest, digest },
+    );
+    defer alloc.free(activate_body);
+    var typed_activate = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_base_backups_activate,
+        .content_type = "application/json",
+        .body = activate_body,
+    });
+    defer typed_activate.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_activate.status);
+    try expectContains(typed_activate.body, "\"action_kind\":\"seeded_slot_activate\"");
+    try expectContains(typed_activate.body, "\"action_id\":\"seeded_slot_activate:seed-standby-seed-1\"");
+    try expectContains(typed_activate.body, "\"target\":\"seed-standby-seed-1\"");
+    try expectContains(typed_activate.body, "\"state\":\"applied\"");
+    try expectContains(typed_activate.body, "\"checkpoint_lsn\":2");
+    const activated = primary.slot("standby-seed") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(slot_store.SlotLifecycle.streaming, activated.lifecycle);
+    try std.testing.expect(activated.active);
+
+    var typed_activate_retry = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_base_backups_activate,
+        .content_type = "application/json",
+        .body = activate_body,
+    });
+    defer typed_activate_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_activate_retry.status);
+    try expectContains(typed_activate_retry.body, "\"state\":\"already_applied\"");
 
     const bootstrap_body = try std.fmt.allocPrint(
         alloc,

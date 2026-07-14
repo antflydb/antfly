@@ -342,6 +342,43 @@ pub const HARetentionSnapshot = struct {
     reseed_recommended: i64,
 };
 
+pub const HASeedArtifactCaptureResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    slot_name: HASlotName,
+    generation: []const u8,
+    cluster_id: i64,
+    shard_id: i64,
+    table_id: i64,
+    timeline_id: i64,
+    epoch: i64,
+    manifest_id: []const u8,
+    source_plan_sha256: []const u8,
+    backup_lsn: i64,
+    checkpoint_lsn: i64,
+    end_record_lsn: i64,
+    manifest_sha256: []const u8,
+    file_count: i64,
+    total_bytes: i64,
+    generation_root: []const u8,
+    content_root: []const u8,
+    manifest_path: []const u8,
+    already_captured: bool,
+};
+
+pub const HASeededSlotActivateResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    slot_name: HASlotName,
+    generation: []const u8,
+    manifest_id: []const u8,
+    timeline_id: i64,
+    checkpoint_lsn: i64,
+    seed_receipt_sha256: []const u8,
+    manifest_sha256: []const u8,
+    aggregate_sha256: []const u8,
+};
+
 /// Stable standby replication slot name.
 pub const HASlotName = []const u8;
 
@@ -465,6 +502,22 @@ pub const ReplicationSlotCreateRequest = struct {
     slot_name: HASlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
     initial_lsn: ?i64 = null,
+};
+
+pub const SeedArtifactCaptureRequest = struct {
+    slot_name: HASlotName,
+    generation: []const u8,
+};
+
+pub const SeededSlotActivateRequest = struct {
+    slot_name: HASlotName,
+    generation: []const u8,
+    manifest_id: []const u8,
+    timeline_id: i64,
+    checkpoint_lsn: i64,
+    seed_receipt_sha256: []const u8,
+    manifest_sha256: []const u8,
+    aggregate_sha256: []const u8,
 };
 
 pub const StandbyBootstrapRequest = struct {

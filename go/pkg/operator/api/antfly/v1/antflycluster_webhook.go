@@ -1189,13 +1189,28 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if artifact := standby.SeedArtifact; artifact != nil {
 			fieldPath := fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact", i)
 			errors = append(errors, validateHASeedArtifact(artifact, fieldPath)...)
-			if strings.TrimSpace(standby.SeedManifestPath) == "" {
-				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedArtifact is set", i))
+			hasManifest := strings.TrimSpace(standby.SeedManifestPath) != ""
+			hasContent := strings.TrimSpace(standby.SeedContentRoot) != ""
+			if hasManifest != hasContent {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath and seedContentRoot must either both be set or both be omitted for runtime-owned capture", i))
 			}
-			if strings.TrimSpace(standby.SeedContentRoot) == "" {
-				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot is required when seedArtifact is set", i))
+			if !hasManifest && !hasContent {
+				if ha.Runtime == nil || ha.Runtime.Role != HARuntimeRolePrimary {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d] runtime-owned seed capture requires runtime.role Primary", i))
+				}
+				if artifact.SourcePVC == nil {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.sourcePVC is required for runtime-owned seed publication", i))
+				} else {
+					captureRoot := "/antflydb/ha/seed-captures"
+					if ha.Runtime != nil && strings.TrimSpace(ha.Runtime.SeedCaptureRoot) != "" {
+						captureRoot = ha.Runtime.SeedCaptureRoot
+					}
+					if !haPathWithinMount(captureRoot, artifact.SourcePVC.MountPath) {
+						errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d] runtime seedCaptureRoot must be within seedArtifact.sourcePVC.mountPath", i))
+					}
+				}
 			}
-			if artifact.SourcePVC != nil {
+			if artifact.SourcePVC != nil && hasManifest && hasContent {
 				if !haPathWithinMount(standby.SeedManifestPath, artifact.SourcePVC.MountPath) {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath must be within seedArtifact.sourcePVC.mountPath", i))
 				}
@@ -1479,6 +1494,7 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	}
 	runtime := ha.Runtime
 	var errors []string
+	errors = append(errors, validateHAOptionalPath(runtime.SeedCaptureRoot, "spec.highAvailability.runtime.seedCaptureRoot")...)
 	nodeID := strings.TrimSpace(runtime.NodeID)
 	currentPrimaryID := ""
 	if ha.Identity != nil {

@@ -1509,6 +1509,20 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 			}),
 		},
 		{
+			name: "capture seed artifact",
+			got:  HASeedCaptureOperation(),
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewCaptureHASeedArtifactRequest(server, oapi.CaptureHASeedArtifactJSONRequestBody{})
+			}),
+		},
+		{
+			name: "activate seeded slot",
+			got:  HAActivateSeededSlotOperation(),
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewActivateHASeededSlotRequest(server, oapi.ActivateHASeededSlotJSONRequestBody{})
+			}),
+		},
+		{
 			name: "bootstrap standby",
 			got:  HABootstrapStandbyOperation(),
 			generated: generatedHAOperation(func(server string) (*http.Request, error) {
@@ -1703,6 +1717,12 @@ func TestHAReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
 			name:      "finish base backup",
 			got:       HABaseBackupFinishReceiptExpectation(),
 			wantKind:  "base_backup_finish",
+			wantState: "applied",
+		},
+		{
+			name:      "capture seed artifact",
+			got:       HASeedCaptureReceiptExpectation(),
+			wantKind:  "seed_capture",
 			wantState: "applied",
 		},
 		{
@@ -1972,6 +1992,73 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 	finish.EndRecordLsn = 0
 	if err := ValidateHABaseBackupFinishResponse(finish); err == nil || !strings.Contains(err.Error(), "end_record_lsn") {
 		t.Fatalf("missing end_record_lsn error = %v, want end_record_lsn error", err)
+	}
+
+	digest := strings.Repeat("a", 64)
+	capture := HASeedArtifactCaptureResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "seed_capture:seed-standby-a-7",
+			ActionKind: HAActionKindSeedCapture,
+			Target:     "seed-standby-a-7",
+			State:      HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		SlotName:         "standby-a",
+		Generation:       "seed-standby-a-7",
+		ClusterId:        1,
+		TimelineId:       4,
+		Epoch:            2,
+		ManifestId:       "seed-standby-a-7",
+		SourcePlanSha256: digest,
+		BackupLsn:        7,
+		CheckpointLsn:    7,
+		EndRecordLsn:     8,
+		ManifestSha256:   digest,
+		FileCount:        2,
+		TotalBytes:       20,
+		GenerationRoot:   "/antflydb/ha/seed-captures/generations/seed-standby-a-7",
+		ContentRoot:      "/antflydb/ha/seed-captures/generations/seed-standby-a-7/content",
+		ManifestPath:     "/antflydb/ha/seed-captures/generations/seed-standby-a-7/manifest.afha",
+	}
+	if err := ValidateHASeedArtifactCaptureResponse(capture); err != nil {
+		t.Fatalf("ValidateHASeedArtifactCaptureResponse returned error: %v", err)
+	}
+	badCapture := capture
+	badCapture.SourcePlanSha256 = strings.ToUpper(digest)
+	if err := ValidateHASeedArtifactCaptureResponse(badCapture); err == nil || !strings.Contains(err.Error(), "digest") {
+		t.Fatalf("invalid capture digest error = %v, want digest error", err)
+	}
+
+	activation := HASeededSlotActivateResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "seeded_slot_activate:seed-standby-a-7",
+			ActionKind: HAActionKindSeededSlotActivate,
+			Target:     "seed-standby-a-7",
+			State:      HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		SlotName:          "standby-a",
+		Generation:        "seed-standby-a-7",
+		ManifestId:        "manifest-a",
+		TimelineId:        4,
+		CheckpointLsn:     10,
+		SeedReceiptSha256: digest,
+		ManifestSha256:    digest,
+		AggregateSha256:   digest,
+	}
+	if err := ValidateHASeededSlotActivateResponse(activation); err != nil {
+		t.Fatalf("ValidateHASeededSlotActivateResponse returned error: %v", err)
+	}
+	wrongActivationTarget := activation
+	wrongActivationTarget.Action.Target = "seed-standby-a-8"
+	if err := ValidateHASeededSlotActivateResponse(wrongActivationTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("wrong activation target error = %v, want receipt mismatch", err)
+	}
+	activation.SeedReceiptSha256 = strings.Repeat("A", 64)
+	if err := ValidateHASeededSlotActivateResponse(activation); err == nil || !strings.Contains(err.Error(), "digest") {
+		t.Fatalf("invalid activation digest error = %v, want digest error", err)
 	}
 
 	bootstrap := HAStandbyBootstrapResponse{

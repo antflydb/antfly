@@ -28,8 +28,11 @@ const (
 	haActionDropSlot             haActionKind = "DropSlot"
 	haActionSeedStandby          haActionKind = "SeedStandby"
 	haActionFinishStandbySeed    haActionKind = "FinishStandbySeed"
+	haActionCaptureSeedArtifact  haActionKind = "CaptureSeedArtifact"
 	haActionPublishSeedArtifact  haActionKind = "PublishSeedArtifact"
 	haActionRestoreSeedArtifact  haActionKind = "RestoreSeedArtifact"
+	haActionActivateSeedArtifact haActionKind = "ActivateSeedArtifact"
+	haActionActivateSeededSlot   haActionKind = "ActivateSeededSlot"
 	haActionBootstrapStandbySeed haActionKind = "BootstrapStandbySeed"
 	haActionPruneSeedArtifacts   haActionKind = "PruneSeedArtifacts"
 	haActionMarkReseed           haActionKind = "MarkReseed"
@@ -78,6 +81,8 @@ const (
 	haAdminReplicationSlotResumePathSuffix = adminsdk.HAReplicationSlotResumePathSuffix
 	haAdminBaseBackupsPath                 = adminsdk.HABaseBackupsPath
 	haAdminBaseBackupsFinishPath           = adminsdk.HABaseBackupsFinishPath
+	haAdminBaseBackupsCapturePath          = adminsdk.HABaseBackupsCapturePath
+	haAdminBaseBackupsActivatePath         = adminsdk.HABaseBackupsActivatePath
 	haAdminStandbyBootstrapPath            = adminsdk.HAStandbyBootstrapPath
 	haAdminFencePath                       = adminsdk.HAFencePath
 	haAdminFenceCurrentPath                = adminsdk.HAFenceCurrentPath
@@ -135,6 +140,7 @@ type haPlannedAction struct {
 	FenceReason            string
 	SeedManifestPath       string
 	SeedContentRoot        string
+	SeedArtifactTargetRoot string
 	SeedArtifactLocation   string
 	SeedArtifactGeneration string
 	SeedArtifactRetention  int32
@@ -705,6 +711,16 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			if seedTargetLSN == 0 {
 				continue
 			}
+			if haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+				plan.Actions = append(plan.Actions, haSeedCompletionActions(
+					standby,
+					slotName,
+					haSeedBeginTargetLSN(status.PrimaryLSN),
+					"StandbyNeedsBaseBackup",
+					"",
+				)...)
+				continue
+			}
 			plan.Actions = append(plan.Actions, haPlannedAction{
 				Kind:        haActionCreateSlot,
 				StandbyName: standby.Name,
@@ -743,6 +759,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			plan.ReseedRequiredCount++
 			if status.PrimaryLSN > 0 {
 				seedTargetLSN := haSeedBeginTargetLSN(status.PrimaryLSN)
+				if haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+					plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "SlotRequiresReseed", "")...)
+					continue
+				}
 				plan.Actions = append(plan.Actions, haPlannedAction{
 					Kind:        haActionMarkReseed,
 					StandbyName: standby.Name,
@@ -1003,6 +1023,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			out = append(out, *retainedAssessment)
 			retainedAssessment = nil
 		}
+		haBindSeedCaptureResultToPublish(&action, status)
 		adminMethod, adminPath := haAdminOperation(action)
 		statusAction := antflyv1.HAPlannedActionStatus{
 			Kind:                          string(action.Kind),
@@ -1022,6 +1043,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			FenceReason:                   action.FenceReason,
 			SeedManifestPath:              action.SeedManifestPath,
 			SeedContentRoot:               action.SeedContentRoot,
+			SeedArtifactTargetRoot:        action.SeedArtifactTargetRoot,
 			SeedArtifactLocation:          action.SeedArtifactLocation,
 			SeedArtifactGeneration:        action.SeedArtifactGeneration,
 			SeedArtifactRetainGenerations: action.SeedArtifactRetention,
@@ -1036,6 +1058,27 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		out = append(out, statusAction)
 	}
 	return out
+}
+
+func haBindSeedCaptureResultToPublish(action *haPlannedAction, status *antflyv1.HAStatus) {
+	if action == nil || status == nil || action.Kind != haActionPublishSeedArtifact ||
+		(strings.TrimSpace(action.SeedManifestPath) != "" || strings.TrimSpace(action.SeedContentRoot) != "") {
+		return
+	}
+	for i := range status.PlannedActions {
+		capture := status.PlannedActions[i]
+		if haActionKind(capture.Kind) != haActionCaptureSeedArtifact ||
+			strings.TrimSpace(capture.StandbyName) != strings.TrimSpace(action.StandbyName) ||
+			strings.TrimSpace(capture.SlotName) != strings.TrimSpace(action.SlotName) ||
+			strings.TrimSpace(capture.SeedArtifactGeneration) != strings.TrimSpace(action.SeedArtifactGeneration) ||
+			!haAdminActionSucceededWithEvidence(capture) || capture.AdminResult == nil {
+			continue
+		}
+		result := capture.AdminResult
+		action.SeedManifestPath = result.SeedManifestPath
+		action.SeedContentRoot = result.SeedContentRoot
+		return
+	}
 }
 
 func haRetainedFormerPrimaryAssessment(actions []haPlannedAction, status *antflyv1.HAStatus) *antflyv1.HAPlannedActionStatus {
@@ -1176,6 +1219,7 @@ func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.H
 		a.AdminPath == b.AdminPath &&
 		a.SeedManifestPath == b.SeedManifestPath &&
 		a.SeedContentRoot == b.SeedContentRoot &&
+		a.SeedArtifactTargetRoot == b.SeedArtifactTargetRoot &&
 		a.SeedArtifactLocation == b.SeedArtifactLocation &&
 		a.SeedArtifactGeneration == b.SeedArtifactGeneration &&
 		a.SeedArtifactRetainGenerations == b.SeedArtifactRetainGenerations &&
@@ -1398,7 +1442,7 @@ func haPlannedActionPhase(kind haActionKind) haActionPhase {
 		return haActionPhaseRoute
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return haActionPhaseRejoin
-	case haActionPublishSeedArtifact, haActionRestoreSeedArtifact, haActionPruneSeedArtifacts:
+	case haActionCaptureSeedArtifact, haActionPublishSeedArtifact, haActionRestoreSeedArtifact, haActionActivateSeedArtifact, haActionActivateSeededSlot, haActionPruneSeedArtifacts:
 		return haActionPhaseSeed
 	default:
 		return haActionPhaseReconcile
@@ -1418,6 +1462,7 @@ func haPlannedActionExecutor(kind haActionKind) haActionExecutor {
 func haPlannedActionKindIsPortableArtifact(kind haActionKind) bool {
 	return kind == haActionPublishSeedArtifact ||
 		kind == haActionRestoreSeedArtifact ||
+		kind == haActionActivateSeedArtifact ||
 		kind == haActionPruneSeedArtifacts
 }
 
@@ -1480,6 +1525,24 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--generation", action.SeedArtifactGeneration,
 			"--slot", action.SlotName,
 			"--staging-root", action.SeedContentRoot,
+			"--ha-cluster-id", strconv.FormatUint(identity.ClusterID, 10),
+			"--ha-shard-id", strconv.FormatUint(identity.ShardID, 10),
+			"--ha-table-id", strconv.FormatUint(identity.TableID, 10),
+			"--ha-timeline-id", strconv.FormatUint(identity.TimelineID, 10),
+			"--ha-epoch", strconv.FormatUint(identity.Epoch, 10),
+			"--minimum-checkpoint-lsn", strconv.FormatUint(action.TargetLSN, 10),
+		}
+	case haActionActivateSeedArtifact:
+		if identity == nil || action.SeedArtifactGeneration == "" || action.SeedContentRoot == "" ||
+			action.SeedArtifactTargetRoot == "" || action.SlotName == "" {
+			return nil
+		}
+		return []string{
+			"artifact", "activate",
+			"--generation", action.SeedArtifactGeneration,
+			"--slot", action.SlotName,
+			"--staging-root", action.SeedContentRoot,
+			"--target-root", action.SeedArtifactTargetRoot,
 			"--ha-cluster-id", strconv.FormatUint(identity.ClusterID, 10),
 			"--ha-shard-id", strconv.FormatUint(identity.ShardID, 10),
 			"--ha-table-id", strconv.FormatUint(identity.TableID, 10),
@@ -1693,7 +1756,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 		return ""
 	}
 	switch action.Kind {
-	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionCaptureSeedArtifact, haActionActivateSeededSlot, haActionMarkReseed:
 		return haCurrentPrimaryAdminURL(ha, status)
 	case haActionAcquireFence:
 		return haStandbyAdminURL(ha, action.StandbyName)
@@ -1743,7 +1806,7 @@ func haCurrentPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv
 
 func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
 	switch action.Kind {
-	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionCaptureSeedArtifact, haActionActivateSeededSlot, haActionMarkReseed:
 		return haCurrentPrimaryNodeID(ha, status)
 	case haActionAcquireFence, haActionBootstrapStandbySeed, haActionAssessPromotion, haActionPromoteStandby:
 		return strings.TrimSpace(action.StandbyName)
@@ -1792,6 +1855,10 @@ func haAdminOperation(action haPlannedAction) (string, string) {
 		operation = adminsdk.HABeginBaseBackupOperation()
 	case haActionFinishStandbySeed:
 		operation = adminsdk.HAFinishBaseBackupOperation()
+	case haActionCaptureSeedArtifact:
+		operation = adminsdk.HASeedCaptureOperation()
+	case haActionActivateSeededSlot:
+		operation = adminsdk.HAActivateSeededSlotOperation()
 	case haActionBootstrapStandbySeed:
 		operation = adminsdk.HABootstrapStandbyOperation()
 	case haActionAcquireFence:
@@ -1861,14 +1928,20 @@ func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplic
 }
 
 func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64, reason string, dependsOn haActionKind) []haPlannedAction {
-	if standby.SeedManifestPath == "" {
-		return nil
-	}
 	if artifact := standby.SeedArtifact; artifact != nil {
 		location := strings.TrimSpace(artifact.Location)
 		stagingRoot := strings.TrimRight(strings.TrimSpace(artifact.StagingRoot), "/")
 		contentRoot := strings.TrimSpace(standby.SeedContentRoot)
-		if location == "" || stagingRoot == "" || contentRoot == "" {
+		targetRoot := ""
+		if artifact.TargetPVC != nil {
+			targetMount := strings.TrimRight(strings.TrimSpace(artifact.TargetPVC.MountPath), "/")
+			if targetMount != "" {
+				targetRoot = targetMount + "/.antfly-ha/active"
+			}
+		}
+		runtimeOwned := strings.TrimSpace(standby.SeedManifestPath) == "" && contentRoot == ""
+		if location == "" || stagingRoot == "" || targetRoot == "" || targetRoot == "." ||
+			(runtimeOwned && artifact.SourcePVC == nil) {
 			return nil
 		}
 		prefix := strings.TrimSpace(artifact.GenerationPrefix)
@@ -1880,8 +1953,24 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 		if retention == 0 {
 			retention = 2
 		}
-		return []haPlannedAction{
-			{
+		actions := make([]haPlannedAction, 0, 6)
+		publishDependsOn := haActionFinishStandbySeed
+		if runtimeOwned {
+			actions = append(actions, haPlannedAction{
+				Kind:                   haActionCaptureSeedArtifact,
+				DependsOn:              dependsOn,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
+			})
+			publishDependsOn = haActionCaptureSeedArtifact
+		} else {
+			if standby.SeedManifestPath == "" || contentRoot == "" {
+				return nil
+			}
+			actions = append(actions, haPlannedAction{
 				Kind:             haActionFinishStandbySeed,
 				DependsOn:        dependsOn,
 				StandbyName:      standby.Name,
@@ -1890,10 +1979,12 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 				SeedManifestPath: standby.SeedManifestPath,
 				SeedContentRoot:  contentRoot,
 				Reason:           reason,
-			},
-			{
+			})
+		}
+		actions = append(actions,
+			haPlannedAction{
 				Kind:                   haActionPublishSeedArtifact,
-				DependsOn:              haActionFinishStandbySeed,
+				DependsOn:              publishDependsOn,
 				StandbyName:            standby.Name,
 				SlotName:               slotName,
 				TargetLSN:              targetLSN,
@@ -1903,7 +1994,7 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 				SeedArtifactGeneration: generation,
 				Reason:                 reason,
 			},
-			{
+			haPlannedAction{
 				Kind:                   haActionRestoreSeedArtifact,
 				DependsOn:              haActionPublishSeedArtifact,
 				StandbyName:            standby.Name,
@@ -1914,19 +2005,29 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 				SeedArtifactGeneration: generation,
 				Reason:                 reason,
 			},
-			{
-				Kind:             haActionBootstrapStandbySeed,
-				DependsOn:        haActionRestoreSeedArtifact,
-				StandbyName:      standby.Name,
-				SlotName:         slotName,
-				TargetLSN:        targetLSN,
-				SeedManifestPath: stagingRoot + "/.antfly-ha-seed-manifest.afha",
-				SeedContentRoot:  stagingRoot,
-				Reason:           reason,
+			haPlannedAction{
+				Kind:                   haActionActivateSeedArtifact,
+				DependsOn:              haActionRestoreSeedArtifact,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedContentRoot:        stagingRoot,
+				SeedArtifactTargetRoot: targetRoot,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
 			},
-			{
+			haPlannedAction{
+				Kind:                   haActionActivateSeededSlot,
+				DependsOn:              haActionActivateSeedArtifact,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
+			},
+			haPlannedAction{
 				Kind:                   haActionPruneSeedArtifacts,
-				DependsOn:              haActionBootstrapStandbySeed,
+				DependsOn:              haActionActivateSeededSlot,
 				StandbyName:            standby.Name,
 				SlotName:               slotName,
 				TargetLSN:              targetLSN,
@@ -1935,7 +2036,11 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 				SeedArtifactRetention:  retention,
 				Reason:                 reason,
 			},
-		}
+		)
+		return actions
+	}
+	if standby.SeedManifestPath == "" {
+		return nil
 	}
 	return []haPlannedAction{
 		{
@@ -1959,6 +2064,13 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 			Reason:           reason,
 		},
 	}
+}
+
+func haStandbyUsesRuntimeOwnedSeedCapture(standby antflyv1.HAStandbySpec) bool {
+	return standby.SeedArtifact != nil &&
+		strings.TrimSpace(standby.SeedManifestPath) == "" &&
+		strings.TrimSpace(standby.SeedContentRoot) == "" &&
+		standby.SeedArtifact.SourcePVC != nil
 }
 
 func haAutomaticFailoverFormerPrimaryID(ha *antflyv1.HighAvailabilitySpec) string {

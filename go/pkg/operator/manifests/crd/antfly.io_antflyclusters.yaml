@@ -1716,6 +1716,8 @@ spec:
                         - Primary
                         - Standby
                         type: string
+                      seedCaptureRoot:
+                        type: string
                       standby:
                         properties:
                           logPath:
@@ -4403,6 +4405,8 @@ spec:
                               type: string
                             actionTarget:
                               type: string
+                            aggregateSHA256:
+                              type: string
                             backupLSN:
                               format: int64
                               type: integer
@@ -4464,6 +4468,8 @@ spec:
                               type: string
                             manifestID:
                               type: string
+                            manifestSHA256:
+                              type: string
                             promotionAppliedLSN:
                               format: int64
                               type: integer
@@ -4520,6 +4526,41 @@ spec:
                               type: integer
                             schemaVersion:
                               format: int32
+                              type: integer
+                            seedAlreadyCaptured:
+                              type: boolean
+                            seedArtifactGeneration:
+                              type: string
+                            seedClusterID:
+                              format: int64
+                              type: integer
+                            seedContentRoot:
+                              type: string
+                            seedEpoch:
+                              format: int64
+                              type: integer
+                            seedFileCount:
+                              format: int64
+                              type: integer
+                            seedGenerationRoot:
+                              type: string
+                            seedManifestPath:
+                              type: string
+                            seedReceiptSHA256:
+                              type: string
+                            seedShardID:
+                              format: int64
+                              type: integer
+                            seedSourcePlanSHA256:
+                              type: string
+                            seedTableID:
+                              format: int64
+                              type: integer
+                            seedTimelineID:
+                              format: int64
+                              type: integer
+                            seedTotalBytes:
+                              format: int64
                               type: integer
                             slotAction:
                               type: string
@@ -4599,6 +4640,8 @@ spec:
                               type: integer
                             generation:
                               type: string
+                            generationPath:
+                              type: string
                             manifestID:
                               type: string
                             manifestSHA256:
@@ -4606,6 +4649,8 @@ spec:
                             retainedCount:
                               format: int32
                               type: integer
+                            seedReceiptSHA256:
+                              type: string
                             shardID:
                               format: int64
                               type: integer
@@ -4628,6 +4673,8 @@ spec:
                         seedArtifactRetainGenerations:
                           format: int32
                           type: integer
+                        seedArtifactTargetRoot:
+                          type: string
                         seedContentRoot:
                           type: string
                         seedManifestPath:

@@ -218,7 +218,7 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
     std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
 }
 
-const ArtifactAction = enum { publish, restore, verify, prune };
+const ArtifactAction = enum { publish, restore, verify, activate, prune };
 
 const ArtifactOptions = struct {
     action: ArtifactAction,
@@ -228,6 +228,7 @@ const ArtifactOptions = struct {
     manifest_path: ?[]const u8 = null,
     content_root: ?[]const u8 = null,
     staging_root: ?[]const u8 = null,
+    target_root: ?[]const u8 = null,
     identity: IdentityOptions = .{},
     minimum_checkpoint_lsn: u64 = 0,
     retain_generations: usize = 2,
@@ -291,6 +292,22 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             }, .{});
             std.Io.File.stdout().writeStreamingAll(io, "{\"verified\":true}\n") catch {};
         },
+        .activate => {
+            const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
+            var result = try ha.seed_activation.activate(alloc, .{
+                .staging_root = staging_root,
+                .target_root = target_root,
+                .expected = .{
+                    .generation = generation,
+                    .slot_name = slot_name,
+                    .identity = try options.identity.finish(),
+                    .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                },
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.active_receipt_json);
+        },
         .prune => {
             const location = options.location orelse return error.SeedLocationMissing;
             var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
@@ -318,6 +335,8 @@ fn parseArtifactArgs(argv: []const []const u8) !ArtifactOptions {
         .restore
     else if (std.mem.eql(u8, argv[0], "verify"))
         .verify
+    else if (std.mem.eql(u8, argv[0], "activate"))
+        .activate
     else if (std.mem.eql(u8, argv[0], "prune"))
         .prune
     else
@@ -338,6 +357,8 @@ fn parseArtifactArgs(argv: []const []const u8) !ArtifactOptions {
             options.content_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
         } else if (std.mem.eql(u8, flag, "--staging-root")) {
             options.staging_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--target-root")) {
+            options.target_root = try absoluteArtifactPath(try artifactValue(argv, &idx));
         } else if (std.mem.eql(u8, flag, "--ha-cluster-id")) {
             options.identity.cluster_id = try parseU64(try artifactValue(argv, &idx));
         } else if (std.mem.eql(u8, flag, "--ha-shard-id")) {
@@ -1259,6 +1280,7 @@ fn printUsage(argv0: []const u8) void {
         \\examples:
         \\  {s} ha artifact publish --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --manifest /source/manifest.afha --content-root /source/content
         \\  {s} ha artifact restore --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --staging-root /target/seed --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
+        \\  {s} ha artifact activate --generation seed-standby-a-42 --slot standby-a --staging-root /target/.antfly-ha/staging --target-root /target --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
         \\  {s} ha artifact prune --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --retain-generations 2
         \\  {s} ha --ha-url http://127.0.0.1:8081 --ha-token-env ANTFLY_HA_ADMIN_TOKEN -- status primary
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
@@ -1266,7 +1288,7 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
         \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
 test "ha cmd parses local handles before admin command" {
@@ -1332,16 +1354,26 @@ test "ha cmd local handles default shard and table identity to whole instance" {
 test "ha cmd parses offline seed activation target and identity" {
     const options = try parseArtifactArgs(&.{
         "activate",
-        "--generation", "seed-standby-a-10",
-        "--slot", "standby-a",
-        "--staging-root", "/target/.antfly-ha/staging",
-        "--target-root", "/target",
-        "--ha-cluster-id", "100",
-        "--ha-shard-id", "0",
-        "--ha-table-id", "0",
-        "--ha-timeline-id", "4",
-        "--ha-epoch", "6",
-        "--minimum-checkpoint-lsn", "10",
+        "--generation",
+        "seed-standby-a-10",
+        "--slot",
+        "standby-a",
+        "--staging-root",
+        "/target/.antfly-ha/staging",
+        "--target-root",
+        "/target",
+        "--ha-cluster-id",
+        "100",
+        "--ha-shard-id",
+        "0",
+        "--ha-table-id",
+        "0",
+        "--ha-timeline-id",
+        "4",
+        "--ha-epoch",
+        "6",
+        "--minimum-checkpoint-lsn",
+        "10",
     });
     try std.testing.expectEqual(ArtifactAction.activate, options.action);
     try std.testing.expectEqualStrings("/target/.antfly-ha/staging", options.staging_root.?);

@@ -116,6 +116,10 @@ pub fn endBaseBackup(primary: *primary_mod.Primary, manifest: backup_manifest.Ma
     return try primary.endBaseBackup(manifest);
 }
 
+pub fn activateSeededSlot(primary: *primary_mod.Primary, slot_name: []const u8, timeline_id: u64, checkpoint_lsn: u64) !void {
+    return try primary.activateSeededSlot(slot_name, timeline_id, checkpoint_lsn, checkpoint_lsn, checkpoint_lsn);
+}
+
 pub fn bootstrapStandby(
     alloc: Allocator,
     standby: *standby_mod.Standby,

@@ -1512,6 +1512,9 @@ pub const DataServerHAConfig = struct {
     admin_context: ?antfly.ha.admin_exec.Context = null,
     standby_owner: ?*?antfly.ha.standby.Standby = null,
     admin_bearer_token: ?[]const u8 = null,
+    /// Durable primary-local root for immutable runtime-owned seed generations.
+    /// The admin API never accepts caller-selected source or destination paths.
+    seed_capture_root: ?[]const u8 = null,
     internal_primary: ?*antfly.ha.primary.Primary = null,
     primary_retention_policy: antfly.ha.slot_store.RetentionPolicy = .{},
     primary_sync_policy: antfly.ha.primary.SyncPolicy = .{},
@@ -2086,6 +2089,7 @@ pub const DataServer = struct {
     provisioned_storage: antfly.public_api.ProvisionedGroupStorage,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
+    replica_catalog_path: ?[]const u8 = null,
     /// Long-lived backing for the cross-shard entity-resolution candidate
     /// source; its `CandidateSource` vtable points into this field, so it must
     /// not move. Wraps `read_source.source()` and is handed to the write
@@ -2249,6 +2253,7 @@ pub const DataServer = struct {
                 cfg.replica_root_dir,
                 catalog,
             ),
+            .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = status_source,
             .api_server_cfg = cfg.api_server_cfg,
             .ha_cfg = cfg.ha,
@@ -2281,6 +2286,7 @@ pub const DataServer = struct {
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
             ),
+            .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
             .ha_cfg = cfg.ha,
@@ -2313,6 +2319,7 @@ pub const DataServer = struct {
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),
             ),
+            .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
             .ha_cfg = cfg.ha,
@@ -2651,6 +2658,10 @@ pub const DataServer = struct {
             server.ctx.primary = promoted_primary_handle;
             server.ctx.primary_node_id = promoted_node_id;
             server.ctx.promoted_standby_handoff = handoff;
+            server.auth.seed_capture = if (self.ha_cfg.seed_capture_root != null) .{
+                .ptr = self,
+                .run_fn = DataServer.captureHASeedCallback,
+            } else null;
         }
         self.ha_internal_server = null;
         self.api_server_cfg.ha_internal_executor = null;
@@ -2811,12 +2822,69 @@ pub const DataServer = struct {
         return self.ha_public_gate_state.ownerJobsCanRun();
     }
 
+    fn captureHASeedCallback(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        slot_name: []const u8,
+        generation: []const u8,
+    ) !antfly.ha.http_admin.Server.SeedCaptureResult {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+
+        // Global ordering is non-negotiable: capture excludes every durable
+        // mutation before freezing the role pointer that keeps Primary alive.
+        var lease = self.ha_mutation_barrier.acquireExclusive();
+        defer lease.release();
+        lockAtomic(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+
+        const ctx = self.ha_cfg.admin_context orelse return error.HASeedCaptureUnavailable;
+        if (ctx.standby != null) return error.HASeedCaptureRequiresPrimary;
+        if (haContextPrimaryIsFenced(ctx)) return error.PrimaryFenced;
+        const primary = ctx.primary orelse return error.HASeedCaptureRequiresPrimary;
+        if (self.ha_cfg.internal_primary) |current| {
+            if (current != primary) return error.HASeedCapturePrimaryChanged;
+        }
+        const capture_root = self.ha_cfg.seed_capture_root orelse return error.HASeedCaptureRootMissing;
+        const node_id = ctx.primary_node_id orelse return error.HAPrimaryNodeIdMissing;
+        const catalog_path = self.replica_catalog_path orelse return error.HASeedCaptureCatalogMissing;
+
+        const sources = [_]antfly.ha.seed_capture.Source{
+            .{ .tree = .{
+                .source_root = self.write_source.replica_root_dir,
+                .artifact_prefix = "replicas",
+                .kind = .artifact,
+            } },
+            .{ .file = .{
+                .source_path = catalog_path,
+                .artifact_path = "catalog.txt",
+                .kind = .metadata,
+            } },
+        };
+        var capture = try antfly.ha.seed_capture.captureWithExclusiveLease(alloc, .{
+            .primary = primary,
+            .barrier = &self.ha_mutation_barrier,
+            .slot_name = slot_name,
+            .generation = generation,
+            .capture_root = capture_root,
+            .sources = &sources,
+        }, &lease);
+        errdefer capture.deinit(alloc);
+        return .{
+            .capture = capture,
+            .node_id = try alloc.dupe(u8, node_id),
+        };
+    }
+
     fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
         if (api_server_cfg.ha_admin_executor == null) {
             if (self.ha_cfg.admin_context) |ctx| {
                 self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(self.alloc, ctx, .{
                     .bearer_token = self.ha_cfg.admin_bearer_token,
                     .state_mutex = if (ctx.primary != null or ctx.standby != null) &self.ha_state_mutex else null,
+                    .seed_capture = if (ctx.primary != null and self.ha_cfg.seed_capture_root != null) .{
+                        .ptr = self,
+                        .run_fn = DataServer.captureHASeedCallback,
+                    } else null,
                     .primary_fence_started = .{
                         .ptr = self,
                         .run_fn = DataServer.haPrimaryFenceStartedCallback,
@@ -15709,6 +15777,27 @@ test "data server wires configured HA executors into API server" {
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
+    const capture_fixture_root = try std.fmt.allocPrint(alloc, "/private/tmp/data-runtime-ha-seed-capture-{d}", .{nonce});
+    defer alloc.free(capture_fixture_root);
+    const replica_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "replicas" });
+    defer alloc.free(replica_root);
+    const replica_file = try std.fs.path.join(alloc, &.{ replica_root, "group-1/table-db/state.bin" });
+    defer alloc.free(replica_file);
+    const replica_catalog_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "catalog.txt" });
+    defer alloc.free(replica_catalog_path);
+    const seed_capture_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "seed-captures" });
+    defer alloc.free(seed_capture_root);
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
+    try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(replica_file).?);
+    var replica_fixture = try std.Io.Dir.cwd().createFile(io_impl.io(), replica_file, .{ .truncate = true });
+    try replica_fixture.writeStreamingAll(io_impl.io(), "replica-state");
+    try replica_fixture.sync(io_impl.io());
+    replica_fixture.close(io_impl.io());
+    var catalog_fixture = try std.Io.Dir.cwd().createFile(io_impl.io(), replica_catalog_path, .{ .truncate = true });
+    try catalog_fixture.writeStreamingAll(io_impl.io(), "catalog-state");
+    try catalog_fixture.sync(io_impl.io());
+    catalog_fixture.close(io_impl.io());
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -15727,13 +15816,15 @@ test "data server wires configured HA executors into API server" {
     _ = try primary.append(.{ .payload = "two" });
 
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
-        .replica_root_dir = ".",
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
         .ha = .{
             .admin_context = .{
                 .primary = &primary,
                 .primary_node_id = "primary-a",
             },
             .admin_bearer_token = "runtime-secret-token",
+            .seed_capture_root = seed_capture_root,
             .primary_retention_policy = .{ .max_lag_lsn = 1 },
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
@@ -15760,6 +15851,34 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
 
+    const capture_body = "{\"slot_name\":\"standby-capture\",\"generation\":\"seed-standby-capture-3\"}";
+    var capture_resp = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_base_backups_capture,
+        .authorization = "Bearer runtime-secret-token",
+        .content_type = "application/json",
+        .body = capture_body,
+    });
+    defer capture_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), capture_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"manifest_path\":") != null);
+    const captured_slot = primary.slot("standby-capture") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, captured_slot.lifecycle);
+    try std.testing.expect(!captured_slot.active);
+
+    var capture_retry = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_base_backups_capture,
+        .authorization = "Bearer runtime-secret-token",
+        .content_type = "application/json",
+        .body = capture_body,
+    });
+    defer capture_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), capture_retry.status);
+    try std.testing.expect(std.mem.indexOf(u8, capture_retry.body, "\"state\":\"already_applied\"") != null);
+
     var internal_resp = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
@@ -15774,7 +15893,7 @@ test "data server wires configured HA executors into API server" {
     try health.metricsWriter().writeMetrics(&writer);
     const metrics = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_retained_age_ns 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_reseed_recommended 1\n") != null);

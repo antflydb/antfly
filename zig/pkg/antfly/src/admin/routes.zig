@@ -31,6 +31,8 @@ pub const ha_replication_slot_pause_suffix = "/pause";
 pub const ha_replication_slot_resume_suffix = "/resume";
 pub const ha_base_backups = ha ++ "/base-backups";
 pub const ha_base_backups_finish = ha_base_backups ++ "/finish";
+pub const ha_base_backups_capture = ha_base_backups ++ "/capture";
+pub const ha_base_backups_activate = ha_base_backups ++ "/activate";
 pub const ha_standby_bootstrap = ha ++ "/standby/bootstrap";
 pub const ha_fence = ha ++ "/fence";
 pub const ha_fence_current = ha_fence ++ "/current";
@@ -149,6 +151,7 @@ test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots", ha_replication_slots);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups", ha_base_backups);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/finish", ha_base_backups_finish);
+    try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/activate", ha_base_backups_activate);
     try std.testing.expectEqualStrings("/admin/v1/ha/standby/bootstrap", ha_standby_bootstrap);
     try std.testing.expectEqualStrings("/admin/v1/ha/fence", ha_fence);
     try std.testing.expectEqualStrings("/admin/v1/ha/fence/current", ha_fence_current);
