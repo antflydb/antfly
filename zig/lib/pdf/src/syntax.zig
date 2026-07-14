@@ -62,38 +62,49 @@ pub const Object = union(enum) {
             .name => |value| .{ .name = try alloc.dupe(u8, value) },
             .array => |items| blk: {
                 const out = try alloc.alloc(Object, items.len);
+                var initialized: usize = 0;
                 errdefer {
-                    for (out[0..items.len]) |*item| item.deinit(alloc);
+                    for (out[0..initialized]) |*item| item.deinit(alloc);
                     alloc.free(out);
                 }
-                for (items, 0..) |item, i| out[i] = try item.clone(alloc);
+                for (items, 0..) |item, i| {
+                    out[i] = .null;
+                    initialized += 1;
+                    out[i] = try item.clone(alloc);
+                }
                 break :blk .{ .array = out };
             },
             .dict => |entries| blk: {
                 const out = try alloc.alloc(DictEntry, entries.len);
+                var initialized: usize = 0;
                 errdefer {
-                    for (out[0..entries.len]) |*entry| entry.deinit(alloc);
+                    for (out[0..initialized]) |*entry| entry.deinit(alloc);
                     alloc.free(out);
                 }
                 for (entries, 0..) |entry, i| {
                     out[i] = .{
                         .key = try alloc.dupe(u8, entry.key),
-                        .value = try entry.value.clone(alloc),
+                        .value = .null,
                     };
+                    initialized += 1;
+                    out[i].value = try entry.value.clone(alloc);
                 }
                 break :blk .{ .dict = out };
             },
             .stream => |stream_value| blk: {
                 const out = try alloc.alloc(DictEntry, stream_value.header.len);
+                var initialized: usize = 0;
                 errdefer {
-                    for (out[0..stream_value.header.len]) |*entry| entry.deinit(alloc);
+                    for (out[0..initialized]) |*entry| entry.deinit(alloc);
                     alloc.free(out);
                 }
                 for (stream_value.header, 0..) |entry, i| {
                     out[i] = .{
                         .key = try alloc.dupe(u8, entry.key),
-                        .value = try entry.value.clone(alloc),
+                        .value = .null,
                     };
+                    initialized += 1;
+                    out[i].value = try entry.value.clone(alloc);
                 }
                 break :blk .{ .stream = .{
                     .header = out,
@@ -922,6 +933,40 @@ test "object clone duplicates nested data" {
     try std.testing.expect(cloned == .dict);
     try std.testing.expectEqualStrings("Type", cloned.dict[0].key);
     try std.testing.expect(cloned.get("Nums").?.* == .array);
+}
+
+test "object clone cleans up only initialized values on allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var array_items = [_]Object{
+                .{ .string = @constCast("first"[0..]) },
+                .{ .name = @constCast("second"[0..]) },
+            };
+            var nested_entries = [_]DictEntry{
+                .{
+                    .key = @constCast("Items"[0..]),
+                    .value = .{ .array = array_items[0..] },
+                },
+            };
+            var stream_entries = [_]DictEntry{
+                .{
+                    .key = @constCast("Nested"[0..]),
+                    .value = .{ .dict = nested_entries[0..] },
+                },
+            };
+            const source = Object{ .stream = .{
+                .header = stream_entries[0..],
+                .data_offset = 10,
+                .data_length = 20,
+            } };
+
+            var cloned = try source.clone(alloc);
+            defer cloned.deinit(alloc);
+            try std.testing.expect(cloned == .stream);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "scanner parses stream object with inline length" {
