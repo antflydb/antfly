@@ -1408,6 +1408,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !BatchResponse {
+        return self.fetchGroupBatchWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupBatchWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !BatchResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1423,6 +1434,7 @@ pub const ApiHttpClient = struct {
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
+            .timeout_ms = timeout_ms,
             .body = body,
         });
         defer resp.deinit(self.alloc);
@@ -2247,6 +2259,7 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
+    destination_base_uri: ?[]const u8 = null,
 };
 
 fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.TransitionAction) ![]u8 {
@@ -2271,12 +2284,14 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .transition_id = op.transition_id,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .destination_base_uri = op.destination_base_uri,
         },
         .catch_up_split_destination => |op| .{
             .kind = .catch_up_split_destination,
             .transition_id = op.transition_id,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .destination_base_uri = op.destination_base_uri,
         },
         .finalize_split_source => |op| .{
             .kind = .finalize_split_source,

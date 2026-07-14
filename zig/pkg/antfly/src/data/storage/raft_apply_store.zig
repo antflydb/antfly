@@ -22,6 +22,7 @@ const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig"
 const shard_mod = @import("../../storage/shard.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const shard_state_store = @import("shard_state_store.zig");
+const data_raft_batch = @import("../raft_batch.zig");
 const batch_shard_count: usize = 64;
 
 pub const AppliedDataBatch = struct {
@@ -160,6 +161,16 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.groupState(&self.store, alloc, group_id);
     }
 
+    pub fn replaceGroupSnapshot(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        byte_range: AppliedDataRange,
+        entries: []const AppliedDataKV,
+    ) !void {
+        try shard_state_store.replaceGroupSnapshot(&self.store, alloc, group_id, byte_range, entries);
+    }
+
     pub fn currentRange(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
         return try shard_state_store.currentRange(&self.store, alloc, group_id);
     }
@@ -170,6 +181,10 @@ pub const RaftApplyStore = struct {
 
     pub fn currentSplitDeltaSequence(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !u64 {
         return try shard_state_store.currentSplitDeltaSequence(&self.store, alloc, group_id);
+    }
+
+    pub fn currentSplitAcknowledgement(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?shard_state_store.SplitAcknowledgement {
+        return try shard_state_store.currentSplitAcknowledgement(&self.store, alloc, group_id);
     }
 
     pub fn captureSplitHandoff(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !SplitHandoff {
@@ -215,7 +230,7 @@ pub const RaftApplyStore = struct {
                 },
                 .prepare_split => |split_key| self.alloc.free(split_key),
                 .start_split => |start| self.alloc.free(start.split_key),
-                .finalize_split, .rollback_split => {},
+                .acknowledge_split, .finalize_split, .rollback_split => {},
             };
             self.alloc.free(metadata.operations);
         }
@@ -257,10 +272,11 @@ pub const RaftApplyStore = struct {
         for (metadata.normal_entries) |entry| {
             var normal_key_buf: [160]u8 = undefined;
             const normal_key = try normalEntryKeyForGroup(&normal_key_buf, group_id, entry.index);
-            try writes.append(self.alloc, .{
-                .key = try self.alloc.dupe(u8, normal_key),
-                .value = try self.alloc.dupe(u8, entry.data),
-            });
+            const owned_key = try self.alloc.dupe(u8, normal_key);
+            errdefer self.alloc.free(owned_key);
+            const owned_value = try self.alloc.dupe(u8, entry.data);
+            errdefer self.alloc.free(owned_value);
+            try writes.append(self.alloc, .{ .key = owned_key, .value = owned_value });
         }
         try shard_state_store.appendOperationEffects(&self.store, self.alloc, group_id, metadata.operations, &writes, &deletes);
         try shard_state_store.putOwnedBatch(&self.store, self.alloc, writes.items, deletes.items);
@@ -374,7 +390,7 @@ pub const RaftApplyStore = struct {
                 },
                 .prepare_split => |split_key| alloc.free(split_key),
                 .start_split => |start| alloc.free(start.split_key),
-                .finalize_split, .rollback_split => {},
+                .acknowledge_split, .finalize_split, .rollback_split => {},
             };
             operations.deinit(alloc);
         }
@@ -386,9 +402,7 @@ pub const RaftApplyStore = struct {
                         .index = entry.index,
                         .data = try alloc.dupe(u8, entry.data),
                     });
-                    if (try parseDataOperation(alloc, entry.data)) |op| {
-                        try operations.append(alloc, op);
-                    }
+                    try appendDataOperations(alloc, entry.data, &operations);
                 },
                 .conf_change, .conf_change_v2 => admin_entry_count += 1,
             }
@@ -495,6 +509,57 @@ pub const RaftApplyStore = struct {
             return .{ .delete = try alloc.dupe(u8, data["del:".len..]) };
         }
         return null;
+    }
+
+    fn appendDataOperations(
+        alloc: std.mem.Allocator,
+        data: []const u8,
+        operations: *std.ArrayListUnmanaged(DataOperation),
+    ) !void {
+        if (!data_raft_batch.looksLikeEnvelope(data)) {
+            if (try parseDataOperation(alloc, data)) |op| try operations.append(alloc, op);
+            return;
+        }
+
+        var decoded = try data_raft_batch.decode(alloc, data);
+        defer decoded.deinit(alloc);
+        for (decoded.batch.req.writes) |write| {
+            const key = try alloc.dupe(u8, write.key);
+            errdefer alloc.free(key);
+            const value = try alloc.dupe(u8, write.value);
+            errdefer alloc.free(value);
+            try operations.append(alloc, .{ .put = .{ .key = key, .value = value } });
+        }
+        for (decoded.batch.req.deletes) |key| {
+            const owned_key = try alloc.dupe(u8, key);
+            errdefer alloc.free(owned_key);
+            try operations.append(alloc, .{ .delete = owned_key });
+        }
+        if (decoded.batch.req.split_transition) |transition| switch (transition.kind) {
+            .prepare => {
+                const split_key = try alloc.dupe(u8, transition.split_key);
+                errdefer alloc.free(split_key);
+                try operations.append(alloc, .{ .prepare_split = split_key });
+            },
+            .start => {
+                const split_key = try alloc.dupe(u8, transition.split_key);
+                errdefer alloc.free(split_key);
+                try operations.append(alloc, .{ .start_split = .{
+                    .new_shard_id = transition.destination_group_id,
+                    .split_key = split_key,
+                } });
+            },
+            .finalize => try operations.append(alloc, .finalize_split),
+            .rollback => try operations.append(alloc, .rollback_split),
+        };
+        if (decoded.batch.req.split_checkpoint) |checkpoint| {
+            if (checkpoint.kind == .source_ack) {
+                try operations.append(alloc, .{ .acknowledge_split = .{
+                    .destination_group_id = checkpoint.destination_group_id,
+                    .delta_sequence = checkpoint.delta_sequence,
+                } });
+            }
+        }
     }
 };
 
@@ -926,6 +991,40 @@ test "data raft apply store parses colon-delimited range keys correctly" {
     const split_state = (try store.currentSplitState(std.testing.allocator, 191)) orelse return error.MissingSplitState;
     defer shard_state_store.freeSplitState(std.testing.allocator, split_state);
     try std.testing.expectEqualStrings("doc:n", split_state.split_key);
+}
+
+test "data raft apply store persists split destination acknowledgements" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-ack", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const batch = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .source_group_id = 201,
+            .destination_group_id = 202,
+            .delta_sequence = 9,
+        },
+    });
+    defer std.testing.allocator.free(batch);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = batch },
+    });
+    defer std.testing.allocator.free(entries);
+
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 201,
+        .commit_index = 1,
+        .entries_bytes = entries,
+    });
+    const acknowledgement = (try store.currentSplitAcknowledgement(std.testing.allocator, 201)) orelse
+        return error.MissingSplitAcknowledgement;
+    try std.testing.expectEqual(@as(u64, 202), acknowledgement.destination_group_id);
+    try std.testing.expectEqual(@as(u64, 9), acknowledgement.delta_sequence);
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {

@@ -22,6 +22,12 @@ const doc_identity = @import("storage/db/doc_identity.zig");
 const range_transition = @import("data/storage/range_transition.zig");
 const raft_state_machine = @import("raft/state_machine/mod.zig");
 
+test "data storage module tests are reachable" {
+    std.testing.refAllDecls(storage.shard_state_store);
+    std.testing.refAllDecls(storage.raft_apply_store);
+    std.testing.refAllDecls(db_split_handoff);
+}
+
 test "db split sync coordinator allocates destination identity namespace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

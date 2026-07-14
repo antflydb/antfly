@@ -316,6 +316,19 @@ pub const OwnedKVPair = struct {
     value: []u8,
 };
 
+fn appendOwnedKVPairCopy(
+    alloc: Allocator,
+    results: *std.ArrayListUnmanaged(OwnedKVPair),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try results.append(alloc, .{ .key = owned_key, .value = owned_value });
+}
+
 pub const ReplayIterationStats = struct {
     scanned_entries: usize = 0,
     matched_entries: usize = 0,
@@ -1490,10 +1503,7 @@ pub const DocStore = struct {
         const first = (try cur.seekAtOrAfter(prefix)) orelse return try alloc.dupe(OwnedKVPair, results.items);
 
         if (std.mem.startsWith(u8, first.key, prefix)) {
-            try results.append(alloc, .{
-                .key = try alloc.dupe(u8, first.key),
-                .value = try alloc.dupe(u8, first.value),
-            });
+            try appendOwnedKVPairCopy(alloc, &results, first.key, first.value);
         } else {
             return try alloc.dupe(OwnedKVPair, results.items);
         }
@@ -1501,10 +1511,7 @@ pub const DocStore = struct {
         var entry = try cur.next();
         while (entry) |kv| : (entry = try cur.next()) {
             if (!std.mem.startsWith(u8, kv.key, prefix)) break;
-            try results.append(alloc, .{
-                .key = try alloc.dupe(u8, kv.key),
-                .value = try alloc.dupe(u8, kv.value),
-            });
+            try appendOwnedKVPairCopy(alloc, &results, kv.key, kv.value);
         }
 
         const owned = try alloc.dupe(OwnedKVPair, results.items);
@@ -1544,10 +1551,7 @@ pub const DocStore = struct {
         while (true) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             if (bounded_after_key == null or std.mem.order(u8, entry.key, bounded_after_key.?) == .gt) {
-                try results.append(alloc, .{
-                    .key = try alloc.dupe(u8, entry.key),
-                    .value = try alloc.dupe(u8, entry.value),
-                });
+                try appendOwnedKVPairCopy(alloc, &results, entry.key, entry.value);
                 if (results.items.len >= limit) break;
             }
             entry = (try cur.next()) orelse break;
@@ -1586,18 +1590,12 @@ pub const DocStore = struct {
             return try alloc.dupe(OwnedKVPair, results.items);
         }
 
-        try results.append(alloc, .{
-            .key = try alloc.dupe(u8, first.key),
-            .value = try alloc.dupe(u8, first.value),
-        });
+        try appendOwnedKVPairCopy(alloc, &results, first.key, first.value);
 
         var entry = try cur.next();
         while (entry) |kv| : (entry = try cur.next()) {
             if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
-            try results.append(alloc, .{
-                .key = try alloc.dupe(u8, kv.key),
-                .value = try alloc.dupe(u8, kv.value),
-            });
+            try appendOwnedKVPairCopy(alloc, &results, kv.key, kv.value);
         }
 
         const owned = try alloc.dupe(OwnedKVPair, results.items);

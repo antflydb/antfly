@@ -22,6 +22,41 @@ pub const default_request_stack_size: usize = 8 * 1024 * 1024;
 pub const default_header_read_timeout_ms: u32 = 30_000;
 pub const default_body_read_timeout_ms: u32 = 120_000;
 
+const ProcessIo = struct {
+    var lock: std.atomic.Mutex = .unlocked;
+    var runtime: ?*std.Io.Threaded = null;
+    var ref_count: usize = 0;
+
+    fn acquire() *std.Io.Threaded {
+        platform_sync.lockYielding(&lock);
+        defer lock.unlock();
+
+        if (runtime == null) {
+            const io_impl = std.heap.page_allocator.create(std.Io.Threaded) catch @panic("OOM");
+            io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{
+                .stack_size = default_request_stack_size,
+            });
+            runtime = io_impl;
+        }
+        ref_count += 1;
+        return runtime.?;
+    }
+
+    fn release(io_impl: *std.Io.Threaded) void {
+        platform_sync.lockYielding(&lock);
+        defer lock.unlock();
+
+        std.debug.assert(runtime == io_impl);
+        std.debug.assert(ref_count > 0);
+        ref_count -= 1;
+        if (ref_count != 0) return;
+
+        io_impl.deinit();
+        std.heap.page_allocator.destroy(io_impl);
+        runtime = null;
+    }
+};
+
 fn sleepMs(ms: u64) void {
     var req = std.posix.timespec{
         .sec = @intCast(ms / std.time.ms_per_s),
@@ -52,7 +87,7 @@ pub const StdHttpListenerConfig = struct {
 
 pub const StdHttpListener = struct {
     const IoOwner = enum {
-        owned,
+        process_shared,
         shared,
     };
 
@@ -74,14 +109,12 @@ pub const StdHttpListener = struct {
         cfg: StdHttpListenerConfig,
         app: common.RequestExecutor,
     ) StdHttpListener {
-        const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
-        io_impl.* = std.Io.Threaded.init(alloc, .{ .stack_size = cfg.connection_thread_stack_size });
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .app = app,
-            .io_impl = io_impl,
-            .io_owner = .owned,
+            .io_impl = ProcessIo.acquire(),
+            .io_owner = .process_shared,
         };
     }
 
@@ -107,10 +140,7 @@ pub const StdHttpListener = struct {
     pub fn deinit(self: *StdHttpListener) void {
         self.stop();
         self.active_streams.deinit(self.alloc);
-        if (self.io_owner == .owned) {
-            self.io_impl.deinit();
-            self.alloc.destroy(self.io_impl);
-        }
+        if (self.io_owner == .process_shared) ProcessIo.release(self.io_impl);
         self.* = undefined;
     }
 

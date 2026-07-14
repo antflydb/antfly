@@ -3398,12 +3398,14 @@ pub fn build(b: *std.Build) void {
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "data storage module tests are reachable",
         "db split destination read-only open does not create missing root",
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db split status borrows the live raft apply store without a second writer",
         "data raft apply store applies delete operations into group state",
         "data raft apply store orders independent groups through separate shards",
+        "group state range scan is allocation-failure safe",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",

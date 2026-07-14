@@ -110,6 +110,33 @@ pub const DocumentTransform = struct {
     upsert: bool = false,
 };
 
+pub const SplitReplicationCheckpoint = struct {
+    pub const Kind = enum {
+        destination,
+        source_ack,
+    };
+
+    kind: Kind,
+    source_group_id: u64,
+    destination_group_id: u64,
+    range_start: []const u8 = "",
+    range_end: []const u8 = "",
+    delta_sequence: u64,
+};
+
+pub const SplitTransitionMutation = struct {
+    pub const Kind = enum {
+        prepare,
+        start,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    destination_group_id: u64,
+    split_key: []const u8 = "",
+};
+
 pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
@@ -119,6 +146,10 @@ pub const BatchRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
+    /// Internal data-Raft transition state. Public batch parsing never sets it.
+    split_checkpoint: ?SplitReplicationCheckpoint = null,
+    /// Internal source lifecycle mutation. It must be ordered with data writes.
+    split_transition: ?SplitTransitionMutation = null,
 };
 
 pub const GraphEdgeWrite = struct {

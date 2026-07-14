@@ -8070,6 +8070,24 @@ pub const DB = struct {
         try self.core.clearSplitDeltaFinalSeq();
     }
 
+    pub fn getSplitBootstrapMarker(self: *DB, alloc: Allocator) !?range_state_mod.SplitBootstrapMarker {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.loadSplitBootstrapMarker(alloc);
+    }
+
+    pub fn setSplitBootstrapMarker(self: *DB, marker: range_state_mod.SplitBootstrapMarker) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.saveSplitBootstrapMarker(marker);
+    }
+
+    pub fn clearSplitBootstrapMarker(self: *DB) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.clearSplitBootstrapMarker();
+    }
+
     pub fn listSplitDeltaEntriesAfter(self: *DB, alloc: Allocator, after_seq: u64) ![]types.SplitDeltaEntry {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();

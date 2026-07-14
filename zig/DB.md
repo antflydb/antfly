@@ -1170,6 +1170,36 @@ Principles:
 6. If rebuild is required, rebuild only the mixed remainder, not the full child
    index.
 
+### Raft-Ordered Split Control State
+
+Online split lifecycle state belongs to the source data Raft group. Source
+prepare, start, finalize, rollback, and destination acknowledgements are typed
+internal batch mutations and use the same committed-entry index domain as
+document writes. They must never be written directly to a side store with a
+synthetic sequence, because that can reorder lifecycle state and user data after
+replay or leadership changes.
+
+The source `RaftApplyStore` durably owns:
+
+- source split phase and split key
+- source delta sequence
+- destination group acknowledgement and applied delta sequence
+
+Transition observation reads only this already-open replicated control state.
+It does not open the live table DB, initialize indexes, or compete with the
+generation-owned writer. Destination bootstrap and catch-up apply through the
+destination Raft group, then acknowledge the resulting checkpoint through the
+source Raft group. Retries are idempotent and every transition RPC attempt is
+bounded so metadata reconciliation cannot starve metadata Raft heartbeats while
+a destination group elects its first leader.
+
+Publication requires the destination's complete configured voter set to report
+healthy, a known stable leader, and an acknowledged checkpoint at least as new
+as the source delta sequence. Physical handoff scans treat the encoded range as
+an optimization and explicitly retain only primary documents owned by the
+source group; derived records and unrelated primary records are not lifecycle
+state.
+
 ### Text Segment Handoff
 
 Text index split should classify active segments using persisted key-range
