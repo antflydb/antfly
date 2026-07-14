@@ -893,6 +893,7 @@ pub const DBCore = struct {
     pub fn writeSnapshot(self: *DBCore, snapshot_root: []const u8) !u64 {
         var total: u64 = 0;
         total += try writeStoreSnapshot(self.alloc, self.store, snapshot_root);
+        total += try writeChangeJournalSnapshot(self.alloc, self.store, snapshot_root);
         return total;
     }
 
@@ -1707,6 +1708,34 @@ fn writeStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_
     defer alloc.free(encoded);
     try writeFileAbsolute(snapshot_path, encoded);
     return encoded.len;
+}
+
+fn writeChangeJournalSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !u64 {
+    if (!try store.hasReplayEntries()) return 0;
+    const entries = try store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    var integer: [8]u8 = undefined;
+    std.mem.writeInt(u64, &integer, @intCast(entries.len), .little);
+    try encoded.appendSlice(alloc, &integer);
+    for (entries) |entry| {
+        std.mem.writeInt(u64, &integer, entry.sequence, .little);
+        try encoded.appendSlice(alloc, &integer);
+        std.mem.writeInt(u64, &integer, @intCast(entry.payload.len), .little);
+        try encoded.appendSlice(alloc, &integer);
+        try encoded.appendSlice(alloc, entry.payload);
+        if (encoded.items.len > 256 * 1024 * 1024) return error.SnapshotTooLarge;
+    }
+
+    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/change-journal.bin", .{snapshot_root});
+    defer alloc.free(snapshot_path);
+    try writeFileAbsolute(snapshot_path, encoded.items);
+    return encoded.items.len;
 }
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
