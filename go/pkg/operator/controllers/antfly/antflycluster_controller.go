@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -58,6 +59,7 @@ type AntflyClusterReconciler struct {
 	Recorder              events.EventRecorder
 	ManageInferencePools  bool
 	DefaultInferenceImage string
+	Now                   func() time.Time
 
 	// validationAttempts tracks consecutive validation failure counts per cluster
 	// (namespace/name -> int). Reset on successful validation. Used for
@@ -87,7 +89,9 @@ const (
 	defaultHAFencePath                      = "/antflydb/ha/fence.wal"
 	defaultHAStandbyLogPath                 = "/antflydb/ha/standby.wal"
 	defaultHAStandbyProgressPath            = "/antflydb/ha/standby-progress.wal"
-	haAdminRetryRequeueAfter                = 5 * time.Second
+	defaultHADirectAdminRetryLimit          = int32(8)
+	defaultHADirectAdminRetryBase           = 5 * time.Second
+	defaultHADirectAdminRetryMaximum        = 2 * time.Minute
 	haStartupGateReceiptHashAnnotation      = "antfly.io/ha-startup-receipt-hash"
 	haSeedGenerationVolumeName              = "ha-seed-generation"
 	haSeedLiveDataPath                      = "/antflydb/data"
@@ -1910,12 +1914,16 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
+	return periodicRequeueAfterAt(cluster, time.Now())
+}
+
+func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time.Duration {
 	var requeueAfter time.Duration
 	if haKubernetesLeaseRenewalEnabled(cluster) {
 		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter())
 	}
-	if haRetryingDirectAdminAction(cluster) {
-		requeueAfter = minPositiveDuration(requeueAfter, haAdminRetryRequeueAfter)
+	if retryAfter := haDirectAdminRetryRequeueAfter(cluster, now); retryAfter > 0 {
+		requeueAfter = minPositiveDuration(requeueAfter, retryAfter)
 	}
 	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
 		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
@@ -1926,18 +1934,26 @@ func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 	return requeueAfter
 }
 
-func haRetryingDirectAdminAction(cluster *antflyv1.AntflyCluster) bool {
+func haDirectAdminRetryRequeueAfter(cluster *antflyv1.AntflyCluster, now time.Time) time.Duration {
 	if cluster == nil || cluster.Status.HAStatus == nil {
-		return false
+		return 0
 	}
+	var retryAfter time.Duration
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.AdminJobName == haAdminDirectAPIName &&
 			action.AdminJobPhase == haAdminJobPhasePending &&
-			strings.TrimSpace(action.AdminError) != "" {
-			return true
+			action.Retryable && strings.TrimSpace(action.AdminError) != "" {
+			candidate := defaultHADirectAdminRetryBase
+			if action.NextRetryAt != nil {
+				candidate = action.NextRetryAt.Sub(now)
+				if candidate <= 0 {
+					candidate = time.Millisecond
+				}
+			}
+			retryAfter = minPositiveDuration(retryAfter, candidate)
 		}
 	}
-	return false
+	return retryAfter
 }
 
 func minPositiveDuration(current time.Duration, candidate time.Duration) time.Duration {
@@ -1948,6 +1964,87 @@ func minPositiveDuration(current time.Duration, candidate time.Duration) time.Du
 		return candidate
 	}
 	return current
+}
+
+func (r *AntflyClusterReconciler) haNow() time.Time {
+	if r != nil && r.Now != nil {
+		return r.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func haDirectAdminRetryLimit(admin *antflyv1.HAAdminSpec) int32 {
+	if admin != nil && admin.DirectRetryLimit != nil && *admin.DirectRetryLimit > 0 {
+		return *admin.DirectRetryLimit
+	}
+	return defaultHADirectAdminRetryLimit
+}
+
+func haDirectAdminRetryBase(admin *antflyv1.HAAdminSpec) time.Duration {
+	if admin != nil && admin.DirectRetryBaseSeconds != nil && *admin.DirectRetryBaseSeconds > 0 {
+		return time.Duration(*admin.DirectRetryBaseSeconds) * time.Second
+	}
+	return defaultHADirectAdminRetryBase
+}
+
+func haDirectAdminRetryMaximum(admin *antflyv1.HAAdminSpec) time.Duration {
+	if admin != nil && admin.DirectRetryMaxSeconds != nil && *admin.DirectRetryMaxSeconds > 0 {
+		return time.Duration(*admin.DirectRetryMaxSeconds) * time.Second
+	}
+	return defaultHADirectAdminRetryMaximum
+}
+
+func haDirectAdminRetryDelay(admin *antflyv1.HAAdminSpec, attempt int32) time.Duration {
+	delay := haDirectAdminRetryBase(admin)
+	maximum := haDirectAdminRetryMaximum(admin)
+	if maximum < delay {
+		maximum = delay
+	}
+	for i := int32(1); i < attempt && delay < maximum; i++ {
+		if delay > maximum/2 {
+			return maximum
+		}
+		delay *= 2
+	}
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func haDirectAdminRetryDue(action *antflyv1.HAPlannedActionStatus, now time.Time) bool {
+	return action == nil || action.NextRetryAt == nil || !action.NextRetryAt.After(now)
+}
+
+func haDirectAdminErrorClass(err error) string {
+	if stderrors.Is(err, errHAPromotionBoundaryNotApplied) {
+		return "PromotionBoundaryNotApplied"
+	}
+	if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+		return fmt.Sprintf("HTTP%d", statusCode)
+	}
+	if adminsdk.HAIsRetryable(err) {
+		return "RetryableAdminError"
+	}
+	return "PermanentAdminError"
+}
+
+func haActionTime(t time.Time) *metav1.Time {
+	value := metav1.NewTime(t.UTC())
+	return &value
+}
+
+func resetHAActionAttemptStatus(action *antflyv1.HAPlannedActionStatus) {
+	if action == nil {
+		return
+	}
+	action.AttemptCount = 0
+	action.Retryable = false
+	action.ErrorClass = ""
+	action.FirstAttemptAt = nil
+	action.LastAttemptAt = nil
+	action.NextRetryAt = nil
+	action.CompletedAt = nil
 }
 
 func (r *AntflyClusterReconciler) reconcileInferencePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
@@ -3883,6 +3980,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			action.AdminJobPhase = ""
 			action.AdminError = ""
 			action.AdminStatusCode = 0
+			resetHAActionAttemptStatus(action)
 		}
 		if haActionKind(action.Kind) == haActionActivateSeedArtifact && action.AdminJobPhase == haAdminJobPhaseSucceeded {
 			current, err := r.haActivationReceiptMatchesCurrentTarget(ctx, cluster, *action)
@@ -3895,15 +3993,8 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 				action.AdminError = ""
 				action.AdminStatusCode = 0
 				action.SeedArtifactReceipt = nil
+				resetHAActionAttemptStatus(action)
 			}
-		}
-		if reset, err := r.resetMissingFailedHAAdminJob(ctx, cluster, action); err != nil {
-			return err
-		} else if reset {
-			action.AdminJobName = ""
-			action.AdminJobPhase = ""
-			action.AdminError = ""
-			action.AdminStatusCode = 0
 		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
 			if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
@@ -3917,22 +4008,60 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			continue
 		}
+		now := r.haNow()
+		if action.AdminJobName == haAdminDirectAPIName &&
+			action.AdminJobPhase == haAdminJobPhasePending &&
+			strings.TrimSpace(action.AdminError) != "" {
+			if !action.Retryable || action.AttemptCount >= haDirectAdminRetryLimit(ha.Admin) {
+				action.AdminJobPhase = haAdminJobPhaseFailed
+				action.Retryable = false
+				action.ErrorClass = "RetryBudgetExhausted"
+				if action.CompletedAt == nil {
+					action.CompletedAt = haActionTime(now)
+				}
+				haObserveActionFailure(action, haMetricExecutorDirect, true)
+				continue
+			}
+			if !haDirectAdminRetryDue(action, now) {
+				continue
+			}
+		}
 		if handled, err := r.executeHAPlannedActionTyped(ctx, cluster, action); handled {
 			if err != nil && haAdminActionCanRunAsFallbackJob(cluster, ha.Admin, *action, err) {
 				action.AdminError = ""
 				action.AdminStatusCode = 0
+				action.Retryable = false
+				action.ErrorClass = ""
 				if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
 					return err
 				}
 				continue
 			}
+			action.AttemptCount++
+			if action.FirstAttemptAt == nil {
+				action.FirstAttemptAt = haActionTime(now)
+			}
+			action.LastAttemptAt = haActionTime(now)
+			action.NextRetryAt = nil
+			action.CompletedAt = nil
+			haObserveActionAttempts(action, haMetricExecutorDirect, 1)
 			action.AdminJobName = haAdminDirectAPIName
 			if err != nil {
-				if adminsdk.HAIsRetryable(err) || stderrors.Is(err, errHAPromotionBoundaryNotApplied) {
+				retryable := adminsdk.HAIsRetryable(err) || stderrors.Is(err, errHAPromotionBoundaryNotApplied)
+				action.ErrorClass = haDirectAdminErrorClass(err)
+				if retryable && action.AttemptCount < haDirectAdminRetryLimit(ha.Admin) {
 					action.AdminJobPhase = haAdminJobPhasePending
+					action.Retryable = true
+					action.NextRetryAt = haActionTime(now.Add(haDirectAdminRetryDelay(ha.Admin, action.AttemptCount)))
 				} else {
 					action.AdminJobPhase = haAdminJobPhaseFailed
+					action.Retryable = false
+					if retryable {
+						action.ErrorClass = "RetryBudgetExhausted"
+					}
+					action.CompletedAt = haActionTime(now)
 				}
+				haObserveActionFailure(action, haMetricExecutorDirect, action.AdminJobPhase == haAdminJobPhaseFailed)
 				action.AdminError = err.Error()
 				if statusCode, ok := adminsdk.HAStatusCode(err); ok {
 					action.AdminStatusCode = statusCode
@@ -3943,6 +4072,10 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 				action.AdminJobPhase = haAdminJobPhaseSucceeded
 				action.AdminError = ""
 				action.AdminStatusCode = 0
+				action.Retryable = false
+				action.ErrorClass = ""
+				action.CompletedAt = haActionTime(now)
+				haObserveActionSuccess(action, haMetricExecutorDirect)
 				if action.Kind == string(haActionPromoteStandby) {
 					if err := r.persistHAPromotionReceipt(ctx, cluster); err != nil {
 						return fmt.Errorf("persist HA promotion receipt: %w", err)
@@ -3955,6 +4088,10 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			action.AdminJobName = haAdminDirectAPIName
 			action.AdminJobPhase = haAdminJobPhaseFailed
 			action.AdminError = fmt.Sprintf("HA action %s is marked AdminAPI but no typed /admin/v1 request could be executed", action.Kind)
+			action.Retryable = false
+			action.ErrorClass = "UnsupportedAdminAction"
+			action.CompletedAt = haActionTime(now)
+			haObserveActionFailure(action, haMetricExecutorDirect, true)
 			continue
 		}
 		if action.Executor != string(haActionExecutorCLIJob) {
@@ -4114,23 +4251,9 @@ const haAdminDirectAPIName = "direct-admin-api"
 var errHAAdminTokenEnvMissing = stderrors.New("configured HA admin token env var is empty or unset")
 var errHAPromotionBoundaryNotApplied = stderrors.New("standby has not applied the frozen former-primary boundary")
 
-func (r *AntflyClusterReconciler) resetMissingFailedHAAdminJob(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
-	if action == nil ||
-		action.AdminJobPhase != haAdminJobPhaseFailed ||
-		action.AdminJobName == "" ||
-		action.AdminJobName == haAdminDirectAPIName ||
-		action.AdminJobName != haAdminJobName(cluster, *action) {
-		return false, nil
-	}
-	existing := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Name: action.AdminJobName, Namespace: cluster.Namespace}, existing)
-	if errors.IsNotFound(err) {
-		return true, nil
-	}
-	return false, err
-}
-
 func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action *antflyv1.HAPlannedActionStatus) error {
+	previousPhase := action.AdminJobPhase
+	previousAttemptCount := action.AttemptCount
 	jobAction, ready, err := r.haActivationJobAction(ctx, cluster, *action)
 	if err != nil {
 		return err
@@ -4141,6 +4264,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, clust
 		return nil
 	}
 	job := buildHAAdminJob(cluster, admin, jobAction)
+	if err := r.bindHAAdminJobToPVCConsumer(ctx, job); err != nil {
+		return err
+	}
 	action.AdminJobName = job.Name
 	if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
 		return err
@@ -4149,15 +4275,73 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, clust
 	existing := &batchv1.Job{}
 	err = r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
 	if errors.IsNotFound(err) {
+		now := r.haNow()
+		if action.FirstAttemptAt == nil {
+			action.FirstAttemptAt = haActionTime(now)
+		}
+		action.LastAttemptAt = haActionTime(now)
+		action.AttemptCount++
+		action.Retryable = true
+		action.ErrorClass = ""
+		action.CompletedAt = nil
 		action.AdminJobPhase = haAdminJobPhasePending
-		return r.Create(ctx, job)
+		if err := r.Create(ctx, job); err != nil {
+			return err
+		}
+		haObserveActionAttempts(action, haMetricExecutorJob, 1)
+		return nil
 	}
 	if err != nil {
 		return err
 	}
 	action.AdminJobPhase = haAdminJobPhase(existing)
+	observedAttempts := existing.Status.Failed + existing.Status.Succeeded
+	if existing.Status.Active > 0 || (observedAttempts == 0 && action.AdminJobPhase != haAdminJobPhasePending) {
+		observedAttempts++
+	}
+	if observedAttempts > action.AttemptCount {
+		action.AttemptCount = observedAttempts
+	}
+	if existing.Status.StartTime != nil {
+		if action.FirstAttemptAt == nil || existing.Status.StartTime.Before(action.FirstAttemptAt) {
+			action.FirstAttemptAt = existing.Status.StartTime.DeepCopy()
+		}
+		action.LastAttemptAt = existing.Status.StartTime.DeepCopy()
+	}
+	switch action.AdminJobPhase {
+	case haAdminJobPhaseSucceeded:
+		action.Retryable = false
+		action.ErrorClass = ""
+		if existing.Status.CompletionTime != nil {
+			action.CompletedAt = existing.Status.CompletionTime.DeepCopy()
+		} else if action.CompletedAt == nil {
+			action.CompletedAt = haActionTime(r.haNow())
+		}
+	case haAdminJobPhaseFailed:
+		action.Retryable = false
+		action.ErrorClass = haAdminJobFailureClass(existing)
+		if existing.Status.CompletionTime != nil {
+			action.CompletedAt = existing.Status.CompletionTime.DeepCopy()
+		} else if action.CompletedAt == nil {
+			action.CompletedAt = haActionTime(r.haNow())
+		}
+	default:
+		action.Retryable = true
+		action.CompletedAt = nil
+	}
 	if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
 		r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+	}
+	if additionalAttempts := action.AttemptCount - previousAttemptCount; additionalAttempts > 0 {
+		haObserveActionAttempts(action, haMetricExecutorJob, additionalAttempts)
+	}
+	if previousPhase != action.AdminJobPhase {
+		switch action.AdminJobPhase {
+		case haAdminJobPhaseSucceeded:
+			haObserveActionSuccess(action, haMetricExecutorJob)
+		case haAdminJobPhaseFailed:
+			haObserveActionFailure(action, haMetricExecutorJob, true)
+		}
 	}
 	return nil
 }
@@ -5699,6 +5883,9 @@ func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStat
 	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &receipt); err != nil {
 		return nil
 	}
+	if len(receipt.Files) > math.MaxInt32 {
+		return nil
+	}
 	result := &antflyv1.HASeedArtifactReceiptStatus{
 		FormatVersion:      receipt.FormatVersion,
 		Generation:         strings.TrimSpace(receipt.Generation),
@@ -5721,7 +5908,7 @@ func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStat
 		TargetPVCName:      strings.TrimSpace(receipt.TargetPVCName),
 		TargetPVCUID:       strings.TrimSpace(receipt.TargetPVCUID),
 		TotalBytes:         receipt.TotalBytes,
-		FileCount:          int32(len(receipt.Files)),
+		FileCount:          int32(len(receipt.Files)), // #nosec G115 -- bounded by math.MaxInt32 above
 	}
 	if !haSeedArtifactReceiptMatchesStatus(action, result) {
 		return nil
@@ -8612,12 +8799,17 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 		if jobName == "" {
 			jobName = "unknown"
 		}
-		message := fmt.Sprintf("HA admin action %s failed in Job %s", action.Kind, jobName)
+		message := fmt.Sprintf("HA admin action %s failed in executor %s after %d attempt(s)", action.Kind, jobName, action.AttemptCount)
+		if strings.TrimSpace(action.ErrorClass) != "" {
+			message = fmt.Sprintf("%s (class %s)", message, strings.TrimSpace(action.ErrorClass))
+		}
 		if strings.TrimSpace(action.AdminError) != "" {
 			message = fmt.Sprintf("%s: %s", message, strings.TrimSpace(action.AdminError))
 		}
 		reason := antflyv1.ReasonHAAdminJobFailed
-		if action.AdminStatusCode == http.StatusUnauthorized {
+		if action.ErrorClass == "RetryBudgetExhausted" {
+			reason = antflyv1.ReasonHAAdminRetryBudgetExhausted
+		} else if action.AdminStatusCode == http.StatusUnauthorized {
 			reason = antflyv1.ReasonHAAdminUnauthorized
 		}
 		setHACondition(
@@ -8791,6 +8983,84 @@ func haAdminJobStorage(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminS
 	return append([]corev1.VolumeMount{}, admin.VolumeMounts...), append([]corev1.Volume{}, admin.Volumes...)
 }
 
+// bindHAAdminJobToPVCConsumer prevents a portable artifact Job from being
+// scheduled on a different node while its ReadWriteOnce claim is mounted by a
+// live runtime pod. StatefulSet pod names are stable across replacement, so
+// required pod affinity follows a restarted consumer without pinning a stale
+// node name. When no live consumer exists, normal PVC/PV scheduling applies.
+func (r *AntflyClusterReconciler) bindHAAdminJobToPVCConsumer(ctx context.Context, job *batchv1.Job) error {
+	if r == nil || job == nil {
+		return nil
+	}
+	claimName := ""
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.PersistentVolumeClaim == nil || strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) == "" {
+			continue
+		}
+		if claimName != "" && claimName != volume.PersistentVolumeClaim.ClaimName {
+			return fmt.Errorf("HA admin Job %s mounts multiple PVCs; portable artifact actions must remain action-scoped", job.Name)
+		}
+		claimName = volume.PersistentVolumeClaim.ClaimName
+	}
+	if claimName == "" {
+		return nil
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace)); err != nil {
+		return fmt.Errorf("list PVC consumers for HA admin Job %s: %w", job.Name, err)
+	}
+	consumerPodName := ""
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		mountsClaim := false
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == claimName {
+				mountsClaim = true
+				break
+			}
+		}
+		if !mountsClaim {
+			continue
+		}
+		stableName := strings.TrimSpace(pod.Labels[appsv1.StatefulSetPodNameLabel])
+		if stableName == "" || stableName != pod.Name {
+			return fmt.Errorf("PVC %s consumer pod %s lacks its stable StatefulSet pod-name label", claimName, pod.Name)
+		}
+		if consumerPodName != "" && consumerPodName != stableName {
+			return fmt.Errorf("PVC %s has multiple live consumer pods (%s, %s); refusing ambiguous HA Job placement", claimName, consumerPodName, stableName)
+		}
+		consumerPodName = stableName
+	}
+	if consumerPodName == "" {
+		return nil
+	}
+	if job.Spec.Template.Spec.Affinity == nil {
+		job.Spec.Template.Spec.Affinity = &corev1.Affinity{}
+	}
+	if job.Spec.Template.Spec.Affinity.PodAffinity == nil {
+		job.Spec.Template.Spec.Affinity.PodAffinity = &corev1.PodAffinity{}
+	}
+	job.Spec.Template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
+		job.Spec.Template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		corev1.PodAffinityTerm{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				appsv1.StatefulSetPodNameLabel: consumerPodName,
+			}},
+			TopologyKey: corev1.LabelHostname,
+		},
+	)
+	if job.Annotations == nil {
+		job.Annotations = map[string]string{}
+	}
+	job.Annotations["antfly.io/ha-pvc-consumer"] = consumerPodName
+	job.Annotations["antfly.io/ha-pvc-claim"] = claimName
+	return nil
+}
+
 func haSeedArtifactPVCStorage(name string, pvc *antflyv1.HASeedArtifactPVCSpec, readOnly bool) ([]corev1.VolumeMount, []corev1.Volume) {
 	if pvc == nil {
 		return nil, nil
@@ -8900,6 +9170,21 @@ func haAdminJobPhase(job *batchv1.Job) string {
 		return haAdminJobPhaseRunning
 	}
 	return haAdminJobPhasePending
+}
+
+func haAdminJobFailureClass(job *batchv1.Job) string {
+	if job == nil {
+		return "JobFailed"
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		if reason := strings.TrimSpace(condition.Reason); reason != "" {
+			return reason
+		}
+	}
+	return "JobFailed"
 }
 
 func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) string {

@@ -1150,17 +1150,25 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 			!haSeedArtifactReceiptMatches(previous) {
 			return action
 		}
-		if previous.AdminJobPhase == haAdminJobPhaseFailed &&
-			previous.AdminJobName == haAdminDirectAPIName {
-			return action
-		}
-		if haDirectAdminTypedEvidenceFailure(previous) {
-			return action
-		}
 		action.AdminJobName = previous.AdminJobName
 		action.AdminJobPhase = previous.AdminJobPhase
 		action.AdminError = previous.AdminError
 		action.AdminStatusCode = previous.AdminStatusCode
+		action.AttemptCount = previous.AttemptCount
+		action.Retryable = previous.Retryable
+		action.ErrorClass = previous.ErrorClass
+		if previous.FirstAttemptAt != nil {
+			action.FirstAttemptAt = previous.FirstAttemptAt.DeepCopy()
+		}
+		if previous.LastAttemptAt != nil {
+			action.LastAttemptAt = previous.LastAttemptAt.DeepCopy()
+		}
+		if previous.NextRetryAt != nil {
+			action.NextRetryAt = previous.NextRetryAt.DeepCopy()
+		}
+		if previous.CompletedAt != nil {
+			action.CompletedAt = previous.CompletedAt.DeepCopy()
+		}
 		if previous.AdminResult != nil {
 			action.AdminResult = previous.AdminResult.DeepCopy()
 		}
@@ -1170,16 +1178,6 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		return action
 	}
 	return action
-}
-
-func haDirectAdminTypedEvidenceFailure(action antflyv1.HAPlannedActionStatus) bool {
-	if action.AdminJobPhase != haAdminJobPhaseFailed ||
-		action.AdminJobName != haAdminDirectAPIName {
-		return false
-	}
-	err := strings.TrimSpace(action.AdminError)
-	return strings.Contains(err, "succeeded without typed") ||
-		strings.Contains(err, "missing typed result evidence")
 }
 
 func haFormerPrimaryDemotePreserveAllowed(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {

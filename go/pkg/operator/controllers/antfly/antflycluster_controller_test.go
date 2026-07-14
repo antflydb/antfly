@@ -989,7 +989,7 @@ func TestHAAdminBearerTokenDoesNotReadRuntimeSecretRef(t *testing.T) {
 	g.Expect(err.Error()).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
 }
 
-func TestReconcileHAAdminJobsRecreatesMissingFailedFallbackJob(t *testing.T) {
+func TestReconcileHAAdminJobsRetainsMissingFailedFallbackJobAsTerminal(t *testing.T) {
 	g := NewWithT(t)
 	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
 
@@ -1051,17 +1051,11 @@ func TestReconcileHAAdminJobsRecreatesMissingFailedFallbackJob(t *testing.T) {
 
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminJobName(cluster, action)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
-	g.Expect(jobs.Items).To(HaveLen(1))
-	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
-	g.Expect(container.Env).To(HaveLen(1))
-	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
-	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
-	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+	g.Expect(jobs.Items).To(BeEmpty(), "a TTL-deleted terminal Job must not be recreated forever")
 }
 
 func TestHAAdminSDKResponseHelpersPreserveTypedErrors(t *testing.T) {
@@ -1607,6 +1601,7 @@ func TestReconcileHAAdminJobsReportsUnauthorizedDirectAPIFailure(t *testing.T) {
 
 func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	g := NewWithT(t)
+	now := time.Date(2026, 7, 14, 18, 0, 0, 0, time.UTC)
 
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
@@ -1657,6 +1652,7 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
 			}, nil
 		})},
+		Now: func() time.Time { return now },
 	}
 
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
@@ -1665,6 +1661,11 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(Equal(http.StatusServiceUnavailable))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("status 503"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("primary restarting"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AttemptCount).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].Retryable).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].ErrorClass).To(Equal("HTTP503"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].NextRetryAt).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].NextRetryAt.Time).To(Equal(now.Add(defaultHADirectAdminRetryBase)))
 	reconciler.updateHAAdminJobExecutionCondition(cluster)
 	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
 	g.Expect(degraded).NotTo(BeNil())
@@ -1673,15 +1674,79 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	g.Expect(degraded.Message).To(ContainSubstring("primary restarting"))
 
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(requests).To(Equal(1), "retry must not run before persisted nextRetryAt")
+	now = now.Add(defaultHADirectAdminRetryBase)
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(requests).To(Equal(2))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(BeZero())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AttemptCount).To(Equal(int32(2)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].Retryable).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].CompletedAt).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
 	g.Expect(jobs.Items).To(BeEmpty())
+}
+
+func TestReconcileHAAdminJobsFailsClosedAfterRetryBudget(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	retryLimit := int32(2)
+	retryBase := int32(1)
+	now := time.Date(2026, 7, 14, 19, 0, 0, 0, time.UTC)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Mode: antflyv1.HAModeHotStandby,
+			Admin: &antflyv1.HAAdminSpec{
+				PrimaryURL: "http://primary-ha.default.svc:8081", ExecutePlannedActions: true,
+				DirectRetryLimit: &retryLimit, DirectRetryBaseSeconds: &retryBase,
+			},
+		}},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{{
+			Kind: string(haActionCreateSlot), SlotName: "standby-a",
+			AdminCommand: []string{"slot", "create", "--slot", "standby-a"},
+			AdminURL:     "http://primary-ha.default.svc:8081", AdminNodeID: "primary-a",
+		}}}},
+	}
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(), Scheme: s,
+		Now: func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("primary restarting"))}, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	action := &cluster.Status.HAStatus.PlannedActions[0]
+	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(action.AttemptCount).To(Equal(int32(1)))
+	now = action.NextRetryAt.Time
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(requests).To(Equal(2))
+	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(action.AttemptCount).To(Equal(retryLimit))
+	g.Expect(action.Retryable).To(BeFalse())
+	g.Expect(action.ErrorClass).To(Equal("RetryBudgetExhausted"))
+	g.Expect(action.CompletedAt).NotTo(BeNil())
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminRetryBudgetExhausted))
+	g.Expect(degraded.Message).To(ContainSubstring("after 2 attempt(s)"))
+	g.Expect(degraded.Message).To(ContainSubstring("class RetryBudgetExhausted"))
+
+	now = now.Add(time.Hour)
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(requests).To(Equal(2), "terminal retry exhaustion must survive subsequent reconciles")
 }
 
 func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
@@ -2292,6 +2357,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 
 func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAssessment(t *testing.T) {
 	g := NewWithT(t)
+	now := time.Date(2026, 7, 14, 20, 0, 0, 0, time.UTC)
 
 	cluster := &antflyv1.AntflyCluster{
 		Spec: antflyv1.AntflyClusterSpec{
@@ -2361,6 +2427,7 @@ func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAsse
 	var observed []string
 	assessmentCalls := 0
 	reconciler := &AntflyClusterReconciler{
+		Now: func() time.Time { return now },
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.URL.Host+" "+req.Method+" "+req.URL.Path)
 			var payload map[string]any
@@ -2412,6 +2479,7 @@ func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAsse
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhasePending))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminError).To(ContainSubstring("has not applied the frozen former-primary boundary"))
+	now = cluster.Status.HAStatus.PlannedActions[2].NextRetryAt.Time
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"primary-ha.default.svc:8081 POST /admin/v1/ha/fence",
@@ -3519,6 +3587,89 @@ func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials
 	g.Expect(activateJob.Spec.Template.Spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{{Name: "ha-seed-target", MountPath: "/target"}}))
 	g.Expect(activateJob.Spec.Template.Spec.Volumes).To(HaveLen(1))
 	g.Expect(activateJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
+}
+
+func TestPortableArtifactJobFollowsLiveRWOConsumerPod(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{Image: "antfly:test", HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Standbys: []antflyv1.HAStandbySpec{{Name: "standby-a", SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+				SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			}}},
+		}},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionPublishSeedArtifact), StandbyName: "standby-a", SlotName: "standby-a",
+		AdminCommand: []string{"artifact", "publish", "--location", "s3://ha-seeds/cluster-a"},
+	}
+	job := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
+	g.Expect(job.Spec.Template.Spec.Affinity).To(BeNil(), "placement depends on live PVC consumers, not claim-name guessing")
+
+	consumer := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "primary-swarm-0", Namespace: "default",
+			Labels: map[string]string{appsv1.StatefulSetPodNameLabel: "primary-swarm-0"},
+		},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "primary-data"}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(consumer).Build()}
+	g.Expect(reconciler.bindHAAdminJobToPVCConsumer(context.Background(), job)).To(Succeed())
+	g.Expect(job.Annotations).To(HaveKeyWithValue("antfly.io/ha-pvc-consumer", "primary-swarm-0"))
+	g.Expect(job.Annotations).To(HaveKeyWithValue("antfly.io/ha-pvc-claim", "primary-data"))
+	required := job.Spec.Template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	g.Expect(required).To(HaveLen(1))
+	g.Expect(required[0].TopologyKey).To(Equal(corev1.LabelHostname))
+	g.Expect(required[0].LabelSelector.MatchLabels).To(Equal(map[string]string{
+		appsv1.StatefulSetPodNameLabel: "primary-swarm-0",
+	}))
+}
+
+func TestPortableArtifactJobFailsClosedForAmbiguousRWOConsumers(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	consumer := func(name string, labels map[string]string, phase corev1.PodPhase) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+			Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "primary-data"}},
+			}}},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+	}
+	job := func() *batchv1.Job {
+		return &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "publish", Namespace: "default"},
+			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "source", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "primary-data"}},
+			}}}}},
+		}
+	}
+
+	unlabelled := consumer("primary-swarm-0", nil, corev1.PodRunning)
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(unlabelled).Build()}
+	err := reconciler.bindHAAdminJobToPVCConsumer(context.Background(), job())
+	g.Expect(err).To(MatchError(ContainSubstring("lacks its stable StatefulSet pod-name label")))
+
+	first := consumer("primary-swarm-0", map[string]string{appsv1.StatefulSetPodNameLabel: "primary-swarm-0"}, corev1.PodRunning)
+	second := consumer("primary-swarm-1", map[string]string{appsv1.StatefulSetPodNameLabel: "primary-swarm-1"}, corev1.PodPending)
+	reconciler = &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(first, second).Build()}
+	err = reconciler.bindHAAdminJobToPVCConsumer(context.Background(), job())
+	g.Expect(err).To(MatchError(ContainSubstring("multiple live consumer pods")))
+
+	terminated := consumer("old-primary-swarm-0", nil, corev1.PodFailed)
+	reconciler = &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(terminated).Build()}
+	ignored := job()
+	g.Expect(reconciler.bindHAAdminJobToPVCConsumer(context.Background(), ignored)).To(Succeed())
+	g.Expect(ignored.Spec.Template.Spec.Affinity).To(BeNil(), "terminated consumers must not pin a replacement Job")
 }
 
 func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {

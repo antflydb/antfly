@@ -103,7 +103,20 @@ In `status.haStatus`, check:
   `fencing.reason`;
 - `primaryRoute`;
 - `formerPrimary`;
-- `plannedActions`.
+- `plannedActions`, including `attemptCount`, `firstAttemptAt`,
+  `lastAttemptAt`, `nextRetryAt`, `completedAt`, `retryable`, and
+  `errorClass`.
+
+Typed admin requests use a durable, bounded exponential retry policy. The
+defaults are eight attempts, a five-second initial delay, and a two-minute
+maximum delay. Override them with `admin.directRetryLimit`,
+`admin.directRetryBaseSeconds`, and `admin.directRetryMaxSeconds`. Exhausting
+the budget produces a terminal `Failed` action with
+`errorClass: RetryBudgetExhausted`; the operator will not silently recreate or
+retry that exact action identity forever. A changed desired action identity is
+required to begin a new execution series. CLI-backed Jobs remain bounded by
+their Kubernetes Job backoff and deadline settings, and their terminal status
+is retained even after the Job TTL controller removes the Job object.
 
 ## Bootstrap and Reseed
 
@@ -166,6 +179,13 @@ the restore Job. This separation is required for two node-local or RWO PVCs: no
 Job asks Kubernetes to attach both PVCs at once. The standby runtime itself must
 also mount the target path so the typed bootstrap operation can open the
 verified files.
+
+When a live StatefulSet pod already mounts one of those RWO PVCs, the operator
+adds required same-node pod affinity to the artifact Job using the stable
+StatefulSet pod-name label. This prevents a cross-node `Multi-Attach` race while
+still following the replacement pod after a restart. Multiple live consumers,
+or a consumer that cannot be identified as a stable StatefulSet pod, fail
+closed instead of guessing a node.
 
 The restore helper never clears an arbitrary directory. It accepts a missing or
 empty target, a partial directory carrying the matching operator staging
@@ -245,6 +265,22 @@ Alert on:
 - stale or unsupported fences;
 - unsafe promotion requests;
 - old-primary write attempts after promotion.
+
+The operator metrics endpoint exports bounded-label HA execution telemetry:
+
+| Metric | Meaning |
+|--------|---------|
+| `antfly_operator_ha_action_attempts_total` | Actual direct API or Kubernetes Job execution attempts |
+| `antfly_operator_ha_action_retries_total` | Attempts after the first for an exact action identity |
+| `antfly_operator_ha_action_failures_total` | Retryable and terminal failures with a bounded error class |
+| `antfly_operator_ha_action_duration_seconds` | First-attempt to terminal-completion latency |
+| `antfly_operator_ha_seed_artifact_bytes` | Size distribution for successful portable seed operations |
+| `antfly_operator_ha_seed_artifact_files` | File-count distribution for successful portable seed operations |
+
+Page on terminal failures, repeated retry-budget exhaustion, and sustained
+seed-action latency. Raw Kubernetes Job reasons and response bodies remain in
+status and logs; they are deliberately collapsed into bounded metric labels to
+avoid cardinality growth.
 
 For incidents, preserve:
 

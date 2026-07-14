@@ -1259,6 +1259,19 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if admin.JobTTLSecondsAfterFinished != nil && *admin.JobTTLSecondsAfterFinished < 0 {
 			errors = append(errors, "spec.highAvailability.admin.jobTTLSecondsAfterFinished must not be negative")
 		}
+		if admin.DirectRetryLimit != nil && *admin.DirectRetryLimit <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directRetryLimit must be greater than 0")
+		}
+		if admin.DirectRetryBaseSeconds != nil && *admin.DirectRetryBaseSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directRetryBaseSeconds must be greater than 0")
+		}
+		if admin.DirectRetryMaxSeconds != nil && *admin.DirectRetryMaxSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directRetryMaxSeconds must be greater than 0")
+		}
+		if admin.DirectRetryBaseSeconds != nil && admin.DirectRetryMaxSeconds != nil &&
+			*admin.DirectRetryMaxSeconds < *admin.DirectRetryBaseSeconds {
+			errors = append(errors, "spec.highAvailability.admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds")
+		}
 		errors = append(errors, validateHAAdminJobPodSpec(admin)...)
 		if admin.ExecutePlannedActions {
 			if strings.TrimSpace(admin.PrimaryURL) == "" {

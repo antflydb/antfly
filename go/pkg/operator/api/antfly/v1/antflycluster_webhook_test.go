@@ -2216,6 +2216,9 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	backoffLimit := int32(-1)
 	timeoutSeconds := int64(0)
 	ttlSecondsAfterFinished := int32(-10)
+	directRetryLimit := int32(0)
+	directRetryBaseSeconds := int32(30)
+	directRetryMaxSeconds := int32(10)
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
@@ -2224,6 +2227,9 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 			JobBackoffLimit:            &backoffLimit,
 			JobTimeoutSeconds:          &timeoutSeconds,
 			JobTTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+			DirectRetryLimit:           &directRetryLimit,
+			DirectRetryBaseSeconds:     &directRetryBaseSeconds,
+			DirectRetryMaxSeconds:      &directRetryMaxSeconds,
 		},
 		Standbys: []HAStandbySpec{
 			{Name: "standby-a", AdminURL: "grpc://standby-a-ha.default.svc:8081"},
@@ -2239,7 +2245,9 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
 		!strings.Contains(err.Error(), "admin.jobBackoffLimit") ||
 		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
-		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") {
+		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") ||
+		!strings.Contains(err.Error(), "admin.directRetryLimit") ||
+		!strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal") {
 		t.Fatalf("expected invalid HA admin endpoint errors, got: %v", err)
 	}
 }

@@ -733,26 +733,29 @@ func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromot
 	previous.AdminJobName = haAdminDirectAPIName
 	previous.AdminJobPhase = haAdminJobPhaseFailed
 	previous.AdminError = "HA admin API returned status 409: BaseBackupSlotInUse"
+	previous.AttemptCount = defaultHADirectAdminRetryLimit
+	previous.ErrorClass = "RetryBudgetExhausted"
 	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
-	notPreserved := haPreservePlannedActionExecution(action, status)
-	if notPreserved.AdminJobName != "" ||
-		notPreserved.AdminJobPhase != "" ||
-		notPreserved.AdminError != "" ||
-		notPreserved.AdminResult != nil {
-		t.Fatalf("expected failed direct-admin action to be retried, got %#v", notPreserved)
+	preserved = haPreservePlannedActionExecution(action, status)
+	if preserved.AdminJobName != haAdminDirectAPIName ||
+		preserved.AdminJobPhase != haAdminJobPhaseFailed ||
+		preserved.AdminError == "" ||
+		preserved.AttemptCount != defaultHADirectAdminRetryLimit ||
+		preserved.ErrorClass != "RetryBudgetExhausted" {
+		t.Fatalf("expected terminal direct-admin failure to survive replan, got %#v", preserved)
 	}
 
 	previous = action
 	previous.AdminJobName = haAdminDirectAPIName
 	previous.AdminJobPhase = haAdminJobPhaseFailed
 	previous.AdminError = "HA admin action DemoteFormerPrimary succeeded without typed rejoin assessment"
+	previous.ErrorClass = "PermanentAdminError"
 	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
-	notPreserved = haPreservePlannedActionExecution(action, status)
-	if notPreserved.AdminJobName != "" ||
-		notPreserved.AdminJobPhase != "" ||
-		notPreserved.AdminError != "" ||
-		notPreserved.AdminResult != nil {
-		t.Fatalf("expected direct-admin typed evidence failure to be retried, got %#v", notPreserved)
+	preserved = haPreservePlannedActionExecution(action, status)
+	if preserved.AdminJobName != haAdminDirectAPIName ||
+		preserved.AdminJobPhase != haAdminJobPhaseFailed ||
+		preserved.AdminError == "" || preserved.ErrorClass != "PermanentAdminError" {
+		t.Fatalf("expected typed-evidence failure to remain terminal until desired identity changes, got %#v", preserved)
 	}
 
 	previous = action
@@ -761,7 +764,7 @@ func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromot
 	previous.AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
 	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
 	status.LastPromotion.NewTimelineID = 6
-	notPreserved = haPreservePlannedActionExecution(action, status)
+	notPreserved := haPreservePlannedActionExecution(action, status)
 	if notPreserved.AdminJobName != "" ||
 		notPreserved.AdminJobPhase != "" ||
 		notPreserved.AdminResult != nil {
@@ -5177,13 +5180,15 @@ func TestPeriodicRequeueRenewsKubernetesLeaseBeforeExpiry(t *testing.T) {
 		t.Fatalf("expected HA lease requeue to win over autoscaling, got %s", got)
 	}
 
-	cluster.Spec.HighAvailability.AutomaticFailover.Enabled = false
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
 	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
 		t.Fatalf("expected autoscaling requeue without HA renewal, got %s", got)
 	}
 }
 
 func TestPeriodicRequeueRetriesDirectHAAdminAction(t *testing.T) {
+	now := time.Date(2026, 7, 14, 18, 0, 0, 0, time.UTC)
+	nextRetry := metav1.NewTime(now.Add(17 * time.Second))
 	cluster := haCluster()
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		PlannedActions: []antflyv1.HAPlannedActionStatus{{
@@ -5191,22 +5196,51 @@ func TestPeriodicRequeueRetriesDirectHAAdminAction(t *testing.T) {
 			AdminJobName:  haAdminDirectAPIName,
 			AdminJobPhase: haAdminJobPhasePending,
 			AdminError:    "HA admin API returned status 503: primary restarting",
+			Retryable:     true,
+			NextRetryAt:   &nextRetry,
 		}},
 	}
 
-	if got, want := periodicRequeueAfter(cluster), haAdminRetryRequeueAfter; got != want {
+	if got, want := periodicRequeueAfterAt(cluster, now), 17*time.Second; got != want {
 		t.Fatalf("expected direct HA admin retry requeue %s, got %s", want, got)
+	}
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
+	if got, want := periodicRequeueAfterAt(cluster, now), 17*time.Second; got != want {
+		t.Fatalf("expected persisted direct HA admin retry requeue %s, got %s", want, got)
 	}
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminError = ""
-	if got := periodicRequeueAfter(cluster); got != 0 {
+	if got := periodicRequeueAfterAt(cluster, now); got != 0 {
 		t.Fatalf("expected no retry requeue without transient error, got %s", got)
 	}
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminError = "HA admin API returned status 503"
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = "antfly-ha-action"
-	if got := periodicRequeueAfter(cluster); got != 0 {
+	if got := periodicRequeueAfterAt(cluster, now); got != 0 {
 		t.Fatalf("expected no retry requeue for CLI admin job, got %s", got)
+	}
+}
+
+func TestHADirectAdminRetryDelayUsesConfiguredExponentialCap(t *testing.T) {
+	baseSeconds := int32(3)
+	maxSeconds := int32(10)
+	admin := &antflyv1.HAAdminSpec{
+		DirectRetryBaseSeconds: &baseSeconds,
+		DirectRetryMaxSeconds:  &maxSeconds,
+	}
+	tests := []struct {
+		attempt int32
+		want    time.Duration
+	}{
+		{attempt: 1, want: 3 * time.Second},
+		{attempt: 2, want: 6 * time.Second},
+		{attempt: 3, want: 10 * time.Second},
+		{attempt: 30, want: 10 * time.Second},
+	}
+	for _, test := range tests {
+		if got := haDirectAdminRetryDelay(admin, test.attempt); got != test.want {
+			t.Fatalf("attempt %d retry delay = %s, want %s", test.attempt, got, test.want)
+		}
 	}
 }
 

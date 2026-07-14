@@ -230,6 +230,9 @@ const (
 	// ReasonHAAdminActionRetrying indicates an HA admin action hit a retryable error and will be retried.
 	ReasonHAAdminActionRetrying = "HAAdminActionRetrying"
 
+	// ReasonHAAdminRetryBudgetExhausted indicates an exact HA action reached its bounded retry limit.
+	ReasonHAAdminRetryBudgetExhausted = "HAAdminRetryBudgetExhausted"
+
 	// ReasonHAStandbyUnhealthy indicates at least one desired standby is unhealthy.
 	ReasonHAStandbyUnhealthy = "HAStandbyUnhealthy"
 
@@ -909,6 +912,24 @@ type HAAdminSpec struct {
 	// JobTTLSecondsAfterFinished controls how long completed CLI-backed HA admin Jobs are retained.
 	// +optional
 	JobTTLSecondsAfterFinished *int32 `json:"jobTTLSecondsAfterFinished,omitempty"`
+
+	// DirectRetryLimit bounds attempts for retryable typed HA admin requests. Once
+	// exhausted, the action becomes terminally Failed until its desired identity
+	// changes. Defaults to 8.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectRetryLimit *int32 `json:"directRetryLimit,omitempty"`
+
+	// DirectRetryBaseSeconds is the initial typed HA admin retry delay. Backoff is
+	// exponential and persisted in action status. Defaults to 5 seconds.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectRetryBaseSeconds *int32 `json:"directRetryBaseSeconds,omitempty"`
+
+	// DirectRetryMaxSeconds caps the typed HA admin retry delay. Defaults to 120 seconds.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectRetryMaxSeconds *int32 `json:"directRetryMaxSeconds,omitempty"`
 
 	// EnvFrom is applied to CLI-backed HA admin Job containers, commonly for backup object-store credentials.
 	// +optional
@@ -1996,6 +2017,35 @@ type HAPlannedActionStatus struct {
 	// AdminStatusCode records the latest typed /admin/v1 HA HTTP status code for this action.
 	// +optional
 	AdminStatusCode int `json:"adminStatusCode,omitempty"`
+
+	// AttemptCount is the durable number of direct requests or Kubernetes Job pod
+	// attempts observed for this exact action identity.
+	// +optional
+	AttemptCount int32 `json:"attemptCount,omitempty"`
+
+	// Retryable reports whether the latest failure remains within its retry budget.
+	// +optional
+	Retryable bool `json:"retryable,omitempty"`
+
+	// ErrorClass is a stable machine-readable terminal or retry classification.
+	// +optional
+	ErrorClass string `json:"errorClass,omitempty"`
+
+	// FirstAttemptAt records when execution of this exact action identity began.
+	// +optional
+	FirstAttemptAt *metav1.Time `json:"firstAttemptAt,omitempty"`
+
+	// LastAttemptAt records the most recent execution attempt.
+	// +optional
+	LastAttemptAt *metav1.Time `json:"lastAttemptAt,omitempty"`
+
+	// NextRetryAt records the persisted earliest time for the next direct retry.
+	// +optional
+	NextRetryAt *metav1.Time `json:"nextRetryAt,omitempty"`
+
+	// CompletedAt records terminal success or failure.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 
 	Reason string `json:"reason,omitempty"`
 }

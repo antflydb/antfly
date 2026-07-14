@@ -753,6 +753,18 @@ spec:
                 properties:
                   admin:
                     properties:
+                      directRetryBaseSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      directRetryLimit:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      directRetryMaxSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
                       envFrom:
                         items:
                           properties:
@@ -4630,7 +4642,15 @@ spec:
                           type: integer
                         adminURL:
                           type: string
+                        attemptCount:
+                          format: int32
+                          type: integer
+                        completedAt:
+                          format: date-time
+                          type: string
                         dependsOn:
+                          type: string
+                        errorClass:
                           type: string
                         executor:
                           type: string
@@ -4643,7 +4663,16 @@ spec:
                           type: string
                         fenceReason:
                           type: string
+                        firstAttemptAt:
+                          format: date-time
+                          type: string
                         kind:
+                          type: string
+                        lastAttemptAt:
+                          format: date-time
+                          type: string
+                        nextRetryAt:
+                          format: date-time
                           type: string
                         observedLSN:
                           format: int64
@@ -4655,6 +4684,8 @@ spec:
                         retainedFromLSN:
                           format: int64
                           type: integer
+                        retryable:
+                          type: boolean
                         routeFrom:
                           type: string
                         routeTo:

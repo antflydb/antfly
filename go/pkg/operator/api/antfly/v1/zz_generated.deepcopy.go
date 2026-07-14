@@ -814,6 +814,21 @@ func (in *HAAdminSpec) DeepCopyInto(out *HAAdminSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.DirectRetryLimit != nil {
+		in, out := &in.DirectRetryLimit, &out.DirectRetryLimit
+		*out = new(int32)
+		**out = **in
+	}
+	if in.DirectRetryBaseSeconds != nil {
+		in, out := &in.DirectRetryBaseSeconds, &out.DirectRetryBaseSeconds
+		*out = new(int32)
+		**out = **in
+	}
+	if in.DirectRetryMaxSeconds != nil {
+		in, out := &in.DirectRetryMaxSeconds, &out.DirectRetryMaxSeconds
+		*out = new(int32)
+		**out = **in
+	}
 	if in.EnvFrom != nil {
 		in, out := &in.EnvFrom, &out.EnvFrom
 		*out = make([]corev1.EnvFromSource, len(*in))
@@ -914,6 +929,22 @@ func (in *HAPlannedActionStatus) DeepCopyInto(out *HAPlannedActionStatus) {
 		in, out := &in.SeedArtifactReceipt, &out.SeedArtifactReceipt
 		*out = new(HASeedArtifactReceiptStatus)
 		**out = **in
+	}
+	if in.FirstAttemptAt != nil {
+		in, out := &in.FirstAttemptAt, &out.FirstAttemptAt
+		*out = (*in).DeepCopy()
+	}
+	if in.LastAttemptAt != nil {
+		in, out := &in.LastAttemptAt, &out.LastAttemptAt
+		*out = (*in).DeepCopy()
+	}
+	if in.NextRetryAt != nil {
+		in, out := &in.NextRetryAt, &out.NextRetryAt
+		*out = (*in).DeepCopy()
+	}
+	if in.CompletedAt != nil {
+		in, out := &in.CompletedAt, &out.CompletedAt
+		*out = (*in).DeepCopy()
 	}
 }
 
