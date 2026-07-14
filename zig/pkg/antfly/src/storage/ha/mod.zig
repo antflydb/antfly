@@ -20,6 +20,7 @@ pub const primary = @import("primary.zig");
 pub const session = @import("session.zig");
 pub const backup_manifest = @import("backup_manifest.zig");
 pub const seed_artifact = @import("seed_artifact.zig");
+pub const seed_activation = @import("seed_activation.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const status = @import("status.zig");
 pub const replication_api = @import("replication_api.zig");
@@ -53,6 +54,7 @@ test {
     _ = session;
     _ = backup_manifest;
     _ = seed_artifact;
+    _ = seed_activation;
     _ = bootstrap;
     _ = status;
     _ = replication_api;
