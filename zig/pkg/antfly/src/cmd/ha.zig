@@ -1329,6 +1329,27 @@ test "ha cmd local handles default shard and table identity to whole instance" {
     try std.testing.expectEqual(@as(u64, 2), standby_identity.epoch);
 }
 
+test "ha cmd parses offline seed activation target and identity" {
+    const options = try parseArtifactArgs(&.{
+        "activate",
+        "--generation", "seed-standby-a-10",
+        "--slot", "standby-a",
+        "--staging-root", "/target/.antfly-ha/staging",
+        "--target-root", "/target",
+        "--ha-cluster-id", "100",
+        "--ha-shard-id", "0",
+        "--ha-table-id", "0",
+        "--ha-timeline-id", "4",
+        "--ha-epoch", "6",
+        "--minimum-checkpoint-lsn", "10",
+    });
+    try std.testing.expectEqual(ArtifactAction.activate, options.action);
+    try std.testing.expectEqualStrings("/target/.antfly-ha/staging", options.staging_root.?);
+    try std.testing.expectEqualStrings("/target", options.target_root.?);
+    try std.testing.expectEqual(@as(u64, 100), options.identity.cluster_id.?);
+    try std.testing.expectEqual(@as(u64, 10), options.minimum_checkpoint_lsn);
+}
+
 test "ha cmd parses remote admin URL before command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{

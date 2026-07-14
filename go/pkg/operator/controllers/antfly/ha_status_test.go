@@ -1043,13 +1043,17 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 			Location:         "s3://ha-seeds/cluster-a",
 			GenerationPrefix: "base",
 			StagingRoot:      "/target/seed/staging",
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{
+				ClaimName: "standby-a-data",
+				MountPath: "/target",
+			},
 		},
 	}}
 
 	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 	actions := cluster.Status.HAStatus.PlannedActions
-	if len(actions) != 7 {
-		t.Fatalf("expected create, begin, finish, publish, restore, bootstrap, prune actions, got %#v", actions)
+	if len(actions) != 8 {
+		t.Fatalf("expected create, begin, finish, publish, restore, activate artifact, activate slot, prune actions, got %#v", actions)
 	}
 	publish := actions[3]
 	if publish.Kind != string(haActionPublishSeedArtifact) ||
@@ -1078,16 +1082,37 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 		!strings.Contains(strings.Join(restore.AdminCommand, " "), "--minimum-checkpoint-lsn 10") {
 		t.Fatalf("unexpected portable restore action: %#v", restore)
 	}
-	bootstrap := actions[5]
-	if bootstrap.Kind != string(haActionBootstrapStandbySeed) ||
-		bootstrap.DependsOn != string(haActionRestoreSeedArtifact) ||
-		bootstrap.SeedManifestPath != "/target/seed/staging/.antfly-ha-seed-manifest.afha" ||
-		bootstrap.SeedContentRoot != "/target/seed/staging" {
-		t.Fatalf("bootstrap must consume only verified restored staging: %#v", bootstrap)
+	activate := actions[5]
+	if activate.Kind != "ActivateSeedArtifact" ||
+		activate.DependsOn != string(haActionRestoreSeedArtifact) ||
+		activate.Executor != string(haActionExecutorCLIJob) ||
+		!reflect.DeepEqual(activate.AdminCommand, []string{
+			"artifact", "activate",
+			"--generation", "base-standby-a-10",
+			"--slot", "standby-a",
+			"--staging-root", "/target/seed/staging",
+			"--target-root", "/target",
+			"--ha-cluster-id", "100",
+			"--ha-shard-id", "0",
+			"--ha-table-id", "0",
+			"--ha-timeline-id", "4",
+			"--ha-epoch", "6",
+			"--minimum-checkpoint-lsn", "10",
+		}) {
+		t.Fatalf("activation must durably publish the verified generation on the target PVC: %#v", activate)
 	}
-	prune := actions[6]
+	activateSlot := actions[6]
+	if activateSlot.Kind != "ActivateSeededSlot" ||
+		activateSlot.DependsOn != "ActivateSeedArtifact" ||
+		activateSlot.Executor != string(haActionExecutorAdminAPI) ||
+		activateSlot.AdminURL != "http://primary-ha.default.svc:8081" ||
+		activateSlot.AdminMethod != "POST" ||
+		activateSlot.AdminPath != "/admin/v1/ha/base-backups/activate" {
+		t.Fatalf("slot must remain non-streamable until durable target activation evidence exists: %#v", activateSlot)
+	}
+	prune := actions[7]
 	if prune.Kind != string(haActionPruneSeedArtifacts) ||
-		prune.DependsOn != string(haActionBootstrapStandbySeed) ||
+		prune.DependsOn != "ActivateSeededSlot" ||
 		prune.SeedArtifactRetainGenerations != 2 ||
 		!reflect.DeepEqual(prune.AdminCommand, []string{
 			"artifact", "prune",

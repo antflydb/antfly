@@ -3512,6 +3512,13 @@ func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials
 	g.Expect(restoreJob.Spec.Template.Spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{{Name: "ha-seed-target", MountPath: "/target"}}))
 	g.Expect(restoreJob.Spec.Template.Spec.Volumes).To(HaveLen(1))
 	g.Expect(restoreJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
+
+	activateAction := action
+	activateAction.Kind = "ActivateSeedArtifact"
+	activateJob := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, activateAction)
+	g.Expect(activateJob.Spec.Template.Spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{{Name: "ha-seed-target", MountPath: "/target"}}))
+	g.Expect(activateJob.Spec.Template.Spec.Volumes).To(HaveLen(1))
+	g.Expect(activateJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
 }
 
 func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
@@ -5883,6 +5890,21 @@ func TestParseHASeedArtifactReceiptRequiresMatchingTypedEvidence(t *testing.T) {
 	g.Expect(pruneReceipt).NotTo(BeNil())
 	pruneAction.SeedArtifactReceipt = pruneReceipt
 	g.Expect(haAdminActionSucceededWithEvidence(pruneAction)).To(BeTrue())
+
+	activateAction := antflyv1.HAPlannedActionStatus{
+		Kind:                   "ActivateSeedArtifact",
+		SlotName:               "standby-a",
+		TargetLSN:              10,
+		SeedArtifactGeneration: "seed-standby-a-10",
+		AdminJobPhase:          haAdminJobPhaseSucceeded,
+	}
+	activation := fmt.Sprintf(`{"format_version":1,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"seed_receipt_sha256":"%s","manifest_sha256":"%s","aggregate_sha256":"%s","generation_path":"generations/seed-standby-a-10"}`, strings.Repeat("c", 64), strings.Repeat("a", 64), strings.Repeat("b", 64))
+	activationReceipt := parseHASeedArtifactReceipt(activation, activateAction)
+	g.Expect(activationReceipt).NotTo(BeNil())
+	g.Expect(activationReceipt.CheckpointLSN).To(Equal(uint64(12)))
+	g.Expect(activationReceipt.GenerationPath).To(Equal("generations/seed-standby-a-10"))
+	activateAction.SeedArtifactReceipt = activationReceipt
+	g.Expect(haAdminActionSucceededWithEvidence(activateAction)).To(BeTrue())
 }
 
 func TestCompletedSlotAdminJobResultSatisfiesReceiptEvidence(t *testing.T) {
