@@ -26,7 +26,7 @@ const Crc32 = std.hash.Crc32;
 const wal_mod = @import("../wal.zig");
 
 const magic = [8]u8{ 'A', 'F', 'H', 'A', 'S', 'L', 'T', '\n' };
-const version: u16 = 3;
+const version: u16 = 4;
 const header_len: usize = 60;
 const v2_error_len_size: usize = 4;
 const v3_body_prefix_len: usize = 12;
@@ -52,6 +52,15 @@ pub const SlotStatus = enum {
     reseed_required,
 };
 
+/// Durable initialization phase for a replication slot. `active` remains the
+/// operator-controlled pause state for streaming slots; a seeding slot is
+/// inactive for transport and synchronous durability while still retaining
+/// WAL from its base-backup boundary.
+pub const SlotLifecycle = enum {
+    seeding,
+    streaming,
+};
+
 pub const SlotState = struct {
     name: []const u8,
     timeline_id: u64,
@@ -60,6 +69,7 @@ pub const SlotState = struct {
     applied_lsn: u64,
     safe_read_lsn: u64,
     active: bool = true,
+    lifecycle: SlotLifecycle = .streaming,
     reseed_required: bool = false,
     last_error: ?[]const u8 = null,
 
@@ -157,6 +167,7 @@ pub const SlotStore = struct {
         safe_read_lsn: u64,
     ) !void {
         const current = self.get(name) orelse return error.SlotNotFound;
+        if (current.lifecycle == .seeding) return error.SlotSeeding;
         if (received_lsn < current.received_lsn) return error.InvalidSlotProgress;
         if (applied_lsn < current.applied_lsn) return error.InvalidSlotProgress;
         if (safe_read_lsn < current.safe_read_lsn) return error.InvalidSlotProgress;
@@ -168,6 +179,37 @@ pub const SlotStore = struct {
         next.safe_read_lsn = safe_read_lsn;
         next.restart_lsn = received_lsn;
         next.reseed_required = false;
+        next.last_error = null;
+        try self.createOrUpdate(next);
+    }
+
+    /// Complete a verified base-backup restore and make the slot eligible for
+    /// streaming. Ordinary progress cannot perform this state transition.
+    pub fn activateSeeded(
+        self: *SlotStore,
+        name: []const u8,
+        received_lsn: u64,
+        applied_lsn: u64,
+        safe_read_lsn: u64,
+    ) !void {
+        const current = self.get(name) orelse return error.SlotNotFound;
+        if (current.lifecycle != .seeding) return error.SlotNotSeeding;
+        if (current.reseed_required) return error.SlotRequiresReseed;
+        if (received_lsn < current.restart_lsn) return error.SeedBehindBackupBoundary;
+        if (applied_lsn < current.restart_lsn) return error.SeedBehindBackupBoundary;
+        if (received_lsn < current.received_lsn) return error.InvalidSlotProgress;
+        if (applied_lsn < current.applied_lsn) return error.InvalidSlotProgress;
+        if (safe_read_lsn < current.safe_read_lsn) return error.InvalidSlotProgress;
+        if (applied_lsn > received_lsn) return error.InvalidSlotProgress;
+        if (safe_read_lsn > applied_lsn) return error.InvalidSlotProgress;
+
+        var next = current;
+        next.restart_lsn = received_lsn;
+        next.received_lsn = received_lsn;
+        next.applied_lsn = applied_lsn;
+        next.safe_read_lsn = safe_read_lsn;
+        next.active = true;
+        next.lifecycle = .streaming;
         next.last_error = null;
         try self.createOrUpdate(next);
     }
@@ -205,7 +247,7 @@ pub const SlotStore = struct {
         }
 
         for (self.slots.items) |slot| {
-            if (!slot.state.active) continue;
+            if (!retainsWal(slot.state)) continue;
             if (slot.state.reseed_required) continue;
             if (slot.state.timeline_id != timeline_id) continue;
             if (slot.state.restart_lsn != restart_lsn) continue;
@@ -220,6 +262,7 @@ pub const SlotStore = struct {
 
     pub fn pause(self: *SlotStore, name: []const u8) !void {
         const current = self.get(name) orelse return error.SlotNotFound;
+        if (current.lifecycle == .seeding) return error.SlotSeeding;
         if (!current.active) return;
         var next = current;
         next.active = false;
@@ -228,6 +271,7 @@ pub const SlotStore = struct {
 
     pub fn resumeSlot(self: *SlotStore, name: []const u8) !void {
         const current = self.get(name) orelse return error.SlotNotFound;
+        if (current.lifecycle == .seeding) return error.SlotSeeding;
         if (current.active) return;
         var next = current;
         next.active = true;
@@ -306,10 +350,11 @@ pub const SlotStore = struct {
 
         var oldest = primary_lsn + 1;
         var active: usize = 0;
+        var retaining: usize = 0;
         var reseed: usize = 0;
 
         for (self.slots.items) |slot| {
-            if (!slot.state.active) continue;
+            if (!retainsWal(slot.state)) continue;
             if (current_timeline_id) |timeline_id| {
                 if (slot.state.timeline_id != timeline_id) {
                     if (!slot.state.reseed_required) {
@@ -332,13 +377,14 @@ pub const SlotStore = struct {
                 reseed += 1;
                 continue;
             }
-            active += 1;
+            retaining += 1;
+            if (slot.state.active) active += 1;
             oldest = @min(oldest, slot.state.restart_lsn);
         }
 
         for (mark_reseed.items) |name| try self.markReseedRequired(name);
 
-        const retained_lsn_count: u64 = if (active == 0 or oldest == primary_lsn + 1) blk: {
+        const retained_lsn_count: u64 = if (retaining == 0 or oldest == primary_lsn + 1) blk: {
             oldest = primary_lsn;
             break :blk 0;
         } else if (oldest < primary_lsn)
@@ -424,6 +470,7 @@ pub const SlotStore = struct {
 
 fn validateSlotState(state: SlotState) !void {
     if (state.name.len == 0) return error.InvalidSlotName;
+    if (state.lifecycle == .seeding and state.active) return error.InvalidSlotLifecycle;
     if (state.applied_lsn > state.received_lsn) return error.InvalidSlotProgress;
     if (state.safe_read_lsn > state.applied_lsn) return error.InvalidSlotProgress;
     if (state.last_error) |last_error| {
@@ -460,6 +507,7 @@ fn encodeEvent(alloc: Allocator, event: EventView) ![]u8 {
     var flags: u32 = 0;
     if (event.state.active) flags |= 1 << 0;
     if (event.state.reseed_required) flags |= 1 << 1;
+    if (event.state.lifecycle == .seeding) flags |= 1 << 2;
     std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
     std.mem.writeInt(u32, out[header_len..][0..4], @intCast(last_error.len), .little);
     std.mem.writeInt(u64, out[header_len + v2_error_len_size ..][0..8], event.state.safe_read_lsn, .little);
@@ -497,6 +545,7 @@ fn decodeEvent(bytes: []const u8) !EventView {
             .applied_lsn = std.mem.readInt(u64, bytes[applied_lsn_offset..][0..8], .little),
             .safe_read_lsn = body.safe_read_lsn orelse std.mem.readInt(u64, bytes[applied_lsn_offset..][0..8], .little),
             .active = (flags & (1 << 0)) != 0,
+            .lifecycle = if (decoded_version >= 4 and (flags & (1 << 2)) != 0) .seeding else .streaming,
             .reseed_required = (flags & (1 << 1)) != 0,
             .last_error = body.last_error,
         },
@@ -535,7 +584,7 @@ fn decodeEventBody(bytes: []const u8, decoded_version: u16, name_len: usize) !Ev
                 .last_error = last_error,
             };
         },
-        3 => blk: {
+        3, 4 => blk: {
             if (bytes.len < header_len + v3_body_prefix_len) return error.EndOfStream;
             const error_len: usize = @intCast(std.mem.readInt(u32, bytes[header_len..][0..4], .little));
             const safe_read_lsn = std.mem.readInt(u64, bytes[header_len + v2_error_len_size ..][0..8], .little);
@@ -553,6 +602,10 @@ fn decodeEventBody(bytes: []const u8, decoded_version: u16, name_len: usize) !Ev
         },
         else => error.UnsupportedVersion,
     };
+}
+
+fn retainsWal(state: SlotState) bool {
+    return state.lifecycle == .seeding or state.active;
 }
 
 fn encodeV1TestEvent(alloc: Allocator, event: EventView) ![]u8 {
@@ -606,6 +659,16 @@ fn encodeV2TestEvent(alloc: Allocator, event: EventView) ![]u8 {
     @memcpy(out[header_len + v2_error_len_size ..][0..event.state.name.len], event.state.name);
     @memcpy(out[header_len + v2_error_len_size + event.state.name.len ..][0..last_error.len], last_error);
     std.mem.writeInt(u32, out[body_crc_offset..][0..4], Crc32.hash(out[header_len..]), .little);
+    std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
+    return out;
+}
+
+fn encodeV3TestEvent(alloc: Allocator, event: EventView) ![]u8 {
+    const out = try encodeEvent(alloc, event);
+    std.mem.writeInt(u16, out[version_offset..][0..2], 3, .little);
+    var flags = std.mem.readInt(u32, out[flags_offset..][0..4], .little);
+    flags &= ~(@as(u32, 1) << 2);
+    std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
     std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
     return out;
 }
@@ -746,6 +809,26 @@ test "storage.ha slot store decodes v2 slot events with safe reads at applied ls
     try std.testing.expectEqualStrings("standby-a", event.state.name);
     try std.testing.expectEqual(@as(u64, 4), event.state.safe_read_lsn);
     try std.testing.expectEqualStrings("TransientLag", event.state.last_error.?);
+}
+
+test "storage.ha slot store migrates v3 slot events to streaming lifecycle" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeV3TestEvent(alloc, .{
+        .event_type = .upsert,
+        .state = .{
+            .name = "standby-a",
+            .timeline_id = 1,
+            .restart_lsn = 2,
+            .received_lsn = 5,
+            .applied_lsn = 4,
+            .safe_read_lsn = 4,
+        },
+    });
+    defer alloc.free(encoded);
+
+    const event = try decodeEvent(encoded);
+    try std.testing.expectEqual(SlotLifecycle.streaming, event.state.lifecycle);
+    try std.testing.expect(event.state.active);
 }
 
 test "storage.ha slot store rejects invalid slot state on replay" {
@@ -940,4 +1023,54 @@ test "storage.ha slot store allows backup pin ahead of standby progress" {
     try std.testing.expectEqual(@as(u64, 9), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 9), slot.applied_lsn);
     try std.testing.expectEqual(@as(u64, 9), slot.safe_read_lsn);
+}
+
+test "storage.ha slot store persists inactive seeding retention until explicit activation" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "seeding-lifecycle");
+    defer alloc.free(path);
+
+    {
+        var store = try SlotStore.open(alloc, path.ptr, .{});
+        defer store.close();
+        try store.createOrUpdate(.{
+            .name = "standby-seeding",
+            .timeline_id = 1,
+            .restart_lsn = 10,
+            .received_lsn = 9,
+            .applied_lsn = 9,
+            .safe_read_lsn = 9,
+            .active = false,
+            .lifecycle = .seeding,
+        });
+
+        const snapshot = try store.retentionSnapshot(12, .{});
+        try std.testing.expectEqual(@as(u64, 10), snapshot.oldest_restart_lsn);
+        try std.testing.expectEqual(@as(u64, 2), snapshot.retained_lsn_count);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.active_slots);
+        try std.testing.expectError(error.SlotSeeding, store.updateProgress("standby-seeding", 10, 10, 10));
+        try std.testing.expectError(error.SlotSeeding, store.resumeSlot("standby-seeding"));
+    }
+
+    {
+        var reopened = try SlotStore.open(alloc, path.ptr, .{});
+        defer reopened.close();
+        var slot = reopened.get("standby-seeding") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(SlotLifecycle.seeding, slot.lifecycle);
+        try std.testing.expect(!slot.active);
+
+        try reopened.activateSeeded("standby-seeding", 11, 10, 10);
+        slot = reopened.get("standby-seeding") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(SlotLifecycle.streaming, slot.lifecycle);
+        try std.testing.expect(slot.active);
+        try std.testing.expectEqual(@as(u64, 11), slot.restart_lsn);
+    }
+
+    {
+        var reopened = try SlotStore.open(alloc, path.ptr, .{});
+        defer reopened.close();
+        const slot = reopened.get("standby-seeding") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(SlotLifecycle.streaming, slot.lifecycle);
+        try std.testing.expect(slot.active);
+    }
 }

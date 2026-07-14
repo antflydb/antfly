@@ -210,6 +210,7 @@ test "storage.ha chaos crash during base backup preserves slot pin and catch-up 
     };
     _ = try bootstrap.bootstrapFromManifest(alloc, &standby, manifest, &contents);
     try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
+    try primary.activateSeededSlot("standby-a", identity.timeline_id, 2, 2, 2);
 
     var capture = ApplyCapture{ .alloc = alloc };
     defer capture.deinit();

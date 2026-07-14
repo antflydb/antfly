@@ -290,6 +290,7 @@ test "storage.ha bootstrap catches up from primary backup end record" {
         .flags = 0,
     };
     _ = try bootstrapFromManifest(alloc, &standby, manifest, &contents);
+    try primary.activateSeededSlot("standby-a", identity.timeline_id, 2, 2, 2);
 
     var capture = ApplyCapture{ .alloc = alloc };
     defer capture.deinit();
