@@ -47,6 +47,113 @@ const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
 const provisioned_startup_catch_up_interval_ms: u64 = std.time.ms_per_s;
+const provisioned_index_repair_interval_ms: u64 = 5 * std.time.ms_per_s;
+const default_provisioned_index_repair_discovery_interval_ms: u64 = 30 * std.time.ms_per_s;
+const provisioned_index_repair_fallback_min_groups_per_scan: usize = 16;
+const provisioned_index_repair_fallback_max_groups_per_scan: usize = 256;
+const provisioned_index_repair_fallback_rotation_target_ms: u64 = 30 * std.time.ms_per_min;
+const provisioned_index_repair_queued_groups_per_scan: usize = 32;
+
+/// Durable repair intents use realtime deadlines so they survive restart.
+/// The in-memory scheduler uses monotonic time so wall-clock adjustments cannot
+/// strand or prematurely release queued work. Translate once at the queue
+/// boundary and keep the two domains distinct thereafter.
+fn indexRepairMonotonicDeadlineMs(
+    realtime_deadline_ms: u64,
+    realtime_now_ms: u64,
+    monotonic_now_ms: u64,
+) u64 {
+    if (realtime_deadline_ms == 0 or realtime_deadline_ms <= realtime_now_ms) return 0;
+    return monotonic_now_ms +| (realtime_deadline_ms - realtime_now_ms);
+}
+
+const IndexRepairFallbackWindow = struct {
+    start: usize = 0,
+    count: usize = 0,
+    next: usize = 0,
+};
+
+fn indexRepairFallbackGroupsPerScan(total_groups: usize, discovery_interval_ms: u64) usize {
+    if (total_groups == 0) return 0;
+    const passes = @max(@as(u64, 1), provisioned_index_repair_fallback_rotation_target_ms /
+        @max(@as(u64, 1), discovery_interval_ms));
+    const desired: usize = @intCast((@as(u64, @intCast(total_groups)) +| passes - 1) / passes);
+    return @min(
+        provisioned_index_repair_fallback_max_groups_per_scan,
+        @max(provisioned_index_repair_fallback_min_groups_per_scan, desired),
+    );
+}
+
+fn indexRepairFallbackWindow(total_groups: usize, cursor: u64, discovery_interval_ms: u64) IndexRepairFallbackWindow {
+    if (total_groups == 0) return .{};
+    const start: usize = @intCast(cursor % @as(u64, @intCast(total_groups)));
+    const count = @min(indexRepairFallbackGroupsPerScan(total_groups, discovery_interval_ms), total_groups);
+    return .{
+        .start = start,
+        .count = count,
+        .next = (start + count) % total_groups,
+    };
+}
+
+fn indexRepairFallbackAdvance(
+    candidate_count: usize,
+    window_count: usize,
+    consumed_prefix: usize,
+    opened_prefix: usize,
+) usize {
+    return @max(
+        if (candidate_count == 0) window_count else consumed_prefix,
+        opened_prefix,
+    );
+}
+
+fn indexRepairScanDue(dirty: bool, last_run_at_ms: u64, now_ms: u64, discovery_interval_ms: u64) bool {
+    // Startup catch-up and explicit repair requests provide the initial wake.
+    // Do not turn every fresh runtime round into an unsolicited cluster-wide
+    // repair discovery scan. Once the executor has run, periodic discovery
+    // still recovers a subsequently lost dirty wake.
+    if (last_run_at_ms == 0) return dirty;
+    const interval_ms = if (dirty)
+        provisioned_index_repair_interval_ms
+    else
+        @max(@as(u64, 1), discovery_interval_ms);
+    return now_ms -| last_run_at_ms >= interval_ms;
+}
+
+test "index repair scan periodically rediscovers debt after a lost wake" {
+    try std.testing.expect(!indexRepairScanDue(false, 0, 20_000, 30_000));
+    try std.testing.expect(indexRepairScanDue(true, 0, 20_000, 30_000));
+    try std.testing.expect(!indexRepairScanDue(false, 100, 20_000, 30_000));
+    try std.testing.expect(indexRepairScanDue(false, 100, 30_100, 30_000));
+    try std.testing.expect(indexRepairScanDue(true, 100, 5_100, 30_000));
+}
+
+test "index repair lost-wakeup fallback stays bounded at large group counts" {
+    const first = indexRepairFallbackWindow(1_000_000, 999_995, default_provisioned_index_repair_discovery_interval_ms);
+    try std.testing.expectEqual(@as(usize, 999_995), first.start);
+    try std.testing.expectEqual(provisioned_index_repair_fallback_max_groups_per_scan, first.count);
+    try std.testing.expectEqual(@as(usize, 251), first.next);
+    const small = indexRepairFallbackWindow(3, 2, default_provisioned_index_repair_discovery_interval_ms);
+    try std.testing.expectEqual(@as(usize, 3), small.count);
+    try std.testing.expectEqual(@as(usize, 2), small.next);
+}
+
+test "index repair lost-wakeup audit meets rotation target within supported envelope" {
+    const groups: usize = 10_000;
+    const per_scan = indexRepairFallbackGroupsPerScan(groups, default_provisioned_index_repair_discovery_interval_ms);
+    const scans = (groups + per_scan - 1) / per_scan;
+    try std.testing.expect(@as(u64, @intCast(scans)) * default_provisioned_index_repair_discovery_interval_ms <=
+        provisioned_index_repair_fallback_rotation_target_ms + default_provisioned_index_repair_discovery_interval_ms);
+}
+
+test "index repair fallback advances past a non-local prefix without skipping local debt" {
+    // Fifteen non-local routes followed by one uninspected local candidate:
+    // queued work may consume the execution slot, but the next pass starts at
+    // the local candidate rather than rescanning the same non-local prefix.
+    try std.testing.expectEqual(@as(usize, 15), indexRepairFallbackAdvance(1, 16, 15, 0));
+    try std.testing.expectEqual(@as(usize, 16), indexRepairFallbackAdvance(0, 16, 16, 0));
+    try std.testing.expectEqual(@as(usize, 8), indexRepairFallbackAdvance(2, 16, 3, 8));
+}
 const metrics_lsm_maintenance_snapshot_ttl_ns: u64 = 60 * std.time.ns_per_s;
 const data_raft_batch_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
 const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
@@ -68,6 +175,77 @@ fn decodeSplitDeltaDocumentKeyAlloc(alloc: std.mem.Allocator, internal_key: []co
     const sep = std.mem.indexOfScalarPos(u8, logical_key, 2, ':') orelse return error.InvalidAppliedDataDocumentKey;
     return try alloc.dupe(u8, logical_key[sep + 1 ..]);
 }
+
+const IndexRepairScheduleCandidate = struct {
+    group_id: u64,
+    table_name: []const u8,
+    owns_table_name: bool = false,
+    table_id: u64 = 0,
+    identity_shard_id: u64 = 0,
+    identity_range_id: u64 = 0,
+    estimated_bytes: u64,
+    queued: bool,
+    cursor_distance: usize,
+};
+
+test "index repair queue retains debt while leadership is temporarily unknown" {
+    try std.testing.expectEqual(
+        DataServer.QueuedRepairOwnershipAction.schedule,
+        DataServer.queuedRepairOwnershipAction(.attempt),
+    );
+    try std.testing.expectEqual(
+        DataServer.QueuedRepairOwnershipAction.retain,
+        DataServer.queuedRepairOwnershipAction(.retry_unknown),
+    );
+    try std.testing.expectEqual(
+        DataServer.QueuedRepairOwnershipAction.remove,
+        DataServer.queuedRepairOwnershipAction(.skip_nonlocal),
+    );
+}
+
+const IndexRepairQueueEntry = struct {
+    first_seen_ms: u64,
+    next_retry_at_ms: u64 = 0,
+    table_name: ?[]u8 = null,
+    previous_group_id: ?u64 = null,
+    next_group_id: ?u64 = null,
+    metadata_epoch: u64 = 0,
+    table_id: u64 = 0,
+    identity_shard_id: u64 = 0,
+    identity_range_id: u64 = 0,
+};
+
+const IndexRepairRoute = struct {
+    group_id: u64,
+    table_name: []u8,
+    table_id: u64,
+    identity_shard_id: u64,
+    identity_range_id: u64,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+const IndexRepairRoutingIndex = struct {
+    initialized: bool = false,
+    metadata_epoch: u64 = 0,
+    routes: std.ArrayListUnmanaged(IndexRepairRoute) = .empty,
+    by_group: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.routes.items) |*entry| entry.deinit(alloc);
+        self.routes.deinit(alloc);
+        self.by_group.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn lookup(self: *const @This(), group_id: u64) ?*const IndexRepairRoute {
+        const index = self.by_group.get(group_id) orelse return null;
+        return &self.routes.items[index];
+    }
+};
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -453,6 +631,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_root_refresh_completed_total", "counter", "Provisioned replica-root refresh runs completed", self.data_server.provisioned_root_refresh_completed.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_root_refresh_failed_total", "counter", "Provisioned replica-root refresh runs failed", self.data_server.provisioned_root_refresh_failed.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_root_refresh_last_duration_ns", "gauge", "Duration of the most recent provisioned replica-root refresh run in monotonic nanoseconds", self.data_server.provisioned_root_refresh_last_duration_ns.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_store_capacity_probe_failures_total", "counter", "Store capacity observations that failed and retained the last known value", self.data_server.store_capacity_probe_failures.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_auto_bulk_finish_active", "gauge", "Whether an auto bulk-ingest finish run is currently active", if (self.data_server.auto_bulk_finish_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_data_auto_bulk_finish_started_total", "counter", "Auto bulk-ingest finish runs started", self.data_server.auto_bulk_finish_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_auto_bulk_finish_completed_total", "counter", "Auto bulk-ingest finish runs completed", self.data_server.auto_bulk_finish_completed.load(.monotonic));
@@ -520,6 +699,36 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_busy_groups", "gauge", "Provisioned table groups deferred by the most recent startup catch-up run because foreground work held the writer lock", self.data_server.provisioned_startup_catch_up_last_busy_groups.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_quarantined_groups", "gauge", "Provisioned table groups parked by zero-progress startup catch-up backoff in the most recent run", self.data_server.provisioned_startup_catch_up_last_quarantined_groups.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_startup_catch_up_last_duration_ns", "gauge", "Duration of the most recent provisioned startup catch-up run in monotonic nanoseconds", self.data_server.provisioned_startup_catch_up_last_duration_ns.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_active", "gauge", "Whether the bounded node-local index repair executor is active", if (self.data_server.provisioned_index_repair_active.load(.acquire)) 1 else 0);
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_pending", "gauge", "Whether durable index repair debt requires another node-local scan", if (self.data_server.provisioned_index_repair_dirty.load(.acquire)) 1 else 0);
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_started_total", "counter", "Node-local index repair scans started", self.data_server.provisioned_index_repair_started.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_completed_total", "counter", "Node-local index repair scans completed", self.data_server.provisioned_index_repair_completed.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_runs_failed_total", "counter", "Node-local index repair group scans that failed", self.data_server.provisioned_index_repair_failed.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_attempts_total", "counter", "Durable index reconstruction attempts admitted by this node", self.data_server.provisioned_index_repair_attempted.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repairs_completed_total", "counter", "Indexes reconstructed and validated by this node", self.data_server.provisioned_index_repair_repaired.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_queue_depth", "gauge", "Known local groups with durable index repair debt", self.data_server.provisioned_index_repair_queue_depth.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_oldest_age_ms", "gauge", "Age of the oldest known local index repair debt in milliseconds", self.data_server.provisioned_index_repair_oldest_age_ms.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_last_groups_inspected", "gauge", "Groups opened by the most recent bounded index repair pass", self.data_server.provisioned_index_repair_last_groups_inspected.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_last_duration_ns", "gauge", "Duration of the most recent bounded index repair pass", self.data_server.provisioned_index_repair_last_duration_ns.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_fallback_groups_scanned_total", "counter", "Groups inspected by bounded lost-wakeup discovery", self.data_server.provisioned_index_repair_fallback_groups_scanned.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_fallback_rotation_estimate_ms", "gauge", "Estimated full rotation time for bounded lost-wakeup discovery", self.data_server.provisioned_index_repair_fallback_rotation_estimate_ms.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_fallback_rotation_slo_exceeded", "gauge", "Whether the local group count exceeds the bounded lost-wakeup rotation envelope", self.data_server.provisioned_index_repair_fallback_rotation_slo_exceeded.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_disk_waits_total", "counter", "Repair passes deferred by disk admission", self.data_server.provisioned_index_repair_disk_waits.load(.monotonic));
+        const activation = self.data_server.provisioned_storage.resource_manager.indexRepairActivationStats();
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_activation_attempts_total", "counter", "Index generation activations measured by the node resource manager", activation.attempts);
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_activation_overruns_total", "counter", "Index generation activations whose fenced interval exceeded its budget", activation.overruns);
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_activation_last_pause_ns", "gauge", "Most recent index repair activation fenced interval in monotonic nanoseconds", activation.last_pause_ns);
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_activation_max_pause_ns", "gauge", "Largest observed index repair activation fenced interval in monotonic nanoseconds", activation.max_pause_ns);
+        try health_metrics.appendPromMetric(writer, "antfly_data_index_repair_activation_last_budget_ns", "gauge", "Pause budget for the most recent index repair activation", activation.last_budget_ns);
+        const disk = self.data_server.provisioned_storage.resource_manager.capacityStats();
+        try health_metrics.appendPromMetric(writer, "antfly_resource_disk_reserved_bytes", "gauge", "Bytes currently claimed by resource-manager disk admission", disk.reserved_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_resource_disk_peak_reserved_bytes", "gauge", "Peak bytes claimed by resource-manager disk admission", disk.peak_reserved_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_resource_disk_reservations_total", "counter", "Resource-manager disk reservations admitted", disk.reservations);
+        try health_metrics.appendPromMetric(writer, "antfly_resource_disk_denials_total", "counter", "Resource-manager disk reservations denied", disk.denials);
+        try health_metrics.appendPromMetric(writer, "antfly_resource_disk_growth_denials_total", "counter", "Resource-manager disk reservation growth requests denied", disk.growth_denials);
+        try health_metrics.appendPromMetric(writer, "antfly_resource_disk_stale_observations_total", "counter", "Disk admission observations rejected as stale", disk.stale_observations);
+        try health_metrics.appendPromMetric(writer, "antfly_resource_disk_capacity_domains", "gauge", "Storage capacity domains tracked by the node resource manager", disk.domain_count);
+        try writeCapacityDomainMetrics(writer, self.data_server.alloc, &self.data_server.provisioned_storage.resource_manager);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_read_cache_hits_total", "counter", "Provisioned read-cache hits served from already-open local table DBs", read_cache_stats.hit_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_read_cache_misses_total", "counter", "Provisioned read-cache opens that had to open a local table DB", read_cache_stats.miss_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_hits_total", "counter", "Provisioned write-cache hits served from already-open local table DBs", write_cache_stats.hit_count);
@@ -1044,6 +1253,28 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try writeResourceMetricFamily(writer, snapshot, .pressure, "antfly_resource_pressure", "gauge", "Resource slice pressure state, 0 normal, 1 soft, 2 hard");
 }
 
+fn writeCapacityDomainMetrics(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    manager: *resource_manager_mod.ResourceManager,
+) !void {
+    const domains = try manager.capacityDomainStats(alloc);
+    defer alloc.free(domains);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_resource_disk_domain_reserved_bytes", "gauge", "Bytes currently claimed in a storage capacity domain");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_resource_disk_domain_available_bytes", "gauge", "Last observed available bytes in a storage capacity domain; zero when unknown");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_resource_disk_domain_observation_known", "gauge", "Whether the storage capacity domain has a usable available-byte observation");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_resource_disk_domain_safety_floor_bytes", "gauge", "Bytes protected from background growth in a storage capacity domain");
+    for (domains) |domain| {
+        var domain_buf: [32]u8 = undefined;
+        const domain_label = try std.fmt.bufPrint(&domain_buf, "{x}", .{domain.domain_id});
+        const labels = [_]health_metrics.PromLabel{.{ .name = "domain", .value = domain_label }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_resource_disk_domain_reserved_bytes", &labels, domain.reserved_bytes);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_resource_disk_domain_available_bytes", &labels, domain.last_available_bytes orelse 0);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_resource_disk_domain_observation_known", &labels, @intFromBool(domain.last_available_bytes != null));
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_resource_disk_domain_safety_floor_bytes", &labels, domain.last_safety_floor_bytes);
+    }
+}
+
 const ResourceMetricField = enum {
     used_bytes,
     peak_bytes,
@@ -1083,6 +1314,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.lite_docstore_snapshot_cache,
         resource_manager_mod.Slice.inference_prompt_cache,
+        resource_manager_mod.Slice.dense_repair_working_set,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
@@ -1314,6 +1546,86 @@ const StoreStatusHeartbeatCache = struct {
     }
 };
 
+const StoreCapacitySnapshot = struct {
+    capacity_bytes: u64 = 0,
+    available_bytes: u64 = 0,
+};
+
+fn storeCapacitySnapshot(
+    observation: ?resource_manager_mod.CapacityObservation,
+    fallback: StoreCapacitySnapshot,
+) StoreCapacitySnapshot {
+    const observed = observation orelse return fallback;
+    const available_bytes = observed.available_bytes orelse return fallback;
+    return .{
+        .capacity_bytes = observed.capacity_bytes orelse fallback.capacity_bytes,
+        .available_bytes = available_bytes,
+    };
+}
+
+test "store capacity reporting preserves the last good observation on probe failure" {
+    const previous = StoreCapacitySnapshot{ .capacity_bytes = 1_000, .available_bytes = 400 };
+    try std.testing.expectEqualDeep(previous, storeCapacitySnapshot(null, previous));
+    try std.testing.expectEqualDeep(StoreCapacitySnapshot{
+        .capacity_bytes = 2_000,
+        .available_bytes = 1_500,
+    }, storeCapacitySnapshot(.{
+        .capacity_bytes = 2_000,
+        .available_bytes = 1_500,
+    }, previous));
+}
+
+test "data server repair owner cancels and drains through backend runtime" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+
+    const catalog = antfly.public_api.table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+    };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            ".",
+            catalog,
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    const Job = struct {
+        fn run(ptr: *anyopaque) !void {
+            const data_server: *DataServer = @ptrCast(@alignCast(ptr));
+            while (!data_server.provisioned_index_repair_shutdown.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    server.provisioned_index_repair_owner_id = runtime.ptr().allocOwnerId();
+    server.provisioned_index_repair_active.store(true, .release);
+    try runtime.ptr().durable_jobs.submit(.{
+        .owner_id = server.provisioned_index_repair_owner_id,
+        .class = .maintenance,
+        .ptr = &server,
+        .run = Job.run,
+        .deinit = Job.deinit,
+    });
+    server.stopProvisionedIndexRepair();
+    try std.testing.expect(server.provisioned_index_repair_shutdown.load(.acquire));
+    try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
+}
+
 const RuntimeStatusDiskUsageCacheEntry = struct {
     disk_bytes: u64 = 0,
     checked_at_ns: u64 = 0,
@@ -1524,6 +1836,10 @@ pub const DataServerConfig = struct {
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     query_async_limit: std.Io.Limit = .limited(8),
+    index_repair_discovery_interval_ms: u64 = default_provisioned_index_repair_discovery_interval_ms,
+    index_repair_max_activation_gap_sequences: u64 = 200,
+    index_repair_max_convergence_rounds: u32 = 32,
+    index_repair_max_activation_pause_ms: u64 = 250,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
@@ -1931,10 +2247,16 @@ pub const GroupLeadershipSource = struct {
 
     pub const VTable = struct {
         is_local_leader: *const fn (ptr: *anyopaque, group_id: u64) bool,
+        current_epoch: ?*const fn (ptr: *anyopaque, group_id: u64) ?u64 = null,
     };
 
     pub fn isLocalLeader(self: GroupLeadershipSource, group_id: u64) bool {
         return self.vtable.is_local_leader(self.ptr, group_id);
+    }
+
+    pub fn currentEpoch(self: GroupLeadershipSource, group_id: u64) ?u64 {
+        const current_epoch = self.vtable.current_epoch orelse return null;
+        return current_epoch(self.ptr, group_id);
     }
 
     pub fn fromManagedHostService(service: *antfly.raft.ManagedHostService) GroupLeadershipSource {
@@ -1947,6 +2269,13 @@ pub const GroupLeadershipSource = struct {
                         return svc.host.host.isLocalLeader(group_id);
                     }
                 }.isLocalLeader,
+                .current_epoch = struct {
+                    fn currentEpoch(ptr: *anyopaque, group_id: u64) ?u64 {
+                        const svc: *antfly.raft.ManagedHostService = @ptrCast(@alignCast(ptr));
+                        const status = svc.host.host.raftStatus(group_id) orelse return null;
+                        return status.hard.current_term;
+                    }
+                }.currentEpoch,
             },
         };
     }
@@ -1961,8 +2290,54 @@ pub const GroupLeadershipSource = struct {
                         return svc.host.http_host.host.isLocalLeader(group_id);
                     }
                 }.isLocalLeader,
+                .current_epoch = struct {
+                    fn currentEpoch(ptr: *anyopaque, group_id: u64) ?u64 {
+                        const svc: *antfly.raft.ManagedHttpHostService = @ptrCast(@alignCast(ptr));
+                        const status = svc.host.http_host.host.raftStatus(group_id) orelse return null;
+                        return status.hard.current_term;
+                    }
+                }.currentEpoch,
             },
         };
+    }
+};
+
+const IndexRepairOwnershipFence = struct {
+    leadership_source: ?GroupLeadershipSource,
+    write_source: *antfly.public_api.table_writes.ProvisionedTableWriteSource,
+    group_id: u64,
+    root_generation: u64,
+    owner_epoch: u64,
+
+    fn currentOwnerEpoch(self: *const @This()) u64 {
+        if (self.leadership_source) |source| {
+            if (source.currentEpoch(self.group_id)) |epoch| return epoch;
+        }
+        // The visible root generation is the strongest monotonic fence
+        // available to deployments without a Raft term source.
+        return self.write_source.visibleRootGenerationForRepair(self.group_id);
+    }
+
+    fn isCurrentOwner(ptr: *anyopaque) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.write_source.visibleRootGenerationForRepair(self.group_id) != self.root_generation) return false;
+        if (self.currentOwnerEpoch() != self.owner_epoch) return false;
+        const source = self.leadership_source orelse return true;
+        // Activation is intentionally stricter than discovery. Snapshot
+        // placement can admit inspection while leadership is converging, but
+        // a replacement pointer may only be published by the live leader.
+        return source.isLocalLeader(self.group_id);
+    }
+};
+
+const IndexRepairCancellationFence = struct {
+    server: *DataServer,
+    group_id: u64,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.server.provisioned_index_repair_shutdown.load(.acquire) or
+            self.server.provisionedIndexRepairCancellationRequested(self.group_id);
     }
 };
 
@@ -2042,6 +2417,64 @@ pub const GroupMembershipSource = struct {
         };
     }
 };
+
+test "index repair queue removes only authoritative non-local ownership" {
+    const Ownership = struct {
+        const Self = @This();
+
+        leader: bool = false,
+        membership: GroupMembership = .{},
+
+        fn leadership(self: *Self) GroupLeadershipSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .is_local_leader = struct {
+                        fn call(ptr: *anyopaque, _: u64) bool {
+                            const ctx: *Self = @ptrCast(@alignCast(ptr));
+                            return ctx.leader;
+                        }
+                    }.call,
+                },
+            };
+        }
+
+        fn memberships(self: *Self) GroupMembershipSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .membership = struct {
+                        fn call(ptr: *anyopaque, _: u64) GroupMembership {
+                            const ctx: *Self = @ptrCast(@alignCast(ptr));
+                            return ctx.membership;
+                        }
+                    }.call,
+                },
+            };
+        }
+    };
+
+    var ownership = Ownership{};
+    try std.testing.expectEqual(
+        DataServer.StartupCatchUpGroupDisposition.retry_unknown,
+        DataServer.queuedRepairLiveOwnershipDisposition(ownership.leadership(), ownership.memberships(), 7),
+    );
+    ownership.membership = .{ .voter_set_known = true, .local_voter = true };
+    try std.testing.expectEqual(
+        DataServer.StartupCatchUpGroupDisposition.retry_unknown,
+        DataServer.queuedRepairLiveOwnershipDisposition(ownership.leadership(), ownership.memberships(), 7),
+    );
+    ownership.membership.local_voter = false;
+    try std.testing.expectEqual(
+        DataServer.StartupCatchUpGroupDisposition.skip_nonlocal,
+        DataServer.queuedRepairLiveOwnershipDisposition(ownership.leadership(), ownership.memberships(), 7),
+    );
+    ownership.leader = true;
+    try std.testing.expectEqual(
+        DataServer.StartupCatchUpGroupDisposition.attempt,
+        DataServer.queuedRepairLiveOwnershipDisposition(ownership.leadership(), ownership.memberships(), 7),
+    );
+}
 
 const InferredSnapshotLeadershipSource = struct {
     local_node_id: u64,
@@ -2151,6 +2584,7 @@ pub const DataServer = struct {
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
     store_status_ticks: std.atomic.Value(usize) = .init(0),
     store_status_dirty: std.atomic.Value(bool) = .init(true),
+    store_capacity_probe_failures: std.atomic.Value(u64) = .init(0),
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
     last_data_raft_placement_fingerprint: ?u64 = null,
@@ -2228,6 +2662,46 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_last_run_at_ms: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_epoch: std.atomic.Value(u64) = .init(1),
     provisioned_startup_catch_up_not_before_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_mutex: std.atomic.Mutex = .unlocked,
+    provisioned_index_repair_owner_id: u64 = 0,
+    provisioned_index_repair_shutdown: std.atomic.Value(bool) = .init(false),
+    provisioned_index_repair_active: std.atomic.Value(bool) = .init(false),
+    provisioned_index_repair_dirty: std.atomic.Value(bool) = .init(false),
+    provisioned_index_repair_last_run_at_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_discovery_interval_ms: u64 = default_provisioned_index_repair_discovery_interval_ms,
+    provisioned_index_repair_max_activation_gap_sequences: u64 = 200,
+    provisioned_index_repair_max_convergence_rounds: u32 = 32,
+    provisioned_index_repair_max_activation_pause_ms: u64 = 250,
+    provisioned_index_repair_started: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_completed: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_failed: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_attempted: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_repaired: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_queue_depth: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_oldest_age_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_not_before_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_last_groups_inspected: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_last_duration_ns: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_fallback_groups_scanned: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_fallback_rotation_estimate_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_fallback_rotation_slo_exceeded: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_disk_waits: std.atomic.Value(u64) = .init(0),
+    // Round-robin position for the bounded lost-wakeup fallback scan.
+    provisioned_index_repair_scan_cursor: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_queue_mutex: std.atomic.Mutex = .unlocked,
+    provisioned_index_repair_cancel_mutex: std.atomic.Mutex = .unlocked,
+    provisioned_index_repair_cancel_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    // Known debt is an O(1) linked hash queue. The cursor lets every pass inspect
+    // a fixed window without copying or sorting the entire node's repair debt.
+    provisioned_index_repair_group_ages: std.AutoHashMapUnmanaged(u64, IndexRepairQueueEntry) = .empty,
+    provisioned_index_repair_queue_head: ?u64 = null,
+    provisioned_index_repair_queue_tail: ?u64 = null,
+    provisioned_index_repair_queue_cursor: ?u64 = null,
+    // Immutable between repair passes and rebuilt only when the metadata epoch
+    // changes. This keeps fixed-window reconciliation independent of the size
+    // of the administrative snapshot on the steady-state hot path.
+    provisioned_index_repair_routes: IndexRepairRoutingIndex = .{},
+    provisioned_index_repair_last_fallback_at_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_dirty: std.atomic.Value(bool) = .init(true),
     runtime_status_last_refresh_at_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_disk_usage_cache_mutex: std.atomic.Mutex = .unlocked,
@@ -2349,6 +2823,32 @@ pub const DataServer = struct {
         retry_unknown,
     };
 
+    const QueuedRepairOwnershipAction = enum {
+        schedule,
+        retain,
+        remove,
+    };
+
+    fn queuedRepairOwnershipAction(disposition: StartupCatchUpGroupDisposition) QueuedRepairOwnershipAction {
+        return switch (disposition) {
+            .attempt => .schedule,
+            .retry_unknown => .retain,
+            .skip_nonlocal => .remove,
+        };
+    }
+
+    fn queuedRepairLiveOwnershipDisposition(
+        leadership_source: ?GroupLeadershipSource,
+        membership_source: ?GroupMembershipSource,
+        group_id: u64,
+    ) StartupCatchUpGroupDisposition {
+        const leadership = leadership_source orelse return .attempt;
+        if (leadership.isLocalLeader(group_id)) return .attempt;
+        const membership = if (membership_source) |source| source.membership(group_id) else return .retry_unknown;
+        if (!membership.voter_set_known) return .retry_unknown;
+        return if (membership.local_voter) .retry_unknown else .skip_nonlocal;
+    }
+
     const RuntimeStatusRefreshStats = struct {
         table_count: u64 = 0,
         group_count: u64 = 0,
@@ -2415,6 +2915,10 @@ pub const DataServer = struct {
             ),
             .status_source = status_source,
             .api_server_cfg = cfg.api_server_cfg,
+            .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
+            .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
+            .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
+            .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
@@ -2447,6 +2951,10 @@ pub const DataServer = struct {
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
+            .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
+            .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
+            .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
@@ -2479,6 +2987,10 @@ pub const DataServer = struct {
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
+            .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
+            .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
+            .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
@@ -2509,6 +3021,7 @@ pub const DataServer = struct {
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
         api_server_cfg.backend_runtime = self.backend_runtime;
+        api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
         self.attachHaExecutors(&api_server_cfg);
         if (self.query_io_impl == null) {
@@ -2524,7 +3037,7 @@ pub const DataServer = struct {
         if (self.backend_runtime) |runtime| {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }
-        self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
+        try self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
         _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();
         const ha_primary_mirror = self.haPrimaryMirror();
@@ -2539,10 +3052,12 @@ pub const DataServer = struct {
             _ = try apply_sm.write_source.withHAWriteGate(ha_write_gate);
             _ = try apply_sm.write_source.withHAMirror(ha_primary_mirror);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
+            apply_sm.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
             _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
+        self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
         const promotion_leadership = self.promotionLeadershipSource();
         _ = self.write_source.withPromotionLeadershipSource(promotion_leadership);
@@ -3258,6 +3773,7 @@ pub const DataServer = struct {
         }
         try self.maybeRequestRuntimeStatusRefresh();
         try self.maybeRequestProvisionedStartupCatchUp();
+        try self.maybeRequestProvisionedIndexRepair();
         // Session cleanup and lease renewal may touch durable storage. Keep
         // that work off HTTP request fibers; this runtime loop is the sole
         // opportunistic scheduler for the API server.
@@ -3280,6 +3796,7 @@ pub const DataServer = struct {
         self.joinAutoBulkFinishTask();
         self.joinProvisionedWarmupThread();
         self.joinProvisionedStartupCatchUpThread();
+        self.stopProvisionedIndexRepair();
         self.clearProvisionedStartupCatchUpTarget();
         if (self.listener) |*listener| listener.deinit();
         if (self.http_server) |*http_server| http_server.deinit();
@@ -3307,6 +3824,13 @@ pub const DataServer = struct {
         self.local_split_key_cache.deinit(self.alloc);
         self.local_group_status_cache.clear(self.alloc);
         self.runtime_status_disk_usage_cache.deinit(self.alloc);
+        var repair_queue_it = self.provisioned_index_repair_group_ages.valueIterator();
+        while (repair_queue_it.next()) |entry| {
+            if (entry.table_name) |table_name| self.alloc.free(table_name);
+        }
+        self.provisioned_index_repair_group_ages.deinit(self.alloc);
+        self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
+        self.provisioned_index_repair_routes.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.write_source.deinit();
         self.provisioned_storage.deinit();
@@ -4050,6 +4574,38 @@ pub const DataServer = struct {
         };
     }
 
+    fn localIndexRepairDebtHook(self: *DataServer) antfly.public_api.ProvisionedTableWriteSource.LocalIndexRepairDebtHook {
+        return .{
+            .ptr = self,
+            .on_change = onLocalIndexRepairDebtChanged,
+        };
+    }
+
+    fn onLocalIndexRepairDebtChanged(
+        ptr: *anyopaque,
+        table_name: []const u8,
+        group_id: u64,
+        action: antfly.public_api.ProvisionedTableWriteSource.LocalIndexRepairDebtAction,
+    ) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        switch (action) {
+            .enqueue => self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                self.provisioned_index_repair_dirty.store(true, .release);
+                std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+            },
+            .remove => {
+                self.removeProvisionedIndexRepair(group_id);
+                self.clearProvisionedIndexRepairCancellation(group_id);
+            },
+            .cancel => self.requestProvisionedIndexRepairCancellation(group_id) catch |err| {
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                std.log.warn("provisioned index repair cancellation registration failed group={} err={s}", .{ group_id, @errorName(err) });
+            },
+            .clear_cancel => self.clearProvisionedIndexRepairCancellation(group_id),
+        }
+    }
+
     fn onLocalTableChanged(
         ptr: *anyopaque,
         table_name: []const u8,
@@ -4058,7 +4614,7 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         self.markLocalSplitKeyCacheDirty();
         switch (kind) {
-            .data => self.markLocalGroupDataChanged(),
+            .data, .index_repair => self.markLocalGroupDataChanged(),
             .structural => {
                 self.invalidateLocalGroupStatusCache();
                 if (self.data_raft_apply) |apply_sm| {
@@ -4150,6 +4706,7 @@ pub const DataServer = struct {
         self.runtime_status_dirty.store(true, .release);
         switch (kind) {
             .data => self.provisioned_startup_catch_up_dirty.store(true, .release),
+            .index_repair => {},
             .structural => {
                 self.clearProvisionedStartupCatchUpBackoffs();
                 self.provisioned_startup_catch_up_dirty.store(true, .release);
@@ -5590,10 +6147,14 @@ pub const DataServer = struct {
         );
         defer antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
 
+        const capacity = self.observeStoreCapacityForStatus();
+
         const report: antfly.metadata.table_manager.StoreStatusReport = .{
             .store_id = registration.store_id,
             .live = true,
             .health_class = "healthy",
+            .capacity_bytes = capacity.capacity_bytes,
+            .available_bytes = capacity.available_bytes,
             .group_statuses = group_statuses,
             .runtime_statuses = runtime_statuses,
         };
@@ -5609,6 +6170,26 @@ pub const DataServer = struct {
         try self.storeStatusHeartbeatCacheReplace(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         self.clearMetadataBootstrapRetry();
+    }
+
+    fn cachedStoreCapacitySnapshot(self: *DataServer) StoreCapacitySnapshot {
+        lockAtomic(&self.store_status_cache_mutex);
+        defer self.store_status_cache_mutex.unlock();
+        return .{
+            .capacity_bytes = self.store_status_heartbeat_cache.capacity_bytes,
+            .available_bytes = self.store_status_heartbeat_cache.available_bytes,
+        };
+    }
+
+    fn observeStoreCapacityForStatus(self: *DataServer) StoreCapacitySnapshot {
+        const fallback = self.cachedStoreCapacitySnapshot();
+        const source = self.provisioned_storage.resource_manager.capacitySource() orelse return fallback;
+        const observed = source.current() catch |err| {
+            _ = self.store_capacity_probe_failures.fetchAdd(1, .monotonic);
+            std.log.warn("store capacity observation failed; retaining last known value err={s}", .{@errorName(err)});
+            return fallback;
+        };
+        return storeCapacitySnapshot(observed, fallback);
     }
 
     fn syncDataRaftFromRemoteMetadata(self: *DataServer) !void {
@@ -6030,6 +6611,185 @@ pub const DataServer = struct {
         }
     }
 
+    fn stopProvisionedIndexRepair(self: *DataServer) void {
+        // Publish cancellation before draining the BackendRuntime owner. The
+        // repair state machine observes this at bounded snapshot, catch-up,
+        // capacity, and activation boundaries and leaves its durable candidate
+        // resumable for the next owner.
+        self.provisioned_index_repair_shutdown.store(true, .release);
+        lockAtomic(&self.provisioned_index_repair_mutex);
+        const owner_id = self.provisioned_index_repair_owner_id;
+        const runtime = self.backend_runtime;
+        self.provisioned_index_repair_mutex.unlock();
+        if (owner_id != 0) {
+            if (runtime) |active_runtime| active_runtime.durable_jobs.closeOwner(owner_id);
+        }
+        self.provisioned_index_repair_active.store(false, .release);
+    }
+
+    fn refreshProvisionedIndexRepairQueueMetricsLocked(self: *DataServer, now_ms: u64) void {
+        const count = self.provisioned_index_repair_group_ages.count();
+        if (count == 0) {
+            self.provisioned_index_repair_queue_depth.store(0, .monotonic);
+            self.provisioned_index_repair_oldest_age_ms.store(0, .monotonic);
+            self.provisioned_index_repair_not_before_ms.store(0, .monotonic);
+            return;
+        }
+
+        const oldest_ms = if (self.provisioned_index_repair_queue_head) |head|
+            if (self.provisioned_index_repair_group_ages.get(head)) |entry| now_ms -| entry.first_seen_ms else 0
+        else
+            0;
+        var next_retry_at_ms: u64 = 0;
+        var runnable = false;
+        // Exact backoff suppression is cheap for the normal small queue. For a
+        // larger queue, fail open to a bounded scheduler pass: an uninspected
+        // entry may be runnable and must not be delayed by unrelated backoff.
+        if (count > provisioned_index_repair_queued_groups_per_scan) {
+            runnable = true;
+        } else {
+            var group_id = self.provisioned_index_repair_queue_head;
+            var inspected: usize = 0;
+            while (group_id != null and inspected < count) : (inspected += 1) {
+                const entry = self.provisioned_index_repair_group_ages.get(group_id.?) orelse break;
+                group_id = entry.next_group_id;
+                if (entry.next_retry_at_ms == 0 or entry.next_retry_at_ms <= now_ms) {
+                    runnable = true;
+                } else if (next_retry_at_ms == 0 or entry.next_retry_at_ms < next_retry_at_ms) {
+                    next_retry_at_ms = entry.next_retry_at_ms;
+                }
+            }
+        }
+        self.provisioned_index_repair_queue_depth.store(@intCast(count), .monotonic);
+        self.provisioned_index_repair_oldest_age_ms.store(oldest_ms, .monotonic);
+        self.provisioned_index_repair_not_before_ms.store(if (runnable) 0 else next_retry_at_ms, .monotonic);
+    }
+
+    fn enqueueProvisionedIndexRepairWithRetryForTable(
+        self: *DataServer,
+        table_name: ?[]const u8,
+        group_id: u64,
+        next_retry_at_realtime_ms: u64,
+    ) !void {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        const next_retry_at_ms = indexRepairMonotonicDeadlineMs(
+            next_retry_at_realtime_ms,
+            platform_clock.Clock.real().nowRealtimeMs(),
+            now_ms,
+        );
+        var owned_table_name = if (table_name) |name| try self.alloc.dupe(u8, name) else null;
+        defer if (owned_table_name) |name| self.alloc.free(name);
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const gop = try self.provisioned_index_repair_group_ages.getOrPut(self.alloc, group_id);
+        if (!gop.found_existing) {
+            const previous = self.provisioned_index_repair_queue_tail;
+            gop.value_ptr.* = .{
+                .first_seen_ms = now_ms,
+                .previous_group_id = previous,
+                .table_name = owned_table_name,
+            };
+            owned_table_name = null;
+            if (previous) |tail| {
+                self.provisioned_index_repair_group_ages.getPtr(tail).?.next_group_id = group_id;
+            } else {
+                self.provisioned_index_repair_queue_head = group_id;
+            }
+            self.provisioned_index_repair_queue_tail = group_id;
+            if (self.provisioned_index_repair_queue_cursor == null) {
+                self.provisioned_index_repair_queue_cursor = group_id;
+            }
+        }
+        if (gop.value_ptr.table_name == null) {
+            gop.value_ptr.table_name = owned_table_name;
+            owned_table_name = null;
+        }
+        gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
+        self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+        self.provisioned_index_repair_dirty.store(true, .release);
+    }
+
+    fn enqueueProvisionedIndexRepair(self: *DataServer, group_id: u64) !void {
+        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0);
+    }
+
+    fn enqueueProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
+        try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0);
+    }
+
+    fn enqueueProvisionedIndexRepairWithRetry(self: *DataServer, group_id: u64, next_retry_at_ms: u64) !void {
+        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms);
+    }
+
+    fn removeProvisionedIndexRepair(self: *DataServer, group_id: u64) void {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const removed = self.provisioned_index_repair_group_ages.get(group_id) orelse return;
+        if (removed.previous_group_id) |previous| {
+            self.provisioned_index_repair_group_ages.getPtr(previous).?.next_group_id = removed.next_group_id;
+        } else {
+            self.provisioned_index_repair_queue_head = removed.next_group_id;
+        }
+        if (removed.next_group_id) |next| {
+            self.provisioned_index_repair_group_ages.getPtr(next).?.previous_group_id = removed.previous_group_id;
+        } else {
+            self.provisioned_index_repair_queue_tail = removed.previous_group_id;
+        }
+        if (self.provisioned_index_repair_queue_cursor == group_id) {
+            self.provisioned_index_repair_queue_cursor = removed.next_group_id orelse self.provisioned_index_repair_queue_head;
+        }
+        _ = self.provisioned_index_repair_group_ages.remove(group_id);
+        if (self.provisioned_index_repair_group_ages.count() == 0) {
+            self.provisioned_index_repair_queue_head = null;
+            self.provisioned_index_repair_queue_tail = null;
+            self.provisioned_index_repair_queue_cursor = null;
+        }
+        if (removed.table_name) |table_name| self.alloc.free(table_name);
+        self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+    }
+
+    fn requestProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) !void {
+        lockAtomic(&self.provisioned_index_repair_cancel_mutex);
+        defer self.provisioned_index_repair_cancel_mutex.unlock();
+        try self.provisioned_index_repair_cancel_groups.put(self.alloc, group_id, {});
+    }
+
+    fn clearProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) void {
+        lockAtomic(&self.provisioned_index_repair_cancel_mutex);
+        defer self.provisioned_index_repair_cancel_mutex.unlock();
+        _ = self.provisioned_index_repair_cancel_groups.remove(group_id);
+    }
+
+    fn provisionedIndexRepairCancellationRequested(self: *DataServer, group_id: u64) bool {
+        lockAtomic(&self.provisioned_index_repair_cancel_mutex);
+        defer self.provisioned_index_repair_cancel_mutex.unlock();
+        return self.provisioned_index_repair_cancel_groups.contains(group_id);
+    }
+
+    fn hasQueuedProvisionedIndexRepair(self: *DataServer, group_id: u64) bool {
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        return self.provisioned_index_repair_group_ages.contains(group_id);
+    }
+
+    fn cacheQueuedProvisionedIndexRepairRoute(
+        self: *DataServer,
+        group_id: u64,
+        metadata_epoch: u64,
+        table_id: u64,
+        identity_shard_id: u64,
+        identity_range_id: u64,
+    ) void {
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const entry = self.provisioned_index_repair_group_ages.getPtr(group_id) orelse return;
+        entry.metadata_epoch = metadata_epoch;
+        entry.table_id = table_id;
+        entry.identity_shard_id = identity_shard_id;
+        entry.identity_range_id = identity_range_id;
+    }
+
     fn joinProvisionedRootRefreshThread(self: *DataServer) void {
         lockAtomic(&self.provisioned_root_refresh_mutex);
         defer self.provisioned_root_refresh_mutex.unlock();
@@ -6300,6 +7060,20 @@ pub const DataServer = struct {
                     };
                 };
                 stats.group_count += 1;
+                if (result.index_repair_pending) {
+                    self.enqueueProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
+                        _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                        std.log.warn("provisioned index repair enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+                        self.provisioned_index_repair_dirty.store(true, .release);
+                    };
+                    self.cacheQueuedProvisionedIndexRepairRoute(
+                        group_id,
+                        snapshot.status.metadata_epoch,
+                        range.table_id,
+                        antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                        antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+                    );
+                }
                 if (result.busy) {
                     stats.busy_groups += 1;
                     if (self.runtime_status_dirty.load(.acquire) or self.runtime_status_refresh_active.load(.acquire)) {
@@ -6360,9 +7134,382 @@ pub const DataServer = struct {
         return stats;
     }
 
+    /// Executes at most one reconstruction attempt per invocation. The worker
+    /// rescans durable intents instead of trusting notifications, reopens the
+    /// selected DB through the managed owner, and rechecks placement and
+    /// leadership immediately before claiming group work.
+    fn runProvisionedIndexRepair(self: *DataServer) void {
+        if (self.provisioned_index_repair_shutdown.load(.acquire)) return;
+        const started_ns = platform_time.monotonicNs();
+        const now_ms: u64 = @intCast(@divTrunc(started_ns, std.time.ns_per_ms));
+        self.provisioned_index_repair_last_run_at_ms.store(now_ms, .monotonic);
+        self.provisioned_index_repair_dirty.store(false, .release);
+        _ = self.provisioned_index_repair_started.fetchAdd(1, .monotonic);
+        defer {
+            _ = self.provisioned_index_repair_completed.fetchAdd(1, .monotonic);
+            self.provisioned_index_repair_last_duration_ns.store(platform_time.monotonicNs() -| started_ns, .monotonic);
+        }
+
+        const registration = self.store_registration orelse return;
+
+        var found_pending = false;
+        var attempted = false;
+        var groups_inspected: u64 = 0;
+        var fallback_window_start: usize = 0;
+        var fallback_window_total_groups: usize = 0;
+        var fallback_window_count: usize = 0;
+        var fallback_candidate_count: usize = 0;
+        var fallback_consumed_prefix: usize = 0;
+        var fallback_prefix_blocked = false;
+        var fallback_advance_count: usize = 0;
+        var schedule_candidates = std.ArrayListUnmanaged(IndexRepairScheduleCandidate).empty;
+        defer {
+            for (schedule_candidates.items) |candidate| {
+                if (candidate.owns_table_name) self.alloc.free(@constCast(candidate.table_name));
+            }
+            schedule_candidates.deinit(self.alloc);
+        }
+        var stale_queued_groups = std.ArrayListUnmanaged(u64).empty;
+        defer stale_queued_groups.deinit(self.alloc);
+        const QueuedRepair = struct {
+            group_id: u64,
+            next_retry_at_ms: u64,
+            table_name: ?[]u8,
+        };
+        var queued_repairs = std.ArrayListUnmanaged(QueuedRepair).empty;
+        defer {
+            for (queued_repairs.items) |queued| {
+                if (queued.table_name) |table_name| self.alloc.free(table_name);
+            }
+            queued_repairs.deinit(self.alloc);
+        }
+
+        // Known debt is the primary scheduling source. Snapshot it under the
+        // queue lock, then release the lock before ownership callbacks or
+        // metadata work. Enqueuers are never blocked by storage inspection.
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        const queue_count = self.provisioned_index_repair_group_ages.count();
+        var queued_group_id = self.provisioned_index_repair_queue_cursor orelse self.provisioned_index_repair_queue_head;
+        const queued_limit = @min(queue_count, provisioned_index_repair_queued_groups_per_scan);
+        var queued_inspected: usize = 0;
+        while (queued_group_id != null and queued_inspected < queued_limit) : (queued_inspected += 1) {
+            const group_id = queued_group_id.?;
+            const entry = self.provisioned_index_repair_group_ages.getPtr(group_id) orelse break;
+            const queued_table_name = if (entry.table_name) |table_name|
+                self.alloc.dupe(u8, table_name) catch |err| {
+                    self.provisioned_index_repair_queue_mutex.unlock();
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    self.provisioned_index_repair_dirty.store(true, .release);
+                    std.log.warn("provisioned index repair route snapshot failed err={s}", .{@errorName(err)});
+                    return;
+                }
+            else
+                null;
+            queued_repairs.append(self.alloc, .{
+                .group_id = group_id,
+                .next_retry_at_ms = entry.next_retry_at_ms,
+                .table_name = queued_table_name,
+            }) catch |err| {
+                if (queued_table_name) |table_name| self.alloc.free(table_name);
+                self.provisioned_index_repair_queue_mutex.unlock();
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                self.provisioned_index_repair_dirty.store(true, .release);
+                std.log.warn("provisioned index repair queue snapshot failed err={s}", .{@errorName(err)});
+                return;
+            };
+            queued_group_id = entry.next_group_id orelse self.provisioned_index_repair_queue_head;
+        }
+        self.provisioned_index_repair_queue_cursor = queued_group_id;
+        self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+        self.provisioned_index_repair_queue_mutex.unlock();
+
+        for (queued_repairs.items) |queued| {
+            const group_id = queued.group_id;
+            const queued_disposition = queuedRepairLiveOwnershipDisposition(
+                self.group_leadership_source,
+                self.group_membership_source,
+                group_id,
+            );
+            switch (queuedRepairOwnershipAction(queued_disposition)) {
+                .schedule => {},
+                // Leadership is temporarily ambiguous while metadata and the
+                // local Raft view converge. Keep durable debt queued while the
+                // independent fallback cursor continues discovering other debt.
+                .retain => {
+                    found_pending = true;
+                    continue;
+                },
+                .remove => {
+                    stale_queued_groups.append(self.alloc, group_id) catch continue;
+                    continue;
+                },
+            }
+            if (queued.next_retry_at_ms > now_ms) {
+                found_pending = true;
+                continue;
+            }
+            const table_name = queued.table_name orelse {
+                // Legacy in-memory entries created before route-bearing debt
+                // notifications are retained until reconciliation refreshes
+                // them; never drop durable debt merely for missing cache data.
+                found_pending = true;
+                continue;
+            };
+            schedule_candidates.append(self.alloc, .{
+                .group_id = group_id,
+                .table_name = table_name,
+                // The DB performs authoritative generation sizing and capacity
+                // admission. Avoid a node-wide status lookup merely to rank the
+                // single bounded repair slot.
+                .estimated_bytes = 1,
+                .queued = true,
+                .cursor_distance = 0,
+            }) catch |err| {
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                self.provisioned_index_repair_dirty.store(true, .release);
+                std.log.warn("provisioned index repair candidate allocation failed err={s}", .{@errorName(err)});
+                return;
+            };
+            // One runnable queued group is sufficient: the executor admits at
+            // most one repair, and the linked cursor provides round-robin
+            // fairness across subsequent passes.
+            break;
+        }
+        for (stale_queued_groups.items) |group_id| self.removeProvisionedIndexRepair(group_id);
+
+        // Reconciliation uses a compact node-local routing index. Refreshing
+        // that index may clone metadata once per epoch, but steady-state repair
+        // passes never clone or free the cluster-wide administrative snapshot.
+        const fallback_due = now_ms -| self.provisioned_index_repair_last_fallback_at_ms.load(.monotonic) >=
+            self.provisioned_index_repair_discovery_interval_ms;
+        if (fallback_due) {
+            self.refreshProvisionedIndexRepairRoutes() catch |err| {
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                self.provisioned_index_repair_dirty.store(true, .release);
+                std.log.warn("provisioned index repair route refresh failed err={s}", .{@errorName(err)});
+                return;
+            };
+            self.provisioned_index_repair_last_fallback_at_ms.store(now_ms, .monotonic);
+        }
+        const routes = self.provisioned_index_repair_routes.routes.items;
+        if (fallback_due and routes.len == 0) {
+            self.provisioned_index_repair_fallback_rotation_estimate_ms.store(0, .monotonic);
+            self.provisioned_index_repair_fallback_rotation_slo_exceeded.store(0, .monotonic);
+        }
+        if (fallback_due and routes.len != 0) {
+            const window = indexRepairFallbackWindow(
+                routes.len,
+                self.provisioned_index_repair_scan_cursor.load(.monotonic),
+                self.provisioned_index_repair_discovery_interval_ms,
+            );
+            const rotation_passes = (routes.len + window.count - 1) / window.count;
+            const rotation_estimate_ms = @as(u64, @intCast(rotation_passes)) *|
+                self.provisioned_index_repair_discovery_interval_ms;
+            self.provisioned_index_repair_fallback_rotation_estimate_ms.store(rotation_estimate_ms, .monotonic);
+            self.provisioned_index_repair_fallback_rotation_slo_exceeded.store(
+                @intFromBool(rotation_estimate_ms > provisioned_index_repair_fallback_rotation_target_ms +
+                    self.provisioned_index_repair_discovery_interval_ms),
+                .monotonic,
+            );
+            fallback_window_start = window.start;
+            fallback_window_total_groups = routes.len;
+            fallback_window_count = window.count;
+            for (0..window.count) |distance| {
+                const route_index = (window.start + distance) % routes.len;
+                const route = routes[route_index];
+                const group_id = route.group_id;
+                if (self.group_leadership_source) |source| {
+                    if (!source.isLocalLeader(group_id)) {
+                        if (!fallback_prefix_blocked) fallback_consumed_prefix = distance + 1;
+                        continue;
+                    }
+                }
+                if (self.hasQueuedProvisionedIndexRepair(group_id)) {
+                    if (!fallback_prefix_blocked) fallback_consumed_prefix = distance + 1;
+                    continue;
+                }
+                fallback_candidate_count += 1;
+                fallback_prefix_blocked = true;
+                schedule_candidates.append(self.alloc, .{
+                    .group_id = group_id,
+                    .table_name = route.table_name,
+                    .table_id = route.table_id,
+                    .identity_shard_id = route.identity_shard_id,
+                    .identity_range_id = route.identity_range_id,
+                    .estimated_bytes = 1,
+                    .queued = false,
+                    .cursor_distance = distance,
+                }) catch |err| {
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    self.provisioned_index_repair_dirty.store(true, .release);
+                    std.log.warn("provisioned index repair fallback allocation failed err={s}", .{@errorName(err)});
+                    return;
+                };
+            }
+        }
+        for (schedule_candidates.items) |candidate| {
+            if (self.provisioned_index_repair_shutdown.load(.acquire)) {
+                found_pending = true;
+                break;
+            }
+            const group_id = candidate.group_id;
+            if (!candidate.queued) fallback_advance_count = @max(fallback_advance_count, candidate.cursor_distance + 1);
+            const table_name = candidate.table_name;
+
+            var ownership_fence = IndexRepairOwnershipFence{
+                .leadership_source = self.group_leadership_source,
+                .write_source = self.liveRuntimeWriteSource(),
+                .group_id = group_id,
+                .root_generation = self.liveRuntimeWriteSource().visibleRootGenerationForRepair(group_id),
+                .owner_epoch = 0,
+            };
+            var cancellation_fence = IndexRepairCancellationFence{
+                .server = self,
+                .group_id = group_id,
+            };
+            ownership_fence.owner_epoch = ownership_fence.currentOwnerEpoch();
+            groups_inspected +|= 1;
+            const result = self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table_name, .{
+                .advance_index_repairs = true,
+                .index_repair_options = .{
+                    .cancel_check = .{
+                        .ptr = &cancellation_fence,
+                        .is_requested = IndexRepairCancellationFence.requested,
+                    },
+                    // The DB measures the selected index generation. Group disk
+                    // bytes above are only a fair-scheduling proxy.
+                    .estimated_candidate_bytes = candidate.estimated_bytes,
+                    .capacity_domain_id = registration.store_id,
+                    .owner_epoch = ownership_fence.owner_epoch,
+                    .max_activation_gap_sequences = self.provisioned_index_repair_max_activation_gap_sequences,
+                    .max_convergence_rounds = self.provisioned_index_repair_max_convergence_rounds,
+                    .max_activation_pause_ms = self.provisioned_index_repair_max_activation_pause_ms,
+                    .activation_check = .{
+                        .ptr = &ownership_fence,
+                        .is_current_owner = IndexRepairOwnershipFence.isCurrentOwner,
+                    },
+                },
+            }) catch |err| {
+                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                found_pending = true;
+                self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch {};
+                std.log.warn("provisioned index repair group pass failed group={} table={s} err={s}", .{ group_id, table_name, @errorName(err) });
+                continue;
+            };
+            found_pending = found_pending or result.index_repair_pending;
+            if (result.index_repair_disk_wait) {
+                _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
+            }
+            if (result.index_repair_pending) {
+                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms) catch {};
+            } else {
+                self.removeProvisionedIndexRepair(group_id);
+            }
+            if (result.index_repair_attempted) {
+                attempted = true;
+                _ = self.provisioned_index_repair_attempted.fetchAdd(1, .monotonic);
+                if (result.index_repair_repaired) {
+                    _ = self.provisioned_index_repair_repaired.fetchAdd(1, .monotonic);
+                    self.runtime_status_dirty.store(true, .release);
+                    self.store_status_dirty.store(true, .release);
+                    self.provisioned_startup_catch_up_dirty.store(true, .release);
+                }
+                break;
+            }
+        }
+        // Do not consume local candidates merely because queued work used the
+        // single repair slot first. Advance past non-local entries immediately,
+        // but only past local candidates that were actually opened.
+        if (fallback_window_total_groups != 0) {
+            const advance_count = indexRepairFallbackAdvance(
+                fallback_candidate_count,
+                fallback_window_count,
+                fallback_consumed_prefix,
+                fallback_advance_count,
+            );
+            if (advance_count != 0) {
+                const next = (fallback_window_start + advance_count) % fallback_window_total_groups;
+                self.provisioned_index_repair_scan_cursor.store(@intCast(next), .monotonic);
+                _ = self.provisioned_index_repair_fallback_groups_scanned.fetchAdd(@intCast(advance_count), .monotonic);
+            }
+        }
+        self.provisioned_index_repair_last_groups_inspected.store(groups_inspected, .monotonic);
+
+        // An attempt consumes the single node admission slot, so rescan later
+        // even when that group completed; another durable intent may exist in
+        // a group not yet visited. Concurrent discovery can also set this bit
+        // after the worker's initial clear without being overwritten here.
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        const queue_pending = self.provisioned_index_repair_group_ages.count() != 0;
+        self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+        self.provisioned_index_repair_queue_mutex.unlock();
+        if (found_pending or attempted or queue_pending) self.provisioned_index_repair_dirty.store(true, .release);
+    }
+
     fn adminSnapshotPreferCached(self: *DataServer) !?antfly.metadata_api.AdminSnapshot {
         if (try self.status_source.cachedAdminSnapshot()) |snapshot| return snapshot;
         return try self.status_source.adminSnapshot();
+    }
+
+    fn refreshProvisionedIndexRepairRoutes(self: *DataServer) !void {
+        const registration = self.store_registration orelse return;
+        const status = try self.status_source.status();
+        if (self.provisioned_index_repair_routes.initialized and
+            self.provisioned_index_repair_routes.metadata_epoch == status.metadata_epoch)
+        {
+            return;
+        }
+
+        const snapshot_opt = try self.adminSnapshotPreferCached();
+        var snapshot = snapshot_opt orelse return;
+        defer self.status_source.freeAdminSnapshot(&snapshot);
+
+        var local_group_ids = try collectLocalGroupIds(self.alloc, snapshot.placement_intents, registration.node_id);
+        if (local_group_ids.len == 0 and hasSingleRoleStore(snapshot.stores, registration.role, registration.store_id)) {
+            const all_groups = try collectAllRangeGroupIds(self.alloc, snapshot.ranges);
+            self.alloc.free(local_group_ids);
+            local_group_ids = all_groups;
+        }
+        defer self.alloc.free(local_group_ids);
+
+        var local_groups = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer local_groups.deinit(self.alloc);
+        try local_groups.ensureTotalCapacity(self.alloc, @intCast(local_group_ids.len));
+        for (local_group_ids) |group_id| local_groups.putAssumeCapacity(group_id, {});
+
+        var tables = std.AutoHashMapUnmanaged(u64, usize).empty;
+        defer tables.deinit(self.alloc);
+        try tables.ensureTotalCapacity(self.alloc, @intCast(snapshot.tables.len));
+        for (snapshot.tables, 0..) |table, i| tables.putAssumeCapacity(table.table_id, i);
+
+        var next: IndexRepairRoutingIndex = .{
+            .initialized = true,
+            .metadata_epoch = snapshot.status.metadata_epoch,
+        };
+        errdefer next.deinit(self.alloc);
+        try next.routes.ensureTotalCapacity(self.alloc, local_group_ids.len);
+        try next.by_group.ensureTotalCapacity(self.alloc, @intCast(local_group_ids.len));
+        for (snapshot.ranges) |range| {
+            if (!local_groups.contains(range.group_id) or next.by_group.contains(range.group_id)) continue;
+            const table_index = tables.get(range.table_id) orelse continue;
+            const table = snapshot.tables[table_index];
+            const route_index = next.routes.items.len;
+            next.routes.appendAssumeCapacity(.{
+                .group_id = range.group_id,
+                .table_name = try self.alloc.dupe(u8, table.name),
+                .table_id = range.table_id,
+                .identity_shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                .identity_range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+            });
+            next.by_group.putAssumeCapacity(range.group_id, route_index);
+        }
+
+        var previous = self.provisioned_index_repair_routes;
+        self.provisioned_index_repair_routes = next;
+        previous.deinit(self.alloc);
+        if (self.provisioned_index_repair_scan_cursor.load(.monotonic) >= self.provisioned_index_repair_routes.routes.items.len) {
+            self.provisioned_index_repair_scan_cursor.store(0, .monotonic);
+        }
     }
 
     fn maybeRequestRuntimeStatusRefresh(self: *DataServer) !void {
@@ -6565,6 +7712,48 @@ pub const DataServer = struct {
         self.provisioned_startup_catch_up_thread = try spawner(self);
         self.provisioned_startup_catch_up_last_run_at_ms.store(now_ms, .monotonic);
     }
+
+    fn maybeRequestProvisionedIndexRepair(self: *DataServer) !void {
+        if (self.provisioned_index_repair_shutdown.load(.acquire)) return;
+        const dirty = self.provisioned_index_repair_dirty.load(.acquire);
+        if (self.provisioned_index_repair_active.load(.acquire)) return;
+        if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        const not_before_ms = self.provisioned_index_repair_not_before_ms.load(.monotonic);
+        if (dirty and not_before_ms != 0 and now_ms < not_before_ms) return;
+        const last_run_at_ms = self.provisioned_index_repair_last_run_at_ms.load(.monotonic);
+        if (!indexRepairScanDue(dirty, last_run_at_ms, now_ms, self.provisioned_index_repair_discovery_interval_ms)) return;
+        try self.requestProvisionedIndexRepair();
+    }
+
+    fn requestProvisionedIndexRepair(self: *DataServer) !void {
+        const runtime = try self.ensureBackendRuntime();
+        if (self.provisioned_index_repair_active.load(.acquire)) return;
+        lockAtomic(&self.provisioned_index_repair_mutex);
+        defer self.provisioned_index_repair_mutex.unlock();
+        if (self.provisioned_index_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
+        if (self.provisioned_index_repair_active.load(.acquire)) return;
+        if (self.provisioned_index_repair_owner_id == 0) {
+            self.provisioned_index_repair_owner_id = runtime.allocOwnerId();
+        }
+        self.provisioned_index_repair_active.store(true, .release);
+        errdefer self.provisioned_index_repair_active.store(false, .release);
+        try runtime.durable_jobs.submit(.{
+            .owner_id = self.provisioned_index_repair_owner_id,
+            .class = .maintenance,
+            .ptr = self,
+            .run = runProvisionedIndexRepairJob,
+            .deinit = deinitProvisionedIndexRepairJob,
+        });
+    }
+
+    fn runProvisionedIndexRepairJob(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        defer self.provisioned_index_repair_active.store(false, .release);
+        self.runProvisionedIndexRepair();
+    }
+
+    fn deinitProvisionedIndexRepairJob(_: *anyopaque) void {}
 
     fn spawnProvisionedStartupCatchUpThreadMain(self: *DataServer) !std.Thread {
         return try std.Thread.spawn(.{}, provisionedStartupCatchUpWorkerMain, .{self});
@@ -7555,6 +8744,10 @@ pub const DataServer = struct {
             ),
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
+            .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
+            .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
+            .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
+            .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
@@ -12271,7 +13464,7 @@ test "data runtime background runtime snapshot warm populates cold status cache 
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     try server.requestRuntimeStatusRefresh();
 
@@ -12404,7 +13597,7 @@ test "data runtime provisioned cache warmup populates runtime status without pin
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     try std.testing.expectEqual(@as(usize, 0), server.write_source.cachedWriteDbCount());
     try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
@@ -12554,7 +13747,7 @@ test "data runtime provisioned cache warmup defers while startup catch-up is act
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     server.provisioned_startup_catch_up_active.store(true, .release);
 
     const stats = server.runProvisionedCacheWarmup();
@@ -12695,7 +13888,7 @@ test "data runtime status refresh preserves only the active catch-up group while
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     const indexes = try alloc.alloc(antfly.db.types.DBIndexStats, 1);
     indexes[0] = .{
@@ -12890,7 +14083,7 @@ test "data runtime status refresh skips opening the active startup group when no
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     server.provisioned_startup_catch_up_active.store(true, .release);
     try server.setProvisionedStartupCatchUpTarget(77, "docs");
@@ -13006,7 +14199,7 @@ test "data runtime status refresh publishes synthetic missing status for absent 
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     const stats = server.runRuntimeStatusRefreshWithBudget(8);
     try std.testing.expectEqual(@as(u64, 1), stats.table_count);
@@ -13126,7 +14319,7 @@ test "data runtime status refresh budget preserves fresh cached group status for
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     const statuses = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
     statuses[0] = .{
@@ -13270,7 +14463,7 @@ test "data runtime status refresh reuses managed writer snapshot instead of reop
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     server.write_source.write_cache = &write_cache;
 
     {
@@ -13411,7 +14604,7 @@ test "data runtime status refresh falls back to live managed writer status when 
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     server.write_source.write_cache = &write_cache;
 
     {
@@ -13542,7 +14735,7 @@ test "data runtime status refresh publishes placeholder when live managed writer
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     server.write_source.write_cache = &write_cache;
 
     {
@@ -13765,7 +14958,7 @@ test "data runtime status refresh publishes sibling placeholder when only one gr
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     server.write_source.write_cache = &write_cache;
 
     {
@@ -14054,7 +15247,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     try server.requestRuntimeStatusRefresh();
@@ -14223,7 +15416,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     server.runtime_status_dirty.store(false, .release);
     server.store_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(true, .release);
@@ -14372,7 +15565,7 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
             .listener_cfg = undefined,
         };
         defer server.deinit();
-        server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+        try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
         server.write_source.write_cache = &write_cache;
 
         try write_cache.beginBulkIngestLocked("docs");
@@ -14611,7 +15804,7 @@ test "data runtime startup catch-up retries unresolved leadership and observes l
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     _ = server.runProvisionedStartupCatchUp();
@@ -14737,7 +15930,7 @@ test "data runtime startup catch-up stays dirty when metadata snapshot is unavai
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     _ = server.runProvisionedStartupCatchUp();
@@ -14821,6 +16014,86 @@ test "data runtime data changes mark provisioned startup catch-up dirty" {
 
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
     try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+}
+
+test "data runtime repair debt hook targets the affected group queue" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_cancel_groups.deinit(alloc);
+
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    DataServer.onLocalTableChanged(&server, "docs", .index_repair);
+    try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    try std.testing.expect(server.provisioned_index_repair_dirty.load(.acquire));
+    try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
+    try std.testing.expectEqualStrings("docs", server.provisioned_index_repair_group_ages.get(7001).?.table_name.?);
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_queue_depth.load(.monotonic));
+
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
+    try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
+    try std.testing.expect(!server.provisionedIndexRepairCancellationRequested(7001));
+
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
+    try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_queue_depth.load(.monotonic));
+}
+
+test "data runtime translates durable repair retry deadlines to monotonic time" {
+    try std.testing.expectEqual(@as(u64, 0), indexRepairMonotonicDeadlineMs(0, 1_000_000, 50));
+    try std.testing.expectEqual(@as(u64, 0), indexRepairMonotonicDeadlineMs(999_999, 1_000_000, 50));
+    try std.testing.expectEqual(@as(u64, 250), indexRepairMonotonicDeadlineMs(1_000_200, 1_000_000, 50));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        indexRepairMonotonicDeadlineMs(std.math.maxInt(u64), 0, std.math.maxInt(u64) - 1),
+    );
+}
+
+test "data runtime repair queue links and removes debt in constant time" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.provisioned_index_repair_group_ages.deinit(alloc);
+
+    for (1..42) |group_id| try server.enqueueProvisionedIndexRepair(@intCast(group_id));
+    try std.testing.expectEqual(@as(?u64, 1), server.provisioned_index_repair_queue_head);
+    try std.testing.expectEqual(@as(?u64, 41), server.provisioned_index_repair_queue_tail);
+    try std.testing.expectEqual(@as(u64, 41), server.provisioned_index_repair_queue_depth.load(.monotonic));
+    // A queue larger than the bounded inspection window must remain immediately
+    // schedulable because an uninspected entry may not be in backoff.
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_not_before_ms.load(.monotonic));
+
+    server.provisioned_index_repair_queue_cursor = 20;
+    server.removeProvisionedIndexRepair(1);
+    server.removeProvisionedIndexRepair(20);
+    server.removeProvisionedIndexRepair(41);
+    try std.testing.expectEqual(@as(?u64, 2), server.provisioned_index_repair_queue_head);
+    try std.testing.expectEqual(@as(?u64, 40), server.provisioned_index_repair_queue_tail);
+    try std.testing.expectEqual(@as(?u64, 21), server.provisioned_index_repair_queue_cursor);
+    try std.testing.expectEqual(@as(?u64, null), server.provisioned_index_repair_group_ages.get(2).?.previous_group_id);
+    try std.testing.expectEqual(@as(?u64, null), server.provisioned_index_repair_group_ages.get(40).?.next_group_id);
 }
 
 test "data runtime structural changes preserve writer-published runtime status and schedule catch-up" {
@@ -14951,7 +16224,7 @@ test "data runtime startup catch-up prefers cached admin snapshot" {
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     _ = server.runProvisionedStartupCatchUp();
 
@@ -15303,7 +16576,7 @@ test "data runtime startup catch-up stays dirty when local groups are not visibl
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     _ = server.runProvisionedStartupCatchUp();
@@ -15452,7 +16725,7 @@ test "data runtime startup catch-up stays dirty when local leadership is unresol
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     _ = server.runProvisionedStartupCatchUp();
@@ -16257,7 +17530,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
         .listener_cfg = undefined,
     };
     defer server.deinit();
-    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     try server.initApiServer();
 
     var status_resp = try server.http_server.?.handle(.{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
@@ -16381,6 +17654,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_resource_disk_reserved_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_resource_disk_growth_denials_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_resource_disk_capacity_domains 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE antfly_resource_disk_domain_reserved_bytes gauge") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_started_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_completed_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_failed_total 1") != null);

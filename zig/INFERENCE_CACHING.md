@@ -143,24 +143,11 @@ and recency. The default policy is:
 - no error caching;
 - reject a result larger than the cache limit.
 
-Operators can override the policy in the normal inference configuration:
-
-```yaml
-inference:
-  api_url: http://127.0.0.1:8082
-  query_embedding_cache:
-    enabled: true
-    max_bytes_mb: 64
-    ttl_ms: 300000
-    max_inflight: 16
-```
-
-`max_bytes_mb: 0` disables result retention while preserving singleflight.
-Likewise, `ttl_ms: 0` preserves singleflight without publishing entries that
-would be expired immediately.
-`enabled: false` bypasses retention and singleflight while preserving the
-`max_inflight` provider admission bound. This allows operators to disable
-cache reuse without removing overload protection.
+These values are internal `ResourceManager` policy. They are not inference,
+HTTP, table, or index configuration and applications cannot toggle the cache.
+A zero manager byte budget disables retention while preserving singleflight;
+a zero internal TTL does the same. Disabling reuse for a deployment is a node
+resource-policy decision and never removes provider overload protection.
 
 `max_inflight` bounds all query embedding provider computations before provider
 pacing and local inference queueing. Requests for a cacheable key already in
@@ -172,11 +159,11 @@ overload, provider rate-limit, and transient provider responses include a short
 `Retry-After` hint so clients can back off instead of immediately amplifying
 pressure.
 
-The default of 16 is deliberately conservative: remote provider responses are
+The internal default of 16 is deliberately conservative: remote provider responses are
 accepted up to 4 MiB before decoding, so the default bounds that transient
 response envelope to 64 MiB before allocator and caller-owned copies. Operators
-can raise the count after load testing the configured providers, dimensions,
-and node memory budget.
+may be changed only with the node resource budget after load testing the
+configured providers, dimensions, and memory envelope.
 
 Internal group query and preflight routes use the same server-owned planning
 context as public queries: backend-runtime I/O, cache and singleflight,
@@ -203,7 +190,7 @@ conservative allowance for hash-table occupancy. The cache reserves its charge
 from `CacheBudget` before publishing the entry and releases it on expiration,
 eviction, or shutdown.
 
-`CacheBudget` is the reusable coordination boundary. It atomically enforces an
+`CacheBudget` is owned by `ResourceManager` and is the reusable coordination boundary. It atomically enforces an
 aggregate process limit while allowing each consumer to implement correct
 resource release. When prompt-prefix caching is merged, its host metadata,
 host KV copies, and device KV allocations should reserve from the same kind of

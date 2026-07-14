@@ -3757,6 +3757,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/DenseRepairBackpressure'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -4478,13 +4480,21 @@ paths:
     post:
       summary: Cancel a table repair job
       description: >
-        Cancels a queued table repair job. If a repair pass is already running,
+        Requests cancellation at a bounded repair boundary. For a named-index
 
-        the response returns the current running state; cancellation is applied
+        job, the server also traverses the table in bounded passes, durably
 
-        only at pass boundaries so the API never reports a committed in-flight
+        pauses matching automatic repair, and asks an active owner to yield.
 
-        pass as cancelled.
+        The job remains nonterminal until that traversal completes, so a
+
+        `cancelled` response means detached reconstruction will not restart
+
+        without an explicit resume action. If the API process restarts during
+
+        the traversal, server maintenance resumes it automatically; clients do
+
+        not need to advance or repeat the cancellation request.
       tags:
         - data_operations
       operationId: cancelTableRepairJob
@@ -4496,8 +4506,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/TableRepairJob'
         '202':
-          description: Cancellation requested; the current running pass has not yet reached a cancellation
-            boundary.
+          description: Cancellation remains in progress at a running-pass boundary or during the durable
+            named-index pause traversal.
           content:
             application/json:
               schema:
@@ -8129,8 +8139,22 @@ components:
         force:
           type: boolean
           default: false
-          description: Force a named index rebuild even when no repair debt is currently recorded. Only
-            applies to target=index.
+          description: Force one named-index replacement generation even when no repair debt is currently
+            recorded. The force is dispatched once across the initial bounded group traversal; later convergence
+            passes only observe that generation. Only applies to target=index.
+        control:
+          type: string
+          enum:
+            - pause_automatic
+            - resume_automatic
+            - cancel_current_attempt
+          description: Applies one control to an existing named index repair. Requires target=index and
+            index; cannot be combined with force, kind, or cursor.
+        repair_id:
+          type: string
+          pattern: ^[1-9][0-9]*$
+          description: Optional opaque generation fence for a repair control. A stale value is rejected
+            instead of affecting a newer repair.
         limit:
           type: integer
           format: uint32
@@ -8154,6 +8178,7 @@ components:
         - in_progress
         - indexes_rebuilt
         - indexes_degraded
+        - controls_applied
         - limit
         - has_more
         - debt_remaining
@@ -8204,6 +8229,10 @@ components:
           type: integer
           format: uint64
           description: Number of selected indexes that were already degraded or quarantined before repair.
+        controls_applied:
+          type: integer
+          format: uint64
+          description: Number of existing index repairs that accepted the requested control.
         limit:
           type: integer
           format: uint32
@@ -8338,7 +8367,8 @@ components:
           description: Effective per-pass repair limit.
         force:
           type: boolean
-          description: Whether the job forces a named index rebuild.
+          description: Whether the next bounded pass still needs to dispatch the job's one forced named-index
+            generation.
         result:
           $ref: '#/components/schemas/TableRepairRunResult'
         last_error:
@@ -8347,8 +8377,9 @@ components:
           description: Last stable job-level error code.
         cancel_requested:
           type: boolean
-          description: Whether cancellation has been requested for a running pass. Running passes finish
-            at a bounded repair boundary before the job transitions to cancelled.
+          description: Whether cancellation is pending. For a named-index job, cancellation durably pauses
+            the matching repair in every group and becomes terminal only after that bounded traversal
+            completes.
         created_at_millis:
           type: integer
           format: uint64
@@ -10185,6 +10216,31 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+    DenseRepairBackpressureError:
+      type: object
+      description: A dense-index rebuild is retaining replay history and the node has reached its hard
+        safety budget.
+      required:
+        - code
+        - message
+        - retryable
+        - retry_after_ms
+      properties:
+        code:
+          type: string
+          enum:
+            - dense_repair_backpressure
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - true
+        retry_after_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          description: Suggested delay before retrying the write.
     MultiBatchRequest:
       type: object
       description: >
@@ -16845,6 +16901,26 @@ components:
         - $ref: '#/components/schemas/GeoDistanceQuery'
         - $ref: '#/components/schemas/GeoBoundingPolygonQuery'
         - $ref: '#/components/schemas/GeoShapeQuery'
+    IndexRepairStatus:
+      type: object
+      description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available
+        from the admin API and metrics.
+      required:
+        - state
+        - action_required
+      properties:
+        state:
+          type: string
+          enum:
+            - rebuilding
+            - waiting
+            - paused
+            - failed
+          description: Stable repair state. Internal state-machine phases are intentionally not exposed
+            here.
+        action_required:
+          type: boolean
+          description: Whether an operator must resume, retry, reconfigure, or drop the affected index.
     FullTextIndexStats:
       type: object
       required:
@@ -16874,6 +16950,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the index is currently rebuilding
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -17179,6 +17257,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the index enricher is currently backfilling
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         wal_backlog:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17422,6 +17502,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the index is currently rebuilding
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -17640,6 +17722,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the sidecar is currently rebuilding
+        repair:
+          $ref: '#/components/schemas/IndexRepairStatus'
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -22490,6 +22574,18 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    DenseRepairBackpressure:
+      description: Writes are temporarily limited while a dense-index rebuild catches up.
+      headers:
+        Retry-After:
+          description: Suggested delay in seconds before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/DenseRepairBackpressureError'
     UnsupportedMediaType:
       description: Unsupported request media or content encoding
       content:

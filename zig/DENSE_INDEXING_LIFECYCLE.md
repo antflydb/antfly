@@ -2,7 +2,110 @@
 
 ## Status
 
-Design and implementation plan.
+Core implementation complete; the single-run one-million-document qualification
+passes. Repeated baseline/candidate performance runs and the full deterministic
+fault matrix remain rollout gates.
+
+Implemented in the current tree:
+
+- ordinary dense replay uses reopenable streaming sessions rather than active
+  bulk-publication state
+- `IncompleteBulkPublish` is quarantined and repaired through a durable,
+  restart-resumable shadow-generation state machine
+- explicit generation rebuilds for dense, sparse, graph, and full-text indexes
+  use the same durable intent and post-pointer restart reconciliation
+- startup repair is ownership-fenced, resource-admitted, and driven by a
+  debt-only fair queue with O(1) enqueue/removal and a 32-entry bounded
+  round-robin inspection window; lost notifications are recovered by an
+  independent adaptive 16-to-256-group cursor window rather than a periodic
+  full-node sweep, with a measured full-rotation estimate and SLO violation
+  metric when the configured group count exceeds the qualified envelope
+- repair execution is owned by a dedicated `BackendRuntime` maintenance owner;
+  shutdown cooperatively cancels at durable boundaries and drains that owner,
+  leaving the candidate resumable instead of waiting for a full rebuild
+- temporarily unknown leadership retains queued debt with retry semantics;
+  only an authoritative non-local ownership decision removes local queue state
+- provisioned operator rebuild requests only persist/attach to the durable
+  intent while holding the group lifecycle guard, then enqueue the exact group;
+  the same `BackendRuntime` maintenance owner performs automatic and operator
+  reconstruction. Pause/resume/cancel updates only that affected group queue,
+  and ordinary writes do not wake the repair scanner
+- a validated replacement is activated atomically while any prior healthy
+  generation remains available
+- activation durably records and retains the previous root until the new clean
+  checkpoint is published; a missing or corrupt pointer-selected generation
+  fails closed and rolls back to that retained predecessor when one is valid
+- root-generation rollover atomically replaces the replica repair identity and
+  all pointer-selected replacement debts in one checkpoint; affected indexes
+  stay fail-closed and rebuild under the new identity instead of losing an old
+  activation intent during promotion or physical-root replacement
+- activation adopts the already-open shadow runtime for every index family
+  after the durable pointer write instead of closing and reopening a large
+  index under the write fence; dense query-drain, apply-lock acquisition, final
+  replay, and every reversible pre-commit step share one absolute activation
+  deadline
+- public repair status and errors are intentionally compact; detailed state is
+  confined to operator metrics and logs; malformed durable repair state maps
+  to the same compact `failed` status instead of disappearing from the response
+- cache policy is node-owned by `ResourceManager` and is absent from index
+  configuration
+- disk growth is estimated from the selected index generation and claimed by
+  `ResourceManager` in a storage-backend capacity domain; provisioned storage
+  supplies a live platform filesystem probe, and claims are rechecked and may
+  grow at bounded shadow publication/catch-up boundaries, including every HBC
+  deferred-publication window. Before a conservative claim can deny progress,
+  materialized candidate bytes are reconciled out of the future-growth claim,
+  so free space and the shared reservation never charge the same bytes twice
+- filesystem-observation freshness is monotonic end to end. Durable retry
+  deadlines remain realtime so they survive restart, and are translated once
+  into monotonic deadlines when inserted into a process-local scheduler; the
+  two clock domains are never compared directly
+- a forced named-index repair job requests one replacement generation across
+  its bounded group traversal and then becomes observational; cancellation is
+  terminal only after a bounded durable pause traversal has reached every
+  affected group and signalled any active owner to yield
+- forced generation completion is persisted against the stable API job
+  identity before the repair intent is removed. A crash after pointer/checkpoint
+  publication but before API acknowledgement therefore observes the completion
+  instead of constructing a second generation
+- generation completion and source-artifact debt are separate durable
+  outcomes. Once a replacement pointer and clean checkpoint commit, the
+  generation intent is complete even if corrupt or missing source artifacts
+  remain in the bounded artifact-repair queue; those issues stay visible
+  without triggering redundant full-generation rebuilds
+- transient repair-job dispatch, ownership, routing, and storage failures return
+  the durable job to bounded exponential backoff. Named-index cancellation
+  remains queued and is resumed by the API maintenance supervisor; malformed or
+  semantically invalid requests alone become terminal
+- retired-generation collection is deduplicated `BackendRuntime` cleanup work.
+  A rerun latch covers retirements that race an active scan, and DB shutdown
+  drains the cleanup owner before destroying the index manager
+- embedded/Lite databases that intentionally omit the managed durable-repair
+  checkpoint treat repair-intent discovery as empty, so normal index deletion
+  remains available; attempts to create managed durable repair state still
+  fail closed
+- replay-pin creation/removal and the in-memory pressure gate share the replay
+  truncation exclusion, including concurrent repairs of different indexes
+- ordinary `.write` traffic participates in derived-backlog admission: the
+  node resource manager uses 200/100 pending-sequence hysteresis and also
+  forces bounded progress when aggregate LSM state reaches its configured
+  write-throttle pressure; if per-sequence accounting allocation fails, an
+  allocation-free aggregate keeps exact byte pressure and fails closed through
+  the newest affected sequence
+- mutable LSM snapshots have generation-specific reader references, so an old
+  replay scan cannot retain unrelated later snapshots; write transactions keep
+  backend-close fencing without pinning versions unless they open a cursor
+- the gated 1,000,000-document streaming-ingest qualification passes exact
+  count/checkpoint, bounded memory, durable reopen, and post-restart search in
+  471.709 seconds under `ReleaseFast`, with an 874,287,160-byte peak pressure
+  working set (1,000-document client batches)
+- the final 100,000-document `ReleaseFast` regression run, after resource and
+  snapshot-lifecycle hardening, completes the same ingest/catch-up/reopen/search
+  contract in 69.399 seconds with a 114,001,576-byte peak pressure working set
+- the post-production-hardening provisioned-path guardrail ingests 50,000
+  1,536-dimensional external vectors in 21.347 seconds and drains dense replay
+  in 3.748 seconds (426,949 write ns/document, 100-document client batches),
+  confirming that normal writes do not enter bulk publication or repair
 
 This document defines how ordinary dense replay, explicit bulk construction,
 and interrupted HBC publication should differ. The immediate objective is to
@@ -354,6 +457,34 @@ The dense replay window remains bounded by records, items, bytes, and resource
 manager pressure. These limits are operational backpressure controls, not
 durability boundaries.
 
+Ordinary writes must not merely *report* replay debt. After the primary commit,
+`.write`, enrichment, full-text, and full-index paths consult the executor's
+backlog-admission target; only the proposal-only path is exempt. The target is
+owned by `ResourceManager`, exposed through the derived-executor vtable, and is
+identical for manual and threaded backend runtimes.
+
+Admission uses hysteresis rather than draining every producer to the newest
+sequence. The current node policy stops a producer above 200 pending replay
+sequences and waits only far enough to resume at 100. Encoded replay-byte
+pressure computes an equivalent low-water target. If aggregate
+`lsm.in_memory_state` reaches a pressure whose policy action is
+`throttle_writes` or `reject_work`, the producer waits through at least the
+oldest pending sequence; that lets the active bounded replay window publish and
+release pinned LSM state before more foreground mutations are admitted.
+
+Backlog accounting may not disappear under allocator pressure. If appending a
+per-sequence accounting entry fails, the tracker switches to an allocation-free
+overflow interval. It continues exact saturating byte accounting and returns
+the newest overflow sequence as the admission target. Partial replay does not
+release that aggregate early; reaching the interval tail releases its exact
+bytes and restores precise per-sequence tracking. This deliberately trades a
+temporarily larger drain for fail-closed memory and WAL admission.
+
+These are internal resource-policy values, not index configuration or public
+cache toggles. A composed runtime may supply one resource manager to multiple
+DBs; the executor abstraction carries only the resulting target sequence, so
+backend choice does not change correctness or admission behavior.
+
 ### Session resource bounds
 
 Streaming sessions require both per-index and node-wide bounds. The current
@@ -448,7 +579,11 @@ The HTTP repair-job store remains the operator-facing mechanism for explicit
 repair, cancellation, and observability. Making it the correctness mechanism
 for startup would introduce a second ownership and scheduling system, and its
 table-scoped job shape does not currently identify the locally owned group that
-startup is repairing.
+startup is repairing. It does, however, durably retain unfinished operator
+cancellation traversals. The API maintenance supervisor automatically resumes
+the oldest queued traversal after process restart, one bounded pass at a time
+through `BackendRuntime`; a client does not have to call the advance endpoint to
+finish cancellation.
 
 Automatic and operator-triggered repair must call the same DB repair engine and
 use the same durable repair intent. They differ only in scheduling and policy.
@@ -520,8 +655,13 @@ pub const IndexRepairIntent = struct {
     config_hash: u64,
     trigger: enum {
         incomplete_bulk_publish,
+        operator_generation_rebuild,
+        root_generation_rebuild,
     },
     candidate_relative_path: ?[]const u8 = null,
+    previous_pointer_captured: bool = false,
+    // null after capture means the canonical root was previously active
+    previous_active_relative_path: ?[]const u8 = null,
     detected_sequence: u64,
     build_floor_sequence: u64 = 0,
     candidate_applied_sequence: u64 = 0,
@@ -592,7 +732,7 @@ Replica lifecycle handling is explicit:
 | Restart with matching identity | Reload intent and pin before truncation; resume by phase |
 | Leadership/placement loss | Fence and stop local execution; retain local intent for possible return, but forbid activation |
 | Promotion of another existing replica | Discover that replica's own load state and intent; never open the former owner's candidate |
-| Replica replacement or root-generation change | Invalidate old candidates and create a new local repair identity |
+| Replica replacement or root-generation change | Delete inactive old candidates. If an old candidate is pointer-selected, persist fresh new-root reconstruction debt and keep the index fail-closed; never make it serviceable by merely discarding the old intent |
 | Group move or split | Do not copy repair state or candidate files; fence source work and build destination/children from their durable logical state |
 | Logical backup/restore | Omit repair state and rebuild derived indexes under new identities |
 | Physical backup/restore | Resume only after exact identity, generation, config, checkpoint, and candidate validation |
@@ -614,6 +754,7 @@ detect IncompleteBulkPublish
     -> converge below the bounded activation thresholds
     -> revalidate ownership and configuration under a time-bounded apply barrier
     -> perform bounded final catch-up
+    -> durably record the exact previous active-root pointer
     -> atomically swap the active-root pointer
     -> open and validate the replacement
     -> persist a clean projection checkpoint and clear the load failure
@@ -629,10 +770,22 @@ empty replacement opened only to facilitate rebuilding.
 
 Manual index repair must use the same intent. An interrupted operator repair
 therefore becomes eligible for safe automatic continuation after restart.
+On provisioned storage, the request handler performs only the bounded durable
+intent transition and exact-group enqueue while the group lifecycle guard is
+held. It never scans the corpus inline and never creates a second repair owner.
+Standalone DB use may synchronously advance the same state machine when no
+managed scheduler exists.
 
 If startup finds both a healthy active replacement and a stale intent from a
 crash after pointer activation, it validates the configuration hash and clean
 checkpoint, then clears the intent without rebuilding again.
+
+Every pointer-selected root must validate its durable ready manifest and
+configuration hash before a storage backend is opened. A missing directory must
+not be recreated as an empty index. If the selected replacement cannot be
+opened or validated, restart restores the previous pointer recorded by the
+intent when that predecessor remains valid; otherwise the index stays
+quarantined and reconstruction resumes.
 
 If startup finds an intent and a candidate path:
 
@@ -732,12 +885,122 @@ reopens from a resumable checkpoint where supported; exceeding a hard budget
 enters write backpressure or pauses the repair rather than allowing unbounded
 disk growth.
 
+### Disk-capacity ownership and admission
+
+Disk admission is capacity policy and belongs to `ResourceManager`, not to the
+executor. `BackendRuntime` owns the threads and I/O lanes that run an admitted
+repair; a storage backend may install a capacity source while composing
+`DB.OpenOptions`. That source returns a stable identity for the physical
+volume/quota namespace plus a current optional capacity observation. Table,
+group, index, repair, and logical store identifiers are not capacity domains
+unless the deployment guarantees that each maps one-to-one to an independently
+exhausted allocation.
+
+Provisioned storage installs a live `statvfs` probe for its replica root into
+the shared `ResourceManager`. The same observation feeds store heartbeats and
+repair admission, so scheduling data and the final admission decision do not
+diverge. A backend with a quota or non-filesystem capacity model replaces that
+probe through the same capacity-source interface.
+
+Capacity-source installation is immutable after runtime composition. DBs copy
+the source when they open and reservations coordinate through its domain ID, so
+runtime replacement would create inconsistent admission views. Idempotently
+installing the exact same source is allowed; installing a different source or
+installing after admission has begun is rejected.
+
+The durable intent stores `planned_disk_bytes`. It is an estimate and does not
+claim that an in-memory reservation survived restart. Each attempt measures any
+existing candidate, refreshes the observation, reserves only remaining growth,
+and retains a node-owned safety floor for WAL/checkpoint/foreground durability.
+Unknown capacity remains accounting-only. Known but stale capacity fails
+closed. Shadow construction reconciles actual bytes at bounded durable
+publication and catch-up boundaries, refreshes the live capacity observation,
+and grows the claim before proceeding when the plan is exceeded. Revalidation
+uses the aggregate outstanding claim for the physical domain, so a fall in
+available capacity stops the next bounded unit even when the original estimate
+has not been exceeded. Full-text segment batches, graph batches, dense/sparse
+artifact chunks, replay catch-up chunks, and each HBC deferred-publication
+window all cross this fence. Admission never performs a recursive directory
+walk on the foreground write path.
+
+The reservation represents future growth, while filesystem availability
+already reflects bytes written by the candidate. Every bounded repair boundary
+first performs an O(1) capacity-source refresh and aggregate-claim check. If the
+conservative claim would deny progress, the executor measures the complete
+shadow generation (index artifacts, checkpoint, and publication markers),
+shrinks the future-growth reservation by the materialized amount, and
+revalidates before deciding. Major phase transitions also reconcile exactly.
+This prevents false admission failures as a large rebuild approaches its
+estimate without turning segment-heavy builds into repeated recursive walks.
+The preliminary fit probe updates the capacity observation but does not record
+an admission denial; only a stale observation or the final decision after exact
+reconciliation increments denial metrics. Thus operator alerts describe work
+that was actually stopped rather than conservative estimates corrected in the
+same pass.
+Ordinary ingest and query paths never perform this measurement.
+
+Unsupported capacity observation is treated as unknown capacity rather than an
+endless repair wait. On a backend that does support observation, transient probe
+failure fails new repair admission closed and retries with durable backoff. Store
+heartbeats retain the last successful capacity value across that transient
+failure and expose a failure counter instead of publishing a false zero-capacity
+sample.
+
+Claims coordinate all DBs sharing a manager. They do not coordinate independent
+processes on one volume. Production deployments must therefore enforce one
+writer process per capacity domain or provide a capacity source backed by an
+OS quota, preallocation scheme, or shared allocator. This invariant is part of
+the storage backend contract, not an application-facing tuning switch.
+
+### Cache ownership and admission
+
+Dense cache policy is node resource policy, not index schema. Public and raw
+index configuration must not expose cache enable/disable switches, entry
+counts, or byte values. In particular, `max_cached_nodes`,
+`max_cached_vectors`, and `max_cached_metadata` are not supported tuning
+controls. Older persisted configuration containing those keys may continue to
+load for compatibility, but the values are ignored. HBC-specific environment
+switches and mutable runtime cache-cap setters are likewise outside the
+supported control plane; node resource-manager policy is the sole production
+authority.
+
+The `ResourceManager` owns the cache policy and is authoritative for exact byte
+admission across all indexes sharing the manager:
+
+- retained HBC nodes, quantized state, vectors, and metadata use the shared
+  `hbc_node_metadata_cache` byte budget
+- replay-time decoded-vector and raw-read caches use the applicable dense
+  working-set byte budget
+- HBC count ceilings exist only as internal CLOCK-bookkeeping safety bounds;
+  they are derived from the resource budget and cannot override it
+- a provisioned node shares one manager and HBC cache across its groups and
+  indexes
+- a standalone DB installs one internal default manager before opening primary
+  or index storage, so primary LSM state, dense LSM state, replay, and HBC share
+  the same policy; direct standalone `IndexManager` use also gets a fallback
+
+Shared-cache lifetime is part of this ownership contract. A node-owned shared
+cache is constructed and explicitly bound by the same node resource manager
+that outlives every DB using it. A per-DB fallback manager governs DB-local
+working sets and internal caches only; it must never install itself into a
+caller-owned LSM or HBC cache. Passing an explicit manager with a shared cache
+asserts that the caller owns both lifetimes and keeps the manager alive until
+the cache is detached or destroyed.
+
+Startup catch-up and repair do not rewrite per-index cache caps. They compete
+through the same byte reservations, pressure actions, and fairness policy as
+foreground dense work. Operators tune node resource budgets; applications tune
+index semantics and search quality, not storage-engine cache internals.
+
 ### Repair state transitions
 
-Every transition is idempotent and compare-and-swaps the expected `repair_id`,
-phase, configuration hash, root generation, and ownership epoch. Filesystem
-effects happen before the durable phase that claims they are complete; restart
-validates those effects before advancing.
+Every transition is idempotent and compare-and-swaps a monotonically increasing
+checkpoint revision in addition to `repair_id`, phase, configuration hash, root
+generation, and ownership epoch. The revision advances on every mutation,
+including same-phase progress, retry, pin, and automation changes, so a pause or
+checkpoint cannot be overwritten by a stale snapshot. Filesystem effects happen
+before the durable phase that claims they are complete; restart validates those
+effects before advancing.
 
 | Phase | Required durable facts | Allowed next phase | Restart action |
 | --- | --- | --- | --- |
@@ -776,6 +1039,32 @@ and the current replay target. If the new estimate exceeds the maximum pause,
 it releases the barrier without swapping, records
 `waiting_for_convergence`, and continues background catch-up. No repair may
 hold the write/apply barrier for an unbounded corpus scan or wait.
+
+Activation uses one absolute monotonic deadline rather than independent
+timeouts. Final replay receives a deadline-aware record/item window and reserves
+a bounded tail for readiness validation, pointer publication, and the clean
+checkpoint. The replay worker refuses to open a new apply window after its
+deadline. A single backend operation remains non-preemptive, so admission uses
+the slower observed per-sequence cost and production qualification must verify
+that the largest permitted window fits the pause SLO.
+
+Activation transfers the already-open replacement entry from the shadow manager
+into the active manager for every index family. All allocations and candidate
+validation occur before the pointer write; dense vector-load context is rebound
+during the allocation-free handoff. The detached predecessor is retained while
+the pointer and clean checkpoint commit, then closed only after the apply and
+dense-query fences are released. This removes size-dependent close/reopen and
+generation teardown from the service pause. Pointer commit and clean-checkpoint
+publication remain an intentionally non-interruptible correctness tail. The
+resource manager records actual fence-held duration separately from post-commit
+cleanup, including failed attempts and over-budget events.
+
+An activation error remains in `activating` until restart or the next pass has
+read and validated the durable pointer. It cannot fall back to disk-admitted
+rebuild work first. Pointer publication is the last fallible handoff operation:
+if it fails, the predecessor remains installed and searchable. If the pointer
+commits but later checkpoint publication is interrupted, restart reconciles the
+selected candidate idempotently; an unverified rollback fails closed.
 
 If sustained writes prevent convergence, the resource manager may apply
 bounded dense-replay prioritization and then explicit write admission control.
@@ -832,6 +1121,14 @@ executor scans durable intents at startup and periodically thereafter, so a
 lost notification, executor restart, or temporarily closed DB cannot strand
 repair debt. It reopens the DB through the managed owner for each claim and
 does not retain an unsafe raw DB pointer across placement or lifecycle changes.
+Startup discovery and operator repair controls enqueue or remove the exact
+affected group. They do not route through broad startup catch-up, and high-rate
+ordinary document writes never mark the repair scanner dirty.
+Named-index pause, resume, cancellation, and successful repair passes retain the
+group in the queue until an aggregate owner-side audit has checked every index
+in that group. This prevents an operation on one index from dropping independent
+repair debt for another index; the aggregate audit performs the eventual O(1)
+queue removal when the group is clean.
 It calls the same refactored DB repair state machine used by explicit operator
 repair:
 
@@ -853,15 +1150,19 @@ Start with these scheduler limits:
 
 - at most one active index reconstruction per node
 - at most one active reconstruction per group
-- size-aware fair selection across tables and groups, with aging so a large
-  repair cannot starve indefinitely
-- resource-manager admission for memory, disk I/O, compaction, and background
-  CPU
-- a durable or reconstructible disk-reservation token that accounts for the
+- bounded round-robin selection across known groups; exact generation sizing
+  and capacity admission happen inside the selected DB, avoiding node-wide
+  status materialization merely to rank one repair slot
+- resource-manager admission for memory and disk capacity, backend-runtime
+  execution, and one-per-node scheduling bounds for disk I/O, compaction, and CPU
+- a reconstructible disk plan plus a process-local reservation token that accounts for the
   candidate, retained poisoned root, WAL/replay growth, and cleanup reserve;
   free-space preflight alone is not admission because concurrent repairs can
   consume the same bytes
 - cancellation and a final fencing check when placement or leadership changes
+- a dedicated `BackendRuntime` maintenance owner and cooperative shutdown token;
+  shutdown requests cancellation before draining the owner, and cancellation
+  preserves resumable durable repair state without recording an attempt failure
 
 The concurrency limit may become configurable after qualification, but
 unbounded per-group concurrency is never allowed. A future resumable scanner
@@ -870,13 +1171,45 @@ build to completion on the dedicated executor only if capacity tests show that
 the largest supported repair meets queue-age and startup SLOs. Otherwise,
 resumable checkpoints and cooperative yielding are required before GA.
 
-The scheduler publishes queue depth, oldest-intent age, admitted and reserved
-bytes, per-resource wait reason, estimated remaining bytes, and projected
-completion time. Initial concurrency is one reconstruction per node. Higher
-configurable concurrency is enabled only after multi-group qualification proves
-that memory, disk, replay retention, query latency, and activation-pause budgets
-remain bounded. The periodic rescan interval and repair-capacity SLO are
-configuration with conservative defaults, not hard-coded operational policy.
+The scheduler publishes queue depth, oldest-intent age, bounded-scan work,
+attempt outcomes, disk-admission waits, and current/peak resource-manager disk
+claims. Detailed per-intent phase, retry deadline, sequences, reservation, and
+last error remain available through authenticated operator diagnostics and
+structured logs. Projected completion is intentionally omitted until measured
+throughput makes it defensible. Initial concurrency is one reconstruction per
+node. Higher configurable concurrency is enabled only after multi-group
+qualification proves that memory, disk, replay retention, query latency, and
+activation-pause budgets remain bounded. The periodic lost-wakeup interval and
+repair-capacity SLO are internal node policy with conservative defaults. Known
+debt is held in an intrusive linked hash queue: enqueue and removal are O(1),
+each pass snapshots at most 32 entries, and durable-intent transitions directly
+supply the group and table route. Creating, resuming, pausing, or removing an
+intent therefore updates scheduling without an administrative snapshot. Metrics
+inspect at most the same bounded window; larger queues conservatively keep the
+executor runnable instead of performing a full scan.
+
+Lost-wakeup reconciliation uses a compact node-local routing index rebuilt only
+when the metadata epoch changes. Steady-state passes neither clone nor free the
+cluster-wide administrative snapshot. The fallback window adapts between 16
+and 256 routes per pass to target a 30-minute full rotation at the configured
+discovery interval, and advances a separate cursor even when queued debt exists.
+The 256-route ceiling bounds DB opens and metadata work; deployments beyond the
+resulting supported envelope report an explicit rotation-SLO violation rather
+than hiding unbounded recovery latency. If queued work consumes the repair slot,
+a safe-consumed prefix advances past non-local or already-queued entries but
+stops at the first uninspected local candidate. The fallback is a safety audit;
+direct durable-intent notifications and startup reconciliation are the primary
+discovery paths, so normal recovery latency does not scale with a full cursor
+rotation.
+
+Queue ownership decisions are tri-state. `attempt` schedules eligible debt,
+`retry_unknown` retains it in-place while metadata and Raft leadership converge,
+and only `skip_nonlocal` removes it. The live membership source produces that
+decision only from a known voter set in which the local node is absent; a
+known local voter without leadership remains queued through elections. The
+lost-wakeup cursor is therefore a
+notification safety net, not the correctness path for temporary ownership
+ambiguity.
 
 ### Startup integration
 
@@ -946,37 +1279,47 @@ intent backoff protects expensive reconstruction and prevents restart thrash.
 
 ### Status and metrics
 
-Automatic repair should report more than generic startup catch-up:
+The normal table/index status response is a user-facing health surface, not a
+dump of the repair state machine. It exposes one compact object, and only while
+a repair exists:
 
-```text
-index_repair_trigger = IncompleteBulkPublish
-index_repair_id
-index_repair_phase = detected | preflight | building | catching_up | ready |
-                     waiting_for_convergence | activating | validating |
-                     cleanup | terminal
-index_repair_automation = enabled | paused
-index_repair_attempts
-index_repair_documents_reprocessed
-index_repair_started_at
-index_repair_updated_at
-index_repair_build_floor_sequence
-index_repair_applied_sequence
-index_repair_target_sequence
-index_repair_next_retry_at
-index_repair_last_error
-index_repair_wait_reason = none | backoff | resource | convergence | paused
-index_repair_queue_age
-index_repair_estimated_completion
-index_repair_replay_bytes_retained
-index_repair_snapshot_age
-index_repair_snapshot_bytes_pinned
-index_repair_disk_bytes_reserved
+```json
+{
+  "repair": {
+    "state": "rebuilding",
+    "action_required": false
+  }
+}
 ```
 
-These fields belong in the per-index status API and structured logs. Prometheus
-metrics use bounded phase/outcome labels and aggregate counts or durations;
-`repair_id`, index names, candidate paths, and error strings must not become
-unbounded metric labels.
+`state` is the stable, deliberately small vocabulary `rebuilding | waiting |
+paused | failed`. `action_required` is true only for `paused` or `failed`.
+Healthy indexes omit `repair` entirely. Do not add attempts, phase names,
+timestamps, byte counters, repair IDs, paths, error strings, or speculative
+percent-complete estimates to this response. Existing top-level index
+availability and rebuilding fields remain authoritative, so clients do not
+need to interpret internal phases.
+
+Detailed diagnostics belong in the authenticated admin/operator surface and
+structured logs, not the ordinary status response. They may include the repair
+ID and trigger, internal phase, automation mode, attempts, timestamps, build and
+replay sequences, retry deadline, wait reason, last error, queue age, throughput
+estimate, retained replay bytes, pinned snapshot bytes, disk reservation, and
+monotonic progress when it can be computed defensibly.
+The operator endpoint can return these fields on explicit request and returns
+the repair ID when an action is created or attached, allowing stale-action
+fencing without making every status consumer carry it.
+
+Prometheus metrics use bounded phase/outcome labels and aggregate counts or
+durations; repair IDs, index names, candidate paths, and error strings must not
+become unbounded metric labels.
+
+The current node metrics cover queue depth and oldest age, groups inspected and
+fallback groups scanned, pass duration, attempts/outcomes, disk waits, and
+current/peak/admitted/denied resource-manager disk claims. ResourceManager metrics
+cover the memory and retained-WAL pressure involved in repair. Further phase
+histograms may be added with bounded labels; they are not part of the public
+index response.
 
 While rebuilding:
 
@@ -1002,11 +1345,16 @@ returns a structured retryable error containing:
 
 ```text
 code = index_rebuilding
-index_name
-repair_id
-phase
+retryable = true
 retry_after_ms, when known
 ```
+
+Internal phase and repair identity are available through the authenticated
+operator endpoint and correlated logs. They are intentionally omitted from the
+normal query error because they do not help an application decide whether to
+retry. The index name may be included when the request maps unambiguously to one
+index, but clients must not require it for retry behavior (hybrid queries can
+depend on more than one unavailable index).
 
 Composed or hybrid searches fail the complete request when a required index is
 rebuilding. Partial results are allowed only through an explicit request option
@@ -1038,6 +1386,24 @@ Operator actions follow these rules:
   owner resumes from durable state
 - a terminal repair remains visible with a documented operator retry or
   drop/recreate action
+- `force` is edge-triggered for a named index: every group in the initial
+  bounded cursor traversal receives the explicit generation request once, and
+  subsequent convergence/observation passes cannot create another generation.
+  Each group records the stable job identity before removing a completed intent,
+  closing the crash gap between group completion and API job acknowledgement
+- cancelling a named-index repair job means durably stopping that requested
+  work, not merely changing the HTTP job record. The job remains nonterminal
+  while bounded passes apply `pause_automatic_repair` across the table. The
+  owner is signalled before the control waits for group-operation serialization,
+  allowing an active rebuild to yield at its next durable boundary. Only after
+  the traversal completes does the job become `cancelled`; resumption remains
+  an explicit operator action. A durable FIFO of unfinished cancellation jobs
+  lets the API maintenance supervisor redispatch them automatically after a
+  process restart without scanning the complete job store
+- a transient cancellation pass failure preserves `cancel_requested`, cursor,
+  and accumulated results, then enters durable exponential backoff. The FIFO
+  inspects a bounded window so one delayed cancellation does not head-of-line
+  block unrelated due work
 
 These actions are idempotent and scoped by `repair_id`. A stale action for an
 old repair cannot pause, resume, cancel, or delete its replacement.
@@ -1143,6 +1509,12 @@ keep generation N active
     -> atomically update the active-root pointer
     -> retire generation N after readers release it
 ```
+
+Generation N remains a durable rollback anchor through replacement open,
+validation, clean-checkpoint publication, and repair-intent cleanup. Inactive
+shadow roots and stale canonical-root contents are garbage-collected only after
+no durable intent can refer to them. Startup orphan cleanup is suppressed when
+repair state exists or is malformed.
 
 The existing repair shadow build and active-root pointer swap should be
 refactored into reusable build and publication primitives before adding a
@@ -1261,6 +1633,14 @@ documented warm-up; retain raw results and report median plus dispersion or a
 confidence interval. Compare on the same isolated hardware, and explain rather
 than silently discard outliers.
 
+The current single-run development signal is 1,000,000 documents in 471.709
+seconds under `ReleaseFast`, using 1,000-document client batches. It includes an
+exact indexed count and replay checkpoint, durable reopen, and post-restart
+search validation. Peak pressure working set was 874,287,160 bytes (peak RSS was
+2,723,430,400 bytes), below the 2 GiB working-set gate. This is a qualification
+datapoint, not a replacement for the repeated one-million-document
+baseline/candidate comparison above.
+
 Acceptance:
 
 - streaming throughput is within 10% of the current bulk session and write p99
@@ -1313,17 +1693,23 @@ Acceptance:
 - one long repair does not block startup inspection of later groups
 - default concurrency is one reconstruction per node and never exceeds the
   configured resource budget
-- every durable intent is rediscovered within the configured scan SLO even if
-  its notification is lost
-- queue age and projected completion remain within the qualified repair
-  capacity SLO, with no starvation
+- direct durable-intent notifications enqueue the exact group without a scan;
+  after restart, managed startup catch-up rediscovers every owned group, and
+  the bounded periodic cursor supplies a final lost-wakeup audit. The supported
+  groups-per-node envelope must qualify that cursor's full-rotation time rather
+  than treating the per-pass discovery interval as an end-to-end SLO
+- queue age remains within the qualified repair-capacity SLO, with no
+  starvation under bounded round-robin selection
 - process restart does not reset retry backoff or duplicate a repair
 - an existing `IncompleteBulkPublish` index repairs after restart without an
   explicit API call
 - primary reads and ordinary writes remain available during repair
 - the affected index consistently returns `index_rebuilding` until validation
 - all repair state, candidates, and replay pins are eventually cleaned up
-- activation never exceeds the configured write-pause budget
+- reversible activation work aborts before the configured absolute deadline;
+  dense publication performs no size-dependent close/reopen under the fence,
+  and the non-interruptible post-pointer durability tail meets the qualified
+  write-pause SLO
 
 ### Phase 6: Shadow generation publication
 

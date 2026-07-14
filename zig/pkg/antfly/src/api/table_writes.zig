@@ -313,6 +313,7 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mo
     dst.in_progress += src.in_progress;
     dst.indexes_rebuilt += src.indexes_rebuilt;
     dst.indexes_degraded += src.indexes_degraded;
+    dst.controls_applied += src.controls_applied;
     dst.debt_remaining = dst.debt_remaining or src.debt_remaining;
 }
 
@@ -359,8 +360,11 @@ fn artifactRepairRunRequestForShard(
         .limit = limit,
         .cursor = cursor,
         .force = req.force,
+        .control = req.control,
+        .repair_id = req.repair_id,
         .repair_job_id = req.repair_job_id,
         .repair_attempt_id = req.repair_attempt_id,
+        .repair_job_created_at_ms = req.repair_job_created_at_ms,
         .repair_cancel_base_uri = req.repair_cancel_base_uri,
     };
 }
@@ -373,8 +377,11 @@ test "artifact repair shard run request preserves repair target" {
         .limit = 10,
         .cursor = "idx_b",
         .force = true,
+        .control = .pause_automatic,
+        .repair_id = 99,
         .repair_job_id = 42,
         .repair_attempt_id = 7,
+        .repair_job_created_at_ms = 1234,
         .repair_cancel_base_uri = "http://node-a",
     }, 2, "idx_c");
 
@@ -384,8 +391,11 @@ test "artifact repair shard run request preserves repair target" {
     try std.testing.expectEqual(@as(u32, 2), shard_req.limit);
     try std.testing.expectEqualStrings("idx_c", shard_req.cursor.?);
     try std.testing.expect(shard_req.force);
+    try std.testing.expectEqual(db_mod.types.IndexRepairControl.pause_automatic, shard_req.control.?);
+    try std.testing.expectEqual(@as(u128, 99), shard_req.repair_id.?);
     try std.testing.expectEqual(@as(u64, 42), shard_req.repair_job_id.?);
     try std.testing.expectEqual(@as(u64, 7), shard_req.repair_attempt_id.?);
+    try std.testing.expectEqual(@as(u64, 1234), shard_req.repair_job_created_at_ms.?);
     try std.testing.expectEqualStrings("http://node-a", shard_req.repair_cancel_base_uri.?);
 }
 
@@ -4315,16 +4325,39 @@ pub const ProvisionedTableWriteSource = struct {
         quarantined: bool = false,
         quarantine_retry_scheduled: bool = false,
         retry_at_ms: u64 = 0,
+        index_repair_pending: bool = false,
+        index_repair_attempted: bool = false,
+        index_repair_repaired: bool = false,
+        index_repair_disk_wait: bool = false,
+        index_repair_retry_at_ms: u64 = 0,
     };
 
     pub const LocalChangeKind = enum {
         data,
+        index_repair,
         structural,
     };
 
     pub const LocalChangeHook = struct {
         ptr: *anyopaque,
         on_change: *const fn (ptr: *anyopaque, table_name: []const u8, kind: LocalChangeKind) void,
+    };
+
+    pub const LocalIndexRepairDebtAction = enum {
+        enqueue,
+        remove,
+        cancel,
+        clear_cancel,
+    };
+
+    pub const LocalIndexRepairDebtHook = struct {
+        ptr: *anyopaque,
+        on_change: *const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+            group_id: u64,
+            action: LocalIndexRepairDebtAction,
+        ) void,
     };
 
     const StructuralReconcileRequest = struct {
@@ -4376,6 +4409,7 @@ pub const ProvisionedTableWriteSource = struct {
     structural_reconcile_tables: std.ArrayListUnmanaged(StructuralReconcileRequest) = .empty,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     local_change_hook: ?LocalChangeHook = null,
+    local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     seed_create_table_writers: bool = true,
@@ -4872,6 +4906,13 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn visibleRootGeneration(self: *const ProvisionedTableWriteSource, group_id: u64) u64 {
         return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
+    }
+
+    /// Activation fence for long-running owner-side repair work. This is
+    /// intentionally narrower than exposing the generation source itself.
+    pub fn visibleRootGenerationForRepair(self: *const ProvisionedTableWriteSource, group_id: u64) u64 {
+        if (self.local_write_owner) |owner| return owner.visibleRootGenerationForRepair(group_id);
+        return self.visibleRootGeneration(group_id);
     }
 
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
@@ -6186,6 +6227,10 @@ pub const ProvisionedTableWriteSource = struct {
         self.local_change_hook = hook;
     }
 
+    pub fn setLocalIndexRepairDebtHook(self: *ProvisionedTableWriteSource, hook: ?LocalIndexRepairDebtHook) void {
+        self.local_index_repair_debt_hook = hook;
+    }
+
     fn invalidateReadCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         if (self.read_cache) |cache| cache.invalidateTable(table_name);
     }
@@ -6326,6 +6371,14 @@ pub const ProvisionedTableWriteSource = struct {
     ) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         switch (change) {
+            .index_repair_pending => {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                return;
+            },
+            .index_repair_cleared => {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+                return;
+            },
             .status => {
                 if (db) |managed_db| {
                     if (self.publishManagedRuntimeStatusBestEffort(table_name, group_id, managed_db)) {
@@ -6796,12 +6849,14 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const backoff_epoch = self.startup_catch_up_backoff_epoch.load(.acquire);
         const now_ms = startupCatchUpMonotonicMs();
-        if (self.startupCatchUpRetryAt(group_id, now_ms)) |retry_at_ms| {
-            return .{
-                .had_debt = true,
-                .quarantined = true,
-                .retry_at_ms = retry_at_ms,
-            };
+        if (!metadata.advance_index_repairs) {
+            if (self.startupCatchUpRetryAt(group_id, now_ms)) |retry_at_ms| {
+                return .{
+                    .had_debt = true,
+                    .quarantined = true,
+                    .retry_at_ms = retry_at_ms,
+                };
+            }
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -6825,6 +6880,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         self.local_db_mutex.unlock();
+        var group_operation_active = true;
         var preserve_startup_cache = false;
         errdefer {
             var failed_result = StartupCatchUpResult{ .had_debt = true };
@@ -6838,7 +6894,7 @@ pub const ProvisionedTableWriteSource = struct {
                     @errorName(err),
                 });
             };
-            self.endGroupOperation(table_name, group_id);
+            if (group_operation_active) self.endGroupOperation(table_name, group_id);
         }
         self.startup_catch_up_active.store(true, .monotonic);
         defer self.startup_catch_up_active.store(false, .monotonic);
@@ -6968,7 +7024,23 @@ pub const ProvisionedTableWriteSource = struct {
             db,
             configured_indexes,
         );
-        var result = try catchUpManagedDb(self, alloc, group_id, table_name, db);
+        if (metadata.advance_index_repairs and cached_db != null) {
+            // The cache lease keeps the DB/root alive across retirement, while
+            // the activation callback fences leadership and root generation.
+            // Releasing this broad lifecycle guard prevents a multi-minute
+            // corpus scan from head-of-line blocking unrelated group work.
+            self.endGroupOperation(table_name, group_id);
+            group_operation_active = false;
+        }
+        var result = try catchUpManagedDb(
+            self,
+            alloc,
+            group_id,
+            table_name,
+            db,
+            metadata.advance_index_repairs,
+            metadata.index_repair_options,
+        );
         try publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db);
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = result.had_debt and !result.cleared_debt and
@@ -8199,6 +8271,37 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn notifyLocalChange(self: *ProvisionedTableWriteSource, table_name: []const u8, kind: LocalChangeKind) void {
         if (self.local_change_hook) |hook| hook.on_change(hook.ptr, table_name, kind);
+    }
+
+    fn notifyLocalIndexRepairDebt(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        action: LocalIndexRepairDebtAction,
+    ) void {
+        if (self.local_index_repair_debt_hook) |hook| hook.on_change(hook.ptr, table_name, group_id, action);
+    }
+
+    fn indexRepairDebtAction(
+        req: db_mod.types.ArtifactRepairRunRequest,
+        result: db_mod.types.ArtifactRepairResult,
+    ) ?LocalIndexRepairDebtAction {
+        if (req.target != .index or result.scanned == 0) return null;
+        if (req.control) |control| {
+            if (result.controls_applied == 0) return null;
+            return switch (control) {
+                // A named pause says nothing about other repair intents in the
+                // same group. Keep the group queued for one aggregate owner
+                // audit; that pass removes it cheaply when only paused debt
+                // remains, or advances another runnable index immediately.
+                .pause_automatic => .enqueue,
+                .resume_automatic, .cancel_current_attempt => .enqueue,
+            };
+        }
+        // Index repair requests are named-index operations. Even when that
+        // index completes, another intent may remain in the group, so only the
+        // aggregate owner-side pass is allowed to remove the group queue key.
+        return .enqueue;
     }
 
     fn changeKindForHARecord(record: db_mod.HAReplicationRecordView) LocalChangeKind {
@@ -11358,6 +11461,17 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocalControlled(alloc, group_id, table_name, req, options);
         if (options.cancelled()) return error.Canceled;
+        var effective_options = options;
+        if (req.target == .index and req.control == null) {
+            // Persist the generation intent while the group lifecycle guard is
+            // held, then let the DataServer's BackendRuntime maintenance owner
+            // perform the admitted long-running work. This request remains a
+            // bounded metadata operation and cannot stall foreground writes.
+            effective_options.defer_durable_index_repair_execution = true;
+        }
+        const notify_cancellation = req.target == .index and req.control == .pause_automatic;
+        if (notify_cancellation) self.notifyLocalIndexRepairDebt(table_name, group_id, .cancel);
+        errdefer if (notify_cancellation) self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -11369,7 +11483,7 @@ pub const ProvisionedTableWriteSource = struct {
         var result = if (self.write_cache) |cache| blk: {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
-            break :blk try cached.db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+            break :blk try cached.db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
         } else blk: {
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
@@ -11393,7 +11507,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+            const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
             if (group_result.scanned > 0) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk group_result;
         };
@@ -11403,8 +11517,12 @@ pub const ProvisionedTableWriteSource = struct {
             self.invalidateReadCache(table_name);
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
-            self.notifyLocalChange(table_name, .data);
+            self.notifyLocalChange(table_name, if (req.target == .index) .index_repair else .data);
+            if (indexRepairDebtAction(req, result)) |action| {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, action);
+            }
         }
+        if (notify_cancellation) self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         return result;
     }
 };
@@ -14543,6 +14661,11 @@ pub const StartupCatchUpMetadata = struct {
     schema_json: ?[]const u8 = null,
     identity_namespace: ?doc_identity.Namespace = null,
     target_index_name: ?[]const u8 = null,
+    /// Internal owner-side executor mode. Normal startup inspection only
+    /// discovers durable repair debt; the bounded repair worker sets this to
+    /// advance at most one admitted intent.
+    advance_index_repairs: bool = false,
+    index_repair_options: db_mod.types.ArtifactRepairRunOptions = .{},
 };
 
 fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
@@ -15877,6 +16000,8 @@ fn catchUpManagedDb(
     group_id: u64,
     table_name: []const u8,
     db: *db_mod.DB,
+    advance_index_repairs: bool,
+    index_repair_options: db_mod.types.ArtifactRepairRunOptions,
 ) !ProvisionedTableWriteSource.StartupCatchUpResult {
     const max_startup_catch_up_replay_passes: usize = 16;
 
@@ -15927,10 +16052,15 @@ fn catchUpManagedDb(
         return err;
     };
     const initial_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
-    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild or initial_index_load_failure;
+    const initial_index_repair_intents = db.hasPendingIndexRepairIntents(alloc) catch |err| switch (err) {
+        error.DurableIndexRepairStateUnavailable => false,
+        else => return err,
+    };
+    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild or initial_index_load_failure or initial_index_repair_intents;
 
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts: usize = 0;
+    var repaired_indexes: usize = 0;
     var made_progress = false;
     defer if (made_progress) {
         // Only retire shared handles after this isolated owner changed durable
@@ -16020,6 +16150,45 @@ fn catchUpManagedDb(
         return .{};
     }
 
+    if (initial_index_load_failure) {
+        const discovery = db.discoverRecoverableStartupIndexFailures(alloc, 1) catch |err| switch (err) {
+            error.DurableIndexRepairStateUnavailable => db_mod.DB.StartupIndexRepairDiscovery{},
+            else => return err,
+        };
+        made_progress = made_progress or discovery.discovered != 0;
+    }
+    var repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
+        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
+        else => return err,
+    };
+    if (repair_summary.runnable != 0) {
+        progress_ctx.phase = .artifact_rebuild;
+        try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
+        if (!advance_index_repairs) {
+            return .{
+                .had_debt = true,
+                .made_progress = made_progress,
+                .index_repair_pending = true,
+            };
+        }
+        const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, index_repair_options);
+        repaired_indexes = repair.repaired;
+        made_progress = made_progress or repair.repaired != 0 or repair.discovered != 0;
+        repair_summary = try db.indexRepairIntentSummary(alloc);
+        if (repair_summary.runnable != 0) {
+            return .{
+                .had_debt = true,
+                .made_progress = made_progress,
+                .busy = repair.busy != 0,
+                .index_repair_pending = true,
+                .index_repair_attempted = repair.attempted != 0,
+                .index_repair_repaired = repair.repaired != 0,
+                .index_repair_disk_wait = repair.disk_waits != 0,
+                .index_repair_retry_at_ms = repair.next_retry_at_ms,
+            };
+        }
+    }
+
     if (repaired_restore_runtime) db.clearDenseHbcCaches();
 
     const after = db.listDerivedReplayDebt(alloc) catch |err| {
@@ -16060,6 +16229,24 @@ fn catchUpManagedDb(
             .made_progress = made_progress,
         };
     }
+    repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
+        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
+        else => return err,
+    };
+    if (repair_summary.paused != 0) {
+        return .{
+            .had_debt = true,
+            .made_progress = made_progress,
+        };
+    }
+    if (repair_summary.terminal != 0) {
+        try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
+        return .{
+            .had_debt = true,
+            .terminal_degraded = true,
+            .made_progress = made_progress,
+        };
+    }
     if (try managedDbHasIndexLoadFailure(alloc, db)) {
         try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
         return .{
@@ -16070,8 +16257,10 @@ fn catchUpManagedDb(
     }
     return .{
         .had_debt = initial_repair_debt,
-        .cleared_debt = had_debt or repaired_restore_runtime or repaired_dense_artifacts > 0,
+        .cleared_debt = had_debt or repaired_restore_runtime or repaired_dense_artifacts > 0 or repaired_indexes > 0,
         .made_progress = made_progress or initial_repair_debt,
+        .index_repair_attempted = advance_index_repairs and repaired_indexes != 0,
+        .index_repair_repaired = repaired_indexes != 0,
     };
 }
 
@@ -25190,6 +25379,35 @@ test "provisioned table write source restore repair completion retires cached ve
     try std.testing.expectEqual(stats_before.miss_count + 1, stats_after.miss_count);
 }
 
+test "provisioned named index repair keeps group queued for aggregate debt audit" {
+    const base = db_mod.types.ArtifactRepairRunRequest{
+        .target = .index,
+        .index_name = "dense_idx",
+        .control = .resume_automatic,
+    };
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(base, .{ .scanned = 1, .controls_applied = 1 }).?,
+    );
+    var pause = base;
+    pause.control = .pause_automatic;
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(pause, .{ .scanned = 1, .controls_applied = 1 }).?,
+    );
+    try std.testing.expect(ProvisionedTableWriteSource.indexRepairDebtAction(base, .{ .scanned = 1 }) == null);
+    var automatic = base;
+    automatic.control = null;
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(automatic, .{ .scanned = 1, .debt_remaining = true }).?,
+    );
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(automatic, .{ .scanned = 1 }).?,
+    );
+}
+
 test "provisioned table write source path invalidation clears shared vector read cache" {
     const alloc = std.testing.allocator;
 
@@ -28727,7 +28945,7 @@ test "managed startup catch-up repeats replay while dense debt progresses" {
     });
     defer startup_db.close();
 
-    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &startup_db);
+    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &startup_db, false, .{});
     try std.testing.expect(!result.busy);
     try std.testing.expect(result.had_debt);
     try std.testing.expect(result.cleared_debt);

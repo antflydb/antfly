@@ -83,6 +83,8 @@ pub const JobState = struct {
     result: db_mod.types.ArtifactRepairResult = .{},
     last_error: ?[]const u8 = null,
     cancel_requested: bool = false,
+    /// Realtime deadline because this state survives process restart.
+    next_retry_at_millis: u64 = 0,
     created_at_millis: u64,
     last_updated_at_millis: u64,
     expires_at_millis: u64,
@@ -94,6 +96,11 @@ pub const BeginAdvanceResult = struct {
 };
 
 pub const Store = struct {
+    const PendingCancelEntry = struct {
+        previous_job_id: ?u64 = null,
+        next_job_id: ?u64 = null,
+    };
+
     alloc: std.mem.Allocator,
     cfg: StoreConfig,
     opened_store: ?*OpenedStore = null,
@@ -102,6 +109,9 @@ pub const Store = struct {
     next_job_id: u64 = 1,
     last_durable_cleanup_ms: u64 = 0,
     durable_cleanup_cursor: ?[]u8 = null,
+    pending_cancel_jobs: std.AutoHashMapUnmanaged(u64, PendingCancelEntry) = .empty,
+    pending_cancel_head: ?u64 = null,
+    pending_cancel_tail: ?u64 = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: StoreConfig) Store {
         return .{
@@ -114,12 +124,80 @@ pub const Store = struct {
         var it = self.jobs.iterator();
         while (it.next()) |entry| self.alloc.free(entry.value_ptr.*);
         self.jobs.deinit(self.alloc);
+        self.pending_cancel_jobs.deinit(self.alloc);
         if (self.durable_cleanup_cursor) |cursor| self.alloc.free(cursor);
         if (self.opened_store) |store| {
             store.deinit();
             self.alloc.destroy(store);
         }
         self.* = undefined;
+    }
+
+    fn enqueuePendingCancelLocked(self: *Store, job_id: u64) !bool {
+        if (self.pending_cancel_jobs.contains(job_id)) return false;
+        try self.pending_cancel_jobs.put(self.alloc, job_id, .{ .previous_job_id = self.pending_cancel_tail });
+        if (self.pending_cancel_tail) |tail| {
+            self.pending_cancel_jobs.getPtr(tail).?.next_job_id = job_id;
+        } else {
+            self.pending_cancel_head = job_id;
+        }
+        self.pending_cancel_tail = job_id;
+        return true;
+    }
+
+    fn removePendingCancelLocked(self: *Store, job_id: u64) void {
+        const removed = self.pending_cancel_jobs.get(job_id) orelse return;
+        if (removed.previous_job_id) |previous| {
+            self.pending_cancel_jobs.getPtr(previous).?.next_job_id = removed.next_job_id;
+        } else {
+            self.pending_cancel_head = removed.next_job_id;
+        }
+        if (removed.next_job_id) |next| {
+            self.pending_cancel_jobs.getPtr(next).?.previous_job_id = removed.previous_job_id;
+        } else {
+            self.pending_cancel_tail = removed.previous_job_id;
+        }
+        _ = self.pending_cancel_jobs.remove(job_id);
+    }
+
+    /// Returns the oldest queued durable cancellation without consuming it.
+    /// `beginAdvance` removes the entry atomically with the queued-to-running
+    /// transition, so supervisor and explicit advances may race safely.
+    pub fn nextPendingDurableCancelAlloc(self: *Store, alloc: std.mem.Allocator) !?[]u8 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const now_ms = nowMillis();
+        var job_id_opt = self.pending_cancel_head;
+        var inspected: usize = 0;
+        const inspect_limit = @min(self.pending_cancel_jobs.count(), pending_cancel_scan_limit);
+        while (job_id_opt) |job_id| : (inspected += 1) {
+            if (inspected >= inspect_limit) break;
+            const next_job_id = if (self.pending_cancel_jobs.get(job_id)) |entry| entry.next_job_id else null;
+            const encoded = (try self.loadJobLocked(job_id)) orelse {
+                self.removePendingCancelLocked(job_id);
+                job_id_opt = next_job_id orelse self.pending_cancel_head;
+                continue;
+            };
+            var parsed = std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+                self.removePendingCancelLocked(job_id);
+                job_id_opt = next_job_id orelse self.pending_cancel_head;
+                continue;
+            };
+            defer parsed.deinit();
+            if (!requiresDurableCancel(parsed.value) or
+                !std.mem.eql(u8, parsed.value.phase, phaseString(.queued)))
+            {
+                self.removePendingCancelLocked(job_id);
+                job_id_opt = next_job_id orelse self.pending_cancel_head;
+                continue;
+            }
+            if (parsed.value.next_retry_at_millis > now_ms) {
+                job_id_opt = next_job_id;
+                continue;
+            }
+            return try alloc.dupe(u8, encoded);
+        }
+        return null;
     }
 
     pub fn retentionMillis(self: *const Store) u64 {
@@ -201,6 +279,32 @@ pub const Store = struct {
         if (!jobStateTransitionTokenMatches(current, previous)) {
             return try alloc.dupe(u8, current_encoded);
         }
+        if (phase == .cancelled and requiresDurableCancel(current)) {
+            const encoded = try encodeState(alloc, .{
+                .job_id = current.job_id,
+                .attempt_id = current.attempt_id,
+                .table_name = current.table_name,
+                .phase = phaseString(.queued),
+                .repair_status = repairStatusForPhase(.queued, true, true),
+                .target = current.target,
+                .kind = current.kind,
+                .index = current.index,
+                .cursor = null,
+                .limit = current.limit,
+                .force = false,
+                .result = current.result,
+                .last_error = "cancel_pending",
+                .cancel_requested = true,
+                .created_at_millis = current.created_at_millis,
+                .last_updated_at_millis = now_ms,
+                .expires_at_millis = now_ms + self.retentionMillis(),
+            });
+            errdefer alloc.free(encoded);
+            const enqueued = try self.enqueuePendingCancelLocked(current.job_id);
+            errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
+            try self.storeEncodedLocked(current.job_id, encoded, null);
+            return encoded;
+        }
         const cancel_requested = phase == .cancelled or previous.cancel_requested or current.cancel_requested;
 
         const encoded = try encodeState(alloc, .{
@@ -227,6 +331,55 @@ pub const Store = struct {
         return encoded;
     }
 
+    /// Returns an operationally interrupted attempt to the durable queue.
+    /// Invalid requests use `markPhase(.failed)`; ownership, routing, storage,
+    /// and BackendRuntime availability failures use this bounded backoff path.
+    pub fn recordRetryableFailure(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        previous: JobState,
+        last_error: []const u8,
+    ) ![]u8 {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        const current = parsed_current.value;
+        if (!jobStateTransitionTokenMatches(current, previous) or isTerminalPhase(current.phase)) {
+            return try alloc.dupe(u8, current_encoded);
+        }
+
+        const durable_cancel = current.cancel_requested and
+            std.mem.eql(u8, current.target, "index") and current.index != null;
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .phase = phaseString(.queued),
+            .repair_status = repairStatusForPhase(.queued, true, true),
+            .target = current.target,
+            .kind = current.kind,
+            .index = current.index,
+            .cursor = current.cursor,
+            .limit = current.limit,
+            .force = if (durable_cancel) false else current.force,
+            .result = current.result,
+            .last_error = last_error,
+            .cancel_requested = current.cancel_requested,
+            .next_retry_at_millis = now_ms +| retryDelayMs(current.job_id, current.attempt_id),
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        const enqueued = if (durable_cancel) try self.enqueuePendingCancelLocked(current.job_id) else false;
+        errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
+        try self.storeEncodedLocked(current.job_id, encoded, null);
+        return encoded;
+    }
+
     pub fn recordPass(
         self: *Store,
         alloc: std.mem.Allocator,
@@ -245,6 +398,7 @@ pub const Store = struct {
         total.in_progress +|= pass.in_progress;
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
         total.indexes_degraded +|= pass.indexes_degraded;
+        total.controls_applied +|= pass.controls_applied;
         total.limit = pass.limit;
         total.has_more = pass.has_more;
         total.debt_remaining = pass.debt_remaining;
@@ -271,6 +425,32 @@ pub const Store = struct {
         if (!jobStateTransitionTokenMatches(parsed_current.value, previous)) {
             return try alloc.dupe(u8, current_encoded);
         }
+        if (requiresDurableCancel(current)) {
+            const encoded = try encodeState(alloc, .{
+                .job_id = current.job_id,
+                .attempt_id = current.attempt_id,
+                .table_name = current.table_name,
+                .phase = phaseString(.queued),
+                .repair_status = repairStatusForPhase(.queued, true, true),
+                .target = current.target,
+                .kind = current.kind,
+                .index = current.index,
+                .cursor = null,
+                .limit = current.limit,
+                .force = false,
+                .result = total,
+                .last_error = "cancel_pending",
+                .cancel_requested = true,
+                .created_at_millis = current.created_at_millis,
+                .last_updated_at_millis = now_ms,
+                .expires_at_millis = now_ms + self.retentionMillis(),
+            });
+            errdefer alloc.free(encoded);
+            const enqueued = try self.enqueuePendingCancelLocked(current.job_id);
+            errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
+            try self.storeEncodedLocked(current.job_id, encoded, null);
+            return encoded;
+        }
         const cancel_requested = previous.cancel_requested or current.cancel_requested;
         const final_phase: JobPhase = if (cancel_requested) .cancelled else phase;
         const final_last_error: ?[]const u8 = if (final_phase == .cancelled) "cancel_requested" else last_error;
@@ -286,7 +466,11 @@ pub const Store = struct {
             .index = previous.index,
             .cursor = pass.next_cursor,
             .limit = previous.limit,
-            .force = previous.force,
+            // Force is an edge-triggered dispatch policy. Keep it only while a
+            // bounded table cursor has more groups that have not yet received
+            // the generation request. Observation passes must never create a
+            // second generation after the first one completes.
+            .force = previous.force and pass.has_more,
             .result = total,
             .last_error = final_last_error,
             .cancel_requested = cancel_requested,
@@ -313,10 +497,13 @@ pub const Store = struct {
         }
         const is_running = std.mem.eql(u8, current.phase, phaseString(.running));
         const running_expired = is_running and leaseExpired(now_ms, current.last_updated_at_millis, running_lease_timeout_ms);
-        if (current.cancel_requested and (!is_running or running_expired)) {
+        if (current.cancel_requested and !requiresDurableCancel(current) and (!is_running or running_expired)) {
             return .{ .encoded = try self.encodeCancelledCurrentLocked(alloc, current, now_ms), .started = false };
         }
         if (is_running and !running_expired) {
+            return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
+        }
+        if (!is_running and current.next_retry_at_millis > now_ms) {
             return .{ .encoded = try alloc.dupe(u8, current_encoded), .started = false };
         }
         if (!is_running and !jobStateTransitionTokenMatches(current, expected)) {
@@ -337,13 +524,15 @@ pub const Store = struct {
             .force = current.force,
             .result = current.result,
             .last_error = current.last_error,
-            .cancel_requested = false,
+            .cancel_requested = current.cancel_requested,
+            .next_retry_at_millis = 0,
             .created_at_millis = current.created_at_millis,
             .last_updated_at_millis = now_ms,
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
         try self.storeEncodedLocked(current.job_id, encoded, null);
+        self.removePendingCancelLocked(current.job_id);
         return .{ .encoded = encoded, .started = true };
     }
 
@@ -400,7 +589,13 @@ pub const Store = struct {
         if (!std.mem.eql(u8, current.table_name, expected.table_name)) return error.NotFound;
         if (current.cancel_requested) return try alloc.dupe(u8, current_encoded);
 
-        const phase: JobPhase = if (std.mem.eql(u8, current.phase, phaseString(.running))) .running else .cancelled;
+        const durable_cancel = std.mem.eql(u8, current.target, "index") and current.index != null;
+        const phase: JobPhase = if (std.mem.eql(u8, current.phase, phaseString(.running)))
+            .running
+        else if (durable_cancel)
+            .queued
+        else
+            .cancelled;
         const encoded = try encodeState(alloc, .{
             .job_id = current.job_id,
             .attempt_id = current.attempt_id,
@@ -410,9 +605,11 @@ pub const Store = struct {
             .target = current.target,
             .kind = current.kind,
             .index = current.index,
-            .cursor = current.cursor,
+            // Cancellation must revisit the whole table. Groups before the
+            // current repair cursor may already own an active generation.
+            .cursor = if (durable_cancel) null else current.cursor,
             .limit = current.limit,
-            .force = current.force,
+            .force = if (durable_cancel) false else current.force,
             .result = current.result,
             .last_error = "cancel_requested",
             .cancel_requested = true,
@@ -421,7 +618,70 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
+        const enqueued = if (durable_cancel and phase == .queued)
+            try self.enqueuePendingCancelLocked(current.job_id)
+        else
+            false;
+        errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
         try self.storeEncodedLocked(current.job_id, encoded, null);
+        return encoded;
+    }
+
+    /// Records one bounded traversal that durably pauses every affected index
+    /// intent and cancels any active attempt. Cancellation becomes terminal
+    /// only after the table cursor has covered all groups.
+    pub fn recordDurableCancelPass(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        previous: JobState,
+        pass: db_mod.types.ArtifactRepairResult,
+    ) ![]u8 {
+        const now_ms = nowMillis();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const current_encoded = (try self.loadJobLocked(previous.job_id)) orelse return error.NotFound;
+        var parsed_current = try std.json.parseFromSlice(JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        const current = parsed_current.value;
+        if (!jobStateTransitionTokenMatches(current, previous)) return try alloc.dupe(u8, current_encoded);
+
+        var total = current.result;
+        total.scanned +|= pass.scanned;
+        total.groups_scanned +|= pass.groups_scanned;
+        total.controls_applied +|= pass.controls_applied;
+        total.limit = pass.limit;
+        total.has_more = pass.has_more;
+        total.debt_remaining = pass.has_more;
+        total.next_cursor = pass.next_cursor;
+        const phase: JobPhase = if (pass.has_more) .queued else .cancelled;
+        const encoded = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .phase = phaseString(phase),
+            .repair_status = repairStatusForPhase(phase, pass.has_more, pass.has_more),
+            .target = current.target,
+            .kind = current.kind,
+            .index = current.index,
+            .cursor = pass.next_cursor,
+            .limit = current.limit,
+            .force = false,
+            .result = total,
+            .last_error = if (pass.has_more) "cancel_pending" else "cancel_requested",
+            .cancel_requested = true,
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + self.retentionMillis(),
+        });
+        errdefer alloc.free(encoded);
+        if (pass.has_more) {
+            const enqueued = try self.enqueuePendingCancelLocked(current.job_id);
+            errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
+            try self.storeEncodedLocked(current.job_id, encoded, null);
+        } else {
+            try self.storeEncodedLocked(current.job_id, encoded, null);
+            self.removePendingCancelLocked(current.job_id);
+        }
         return encoded;
     }
 
@@ -472,6 +732,7 @@ pub const Store = struct {
             if (self.opened_store) |opened| opened.docstore.putBatch(&.{}, durable_delete_keys.items) catch {};
         }
         for (expired.items) |job_id| {
+            self.removePendingCancelLocked(job_id);
             if (self.jobs.fetchRemove(job_id)) |removed| self.alloc.free(removed.value);
         }
     }
@@ -524,6 +785,10 @@ pub const Store = struct {
     fn storeEncodedLocked(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64) !void {
         const owned = try self.alloc.dupe(u8, encoded);
         errdefer self.alloc.free(owned);
+        // Reserve the process-local cache slot before committing the durable
+        // state. Once the store write succeeds, publishing the matching cache
+        // value cannot fail and leave scheduler metadata out of sync.
+        if (!self.jobs.contains(job_id)) try self.jobs.ensureUnusedCapacity(self.alloc, 1);
         if (self.opened_store) |opened| {
             const key = try jobKey(self.alloc, job_id);
             defer self.alloc.free(key);
@@ -540,7 +805,7 @@ pub const Store = struct {
                 try opened.docstore.put(key, encoded);
             }
         }
-        if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |old| self.alloc.free(old.value);
+        if (self.jobs.fetchPutAssumeCapacity(job_id, owned)) |old| self.alloc.free(old.value);
     }
 
     fn loadJobLocked(self: *Store, job_id: u64) !?[]const u8 {
@@ -565,8 +830,15 @@ pub const Store = struct {
             var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
             const now_ms = nowMillis();
-            const cached = if (std.mem.eql(u8, parsed.value.phase, phaseString(.running))) blk: {
-                const recovered_phase: JobPhase = if (parsed.value.cancel_requested) .cancelled else .queued;
+            const was_running = std.mem.eql(u8, parsed.value.phase, phaseString(.running));
+            const durable_cancel = requiresDurableCancel(parsed.value);
+            const cached = if (was_running or durable_cancel) blk: {
+                const recovered_phase: JobPhase = if (durable_cancel)
+                    .queued
+                else if (parsed.value.cancel_requested)
+                    .cancelled
+                else
+                    .queued;
                 break :blk try encodeState(self.alloc, .{
                     .job_id = parsed.value.job_id,
                     .attempt_id = parsed.value.attempt_id,
@@ -576,22 +848,38 @@ pub const Store = struct {
                     .target = parsed.value.target,
                     .kind = parsed.value.kind,
                     .index = parsed.value.index,
-                    .cursor = parsed.value.cursor,
+                    // A cancellation traversal always restarts from the first
+                    // group: repair pages already visited before interruption
+                    // may contain the active attempt being stopped.
+                    .cursor = if (durable_cancel) null else parsed.value.cursor,
                     .limit = parsed.value.limit,
-                    .force = parsed.value.force,
+                    .force = if (durable_cancel) false else parsed.value.force,
                     .result = parsed.value.result,
-                    .last_error = if (parsed.value.cancel_requested) "cancel_requested" else "recovered_interrupted_attempt",
+                    .last_error = if (durable_cancel and !was_running)
+                        parsed.value.last_error
+                    else if (parsed.value.cancel_requested)
+                        "cancel_requested"
+                    else
+                        "recovered_interrupted_attempt",
                     .cancel_requested = parsed.value.cancel_requested,
+                    .next_retry_at_millis = if (durable_cancel and !was_running)
+                        parsed.value.next_retry_at_millis
+                    else
+                        0,
                     .created_at_millis = parsed.value.created_at_millis,
                     .last_updated_at_millis = now_ms,
                     .expires_at_millis = now_ms + self.retentionMillis(),
                 });
             } else try self.alloc.dupe(u8, kv.value);
             errdefer self.alloc.free(cached);
-            if (std.mem.eql(u8, parsed.value.phase, phaseString(.running))) {
+            if (was_running or durable_cancel) {
                 const key = try jobKey(self.alloc, parsed.value.job_id);
                 defer self.alloc.free(key);
                 try opened.docstore.put(key, cached);
+            }
+            if (durable_cancel) {
+                const enqueued = try self.enqueuePendingCancelLocked(parsed.value.job_id);
+                errdefer if (enqueued) self.removePendingCancelLocked(parsed.value.job_id);
             }
             if (try self.jobs.fetchPut(self.alloc, parsed.value.job_id, cached)) |old| self.alloc.free(old.value);
             recovered_max_job_id = @max(recovered_max_job_id, parsed.value.job_id);
@@ -631,6 +919,18 @@ pub const Store = struct {
 };
 
 const running_lease_timeout_ms: u64 = 300_000;
+const retry_base_ms: u64 = 250;
+const retry_max_ms: u64 = 30 * std.time.ms_per_s;
+const pending_cancel_scan_limit: usize = 64;
+
+fn retryDelayMs(job_id: u64, attempt_id: u64) u64 {
+    const shift: u6 = @intCast(@min(attempt_id, 16));
+    const exponential = @min(retry_max_ms, retry_base_ms *| (@as(u64, 1) << shift));
+    var hasher = std.hash.Wyhash.init(job_id);
+    hasher.update(std.mem.asBytes(&attempt_id));
+    const jitter_span = @max(@as(u64, 1), exponential / 4);
+    return @min(retry_max_ms, exponential +| (hasher.final() % jitter_span));
+}
 
 fn jobStateTransitionTokenMatches(current: JobState, expected: JobState) bool {
     return current.job_id == expected.job_id and
@@ -656,6 +956,13 @@ pub fn isTerminalPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, phaseString(.succeeded)) or
         std.mem.eql(u8, phase, phaseString(.failed)) or
         std.mem.eql(u8, phase, phaseString(.cancelled));
+}
+
+pub fn requiresDurableCancel(state: JobState) bool {
+    return state.cancel_requested and
+        std.mem.eql(u8, state.target, "index") and
+        state.index != null and
+        !isTerminalPhase(state.phase);
 }
 
 pub fn repairStatusForPhase(phase: JobPhase, has_more: bool, debt_remaining: bool) []const u8 {
@@ -756,6 +1063,184 @@ test "table repair job records bounded pass and continuation" {
     try std.testing.expectEqualStrings("queued", parsed_update.value.phase);
     try std.testing.expectEqualStrings("cursor-1", parsed_update.value.cursor.?);
     try std.testing.expectEqual(@as(u64, 2), parsed_update.value.result.repaired);
+}
+
+test "forced index repair job dispatches force only once" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    const started = try store.startJob(alloc, "docs", .{
+        .target = "index",
+        .index = "semantic",
+        .cursor = "group:65",
+        .force = true,
+    });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+    const begin = try store.beginAdvance(alloc, parsed_started.value);
+    defer alloc.free(begin.encoded);
+    var parsed_running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_running.deinit();
+
+    const updated = try store.recordPass(alloc, parsed_running.value, .{
+        .scanned = 1,
+        .in_progress = 1,
+        .unresolved = 1,
+        .debt_remaining = true,
+    });
+    defer alloc.free(updated);
+    var parsed_updated = try std.json.parseFromSlice(JobState, alloc, updated, .{ .ignore_unknown_fields = true });
+    defer parsed_updated.deinit();
+    try std.testing.expectEqualStrings("queued", parsed_updated.value.phase);
+    try std.testing.expect(!parsed_updated.value.force);
+}
+
+test "durable cancellation retries transient failures with backoff" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    const started = try store.startJob(alloc, "docs", .{ .target = "index", .index = "semantic" });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+    const cancelling = try store.requestCancel(alloc, parsed_started.value);
+    defer alloc.free(cancelling);
+    var parsed_cancelling = try std.json.parseFromSlice(JobState, alloc, cancelling, .{ .ignore_unknown_fields = true });
+    defer parsed_cancelling.deinit();
+    const begin = try store.beginAdvance(alloc, parsed_cancelling.value);
+    defer alloc.free(begin.encoded);
+    var running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer running.deinit();
+
+    const queued = try store.recordRetryableFailure(alloc, running.value, "RepairOwnershipLost");
+    defer alloc.free(queued);
+    var parsed_queued = try std.json.parseFromSlice(JobState, alloc, queued, .{ .ignore_unknown_fields = true });
+    defer parsed_queued.deinit();
+    try std.testing.expectEqualStrings("queued", parsed_queued.value.phase);
+    try std.testing.expect(parsed_queued.value.next_retry_at_millis > parsed_queued.value.last_updated_at_millis);
+    try std.testing.expect((try store.nextPendingDurableCancelAlloc(alloc)) == null);
+    const early = try store.beginAdvance(alloc, parsed_queued.value);
+    defer alloc.free(early.encoded);
+    try std.testing.expect(!early.started);
+}
+
+test "named index repair cancellation remains nonterminal until durable controls finish" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    const started = try store.startJob(alloc, "docs", .{
+        .target = "index",
+        .index = "semantic",
+    });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+    const cancelling = try store.requestCancel(alloc, parsed_started.value);
+    defer alloc.free(cancelling);
+    var parsed_cancelling = try std.json.parseFromSlice(JobState, alloc, cancelling, .{ .ignore_unknown_fields = true });
+    defer parsed_cancelling.deinit();
+    try std.testing.expectEqualStrings("queued", parsed_cancelling.value.phase);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_cancelling.value.cursor);
+    try std.testing.expect(requiresDurableCancel(parsed_cancelling.value));
+    const first_pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+    defer alloc.free(first_pending);
+
+    const first_begin = try store.beginAdvance(alloc, parsed_cancelling.value);
+    defer alloc.free(first_begin.encoded);
+    var parsed_first = try std.json.parseFromSlice(JobState, alloc, first_begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_first.deinit();
+    try std.testing.expect((try store.nextPendingDurableCancelAlloc(alloc)) == null);
+    var first_pass = db_mod.types.ArtifactRepairResult{
+        .scanned = 64,
+        .groups_scanned = 64,
+        .controls_applied = 64,
+        .has_more = true,
+        .next_cursor = try alloc.dupe(u8, "group:65"),
+    };
+    defer first_pass.deinit(alloc);
+    const continuing = try store.recordDurableCancelPass(alloc, parsed_first.value, first_pass);
+    defer alloc.free(continuing);
+    var parsed_continuing = try std.json.parseFromSlice(JobState, alloc, continuing, .{ .ignore_unknown_fields = true });
+    defer parsed_continuing.deinit();
+    try std.testing.expectEqualStrings("queued", parsed_continuing.value.phase);
+    try std.testing.expectEqualStrings("group:65", parsed_continuing.value.cursor.?);
+    const continuing_pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+    defer alloc.free(continuing_pending);
+
+    const second_begin = try store.beginAdvance(alloc, parsed_continuing.value);
+    defer alloc.free(second_begin.encoded);
+    var parsed_second = try std.json.parseFromSlice(JobState, alloc, second_begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_second.deinit();
+    const cancelled = try store.recordDurableCancelPass(alloc, parsed_second.value, .{
+        .scanned = 1,
+        .groups_scanned = 1,
+        .controls_applied = 1,
+    });
+    defer alloc.free(cancelled);
+    var parsed_cancelled = try std.json.parseFromSlice(JobState, alloc, cancelled, .{ .ignore_unknown_fields = true });
+    defer parsed_cancelled.deinit();
+    try std.testing.expectEqualStrings("cancelled", parsed_cancelled.value.phase);
+    try std.testing.expect(!requiresDurableCancel(parsed_cancelled.value));
+}
+
+test "named index repair cancellation restarts its durable traversal after job store recovery" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-cancel-recovery", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var job_id: u64 = 0;
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const started = try store.startJob(alloc, "docs", .{
+            .target = "index",
+            .index = "semantic",
+            .cursor = "group:65",
+            .force = true,
+        });
+        defer alloc.free(started);
+        var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+        defer parsed_started.deinit();
+        const begin = try store.beginAdvance(alloc, parsed_started.value);
+        defer alloc.free(begin.encoded);
+        var parsed_running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_running.deinit();
+        job_id = parsed_running.value.job_id;
+        const cancelling = try store.requestCancel(alloc, parsed_running.value);
+        defer alloc.free(cancelling);
+    }
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const recovered = (try store.loadJobAlloc(alloc, job_id)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(recovered);
+        var parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("queued", parsed.value.phase);
+        try std.testing.expect(parsed.value.cancel_requested);
+        try std.testing.expect(parsed.value.cursor == null);
+        try std.testing.expect(!parsed.value.force);
+        try std.testing.expect(requiresDurableCancel(parsed.value));
+        const pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+        defer alloc.free(pending);
+    }
 }
 
 test "table repair job store persists monotonic next id across stale durable writes" {

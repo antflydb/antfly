@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const cache_budget = @import("../common/cache_budget.zig");
 
 const MiB: u64 = 1024 * 1024;
 const dense_replay_window_min_bytes: u64 = 16 * MiB;
@@ -24,6 +25,8 @@ const dense_replay_window_shrink_denominator: u64 = 4;
 const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
+const default_disk_safety_floor_bytes: u64 = 1024 * MiB;
+const default_disk_safety_floor_divisor: u64 = 20;
 
 pub const Slice = enum(u8) {
     lsm_block_table_cache,
@@ -49,6 +52,7 @@ pub const Slice = enum(u8) {
     lite_native_link_cache,
     lite_docstore_snapshot_cache,
     inference_prompt_cache,
+    dense_repair_working_set,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -75,6 +79,7 @@ pub const Slice = enum(u8) {
             .lite_native_link_cache => "lite.native_link_cache",
             .lite_docstore_snapshot_cache => "lite.docstore_snapshot_cache",
             .inference_prompt_cache => "inference.prompt_cache",
+            .dense_repair_working_set => "dense_repair.working_set",
         };
     }
 };
@@ -85,6 +90,20 @@ pub const Budget = struct {
     soft_limit_bytes: u64 = 0,
     hard_limit_bytes: u64 = 0,
 };
+
+/// Internal HBC cache safety ceilings. These are not index configuration:
+/// byte admission remains authoritative and shared across every index using
+/// this manager. The ceilings only bound the local CLOCK bookkeeping arrays.
+pub const HbcCacheLimits = struct {
+    max_cached_nodes: usize,
+    max_cached_vectors: usize,
+    max_cached_metadata: usize,
+};
+
+const hbc_max_clock_entries: u64 = 100_000;
+const hbc_estimated_node_entry_bytes: u64 = 1024;
+const hbc_estimated_metadata_entry_bytes: u64 = 256;
+const hbc_estimated_vector_overhead_bytes: u64 = 64;
 
 pub const Pressure = enum(u8) {
     normal,
@@ -118,6 +137,21 @@ pub const Policy = struct {
 pub const Options = struct {
     budgets: [slice_count]Budget = defaultBudgets(),
     policies: [slice_count]Policy = defaultPolicies(),
+    /// Bound durable replay debt by record count as well as encoded bytes.
+    /// These are runtime policy values, not index or API configuration.
+    derived_backlog_high_sequences: usize = 200,
+    derived_backlog_resume_sequences: usize = 100,
+    /// Node-owned filesystem growth policy. This is deliberately not table or
+    /// index configuration. The larger of the fixed floor and this fraction
+    /// of observed capacity is kept available for WAL, checkpoints, and
+    /// foreground durability.
+    disk_safety_floor_bytes: u64 = default_disk_safety_floor_bytes,
+    disk_safety_floor_divisor: u64 = default_disk_safety_floor_divisor,
+    /// Internal query-embedding cache policy. Serving layers consume this
+    /// policy but cannot override it independently of the node manager.
+    query_embedding_cache_bytes: usize = 64 * 1024 * 1024,
+    query_embedding_cache_ttl_ns: u64 = 5 * std.time.ns_per_min,
+    query_embedding_max_inflight: usize = 16,
 
     pub fn defaultBudgets() [slice_count]Budget {
         return .{
@@ -144,6 +178,7 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
             .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
         };
     }
 
@@ -172,6 +207,7 @@ pub const Options = struct {
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
         };
     }
 };
@@ -193,6 +229,78 @@ pub const Stats = struct {
     slices: [slice_count]SliceStats,
 };
 
+/// Stable identity for one independently exhausted storage capacity domain.
+/// The storage layer should derive this from the volume/quota namespace, not
+/// from a table, shard, or repair identifier.
+pub const CapacityDomainId = u128;
+
+pub const CapacityObservation = struct {
+    /// Null means the backend cannot observe capacity. Reservations are still
+    /// coordinated and measured, but cannot be rejected on free-space grounds.
+    available_bytes: ?u64 = null,
+    capacity_bytes: ?u64 = null,
+    /// Monotonic timestamp in the caller's process clock domain. Capacity
+    /// freshness is process-local; durable wall-clock deadlines are translated
+    /// before reaching ResourceManager.
+    observed_at_ns: u64 = 0,
+    /// Zero disables age checking (used by deterministic tests and backends
+    /// whose observation is synchronously obtained during admission).
+    valid_for_ns: u64 = 0,
+
+    fn stale(self: @This(), now_ns: u64) bool {
+        if (self.available_bytes == null or self.valid_for_ns == 0) return false;
+        if (now_ns < self.observed_at_ns) return true;
+        return now_ns - self.observed_at_ns > self.valid_for_ns;
+    }
+};
+
+pub const CapacitySource = struct {
+    ptr: *anyopaque,
+    domain_id: CapacityDomainId,
+    observe: *const fn (ptr: *anyopaque) anyerror!CapacityObservation,
+
+    pub fn current(self: @This()) !CapacityObservation {
+        return try self.observe(self.ptr);
+    }
+};
+
+pub const CapacityDomainStats = struct {
+    domain_id: CapacityDomainId,
+    reserved_bytes: u64 = 0,
+    peak_reserved_bytes: u64 = 0,
+    reservations: u64 = 0,
+    denials: u64 = 0,
+    growth_denials: u64 = 0,
+    stale_observations: u64 = 0,
+    last_available_bytes: ?u64 = null,
+    last_capacity_bytes: ?u64 = null,
+    last_safety_floor_bytes: u64 = 0,
+    last_observed_at_ns: u64 = 0,
+};
+
+pub const CapacityStats = struct {
+    reserved_bytes: u64 = 0,
+    peak_reserved_bytes: u64 = 0,
+    reservations: u64 = 0,
+    denials: u64 = 0,
+    growth_denials: u64 = 0,
+    stale_observations: u64 = 0,
+    domain_count: usize = 0,
+};
+
+const MutableCapacityDomain = struct {
+    reserved_bytes: u64 = 0,
+    peak_reserved_bytes: u64 = 0,
+    reservations: u64 = 0,
+    denials: u64 = 0,
+    growth_denials: u64 = 0,
+    stale_observations: u64 = 0,
+    last_available_bytes: ?u64 = null,
+    last_capacity_bytes: ?u64 = null,
+    last_safety_floor_bytes: u64 = 0,
+    last_observed_at_ns: u64 = 0,
+};
+
 pub const DenseReplayWindowBudgetOptions = struct {
     default_bytes: u64,
     max_bytes: u64,
@@ -203,6 +311,25 @@ pub const DenseReplayWindowResult = struct {
     finish_ns: u64 = 0,
     write_pressure_ns: u64 = 0,
     write_pressure_compactions: u64 = 0,
+};
+
+pub const DerivedBacklogLimits = struct {
+    high_sequences: usize,
+    resume_sequences: usize,
+};
+
+pub const QueryEmbeddingPolicy = struct {
+    enabled: bool,
+    ttl_ns: u64,
+    max_inflight: usize,
+};
+
+pub const IndexRepairActivationStats = struct {
+    attempts: u64 = 0,
+    overruns: u64 = 0,
+    last_pause_ns: u64 = 0,
+    max_pause_ns: u64 = 0,
+    last_budget_ns: u64 = 0,
 };
 
 const MutableSlice = struct {
@@ -221,6 +348,16 @@ pub const ResourceManager = struct {
     dense_replay_last_finish_ns: u64 = 0,
     dense_replay_last_write_pressure_ns: u64 = 0,
     dense_replay_last_write_pressure_compactions: u64 = 0,
+    derived_backlog_high_sequences: usize,
+    derived_backlog_resume_sequences: usize,
+    disk_safety_floor_bytes: u64,
+    disk_safety_floor_divisor: u64,
+    capacity_domains: std.AutoHashMapUnmanaged(CapacityDomainId, MutableCapacityDomain) = .empty,
+    query_embedding_cache_budget: cache_budget.CacheBudget,
+    query_embedding_cache_ttl_ns: u64,
+    query_embedding_max_inflight: usize,
+    index_repair_activation: IndexRepairActivationStats = .{},
+    capacity_source: ?CapacitySource = null,
 
     pub fn init(options: Options) ResourceManager {
         var slices: [slice_count]MutableSlice = undefined;
@@ -230,7 +367,281 @@ pub const ResourceManager = struct {
                 .policy = options.policies[i],
             };
         }
-        return .{ .slices = slices };
+        const high_sequences = options.derived_backlog_high_sequences;
+        return .{
+            .slices = slices,
+            .derived_backlog_high_sequences = high_sequences,
+            .derived_backlog_resume_sequences = if (high_sequences == 0)
+                0
+            else
+                @min(options.derived_backlog_resume_sequences, high_sequences - 1),
+            .disk_safety_floor_bytes = options.disk_safety_floor_bytes,
+            .disk_safety_floor_divisor = options.disk_safety_floor_divisor,
+            .query_embedding_cache_budget = cache_budget.CacheBudget.init(options.query_embedding_cache_bytes),
+            .query_embedding_cache_ttl_ns = options.query_embedding_cache_ttl_ns,
+            .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
+        };
+    }
+
+    pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
+        return &self.query_embedding_cache_budget;
+    }
+
+    pub fn queryEmbeddingPolicy(self: *const ResourceManager) QueryEmbeddingPolicy {
+        return .{
+            .enabled = self.query_embedding_cache_budget.max_bytes != 0 and self.query_embedding_cache_ttl_ns != 0,
+            .ttl_ns = self.query_embedding_cache_ttl_ns,
+            .max_inflight = self.query_embedding_max_inflight,
+        };
+    }
+
+    pub fn recordIndexRepairActivation(self: *ResourceManager, pause_ns: u64, budget_ns: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.index_repair_activation.attempts +|= 1;
+        if (pause_ns > budget_ns) self.index_repair_activation.overruns +|= 1;
+        self.index_repair_activation.last_pause_ns = pause_ns;
+        self.index_repair_activation.max_pause_ns = @max(self.index_repair_activation.max_pause_ns, pause_ns);
+        self.index_repair_activation.last_budget_ns = budget_ns;
+    }
+
+    pub fn indexRepairActivationStats(self: *ResourceManager) IndexRepairActivationStats {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.index_repair_activation;
+    }
+
+    /// Install the capacity source for this manager's storage domain.
+    ///
+    /// A source is part of the manager's lifetime contract: DBs copy the
+    /// callback when they open and reservations are coordinated by its domain
+    /// identity. Replacing it at runtime could split one physical domain into
+    /// inconsistent admission views, so installation is immutable. Repeating
+    /// the exact same installation is harmless and supports idempotent runtime
+    /// composition.
+    pub fn installCapacitySource(self: *ResourceManager, source: CapacitySource) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.capacity_source) |existing| {
+            if (existing.ptr == source.ptr and
+                existing.domain_id == source.domain_id and
+                existing.observe == source.observe)
+            {
+                return;
+            }
+            return error.CapacitySourceAlreadyInstalled;
+        }
+        if (self.capacity_domains.count() != 0) return error.CapacitySourceInstalledAfterAdmission;
+        self.capacity_source = source;
+    }
+
+    pub fn capacitySource(self: *ResourceManager) ?CapacitySource {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.capacity_source;
+    }
+
+    /// Required only for managers that have admitted capacity reservations.
+    /// Owners must call this after all reservations have been released.
+    pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var it = self.capacity_domains.valueIterator();
+        while (it.next()) |domain| std.debug.assert(domain.reserved_bytes == 0);
+        self.capacity_domains.deinit(alloc);
+        self.capacity_domains = .empty;
+    }
+
+    pub fn reserveCapacity(
+        self: *ResourceManager,
+        alloc: std.mem.Allocator,
+        domain_id: CapacityDomainId,
+        bytes: u64,
+        observation: CapacityObservation,
+        now_ns: u64,
+    ) !CapacityReservation {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const entry = try self.capacity_domains.getOrPut(alloc, domain_id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        const domain = entry.value_ptr;
+        self.observeCapacityLocked(domain, observation);
+        domain.last_safety_floor_bytes = self.capacitySafetyFloorLocked(observation);
+        if (observation.stale(now_ns)) {
+            domain.stale_observations +|= 1;
+            domain.denials +|= 1;
+            return error.CapacityObservationStale;
+        }
+        const next = std.math.add(u64, domain.reserved_bytes, bytes) catch {
+            domain.denials +|= 1;
+            return error.CapacityUnavailable;
+        };
+        if (!self.capacityFitsLocked(next, observation)) {
+            domain.denials +|= 1;
+            return error.CapacityUnavailable;
+        }
+        domain.reserved_bytes = next;
+        domain.peak_reserved_bytes = @max(domain.peak_reserved_bytes, next);
+        domain.reservations +|= 1;
+        return .{ .manager = self, .domain_id = domain_id, .bytes = bytes };
+    }
+
+    fn growCapacityReservation(
+        self: *ResourceManager,
+        domain_id: CapacityDomainId,
+        additional_bytes: u64,
+        observation: CapacityObservation,
+        now_ns: u64,
+    ) !void {
+        if (additional_bytes == 0) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const domain = self.capacity_domains.getPtr(domain_id) orelse return error.CapacityReservationReleased;
+        self.observeCapacityLocked(domain, observation);
+        domain.last_safety_floor_bytes = self.capacitySafetyFloorLocked(observation);
+        if (observation.stale(now_ns)) {
+            domain.stale_observations +|= 1;
+            domain.denials +|= 1;
+            domain.growth_denials +|= 1;
+            return error.CapacityObservationStale;
+        }
+        const next = std.math.add(u64, domain.reserved_bytes, additional_bytes) catch {
+            domain.denials +|= 1;
+            domain.growth_denials +|= 1;
+            return error.CapacityUnavailable;
+        };
+        if (!self.capacityFitsLocked(next, observation)) {
+            domain.denials +|= 1;
+            domain.growth_denials +|= 1;
+            return error.CapacityUnavailable;
+        }
+        domain.reserved_bytes = next;
+        domain.peak_reserved_bytes = @max(domain.peak_reserved_bytes, next);
+    }
+
+    fn revalidateCapacityReservation(
+        self: *ResourceManager,
+        domain_id: CapacityDomainId,
+        observation: CapacityObservation,
+        now_ns: u64,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const domain = self.capacity_domains.getPtr(domain_id) orelse return error.CapacityReservationReleased;
+        self.observeCapacityLocked(domain, observation);
+        domain.last_safety_floor_bytes = self.capacitySafetyFloorLocked(observation);
+        if (observation.stale(now_ns)) {
+            domain.stale_observations +|= 1;
+            domain.denials +|= 1;
+            domain.growth_denials +|= 1;
+            return error.CapacityObservationStale;
+        }
+        if (!self.capacityFitsLocked(domain.reserved_bytes, observation)) {
+            domain.denials +|= 1;
+            domain.growth_denials +|= 1;
+            return error.CapacityUnavailable;
+        }
+    }
+
+    fn capacityReservationFits(
+        self: *ResourceManager,
+        domain_id: CapacityDomainId,
+        observation: CapacityObservation,
+        now_ns: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const domain = self.capacity_domains.getPtr(domain_id) orelse return error.CapacityReservationReleased;
+        self.observeCapacityLocked(domain, observation);
+        domain.last_safety_floor_bytes = self.capacitySafetyFloorLocked(observation);
+        if (observation.stale(now_ns)) {
+            // Staleness cannot be corrected by reconciling materialized bytes;
+            // it is a real fail-closed admission event.
+            domain.stale_observations +|= 1;
+            domain.denials +|= 1;
+            domain.growth_denials +|= 1;
+            return error.CapacityObservationStale;
+        }
+        return self.capacityFitsLocked(domain.reserved_bytes, observation);
+    }
+
+    fn releaseCapacity(self: *ResourceManager, domain_id: CapacityDomainId, bytes: u64) void {
+        if (bytes == 0) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const domain = self.capacity_domains.getPtr(domain_id) orelse unreachable;
+        std.debug.assert(domain.reserved_bytes >= bytes);
+        domain.reserved_bytes -= bytes;
+    }
+
+    fn observeCapacityLocked(_: *ResourceManager, domain: *MutableCapacityDomain, observation: CapacityObservation) void {
+        domain.last_available_bytes = observation.available_bytes;
+        domain.last_capacity_bytes = observation.capacity_bytes;
+        domain.last_observed_at_ns = observation.observed_at_ns;
+    }
+
+    fn capacityFitsLocked(self: *ResourceManager, reserved_bytes: u64, observation: CapacityObservation) bool {
+        const available = observation.available_bytes orelse return true;
+        return reserved_bytes <= available -| self.capacitySafetyFloorLocked(observation);
+    }
+
+    fn capacitySafetyFloorLocked(self: *ResourceManager, observation: CapacityObservation) u64 {
+        var floor = self.disk_safety_floor_bytes;
+        if (self.disk_safety_floor_divisor != 0) {
+            if (observation.capacity_bytes) |capacity| {
+                floor = @max(floor, capacity / self.disk_safety_floor_divisor);
+            }
+        }
+        return floor;
+    }
+
+    pub fn capacityStats(self: *ResourceManager) CapacityStats {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var out = CapacityStats{ .domain_count = self.capacity_domains.count() };
+        var it = self.capacity_domains.valueIterator();
+        while (it.next()) |domain| {
+            out.reserved_bytes +|= domain.reserved_bytes;
+            out.peak_reserved_bytes +|= domain.peak_reserved_bytes;
+            out.reservations +|= domain.reservations;
+            out.denials +|= domain.denials;
+            out.growth_denials +|= domain.growth_denials;
+            out.stale_observations +|= domain.stale_observations;
+        }
+        return out;
+    }
+
+    pub fn capacityDomainStats(self: *ResourceManager, alloc: std.mem.Allocator) ![]CapacityDomainStats {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const out = try alloc.alloc(CapacityDomainStats, self.capacity_domains.count());
+        var index: usize = 0;
+        var it = self.capacity_domains.iterator();
+        while (it.next()) |entry| : (index += 1) {
+            const domain = entry.value_ptr.*;
+            out[index] = .{
+                .domain_id = entry.key_ptr.*,
+                .reserved_bytes = domain.reserved_bytes,
+                .peak_reserved_bytes = domain.peak_reserved_bytes,
+                .reservations = domain.reservations,
+                .denials = domain.denials,
+                .growth_denials = domain.growth_denials,
+                .stale_observations = domain.stale_observations,
+                .last_available_bytes = domain.last_available_bytes,
+                .last_capacity_bytes = domain.last_capacity_bytes,
+                .last_safety_floor_bytes = domain.last_safety_floor_bytes,
+                .last_observed_at_ns = domain.last_observed_at_ns,
+            };
+        }
+        return out;
+    }
+
+    pub fn derivedBacklogLimits(self: *const ResourceManager) DerivedBacklogLimits {
+        return .{
+            .high_sequences = self.derived_backlog_high_sequences,
+            .resume_sequences = self.derived_backlog_resume_sequences,
+        };
     }
 
     pub fn reserve(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
@@ -303,7 +714,7 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
 
         var stats: [slice_count]SliceStats = undefined;
-        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set, Slice.lite_native_page_cache, Slice.lite_native_link_cache, Slice.lite_docstore_snapshot_cache, Slice.inference_prompt_cache }, 0..) |slice, i| {
+        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set, Slice.lite_native_page_cache, Slice.lite_native_link_cache, Slice.lite_docstore_snapshot_cache, Slice.inference_prompt_cache, Slice.dense_repair_working_set }, 0..) |slice, i| {
             const state = self.slices[i];
             stats[i] = .{
                 .name = slice.name(),
@@ -327,6 +738,37 @@ pub const ResourceManager = struct {
 
         const state = self.slices[sliceIndex(slice)];
         return sliceStatsFromState(slice, state);
+    }
+
+    /// Derive HBC's internal count ceilings from the resource manager's byte
+    /// budget. A shared cache owns its own dynamic CLOCK, so local arrays only
+    /// need a non-zero gate. Local caches retain bounded arrays while exact
+    /// entry bytes are admitted through `hbc_node_metadata_cache`.
+    pub fn hbcCacheLimits(self: *ResourceManager, dims: u32, shared_cache: bool) HbcCacheLimits {
+        if (shared_cache) {
+            return .{
+                .max_cached_nodes = 1,
+                .max_cached_vectors = 1,
+                .max_cached_metadata = 1,
+            };
+        }
+
+        const stats = self.sliceStats(.hbc_node_metadata_cache);
+        const budget_bytes = if (stats.hard_limit_bytes > 0)
+            stats.hard_limit_bytes
+        else if (stats.soft_limit_bytes > 0)
+            stats.soft_limit_bytes
+        else
+            std.math.maxInt(u64);
+        const vector_bytes = @max(
+            hbc_estimated_vector_overhead_bytes,
+            @as(u64, dims) * @sizeOf(f32) + hbc_estimated_vector_overhead_bytes,
+        );
+        return .{
+            .max_cached_nodes = hbcClockEntries(budget_bytes, hbc_estimated_node_entry_bytes),
+            .max_cached_vectors = hbcClockEntries(budget_bytes, vector_bytes),
+            .max_cached_metadata = hbcClockEntries(budget_bytes, hbc_estimated_metadata_entry_bytes),
+        };
     }
 
     pub fn denseReplayWindowBudget(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) u64 {
@@ -386,6 +828,56 @@ pub const ResourceManager = struct {
         return pressureFor(state.budget, state.used_bytes);
     }
 };
+
+pub const CapacityReservation = struct {
+    manager: *ResourceManager,
+    domain_id: CapacityDomainId,
+    bytes: u64,
+    released: bool = false,
+
+    pub fn grow(self: *CapacityReservation, additional_bytes: u64, observation: CapacityObservation, now_ns: u64) !void {
+        if (self.released) return error.CapacityReservationReleased;
+        try self.manager.growCapacityReservation(self.domain_id, additional_bytes, observation, now_ns);
+        self.bytes = std.math.add(u64, self.bytes, additional_bytes) catch unreachable;
+    }
+
+    /// Reconcile a future-growth claim as planned bytes materialize on disk.
+    /// Shrinking is admission-free because the filesystem observation already
+    /// reflects materialized bytes; growing revalidates current capacity.
+    pub fn resize(self: *CapacityReservation, target_bytes: u64, observation: CapacityObservation, now_ns: u64) !void {
+        if (self.released) return error.CapacityReservationReleased;
+        if (target_bytes == self.bytes) return;
+        if (target_bytes > self.bytes) {
+            return try self.grow(target_bytes - self.bytes, observation, now_ns);
+        }
+        self.manager.releaseCapacity(self.domain_id, self.bytes - target_bytes);
+        self.bytes = target_bytes;
+    }
+
+    pub fn revalidate(self: *CapacityReservation, observation: CapacityObservation, now_ns: u64) !void {
+        if (self.released) return error.CapacityReservationReleased;
+        try self.manager.revalidateCapacityReservation(self.domain_id, observation, now_ns);
+    }
+
+    /// Checks whether the aggregate claim fits without recording a denial.
+    /// Repair admission uses this before exact materialized-byte reconciliation;
+    /// only the final post-reconciliation decision contributes denial metrics.
+    pub fn fits(self: *CapacityReservation, observation: CapacityObservation, now_ns: u64) !bool {
+        if (self.released) return error.CapacityReservationReleased;
+        return try self.manager.capacityReservationFits(self.domain_id, observation, now_ns);
+    }
+
+    pub fn release(self: *CapacityReservation) void {
+        if (self.released) return;
+        self.manager.releaseCapacity(self.domain_id, self.bytes);
+        self.released = true;
+    }
+};
+
+fn hbcClockEntries(budget_bytes: u64, estimated_entry_bytes: u64) usize {
+    const entries = @min(hbc_max_clock_entries, @max(@as(u64, 1), budget_bytes / estimated_entry_bytes));
+    return @intCast(entries);
+}
 
 pub const Reservation = struct {
     manager: *ResourceManager,
@@ -453,6 +945,115 @@ test "resource manager tracks reservations and releases" {
     try std.testing.expectEqual(@as(u64, 0), stats.slices[sliceIndex(.full_text_pending_segments)].used_bytes);
 }
 
+test "resource manager coordinates growable capacity by physical domain" {
+    var manager = ResourceManager.init(.{
+        .disk_safety_floor_bytes = 10,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer manager.deinit(std.testing.allocator);
+    const observation = CapacityObservation{
+        .available_bytes = 100,
+        .capacity_bytes = 100,
+        .observed_at_ns = 100,
+        .valid_for_ns = 50,
+    };
+
+    var first = try manager.reserveCapacity(std.testing.allocator, 7, 60, observation, 100);
+    defer first.release();
+    try std.testing.expectError(error.CapacityUnavailable, manager.reserveCapacity(std.testing.allocator, 7, 31, observation, 100));
+    var independent = try manager.reserveCapacity(std.testing.allocator, 8, 80, observation, 100);
+    independent.release();
+
+    try first.grow(20, observation, 100);
+    try std.testing.expectError(error.CapacityUnavailable, first.grow(11, observation, 100));
+    try first.resize(50, observation, 100);
+    const stats = manager.capacityStats();
+    try std.testing.expectEqual(@as(u64, 50), stats.reserved_bytes);
+    try std.testing.expectEqual(@as(u64, 2), stats.denials);
+    try std.testing.expectEqual(@as(u64, 1), stats.growth_denials);
+    try std.testing.expectEqual(@as(usize, 2), stats.domain_count);
+}
+
+test "capacity reservation revalidation fails closed when available space falls" {
+    var manager = ResourceManager.init(.{
+        .disk_safety_floor_bytes = 10,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var reservation = try manager.reserveCapacity(std.testing.allocator, 7, 60, .{
+        .available_bytes = 100,
+        .capacity_bytes = 100,
+        .observed_at_ns = 100,
+        .valid_for_ns = 100,
+    }, 100);
+    defer reservation.release();
+
+    try reservation.revalidate(.{
+        .available_bytes = 75,
+        .capacity_bytes = 100,
+        .observed_at_ns = 110,
+        .valid_for_ns = 100,
+    }, 110);
+    try std.testing.expect(!try reservation.fits(.{
+        .available_bytes = 65,
+        .capacity_bytes = 100,
+        .observed_at_ns = 120,
+        .valid_for_ns = 100,
+    }, 120));
+    try std.testing.expectEqual(@as(u64, 0), manager.capacityStats().denials);
+    try std.testing.expectError(error.CapacityUnavailable, reservation.revalidate(.{
+        .available_bytes = 65,
+        .capacity_bytes = 100,
+        .observed_at_ns = 120,
+        .valid_for_ns = 100,
+    }, 120));
+
+    const stats = manager.capacityStats();
+    try std.testing.expectEqual(@as(u64, 60), stats.reserved_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.denials);
+    try std.testing.expectEqual(@as(u64, 1), stats.growth_denials);
+}
+
+test "resource manager rejects stale known capacity but accounts unknown capacity" {
+    var manager = ResourceManager.init(.{ .disk_safety_floor_bytes = 0 });
+    defer manager.deinit(std.testing.allocator);
+    try std.testing.expectError(error.CapacityObservationStale, manager.reserveCapacity(
+        std.testing.allocator,
+        1,
+        1,
+        .{ .available_bytes = 100, .observed_at_ns = 10, .valid_for_ns = 5 },
+        16,
+    ));
+    var accounting_only = try manager.reserveCapacity(std.testing.allocator, 1, 1000, .{}, 16);
+    accounting_only.release();
+    try std.testing.expectEqual(@as(u64, 1), manager.capacityStats().stale_observations);
+}
+
+test "resource manager capacity source is immutable after composition" {
+    const Source = struct {
+        fn observe(_: *anyopaque) anyerror!CapacityObservation {
+            return .{};
+        }
+    };
+    var first_context: u8 = 0;
+    var second_context: u8 = 0;
+    const first = CapacitySource{ .ptr = &first_context, .domain_id = 7, .observe = Source.observe };
+    const second = CapacitySource{ .ptr = &second_context, .domain_id = 8, .observe = Source.observe };
+
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    try manager.installCapacitySource(first);
+    try manager.installCapacitySource(first);
+    try std.testing.expectError(error.CapacitySourceAlreadyInstalled, manager.installCapacitySource(second));
+
+    var admitted = ResourceManager.init(.{ .disk_safety_floor_bytes = 0 });
+    defer admitted.deinit(std.testing.allocator);
+    var reservation = try admitted.reserveCapacity(std.testing.allocator, 1, 1, .{}, 0);
+    reservation.release();
+    try std.testing.expectError(error.CapacitySourceInstalledAfterAdmission, admitted.installCapacitySource(first));
+}
+
 test "resource manager tracks full text build working set independently" {
     var manager = ResourceManager.init(.{});
     var current: u64 = 0;
@@ -496,6 +1097,25 @@ test "resource manager records soft and hard budget pressure" {
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.derived_backlog, 9));
     stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 1), stats.slices[sliceIndex(.derived_backlog)].hard_limit_rejections);
+}
+
+test "resource manager owns HBC cache ceilings" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = 2048,
+        .hard_limit_bytes = 4096,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+
+    const local = manager.hbcCacheLimits(128, false);
+    try std.testing.expectEqual(@as(usize, 4), local.max_cached_nodes);
+    try std.testing.expectEqual(@as(usize, 7), local.max_cached_vectors);
+    try std.testing.expectEqual(@as(usize, 16), local.max_cached_metadata);
+
+    const shared = manager.hbcCacheLimits(128, true);
+    try std.testing.expectEqual(@as(usize, 1), shared.max_cached_nodes);
+    try std.testing.expectEqual(@as(usize, 1), shared.max_cached_vectors);
+    try std.testing.expectEqual(@as(usize, 1), shared.max_cached_metadata);
 }
 
 test "resource manager adjusts tracked usage" {
@@ -551,4 +1171,17 @@ test "resource manager observes over-budget external usage" {
     try std.testing.expectEqual(@as(u64, 5), current);
     try std.testing.expectEqual(@as(u64, 5), stats.slices[sliceIndex(.lsm_block_table_cache)].used_bytes);
     try std.testing.expectEqual(Pressure.normal, stats.slices[sliceIndex(.lsm_block_table_cache)].pressure);
+}
+
+test "resource manager records index repair activation pause separately from cleanup" {
+    var manager = ResourceManager.init(.{});
+    manager.recordIndexRepairActivation(20 * std.time.ns_per_ms, 25 * std.time.ns_per_ms);
+    manager.recordIndexRepairActivation(30 * std.time.ns_per_ms, 25 * std.time.ns_per_ms);
+
+    const stats = manager.indexRepairActivationStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.attempts);
+    try std.testing.expectEqual(@as(u64, 1), stats.overruns);
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.last_pause_ns);
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.max_pause_ns);
+    try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), stats.last_budget_ns);
 }

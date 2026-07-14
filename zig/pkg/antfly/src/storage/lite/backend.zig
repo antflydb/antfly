@@ -225,6 +225,7 @@ pub const Handle = struct {
                     self.native_docstore = null;
                 }
                 if (self.owned_resource_manager) |manager| {
+                    manager.deinit(self.allocator);
                     self.allocator.destroy(manager);
                     self.owned_resource_manager = null;
                 }
@@ -601,7 +602,10 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         owned_resource_manager = manager;
         break :blk manager;
     };
-    errdefer if (owned_resource_manager) |manager| allocator.destroy(manager);
+    errdefer if (owned_resource_manager) |manager| {
+        manager.deinit(allocator);
+        allocator.destroy(manager);
+    };
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
         .read_only = opts.read_only,
@@ -619,7 +623,10 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
         owned_resource_manager = manager;
         break :blk manager;
     };
-    errdefer if (owned_resource_manager) |manager| allocator.destroy(manager);
+    errdefer if (owned_resource_manager) |manager| {
+        manager.deinit(allocator);
+        allocator.destroy(manager);
+    };
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
         .exclusive = opts.exclusive,

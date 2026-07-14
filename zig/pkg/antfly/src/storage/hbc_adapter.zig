@@ -63,10 +63,6 @@ const vectorindex_spfresh_index = @import("antfly_vectorindex").spfresh_index;
 const vectorindex_hbc_transfer = @import("antfly_vectorindex").hbc_transfer;
 const vectorindex_hbc_debug = @import("antfly_vectorindex").hbc_debug;
 
-fn getenv(name: [*:0]const u8) ?[]const u8 {
-    return platform.env.getenv(name);
-}
-
 var temp_path_nonce: u64 = 0;
 const default_deferred_hbc_leaf_splits_per_publish: usize = 256;
 const default_bulk_split_vector_workspace_budget_bytes: u64 = 256 * 1024 * 1024;
@@ -96,31 +92,6 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     }
 }
 
-fn envBoolDisabled(raw: []const u8) bool {
-    return std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no") or
-        std.ascii.eqlIgnoreCase(raw, "off");
-}
-
-fn envBoolEnabled(raw: []const u8) bool {
-    return std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "true") or
-        std.ascii.eqlIgnoreCase(raw, "yes") or
-        std.ascii.eqlIgnoreCase(raw, "on");
-}
-
-fn defaultRetainedVectorCacheEnabled() bool {
-    if (comptime builtin.os.tag == .freestanding) return true;
-    if (getenv("ANTFLY_HBC_VECTOR_CACHE")) |raw| {
-        return !envBoolDisabled(raw);
-    }
-    if (getenv("ANTFLY_HBC_DISABLE_VECTOR_CACHE")) |raw| {
-        return !envBoolEnabled(raw);
-    }
-    return true;
-}
-
 fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?bool) vectorindex_store.BatchMode {
     if (!in_bulk_session) return .default;
     const direct_bulk_ingest_enabled = lsm_direct_bulk_ingest_enabled orelse return .default;
@@ -134,6 +105,10 @@ fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?b
 const meta_key = vectorindex_hbc.meta_key;
 const bulk_publish_state_key = "__bulk_publish_state";
 const bulk_publish_state_value = "incomplete";
+pub const WriteSessionKind = enum {
+    streaming_replay,
+    bulk_publication,
+};
 const hbc_index_version = vectorindex_hbc.hbc_index_version;
 const IndexMetadata = vectorindex_hbc.IndexMetadata;
 pub const ProjectionCheckpointMetadata = vectorindex_hbc.ProjectionCheckpointMetadata;
@@ -1463,6 +1438,7 @@ pub const HBCIndex = struct {
     metadata_clock_refs: []bool,
     metadata_clock_hand: usize,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    bind_shared_cache_resource_manager: bool = true,
     shared_cache: ?*Cache = null,
     shared_cache_registered: bool = false,
     cache_namespace: u64 = 0,
@@ -1484,7 +1460,9 @@ pub const HBCIndex = struct {
     deferred_quantized_nodes: std.AutoHashMapUnmanaged(u64, void),
     deferred_node_keys: std.AutoHashMapUnmanaged(u128, DeferredNodeValue),
     deferred_oversized_leaves: std.AutoHashMapUnmanaged(u64, void),
-    bulk_ingest_session_depth: usize = 0,
+    write_session_depth: usize = 0,
+    write_session_kind: ?WriteSessionKind = null,
+    bulk_publication_may_have_mutated: bool = false,
     hilbert: ?vec.Hilbert,
     scratch_mu: std.atomic.Mutex,
     cached_scratch: ?SearchScratch,
@@ -1743,32 +1721,66 @@ pub const HBCIndex = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *HBCIndex) !bool {
-        if (self.bulk_ingest_session_depth > 0) return false;
+        if (self.shouldSuppressRoutineMaintenance()) return false;
         return switch (self.env_owner) {
             .lsm => |handle| try handle.backend.runMaintenanceStepBestEffort(),
             .lmdb => false,
         };
     }
 
-    pub fn beginBulkIngestSession(self: *HBCIndex) !void {
+    pub fn lsmSessionBatchingActive(self: *const HBCIndex) bool {
+        return self.write_session_depth != 0;
+    }
+
+    pub fn crossBatchPublicationActive(self: *const HBCIndex) bool {
+        return self.write_session_depth != 0 and self.write_session_kind == .bulk_publication;
+    }
+
+    pub fn mustPublishMetadataPerBatch(self: *const HBCIndex) bool {
+        return !self.crossBatchPublicationActive();
+    }
+
+    pub fn shouldPublishSearchStatePerBatch(self: *const HBCIndex) bool {
+        return !self.crossBatchPublicationActive();
+    }
+
+    pub fn shouldSuppressRoutineMaintenance(self: *const HBCIndex) bool {
+        return self.lsmSessionBatchingActive();
+    }
+
+    fn writeSessionFinishNeedsExplicitDurableSync(self: *const HBCIndex) bool {
+        return switch (self.env_owner) {
+            .lmdb => self.config.no_sync or self.config.no_meta_sync,
+            .lsm => |handle| handle.backend.options.backend.durability != .full,
+        };
+    }
+
+    fn beginWriteSession(self: *HBCIndex, kind: WriteSessionKind) !void {
+        if (self.write_session_depth != 0 and self.write_session_kind != kind) {
+            return error.MixedWriteSessionKinds;
+        }
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| {
                 return err;
             },
             .lmdb => {},
         }
-        if (self.bulk_ingest_session_depth == 0) {
+        const opening_outermost = self.write_session_depth == 0;
+        if (opening_outermost) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
             self.clearDeferredNodeKeys();
             self.deferred_oversized_leaves.clearRetainingCapacity();
             self.apply_workspace_split_bytes = 0;
             self.deferred_node_key_value_bytes = 0;
             self.observeApplyWorkspaceBytes();
+            self.write_session_kind = kind;
+            self.bulk_publication_may_have_mutated = false;
         }
-        self.bulk_ingest_session_depth += 1;
-        if (self.bulk_ingest_session_depth == 1) {
+        self.write_session_depth += 1;
+        if (opening_outermost and kind == .bulk_publication) {
             self.persistBulkPublishState() catch |err| {
-                self.bulk_ingest_session_depth -= 1;
+                self.write_session_depth -= 1;
+                self.write_session_kind = null;
                 switch (self.env_owner) {
                     .lsm => |handle| handle.backend.abortBulkIngestSession(),
                     .lmdb => {},
@@ -1778,9 +1790,23 @@ pub const HBCIndex = struct {
         }
     }
 
-    pub fn finishBulkIngestSessionWithOptions(self: *HBCIndex, options: backend_types.BulkIngestFinishOptions) !void {
-        const finishing_outermost = self.bulk_ingest_session_depth > 0 and self.bulk_ingest_session_depth == 1;
-        if (finishing_outermost) {
+    pub fn beginStreamingReplaySession(self: *HBCIndex) !void {
+        try self.beginWriteSession(.streaming_replay);
+    }
+
+    pub fn beginBulkIngestSession(self: *HBCIndex) !void {
+        try self.beginWriteSession(.bulk_publication);
+    }
+
+    fn finishWriteSessionWithOptions(
+        self: *HBCIndex,
+        expected_kind: WriteSessionKind,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !void {
+        if (self.write_session_depth == 0) return error.NoActiveWriteSession;
+        if (self.write_session_kind != expected_kind) return error.WriteSessionKindMismatch;
+        const finishing_outermost = self.write_session_depth == 1;
+        if (finishing_outermost and expected_kind == .bulk_publication) {
             if (options.progress_fn) |progress| if (options.progress_ctx) |progress_ctx| {
                 progress(progress_ctx, .{
                     .phase = .begin,
@@ -1791,6 +1817,7 @@ pub const HBCIndex = struct {
             errdefer self.endBulkSplitVectorWorkspace();
             var publish_window: u64 = 0;
             while (true) {
+                try options.checkAdmission();
                 publish_window += 1;
                 const window_start_ns = nowNs();
                 var batch = try self.store.beginBatch();
@@ -1848,38 +1875,70 @@ pub const HBCIndex = struct {
         }
         var finish_options = options;
         if (finishing_outermost) {
-            // HBC publishes deferred roots and metadata through normal mutable
-            // batches so repeated rewrites coalesce. Make the final published
-            // state durable before exposing the completed bulk session.
+            // Both session kinds require a durable LSM boundary before their
+            // caller may publish an applied sequence. Bulk publication also
+            // publishes deferred HBC state above before reaching this point.
             finish_options.flush = true;
         }
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.finishBulkIngestSessionWithOptions(finish_options) catch |err| {
-                if (finishing_outermost) {
+                if (finishing_outermost and expected_kind == .bulk_publication) {
                     self.persistBulkPublishState() catch {};
                 }
                 return err;
             },
             .lmdb => {},
         }
-        if (self.bulk_ingest_session_depth > 0) self.bulk_ingest_session_depth -= 1;
+        self.write_session_depth -= 1;
         if (finishing_outermost) self.refreshPublishedSearchState();
-        if (self.bulk_ingest_session_depth == 0) {
+        if (self.write_session_depth == 0) {
+            self.write_session_kind = null;
+            self.bulk_publication_may_have_mutated = false;
             self.releaseDeferredBulkWorkspaceCapacity();
         }
     }
 
-    pub fn abortBulkIngestSession(self: *HBCIndex) void {
-        if (self.bulk_ingest_session_depth == 0) return;
+    pub fn finishStreamingReplaySessionWithOptions(
+        self: *HBCIndex,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !void {
+        const finishing_outermost = self.write_session_depth == 1 and self.write_session_kind == .streaming_replay;
+        const needs_explicit_sync = finishing_outermost and self.writeSessionFinishNeedsExplicitDurableSync();
+        try self.finishWriteSessionWithOptions(.streaming_replay, options);
+        if (needs_explicit_sync) try self.sync(true);
+    }
+
+    pub fn finishBulkIngestSessionWithOptions(self: *HBCIndex, options: backend_types.BulkIngestFinishOptions) !void {
+        const finishing_outermost = self.write_session_depth == 1 and self.write_session_kind == .bulk_publication;
+        const needs_explicit_sync = finishing_outermost and self.writeSessionFinishNeedsExplicitDurableSync();
+        try self.finishWriteSessionWithOptions(.bulk_publication, options);
+        if (needs_explicit_sync) try self.sync(true);
+    }
+
+    fn abortWriteSession(self: *HBCIndex, expected_kind: WriteSessionKind) void {
+        if (self.write_session_depth == 0 or self.write_session_kind != expected_kind) return;
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.abortBulkIngestSession(),
             .lmdb => {},
         }
-        self.bulk_ingest_session_depth -= 1;
-        if (self.bulk_ingest_session_depth == 0) {
-            self.clearBulkPublishStateBestEffort();
+        self.write_session_depth -= 1;
+        if (self.write_session_depth == 0) {
+            if (expected_kind == .bulk_publication and !self.bulk_publication_may_have_mutated) {
+                self.clearBulkPublishStateBestEffort();
+            }
+            self.write_session_kind = null;
+            self.bulk_publication_may_have_mutated = false;
+            self.refreshPublishedSearchState();
             self.releaseDeferredBulkWorkspaceCapacity();
         }
+    }
+
+    pub fn abortStreamingReplaySession(self: *HBCIndex) void {
+        self.abortWriteSession(.streaming_replay);
+    }
+
+    pub fn abortBulkIngestSession(self: *HBCIndex) void {
+        self.abortWriteSession(.bulk_publication);
     }
 
     const SplitResult = vectorindex_hbc_index.SplitResult;
@@ -2052,12 +2111,16 @@ pub const HBCIndex = struct {
             .metadata_clock_refs = metadata_clock_refs,
             .metadata_clock_hand = 0,
             .resource_manager = null,
+            .bind_shared_cache_resource_manager = true,
             .shared_cache = null,
             .shared_cache_registered = false,
             .cache_namespace = cache_identity.namespace,
             .cache_path = cache_identity.stable_path,
             .cache_enabled = true,
-            .retained_vector_cache_enabled = defaultRetainedVectorCacheEnabled(),
+            // Cache policy is governed by ResourceManager byte admission and
+            // pressure actions. There is deliberately no environment or
+            // per-index switch for retained-vector caching.
+            .retained_vector_cache_enabled = true,
             .cache_mu = .{},
             .active_searches = .init(0),
             .hbc_cache_bytes_accounted = 0,
@@ -2072,7 +2135,9 @@ pub const HBCIndex = struct {
             .deferred_quantized_nodes = .empty,
             .deferred_node_keys = .empty,
             .deferred_oversized_leaves = .empty,
-            .bulk_ingest_session_depth = 0,
+            .write_session_depth = 0,
+            .write_session_kind = null,
+            .bulk_publication_may_have_mutated = false,
             .hilbert = null,
             .scratch_mu = .unlocked,
             .cached_scratch = null,
@@ -2106,7 +2171,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn shouldPublishSearchStateAfterWrite(self: *const HBCIndex) bool {
-        return self.bulk_ingest_session_depth == 0;
+        return self.shouldPublishSearchStatePerBatch();
     }
 
     pub fn publishedRootNode(self: *const HBCIndex) u64 {
@@ -2126,7 +2191,16 @@ pub const HBCIndex = struct {
     }
 
     pub fn attachResourceManager(self: *HBCIndex, resource_manager: *resource_manager_mod.ResourceManager) void {
+        self.attachResourceManagerWithSharedCacheBinding(resource_manager, true);
+    }
+
+    pub fn attachResourceManagerWithSharedCacheBinding(
+        self: *HBCIndex,
+        resource_manager: *resource_manager_mod.ResourceManager,
+        bind_shared_cache_resource_manager: bool,
+    ) void {
         self.resource_manager = resource_manager;
+        self.bind_shared_cache_resource_manager = bind_shared_cache_resource_manager;
         const current_search_bytes = self.search_workspace_bytes_accounted;
         self.search_workspace_bytes_accounted = 0;
         resource_manager.observeUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, current_search_bytes);
@@ -2137,7 +2211,7 @@ pub const HBCIndex = struct {
         self.apply_workspace_bytes_accounted = 0;
         resource_manager.observeUsage(.dense_apply_working_set, &self.apply_workspace_bytes_accounted, current_apply_bytes);
         if (self.shared_cache) |cache| {
-            cache.attachResourceManager(resource_manager);
+            if (bind_shared_cache_resource_manager) cache.attachResourceManager(resource_manager);
             return;
         }
         self.refreshAndEnforceHbcCacheUsage(.none());
@@ -2157,10 +2231,14 @@ pub const HBCIndex = struct {
         if (!cache.registerNamespacePath(self.cache_namespace, self.cache_path)) return;
         self.shared_cache = cache;
         self.shared_cache_registered = true;
-        if (self.resource_manager) |manager| cache.attachResourceManager(manager);
+        if (self.bind_shared_cache_resource_manager) {
+            if (self.resource_manager) |manager| cache.attachResourceManager(manager);
+        }
     }
 
-    pub fn setCacheEnabled(self: *HBCIndex, enabled: bool) void {
+    /// Test-only fault/cache-coherency control. Production cache policy is
+    /// owned by ResourceManager.
+    fn setCacheEnabled(self: *HBCIndex, enabled: bool) void {
         if (self.cache_enabled == enabled) return;
         self.cache_enabled = enabled;
         if (!enabled) {
@@ -2171,7 +2249,9 @@ pub const HBCIndex = struct {
         }
     }
 
-    pub fn setRetainedVectorCacheEnabled(self: *HBCIndex, enabled: bool) void {
+    /// Test-only cache-path control. Production cache admission and eviction
+    /// are owned by ResourceManager.
+    fn setRetainedVectorCacheEnabled(self: *HBCIndex, enabled: bool) void {
         if (self.retained_vector_cache_enabled == enabled) return;
         self.retained_vector_cache_enabled = enabled;
         if (!enabled) self.clearVectorCache();
@@ -2325,17 +2405,6 @@ pub const HBCIndex = struct {
             return;
         };
         self.observeBulkSplitVectorWorkspaceBytes();
-    }
-
-    pub fn setCacheCaps(self: *HBCIndex, max_cached_nodes: usize, max_cached_vectors: usize) void {
-        const changed = self.config.max_cached_nodes != max_cached_nodes or self.config.max_cached_vectors != max_cached_vectors;
-        self.config.max_cached_nodes = max_cached_nodes;
-        self.config.max_cached_vectors = max_cached_vectors;
-        if (!changed) return;
-        self.clearNodeCache();
-        self.clearQuantizedCache();
-        self.clearVectorCache();
-        self.clearMetadataCache();
     }
 
     pub fn setExternalVectorLoader(self: *HBCIndex, ctx: *anyopaque, loader: ExternalVectorLoader) void {
@@ -2577,6 +2646,18 @@ pub const HBCIndex = struct {
     }
 
     pub fn close(self: *HBCIndex) void {
+        self.deinitWithBackendDisposition(false);
+    }
+
+    /// Test and fault-injection teardown that discards unsynced backend state
+    /// instead of performing a graceful close. Production recovery code does
+    /// not call this; it exists to exercise the exact interrupted-session
+    /// boundary with modeled and WAL-backed storage.
+    pub fn abandonAfterCrash(self: *HBCIndex) void {
+        self.deinitWithBackendDisposition(true);
+    }
+
+    fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
         if (self.shared_cache == null) {
             self.clearNodeCache();
             self.clearQuantizedCache();
@@ -2624,7 +2705,11 @@ pub const HBCIndex = struct {
         self.quantizer.deinit();
         self.alloc.free(self.cache_path);
         self.store.deinit();
-        self.env_owner.close(self.alloc);
+        if (abandon_after_crash) {
+            self.env_owner.abandonAfterCrash(self.alloc);
+        } else {
+            self.env_owner.close(self.alloc);
+        }
         self.* = undefined;
     }
 
@@ -2727,7 +2812,7 @@ pub const HBCIndex = struct {
     }
 
     fn stageNodeKeyPut(self: *HBCIndex, key: []const u8, value: []const u8) !bool {
-        if (self.bulk_ingest_session_depth == 0) return false;
+        if (!self.crossBatchPublicationActive()) return false;
         const staged_key = stagedNodeKeyId(key) orelse return false;
         const owned = try self.alloc.dupe(u8, value);
         errdefer self.alloc.free(owned);
@@ -2743,7 +2828,7 @@ pub const HBCIndex = struct {
     }
 
     fn stageNodeKeyDelete(self: *HBCIndex, key: []const u8) !bool {
-        if (self.bulk_ingest_session_depth == 0) return false;
+        if (!self.crossBatchPublicationActive()) return false;
         const staged_key = stagedNodeKeyId(key) orelse return false;
         const result = try self.deferred_node_keys.getOrPut(self.alloc, staged_key);
         if (result.found_existing) {
@@ -2929,7 +3014,8 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeWriteTxn(self: *HBCIndex) !vectorindex_store.NamespaceWriteTxn {
-        if (self.bulk_ingest_session_depth == 0) {
+        if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
+        if (!self.crossBatchPublicationActive()) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
             self.deferred_oversized_leaves.clearRetainingCapacity();
             self.apply_workspace_split_bytes = 0;
@@ -2939,7 +3025,8 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeBatchTxn(self: *HBCIndex) !vectorindex_store.NamespaceBatch {
-        if (self.bulk_ingest_session_depth == 0) {
+        if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
+        if (!self.crossBatchPublicationActive()) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
             self.deferred_oversized_leaves.clearRetainingCapacity();
             self.apply_workspace_split_bytes = 0;
@@ -2949,15 +3036,16 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeBatchTxnOptions(self: *HBCIndex, options: BatchInsertOptions) !vectorindex_store.NamespaceBatch {
+        if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.shouldDeferQuantizedRebuildToBulkFinish(options)) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
         }
-        if (self.bulk_ingest_session_depth == 0) {
+        if (!self.crossBatchPublicationActive()) {
             self.deferred_oversized_leaves.clearRetainingCapacity();
             self.apply_workspace_split_bytes = 0;
             self.observeApplyWorkspaceBytes();
         }
-        const in_bulk_session = self.bulk_ingest_session_depth > 0;
+        const in_bulk_session = self.lsmSessionBatchingActive();
         // HBC mutation batches rewrite nodes, ranges, and quantized payloads
         // heavily. Keep mutable-state coalescing, but preserve bulk transaction
         // mode when the LSM profile disables direct bulk ingest so LSM defers
@@ -3395,7 +3483,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn cacheSearchNode(self: *HBCIndex, node: *const Node) !void {
-        if (self.bulk_ingest_session_depth > 0) return;
+        if (self.lsmSessionBatchingActive()) return;
         try self.cacheNode(node);
     }
 
@@ -3504,7 +3592,7 @@ pub const HBCIndex = struct {
         if (!self.cache_enabled) return vector_data;
         if (!self.retained_vector_cache_enabled) return vector_data;
         if (self.bypass_external_vector_cache) return vector_data;
-        if (self.bulk_ingest_session_depth > 0) return vector_data;
+        if (self.lsmSessionBatchingActive()) return vector_data;
         if (self.active_searches.load(.acquire) > 1) return vector_data;
         return try self.cacheVectorRetained(vector_id, vector_data);
     }
@@ -3541,7 +3629,7 @@ pub const HBCIndex = struct {
 
     pub fn cacheMetadata(self: *HBCIndex, vector_id: u64, metadata: []const u8) ![]const u8 {
         if (!self.cache_enabled) return metadata;
-        if (self.bulk_ingest_session_depth > 0) return metadata;
+        if (self.lsmSessionBatchingActive()) return metadata;
         if (self.config.max_cached_metadata == 0) return metadata;
         if (self.shared_cache) |cache| {
             return try cache.cacheMetadata(self.cache_namespace, vector_id, metadata);
@@ -3622,7 +3710,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn borrowCachedNodeForSearch(self: *HBCIndex, node_id: u64) ?BorrowedNode {
-        if (self.bulk_ingest_session_depth > 0) return null;
+        if (self.lsmSessionBatchingActive()) return null;
         return self.borrowCachedNode(node_id);
     }
 
@@ -3775,12 +3863,16 @@ pub const HBCIndex = struct {
     }
 
     fn persistBulkPublishState(self: *HBCIndex) !void {
-        var txn = try self.beginRuntimeBatchTxnOptions(.{});
+        // Publication intent must not itself make an otherwise empty session
+        // look mutated, and it must be committed outside deferred session batch
+        // mode before any cross-batch HBC mutation begins.
+        var txn = try self.store.beginBatch();
         var active = true;
         errdefer if (active) txn.abort();
         try self.putNamespaced(&txn, .meta, bulk_publish_state_key, bulk_publish_state_value);
         try txn.commit();
         active = false;
+        if (self.writeSessionFinishNeedsExplicitDurableSync()) try self.sync(true);
     }
 
     fn clearBulkPublishStateTxn(self: *HBCIndex, txn: anytype) !void {
@@ -3797,10 +3889,11 @@ pub const HBCIndex = struct {
         self.clearBulkPublishStateTxn(&txn) catch return;
         txn.commit() catch return;
         active = false;
+        if (self.writeSessionFinishNeedsExplicitDurableSync()) self.sync(true) catch return;
     }
 
     pub fn flushMetadata(self: *HBCIndex, txn: anytype) !void {
-        if (self.bulk_ingest_session_depth > 0) return;
+        if (!self.mustPublishMetadataPerBatch()) return;
         try self.flushMetadataNow(txn);
     }
 
@@ -3865,11 +3958,11 @@ pub const HBCIndex = struct {
     }
 
     pub fn shouldDeferQuantizedRebuildToBulkFinish(self: *const HBCIndex, options: BatchInsertOptions) bool {
-        return self.bulk_ingest_session_depth > 0 and options.bulk_ingest and options.defer_quantized_rebuild_to_bulk_finish;
+        return self.crossBatchPublicationActive() and options.bulk_ingest and options.defer_quantized_rebuild_to_bulk_finish;
     }
 
     pub fn shouldDeferLeafSplitToBulkFinish(self: *const HBCIndex, options: BatchInsertOptions) bool {
-        return self.bulk_ingest_session_depth > 0 and options.bulk_ingest and options.defer_leaf_splits_to_bulk_finish;
+        return self.crossBatchPublicationActive() and options.bulk_ingest and options.defer_leaf_splits_to_bulk_finish;
     }
 
     pub fn recordDeferredOversizedLeaf(self: *HBCIndex, leaf_id: u64) !void {
@@ -3909,7 +4002,7 @@ pub const HBCIndex = struct {
 
     pub fn publishDeferredNodeKeysForBatchFinishTxn(self: *HBCIndex, txn: anytype, options: BatchInsertOptions) !void {
         if (!options.bulk_ingest) return;
-        if (self.bulk_ingest_session_depth > 0 and self.config.centroid_directory_mode == .flat_rabitq) return;
+        if (self.crossBatchPublicationActive() and self.config.centroid_directory_mode == .flat_rabitq) return;
         if (self.shouldDeferLeafSplitToBulkFinish(options)) return;
         if (self.shouldDeferQuantizedRebuildToBulkFinish(options)) return;
         try self.publishDeferredNodeKeysForBulkFinishTxn(txn);
@@ -7619,6 +7712,340 @@ test "bulk ingest session publishes deferred quantized nodes once at finish" {
     var results = try idx.search(&[_]f32{ 10.1, 10.0 }, 2);
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 2), results.getHits().len);
+}
+
+test "streaming replay session publishes reopenable batches without incomplete marker" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+
+    const config: HBCConfig = .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    };
+    var idx = try HBCIndex.openWithLsmOptions(alloc, tmp_path, config, .{
+        .backend_options = .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 8,
+        },
+    });
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 10.0 }, .metadata = "doc:3" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 10.1, 10.0 }, .metadata = "doc:4" },
+    };
+
+    try idx.beginStreamingReplaySession();
+    try std.testing.expectEqual(WriteSessionKind.streaming_replay, idx.write_session_kind.?);
+    try idx.batchInsertWithMetadataOptions(&items, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .defer_quantized_rebuild_to_bulk_finish = true,
+        .defer_leaf_splits_to_bulk_finish = true,
+        .skip_vector_store = false,
+        .bulk_ingest = true,
+    });
+
+    try std.testing.expectEqual(@as(u32, 0), idx.deferred_quantized_nodes.count());
+    try std.testing.expectEqual(@as(u32, 0), idx.deferred_oversized_leaves.count());
+    try std.testing.expectEqual(@as(u32, 0), idx.deferred_node_keys.count());
+    try std.testing.expectEqual(@as(u64, items.len), idx.publishedActiveCount());
+
+    // A long-lived streaming scope may contain several independently durable
+    // mutation batches. Exercise overwrite, delete, and insert before the
+    // process interruption; replaying any suffix remains idempotent.
+    try idx.batchDelete(&.{2});
+    try idx.batchInsertWithMetadataOptions(&.{
+        .{ .vector_id = 1, .vector = &[_]f32{ 20.0, 20.0 }, .metadata = "doc:1-updated" },
+        .{ .vector_id = 5, .vector = &[_]f32{ 20.1, 20.0 }, .metadata = "doc:5" },
+    }, .{
+        .assume_absent_ids = false,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .defer_quantized_rebuild_to_bulk_finish = true,
+        .defer_leaf_splits_to_bulk_finish = true,
+        .skip_vector_store = false,
+        .bulk_ingest = true,
+    });
+    try std.testing.expectEqual(@as(u64, 4), idx.publishedActiveCount());
+
+    var read = try idx.beginReadTxn();
+    try std.testing.expectError(error.NotFound, read.get(.meta, bulk_publish_state_key));
+    read.abort();
+
+    // Do not run either session finish or abort. The crash teardown discards
+    // unsynced process state, so reopen proves that the committed batch and its
+    // metadata are independently recoverable and carry no publication marker.
+    idx.abandonAfterCrash();
+
+    var reopened = try HBCIndex.openWithLsmOptions(alloc, tmp_path, config, .{
+        .backend_options = .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 8,
+        },
+    });
+    try std.testing.expectEqual(@as(u64, 4), reopened.stats().active_count);
+    var results = try reopened.search(&[_]f32{ 20.0, 20.0 }, 2);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 2), results.getHits().len);
+
+    // Replay the committed suffix: identical insert, cross-leaf overwrite,
+    // absent delete, and delete-then-insert. A second interruption must still
+    // reopen with exact cardinality and final values.
+    try reopened.beginStreamingReplaySession();
+    try reopened.batchInsertWithMetadataOptions(&.{
+        .{ .vector_id = 1, .vector = &[_]f32{ 20.0, 20.0 }, .metadata = "doc:1-updated" },
+        .{ .vector_id = 3, .vector = &[_]f32{ -20.0, -20.0 }, .metadata = "doc:3-moved" },
+    }, .{
+        .assume_absent_ids = false,
+        .coalesce_leaf_writes = true,
+        .bulk_ingest = true,
+    });
+    try reopened.batchDelete(&.{ 99, 5 });
+    try reopened.batchInsertWithMetadataOptions(&.{
+        .{ .vector_id = 5, .vector = &[_]f32{ 20.1, 20.0 }, .metadata = "doc:5" },
+    }, .{
+        .assume_absent_ids = false,
+        .coalesce_leaf_writes = true,
+        .bulk_ingest = true,
+    });
+    try std.testing.expectEqual(@as(u64, 4), reopened.publishedActiveCount());
+    reopened.abandonAfterCrash();
+
+    var final = try HBCIndex.openWithLsmOptions(alloc, tmp_path, config, .{
+        .backend_options = .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 8,
+        },
+    });
+    defer final.close();
+    try std.testing.expectEqual(@as(u64, 4), final.stats().active_count);
+    const moved_metadata = (try final.getMetadata(3)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(moved_metadata);
+    try std.testing.expectEqualStrings("doc:3-moved", moved_metadata);
+    var moved_results = try final.search(&[_]f32{ -20.0, -20.0 }, 1);
+    defer moved_results.deinit();
+    try std.testing.expectEqual(@as(u64, 3), moved_results.getHits()[0].vector_id);
+}
+
+test "streaming replay finish establishes durability for relaxed backend" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+    const config: HBCConfig = .{
+        .dims = 2,
+        .storage_backend = .lsm,
+    };
+    const options: hbc_backend.LsmOptions = .{
+        .backend_options = .{ .backend = .{ .durability = .none } },
+    };
+    var idx = try HBCIndex.openWithLsmOptions(alloc, tmp_path, config, options);
+    try idx.beginStreamingReplaySession();
+    try idx.batchInsertWithMetadataOptions(&.{
+        .{ .vector_id = 1, .vector = &[_]f32{ 1, 0 }, .metadata = "doc:1" },
+    }, .{
+        .assume_absent_ids = true,
+        .bulk_ingest = true,
+    });
+    // The finish performs an explicit forced sync before a higher layer may
+    // advance its durable applied-sequence watermark.
+    try idx.finishStreamingReplaySessionWithOptions(.{});
+    idx.abandonAfterCrash();
+
+    var reopened = try HBCIndex.openWithLsmOptions(alloc, tmp_path, config, options);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.stats().active_count);
+    var read = try reopened.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(.meta, bulk_publish_state_key));
+}
+
+test "streaming replay finish establishes explicit durability for lmdb no_sync" {
+    if (!supports_lmdb) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+    const config: HBCConfig = .{
+        .dims = 2,
+        .storage_backend = .lmdb,
+        .no_sync = true,
+        .no_meta_sync = true,
+    };
+    var idx = try HBCIndex.open(alloc, tmp_path, config);
+    try idx.beginStreamingReplaySession();
+    try idx.batchInsertWithMetadataOptions(&.{
+        .{ .vector_id = 1, .vector = &[_]f32{ 1, 0 }, .metadata = "doc:1" },
+    }, .{
+        .assume_absent_ids = true,
+        .bulk_ingest = true,
+    });
+    // The logical LMDB commit runs with no_sync, so the streaming finish must
+    // perform the explicit forced sync before a caller can publish its applied
+    // sequence.
+    try idx.finishStreamingReplaySessionWithOptions(.{});
+    idx.close();
+
+    var reopened = try HBCIndex.open(alloc, tmp_path, config);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.stats().active_count);
+    const metadata = (try reopened.getMetadata(1)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(metadata);
+    try std.testing.expectEqualStrings("doc:1", metadata);
+}
+
+test "interrupted bulk publication remains quarantined" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+
+    const config: HBCConfig = .{
+        .dims = 2,
+        .storage_backend = .lsm,
+    };
+    var idx = try HBCIndex.open(alloc, tmp_path, config);
+    try idx.beginBulkIngestSession();
+    try idx.batchInsertWithMetadataOptions(&[_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 1.0, 0.0 }, .metadata = "doc:1" },
+    }, .{
+        .assume_absent_ids = true,
+        .bulk_ingest = true,
+    });
+    idx.abandonAfterCrash();
+
+    try std.testing.expectError(
+        error.IncompleteBulkPublish,
+        HBCIndex.open(alloc, tmp_path, config),
+    );
+}
+
+test "bulk publication revalidates admission before every publish window" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+
+    const config: HBCConfig = .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 8,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .prefer_key_local_leaf_splits = true,
+    };
+    var idx = try HBCIndex.open(alloc, tmp_path, config);
+    var abandoned = false;
+    defer if (!abandoned) idx.close();
+    try idx.batchInsertWithMetadata(&.{
+        .{ .vector_id = 1, .vector = &.{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &.{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &.{ 100.0, 0.0 }, .metadata = "doc:3" },
+    });
+    try idx.beginBulkIngestSession();
+    try idx.batchInsertWithMetadataOptions(&.{
+        .{ .vector_id = 4, .vector = &.{ 100.1, 0.0 }, .metadata = "doc:4" },
+        .{ .vector_id = 5, .vector = &.{ 100.2, 0.0 }, .metadata = "doc:5" },
+        .{ .vector_id = 6, .vector = &.{ 100.3, 0.0 }, .metadata = "doc:6" },
+        .{ .vector_id = 7, .vector = &.{ 100.4, 0.0 }, .metadata = "doc:7" },
+        .{ .vector_id = 8, .vector = &.{ 100.5, 0.0 }, .metadata = "doc:8" },
+        .{ .vector_id = 9, .vector = &.{ 100.6, 0.0 }, .metadata = "doc:9" },
+        .{ .vector_id = 10, .vector = &.{ 100.7, 0.0 }, .metadata = "doc:10" },
+    }, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .defer_leaf_splits_to_bulk_finish = true,
+        .bulk_ingest = true,
+    });
+
+    const Admission = struct {
+        calls: usize = 0,
+
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 2) return error.TestCapacityUnavailable;
+        }
+    };
+    var admission = Admission{};
+    try std.testing.expectError(error.TestCapacityUnavailable, idx.finishBulkIngestSessionWithOptions(.{
+        .compact = false,
+        .max_deferred_hbc_leaf_splits_per_publish = 1,
+        .bulk_rebuild_hbc_leaf_min_members = 999,
+        .admission_ctx = &admission,
+        .admission_fn = Admission.check,
+    }));
+    try std.testing.expectEqual(@as(usize, 2), admission.calls);
+
+    // The first bounded window was durable. A denied second window therefore
+    // leaves the publication marker intact and the partial generation fenced.
+    idx.abandonAfterCrash();
+    abandoned = true;
+    try std.testing.expectError(error.IncompleteBulkPublish, HBCIndex.open(alloc, tmp_path, config));
+}
+
+test "bulk publication abort clears only an unmodified session" {
+    const alloc = std.testing.allocator;
+    var empty_path: TestPath = .{};
+    const empty_tmp_path = empty_path.init();
+    defer empty_path.cleanup();
+
+    const config: HBCConfig = .{
+        .dims = 2,
+        .storage_backend = .lsm,
+    };
+    var empty = try HBCIndex.open(alloc, empty_tmp_path, config);
+    try empty.beginBulkIngestSession();
+    empty.abortBulkIngestSession();
+    empty.close();
+    var empty_reopened = try HBCIndex.open(alloc, empty_tmp_path, config);
+    empty_reopened.close();
+
+    var dirty_path: TestPath = .{};
+    const dirty_tmp_path = dirty_path.init();
+    defer dirty_path.cleanup();
+
+    var dirty = try HBCIndex.open(alloc, dirty_tmp_path, config);
+    try dirty.beginBulkIngestSession();
+    try dirty.batchInsertWithMetadataOptions(&[_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 1.0, 0.0 }, .metadata = "doc:1" },
+    }, .{
+        .assume_absent_ids = true,
+        .bulk_ingest = true,
+    });
+    dirty.abortBulkIngestSession();
+    dirty.close();
+    try std.testing.expectError(
+        error.IncompleteBulkPublish,
+        HBCIndex.open(alloc, dirty_tmp_path, config),
+    );
+}
+
+test "write sessions reject mixed nested publication semantics" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+
+    var idx = try HBCIndex.open(alloc, tmp_path, .{ .dims = 2 });
+    defer idx.close();
+
+    try idx.beginStreamingReplaySession();
+    defer idx.abortStreamingReplaySession();
+    try std.testing.expectError(error.MixedWriteSessionKinds, idx.beginBulkIngestSession());
+    try std.testing.expectEqual(@as(usize, 1), idx.write_session_depth);
+    try std.testing.expectEqual(WriteSessionKind.streaming_replay, idx.write_session_kind.?);
 }
 
 test "bulk ingest keeps published search state stale until finish" {
