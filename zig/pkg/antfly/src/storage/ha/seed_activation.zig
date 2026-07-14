@@ -163,10 +163,11 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
         try validateActiveReceipt(alloc, existing_active, request.expected, &seed_receipt_hex, generation_relative_path);
         try inspectGenerationsRoot(io, generations_root, request.expected.generation, installing_name);
         try validatePublishedGeneration(alloc, generation_path, request, activation_json);
+        const active_receipt_copy = try alloc.dupe(u8, existing_active);
         alloc.free(activation_json);
         return .{
             .generation_path = generation_path,
-            .active_receipt_json = try alloc.dupe(u8, existing_active),
+            .active_receipt_json = active_receipt_copy,
             .already_active = true,
         };
     } else |err| switch (err) {
@@ -194,14 +195,14 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
             defer alloc.free(source_path);
             const destination_path = try std.fs.path.join(alloc, &.{ installing_path, file.path });
             defer alloc.free(destination_path);
-            try copyFileDurably(io, source_path, destination_path);
+            try copyFileDurably(io, source_path, destination_path, installing_path);
         }
         const installed_receipt_path = try std.fs.path.join(alloc, &.{ installing_path, seed_artifact.receipt_name });
         defer alloc.free(installed_receipt_path);
-        try copyFileDurably(io, staged_receipt_path, installed_receipt_path);
+        try copyFileDurably(io, staged_receipt_path, installed_receipt_path, installing_path);
         const installed_manifest_path = try std.fs.path.join(alloc, &.{ installing_path, seed_artifact.staged_manifest_name });
         defer alloc.free(installed_manifest_path);
-        try copyFileDurably(io, staged_manifest_path, installed_manifest_path);
+        try copyFileDurably(io, staged_manifest_path, installed_manifest_path, installing_path);
 
         try seed_artifact.verifyStaged(alloc, installing_path, request.expected, request.limits);
         try verifyGenerationReceipt(io, alloc, generation_receipt_path, activation_json, request.limits.max_receipt_bytes);
@@ -349,12 +350,19 @@ fn directoryExists(io: std.Io, path: []const u8) !bool {
     return true;
 }
 
-fn copyFileDurably(io: std.Io, source_path: []const u8, destination_path: []const u8) !void {
+fn copyFileDurably(io: std.Io, source_path: []const u8, destination_path: []const u8, sync_root: []const u8) !void {
     try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), destination_path, io, .{
         .make_path = true,
         .replace = false,
     });
     try fs_paths.syncFileAndParentPortable(io, destination_path);
+    var parent = std.fs.path.dirname(destination_path) orelse return error.InvalidActivationPath;
+    while (!std.mem.eql(u8, parent, sync_root)) {
+        if (!pathContains(sync_root, parent)) return error.InvalidActivationPath;
+        try fs_paths.syncDirPortable(io, parent);
+        parent = std.fs.path.dirname(parent) orelse return error.InvalidActivationPath;
+    }
+    try fs_paths.syncDirPortable(io, sync_root);
 }
 
 /// Returns true only when this call published the path. Concurrent publication
