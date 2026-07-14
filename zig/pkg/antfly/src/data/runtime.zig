@@ -1515,11 +1515,46 @@ pub const DataServerHAConfig = struct {
     /// Durable primary-local root for immutable runtime-owned seed generations.
     /// The admin API never accepts caller-selected source or destination paths.
     seed_capture_root: ?[]const u8 = null,
+    /// Optional storage-specific producer for an immutable logical snapshot.
+    /// DataServer still validates and packages the result; providers cannot
+    /// select the published generation root or bypass the mutation barrier.
+    seed_snapshot_provider: ?HASeedSnapshotProvider = null,
     internal_primary: ?*antfly.ha.primary.Primary = null,
     primary_retention_policy: antfly.ha.slot_store.RetentionPolicy = .{},
     primary_sync_policy: antfly.ha.primary.SyncPolicy = .{},
     primary_sync_wait: HASyncWaitConfig = .{},
     standby_replication: ?HAStandbyReplicationConfig = null,
+};
+
+pub const HASeedSnapshotRequest = struct {
+    capture_root: []const u8,
+    generation: []const u8,
+};
+
+pub const HASeedPreparedSnapshot = struct {
+    root: []u8,
+
+    pub fn deinit(self: *HASeedPreparedSnapshot, alloc: std.mem.Allocator) void {
+        alloc.free(self.root);
+        self.* = undefined;
+    }
+};
+
+pub const HASeedSnapshotProvider = struct {
+    ptr: *anyopaque,
+    prepare_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) anyerror!HASeedPreparedSnapshot,
+
+    pub fn prepare(
+        self: HASeedSnapshotProvider,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        return try self.prepare_fn(self.ptr, alloc, request);
+    }
 };
 
 pub const HASyncWaitConfig = struct {
@@ -15714,6 +15749,80 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
 }
 
+const TestHASeedSnapshotProvider = struct {
+    db_path: []const u8,
+    calls: usize = 0,
+    unsupported: bool = false,
+
+    fn iface(self: *@This()) HASeedSnapshotProvider {
+        return .{ .ptr = self, .prepare_fn = prepare };
+    }
+
+    fn prepare(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.unsupported) return error.HASeedSnapshotUnsupportedBackend;
+
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const prepared_root = try std.fs.path.join(alloc, &.{ request.capture_root, ".test-provider", request.generation });
+        errdefer alloc.free(prepared_root);
+        std.Io.Dir.cwd().deleteTree(io, prepared_root) catch {};
+        const replica_snapshot_root = try std.fs.path.join(alloc, &.{ prepared_root, "replicas/group-1" });
+        defer alloc.free(replica_snapshot_root);
+
+        var snapshot_db = try antfly.db.DB.open(alloc, self.db_path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+        });
+        defer snapshot_db.close();
+        const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g1", .{request.generation});
+        defer alloc.free(snapshot_token);
+        _ = try snapshot_db.snapshot(snapshot_token);
+        const source_snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ self.db_path, snapshot_token });
+        defer alloc.free(source_snapshot_root);
+        try antfly.public_api.backups.copyDirectoryRecursive(alloc, source_snapshot_root, replica_snapshot_root);
+
+        const store_path = try std.fs.path.join(alloc, &.{ replica_snapshot_root, "store.bin" });
+        defer alloc.free(store_path);
+        const store_bytes = try std.Io.Dir.cwd().readFileAlloc(io, store_path, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(store_bytes);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(store_bytes, &digest, .{});
+        var digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+        for (digest, 0..) |byte, index| {
+            digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+            digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+        }
+
+        const topology_json = try std.json.Stringify.valueAlloc(alloc, .{
+            .format_version = @as(u16, 1),
+            .generation = request.generation,
+            .replicas = &.{.{
+                .group_id = @as(u64, 1),
+                .table_id = @as(u64, 20),
+                .table_name = "docs",
+                .snapshot_path = "replicas/group-1",
+                .logical_sha256 = digest_hex[0..],
+            }},
+        }, .{});
+        defer alloc.free(topology_json);
+        const topology_path = try std.fs.path.join(alloc, &.{ prepared_root, "TOPOLOGY.json" });
+        defer alloc.free(topology_path);
+        var topology_file = try std.Io.Dir.cwd().createFile(io, topology_path, .{ .truncate = true });
+        try topology_file.writeStreamingAll(io, topology_json);
+        try topology_file.sync(io);
+        topology_file.close(io);
+        try fs_paths.syncDirPortable(io, prepared_root);
+        return .{ .root = prepared_root };
+    }
+};
+
 test "data server wires configured HA executors into API server" {
     const alloc = std.testing.allocator;
     const FakeStatus = struct {
@@ -15735,8 +15844,17 @@ test "data server wires configured HA executors into API server" {
         fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 20,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 1,
+                    .table_id = 20,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
@@ -15781,23 +15899,55 @@ test "data server wires configured HA executors into API server" {
     defer alloc.free(capture_fixture_root);
     const replica_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "replicas" });
     defer alloc.free(replica_root);
-    const replica_file = try std.fs.path.join(alloc, &.{ replica_root, "group-1/table-db/state.bin" });
-    defer alloc.free(replica_file);
+    const replica_db_path = try std.fs.path.join(alloc, &.{ replica_root, "group-1/table-db" });
+    defer alloc.free(replica_db_path);
+    const raft_wal_sentinel = try std.fs.path.join(alloc, &.{ replica_root, "group-1/raft/wal-000001" });
+    defer alloc.free(raft_wal_sentinel);
     const replica_catalog_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "catalog.txt" });
     defer alloc.free(replica_catalog_path);
     const seed_capture_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "seed-captures" });
     defer alloc.free(seed_capture_root);
     std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
-    try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(replica_file).?);
-    var replica_fixture = try std.Io.Dir.cwd().createFile(io_impl.io(), replica_file, .{ .truncate = true });
-    try replica_fixture.writeStreamingAll(io_impl.io(), "replica-state");
-    try replica_fixture.sync(io_impl.io());
-    replica_fixture.close(io_impl.io());
-    var catalog_fixture = try std.Io.Dir.cwd().createFile(io_impl.io(), replica_catalog_path, .{ .truncate = true });
-    try catalog_fixture.writeStreamingAll(io_impl.io(), "catalog-state");
-    try catalog_fixture.sync(io_impl.io());
-    catalog_fixture.close(io_impl.io());
+    {
+        var db = try antfly.db.DB.open(alloc, replica_db_path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+        });
+        defer db.close();
+        const schema_json =
+            \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"string","x-antfly-field":{"type":"text"}}}}}}}
+        ;
+        try db.setSchemaJson(alloc, schema_json);
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:seed", .value = "{\"title\":\"seed state\"}" }},
+            .sync_level = .full_index,
+        });
+        const txn_id = try db.beginTransaction(10_000);
+        try db.writeIntents(txn_id, &.{.{ .key = "doc:txn", .value = "{\"title\":\"txn state\"}" }}, &.{});
+        try db.commitTransaction(txn_id, 10_001);
+    }
+    try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(raft_wal_sentinel).?);
+    var raft_fixture = try std.Io.Dir.cwd().createFile(io_impl.io(), raft_wal_sentinel, .{ .truncate = true });
+    try raft_fixture.writeStreamingAll(io_impl.io(), "node-local-raft-wal-must-not-ship");
+    try raft_fixture.sync(io_impl.io());
+    raft_fixture.close(io_impl.io());
+    {
+        var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, replica_catalog_path);
+        defer replica_catalog.deinit();
+        try replica_catalog.catalog().upsertReplica(.{
+            .group_id = 1,
+            .replica_id = 101,
+            .local_node_id = 11,
+            .bootstrap_mode = .persisted,
+            .metadata_version = 1,
+        });
+    }
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -15815,6 +15965,7 @@ test "data server wires configured HA executors into API server" {
     _ = try primary.append(.{ .payload = "one" });
     _ = try primary.append(.{ .payload = "two" });
 
+    var seed_snapshot_provider = TestHASeedSnapshotProvider{ .db_path = replica_db_path };
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
         .replica_catalog_path = replica_catalog_path,
@@ -15825,6 +15976,7 @@ test "data server wires configured HA executors into API server" {
             },
             .admin_bearer_token = "runtime-secret-token",
             .seed_capture_root = seed_capture_root,
+            .seed_snapshot_provider = seed_snapshot_provider.iface(),
             .primary_retention_policy = .{ .max_lag_lsn = 1 },
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
@@ -15864,6 +16016,90 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"manifest_path\":") != null);
+    // Contract: DataServer must package only provider-produced logical output,
+    // never recursively copy the live replica tree (which contains Raft WAL).
+    try std.testing.expectEqual(@as(usize, 1), seed_snapshot_provider.calls);
+    const captured_raft_wal = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/content/replicas/group-1/raft/wal-000001",
+    });
+    defer alloc.free(captured_raft_wal);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_impl.io(), captured_raft_wal, .{}));
+
+    const captured_topology_path = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/content/TOPOLOGY.json",
+    });
+    defer alloc.free(captured_topology_path);
+    const captured_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), captured_topology_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(captured_topology_json);
+    const TestTopologyReplica = struct {
+        group_id: u64,
+        table_id: u64,
+        table_name: []const u8,
+        snapshot_path: []const u8,
+        logical_sha256: []const u8,
+    };
+    const TestTopology = struct {
+        format_version: u16,
+        generation: []const u8,
+        replicas: []const TestTopologyReplica,
+    };
+    var captured_topology = try std.json.parseFromSlice(TestTopology, alloc, captured_topology_json, .{ .ignore_unknown_fields = false });
+    defer captured_topology.deinit();
+    try std.testing.expectEqual(@as(u16, 1), captured_topology.value.format_version);
+    try std.testing.expectEqualStrings("seed-standby-capture-3", captured_topology.value.generation);
+    try std.testing.expectEqual(@as(usize, 1), captured_topology.value.replicas.len);
+    const captured_replica = captured_topology.value.replicas[0];
+    try std.testing.expectEqual(@as(u64, 1), captured_replica.group_id);
+    try std.testing.expectEqual(@as(u64, 20), captured_replica.table_id);
+    try std.testing.expectEqualStrings("docs", captured_replica.table_name);
+
+    const captured_snapshot_root = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/content",
+        captured_replica.snapshot_path,
+    });
+    defer alloc.free(captured_snapshot_root);
+    const restored_db_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restored/group-1/table-db" });
+    defer alloc.free(restored_db_path);
+    try antfly.db.DB.restoreSnapshotTo(alloc, captured_snapshot_root, restored_db_path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+    });
+    var restored_db = try antfly.db.DB.open(alloc, restored_db_path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+    });
+    defer restored_db.close();
+    const restored_schema = (try restored_db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored_schema);
+    try std.testing.expect(std.mem.indexOf(u8, restored_schema, "title") != null);
+    const restored_doc = (try restored_db.get(alloc, "doc:seed")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"seed state\"}", restored_doc);
+    const restored_txn_doc = (try restored_db.get(alloc, "doc:txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored_txn_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"txn state\"}", restored_txn_doc);
+    var restored_search = try restored_db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "seed" } },
+    });
+    defer restored_search.deinit();
+    try std.testing.expectEqual(@as(u32, 1), restored_search.total_hits);
+    _ = try restored_db.snapshot("canonical-digest");
+    const restored_store_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/canonical-digest/store.bin", .{restored_db_path});
+    defer alloc.free(restored_store_path);
+    const restored_store_bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), restored_store_path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(restored_store_bytes);
+    var restored_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(restored_store_bytes, &restored_digest, .{});
+    var restored_digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+    for (restored_digest, 0..) |byte, index| {
+        restored_digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        restored_digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    try std.testing.expectEqualStrings(captured_replica.logical_sha256, &restored_digest_hex);
     const captured_slot = primary.slot("standby-capture") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, captured_slot.lifecycle);
     try std.testing.expect(!captured_slot.active);
@@ -15878,6 +16114,26 @@ test "data server wires configured HA executors into API server" {
     defer capture_retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), capture_retry.status);
     try std.testing.expect(std.mem.indexOf(u8, capture_retry.body, "\"state\":\"already_applied\"") != null);
+
+    // Contract: maintenance, bulk/structural activity, or an unsupported
+    // snapshot provider must fail closed before backup_start burns a slot.
+    server.lsm_maintenance_active.store(true, .release);
+    defer server.lsm_maintenance_active.store(false, .release);
+    try std.testing.expectError(error.HASeedSnapshotRuntimeBusy, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-busy",
+        "seed-standby-busy-4",
+    ));
+    server.lsm_maintenance_active.store(false, .release);
+
+    seed_snapshot_provider.unsupported = true;
+    try std.testing.expectError(error.HASeedSnapshotUnsupportedBackend, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-unsupported",
+        "seed-standby-unsupported-5",
+    ));
 
     var internal_resp = try server.http_server.?.handle(.{
         .method = .GET,
