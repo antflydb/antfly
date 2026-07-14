@@ -2920,6 +2920,32 @@ pub const DB = struct {
         try enforceHAWriteGateOptional(self.ha_write_gate);
     }
 
+    fn haMutationBarrier(self: *const DB) ?*HAMutationBarrier {
+        var barrier: ?*HAMutationBarrier = null;
+        const mirrors = .{
+            self.ha_async_effect_mirror,
+            self.ha_async_batch_mirror,
+            self.ha_async_metadata_mirror,
+        };
+        inline for (mirrors) |maybe_mirror| {
+            if (maybe_mirror) |mirror| {
+                if (mirror.mutation_barrier) |candidate| {
+                    if (barrier) |configured| {
+                        std.debug.assert(configured == candidate);
+                    } else {
+                        barrier = candidate;
+                    }
+                }
+            }
+        }
+        return barrier;
+    }
+
+    fn acquireHAMutationShared(self: *const DB) ?HAMutationBarrier.SharedLease {
+        const barrier = self.haMutationBarrier() orelse return null;
+        return barrier.acquireShared();
+    }
+
     fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
         var ctx = self.batchContext();
         mirrorHAReplayPayloadBestEffortContext(&ctx, payload);
@@ -3791,10 +3817,15 @@ pub const DB = struct {
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         return try self.core.runTransactionRecoveryOnce(self.alloc, config);
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         self.async_context.text_merge_deferred.store(true, .release);
         errdefer self.async_context.text_merge_deferred.store(false, .release);
@@ -3819,6 +3850,8 @@ pub const DB = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
@@ -3864,6 +3897,8 @@ pub const DB = struct {
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         beginExternalDenseBulkSessionTracked(self.async_context);
         errdefer finishExternalDenseBulkSessionTracked(self.async_context);
@@ -3875,6 +3910,8 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
@@ -3887,6 +3924,8 @@ pub const DB = struct {
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         {
@@ -3924,6 +3963,8 @@ pub const DB = struct {
     }
 
     fn finishDenseAutoBulkIngestSessionWithOptionsInternal(self: *DB, options: backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
@@ -4512,6 +4553,8 @@ pub const DB = struct {
         limit: usize,
     ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
 
         const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
@@ -4548,6 +4591,8 @@ pub const DB = struct {
     }
 
     fn deleteDocumentArtifactChildRangeOutboxEntry(self: *DB, key: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
@@ -4638,6 +4683,8 @@ pub const DB = struct {
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         if (child_batch.artifact_writes.len == 0 and
             child_batch.artifact_delete_keys.len == 0 and
@@ -4786,6 +4833,8 @@ pub const DB = struct {
 
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (!opts.bypass_ha_write_gate) try self.enforceHAWriteGate();
         if (!opts.bypass_ha_write_gate) try self.preflightHABatchSyncCommit();
         const total_start_ns = monotonicTimeNs();
@@ -6129,6 +6178,8 @@ pub const DB = struct {
         update: types.DocumentArtifactChildRangePlacementUpdate,
     ) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
@@ -7957,6 +8008,8 @@ pub const DB = struct {
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
@@ -7999,6 +8052,9 @@ pub const DB = struct {
     }
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         if (state == null) {
@@ -8027,12 +8083,18 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.saveSplitDeltaFinalSeq(seq);
     }
 
     pub fn clearSplitDeltaFinalSeq(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.clearSplitDeltaFinalSeq();
@@ -8082,12 +8144,18 @@ pub const DB = struct {
     }
 
     pub fn clearSplitDeltaEntries(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.clearSplitDeltas();
     }
 
     pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         if (self.shadow != null) return error.ShadowIndexManagerExists;
@@ -8126,6 +8194,9 @@ pub const DB = struct {
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         const shadow = self.shadow orelse return;
         shadow.manager.deinit();
         self.alloc.destroy(shadow.manager);
@@ -8149,6 +8220,9 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         _ = dest_dir1;
         while (true) {
             const target_sequence = self.core.nextDerivedSequence();
@@ -8182,6 +8256,9 @@ pub const DB = struct {
     }
 
     pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try finalizeSplitLocked(self, new_range);
@@ -8524,6 +8601,8 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.preflightHAMetadataSyncCommit();
         try self.core.setSchema(table_schema);
@@ -8531,6 +8610,8 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
         const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
@@ -8562,6 +8643,9 @@ pub const DB = struct {
     }
 
     pub fn beginTransactionWithIdAndParticipants(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.beginTransactionWithParticipants(txn_id, timestamp_ns, participants);
@@ -8573,6 +8657,9 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
         for (intents) |intent| {
@@ -8625,6 +8712,9 @@ pub const DB = struct {
     }
 
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
 
@@ -8701,6 +8791,9 @@ pub const DB = struct {
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantResolved(txn_id, participant);
@@ -8715,6 +8808,9 @@ pub const DB = struct {
     }
 
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
@@ -9022,6 +9118,9 @@ pub const DB = struct {
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         var apply_locked = true;
         errdefer if (apply_locked) self.core.unlockApply();
@@ -9053,6 +9152,9 @@ pub const DB = struct {
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
@@ -9060,6 +9162,9 @@ pub const DB = struct {
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.upsertEnrichment(cfg);
@@ -9067,6 +9172,9 @@ pub const DB = struct {
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         {
             lockApply(self);
             defer self.core.unlockApply();
@@ -9094,6 +9202,9 @@ pub const DB = struct {
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
@@ -9153,6 +9264,9 @@ pub const DB = struct {
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         try self.retireResolverReplayBeforeCatalogRemoval();
 
         const retirement_sequence = blk: {
@@ -9365,6 +9479,8 @@ pub const DB = struct {
         key: []const u8,
     ) !u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
@@ -10060,6 +10176,9 @@ pub const DB = struct {
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
@@ -10122,6 +10241,9 @@ pub const DB = struct {
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.deleteEnrichment(kind, name);
@@ -22648,6 +22770,8 @@ fn collectGraphArtifactsForDocIndex(
 
 fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []const u8, sync_level: types.SyncLevel) !void {
     if (keys.len == 0) return;
+    var ha_mutation = acquireHAMutationSharedContext(ctx);
+    defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
@@ -22803,6 +22927,8 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 }
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
+    var ha_mutation = acquireHAMutationSharedContext(ctx);
+    defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
     ctx.apply_mutex.lockExclusive();
     defer ctx.apply_mutex.unlockExclusive();
@@ -22838,6 +22964,32 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
 fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
     const configured = gate orelse return;
     try configured.check();
+}
+
+fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationBarrier {
+    var barrier: ?*HAMutationBarrier = null;
+    const mirrors = .{
+        ctx.ha_async_effect_mirror,
+        ctx.ha_async_batch_mirror,
+        ctx.ha_async_metadata_mirror,
+    };
+    inline for (mirrors) |maybe_mirror| {
+        if (maybe_mirror) |mirror| {
+            if (mirror.mutation_barrier) |candidate| {
+                if (barrier) |configured| {
+                    std.debug.assert(configured == candidate);
+                } else {
+                    barrier = candidate;
+                }
+            }
+        }
+    }
+    return barrier;
+}
+
+fn acquireHAMutationSharedContext(ctx: *const BatchExecutionContext) ?HAMutationBarrier.SharedLease {
+    const barrier = haMutationBarrierFromContext(ctx) orelse return null;
+    return barrier.acquireShared();
 }
 
 fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
@@ -23757,6 +23909,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
 
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
+    var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
+    defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
     const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
     defer batch_ctx.alloc.free(replay_deleted_keys);
@@ -47394,17 +47548,15 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
-    var still_blocked = true;
     var attempts: usize = 0;
     while (attempts < 10_000) : (attempts += 1) {
-        if (write_probe.done.load(.monotonic) != 0 or write_probe.failed.load(.monotonic) != 0) {
-            still_blocked = false;
-            break;
-        }
+        if (barrier.pendingSharedAcquisitions() > 0) break;
         std.Thread.yield() catch {};
     }
 
-    try std.testing.expect(still_blocked);
+    try std.testing.expect(barrier.pendingSharedAcquisitions() > 0);
+    try std.testing.expectEqual(@as(u8, 0), write_probe.done.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
     try std.testing.expect((try db.get(alloc, "doc:b")) == null);
 

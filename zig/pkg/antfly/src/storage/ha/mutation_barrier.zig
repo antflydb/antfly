@@ -27,6 +27,7 @@ pub const MutationBarrier = struct {
     reader_mutex: std.atomic.Mutex = .unlocked,
     resource_mutex: std.atomic.Mutex = .unlocked,
     reader_count: usize = 0,
+    shared_waiters: std.atomic.Value(u64) = .init(0),
 
     pub const SharedLease = struct {
         barrier: *MutationBarrier,
@@ -66,7 +67,13 @@ pub const MutationBarrier = struct {
         return .{ .barrier = self };
     }
 
+    pub fn pendingSharedAcquisitions(self: *const @This()) u64 {
+        return self.shared_waiters.load(.acquire);
+    }
+
     fn lockShared(self: *@This()) void {
+        _ = self.shared_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.shared_waiters.fetchSub(1, .acq_rel);
         lockAtomic(&self.reader_gate);
         defer self.reader_gate.unlock();
 
