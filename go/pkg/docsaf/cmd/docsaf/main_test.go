@@ -95,6 +95,15 @@ func TestCreateHierarchyIndexesIncludesSelectivePDFOCRInSingleConfig(t *testing.
 	if reader["model"] != "reader" {
 		t.Fatalf("reader model = %#v, want reader", reader["model"])
 	}
+	documentText := indexes["document_text"].(map[string]any)
+	enrichments := documentText["enrichments"].([]map[string]any)
+	chunk := enrichments[1]
+	if chunk["name"] != docsaf.DefaultDocumentChunksArtifact {
+		t.Fatalf("chunk name = %#v, want %q", chunk["name"], docsaf.DefaultDocumentChunksArtifact)
+	}
+	if chunk["full_text_index"] != true {
+		t.Fatalf("full_text_index = %#v, want true", chunk["full_text_index"])
+	}
 }
 
 func TestDocsafEmbedderConfigSupportsOpenRouter(t *testing.T) {

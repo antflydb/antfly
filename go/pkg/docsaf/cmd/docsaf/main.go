@@ -558,6 +558,7 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embe
 					"source_artifact_name": documentUnits,
 					"chunk_size":           chunkSize,
 					"chunk_overlap":        chunkOverlap,
+					"full_text_index":      true,
 				},
 			},
 		},

@@ -521,6 +521,7 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                             "source_artifact_name": "document_units_v1",
                             "chunk_size": 256,
                             "chunk_overlap": 0,
+                            "full_text_index": True,
                         },
                     ],
                 },
@@ -585,6 +586,30 @@ def test_artifact_backed_embedding_table_provisions_atomically(
     assert (
         wait_until(
             lambda: _manifest_ready(stateful_api, table_name, doc_key),
+            timeout_s=60.0,
+            interval_s=0.5,
+        )
+        is not None
+    )
+    assert (
+        wait_until(
+            lambda: (
+                response
+                if doc_key
+                in _query_hit_ids(
+                    response := stateful_api.query_table(
+                        table_name,
+                        {
+                            "full_text_search": {
+                                "field": "text",
+                                "match": "qualification",
+                            },
+                            "limit": 5,
+                        },
+                    )
+                )
+                else None
+            ),
             timeout_s=60.0,
             interval_s=0.5,
         )
