@@ -292,6 +292,59 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 	}
 }
 
+func TestHAPlannedActionRetryGenerationIsTheOnlyTerminalRecoveryNonce(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       4,
+			Epoch:            6,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+	actions := []haPlannedAction{{
+		Kind: haActionCreateSlot, StandbyName: "standby-a", SlotName: "standby-a",
+		TargetLSN: 5, Reason: "SlotMissing",
+	}}
+	initial := haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{})
+	if len(initial) != 1 || initial[0].OperationID == "" {
+		t.Fatalf("expected a stable operation identity, got %#v", initial)
+	}
+	previous := initial[0]
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseFailed
+	previous.AdminError = "retry budget exhausted"
+	previous.ErrorClass = "RetryBudgetExhausted"
+	previous.AttemptCount = 8
+	previous.RetryBudgetUsed = 8
+	previous.ExecutionStateVersion = 1
+	previous.CompletedAt = haActionTime(time.Date(2026, 7, 14, 20, 0, 0, 0, time.UTC))
+	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
+
+	actions[0].TargetLSN = 9
+	actions[0].Reason = "PrimaryLSNAdvanced"
+	ordinaryReplan := haPlannedActionStatuses(actions, ha, status)
+	if ordinaryReplan[0].OperationID != previous.OperationID ||
+		ordinaryReplan[0].AdminJobPhase != haAdminJobPhaseFailed ||
+		ordinaryReplan[0].AttemptCount != 8 ||
+		ordinaryReplan[0].RetryBudgetUsed != 8 ||
+		ordinaryReplan[0].TargetLSN != 5 {
+		t.Fatalf("ordinary observation drift reset or retargeted terminal execution: %#v", ordinaryReplan[0])
+	}
+
+	ha.Admin.RetryGeneration = 1
+	recovered := haPlannedActionStatuses(actions, ha, status)
+	if recovered[0].OperationID == previous.OperationID ||
+		recovered[0].RetryGeneration != 1 ||
+		recovered[0].AdminJobPhase != "" ||
+		recovered[0].AttemptCount != 0 ||
+		recovered[0].RetryBudgetUsed != 0 ||
+		recovered[0].TargetLSN != 9 ||
+		recovered[0].Reason != "PrimaryLSNAdvanced" {
+		t.Fatalf("explicit retryGeneration did not create one clean recovery identity: %#v", recovered[0])
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},

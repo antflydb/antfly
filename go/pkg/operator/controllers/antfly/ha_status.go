@@ -2,6 +2,8 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -1054,6 +1056,10 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			AdminPath:                     adminPath,
 			Reason:                        action.Reason,
 		}
+		if ha != nil && ha.Admin != nil {
+			statusAction.RetryGeneration = ha.Admin.RetryGeneration
+		}
+		statusAction.OperationID = haPlannedActionOperationID(statusAction)
 		statusAction = haPreservePlannedActionExecution(statusAction, status)
 		out = append(out, statusAction)
 	}
@@ -1132,7 +1138,7 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		return action
 	}
 	for _, previous := range status.PlannedActions {
-		if !haSamePlannedActionOperation(action, previous) {
+		if !haSamePlannedActionIdentity(action, previous) {
 			continue
 		}
 		if haActionKind(previous.Kind) == haActionDemoteFormerPrimary &&
@@ -1150,11 +1156,22 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 			!haSeedArtifactReceiptMatches(previous) {
 			return action
 		}
+		if haPlannedActionExecutionStarted(previous) {
+			// Once an external execution is possible, the entire request payload is
+			// immutable. In particular, advancing primary/standby LSN observations and
+			// regenerated Reason strings must not silently retarget a retry.
+			frozen := previous.DeepCopy()
+			if strings.TrimSpace(frozen.OperationID) == "" {
+				frozen.OperationID = haPlannedActionOperationID(action)
+			}
+			return *frozen
+		}
 		action.AdminJobName = previous.AdminJobName
 		action.AdminJobPhase = previous.AdminJobPhase
 		action.AdminError = previous.AdminError
 		action.AdminStatusCode = previous.AdminStatusCode
 		action.AttemptCount = previous.AttemptCount
+		action.RetryBudgetUsed = previous.RetryBudgetUsed
 		action.Retryable = previous.Retryable
 		action.ErrorClass = previous.ErrorClass
 		if previous.FirstAttemptAt != nil {
@@ -1178,6 +1195,88 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		return action
 	}
 	return action
+}
+
+func haPlannedActionExecutionStarted(action antflyv1.HAPlannedActionStatus) bool {
+	if strings.TrimSpace(action.AdminJobName) != "" || action.AttemptCount > 0 || action.InFlightAttempt > 0 {
+		return true
+	}
+	switch action.AdminJobPhase {
+	case haAdminJobPhaseRunning, haAdminJobPhaseSucceeded, haAdminJobPhaseFailed, haAdminJobPhaseWaitingJobFallback:
+		return true
+	default:
+		return false
+	}
+}
+
+// haPlannedActionOperationID intentionally excludes mutable observations
+// (TargetLSN, ObservedLSN, RetainedFromLSN, FenceReason, Reason, and argv hints).
+// Those values remain frozen in the persisted action payload after execution
+// begins, but they do not create an unbounded stream of new retry identities.
+func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
+	identity := struct {
+		Version                       int    `json:"version"`
+		Kind                          string `json:"kind"`
+		Executor                      string `json:"executor"`
+		StandbyName                   string `json:"standby_name"`
+		SlotName                      string `json:"slot_name"`
+		RouteFrom                     string `json:"route_from"`
+		RouteTo                       string `json:"route_to"`
+		FenceAuthority                string `json:"fence_authority"`
+		FenceHolder                   string `json:"fence_holder"`
+		FenceGeneration               uint64 `json:"fence_generation"`
+		AdminURL                      string `json:"admin_url"`
+		AdminNodeID                   string `json:"admin_node_id"`
+		AdminMethod                   string `json:"admin_method"`
+		AdminPath                     string `json:"admin_path"`
+		SeedManifestPath              string `json:"seed_manifest_path"`
+		SeedContentRoot               string `json:"seed_content_root"`
+		SeedArtifactTargetRoot        string `json:"seed_artifact_target_root"`
+		SeedArtifactLocation          string `json:"seed_artifact_location"`
+		SeedArtifactGeneration        string `json:"seed_artifact_generation"`
+		SeedArtifactRetainGenerations int32  `json:"seed_artifact_retain_generations"`
+		RetryGeneration               int64  `json:"retry_generation"`
+	}{
+		Version:                       1,
+		Kind:                          strings.TrimSpace(action.Kind),
+		Executor:                      strings.TrimSpace(action.Executor),
+		StandbyName:                   strings.TrimSpace(action.StandbyName),
+		SlotName:                      strings.TrimSpace(action.SlotName),
+		RouteFrom:                     strings.TrimSpace(action.RouteFrom),
+		RouteTo:                       strings.TrimSpace(action.RouteTo),
+		FenceAuthority:                strings.TrimSpace(string(action.FenceAuthority)),
+		FenceHolder:                   strings.TrimSpace(action.FenceHolder),
+		FenceGeneration:               action.FenceGeneration,
+		AdminURL:                      strings.TrimSpace(action.AdminURL),
+		AdminNodeID:                   strings.TrimSpace(action.AdminNodeID),
+		AdminMethod:                   strings.TrimSpace(action.AdminMethod),
+		AdminPath:                     strings.TrimSpace(action.AdminPath),
+		SeedManifestPath:              strings.TrimSpace(action.SeedManifestPath),
+		SeedContentRoot:               strings.TrimSpace(action.SeedContentRoot),
+		SeedArtifactTargetRoot:        strings.TrimSpace(action.SeedArtifactTargetRoot),
+		SeedArtifactLocation:          strings.TrimSpace(action.SeedArtifactLocation),
+		SeedArtifactGeneration:        strings.TrimSpace(action.SeedArtifactGeneration),
+		SeedArtifactRetainGenerations: action.SeedArtifactRetainGenerations,
+		RetryGeneration:               action.RetryGeneration,
+	}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		panic(fmt.Sprintf("marshal HA operation identity: %v", err))
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("haop-v1-%x", digest[:])
+}
+
+func haSamePlannedActionIdentity(a antflyv1.HAPlannedActionStatus, b antflyv1.HAPlannedActionStatus) bool {
+	aID := strings.TrimSpace(a.OperationID)
+	if aID == "" {
+		aID = haPlannedActionOperationID(a)
+	}
+	bID := strings.TrimSpace(b.OperationID)
+	if bID == "" {
+		bID = haPlannedActionOperationID(b)
+	}
+	return aID == bID
 }
 
 func haFormerPrimaryDemotePreserveAllowed(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {

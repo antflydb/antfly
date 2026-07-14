@@ -2219,17 +2219,22 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	directRetryLimit := int32(0)
 	directRetryBaseSeconds := int32(30)
 	directRetryMaxSeconds := int32(10)
+	directReservationSeconds := int32(0)
+	directPrerequisiteTimeoutSeconds := int32(0)
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
-			PrimaryURL:                 "primary-ha.default.svc:8081",
-			ExecutePlannedActions:      true,
-			JobBackoffLimit:            &backoffLimit,
-			JobTimeoutSeconds:          &timeoutSeconds,
-			JobTTLSecondsAfterFinished: &ttlSecondsAfterFinished,
-			DirectRetryLimit:           &directRetryLimit,
-			DirectRetryBaseSeconds:     &directRetryBaseSeconds,
-			DirectRetryMaxSeconds:      &directRetryMaxSeconds,
+			PrimaryURL:                       "primary-ha.default.svc:8081",
+			ExecutePlannedActions:            true,
+			JobBackoffLimit:                  &backoffLimit,
+			JobTimeoutSeconds:                &timeoutSeconds,
+			JobTTLSecondsAfterFinished:       &ttlSecondsAfterFinished,
+			DirectRetryLimit:                 &directRetryLimit,
+			DirectRetryBaseSeconds:           &directRetryBaseSeconds,
+			DirectRetryMaxSeconds:            &directRetryMaxSeconds,
+			DirectReservationSeconds:         &directReservationSeconds,
+			DirectPrerequisiteTimeoutSeconds: &directPrerequisiteTimeoutSeconds,
+			RetryGeneration:                  -1,
 		},
 		Standbys: []HAStandbySpec{
 			{Name: "standby-a", AdminURL: "grpc://standby-a-ha.default.svc:8081"},
@@ -2247,7 +2252,10 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
 		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") ||
 		!strings.Contains(err.Error(), "admin.directRetryLimit") ||
-		!strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal") {
+		!strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal") ||
+		!strings.Contains(err.Error(), "admin.directReservationSeconds") ||
+		!strings.Contains(err.Error(), "admin.directPrerequisiteTimeoutSeconds") ||
+		!strings.Contains(err.Error(), "admin.retryGeneration") {
 		t.Fatalf("expected invalid HA admin endpoint errors, got: %v", err)
 	}
 }
@@ -2277,6 +2285,26 @@ func TestValidateCreate_HighAvailabilityComparesRetryMaximumWithEffectiveDefault
 	err := cluster.ValidateCreate()
 	if err == nil || !strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds") {
 		t.Fatalf("expected retry maximum below the effective default base to be rejected, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_HighAvailabilityRetryGenerationCannotDecrease(t *testing.T) {
+	oldCluster := baseSwarmCluster()
+	oldCluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:  HAModeHotStandby,
+		Admin: &HAAdminSpec{RetryGeneration: 2},
+	}
+	updated := oldCluster.DeepCopy()
+	updated.Spec.HighAvailability.Admin.RetryGeneration = 1
+
+	err := updated.ValidateUpdate(oldCluster)
+	if err == nil || !strings.Contains(err.Error(), "admin.retryGeneration cannot decrease") {
+		t.Fatalf("expected retryGeneration rollback to be rejected, got: %v", err)
+	}
+
+	updated.Spec.HighAvailability.Admin.RetryGeneration = 3
+	if err := updated.ValidateUpdate(oldCluster); err != nil {
+		t.Fatalf("expected monotonic retryGeneration recovery bump to be accepted, got: %v", err)
 	}
 }
 

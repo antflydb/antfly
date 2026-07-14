@@ -909,13 +909,15 @@ type HAAdminSpec struct {
 	// +optional
 	JobTimeoutSeconds *int64 `json:"jobTimeoutSeconds,omitempty"`
 
-	// JobTTLSecondsAfterFinished controls how long completed CLI-backed HA admin Jobs are retained.
+	// JobTTLSecondsAfterFinished controls how long completed CLI-backed HA admin Jobs are retained
+	// after their terminal evidence has been checkpointed in AntflyCluster status.
 	// +optional
 	JobTTLSecondsAfterFinished *int32 `json:"jobTTLSecondsAfterFinished,omitempty"`
 
-	// DirectRetryLimit bounds attempts for retryable typed HA admin requests. Once
-	// exhausted, the action becomes terminally Failed until its desired identity
-	// changes. Defaults to 8.
+	// DirectRetryLimit bounds retryable typed HA admin failures and expired uncertain
+	// reservations charged to the action's retry budget. Successful prerequisite
+	// polls do not consume it. Once exhausted, the action becomes terminally Failed
+	// until its semantic identity changes or RetryGeneration is incremented. Defaults to 8.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	DirectRetryLimit *int32 `json:"directRetryLimit,omitempty"`
@@ -930,6 +932,29 @@ type HAAdminSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	DirectRetryMaxSeconds *int32 `json:"directRetryMaxSeconds,omitempty"`
+
+	// DirectReservationSeconds bounds an in-flight typed HA admin attempt reservation.
+	// After an operator crash, the exact frozen request may be replayed only after this
+	// lease expires; runtime HA actions are required to return idempotent receipts.
+	// Defaults to 30 seconds.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectReservationSeconds *int32 `json:"directReservationSeconds,omitempty"`
+
+	// DirectPrerequisiteTimeoutSeconds bounds a successful typed assessment that
+	// is waiting for a promotion candidate to apply its frozen boundary. Defaults
+	// to 600 seconds and is independent of the request-failure retry budget.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectPrerequisiteTimeoutSeconds *int32 `json:"directPrerequisiteTimeoutSeconds,omitempty"`
+
+	// RetryGeneration is an operator-controlled recovery nonce. Incrementing it
+	// intentionally creates a new execution identity for terminal HA actions while
+	// leaving ordinary observation changes unable to reset the retry budget. It is
+	// monotonic and the admission webhook rejects decreases.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	RetryGeneration int64 `json:"retryGeneration,omitempty"`
 
 	// EnvFrom is applied to CLI-backed HA admin Job containers, commonly for backup object-store credentials.
 	// +optional
@@ -2018,10 +2043,33 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminStatusCode int `json:"adminStatusCode,omitempty"`
 
+	// OperationID is the stable controller identity for this desired HA operation.
+	// It excludes mutable observations such as LSN progress and human-readable
+	// reasons so replanning cannot orphan an in-flight execution.
+	// +optional
+	OperationID string `json:"operationID,omitempty"`
+
+	// ExecutionStateVersion distinguishes durable bounded-retry state from legacy
+	// Pending/Failed status written before attempt reservations were introduced.
+	// +optional
+	ExecutionStateVersion int32 `json:"executionStateVersion,omitempty"`
+
+	// RetryGeneration is the explicit recovery nonce captured when this operation
+	// was planned.
+	// +optional
+	RetryGeneration int64 `json:"retryGeneration,omitempty"`
+
 	// AttemptCount is the durable number of direct requests or Kubernetes Job pod
 	// attempts observed for this exact action identity.
 	// +optional
 	AttemptCount int32 `json:"attemptCount,omitempty"`
+
+	// RetryBudgetUsed is the durable number of retryable direct-request failures
+	// and expired uncertain reservations charged to the bounded retry budget.
+	// Successful prerequisite polls do not consume this budget; AttemptCount still
+	// records every dispatched request.
+	// +optional
+	RetryBudgetUsed int32 `json:"retryBudgetUsed,omitempty"`
 
 	// Retryable reports whether the latest failure remains within its retry budget.
 	// +optional
@@ -2042,6 +2090,25 @@ type HAPlannedActionStatus struct {
 	// NextRetryAt records the persisted earliest time for the next direct retry.
 	// +optional
 	NextRetryAt *metav1.Time `json:"nextRetryAt,omitempty"`
+
+	// InFlightAttempt is the attempt number durably reserved before a typed admin
+	// request is sent. A nonzero value prevents concurrent or immediate crash replay.
+	// +optional
+	InFlightAttempt int32 `json:"inFlightAttempt,omitempty"`
+
+	// AttemptID identifies the exact in-flight reservation for result checkpointing.
+	// +optional
+	AttemptID string `json:"attemptID,omitempty"`
+
+	// ReservationExpiresAt is the earliest time an uncheckpointed in-flight request
+	// may be replayed with its frozen, idempotent operation payload.
+	// +optional
+	ReservationExpiresAt *metav1.Time `json:"reservationExpiresAt,omitempty"`
+
+	// PrerequisiteDeadlineAt bounds a non-failure wait such as promotion boundary
+	// application. It is preserved across observation replans and request polls.
+	// +optional
+	PrerequisiteDeadlineAt *metav1.Time `json:"prerequisiteDeadlineAt,omitempty"`
 
 	// CompletedAt records terminal success or failure.
 	// +optional

@@ -753,6 +753,14 @@ spec:
                 properties:
                   admin:
                     properties:
+                      directPrerequisiteTimeoutSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      directReservationSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
                       directRetryBaseSeconds:
                         format: int32
                         minimum: 1
@@ -803,6 +811,10 @@ spec:
                         type: integer
                       primaryURL:
                         type: string
+                      retryGeneration:
+                        format: int64
+                        minimum: 0
+                        type: integer
                       tokenEnvVar:
                         pattern: ^$|^[A-Za-z_][A-Za-z0-9_]*$
                         type: string
@@ -4645,6 +4657,8 @@ spec:
                         attemptCount:
                           format: int32
                           type: integer
+                        attemptID:
+                          type: string
                         completedAt:
                           format: date-time
                           type: string
@@ -4652,6 +4666,9 @@ spec:
                           type: string
                         errorClass:
                           type: string
+                        executionStateVersion:
+                          format: int32
+                          type: integer
                         executor:
                           type: string
                         fenceAuthority:
@@ -4666,6 +4683,9 @@ spec:
                         firstAttemptAt:
                           format: date-time
                           type: string
+                        inFlightAttempt:
+                          format: int32
+                          type: integer
                         kind:
                           type: string
                         lastAttemptAt:
@@ -4677,11 +4697,25 @@ spec:
                         observedLSN:
                           format: int64
                           type: integer
+                        operationID:
+                          type: string
                         phase:
+                          type: string
+                        prerequisiteDeadlineAt:
+                          format: date-time
                           type: string
                         reason:
                           type: string
+                        reservationExpiresAt:
+                          format: date-time
+                          type: string
                         retainedFromLSN:
+                          format: int64
+                          type: integer
+                        retryBudgetUsed:
+                          format: int32
+                          type: integer
+                        retryGeneration:
                           format: int64
                           type: integer
                         retryable:

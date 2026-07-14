@@ -33,16 +33,33 @@ func TestHAActionMetricsCountAttemptsAndRetriesWithoutUnboundedLabels(t *testing
 
 func TestHAMetricErrorClassCollapsesUnboundedJobReasons(t *testing.T) {
 	tests := map[string]string{
-		"HTTP503":                     "http_5xx",
-		"HTTP401":                     "http_4xx",
-		"RetryBudgetExhausted":        "retry_budget_exhausted",
-		"BackoffLimitExceeded":        "job_failed",
-		"arbitrary admission message": "job_failed",
-		"":                            "unknown",
+		"HTTP503":                      "http_5xx",
+		"HTTP401":                      "http_4xx",
+		"RetryBudgetExhausted":         "retry_budget_exhausted",
+		"ReservationExpired":           "reservation_expired",
+		"PromotionPrerequisiteTimeout": "promotion_prerequisite_timeout",
+		"BackoffLimitExceeded":         "job_failed",
+		"arbitrary admission message":  "job_failed",
+		"":                             "unknown",
 	}
 	for input, want := range tests {
 		if got := haMetricErrorClass(input); got != want {
 			t.Fatalf("haMetricErrorClass(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestHAActionWaitMetricUsesBoundedReasonLabels(t *testing.T) {
+	action := &antflyv1.HAPlannedActionStatus{Kind: string(haActionAssessPromotion)}
+	waits := haActionWaits.WithLabelValues(action.Kind, "promotion_boundary")
+	before := testutil.ToFloat64(waits)
+
+	haObserveActionWait(action, "promotion_boundary")
+
+	if got := testutil.ToFloat64(waits) - before; got != 1 {
+		t.Fatalf("expected one bounded promotion prerequisite wait, got %v", got)
+	}
+	if got := haMetricWaitReason("arbitrary runtime reason"); got != "unknown" {
+		t.Fatalf("unexpected unbounded wait reason label %q", got)
 	}
 }

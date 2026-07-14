@@ -103,20 +103,44 @@ In `status.haStatus`, check:
   `fencing.reason`;
 - `primaryRoute`;
 - `formerPrimary`;
-- `plannedActions`, including `attemptCount`, `firstAttemptAt`,
-  `lastAttemptAt`, `nextRetryAt`, `completedAt`, `retryable`, and
-  `errorClass`.
+- `plannedActions`, including `operationID`, `executionStateVersion`,
+  `attemptCount`, `retryBudgetUsed`, `inFlightAttempt`, `attemptID`,
+  `reservationExpiresAt`, `prerequisiteDeadlineAt`, `firstAttemptAt`,
+  `lastAttemptAt`, `nextRetryAt`, `completedAt`, `retryable`, and `errorClass`.
 
 Typed admin requests use a durable, bounded exponential retry policy. The
-defaults are eight attempts, a five-second initial delay, and a two-minute
-maximum delay. Override them with `admin.directRetryLimit`,
-`admin.directRetryBaseSeconds`, and `admin.directRetryMaxSeconds`. Exhausting
-the budget produces a terminal `Failed` action with
-`errorClass: RetryBudgetExhausted`; the operator will not silently recreate or
-retry that exact action identity forever. A changed desired action identity is
-required to begin a new execution series. CLI-backed Jobs remain bounded by
-their Kubernetes Job backoff and deadline settings, and their terminal status
-is retained even after the Job TTL controller removes the Job object.
+defaults are eight retry-budget charges, a five-second initial delay, a
+two-minute maximum delay, a 30-second in-flight reservation, and a ten-minute
+prerequisite deadline. Override them with `admin.directRetryLimit`,
+`admin.directRetryBaseSeconds`, `admin.directRetryMaxSeconds`,
+`admin.directReservationSeconds`, and
+`admin.directPrerequisiteTimeoutSeconds`.
+
+Before every typed request, the operator persists an exact frozen action and
+an in-flight reservation. It sends at most one request, checkpoints the typed
+result (and promotion receipt, when applicable), and ends that reconcile. A
+restart cannot replay the request before `reservationExpiresAt`; after expiry,
+the exact request may be replayed only through the runtime's idempotent receipt
+contract. An expired uncertain request consumes retry budget. Status conflicts
+retry only the narrow checkpoint and never repeat the external request.
+
+`attemptCount` is monotonic and records every dispatched request.
+`retryBudgetUsed` records retryable request failures and expired uncertain
+reservations. A valid promotion assessment that is still behind the frozen LSN
+increments `attemptCount` but not `retryBudgetUsed`; it waits until the bounded
+`prerequisiteDeadlineAt`. Exhausting either bounded failure path produces a
+terminal `Failed` action. Ordinary LSN progress and regenerated reason text do
+not create a new operation or reset a terminal budget. After an operator has
+corrected the cause of a terminal failure, increment
+`admin.retryGeneration` to explicitly authorize one new execution identity;
+the webhook rejects decreasing this nonce.
+
+CLI-backed Jobs remain bounded by their Kubernetes Job backoff and deadline
+settings. They use `restartPolicy: Never`, and `attemptCount` is derived from
+started pods owned by the exact current Job UID, not Job counters, names, or
+labels. TTL cleanup is armed only on a later reconcile after terminal evidence
+has been checkpointed, so even `jobTTLSecondsAfterFinished: 0` cannot delete
+the only result before status is durable.
 
 ## Bootstrap and Reseed
 
@@ -180,12 +204,22 @@ Job asks Kubernetes to attach both PVCs at once. The standby runtime itself must
 also mount the target path so the typed bootstrap operation can open the
 verified files.
 
-When a live StatefulSet pod already mounts one of those RWO PVCs, the operator
-adds required same-node pod affinity to the artifact Job using the stable
-StatefulSet pod-name label. This prevents a cross-node `Multi-Attach` race while
-still following the replacement pod after a restart. Multiple live consumers,
-or a consumer that cannot be identified as a stable StatefulSet pod, fail
-closed instead of guessing a node.
+When a live StatefulSet pod already mounts a publish-source RWO PVC, the
+operator adds required same-node pod affinity to the artifact Job using the
+stable StatefulSet pod-name label. Terminating pods remain consumers until
+deleted, preventing an attach race during shutdown. RWX sources need no
+consumer-derived placement; RWOP sources cannot be shared with any live
+non-owner pod. A restore or activation target must have no live consumer at
+all. Only pods controlled by the exact current Job owner UID are excluded; a
+same-name stale Job pod is not trusted. Multiple RWO consumers, an
+unidentifiable consumer, or an unmounted publish source that is not already
+bound to a stable PV fails closed instead of guessing placement.
+
+Portable publish and restore evidence accepts artifact receipt format v1 and
+the bounded-chunk transport format v2. Activation and prune receipts remain
+v1-only because they have different evidence schemas. Unknown versions fail
+closed, and all topology, generation, LSN, manifest, and digest fields must
+still match.
 
 The restore helper never clears an arbitrary directory. It accepts a missing or
 empty target, a partial directory carrying the matching operator staging
@@ -273,6 +307,7 @@ The operator metrics endpoint exports bounded-label HA execution telemetry:
 | `antfly_operator_ha_action_attempts_total` | Actual direct API or Kubernetes Job execution attempts |
 | `antfly_operator_ha_action_retries_total` | Attempts after the first for an exact action identity |
 | `antfly_operator_ha_action_failures_total` | Retryable and terminal failures with a bounded error class |
+| `antfly_operator_ha_action_waits_total` | Successful bounded prerequisite observations, such as promotion-boundary waits |
 | `antfly_operator_ha_action_duration_seconds` | First-attempt to terminal-completion latency |
 | `antfly_operator_ha_seed_artifact_bytes` | Size distribution for successful portable seed operations |
 | `antfly_operator_ha_seed_artifact_files` | File-count distribution for successful portable seed operations |

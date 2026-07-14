@@ -33,6 +33,12 @@ var (
 		Name:      "action_failures_total",
 		Help:      "Number of retryable and terminal HA control-plane action failures.",
 	}, []string{"action", "executor", "class", "terminal"})
+	haActionWaits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "antfly_operator",
+		Subsystem: "ha",
+		Name:      "action_waits_total",
+		Help:      "Number of successful HA control-plane observations that remain blocked on a bounded prerequisite.",
+	}, []string{"action", "reason"})
 	haActionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "antfly_operator",
 		Subsystem: "ha",
@@ -61,10 +67,18 @@ func init() {
 		haActionAttempts,
 		haActionRetries,
 		haActionFailures,
+		haActionWaits,
 		haActionDuration,
 		haSeedArtifactBytes,
 		haSeedArtifactFiles,
 	)
+}
+
+func haObserveActionWait(action *antflyv1.HAPlannedActionStatus, reason string) {
+	if action == nil {
+		return
+	}
+	haActionWaits.WithLabelValues(haMetricActionLabel(action.Kind), haMetricWaitReason(reason)).Inc()
 }
 
 func haObserveActionAttempts(action *antflyv1.HAPlannedActionStatus, executor string, count int32) {
@@ -126,11 +140,33 @@ func haObserveActionCompletion(action *antflyv1.HAPlannedActionStatus, executor,
 }
 
 func haMetricActionLabel(kind string) string {
-	label := strings.TrimSpace(kind)
-	if label == "" {
+	switch label := strings.TrimSpace(kind); label {
+	case string(haActionCreateSlot),
+		string(haActionResumeSlot),
+		string(haActionPauseSlot),
+		string(haActionDropSlot),
+		string(haActionSeedStandby),
+		string(haActionFinishStandbySeed),
+		string(haActionCaptureSeedArtifact),
+		string(haActionPublishSeedArtifact),
+		string(haActionRestoreSeedArtifact),
+		string(haActionActivateSeedArtifact),
+		string(haActionActivateSeededSlot),
+		string(haActionBootstrapStandbySeed),
+		string(haActionPruneSeedArtifacts),
+		string(haActionMarkReseed),
+		string(haActionAcquireFence),
+		string(haActionAssessPromotion),
+		string(haActionPromoteStandby),
+		string(haActionUpdatePrimaryRoute),
+		string(haActionFenceFormerPrimary),
+		string(haActionDemoteFormerPrimary),
+		string(haActionRewindFormerPrimary),
+		string(haActionReseedFormerPrimary):
+		return label
+	default:
 		return "unknown"
 	}
-	return label
 }
 
 func haMetricErrorClass(class string) string {
@@ -139,6 +175,10 @@ func haMetricErrorClass(class string) string {
 		return "retry_budget_exhausted"
 	case value == "PromotionBoundaryNotApplied":
 		return "promotion_boundary_not_applied"
+	case value == "PromotionPrerequisiteTimeout":
+		return "promotion_prerequisite_timeout"
+	case value == "ReservationExpired":
+		return "reservation_expired"
 	case value == "PermanentAdminError":
 		return "permanent_admin_error"
 	case value == "RetryableAdminError":
@@ -157,6 +197,15 @@ func haMetricErrorClass(class string) string {
 		// Kubernetes Job condition reasons are intentionally collapsed to avoid
 		// turning free-form controller or admission text into metric labels.
 		return "job_failed"
+	}
+}
+
+func haMetricWaitReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "promotion_boundary":
+		return "promotion_boundary"
+	default:
+		return "unknown"
 	}
 }
 

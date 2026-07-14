@@ -829,6 +829,16 @@ func (in *HAAdminSpec) DeepCopyInto(out *HAAdminSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.DirectReservationSeconds != nil {
+		in, out := &in.DirectReservationSeconds, &out.DirectReservationSeconds
+		*out = new(int32)
+		**out = **in
+	}
+	if in.DirectPrerequisiteTimeoutSeconds != nil {
+		in, out := &in.DirectPrerequisiteTimeoutSeconds, &out.DirectPrerequisiteTimeoutSeconds
+		*out = new(int32)
+		**out = **in
+	}
 	if in.EnvFrom != nil {
 		in, out := &in.EnvFrom, &out.EnvFrom
 		*out = make([]corev1.EnvFromSource, len(*in))
@@ -940,6 +950,14 @@ func (in *HAPlannedActionStatus) DeepCopyInto(out *HAPlannedActionStatus) {
 	}
 	if in.NextRetryAt != nil {
 		in, out := &in.NextRetryAt, &out.NextRetryAt
+		*out = (*in).DeepCopy()
+	}
+	if in.ReservationExpiresAt != nil {
+		in, out := &in.ReservationExpiresAt, &out.ReservationExpiresAt
+		*out = (*in).DeepCopy()
+	}
+	if in.PrerequisiteDeadlineAt != nil {
+		in, out := &in.PrerequisiteDeadlineAt, &out.PrerequisiteDeadlineAt
 		*out = (*in).DeepCopy()
 	}
 	if in.CompletedAt != nil {

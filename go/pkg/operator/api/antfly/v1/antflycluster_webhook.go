@@ -785,6 +785,15 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 				old.Spec.Storage.SwarmStorage, r.Spec.Storage.SwarmStorage))
 		}
 	}
+	if old.Spec.HighAvailability != nil && old.Spec.HighAvailability.Admin != nil &&
+		r.Spec.HighAvailability != nil && r.Spec.HighAvailability.Admin != nil &&
+		r.Spec.HighAvailability.Admin.RetryGeneration < old.Spec.HighAvailability.Admin.RetryGeneration {
+		errors = append(errors, fmt.Sprintf(
+			"spec.highAvailability.admin.retryGeneration cannot decrease (current: %d, attempted: %d)",
+			old.Spec.HighAvailability.Admin.RetryGeneration,
+			r.Spec.HighAvailability.Admin.RetryGeneration,
+		))
+	}
 
 	if len(errors) > 0 {
 		return fmt.Errorf("%s", strings.Join(errors, "\n\n"))
@@ -1268,9 +1277,25 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if admin.DirectRetryMaxSeconds != nil && *admin.DirectRetryMaxSeconds <= 0 {
 			errors = append(errors, "spec.highAvailability.admin.directRetryMaxSeconds must be greater than 0")
 		}
-		if admin.DirectRetryBaseSeconds != nil && admin.DirectRetryMaxSeconds != nil &&
-			*admin.DirectRetryMaxSeconds < *admin.DirectRetryBaseSeconds {
+		effectiveRetryBase := int32(5)
+		if admin.DirectRetryBaseSeconds != nil {
+			effectiveRetryBase = *admin.DirectRetryBaseSeconds
+		}
+		effectiveRetryMaximum := int32(120)
+		if admin.DirectRetryMaxSeconds != nil {
+			effectiveRetryMaximum = *admin.DirectRetryMaxSeconds
+		}
+		if effectiveRetryMaximum < effectiveRetryBase {
 			errors = append(errors, "spec.highAvailability.admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds")
+		}
+		if admin.DirectReservationSeconds != nil && *admin.DirectReservationSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directReservationSeconds must be greater than 0")
+		}
+		if admin.DirectPrerequisiteTimeoutSeconds != nil && *admin.DirectPrerequisiteTimeoutSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directPrerequisiteTimeoutSeconds must be greater than 0")
+		}
+		if admin.RetryGeneration < 0 {
+			errors = append(errors, "spec.highAvailability.admin.retryGeneration must not be negative")
 		}
 		errors = append(errors, validateHAAdminJobPodSpec(admin)...)
 		if admin.ExecutePlannedActions {

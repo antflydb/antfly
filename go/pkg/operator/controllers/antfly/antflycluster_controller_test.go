@@ -26,7 +26,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -39,58 +41,163 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-type conflictOnceStatusClient struct {
-	client.Client
-	updates   int
-	persisted *antflyv1.AntflyCluster
-}
-
-func (c *conflictOnceStatusClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	if c.persisted != nil && key.Name == c.persisted.Name && key.Namespace == c.persisted.Namespace {
-		cluster, ok := obj.(*antflyv1.AntflyCluster)
-		if !ok {
-			return fmt.Errorf("unexpected persisted status target %T", obj)
+// The default controller-runtime fake client runs updates through structured
+// merge, which cannot represent this CRD's uint64 HA evidence fields. The basic
+// client-go tracker still deep-copies objects and exercises the same client API,
+// without introducing a fake-only product branch or weakening production status
+// subresource writes.
+func newHAControllerTestClient(t *testing.T, scheme *runtime.Scheme, objects ...client.Object) client.Client {
+	t.Helper()
+	tracker := k8stesting.NewObjectTracker(scheme, serializer.NewCodecFactory(scheme).UniversalDecoder())
+	for _, object := range objects {
+		copy := object.DeepCopyObject()
+		if copyObject, ok := copy.(client.Object); ok && copyObject.GetResourceVersion() == "" {
+			copyObject.SetResourceVersion("1")
 		}
-		*cluster = *c.persisted.DeepCopy()
-		return nil
+		if copyObject, ok := copy.(*antflyv1.AntflyCluster); ok && copyObject.UID == "" {
+			copyObject.UID = types.UID("test-antflycluster-uid")
+		}
+		if err := tracker.Add(copy); err != nil {
+			t.Fatalf("add %T to HA controller test tracker: %v", object, err)
+		}
 	}
-	return c.Client.Get(ctx, key, obj, opts...)
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjectTracker(tracker).WithStatusSubresource(&antflyv1.AntflyCluster{}).Build()
 }
 
-func (c *conflictOnceStatusClient) Status() client.SubResourceWriter {
-	return &conflictOnceStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+func reconcileHAAdminJobsUntilIdle(ctx context.Context, reconciler *AntflyClusterReconciler, cluster *antflyv1.AntflyCluster) error {
+	for range 64 {
+		err := reconciler.reconcileHAAdminJobs(ctx, cluster)
+		if stderrors.Is(err, errHAStatusCheckpointed) {
+			continue
+		}
+		if stderrors.Is(err, errHAPlanNeedsPersistence) {
+			if persistErr := reconciler.persistHAActionPlanBarrier(ctx, cluster); persistErr != nil {
+				return persistErr
+			}
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("HA admin reconciliation did not become idle after 64 durable checkpoints")
 }
 
-type conflictOnceStatusWriter struct {
+func durableHACreateSlotCluster(slotName string, targetLSN uint64) *antflyv1.AntflyCluster {
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:         string(haActionCreateSlot),
+		Phase:        string(haActionPhaseReconcile),
+		Executor:     string(haActionExecutorAdminAPI),
+		SlotName:     slotName,
+		TargetLSN:    targetLSN,
+		AdminCommand: []string{"slot", "create", "--slot", slotName, "--initial-lsn", fmt.Sprintf("%d", targetLSN)},
+		AdminURL:     "http://primary-ha.default.svc:8081",
+		AdminNodeID:  "primary-a",
+		AdminMethod:  http.MethodPost,
+		AdminPath:    haAdminReplicationSlotsPath,
+		Reason:       "SlotMissing",
+	}
+	action.OperationID = haPlannedActionOperationID(action)
+	return &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", Generation: 1},
+		Spec: antflyv1.AntflyClusterSpec{HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Mode: antflyv1.HAModeHotStandby,
+			Admin: &antflyv1.HAAdminSpec{
+				PrimaryURL:            action.AdminURL,
+				ExecutePlannedActions: true,
+			},
+		}},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{
+			PlannedActions: []antflyv1.HAPlannedActionStatus{action},
+		}},
+	}
+}
+
+type conflictOnceHAResultClient struct {
+	client.Client
+	conflicts int
+}
+
+type concurrentHAReservationClient struct {
+	client.Client
+	conflicts int
+	expires   time.Time
+}
+
+func (c *concurrentHAReservationClient) Status() client.SubResourceWriter {
+	return &concurrentHAReservationWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type concurrentHAReservationWriter struct {
 	client.SubResourceWriter
-	client *conflictOnceStatusClient
+	client *concurrentHAReservationClient
 }
 
-func (w *conflictOnceStatusWriter) Update(_ context.Context, obj client.Object, _ ...client.SubResourceUpdateOption) error {
-	w.client.updates++
-	if w.client.updates == 1 {
-		w.client.persisted.Status.Phase = "concurrent-status-update"
-		return errors.NewConflict(
-			antflyv1.GroupVersion.WithResource("antflyclusters").GroupResource(),
-			obj.GetName(),
-			fmt.Errorf("injected status resource-version conflict"),
-		)
-	}
+func (w *concurrentHAReservationWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	c := w.client
 	cluster, ok := obj.(*antflyv1.AntflyCluster)
-	if !ok {
-		return fmt.Errorf("unexpected status update target %T", obj)
+	if !ok || c.conflicts > 0 || cluster.Status.HAStatus == nil || len(cluster.Status.HAStatus.PlannedActions) == 0 {
+		return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
 	}
-	if cluster.ResourceVersion != w.client.persisted.ResourceVersion {
-		return errors.NewConflict(
-			antflyv1.GroupVersion.WithResource("antflyclusters").GroupResource(),
-			obj.GetName(),
-			fmt.Errorf("stale status resource version %q, current %q", cluster.ResourceVersion, w.client.persisted.ResourceVersion),
-		)
+	proposed := cluster.Status.HAStatus.PlannedActions[0]
+	if proposed.AdminJobPhase != haAdminJobPhaseRunning || proposed.InFlightAttempt == 0 {
+		return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
 	}
-	w.client.persisted = cluster.DeepCopy()
-	w.client.persisted.ResourceVersion = "persisted-promotion-receipt"
-	cluster.ResourceVersion = w.client.persisted.ResourceVersion
-	return nil
+	latest := &antflyv1.AntflyCluster{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(cluster), latest); err != nil {
+		return err
+	}
+	other := &latest.Status.HAStatus.PlannedActions[0]
+	other.OperationID = proposed.OperationID
+	other.ExecutionStateVersion = 1
+	other.AttemptCount = 1
+	other.InFlightAttempt = 1
+	other.AttemptID = other.OperationID + "/attempt-1/other-controller"
+	other.ReservationExpiresAt = haActionTime(c.expires)
+	other.AdminJobName = haAdminDirectAPIName
+	other.AdminJobPhase = haAdminJobPhaseRunning
+	if err := c.Client.Status().Update(ctx, latest); err != nil {
+		return err
+	}
+	c.conflicts++
+	return errors.NewConflict(
+		antflyv1.GroupVersion.WithResource("antflyclusters").GroupResource(),
+		cluster.Name,
+		fmt.Errorf("another reconciler reserved the action"),
+	)
+}
+
+func (c *conflictOnceHAResultClient) Status() client.SubResourceWriter {
+	return &conflictOnceHAResultWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type conflictOnceHAResultWriter struct {
+	client.SubResourceWriter
+	client *conflictOnceHAResultClient
+}
+
+func (w *conflictOnceHAResultWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	c := w.client
+	cluster, ok := obj.(*antflyv1.AntflyCluster)
+	if !ok || c.conflicts > 0 || cluster.Status.HAStatus == nil || len(cluster.Status.HAStatus.PlannedActions) == 0 {
+		return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+	}
+	action := cluster.Status.HAStatus.PlannedActions[0]
+	if action.AdminJobPhase != haAdminJobPhaseSucceeded || action.InFlightAttempt != 0 {
+		return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+	}
+	latest := &antflyv1.AntflyCluster{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(cluster), latest); err != nil {
+		return err
+	}
+	latest.Status.Phase = "concurrent-status-update"
+	if err := c.Client.Status().Update(ctx, latest); err != nil {
+		return err
+	}
+	c.conflicts++
+	return errors.NewConflict(
+		antflyv1.GroupVersion.WithResource("antflyclusters").GroupResource(),
+		cluster.Name,
+		fmt.Errorf("injected result checkpoint conflict"),
+	)
 }
 
 func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64, token string) string {
@@ -469,7 +576,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 
 	var observed []string
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
@@ -503,8 +610,12 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 		})},
 	}
 	reconciler.updateHAStatusAndConditions(cluster)
+	// The planner and dispatcher are separated by a durable status barrier.
+	// This fixture planned after seeding the fake API, so explicitly model the
+	// outer reconcile persisting that plan before dispatch is allowed.
+	g.Expect(reconciler.persistHAActionPlanBarrier(context.Background(), cluster)).To(Succeed())
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/replication-slots",
 		"POST /admin/v1/ha/base-backups",
@@ -518,7 +629,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	jobs = batchv1.JobList{}
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
 	g.Expect(jobs.Items).To(BeEmpty())
@@ -563,7 +674,7 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 
 	var observed []string
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
@@ -580,7 +691,7 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 			}, nil
 		})},
 	}
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/replication-slots"}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
@@ -633,7 +744,7 @@ func TestReconcileHAAdminJobsUsesConfiguredAdminTokenEnvVar(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.Header.Get("Authorization")).To(Equal("Bearer operator-token"))
@@ -645,7 +756,7 @@ func TestReconcileHAAdminJobsUsesConfiguredAdminTokenEnvVar(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 }
@@ -690,7 +801,7 @@ func TestReconcileHAAdminJobsFailsWhenConfiguredAdminTokenEnvVarMissing(t *testi
 
 	called := false
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			called = true
@@ -698,7 +809,7 @@ func TestReconcileHAAdminJobsFailsWhenConfiguredAdminTokenEnvVarMissing(t *testi
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(called).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
@@ -759,7 +870,7 @@ func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarCome
 
 	called := false
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			called = true
@@ -767,7 +878,7 @@ func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarCome
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(called).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
@@ -844,7 +955,7 @@ func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarCome
 
 	called := false
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			called = true
@@ -852,7 +963,7 @@ func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarCome
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(called).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
@@ -929,11 +1040,11 @@ func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFro
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
@@ -980,7 +1091,7 @@ func TestHAAdminBearerTokenDoesNotReadRuntimeSecretRef(t *testing.T) {
 		Data:       map[string][]byte{"token": []byte("secret-token")},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, secret).Build(),
+		Client: newHAControllerTestClient(t, s, cluster, secret),
 		Scheme: s,
 	}
 
@@ -1045,11 +1156,11 @@ func TestReconcileHAAdminJobsRetainsMissingFailedFallbackJobAsTerminal(t *testin
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseFailed
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminJobName(cluster, action)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 
@@ -1123,7 +1234,7 @@ func TestReconcileHAAdminJobsUsesDefaultAdminTokenEnvVar(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.Header.Get("Authorization")).To(Equal("Bearer default-operator-token"))
@@ -1135,7 +1246,7 @@ func TestReconcileHAAdminJobsUsesDefaultAdminTokenEnvVar(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 }
@@ -1183,11 +1294,11 @@ func TestReconcileHAAdminJobsPassesConfiguredTokenEnvToCLIJob(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
 
 	var jobs batchv1.JobList
@@ -1239,11 +1350,11 @@ func TestReconcileHAAdminJobsDoesNotPassDefaultTokenEnvToCLIJob(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -1292,7 +1403,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingAdminNodeID(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("direct HA admin action without AdminNodeID must not issue HTTP request: %s %s", req.Method, req.URL.Path)
@@ -1300,7 +1411,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingAdminNodeID(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("adminNodeID"))
@@ -1345,7 +1456,7 @@ func TestReconcileHAAdminJobsDoesNotFallbackFromAdminAPIToCLIJob(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("AdminAPI action without typed request inputs must not fall back or issue HTTP request: %s %s", req.Method, req.URL.Path)
@@ -1353,7 +1464,7 @@ func TestReconcileHAAdminJobsDoesNotFallbackFromAdminAPIToCLIJob(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("marked AdminAPI"))
@@ -1397,7 +1508,7 @@ func TestReconcileHAAdminJobsDoesNotRunImplicitCLIJob(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("blank-executor action must not issue typed admin API request: %s %s", req.Method, req.URL.Path)
@@ -1405,7 +1516,7 @@ func TestReconcileHAAdminJobsDoesNotRunImplicitCLIJob(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(BeEmpty())
 
@@ -1453,7 +1564,7 @@ func TestReconcileHAAdminJobsRejectsCLIJobForTypedAdminAction(t *testing.T) {
 	}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("CLIJob action must not issue typed admin API request: %s %s", req.Method, req.URL.Path)
@@ -1461,7 +1572,7 @@ func TestReconcileHAAdminJobsRejectsCLIJobForTypedAdminAction(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("marked CLIJob"))
@@ -1506,7 +1617,7 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/replication-slots"))
@@ -1517,7 +1628,7 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(Equal(http.StatusConflict))
@@ -1571,7 +1682,7 @@ func TestReconcileHAAdminJobsReportsUnauthorizedDirectAPIFailure(t *testing.T) {
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/replication-slots"))
@@ -1582,7 +1693,7 @@ func TestReconcileHAAdminJobsReportsUnauthorizedDirectAPIFailure(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	action := cluster.Status.HAStatus.PlannedActions[0]
 	g.Expect(action.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
@@ -1635,7 +1746,7 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	}
 	requests := 0
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests++
@@ -1655,17 +1766,18 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 		Now: func() time.Time { return now },
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(Equal(http.StatusServiceUnavailable))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("status 503"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("primary restarting"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AttemptCount).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].RetryBudgetUsed).To(Equal(int32(1)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].Retryable).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].ErrorClass).To(Equal("HTTP503"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].NextRetryAt).NotTo(BeNil())
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].NextRetryAt.Time).To(Equal(now.Add(defaultHADirectAdminRetryBase)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].NextRetryAt.Time.Equal(now.Add(defaultHADirectAdminRetryBase))).To(BeTrue())
 	reconciler.updateHAAdminJobExecutionCondition(cluster)
 	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
 	g.Expect(degraded).NotTo(BeNil())
@@ -1673,15 +1785,16 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminActionRetrying))
 	g.Expect(degraded.Message).To(ContainSubstring("primary restarting"))
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(requests).To(Equal(1), "retry must not run before persisted nextRetryAt")
 	now = now.Add(defaultHADirectAdminRetryBase)
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(requests).To(Equal(2))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(BeZero())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AttemptCount).To(Equal(int32(2)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].RetryBudgetUsed).To(Equal(int32(1)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].Retryable).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].CompletedAt).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
@@ -1717,7 +1830,7 @@ func TestReconcileHAAdminJobsFailsClosedAfterRetryBudget(t *testing.T) {
 	}
 	requests := 0
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(), Scheme: s,
+		Client: newHAControllerTestClient(t, s, cluster), Scheme: s,
 		Now: func() time.Time { return now },
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			requests++
@@ -1725,15 +1838,17 @@ func TestReconcileHAAdminJobsFailsClosedAfterRetryBudget(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	action := &cluster.Status.HAStatus.PlannedActions[0]
 	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhasePending))
 	g.Expect(action.AttemptCount).To(Equal(int32(1)))
+	g.Expect(action.RetryBudgetUsed).To(Equal(int32(1)))
 	now = action.NextRetryAt.Time
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(requests).To(Equal(2))
 	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(action.AttemptCount).To(Equal(retryLimit))
+	g.Expect(action.RetryBudgetUsed).To(Equal(retryLimit))
 	g.Expect(action.Retryable).To(BeFalse())
 	g.Expect(action.ErrorClass).To(Equal("RetryBudgetExhausted"))
 	g.Expect(action.CompletedAt).NotTo(BeNil())
@@ -1745,8 +1860,414 @@ func TestReconcileHAAdminJobsFailsClosedAfterRetryBudget(t *testing.T) {
 	g.Expect(degraded.Message).To(ContainSubstring("class RetryBudgetExhausted"))
 
 	now = now.Add(time.Hour)
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(requests).To(Equal(2), "terminal retry exhaustion must survive subsequent reconciles")
+}
+
+func TestHADirectActionCheckpointsReservationBeforeDispatchAndStopsAfterOneSideEffect(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	second := cluster.Status.HAStatus.PlannedActions[0]
+	second.SlotName = "standby-b"
+	second.TargetLSN = 6
+	second.AdminCommand = []string{"slot", "create", "--slot", "standby-b", "--initial-lsn", "6"}
+	second.OperationID = haPlannedActionOperationID(second)
+	cluster.Status.HAStatus.PlannedActions = append(cluster.Status.HAStatus.PlannedActions, second)
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client: apiClient,
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			var payload map[string]any
+			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+			slotName, _ := payload["slot_name"].(string)
+
+			persisted := &antflyv1.AntflyCluster{}
+			g.Expect(apiClient.Get(req.Context(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+			var reserved *antflyv1.HAPlannedActionStatus
+			for i := range persisted.Status.HAStatus.PlannedActions {
+				if persisted.Status.HAStatus.PlannedActions[i].SlotName == slotName {
+					reserved = &persisted.Status.HAStatus.PlannedActions[i]
+					break
+				}
+			}
+			g.Expect(reserved).NotTo(BeNil())
+			g.Expect(reserved.AdminJobPhase).To(Equal(haAdminJobPhaseRunning))
+			g.Expect(reserved.InFlightAttempt).To(Equal(int32(1)))
+			g.Expect(reserved.AttemptID).NotTo(BeEmpty())
+			g.Expect(reserved.ReservationExpiresAt).NotTo(BeNil())
+			g.Expect(reserved.AdminResult).To(BeNil(), "result evidence cannot exist before the external response")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", slotName, "primary-a"))),
+			}, nil
+		})},
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(1), "a checkpoint boundary must end the reconcile before a second external action")
+	persisted := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+	first := persisted.Status.HAStatus.PlannedActions[0]
+	g.Expect(first.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(first.InFlightAttempt).To(BeZero())
+	g.Expect(first.AttemptID).To(BeEmpty())
+	g.Expect(first.ReservationExpiresAt).To(BeNil())
+	g.Expect(first.AdminResult).NotTo(BeNil())
+	g.Expect(first.AdminResult.SlotName).To(Equal("standby-a"))
+	g.Expect(persisted.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(BeEmpty())
+
+	err = reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(2))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+}
+
+func TestHADirectActionReservationConflictNeverDispatchesUsingAnotherOwnersLease(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	now := time.Date(2026, 7, 14, 20, 30, 0, 0, time.UTC)
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	baseClient := newHAControllerTestClient(t, s, cluster)
+	reservationClient := &concurrentHAReservationClient{Client: baseClient, expires: now.Add(time.Minute)}
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client: reservationClient,
+		Scheme: s,
+		Now:    func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return nil, fmt.Errorf("losing reconciler must not dispatch")
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reservationClient.conflicts).To(Equal(1))
+	g.Expect(requests).To(BeZero())
+	action := cluster.Status.HAStatus.PlannedActions[0]
+	g.Expect(action.InFlightAttempt).To(Equal(int32(1)))
+	g.Expect(action.AttemptID).To(ContainSubstring("/other-controller"))
+	g.Expect(action.ReservationExpiresAt).NotTo(BeNil())
+	g.Expect(action.ReservationExpiresAt.After(now)).To(BeTrue())
+}
+
+func TestHADirectActionCrashReplayWaitsForLeaseAndUsesExactFrozenPayload(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	now := time.Date(2026, 7, 14, 21, 0, 0, 0, time.UTC)
+	reservationSeconds := int32(10)
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	cluster.Spec.HighAvailability.Admin.DirectReservationSeconds = &reservationSeconds
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	requests := 0
+	var payloads []map[string]any
+	var attemptIDs []string
+	reconciler := &AntflyClusterReconciler{
+		Client: apiClient,
+		Scheme: s,
+		Now:    func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			var payload map[string]any
+			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+			payloads = append(payloads, payload)
+			persisted := &antflyv1.AntflyCluster{}
+			g.Expect(apiClient.Get(req.Context(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+			attemptIDs = append(attemptIDs, persisted.Status.HAStatus.PlannedActions[0].AttemptID)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
+			}, nil
+		})},
+	}
+	action := &cluster.Status.HAStatus.PlannedActions[0]
+	reserved, checkpointed, err := reconciler.reserveHADirectAdminAttempt(context.Background(), cluster, cluster.Spec.HighAvailability.Admin, action, now)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(reserved).To(BeTrue())
+	g.Expect(checkpointed).To(BeTrue())
+	firstAttemptID := action.AttemptID
+	handled, err := reconciler.executeHAPlannedActionTyped(context.Background(), cluster, action)
+	g.Expect(handled).To(BeTrue())
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(requests).To(Equal(1))
+
+	// Simulate process death after the external response but before its result
+	// checkpoint by discarding the in-memory result and reloading the CR.
+	restarted := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), restarted)).To(Succeed())
+	g.Expect(restarted.Status.HAStatus.PlannedActions[0].AdminResult).To(BeNil())
+	g.Expect(restarted.Status.HAStatus.PlannedActions[0].AttemptID).To(Equal(firstAttemptID))
+	now = now.Add(9 * time.Second)
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), restarted)).To(Succeed())
+	g.Expect(requests).To(Equal(1), "an unexpired reservation must suppress immediate crash replay")
+
+	now = now.Add(time.Second)
+	err = reconciler.reconcileHAAdminJobs(context.Background(), restarted)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(2))
+	g.Expect(payloads).To(HaveLen(2))
+	g.Expect(payloads[1]).To(Equal(payloads[0]), "crash replay must use the exact frozen idempotent request")
+	g.Expect(attemptIDs).To(HaveLen(2))
+	g.Expect(attemptIDs[0]).NotTo(BeEmpty())
+	g.Expect(attemptIDs[1]).NotTo(Equal(attemptIDs[0]), "each replay reservation must have a distinct ownership token")
+	g.Expect(restarted.Status.HAStatus.PlannedActions[0].AttemptCount).To(Equal(int32(2)))
+	g.Expect(restarted.Status.HAStatus.PlannedActions[0].RetryBudgetUsed).To(Equal(int32(1)), "an expired uncertain dispatch must consume replay budget")
+	g.Expect(restarted.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+}
+
+func TestHADirectActionExpiredUncertainLeaseCannotExceedRetryBudget(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	now := time.Date(2026, 7, 14, 21, 30, 0, 0, time.UTC)
+	reservationSeconds := int32(1)
+	retryLimit := int32(1)
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	cluster.Spec.HighAvailability.Admin.DirectReservationSeconds = &reservationSeconds
+	cluster.Spec.HighAvailability.Admin.DirectRetryLimit = &retryLimit
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client: apiClient,
+		Scheme: s,
+		Now:    func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
+			}, nil
+		})},
+	}
+	action := &cluster.Status.HAStatus.PlannedActions[0]
+	reserved, _, err := reconciler.reserveHADirectAdminAttempt(context.Background(), cluster, cluster.Spec.HighAvailability.Admin, action, now)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(reserved).To(BeTrue())
+	_, err = reconciler.executeHAPlannedActionTyped(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(requests).To(Equal(1))
+
+	restarted := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), restarted)).To(Succeed())
+	now = now.Add(time.Second)
+	err = reconciler.reconcileHAAdminJobs(context.Background(), restarted)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(1), "expired uncertainty must fail closed once replay budget is exhausted")
+	failed := restarted.Status.HAStatus.PlannedActions[0]
+	g.Expect(failed.AttemptCount).To(Equal(int32(1)))
+	g.Expect(failed.RetryBudgetUsed).To(Equal(int32(1)))
+	g.Expect(failed.AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(failed.ErrorClass).To(Equal("RetryBudgetExhausted"))
+}
+
+func TestHADirectPrerequisiteDeadlineWinsOverLaterPollAndFailureBudget(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	now := time.Date(2026, 7, 14, 21, 45, 0, 0, time.UTC)
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	action := &cluster.Status.HAStatus.PlannedActions[0]
+	action.ExecutionStateVersion = 1
+	action.AdminJobName = haAdminDirectAPIName
+	action.AdminJobPhase = haAdminJobPhaseWaitingPrerequisite
+	action.AttemptCount = 4
+	action.RetryBudgetUsed = 0
+	action.NextRetryAt = haActionTime(now.Add(time.Minute))
+	action.PrerequisiteDeadlineAt = haActionTime(now)
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client: apiClient,
+		Scheme: s,
+		Now:    func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return nil, fmt.Errorf("unexpected request")
+		})},
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(BeZero())
+	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(action.ErrorClass).To(Equal("PromotionPrerequisiteTimeout"))
+	g.Expect(action.AttemptCount).To(Equal(int32(4)))
+	g.Expect(action.RetryBudgetUsed).To(BeZero())
+
+	requeueCluster := cluster.DeepCopy()
+	requeueAction := &requeueCluster.Status.HAStatus.PlannedActions[0]
+	requeueAction.AdminJobPhase = haAdminJobPhaseWaitingPrerequisite
+	requeueAction.CompletedAt = nil
+	requeueAction.NextRetryAt = haActionTime(now.Add(time.Minute))
+	requeueAction.PrerequisiteDeadlineAt = haActionTime(now.Add(3 * time.Second))
+	g.Expect(haDirectAdminRetryRequeueAfter(requeueCluster, now)).To(Equal(3 * time.Second))
+}
+
+func TestHADirectActionResultConflictRetriesCheckpointWithoutRepeatingRequest(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	baseClient := newHAControllerTestClient(t, s, cluster)
+	conflictClient := &conflictOnceHAResultClient{Client: baseClient}
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client: conflictClient,
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
+			}, nil
+		})},
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(1))
+	g.Expect(conflictClient.conflicts).To(Equal(1))
+	persisted := &antflyv1.AntflyCluster{}
+	g.Expect(baseClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+	g.Expect(persisted.Status.Phase).To(Equal("concurrent-status-update"), "narrow result retry must preserve unrelated concurrent status")
+	g.Expect(persisted.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(persisted.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
+}
+
+func TestHADirectActionRejectsAbsentOrReplacedPersistedPlanWithoutDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*antflyv1.AntflyCluster)
+	}{
+		{
+			name: "absent",
+			mutate: func(cluster *antflyv1.AntflyCluster) {
+				cluster.Status.HAStatus.PlannedActions = nil
+			},
+		},
+		{
+			name: "replaced",
+			mutate: func(cluster *antflyv1.AntflyCluster) {
+				action := &cluster.Status.HAStatus.PlannedActions[0]
+				action.SlotName = "standby-b"
+				action.OperationID = haPlannedActionOperationID(*action)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			s := runtime.NewScheme()
+			g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+			cluster := durableHACreateSlotCluster("standby-a", 5)
+			apiClient := newHAControllerTestClient(t, s, cluster)
+			latest := &antflyv1.AntflyCluster{}
+			g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), latest)).To(Succeed())
+			tc.mutate(latest)
+			g.Expect(apiClient.Status().Update(context.Background(), latest)).To(Succeed())
+			requests := 0
+			reconciler := &AntflyClusterReconciler{
+				Client: apiClient,
+				Scheme: s,
+				HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					requests++
+					return nil, fmt.Errorf("unexpected request")
+				})},
+			}
+
+			err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+			g.Expect(stderrors.Is(err, errHAPlanNeedsPersistence)).To(BeTrue(), "got %v", err)
+			g.Expect(requests).To(BeZero())
+		})
+	}
+}
+
+func TestHADirectReservationRequiresExactCurrentPersistedPayload(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	latest := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), latest)).To(Succeed())
+	// TargetLSN is intentionally outside the stable operation ID. A concurrent
+	// plan can therefore have the same semantic identity but a different exact
+	// request payload, which reservation must reject rather than silently retarget.
+	latest.Status.HAStatus.PlannedActions[0].TargetLSN = 6
+	g.Expect(apiClient.Status().Update(context.Background(), latest)).To(Succeed())
+	reconciler := &AntflyClusterReconciler{Client: apiClient, Scheme: s}
+
+	reserved, _, err := reconciler.reserveHADirectAdminAttempt(
+		context.Background(),
+		cluster,
+		cluster.Spec.HighAvailability.Admin,
+		&cluster.Status.HAStatus.PlannedActions[0],
+		time.Date(2026, 7, 14, 22, 0, 0, 0, time.UTC),
+	)
+	g.Expect(reserved).To(BeFalse())
+	g.Expect(stderrors.Is(err, errHADirectOperationNotPersisted)).To(BeTrue(), "got %v", err)
+	persisted := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+	g.Expect(persisted.Status.HAStatus.PlannedActions[0].InFlightAttempt).To(BeZero())
+	g.Expect(persisted.Status.HAStatus.PlannedActions[0].AttemptCount).To(BeZero())
+}
+
+func TestHADirectActionLegacyFailedStatusMigratesBeforeOneBoundedReplay(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	now := time.Date(2026, 7, 14, 22, 0, 0, 0, time.UTC)
+	retryLimit := int32(2)
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	cluster.Spec.HighAvailability.Admin.DirectRetryLimit = &retryLimit
+	legacyJSON := `{"kind":"CreateSlot","phase":"Reconcile","executor":"AdminAPI","slotName":"standby-a","targetLSN":5,"adminCommand":["slot","create","--slot","standby-a","--initial-lsn","5"],"adminURL":"http://primary-ha.default.svc:8081","adminNodeID":"primary-a","adminMethod":"POST","adminPath":"/admin/v1/ha/replication-slots","adminJobName":"direct-admin-api","adminJobPhase":"Failed","adminError":"legacy retryable failure","retryable":true,"reason":"SlotMissing"}`
+	var legacy antflyv1.HAPlannedActionStatus
+	g.Expect(json.Unmarshal([]byte(legacyJSON), &legacy)).To(Succeed())
+	legacy.OperationID = haPlannedActionOperationID(legacy)
+	cluster.Status.HAStatus.PlannedActions[0] = legacy
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client: apiClient,
+		Scheme: s,
+		Now:    func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
+			}, nil
+		})},
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(BeZero(), "legacy status migration is its own durable barrier")
+	migrated := cluster.Status.HAStatus.PlannedActions[0]
+	g.Expect(migrated.ExecutionStateVersion).To(Equal(int32(1)))
+	g.Expect(migrated.AttemptCount).To(Equal(int32(1)))
+	g.Expect(migrated.RetryBudgetUsed).To(Equal(int32(1)))
+	g.Expect(migrated.AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(migrated.NextRetryAt).NotTo(BeNil())
+
+	err = reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(1))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AttemptCount).To(Equal(int32(2)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].RetryBudgetUsed).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 }
 
 func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
@@ -1783,7 +2304,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/replication-slots"))
@@ -1795,7 +2316,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("typed result evidence"))
@@ -1840,7 +2361,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMismatchedResultEvidence(t *testing
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/replication-slots"))
@@ -1852,7 +2373,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMismatchedResultEvidence(t *testing
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("typed result evidence"))
@@ -1891,7 +2412,7 @@ func TestReconcileHAAdminJobsRejectsDirectSeedWithoutTargetLSN(t *testing.T) {
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("seed without target LSN must fail before HTTP request, got %s %s", req.Method, req.URL.String())
@@ -1899,7 +2420,7 @@ func TestReconcileHAAdminJobsRejectsDirectSeedWithoutTargetLSN(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("nonzero target LSN"))
@@ -2124,7 +2645,7 @@ func TestReconcileHAAdminJobsRejectsMismatchedTypedAdminOperation(t *testing.T) 
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			t.Fatalf("mismatched typed admin metadata must fail before issuing HTTP request: %s %s", req.Method, req.URL.Path)
@@ -2132,7 +2653,7 @@ func TestReconcileHAAdminJobsRejectsMismatchedTypedAdminOperation(t *testing.T) 
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 
@@ -2211,12 +2732,9 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		},
 	}
 	var observed []string
-	statusClient := &conflictOnceStatusClient{
-		Client:    fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
-		persisted: cluster.DeepCopy(),
-	}
+	apiClient := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{
-		Client: statusClient,
+		Client: apiClient,
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
@@ -2264,13 +2782,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		})},
 	}
 
-	var before antflyv1.AntflyCluster
-	g.Expect(reconciler.Get(
-		context.Background(),
-		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
-		&before,
-	)).To(Succeed())
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/fence",
 		"POST /admin/v1/ha/promotion/assess",
@@ -2337,35 +2849,25 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(persisted.Status.HAStatus).NotTo(BeNil())
 	g.Expect(persisted.Status.HAStatus.LastPromotion).NotTo(BeNil())
 	g.Expect(persisted.Status.HAStatus.LastPromotion.FenceToken).To(Equal("ha-fence-token"))
-	g.Expect(persisted.Status.Phase).To(Equal("concurrent-status-update"))
-	g.Expect(statusClient.updates).To(Equal(2))
-
-	// The receipt write advances the stored resource version. The rest of this
-	// reconcile still holds a stale, full status object, so its eventual update
-	// must conflict instead of overwriting the concurrent status field.
-	err := reconciler.Status().Update(context.Background(), cluster)
-	g.Expect(errors.IsConflict(err)).To(BeTrue())
-	g.Expect(statusClient.updates).To(Equal(3))
-	g.Expect(reconciler.Get(
-		context.Background(),
-		types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
-		&persisted,
-	)).To(Succeed())
-	g.Expect(persisted.Status.Phase).To(Equal("concurrent-status-update"))
-	g.Expect(persisted.Status.HAStatus.LastPromotion.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(persisted.Status.Phase).To(BeEmpty())
 }
 
 func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAssessment(t *testing.T) {
 	g := NewWithT(t)
 	now := time.Date(2026, 7, 14, 20, 0, 0, 0, time.UTC)
+	retryLimit := int32(1)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 
 	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
 		Spec: antflyv1.AntflyClusterSpec{
 			HighAvailability: &antflyv1.HighAvailabilitySpec{
 				Mode: antflyv1.HAModeHotStandby,
 				Admin: &antflyv1.HAAdminSpec{
 					PrimaryURL:            "http://primary-ha.default.svc:8081",
 					ExecutePlannedActions: true,
+					DirectRetryLimit:      &retryLimit,
 				},
 				Identity: &antflyv1.HAReplicationIdentitySpec{
 					ClusterID:        100,
@@ -2427,7 +2929,9 @@ func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAsse
 	var observed []string
 	assessmentCalls := 0
 	reconciler := &AntflyClusterReconciler{
-		Now: func() time.Time { return now },
+		Client: newHAControllerTestClient(t, s, cluster),
+		Scheme: s,
+		Now:    func() time.Time { return now },
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.URL.Host+" "+req.Method+" "+req.URL.Path)
 			var payload map[string]any
@@ -2474,13 +2978,15 @@ func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAsse
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhaseWaitingPrerequisite))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminError).To(ContainSubstring("has not applied the frozen former-primary boundary"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AttemptCount).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].RetryBudgetUsed).To(BeZero())
 	now = cluster.Status.HAStatus.PlannedActions[2].NextRetryAt.Time
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"primary-ha.default.svc:8081 POST /admin/v1/ha/fence",
 		"standby-a-ha.default.svc:8081 POST /admin/v1/ha/fence",
@@ -2495,6 +3001,8 @@ func TestReconcileHAAdminJobsFreezesFormerPrimaryTailBeforeCandidateFenceAndAsse
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceToken).To(Equal("tail-17-token"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].TargetLSN).To(Equal(uint64(17)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.PromotionAppliedLSN).To(Equal(uint64(17)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AttemptCount).To(Equal(int32(2)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].RetryBudgetUsed).To(BeZero(), "valid prerequisite polling must not consume a request-failure budget of one")
 }
 
 func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
@@ -2568,7 +3076,7 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 			}
 			var observed []string
 			reconciler := &AntflyClusterReconciler{
-				Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+				Client: newHAControllerTestClient(t, s, cluster),
 				Scheme: s,
 				HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 					observed = append(observed, req.Method+" "+req.URL.Path)
@@ -2588,7 +3096,7 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 				})},
 			}
 
-			g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+			g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 			g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/promotion/assess"}))
 			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
@@ -2662,7 +3170,7 @@ func TestReconcileHAAdminJobsRejectsMismatchedDirectFenceReceipt(t *testing.T) {
 	}
 	var observed []string
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
@@ -2680,7 +3188,7 @@ func TestReconcileHAAdminJobsRejectsMismatchedDirectFenceReceipt(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/fence"}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
@@ -2754,7 +3262,7 @@ func TestReconcileHAAdminJobsDurablyFencesFormerPrimaryFromPromotionReceipt(t *t
 	}
 	var request adminsdk.FenceAcquireRequest
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.Method).To(Equal(http.MethodPost))
@@ -2774,7 +3282,7 @@ func TestReconcileHAAdminJobsDurablyFencesFormerPrimaryFromPromotionReceipt(t *t
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(request.Identity).To(Equal(adminsdk.HAIdentity{ClusterId: 100, ShardId: 10, TableId: 20, TimelineId: 4, Epoch: 6}))
 	g.Expect(string(request.OldPrimaryId)).To(Equal("primary-a"))
 	g.Expect(string(request.PromotedNodeId)).To(Equal("standby-a"))
@@ -2849,7 +3357,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.Path {
@@ -2872,7 +3380,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
@@ -3004,7 +3512,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 
 	var observed []string
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
@@ -3033,7 +3541,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/rejoin/rewind"}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
@@ -3134,7 +3642,7 @@ func TestReconcileHAAdminJobsRejectsDirectRejoinWorkflowMismatchedAssessment(t *
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/rejoin/rewind"))
@@ -3146,7 +3654,7 @@ func TestReconcileHAAdminJobsRejectsDirectRejoinWorkflowMismatchedAssessment(t *
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
@@ -3193,11 +3701,11 @@ func TestReconcileHAAdminJobsMarksExecutableActionMissingAdminURL(t *testing.T) 
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseMissingAdminURL))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(BeEmpty())
@@ -3449,7 +3957,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 
 	var observed []string
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Client: newHAControllerTestClient(t, s, cluster),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
@@ -3493,8 +4001,9 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	}
 	reconciler.updateHAStatusAndConditions(cluster)
 	g.Expect(cluster.Status.HAStatus.PlannedActions).To(HaveLen(4))
+	g.Expect(reconciler.persistHAActionPlanBarrier(context.Background(), cluster)).To(Succeed())
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
@@ -3886,6 +4395,50 @@ func TestHAAdminJobCountsOnlyStartedPodsOwnedByExactJobUID(t *testing.T) {
 	g.Expect(r.reconcileHAAdminJob(context.Background(), cluster, &antflyv1.HAAdminSpec{}, &action)).To(Succeed())
 	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhaseRunning))
 	g.Expect(action.AttemptCount).To(BeZero(), "an unscheduled/unstarted pod is not an external process attempt")
+}
+
+func TestObserveHAAdminJobAttemptsRejectsStaleNameLabelsAndTracksExactPodTimes(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "ha-admin", Namespace: "default", UID: types.UID("current-job-uid"),
+	}}
+	controller := true
+	startedAt := time.Date(2026, 7, 14, 18, 0, 0, 0, time.UTC)
+	finishedAt := startedAt.Add(2 * time.Minute)
+	ownedPod := func(name string, uid types.UID, state corev1.ContainerState) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: "default",
+				Labels: map[string]string{"job-name": job.Name, "batch.kubernetes.io/job-name": job.Name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "batch/v1", Kind: "Job", Name: job.Name,
+					UID: uid, Controller: &controller,
+				}},
+			},
+			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "ha-admin", State: state}}},
+		}
+	}
+	first := ownedPod("ha-admin-first", job.UID, corev1.ContainerState{
+		Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(startedAt)},
+	})
+	second := ownedPod("ha-admin-second", job.UID, corev1.ContainerState{
+		Terminated: &corev1.ContainerStateTerminated{StartedAt: metav1.NewTime(finishedAt), FinishedAt: metav1.NewTime(finishedAt.Add(time.Second))},
+	})
+	stale := ownedPod("ha-admin-stale", types.UID("deleted-job-uid"), corev1.ContainerState{
+		Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(startedAt.Add(-time.Hour))},
+	})
+	r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(first, second, stale).Build()}
+
+	count, firstObserved, lastObserved, err := r.observeHAAdminJobPodAttempts(context.Background(), job)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(count).To(Equal(int32(2)))
+	g.Expect(firstObserved).NotTo(BeNil())
+	g.Expect(lastObserved).NotTo(BeNil())
+	g.Expect(firstObserved.Time.Equal(startedAt)).To(BeTrue())
+	g.Expect(lastObserved.Time.Equal(finishedAt)).To(BeTrue())
 }
 
 func TestHAAdminJobArmsTTLOnlyAfterTerminalStatusWasCheckpointed(t *testing.T) {
@@ -4970,7 +5523,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 	}}
 
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, failedPauseJob).Build(),
+		Client: newHAControllerTestClient(t, s, cluster, failedPauseJob),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/base-backups"))
@@ -4985,7 +5538,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 		})},
 	}
 
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -6539,6 +7092,75 @@ func TestParseHASeedArtifactReceiptRequiresMatchingTypedEvidence(t *testing.T) {
 	g.Expect(activationReceipt.TargetPVCUID).To(Equal("pvc-uid-1"))
 	activateAction.SeedArtifactReceipt = activationReceipt
 	g.Expect(haAdminActionSucceededWithEvidence(activateAction)).To(BeTrue())
+}
+
+func TestParseHASeedArtifactReceiptVersionContracts(t *testing.T) {
+	g := NewWithT(t)
+	manifestDigest := strings.Repeat("a", 64)
+	aggregateDigest := strings.Repeat("b", 64)
+	seedDigest := strings.Repeat("c", 64)
+	body := func(version int) string {
+		return fmt.Sprintf(`{"format_version":%d,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"manifest_sha256":"%s","aggregate_sha256":"%s","seed_receipt_sha256":"%s","generation_path":"generations/seed-standby-a-10","topology_id":"test-swarm","topology_generation":3,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-1","total_bytes":42,"files":[{"path":"catalog/manifest"}]}`, version, manifestDigest, aggregateDigest, seedDigest)
+	}
+	for _, kind := range []haActionKind{haActionPublishSeedArtifact, haActionRestoreSeedArtifact} {
+		for _, version := range []int{1, 2} {
+			action := antflyv1.HAPlannedActionStatus{
+				Kind: string(kind), SlotName: "standby-a", TargetLSN: 10,
+				SeedArtifactGeneration: "seed-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+			}
+			receipt := parseHASeedArtifactReceipt(body(version), action)
+			g.Expect(receipt).NotTo(BeNil(), "%s format v%d", kind, version)
+			g.Expect(receipt.FormatVersion).To(Equal(int32(version)))
+			g.Expect(receipt.Generation).To(Equal("seed-standby-a-10"))
+			g.Expect(receipt.SlotName).To(Equal("standby-a"))
+			g.Expect(receipt.ClusterID).To(Equal(uint64(100)))
+			g.Expect(receipt.ShardID).To(Equal(uint64(10)))
+			g.Expect(receipt.TableID).To(Equal(uint64(20)))
+			g.Expect(receipt.TimelineID).To(Equal(uint64(4)))
+			g.Expect(receipt.Epoch).To(Equal(uint64(6)))
+			g.Expect(receipt.ManifestID).To(Equal("base-standby-a-10"))
+			g.Expect(receipt.BackupLSN).To(Equal(uint64(10)))
+			g.Expect(receipt.CheckpointLSN).To(Equal(uint64(12)))
+			g.Expect(receipt.ManifestSHA256).To(Equal(manifestDigest))
+			g.Expect(receipt.AggregateSHA256).To(Equal(aggregateDigest))
+			g.Expect(receipt.SeedReceiptSHA256).To(Equal(seedDigest))
+			g.Expect(receipt.GenerationPath).To(Equal("generations/seed-standby-a-10"))
+			g.Expect(receipt.TopologyID).To(Equal("test-swarm"))
+			g.Expect(receipt.TopologyGeneration).To(Equal(int64(3)))
+			g.Expect(receipt.NodeID).To(Equal("standby-a"))
+			g.Expect(receipt.TargetPVCName).To(Equal("standby-a-data"))
+			g.Expect(receipt.TargetPVCUID).To(Equal("pvc-uid-1"))
+			g.Expect(receipt.TotalBytes).To(Equal(uint64(42)))
+			g.Expect(receipt.FileCount).To(Equal(int32(1)))
+			action.SeedArtifactReceipt = receipt
+			g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
+		}
+		for _, unsupported := range []int{0, 3} {
+			action := antflyv1.HAPlannedActionStatus{
+				Kind: string(kind), SlotName: "standby-a", TargetLSN: 10,
+				SeedArtifactGeneration: "seed-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+			}
+			g.Expect(parseHASeedArtifactReceipt(body(unsupported), action)).To(BeNil(), "%s format v%d must fail closed", kind, unsupported)
+		}
+	}
+
+	activation := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a", TargetLSN: 10,
+		SeedArtifactGeneration: "seed-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+	}
+	activationBody := func(version int) string {
+		return fmt.Sprintf(`{"format_version":%d,"generation":"seed-standby-a-10","slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"manifest_sha256":"%s","aggregate_sha256":"%s","seed_receipt_sha256":"%s","generation_path":"generations/seed-standby-a-10"}`, version, manifestDigest, aggregateDigest, seedDigest)
+	}
+	g.Expect(parseHASeedArtifactReceipt(activationBody(1), activation)).NotTo(BeNil())
+	g.Expect(parseHASeedArtifactReceipt(activationBody(2), activation)).To(BeNil(), "activation receipt schema remains v1-only")
+
+	prune := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionPruneSeedArtifacts), SlotName: "standby-a",
+		SeedArtifactGeneration: "seed-standby-a-10", SeedArtifactRetainGenerations: 2,
+		AdminJobPhase: haAdminJobPhaseSucceeded,
+	}
+	g.Expect(parseHASeedArtifactReceipt(`{"format_version":1,"slot_name":"standby-a","current_generation":"seed-standby-a-10","retained_generations":2,"deleted_generations":1}`, prune)).NotTo(BeNil())
+	g.Expect(parseHASeedArtifactReceipt(`{"format_version":2,"slot_name":"standby-a","current_generation":"seed-standby-a-10","retained_generations":2,"deleted_generations":1}`, prune)).To(BeNil(), "prune receipt schema remains v1-only")
 }
 
 func TestCompletedSlotAdminJobResultSatisfiesReceiptEvidence(t *testing.T) {
@@ -10560,7 +11182,7 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 
 	cluster := baseSwarmControllerCluster()
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	client := newHAControllerTestClient(t, s, cluster)
 
 	reconciler := &AntflyClusterReconciler{
 		Client: client,
@@ -10647,7 +11269,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 			FenceGeneration: 7,
 		},
 	}
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	client := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
 	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
@@ -10722,7 +11344,7 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 		Key:        "secrets.json",
 		Path:       "/run/antfly/secrets/secrets.json",
 	}
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	client := newHAControllerTestClient(t, s, cluster)
 
 	reconciler := &AntflyClusterReconciler{
 		Client: client,
@@ -10803,7 +11425,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			FailurePolicy: antflyv1.HAFailurePolicyFailClosed,
 		},
 	}
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	client := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
 	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
@@ -10905,7 +11527,7 @@ func TestReconcileSwarmStatefulSetStartupGatePrecreatesTargetPVCAndStaysSuspende
 	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
 	cluster := startupGatedSwarmControllerCluster(false)
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	client := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
 	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
@@ -10938,7 +11560,7 @@ func TestReconcileSwarmStatefulSetSuspendPolicyAlwaysHoldsZeroWithoutActivationP
 	cluster.Spec.HighAvailability.Runtime.StartupGate = &antflyv1.HAStartupGateSpec{
 		Policy: antflyv1.HAStartupGatePolicy("Suspend"), RuntimeEligible: false,
 	}
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	client := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
 	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
@@ -11271,7 +11893,7 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 			Config: "{}",
 		},
 	}
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	client := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{
 		Client: client,
 		Scheme: s,
