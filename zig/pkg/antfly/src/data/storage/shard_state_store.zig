@@ -56,8 +56,14 @@ pub const DataOperation = union(enum) {
         new_shard_id: u64,
         split_key: []u8,
     },
+    acknowledge_split: SplitAcknowledgement,
     finalize_split,
     rollback_split,
+};
+
+pub const SplitAcknowledgement = struct {
+    destination_group_id: u64,
+    delta_sequence: u64,
 };
 
 pub fn currentRange(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
@@ -74,34 +80,53 @@ pub fn groupState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id:
     const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return &.{};
     defer alloc.free(upper);
 
-    const kvs = try store.scanRange(alloc, lower, upper);
-    errdefer {
-        for (kvs) |kv| {
+    return try collectGroupDocumentsInPhysicalRange(store, alloc, group_id, lower, upper);
+}
+
+pub fn replaceGroupSnapshot(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    entries: []const AppliedDataKV,
+) !void {
+    const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
+    defer alloc.free(logical_prefix);
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
+    defer alloc.free(lower);
+    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse return error.InvalidAppliedDataRange;
+    defer alloc.free(upper);
+
+    const existing = try store.scanRange(alloc, lower, upper);
+    defer {
+        for (existing) |kv| {
             alloc.free(kv.key);
             alloc.free(kv.value);
         }
-        alloc.free(kvs);
+        alloc.free(existing);
     }
+    var deletes = try alloc.alloc([]const u8, existing.len);
+    defer alloc.free(deletes);
+    for (existing, 0..) |kv, i| deletes[i] = kv.key;
 
-    const state = try alloc.alloc(AppliedDataKV, kvs.len);
-    errdefer {
-        for (state[0..kvs.len]) |entry| {
-            alloc.free(entry.key);
-            alloc.free(entry.value);
-        }
-        alloc.free(state);
+    var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+    defer {
+        for (writes.items) |write| alloc.free(@constCast(write.key));
+        writes.deinit(alloc);
     }
-    for (kvs, 0..) |kv, i| {
-        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse return error.InvalidAppliedDataDocumentKey;
-        defer alloc.free(logical_key);
-        state[i] = .{
-            .key = try stripGroupDocumentPrefixAlloc(alloc, logical_key, group_id),
-            .value = kv.value,
-        };
-        alloc.free(kv.key);
+    const range_key = try groupRangeKeyAlloc(alloc, group_id);
+    var range_buf: [1024]u8 = undefined;
+    try writes.append(alloc, .{
+        .key = range_key,
+        .value = try range_state.encodeRange(byte_range, &range_buf),
+    });
+    for (entries) |entry| {
+        try writes.append(alloc, .{
+            .key = try groupDocumentStoreKeyAlloc(alloc, group_id, entry.key),
+            .value = entry.value,
+        });
     }
-    alloc.free(kvs);
-    return state;
+    try store.putBatch(writes.items, deletes);
 }
 
 pub fn currentSplitState(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !?AppliedSplitState {
@@ -149,6 +174,21 @@ pub fn currentSplitDeltaSequence(store: *docstore.DocStore, alloc: std.mem.Alloc
     defer alloc.free(raw);
     if (raw.len != 8) return error.InvalidSplitDeltaSequence;
     return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+pub fn currentSplitAcknowledgement(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !?SplitAcknowledgement {
+    const key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
+    defer alloc.free(key);
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (raw.len != 16) return error.InvalidSplitAcknowledgement;
+    return .{
+        .destination_group_id = std.mem.readInt(u64, raw[0..8], .little),
+        .delta_sequence = std.mem.readInt(u64, raw[8..16], .little),
+    };
 }
 
 pub fn captureSplitHandoff(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !SplitHandoff {
@@ -292,34 +332,100 @@ fn groupStateInRange(
     const upper = try groupDocumentUpperBoundAlloc(alloc, group_id, byte_range.end);
     defer if (upper) |bound| alloc.free(bound);
 
-    const kvs = try store.scanRange(alloc, lower, if (upper) |bound| bound else "");
-    errdefer {
-        for (kvs) |kv| {
+    return try collectGroupDocumentsInPhysicalRange(store, alloc, group_id, lower, if (upper) |bound| bound else "");
+}
+
+fn collectGroupDocumentsInPhysicalRange(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lower: []const u8,
+    upper: []const u8,
+) ![]AppliedDataKV {
+    const kvs = try store.scanRange(alloc, lower, upper);
+    var processed: usize = 0;
+    defer {
+        for (kvs[processed..]) |kv| {
             alloc.free(kv.key);
             alloc.free(kv.value);
         }
         alloc.free(kvs);
     }
 
-    const state = try alloc.alloc(AppliedDataKV, kvs.len);
+    var state = std.ArrayListUnmanaged(AppliedDataKV).empty;
     errdefer {
-        for (state[0..kvs.len]) |entry| {
+        for (state.items) |entry| {
             alloc.free(entry.key);
             alloc.free(entry.value);
         }
-        alloc.free(state);
+        state.deinit(alloc);
     }
-    for (kvs, 0..) |kv, i| {
-        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse return error.InvalidAppliedDataDocumentKey;
+
+    const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
+    defer alloc.free(logical_prefix);
+
+    for (kvs) |kv| {
+        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse {
+            alloc.free(kv.key);
+            alloc.free(kv.value);
+            processed += 1;
+            continue;
+        };
         defer alloc.free(logical_key);
-        state[i] = .{
-            .key = try stripGroupDocumentPrefixAlloc(alloc, logical_key, group_id),
-            .value = kv.value,
+        if (!std.mem.startsWith(u8, logical_key, logical_prefix)) {
+            alloc.free(kv.key);
+            alloc.free(kv.value);
+            processed += 1;
+            continue;
+        }
+        const key = try stripGroupDocumentPrefixAlloc(alloc, logical_key, group_id);
+        state.append(alloc, .{ .key = key, .value = kv.value }) catch |err| {
+            alloc.free(key);
+            return err;
         };
         alloc.free(kv.key);
+        processed += 1;
     }
-    alloc.free(kvs);
-    return state;
+    return try state.toOwnedSlice(alloc);
+}
+
+test "group state range scan is allocation-failure safe" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/group-state-range-oom", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+    var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
+    defer store.close();
+
+    var writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
+    defer freeOwnedWrites(std.testing.allocator, &writes);
+    var deletes = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (deletes.items) |key| std.testing.allocator.free(key);
+        deletes.deinit(std.testing.allocator);
+    }
+    const operations = [_]DataOperation{
+        .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("doc:z") } },
+        .{ .put = .{ .key = @constCast("doc:n"), .value = @constCast("one") } },
+        .{ .put = .{ .key = @constCast("doc:t"), .value = @constCast("two") } },
+    };
+    try appendOperationEffects(&store, std.testing.allocator, 61, &operations, &writes, &deletes);
+    try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
+    const ttl_key = try internal_keys.ttlKeyAlloc(std.testing.allocator, "g:61:doc:t");
+    defer std.testing.allocator.free(ttl_key);
+    try store.put(ttl_key, "1234");
+
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, source: *docstore.DocStore) !void {
+            const state = try groupStateInRange(source, alloc, 61, .{ .start = "doc:m", .end = "doc:z" });
+            defer freeGroupStateEntries(alloc, state);
+            try std.testing.expectEqual(@as(usize, 2), state.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{&store});
 }
 
 pub fn appendOperationEffects(
@@ -444,6 +550,12 @@ pub fn appendOperationEffects(
             const split_state_value = try alloc.dupe(u8, encoded_split_state);
             errdefer alloc.free(split_state_value);
             try writes.append(alloc, .{ .key = split_state_key, .value = split_state_value });
+
+            const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
+            defer alloc.free(acknowledgement_key);
+            removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
+            removeDeleteByKey(alloc, deletes, acknowledgement_key);
+            try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
         },
         .start_split => |start| {
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
@@ -495,6 +607,17 @@ pub fn appendOperationEffects(
             const zero_seq_value = try alloc.dupe(u8, &zero_seq);
             errdefer alloc.free(zero_seq_value);
             try writes.append(alloc, .{ .key = split_delta_seq_key, .value = zero_seq_value });
+        },
+        .acknowledge_split => |acknowledgement| {
+            const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
+            errdefer alloc.free(acknowledgement_key);
+            removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
+            removeDeleteByKey(alloc, deletes, acknowledgement_key);
+            const value = try alloc.alloc(u8, 16);
+            errdefer alloc.free(value);
+            std.mem.writeInt(u64, value[0..8], acknowledgement.destination_group_id, .little);
+            std.mem.writeInt(u64, value[8..16], acknowledgement.delta_sequence, .little);
+            try writes.append(alloc, .{ .key = acknowledgement_key, .value = value });
         },
         .finalize_split => {
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
@@ -559,6 +682,11 @@ pub fn appendOperationEffects(
             defer alloc.free(split_delta_seq_key);
             removeOwnedWriteByKey(alloc, writes, split_delta_seq_key);
             removeDeleteByKey(alloc, deletes, split_delta_seq_key);
+            const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
+            defer alloc.free(acknowledgement_key);
+            removeOwnedWriteByKey(alloc, writes, acknowledgement_key);
+            removeDeleteByKey(alloc, deletes, acknowledgement_key);
+            try deletes.append(alloc, try alloc.dupe(u8, acknowledgement_key));
             freeSplitState(alloc, split_state.?);
             split_state = null;
         },
@@ -711,6 +839,10 @@ fn groupSplitStateKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
 
 fn groupSplitDeltaSeqKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_split_delta_seq:{d}", .{group_id});
+}
+
+fn groupSplitAcknowledgementKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_split_ack:{d}", .{group_id});
 }
 
 fn groupSplitDeltaPrefixAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {

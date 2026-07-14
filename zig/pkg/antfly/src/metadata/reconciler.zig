@@ -233,8 +233,6 @@ pub const Reconciler = struct {
         var planner = placement_planner.PlacementPlanner.init(self.alloc);
         const desired_tables = try manager.listTables(self.alloc);
         defer manager.freeTables(self.alloc, desired_tables);
-        const desired_ranges = try manager.listRanges(self.alloc);
-        defer manager.freeRanges(self.alloc, desired_ranges);
         const candidate_domains = try self.alloc.alloc(placement_planner.CandidateDomain, placement_candidate_info.len);
         defer self.alloc.free(candidate_domains);
         for (placement_candidate_info, 0..) |candidate, i| {
@@ -252,14 +250,24 @@ pub const Reconciler = struct {
                 .retain_current = if (current.reallocate_requested) false else candidate.retain_current,
             };
         }
+        try self.syncAutomaticShardIntents(manager, current, now_monotonic_ms, now_realtime_ms);
+        const desired_ranges = try manager.listRanges(self.alloc);
+        defer manager.freeRanges(self.alloc, desired_ranges);
+        const desired_splits = try manager.listDesiredSplitTransitions(self.alloc);
+        defer manager.freeSplitTransitions(self.alloc, desired_splits);
+        const split_provisioning_ranges = try allocSplitProvisioningRanges(self.alloc, desired_ranges, desired_splits);
+        defer self.alloc.free(split_provisioning_ranges);
         const desired_placements = if (placement_candidate_node_ids.len > 0)
-            try planner.planAllIntentsWithCurrentAndDomains(manager, placement_candidate_node_ids, current.placement_intents, candidate_domains)
+            try planner.planAllIntentsWithCurrentAndDomainsAndProvisioningRanges(
+                manager,
+                placement_candidate_node_ids,
+                current.placement_intents,
+                candidate_domains,
+                split_provisioning_ranges,
+            )
         else
             try self.alloc.alloc(raft_reconciler.PlacementIntent, 0);
         defer planner.freeIntents(self.alloc, desired_placements);
-        try self.syncAutomaticShardIntents(manager, current, now_monotonic_ms, now_realtime_ms);
-        const desired_splits = try manager.listDesiredSplitTransitions(self.alloc);
-        defer manager.freeSplitTransitions(self.alloc, desired_splits);
         const desired_merges = try manager.listDesiredMergeTransitions(self.alloc);
         defer manager.freeMergeTransitions(self.alloc, desired_merges);
 
@@ -2045,6 +2053,30 @@ fn findRangeRecord(records: []const table_manager.RangeRecord, group_id: u64) ?t
     return null;
 }
 
+fn allocSplitProvisioningRanges(
+    alloc: std.mem.Allocator,
+    ranges: []const table_manager.RangeRecord,
+    splits: []const transition_state.SplitTransitionRecord,
+) ![]table_manager.RangeRecord {
+    var out = std.ArrayListUnmanaged(table_manager.RangeRecord).empty;
+    errdefer out.deinit(alloc);
+    for (splits) |split| {
+        if (findRangeRecord(ranges, split.destination_group_id) != null) continue;
+        const source = findRangeRecord(ranges, split.source_group_id) orelse continue;
+        const split_key = split.split_key orelse continue;
+        try out.append(alloc, .{
+            .group_id = split.destination_group_id,
+            .range_id = split.destination_group_id,
+            .table_id = source.table_id,
+            .start_key = split_key,
+            .end_key = if (split.source_range_end) |end_key| end_key else source.end_key,
+            .doc_identity_shard_id = source.doc_identity_shard_id,
+            .doc_identity_range_id = source.doc_identity_range_id,
+        });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTransitionRecord) !transition_state.MergeTransitionRecord {
     return .{
         .transition_id = record.transition_id,
@@ -2197,6 +2229,55 @@ test "metadata reconciler plans transition upserts before runtime steps" {
     try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_steps.len);
     try std.testing.expectEqual(@as(usize, 0), plan.merge_steps.len);
+}
+
+test "metadata reconciler provisions split destination without publishing overlapping range" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 10, .name = "docs", .desired_replica_count = 1 });
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+    try manager.requestSplit(.{
+        .transition_id = 7003,
+        .table_id = 10,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:m",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+    const current_placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 101, .replica_id = 1, .local_node_id = 1 },
+        .peer_node_ids = &.{1},
+    }};
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{
+        .node_id = 1,
+        .role = "data",
+        .failure_domain = "",
+        .priority = 0,
+        .status_tag = .preferred,
+        .retain_current = true,
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+        .tables = tables,
+        .ranges = ranges,
+        .placement_intents = &current_placements,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.range_upserts.len);
+    try std.testing.expect(findPlacementIntent(plan.placement_upserts, 103, 1) != null);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
 }
 
 test "metadata reconciler emits runtime steps once transitions are committed" {

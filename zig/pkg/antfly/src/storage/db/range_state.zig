@@ -21,6 +21,12 @@ const mem_backend = @import("../mem_backend.zig");
 
 const range_key = "\x00\x00__metadata__:range";
 const split_delta_final_seq_key = "\x00\x00__metadata__:split_delta_final_seq";
+const split_bootstrap_marker_key = "\x00\x00__metadata__:split_bootstrap_marker";
+
+pub const SplitBootstrapMarker = struct {
+    source_group_id: u64,
+    destination_group_id: u64,
+};
 
 pub fn loadRange(alloc: Allocator, store: anytype) !docstore_mod.ByteRange {
     return try loadRangeAtKey(alloc, store, range_key);
@@ -129,6 +135,46 @@ pub fn clearSplitDeltaFinalSeq(store: anytype) !void {
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     txn.delete(split_delta_final_seq_key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    try txn.commit();
+}
+
+pub fn loadSplitBootstrapMarker(alloc: Allocator, store: anytype) !?SplitBootstrapMarker {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const borrowed = txn.get(split_bootstrap_marker_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (borrowed.len != 2 * @sizeOf(u64)) return error.InvalidSplitBootstrapMarker;
+    return .{
+        .source_group_id = std.mem.readInt(u64, borrowed[0..8], .little),
+        .destination_group_id = std.mem.readInt(u64, borrowed[8..16], .little),
+    };
+}
+
+pub fn saveSplitBootstrapMarker(store: anytype, marker: SplitBootstrapMarker) !void {
+    var buf: [2 * @sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], marker.source_group_id, .little);
+    std.mem.writeInt(u64, buf[8..16], marker.destination_group_id, .little);
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(split_bootstrap_marker_key, &buf);
+    try txn.commit();
+}
+
+pub fn clearSplitBootstrapMarker(store: anytype) !void {
+    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    txn.delete(split_bootstrap_marker_key) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
     };

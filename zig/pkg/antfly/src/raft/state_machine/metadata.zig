@@ -39,20 +39,22 @@ pub const MetadataStateMachine = struct {
         read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *MetadataStateMachine = @ptrCast(@alignCast(ptr));
-        if (self.snapshot_builder) |snapshot_builder| {
-            const payload = try mod.encodeCommittedEntries(self.alloc, committed_entries);
-            defer self.alloc.free(payload);
-            try snapshot_builder.applyBatch(.{
-                .group_id = group_id,
-                .commit_index = if (committed_entries.len > 0) committed_entries[committed_entries.len - 1].index else 0,
-                .entries_bytes = payload,
-            });
-        }
         if (committed_entries.len > 0) {
-            try self.applied_sink.setAppliedIndex(group_id, committed_entries[committed_entries.len - 1].index);
+            if (self.snapshot_builder) |snapshot_builder| {
+                const payload = try mod.encodeCommittedEntries(self.alloc, committed_entries);
+                defer self.alloc.free(payload);
+                try snapshot_builder.applyBatch(.{
+                    .group_id = group_id,
+                    .commit_index = committed_entries[committed_entries.len - 1].index,
+                    .entries_bytes = payload,
+                });
+            }
         }
         if (self.delegate) |delegate| {
             try delegate.applyReady(group_id, committed_entries, read_states);
+        }
+        if (committed_entries.len > 0) {
+            try self.applied_sink.setAppliedIndex(group_id, committed_entries[committed_entries.len - 1].index);
         }
     }
 };

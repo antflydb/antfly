@@ -2768,9 +2768,6 @@ pub const MetadataHttpService = struct {
         phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalTransitions(&local_transition_inputs);
         run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
-        _ = try self.raft.stepTransitions();
-        run_round_trace.recordSince("step_committed_transitions", phase_start_ns);
 
         phase_start_ns = platform_time.monotonicNs();
         const has_reconcile_lease = try self.ensureReconcileLease();
@@ -2865,7 +2862,6 @@ pub const MetadataHttpService = struct {
         var local_transition_inputs = try captureLocalTransitionInputs(self);
         defer freeLocalTransitionInputs(self, &local_transition_inputs);
         try self.refreshLocalTransitions(&local_transition_inputs);
-        _ = try self.raft.stepTransitions();
 
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return;

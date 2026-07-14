@@ -50,6 +50,9 @@ pub const SyncConfig = struct {
     source_store: ?*data_store.RaftApplyStore = null,
     dest: DestinationConfig = .{ .root_dir = "" },
     dest_db: ?*db_mod.DB = null,
+    /// Optional durable source-side acknowledgement used by distributed
+    /// handoff, where the source leader need not host a destination replica.
+    progress_db: ?*db_mod.DB = null,
     dest_lease: ?BorrowedDestinationDb = null,
 };
 
@@ -63,22 +66,27 @@ pub fn observeSplitStatus(alloc: std.mem.Allocator, cfg: SyncConfig) !SplitSyncS
 
     var owned_dest: ?db_mod.DB = null;
     defer if (owned_dest) |*dest| dest.close();
-    const dest_db = cfg.dest_db orelse dest: {
+    var dest_db = cfg.dest_db;
+    if (cfg.progress_db == null and dest_db == null) {
         var dest_opts = cfg.dest.db;
         dest_opts.open_mode = .status_only;
         dest_opts.start_index_workers = false;
         owned_dest = try db_mod.DB.open(alloc, cfg.dest_root_dir, dest_opts);
-        break :dest &owned_dest.?;
-    };
-    try validateConfiguredDestinationIdentityNamespace(cfg.dest.db.identity_namespace, dest_db);
+        dest_db = &owned_dest.?;
+    }
+    if (dest_db) |db| try validateConfiguredDestinationIdentityNamespace(cfg.dest.db.identity_namespace, db);
 
-    const dest_range = dest_db.getRange();
-    const bootstrapped = dest_range.start.len > 0 or dest_range.end.len > 0;
+    const progress_db = cfg.progress_db orelse dest_db orelse return error.MissingSplitProgressStore;
+    const bootstrap_marker = try progress_db.getSplitBootstrapMarker(alloc);
+    const bootstrapped = if (bootstrap_marker) |marker|
+        marker.source_group_id == cfg.source_group_id and marker.destination_group_id == cfg.dest_group_id
+    else
+        false;
     const source_state = try source.currentSplitState(alloc, cfg.source_group_id);
     defer if (source_state) |state| shard_state_store.freeSplitState(alloc, state);
     const source_phase = if (source_state) |state| state.phase else null;
     const source_seq = try source.currentSplitDeltaSequence(alloc, cfg.source_group_id);
-    const dest_seq = try dest_db.getSplitDeltaFinalSeq(alloc);
+    const dest_seq = try progress_db.getSplitDeltaFinalSeq(alloc);
     const derived = range_transition.deriveSplitStatus(source_phase, bootstrapped, source_seq, dest_seq);
     return .{
         .phase = derived.phase,
@@ -508,11 +516,16 @@ pub const SyncCoordinator = struct {
         if (source_phase == null) return false;
         if (source_phase.? != .splitting and source_phase.? != .finalizing) return false;
 
-        const range = self.dest.getRange();
-        if (range.start.len > 0 or range.end.len > 0) return false;
+        if (try self.dest.db.getSplitBootstrapMarker(self.alloc)) |marker| {
+            if (marker.source_group_id == self.source_group_id and marker.destination_group_id == self.dest_group_id) return false;
+        }
         const handoff = try self.source.captureSplitHandoff(self.alloc, self.source_group_id);
         defer shard_state_store.freeHandoff(self.alloc, handoff);
         try self.dest.applyHandoff(self.alloc, handoff);
+        try self.dest.db.setSplitBootstrapMarker(.{
+            .source_group_id = self.source_group_id,
+            .destination_group_id = self.dest_group_id,
+        });
         return true;
     }
 
@@ -581,8 +594,11 @@ pub const SyncCoordinator = struct {
     }
 
     pub fn status(self: *SyncCoordinator) !SplitSyncStatus {
-        const dest_range = self.dest.getRange();
-        const bootstrapped = dest_range.start.len > 0 or dest_range.end.len > 0;
+        const bootstrap_marker = try self.dest.db.getSplitBootstrapMarker(self.alloc);
+        const bootstrapped = if (bootstrap_marker) |marker|
+            marker.source_group_id == self.source_group_id and marker.destination_group_id == self.dest_group_id
+        else
+            false;
         const source_state = try self.source.currentSplitState(self.alloc, self.source_group_id);
         defer if (source_state) |state| shard_state_store.freeSplitState(self.alloc, state);
         const source_phase = if (source_state) |state| state.phase else null;
@@ -1275,6 +1291,10 @@ test "db split sync coordinator resumes catch-up across source and destination r
     });
     defer coord.deinit();
 
+    // Placement provisions the destination range before data handoff. Range
+    // ownership alone must never be interpreted as completed bootstrap.
+    try coord.dest.db.updateRange(.{ .start = "doc:m", .end = "doc:z" });
+
     {
         const result = try coord.syncOnce();
         try std.testing.expect(result.bootstrapped);
@@ -1480,6 +1500,40 @@ test "db split status borrows the live raft apply store without a second writer"
         .dest = .{ .root_dir = dst_root },
     });
     try std.testing.expectEqual(SplitTransitionPhase.rolled_back, status.phase);
+}
+
+test "db split status uses source acknowledgement without opening destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-source-ack-src", .{tmp.sub_path});
+    defer std.testing.allocator.free(src_root);
+    const progress_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-source-ack-progress", .{tmp.sub_path});
+    defer std.testing.allocator.free(progress_root);
+    const missing_dest_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-source-ack-missing-dest", .{tmp.sub_path});
+    defer std.testing.allocator.free(missing_dest_root);
+
+    var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+    defer source.deinit();
+    var progress = try db_mod.DB.open(std.testing.allocator, progress_root, .{});
+    defer progress.close();
+    try progress.setSplitBootstrapMarker(.{
+        .source_group_id = 7001,
+        .destination_group_id = 7002,
+    });
+    try progress.setSplitDeltaFinalSeq(4);
+
+    const status = try observeSplitStatus(std.testing.allocator, .{
+        .source_root_dir = src_root,
+        .dest_root_dir = missing_dest_root,
+        .source_group_id = 7001,
+        .dest_group_id = 7002,
+        .source = .{ .root_dir = src_root },
+        .source_store = &source,
+        .progress_db = &progress,
+    });
+    try std.testing.expectEqual(SplitTransitionPhase.rolled_back, status.phase);
+    try std.testing.expect(status.bootstrapped);
 }
 
 test "db split sync coordinator tracks explicit split transition phases" {

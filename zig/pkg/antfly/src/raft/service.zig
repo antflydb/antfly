@@ -288,12 +288,18 @@ pub const ManagedHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHostService) !transition_service.TransitionStepResult {
+        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
         }
         return .{};
+    }
+
+    fn holdsTransitionAuthority(self: *ManagedHostService) bool {
+        const metadata_group_id = self.host.host.cfg.metadata_group_id orelse return true;
+        return self.host.host.isLocalLeader(metadata_group_id);
     }
 
     pub fn observeSplitTransition(self: *ManagedHostService, transition_id: u64) !?metadata.SplitObservation {
@@ -647,12 +653,18 @@ pub const ManagedHttpHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHttpHostService) !transition_service.TransitionStepResult {
+        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
         }
         return .{};
+    }
+
+    fn holdsTransitionAuthority(self: *ManagedHttpHostService) bool {
+        const metadata_group_id = self.host.http_host.host.cfg.metadata_group_id orelse return true;
+        return self.host.http_host.host.isLocalLeader(metadata_group_id);
     }
 
     pub fn observeSplitTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.SplitObservation {

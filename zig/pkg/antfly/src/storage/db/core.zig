@@ -516,6 +516,18 @@ pub const DBCore = struct {
         try range_state_mod.clearSplitDeltaFinalSeq(self.store);
     }
 
+    pub fn loadSplitBootstrapMarker(self: *DBCore, alloc: Allocator) !?range_state_mod.SplitBootstrapMarker {
+        return try range_state_mod.loadSplitBootstrapMarker(alloc, self.store);
+    }
+
+    pub fn saveSplitBootstrapMarker(self: *DBCore, marker: range_state_mod.SplitBootstrapMarker) !void {
+        try range_state_mod.saveSplitBootstrapMarker(self.store, marker);
+    }
+
+    pub fn clearSplitBootstrapMarker(self: *DBCore) !void {
+        try range_state_mod.clearSplitBootstrapMarker(self.store);
+    }
+
     pub fn addIndex(self: *DBCore, cfg: types.IndexConfig) !u64 {
         try self.index_manager.add(self.store, cfg);
         const applied = if (try self.index_manager.requiresEnrichmentReplay(cfg.name))

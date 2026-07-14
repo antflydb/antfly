@@ -10115,7 +10115,23 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
+            if (apply_req.split_checkpoint) |checkpoint| {
+                if (checkpoint.destination_group_id != group_id and checkpoint.source_group_id != group_id) {
+                    return error.InvalidBatchRequest;
+                }
+                if (checkpoint.kind == .destination) {
+                    if (checkpoint.destination_group_id != group_id) return error.InvalidBatchRequest;
+                    try cached.db.updateRange(.{ .start = checkpoint.range_start, .end = checkpoint.range_end });
+                } else if (checkpoint.source_group_id != group_id) return error.InvalidBatchRequest;
+            }
             try cached.db.batchReplicatedApply(apply_req);
+            if (apply_req.split_checkpoint) |checkpoint| {
+                try cached.db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
+                try cached.db.setSplitBootstrapMarker(.{
+                    .source_group_id = checkpoint.source_group_id,
+                    .destination_group_id = checkpoint.destination_group_id,
+                });
+            }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
                 lockAtomic(&self.local_db_mutex);
@@ -10130,7 +10146,23 @@ pub const ProvisionedTableWriteSource = struct {
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
+            if (apply_req.split_checkpoint) |checkpoint| {
+                if (checkpoint.destination_group_id != group_id and checkpoint.source_group_id != group_id) {
+                    return error.InvalidBatchRequest;
+                }
+                if (checkpoint.kind == .destination) {
+                    if (checkpoint.destination_group_id != group_id) return error.InvalidBatchRequest;
+                    try db.updateRange(.{ .start = checkpoint.range_start, .end = checkpoint.range_end });
+                } else if (checkpoint.source_group_id != group_id) return error.InvalidBatchRequest;
+            }
             try db.batchReplicatedApply(apply_req);
+            if (apply_req.split_checkpoint) |checkpoint| {
+                try db.setSplitDeltaFinalSeq(checkpoint.delta_sequence);
+                try db.setSplitBootstrapMarker(.{
+                    .source_group_id = checkpoint.source_group_id,
+                    .destination_group_id = checkpoint.destination_group_id,
+                });
+            }
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
