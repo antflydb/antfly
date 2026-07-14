@@ -16207,6 +16207,7 @@ test "data server wires configured HA executors into API server" {
         const txn_id = try db.beginTransaction(10_000);
         try db.writeIntents(txn_id, &.{.{ .key = "doc:txn", .value = "{\"title\":\"txn state\"}" }}, &.{});
         try db.commitTransaction(txn_id, 10_001);
+        try db.core.store.appendReplayOpaque(alloc, 1, "derived-change-journal-state");
     }
     try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(raft_wal_sentinel).?);
     var raft_fixture = try std.Io.Dir.cwd().createFile(io_impl.io(), raft_wal_sentinel, .{ .truncate = true });
@@ -16357,6 +16358,14 @@ test "data server wires configured HA executors into API server" {
     const restored_txn_doc = (try restored_db.get(alloc, "doc:txn")) orelse return error.TestExpectedEqual;
     defer alloc.free(restored_txn_doc);
     try std.testing.expectEqualStrings("{\"title\":\"txn state\"}", restored_txn_doc);
+    const restored_replay = try restored_db.core.store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (restored_replay) |*entry| entry.deinit(alloc);
+        alloc.free(restored_replay);
+    }
+    try std.testing.expectEqual(@as(usize, 1), restored_replay.len);
+    try std.testing.expectEqual(@as(u64, 1), restored_replay[0].sequence);
+    try std.testing.expectEqualStrings("derived-change-journal-state", restored_replay[0].payload);
     var restored_search = try restored_db.search(alloc, .{
         .index_name = "ft_v1",
         .full_text = .{ .match = .{ .field = "title", .text = "seed" } },
