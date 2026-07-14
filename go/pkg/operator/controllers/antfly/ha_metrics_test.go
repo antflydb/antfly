@@ -13,8 +13,11 @@ func TestHAActionMetricsCountAttemptsAndRetriesWithoutUnboundedLabels(t *testing
 		Kind:         "MetricContractAction",
 		AttemptCount: 3,
 	}
-	attempts := haActionAttempts.WithLabelValues(action.Kind, haMetricExecutorDirect)
-	retries := haActionRetries.WithLabelValues(action.Kind, haMetricExecutorDirect)
+	// Unknown or future action kinds must collapse to the bounded "unknown"
+	// series instead of allowing status-derived strings to create unbounded
+	// Prometheus label values.
+	attempts := haActionAttempts.WithLabelValues("unknown", haMetricExecutorDirect)
+	retries := haActionRetries.WithLabelValues("unknown", haMetricExecutorDirect)
 	beforeAttempts := testutil.ToFloat64(attempts)
 	beforeRetries := testutil.ToFloat64(retries)
 

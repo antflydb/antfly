@@ -277,15 +277,18 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 		StandbyName: "standby-a",
 		SlotName:    "standby-a",
 		TargetLSN:   6,
-		Reason:      "SlotMissing",
+		Reason:      "PrimaryLSNAdvanced",
 	}}
-	notPreserved := haPlannedActionStatuses(changed, ha, status)
-	if notPreserved[0].AdminJobName != "" ||
-		notPreserved[0].AdminJobPhase != "" ||
-		notPreserved[0].AdminError != "" ||
-		notPreserved[0].AdminStatusCode != 0 ||
-		notPreserved[0].AdminResult != nil {
-		t.Fatalf("expected changed action to drop stale execution state, got %#v", notPreserved[0])
+	frozen := haPlannedActionStatuses(changed, ha, status)
+	if frozen[0].TargetLSN != previous.TargetLSN ||
+		frozen[0].Reason != previous.Reason ||
+		frozen[0].AdminJobName != haAdminDirectAPIName ||
+		frozen[0].AdminJobPhase != haAdminJobPhaseSucceeded ||
+		frozen[0].AdminError != "previous direct-admin-api diagnostic" ||
+		frozen[0].AdminStatusCode != 409 ||
+		frozen[0].AdminResult == nil ||
+		frozen[0].AdminResult.SlotAction != "create" {
+		t.Fatalf("expected an executing semantic operation to retain its exact frozen payload and evidence across mutable LSN/reason drift, got %#v", frozen[0])
 	}
 }
 

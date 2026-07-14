@@ -3561,6 +3561,8 @@ func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials
 	}
 	job := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
 	container := job.Spec.Template.Spec.Containers[0]
+	g.Expect(job.Spec.TTLSecondsAfterFinished).To(BeNil(), "terminal evidence must be checkpointed before TTL cleanup is armed")
+	g.Expect(job.Spec.Template.Spec.RestartPolicy).To(Equal(corev1.RestartPolicyNever), "each Job pod must represent one countable process attempt")
 	g.Expect(container.Args).To(Equal([]string{
 		"ha", "artifact", "publish", "--location", "s3://ha-seeds/cluster-a",
 	}))
@@ -3620,7 +3622,11 @@ func TestPortableArtifactJobFollowsLiveRWOConsumerPod(t *testing.T) {
 		}}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(consumer).Build()}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary-data", Namespace: "default"},
+		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
+	}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(consumer, pvc).Build()}
 	g.Expect(reconciler.bindHAAdminJobToPVCConsumer(context.Background(), job)).To(Succeed())
 	g.Expect(job.Annotations).To(HaveKeyWithValue("antfly.io/ha-pvc-consumer", "primary-swarm-0"))
 	g.Expect(job.Annotations).To(HaveKeyWithValue("antfly.io/ha-pvc-claim", "primary-data"))
@@ -3653,23 +3659,266 @@ func TestPortableArtifactJobFailsClosedForAmbiguousRWOConsumers(t *testing.T) {
 			}}}}},
 		}
 	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary-data", Namespace: "default"},
+		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
+	}
 
 	unlabelled := consumer("primary-swarm-0", nil, corev1.PodRunning)
-	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(unlabelled).Build()}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(unlabelled, pvc.DeepCopy()).Build()}
 	err := reconciler.bindHAAdminJobToPVCConsumer(context.Background(), job())
 	g.Expect(err).To(MatchError(ContainSubstring("lacks its stable StatefulSet pod-name label")))
 
 	first := consumer("primary-swarm-0", map[string]string{appsv1.StatefulSetPodNameLabel: "primary-swarm-0"}, corev1.PodRunning)
 	second := consumer("primary-swarm-1", map[string]string{appsv1.StatefulSetPodNameLabel: "primary-swarm-1"}, corev1.PodPending)
-	reconciler = &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(first, second).Build()}
+	reconciler = &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(first, second, pvc.DeepCopy()).Build()}
 	err = reconciler.bindHAAdminJobToPVCConsumer(context.Background(), job())
 	g.Expect(err).To(MatchError(ContainSubstring("multiple live consumer pods")))
 
 	terminated := consumer("old-primary-swarm-0", nil, corev1.PodFailed)
-	reconciler = &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(terminated).Build()}
+	reconciler = &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(terminated, pvc.DeepCopy()).Build()}
 	ignored := job()
 	g.Expect(reconciler.bindHAAdminJobToPVCConsumer(context.Background(), ignored)).To(Succeed())
 	g.Expect(ignored.Spec.Template.Spec.Affinity).To(BeNil(), "terminated consumers must not pin a replacement Job")
+}
+
+func TestPortableArtifactJobSkipsPlacementRecalculationForExistingDeterministicJob(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec: antflyv1.AntflyClusterSpec{Image: "antfly:test", HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Standbys: []antflyv1.HAStandbySpec{{Name: "standby-a", SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location:  "s3://ha-seeds/cluster-a",
+				SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			}}},
+		}},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionPublishSeedArtifact), Executor: string(haActionExecutorCLIJob),
+		StandbyName: "standby-a", SlotName: "standby-a",
+		AdminCommand: []string{"artifact", "publish", "--location", "s3://ha-seeds/cluster-a"},
+	}
+	existing := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
+	existing.UID = types.UID("existing-job-uid")
+	g.Expect(controllerutil.SetControllerReference(cluster, existing, s)).To(Succeed())
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary-data", Namespace: "default"},
+		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
+	}
+	// This pod appeared after the Job was created. Recomputing placement would
+	// reject an already immutable Job even though there is nothing left to bind.
+	lateConsumer := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "unlabelled-late-consumer", Namespace: "default"},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+			Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "primary-data"}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(existing, pvc, lateConsumer).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJob(context.Background(), cluster, &antflyv1.HAAdminSpec{}, &action)).To(Succeed())
+	g.Expect(action.AdminJobName).To(Equal(existing.Name))
+}
+
+func TestPortableArtifactJobHonorsPVCExclusivityAndConsumerLifecycle(t *testing.T) {
+	newJob := func(kind haActionKind) *batchv1.Job {
+		return &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "portable-job", Namespace: "default", UID: types.UID("current-job-uid"),
+				Annotations: map[string]string{"antfly.io/ha-action-kind": string(kind)},
+			},
+			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "artifact-data"}},
+			}}}}},
+		}
+	}
+	newPVC := func(mode corev1.PersistentVolumeAccessMode) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "artifact-data", Namespace: "default"},
+			Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{mode}},
+		}
+	}
+	newConsumer := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: "default",
+				Labels: map[string]string{appsv1.StatefulSetPodNameLabel: name},
+			},
+			Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "artifact-data"}},
+			}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+
+	t.Run("RWX does not require consumer-derived placement", func(t *testing.T) {
+		g := NewWithT(t)
+		s := runtime.NewScheme()
+		g.Expect(corev1.AddToScheme(s)).To(Succeed())
+		unlabelled := newConsumer("unlabelled")
+		unlabelled.Labels = nil
+		job := newJob(haActionPublishSeedArtifact)
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(
+			newPVC(corev1.ReadWriteMany), unlabelled,
+		).Build()}
+		g.Expect(r.bindHAAdminJobToPVCConsumer(context.Background(), job)).To(Succeed())
+		g.Expect(job.Spec.Template.Spec.Affinity).To(BeNil())
+	})
+
+	t.Run("RWOP refuses every live non-owner consumer", func(t *testing.T) {
+		g := NewWithT(t)
+		s := runtime.NewScheme()
+		g.Expect(corev1.AddToScheme(s)).To(Succeed())
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(
+			newPVC(corev1.ReadWriteOncePod), newConsumer("runtime-0"),
+		).Build()}
+		err := r.bindHAAdminJobToPVCConsumer(context.Background(), newJob(haActionPublishSeedArtifact))
+		g.Expect(err).To(MatchError(ContainSubstring("ReadWriteOncePod")))
+	})
+
+	t.Run("terminating RWO consumers remain live for placement", func(t *testing.T) {
+		g := NewWithT(t)
+		s := runtime.NewScheme()
+		g.Expect(corev1.AddToScheme(s)).To(Succeed())
+		consumer := newConsumer("runtime-0")
+		deleting := metav1.NewTime(time.Unix(1700000000, 0))
+		consumer.DeletionTimestamp = &deleting
+		consumer.Finalizers = []string{"test.antfly.io/hold"}
+		job := newJob(haActionPublishSeedArtifact)
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(
+			newPVC(corev1.ReadWriteOnce), consumer,
+		).Build()}
+		g.Expect(r.bindHAAdminJobToPVCConsumer(context.Background(), job)).To(Succeed())
+		g.Expect(job.Spec.Template.Spec.Affinity).NotTo(BeNil())
+		g.Expect(job.Spec.Template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
+	})
+
+	t.Run("only the exact current Job owner UID is excluded", func(t *testing.T) {
+		g := NewWithT(t)
+		s := runtime.NewScheme()
+		g.Expect(corev1.AddToScheme(s)).To(Succeed())
+		controller := true
+		ownPod := newConsumer("portable-job-pod")
+		ownPod.Labels = nil
+		ownPod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "batch/v1", Kind: "Job", Name: "portable-job",
+			UID: types.UID("current-job-uid"), Controller: &controller,
+		}}
+		pvc := newPVC(corev1.ReadWriteOnce)
+		pvc.Spec.VolumeName = "artifact-pv"
+		pvc.Status.Phase = corev1.ClaimBound
+		job := newJob(haActionPublishSeedArtifact)
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pvc, ownPod).Build()}
+		g.Expect(r.bindHAAdminJobToPVCConsumer(context.Background(), job)).To(Succeed())
+		g.Expect(job.Spec.Template.Spec.Affinity).To(BeNil())
+	})
+
+	t.Run("target restore refuses a live consumer", func(t *testing.T) {
+		g := NewWithT(t)
+		s := runtime.NewScheme()
+		g.Expect(corev1.AddToScheme(s)).To(Succeed())
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(
+			newPVC(corev1.ReadWriteOnce), newConsumer("standby-0"),
+		).Build()}
+		err := r.bindHAAdminJobToPVCConsumer(context.Background(), newJob(haActionRestoreSeedArtifact))
+		g.Expect(err).To(MatchError(ContainSubstring("refusing HA restore/activation")))
+	})
+
+	t.Run("unmounted publish source must be bound to a stable PV", func(t *testing.T) {
+		g := NewWithT(t)
+		s := runtime.NewScheme()
+		g.Expect(corev1.AddToScheme(s)).To(Succeed())
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(
+			newPVC(corev1.ReadWriteOnce),
+		).Build()}
+		err := r.bindHAAdminJobToPVCConsumer(context.Background(), newJob(haActionPublishSeedArtifact))
+		g.Expect(err).To(MatchError(ContainSubstring("is not bound to a stable PV")))
+	})
+}
+
+func TestHAAdminJobCountsOnlyStartedPodsOwnedByExactJobUID(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec:       antflyv1.AntflyClusterSpec{Image: "antfly:test"},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: "LocalMaintenance", Executor: string(haActionExecutorCLIJob),
+		AdminURL: "http://primary-ha.default.svc:8081", AdminCommand: []string{"maintenance"},
+	}
+	job := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
+	job.UID = types.UID("current-job-uid")
+	job.Status.Active = 1
+	g.Expect(controllerutil.SetControllerReference(cluster, job, s)).To(Succeed())
+	controller := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pending-job-pod", Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1", Kind: "Job", Name: job.Name,
+				UID: job.UID, Controller: &controller,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "ha-admin", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
+			}},
+		},
+	}
+	r := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(job, pod).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(r.reconcileHAAdminJob(context.Background(), cluster, &antflyv1.HAAdminSpec{}, &action)).To(Succeed())
+	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhaseRunning))
+	g.Expect(action.AttemptCount).To(BeZero(), "an unscheduled/unstarted pod is not an external process attempt")
+}
+
+func TestHAAdminJobArmsTTLOnlyAfterTerminalStatusWasCheckpointed(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	ttl := int32(0)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{Image: "antfly:test", HighAvailability: &antflyv1.HighAvailabilitySpec{
+			Mode: antflyv1.HAModeHotStandby,
+			Admin: &antflyv1.HAAdminSpec{
+				ExecutePlannedActions:      true,
+				JobTTLSecondsAfterFinished: &ttl,
+			},
+		}},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{{
+			Kind: "LocalMaintenance", Executor: string(haActionExecutorCLIJob),
+			AdminURL: "http://primary-ha.default.svc:8081", AdminCommand: []string{"maintenance"},
+			AdminJobName: "terminal-ha-job", AdminJobPhase: haAdminJobPhaseFailed,
+		}}}},
+	}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "terminal-ha-job", Namespace: "default"}}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, job).Build()
+	r := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(r.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	observed := &batchv1.Job{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Spec.TTLSecondsAfterFinished).NotTo(BeNil())
+	g.Expect(*observed.Spec.TTLSecondsAfterFinished).To(Equal(int32(0)))
 }
 
 func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {

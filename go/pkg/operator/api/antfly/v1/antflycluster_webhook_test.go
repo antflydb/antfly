@@ -2252,6 +2252,34 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityComparesRetryBaseWithEffectiveDefaultMaximum(t *testing.T) {
+	cluster := baseSwarmCluster()
+	retryBaseSeconds := int32(121)
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:  HAModeHotStandby,
+		Admin: &HAAdminSpec{DirectRetryBaseSeconds: &retryBaseSeconds},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds") {
+		t.Fatalf("expected retry base above the effective default maximum to be rejected, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityComparesRetryMaximumWithEffectiveDefaultBase(t *testing.T) {
+	cluster := baseSwarmCluster()
+	retryMaxSeconds := int32(4)
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:  HAModeHotStandby,
+		Admin: &HAAdminSpec{DirectRetryMaxSeconds: &retryMaxSeconds},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds") {
+		t.Fatalf("expected retry maximum below the effective default base to be rejected, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
