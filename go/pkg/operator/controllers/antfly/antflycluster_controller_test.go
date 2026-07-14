@@ -4100,6 +4100,157 @@ func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials
 	g.Expect(activateJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
 }
 
+func TestHASeedCompletionActionsPlanLifecycleGatedLocalGCBeforeRemotePrune(t *testing.T) {
+	g := NewWithT(t)
+	standby := antflyv1.HAStandbySpec{
+		Name: "standby-a",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location:    "s3://ha-seeds/cluster-a",
+			StagingRoot: "/target/staging",
+			SourcePVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+		},
+	}
+
+	actions := haSeedCompletionActions(standby, "standby-a", 10, "test", haActionSeedStandby)
+	kinds := make([]string, 0, len(actions))
+	dependencies := map[string]string{}
+	for _, action := range actions {
+		kinds = append(kinds, string(action.Kind))
+		dependencies[string(action.Kind)] = string(action.DependsOn)
+	}
+	g.Expect(kinds).To(Equal([]string{
+		"CaptureSeedArtifact",
+		"PublishSeedArtifact",
+		"GCSourceSeedGenerations",
+		"RestoreSeedArtifact",
+		"ActivateSeedArtifact",
+		"ActivateSeededSlot",
+		"GCTargetSeedGenerations",
+		"PruneSeedArtifacts",
+	}))
+	g.Expect(dependencies["GCSourceSeedGenerations"]).To(Equal("PublishSeedArtifact"))
+	g.Expect(dependencies["RestoreSeedArtifact"]).To(Equal("GCSourceSeedGenerations"))
+	g.Expect(dependencies["GCTargetSeedGenerations"]).To(Equal("ActivateSeededSlot"))
+	g.Expect(dependencies["PruneSeedArtifacts"]).To(Equal("GCTargetSeedGenerations"), "remote prune must never authorize either local deletion")
+}
+
+func TestBuildHAAdminJobScopesLifecycleGCToOneWritablePVCAndDurableReceipt(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{Standbys: []antflyv1.HAStandbySpec{{
+				Name: "standby-a",
+				SeedArtifact: &antflyv1.HASeedArtifactSpec{
+					Location:             "s3://ha-seeds/cluster-a",
+					StagingRoot:          "/target/staging",
+					CredentialsSecretRef: &corev1.LocalObjectReference{Name: "ha-seed-credentials"},
+					SourcePVC:            &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+					TargetPVC:            &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+				},
+			}}},
+		},
+	}
+	source := antflyv1.HAPlannedActionStatus{
+		Kind: "GCSourceSeedGenerations", Executor: string(haActionExecutorCLIJob),
+		StandbyName: "standby-a", SlotName: "standby-a",
+		AdminCommand: []string{"artifact", "gc-source", "--capture-root", "/source/seed-captures"},
+	}
+	sourceJob := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, source)
+	sourceContainer := sourceJob.Spec.Template.Spec.Containers[0]
+	g.Expect(sourceContainer.Args).To(Equal([]string{"ha", "artifact", "gc-source", "--capture-root", "/source/seed-captures"}))
+	g.Expect(sourceContainer.VolumeMounts).To(Equal([]corev1.VolumeMount{{Name: "ha-seed-source", MountPath: "/source"}}))
+	g.Expect(sourceJob.Spec.Template.Spec.Volumes).To(HaveLen(1))
+	g.Expect(sourceJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim).NotTo(BeNil())
+	g.Expect(sourceJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("primary-data"))
+	g.Expect(sourceJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ReadOnly).To(BeFalse())
+	g.Expect(sourceContainer.EnvFrom).To(HaveLen(1), "source GC must re-verify the full remote v2 artifact with the configured credentials")
+
+	target := antflyv1.HAPlannedActionStatus{
+		Kind: "GCTargetSeedGenerations", Executor: string(haActionExecutorCLIJob),
+		StandbyName: "standby-a", SlotName: "standby-a",
+		AdminCommand: []string{"artifact", "gc-target", "--target-root", "/target/.antfly-ha/active", "--slot-activation-receipt", "/var/run/antfly-ha/seeded-slot-activation/seeded-slot-activation.json"},
+	}
+	targetJob := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, target)
+	targetContainer := targetJob.Spec.Template.Spec.Containers[0]
+	g.Expect(targetContainer.Args).To(Equal(append([]string{"ha"}, target.AdminCommand...)))
+	g.Expect(targetContainer.VolumeMounts).To(ContainElements(
+		corev1.VolumeMount{Name: "ha-seed-target", MountPath: "/target"},
+		corev1.VolumeMount{Name: "ha-seeded-slot-activation", MountPath: "/var/run/antfly-ha/seeded-slot-activation", ReadOnly: true},
+	))
+	g.Expect(targetJob.Spec.Template.Spec.Volumes).To(HaveLen(2))
+	g.Expect(targetJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim).NotTo(BeNil())
+	g.Expect(targetJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
+	g.Expect(targetJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ReadOnly).To(BeFalse())
+	g.Expect(targetJob.Spec.Template.Spec.Volumes[1].ConfigMap).NotTo(BeNil())
+	g.Expect(targetJob.Spec.Template.Spec.Volumes[1].ConfigMap.Name).NotTo(BeEmpty())
+}
+
+func TestReconcileHATargetGCCopiesExactDurableSlotActivationReceiptIdempotently(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	rawReceipt := `{"schema_version":1,"action":{"action_id":"seeded_slot_activate:seed-standby-a-10","action_kind":"seeded_slot_activate","target":"seed-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","generation":"seed-standby-a-10","manifest_id":"seed-standby-a-10","timeline_id":4,"checkpoint_lsn":10,"seed_receipt_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","aggregate_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}`
+	encodedResult, err := json.Marshal(map[string]any{
+		"schemaVersion": 1, "actionID": "seeded_slot_activate:seed-standby-a-10",
+		"actionKind": "seeded_slot_activate", "actionTarget": "seed-standby-a-10",
+		"actionState": "applied", "actionNodeID": "primary-a", "slotName": "standby-a",
+		"manifestID": "seed-standby-a-10", "checkpointLSN": 10,
+		"seedArtifactGeneration": "seed-standby-a-10", "seedTimelineID": 4,
+		"seedReceiptSHA256": strings.Repeat("a", 64), "manifestSHA256": strings.Repeat("b", 64),
+		"aggregateSHA256": strings.Repeat("c", 64), "rawReceiptJSON": rawReceipt,
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	activationResult := &antflyv1.HAAdminActionResultStatus{}
+	g.Expect(json.Unmarshal(encodedResult, activationResult)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{ExecutePlannedActions: true},
+				Standbys: []antflyv1.HAStandbySpec{{Name: "standby-a", SeedArtifact: &antflyv1.HASeedArtifactSpec{
+					Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+					TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+				}}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{{
+			Kind: string(haActionActivateSeededSlot), StandbyName: "standby-a", SlotName: "standby-a",
+			SeedArtifactGeneration: "seed-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded, AdminResult: activationResult,
+		}, {
+			Kind: "GCTargetSeedGenerations", Executor: string(haActionExecutorCLIJob), DependsOn: string(haActionActivateSeededSlot),
+			StandbyName: "standby-a", SlotName: "standby-a", SeedArtifactGeneration: "seed-standby-a-10",
+			AdminCommand: []string{"artifact", "gc-target", "--target-root", "/target/.antfly-ha/active", "--slot-activation-receipt", "/var/run/antfly-ha/seeded-slot-activation/seeded-slot-activation.json"},
+		}}}},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "standby-data", Namespace: "default"},
+		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
+	}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build(), Scheme: s}
+	action := &cluster.Status.HAStatus.PlannedActions[1]
+	g.Expect(reconciler.reconcileHAAdminJob(context.Background(), cluster, cluster.Spec.HighAvailability.Admin, action)).To(Succeed())
+	g.Expect(reconciler.reconcileHAAdminJob(context.Background(), cluster, cluster.Spec.HighAvailability.Admin, action)).To(Succeed())
+
+	var receipts corev1.ConfigMapList
+	g.Expect(reconciler.List(context.Background(), &receipts)).To(Succeed())
+	g.Expect(receipts.Items).To(HaveLen(1))
+	g.Expect(receipts.Items[0].Immutable).NotTo(BeNil())
+	g.Expect(*receipts.Items[0].Immutable).To(BeTrue())
+	g.Expect(receipts.Items[0].Data).To(HaveKeyWithValue("seeded-slot-activation.json", rawReceipt))
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1), "retries must reuse the exact immutable receipt and deterministic Job")
+}
+
 func TestPortableArtifactJobFollowsLiveRWOConsumerPod(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
