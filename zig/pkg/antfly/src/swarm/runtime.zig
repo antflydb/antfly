@@ -86,6 +86,15 @@ const CliConfig = struct {
     ha_standby_node_id: ?[]const u8 = null,
     ha_standby_upstream_url: ?[]const u8 = null,
     ha_standby_slot: ?[]const u8 = null,
+    ha_startup_target_root: ?[]const u8 = null,
+    ha_startup_topology_id: ?[]const u8 = null,
+    ha_startup_topology_generation: ?u64 = null,
+    ha_startup_generation: ?[]const u8 = null,
+    ha_startup_target_pvc_name: ?[]const u8 = null,
+    ha_startup_target_pvc_uid: ?[]const u8 = null,
+    ha_startup_manifest_sha256: ?[]const u8 = null,
+    ha_startup_aggregate_sha256: ?[]const u8 = null,
+    ha_startup_seed_receipt_sha256: ?[]const u8 = null,
     ha_cluster_id: ?u64 = null,
     ha_shard_id: ?u64 = null,
     ha_table_id: ?u64 = null,
@@ -129,6 +138,7 @@ const ResolvedPaths = struct {
 const SwarmHealthSource = struct {
     data_server: *antfly.data.runtime.DataServer,
     unified_api_ready: *const std.atomic.Value(bool),
+    startup_checkpoint_lsn: ?u64 = null,
 
     fn readiness(self: *SwarmHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -146,6 +156,12 @@ const SwarmHealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *SwarmHealthSource = @ptrCast(@alignCast(ptr));
+        if (self.startup_checkpoint_lsn) |checkpoint_lsn| {
+            self.data_server.ha_public_gate_state.checkRead(.{
+                .consistency = .at_least_lsn,
+                .required_lsn = checkpoint_lsn,
+            }) catch return false;
+        }
         return swarmReadyFromState(
             self.data_server.http_server != null,
             self.unified_api_ready.load(.acquire),
@@ -161,6 +177,10 @@ const SwarmHealthSource = struct {
 
 fn swarmReadyFromState(api_server_initialized: bool, unified_api_ready: bool) bool {
     return api_server_initialized and unified_api_ready;
+}
+
+fn startupCheckpointSatisfied(progress: antfly.ha.standby.Progress, checkpoint_lsn: u64) bool {
+    return progress.applied_lsn >= checkpoint_lsn and progress.safe_read_lsn >= checkpoint_lsn;
 }
 
 const LocalSwarmMetadata = struct {
@@ -989,6 +1009,14 @@ pub fn runFromIterator(
 
     try validateHARole(cli);
     try validateHAPathsUnderRoot(cli, data_dir);
+    const ha_startup_expectation = try haStartupExpectationFromCli(cli);
+    const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation|
+        antfly.ha.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
+            std.log.err("swarm startup failed step=validate_ha_active_generation err={}", .{err});
+            return err;
+        }
+    else
+        null;
     var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
     defer ha_sync_policy.deinit(alloc);
     const ha_retention_policy = try haRetentionPolicyFromCli(cli);
@@ -1120,6 +1148,7 @@ pub fn runFromIterator(
     var swarm_health = SwarmHealthSource{
         .data_server = &data_server,
         .unified_api_ready = &unified_api_ready,
+        .startup_checkpoint_lsn = ha_startup_checkpoint_lsn,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
@@ -2414,6 +2443,42 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_standby_slot = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-startup-target-root")) {
+            cfg.ha_startup_target_root = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-topology-id")) {
+            cfg.ha_startup_topology_id = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-topology-generation")) {
+            cfg.ha_startup_topology_generation = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-generation")) {
+            cfg.ha_startup_generation = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-target-pvc-name")) {
+            cfg.ha_startup_target_pvc_name = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-target-pvc-uid")) {
+            cfg.ha_startup_target_pvc_uid = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-manifest-sha256")) {
+            cfg.ha_startup_manifest_sha256 = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-aggregate-sha256")) {
+            cfg.ha_startup_aggregate_sha256 = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-startup-seed-receipt-sha256")) {
+            cfg.ha_startup_seed_receipt_sha256 = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
             cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -2659,6 +2724,18 @@ fn haIdentityRequested(cli: CliConfig) bool {
         cli.ha_epoch != null;
 }
 
+fn haStartupGateRequested(cli: CliConfig) bool {
+    return cli.ha_startup_target_root != null or
+        cli.ha_startup_topology_id != null or
+        cli.ha_startup_topology_generation != null or
+        cli.ha_startup_generation != null or
+        cli.ha_startup_target_pvc_name != null or
+        cli.ha_startup_target_pvc_uid != null or
+        cli.ha_startup_manifest_sha256 != null or
+        cli.ha_startup_aggregate_sha256 != null or
+        cli.ha_startup_seed_receipt_sha256 != null;
+}
+
 fn haSyncPolicyRequested(cli: CliConfig) bool {
     return cli.ha_sync_mode != null or
         cli.ha_sync_selection != null or
@@ -2682,6 +2759,7 @@ fn validateHARole(cli: CliConfig) !void {
     if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_admin_token_env != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_seed_capture_root != null and !primary_requested and !standby_requested) return error.HARoleMissing;
+    if (haStartupGateRequested(cli) and !standby_requested) return error.HAStartupGateRequiresStandby;
     if (cli.ha_former_primary_log != null) {
         _ = try requireHAPath(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
@@ -2768,7 +2846,42 @@ fn validateHAPathsUnderRoot(cli: CliConfig, data_root: []const u8) !void {
     if (haStandbyRequested(cli)) {
         _ = try requireHAPathWithinRoot(cli.ha_standby_log, data_root, error.HAStandbyLogMissing, error.HAStandbyLogInvalid);
         _ = try requireHAPathWithinRoot(cli.ha_standby_progress, data_root, error.HAStandbyProgressMissing, error.HAStandbyProgressInvalid);
+        if (haStartupGateRequested(cli)) {
+            _ = try requireHAPathWithinRoot(cli.ha_startup_target_root, data_root, error.HAStartupTargetRootMissing, error.HAStartupTargetRootInvalid);
+        }
     }
+}
+
+fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.StartupExpectation {
+    if (!haStartupGateRequested(cli)) return null;
+    if (!haStandbyRequested(cli)) return error.HAStartupGateRequiresStandby;
+    return .{
+        .target_root = try requireHAPath(cli.ha_startup_target_root, error.HAStartupTargetRootMissing, error.HAStartupTargetRootInvalid),
+        .expected = .{
+            .generation = try requireHAIdentifier(cli.ha_startup_generation, error.HAStartupGenerationMissing, error.HAStartupGenerationInvalid),
+            .slot_name = try requireHAIdentifier(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid),
+            .identity = try haStandbyIdentity(cli),
+        },
+        .binding = .{
+            .topology_id = try requireHAIdentifier(cli.ha_startup_topology_id, error.HAStartupTopologyIdMissing, error.HAStartupTopologyIdInvalid),
+            .topology_generation = cli.ha_startup_topology_generation orelse return error.HAStartupTopologyGenerationMissing,
+            .node_id = try requireHAIdentifier(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid),
+            .target_pvc_name = try requireHAIdentifier(cli.ha_startup_target_pvc_name, error.HAStartupTargetPVCNameMissing, error.HAStartupTargetPVCNameInvalid),
+            .target_pvc_uid = try requireHAIdentifier(cli.ha_startup_target_pvc_uid, error.HAStartupTargetPVCUIDMissing, error.HAStartupTargetPVCUIDInvalid),
+        },
+        .manifest_sha256 = try optionalHAStartupDigest(cli.ha_startup_manifest_sha256),
+        .aggregate_sha256 = try optionalHAStartupDigest(cli.ha_startup_aggregate_sha256),
+        .seed_receipt_sha256 = try optionalHAStartupDigest(cli.ha_startup_seed_receipt_sha256),
+    };
+}
+
+fn optionalHAStartupDigest(value: ?[]const u8) !?[]const u8 {
+    const digest = value orelse return null;
+    if (digest.len != 64) return error.HAStartupDigestInvalid;
+    for (digest) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.HAStartupDigestInvalid;
+    }
+    return digest;
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
@@ -3664,6 +3777,18 @@ test "parse cli accepts HA standby runtime flags" {
         "http://primary.antfly.svc:8080",
         "--ha-standby-slot",
         "standby-a",
+        "--ha-startup-target-root",
+        "/tmp/active",
+        "--ha-startup-topology-id",
+        "topology-a",
+        "--ha-startup-topology-generation",
+        "3",
+        "--ha-startup-generation",
+        "generation-a",
+        "--ha-startup-target-pvc-name",
+        "standby-a-data",
+        "--ha-startup-target-pvc-uid",
+        "pvc-uid-1",
         "--ha-cluster-id",
         "100",
         "--ha-shard-id",
@@ -3688,6 +3813,12 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqualStrings("/tmp/ha-fence.wal", cfg.ha_fence_wal.?);
     try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", cfg.ha_standby_upstream_url.?);
     try std.testing.expectEqualStrings("standby-a", cfg.ha_standby_slot.?);
+    try std.testing.expectEqualStrings("/tmp/active", cfg.ha_startup_target_root.?);
+    try std.testing.expectEqualStrings("topology-a", cfg.ha_startup_topology_id.?);
+    try std.testing.expectEqual(@as(u64, 3), cfg.ha_startup_topology_generation.?);
+    try std.testing.expectEqualStrings("generation-a", cfg.ha_startup_generation.?);
+    try std.testing.expectEqualStrings("standby-a-data", cfg.ha_startup_target_pvc_name.?);
+    try std.testing.expectEqualStrings("pvc-uid-1", cfg.ha_startup_target_pvc_uid.?);
     try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
@@ -3697,6 +3828,11 @@ test "parse cli accepts HA standby runtime flags" {
     const replication_cfg = (try haStandbyReplicationConfigFromCli(cfg)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", replication_cfg.upstream_base_uri);
     try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
+    const startup = (try haStartupExpectationFromCli(cfg)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/tmp/active", startup.target_root);
+    try std.testing.expectEqualStrings("topology-a", startup.binding.topology_id);
+    try std.testing.expectEqual(@as(u64, 3), startup.binding.topology_generation);
+    try std.testing.expectEqualStrings("generation-a", startup.expected.generation);
 }
 
 test "swarm HA standby replication flags require upstream and slot" {
@@ -4291,6 +4427,12 @@ test "swarm readiness follows api initialization and unified listener" {
     try std.testing.expect(!swarmReadyFromState(false, true));
     try std.testing.expect(!swarmReadyFromState(true, false));
     try std.testing.expect(swarmReadyFromState(true, true));
+}
+
+test "swarm startup checkpoint readiness requires applied and safe-read progress" {
+    try std.testing.expect(!startupCheckpointSatisfied(.{ .received_lsn = 11, .applied_lsn = 10, .safe_read_lsn = 10 }, 11));
+    try std.testing.expect(!startupCheckpointSatisfied(.{ .received_lsn = 11, .applied_lsn = 11, .safe_read_lsn = 10 }, 11));
+    try std.testing.expect(startupCheckpointSatisfied(.{ .received_lsn = 11, .applied_lsn = 11, .safe_read_lsn = 11 }, 11));
 }
 
 test "swarm unified server control stops publication and live listeners" {

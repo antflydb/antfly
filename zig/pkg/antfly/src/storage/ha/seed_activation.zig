@@ -39,6 +39,25 @@ pub const ActivateRequest = struct {
     staging_root: []const u8,
     target_root: []const u8,
     expected: seed_artifact.ExpectedArtifact,
+    binding: ?ActivationBinding = null,
+    limits: seed_artifact.Limits = .{},
+};
+
+pub const ActivationBinding = struct {
+    topology_id: []const u8 = "",
+    topology_generation: u64 = 0,
+    node_id: []const u8 = "",
+    target_pvc_name: []const u8 = "",
+    target_pvc_uid: []const u8 = "",
+};
+
+pub const StartupExpectation = struct {
+    target_root: []const u8,
+    expected: seed_artifact.ExpectedArtifact,
+    binding: ActivationBinding,
+    manifest_sha256: ?[]const u8 = null,
+    aggregate_sha256: ?[]const u8 = null,
+    seed_receipt_sha256: ?[]const u8 = null,
     limits: seed_artifact.Limits = .{},
 };
 
@@ -71,6 +90,11 @@ pub const ActivationReceipt = struct {
     manifest_sha256: []const u8,
     aggregate_sha256: []const u8,
     generation_path: []const u8,
+    topology_id: []const u8 = "",
+    topology_generation: u64 = 0,
+    node_id: []const u8 = "",
+    target_pvc_name: []const u8 = "",
+    target_pvc_uid: []const u8 = "",
 
     pub fn identity(self: ActivationReceipt) standby_mod.Identity {
         return .{
@@ -128,6 +152,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
 
     const generation_relative_path = try std.fs.path.join(alloc, &.{ generations_dir_name, request.expected.generation });
     defer alloc.free(generation_relative_path);
+    const binding = request.binding orelse ActivationBinding{};
     const activation_json = try std.json.Stringify.valueAlloc(alloc, ActivationReceipt{
         .generation = request.expected.generation,
         .slot_name = request.expected.slot_name,
@@ -143,6 +168,11 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
         .manifest_sha256 = staged_receipt.value.manifest_sha256,
         .aggregate_sha256 = staged_receipt.value.aggregate_sha256,
         .generation_path = generation_relative_path,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
     }, .{});
     errdefer alloc.free(activation_json);
 
@@ -160,7 +190,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     try inspectTargetRoot(io, request.target_root);
     if (readOptionalFileAlloc(io, alloc, active_path, request.limits.max_receipt_bytes)) |existing_active| {
         defer alloc.free(existing_active);
-        try validateActiveReceipt(alloc, existing_active, request.expected, &seed_receipt_hex, generation_relative_path);
+        try validateActiveReceipt(alloc, existing_active, request.expected, request.binding, &seed_receipt_hex, generation_relative_path);
         try inspectGenerationsRoot(io, generations_root, request.expected.generation, installing_name);
         try validatePublishedGeneration(alloc, generation_path, request, activation_json);
         const active_receipt_copy = try alloc.dupe(u8, existing_active);
@@ -235,6 +265,14 @@ fn validateRequest(request: ActivateRequest) !void {
     if (!validAbsoluteRoot(request.staging_root)) return error.InvalidStagingRoot;
     if (!validAbsoluteRoot(request.target_root)) return error.InvalidActivationTarget;
     if (pathsOverlap(request.staging_root, request.target_root)) return error.OverlappingActivationPaths;
+    if (request.binding) |binding| try validateBinding(binding);
+}
+
+fn validateBinding(binding: ActivationBinding) !void {
+    if (!validation.isIdentifier(binding.topology_id)) return error.InvalidTopologyId;
+    if (!validation.isIdentifier(binding.node_id)) return error.InvalidNodeId;
+    if (!validation.isIdentifier(binding.target_pvc_name)) return error.InvalidTargetPVCName;
+    if (!validation.isIdentifier(binding.target_pvc_uid)) return error.InvalidTargetPVCUID;
 }
 
 fn validAbsoluteRoot(path: []const u8) bool {
@@ -286,6 +324,7 @@ fn validateActiveReceipt(
     alloc: Allocator,
     raw: []const u8,
     expected: seed_artifact.ExpectedArtifact,
+    expected_binding: ?ActivationBinding,
     seed_receipt_sha256: []const u8,
     generation_path: []const u8,
 ) !void {
@@ -299,6 +338,7 @@ fn validateActiveReceipt(
         !std.mem.eql(u8, receipt.generation_path, generation_path)) return error.ActiveGenerationConflict;
     try expectIdentity(expected.identity, receipt.identity(), error.ActiveGenerationConflict);
     if (receipt.checkpoint_lsn < expected.minimum_checkpoint_lsn) return error.ActiveGenerationConflict;
+    if (expected_binding) |binding| try expectBinding(binding, receipt, error.ActiveGenerationConflict);
 }
 
 fn validatePublishedGeneration(alloc: Allocator, generation_path: []const u8, request: ActivateRequest, activation_json: []const u8) !void {
@@ -308,6 +348,88 @@ fn validatePublishedGeneration(alloc: Allocator, generation_path: []const u8, re
     const marker_path = try std.fs.path.join(alloc, &.{ generation_path, generation_receipt_name });
     defer alloc.free(marker_path);
     try verifyGenerationReceipt(io_impl.io(), alloc, marker_path, activation_json, request.limits.max_receipt_bytes);
+    verifyInstalledActivationEvidence(io_impl.io(), alloc, generation_path, activation_json, request.limits) catch return error.SeedGenerationConflict;
+}
+
+fn verifyInstalledActivationEvidence(io: std.Io, alloc: Allocator, generation_path: []const u8, activation_json: []const u8, limits: seed_artifact.Limits) !void {
+    var active = std.json.parseFromSlice(ActivationReceipt, alloc, activation_json, .{}) catch return error.InvalidActiveReceipt;
+    defer active.deinit();
+    const receipt_path = try std.fs.path.join(alloc, &.{ generation_path, seed_artifact.receipt_name });
+    defer alloc.free(receipt_path);
+    const receipt_json = try readFileAlloc(io, alloc, receipt_path, limits.max_receipt_bytes);
+    defer alloc.free(receipt_json);
+    try expectSha256(receipt_json, active.value.seed_receipt_sha256, error.SeedReceiptDigestMismatch);
+    var installed = std.json.parseFromSlice(seed_artifact.Receipt, alloc, receipt_json, .{}) catch return error.InvalidArtifactReceipt;
+    defer installed.deinit();
+    const receipt = installed.value;
+    if (!std.mem.eql(u8, receipt.generation, active.value.generation) or
+        !std.mem.eql(u8, receipt.slot_name, active.value.slot_name) or
+        !std.mem.eql(u8, receipt.manifest_id, active.value.manifest_id) or
+        receipt.backup_lsn != active.value.backup_lsn or
+        receipt.checkpoint_lsn != active.value.checkpoint_lsn or
+        !std.mem.eql(u8, receipt.manifest_sha256, active.value.manifest_sha256) or
+        !std.mem.eql(u8, receipt.aggregate_sha256, active.value.aggregate_sha256)) return error.ActivationReceiptMismatch;
+    try expectIdentity(receipt.identity(), active.value.identity(), error.ActivationReceiptMismatch);
+}
+
+/// Revalidates all boot-critical evidence from the mounted target volume. This
+/// performs no writes and must succeed before the runtime opens the generation.
+pub fn validateActivatedGeneration(alloc: Allocator, expectation: StartupExpectation) !u64 {
+    if (!validAbsoluteRoot(expectation.target_root)) return error.InvalidActivationTarget;
+    if (!validation.isIdentifier(expectation.expected.generation)) return error.InvalidSeedGeneration;
+    if (!validation.isIdentifier(expectation.expected.slot_name)) return error.InvalidSlotName;
+    try validateBinding(expectation.binding);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const active_path = try std.fs.path.join(alloc, &.{ expectation.target_root, active_receipt_name });
+    defer alloc.free(active_path);
+    const active_json = readFileAlloc(io, alloc, active_path, expectation.limits.max_receipt_bytes) catch |err| switch (err) {
+        error.FileNotFound => return error.ActiveReceiptMissing,
+        else => return err,
+    };
+    defer alloc.free(active_json);
+    var active = std.json.parseFromSlice(ActivationReceipt, alloc, active_json, .{}) catch return error.InvalidActiveReceipt;
+    defer active.deinit();
+    const receipt = active.value;
+    const generation_relative_path = try std.fs.path.join(alloc, &.{ generations_dir_name, expectation.expected.generation });
+    defer alloc.free(generation_relative_path);
+    if (receipt.format_version != format_version or
+        !std.mem.eql(u8, receipt.generation, expectation.expected.generation) or
+        !std.mem.eql(u8, receipt.slot_name, expectation.expected.slot_name) or
+        !std.mem.eql(u8, receipt.generation_path, generation_relative_path) or
+        receipt.checkpoint_lsn < expectation.expected.minimum_checkpoint_lsn) return error.ActiveGenerationConflict;
+    try expectIdentity(expectation.expected.identity, receipt.identity(), error.ActiveGenerationConflict);
+    try expectBinding(expectation.binding, receipt, error.ActiveGenerationConflict);
+    try expectOptionalDigest(expectation.manifest_sha256, receipt.manifest_sha256);
+    try expectOptionalDigest(expectation.aggregate_sha256, receipt.aggregate_sha256);
+    try expectOptionalDigest(expectation.seed_receipt_sha256, receipt.seed_receipt_sha256);
+
+    const generation_path = try std.fs.path.join(alloc, &.{ expectation.target_root, generation_relative_path });
+    defer alloc.free(generation_path);
+    try validatePublishedGeneration(alloc, generation_path, .{
+        .staging_root = "/unused",
+        .target_root = expectation.target_root,
+        .expected = expectation.expected,
+        .binding = expectation.binding,
+        .limits = expectation.limits,
+    }, active_json);
+    return receipt.checkpoint_lsn;
+}
+
+fn expectBinding(expected: ActivationBinding, actual: ActivationReceipt, mismatch: anyerror) !void {
+    if (!std.mem.eql(u8, expected.topology_id, actual.topology_id) or
+        expected.topology_generation != actual.topology_generation or
+        !std.mem.eql(u8, expected.node_id, actual.node_id) or
+        !std.mem.eql(u8, expected.target_pvc_name, actual.target_pvc_name) or
+        !std.mem.eql(u8, expected.target_pvc_uid, actual.target_pvc_uid)) return mismatch;
+}
+
+fn expectOptionalDigest(expected: ?[]const u8, actual: []const u8) !void {
+    if (expected) |digest| {
+        if (digest.len != Sha256.digest_length * 2 or !std.mem.eql(u8, digest, actual)) return error.ActiveGenerationConflict;
+    }
 }
 
 fn verifyGenerationReceipt(io: std.Io, alloc: Allocator, marker_path: []const u8, expected: []const u8, max_bytes: usize) !void {
@@ -530,6 +652,68 @@ test "storage.ha seed activation publishes a verified immutable generation idemp
     try std.testing.expect(retried.already_active);
     try std.testing.expectEqualStrings(activated.generation_path, retried.generation_path);
     try std.testing.expectEqualStrings(activated.active_receipt_json, retried.active_receipt_json);
+}
+
+test "storage.ha seed activation binds startup evidence and revalidates installed bytes on restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const staging_root = try prepareTestStaging(alloc, root, "gen-bound", testIdentity(), "catalog-bound");
+    defer alloc.free(staging_root);
+    const target_root = try std.fs.path.join(alloc, &.{ root, "target-bound" });
+    defer alloc.free(target_root);
+    const binding = ActivationBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 3,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-1",
+    };
+    const expected = seed_artifact.ExpectedArtifact{
+        .generation = "gen-bound",
+        .slot_name = "standby-a",
+        .identity = testIdentity(),
+        .minimum_checkpoint_lsn = 11,
+    };
+
+    var activated = try activate(alloc, .{
+        .staging_root = staging_root,
+        .target_root = target_root,
+        .expected = expected,
+        .binding = binding,
+    });
+    defer activated.deinit(alloc);
+    var receipt = try std.json.parseFromSlice(ActivationReceipt, alloc, activated.active_receipt_json, .{});
+    defer receipt.deinit();
+    try std.testing.expectEqualStrings("topology-a", receipt.value.topology_id);
+    try std.testing.expectEqual(@as(u64, 3), receipt.value.topology_generation);
+    try std.testing.expectEqualStrings("pvc-uid-1", receipt.value.target_pvc_uid);
+
+    const expectation = StartupExpectation{
+        .target_root = target_root,
+        .expected = expected,
+        .binding = binding,
+        .manifest_sha256 = receipt.value.manifest_sha256,
+        .aggregate_sha256 = receipt.value.aggregate_sha256,
+        .seed_receipt_sha256 = receipt.value.seed_receipt_sha256,
+    };
+    try std.testing.expectEqual(@as(u64, 11), try validateActivatedGeneration(alloc, expectation));
+    try std.testing.expectEqual(@as(u64, 11), try validateActivatedGeneration(alloc, expectation));
+
+    var stale = expectation;
+    stale.binding.topology_generation = 2;
+    try std.testing.expectError(error.ActiveGenerationConflict, validateActivatedGeneration(alloc, stale));
+
+    const installed_file = try std.fs.path.join(alloc, &.{ activated.generation_path, "data/catalog.txt" });
+    defer alloc.free(installed_file);
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, installed_file, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "tampered");
+    }
+    try std.testing.expectError(error.SeedGenerationConflict, validateActivatedGeneration(alloc, expectation));
 }
 
 test "storage.ha seed activation rejects unrelated nonempty targets without mutation" {

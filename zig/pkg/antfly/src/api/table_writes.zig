@@ -6511,9 +6511,13 @@ pub const ProvisionedTableWriteSource = struct {
             .lmdb, .lsm => {},
             .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
         }
-        _ = try db.snapshot(snapshot_token);
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
         defer alloc.free(snapshot_root);
+        var io_impl = Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+        defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
+        _ = try db.snapshot(snapshot_token);
         try backups_api.copyDirectoryRecursive(alloc, snapshot_root, destination_root);
     }
 

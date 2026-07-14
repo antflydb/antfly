@@ -220,6 +220,30 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
 
 const ArtifactAction = enum { publish, restore, verify, activate, prune };
 
+const ActivationBindingOptions = struct {
+    topology_id: ?[]const u8 = null,
+    topology_generation: ?u64 = null,
+    node_id: ?[]const u8 = null,
+    target_pvc_name: ?[]const u8 = null,
+    target_pvc_uid: ?[]const u8 = null,
+
+    fn requested(self: ActivationBindingOptions) bool {
+        return self.topology_id != null or self.topology_generation != null or self.node_id != null or
+            self.target_pvc_name != null or self.target_pvc_uid != null;
+    }
+
+    fn finish(self: ActivationBindingOptions) !?ha.seed_activation.ActivationBinding {
+        if (!self.requested()) return null;
+        return .{
+            .topology_id = self.topology_id orelse return error.TopologyIdMissing,
+            .topology_generation = self.topology_generation orelse return error.TopologyGenerationMissing,
+            .node_id = self.node_id orelse return error.NodeIdMissing,
+            .target_pvc_name = self.target_pvc_name orelse return error.TargetPVCNameMissing,
+            .target_pvc_uid = self.target_pvc_uid orelse return error.TargetPVCUIDMissing,
+        };
+    }
+};
+
 const ArtifactOptions = struct {
     action: ArtifactAction,
     location: ?[]const u8 = null,
@@ -230,6 +254,7 @@ const ArtifactOptions = struct {
     staging_root: ?[]const u8 = null,
     target_root: ?[]const u8 = null,
     identity: IdentityOptions = .{},
+    binding: ActivationBindingOptions = .{},
     minimum_checkpoint_lsn: u64 = 0,
     retain_generations: usize = 2,
 };
@@ -304,6 +329,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .identity = try options.identity.finish(),
                     .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
                 },
+                .binding = try options.binding.finish(),
             });
             defer result.deinit(alloc);
             try writeArtifactResult(io, result.active_receipt_json);
@@ -371,6 +397,16 @@ fn parseArtifactArgs(argv: []const []const u8) !ArtifactOptions {
             options.identity.epoch = try parseU64(try artifactValue(argv, &idx));
         } else if (std.mem.eql(u8, flag, "--minimum-checkpoint-lsn")) {
             options.minimum_checkpoint_lsn = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--topology-id")) {
+            options.binding.topology_id = try artifactValue(argv, &idx);
+        } else if (std.mem.eql(u8, flag, "--topology-generation")) {
+            options.binding.topology_generation = try parseU64(try artifactValue(argv, &idx));
+        } else if (std.mem.eql(u8, flag, "--node-id")) {
+            options.binding.node_id = try artifactValue(argv, &idx);
+        } else if (std.mem.eql(u8, flag, "--target-pvc-name")) {
+            options.binding.target_pvc_name = try artifactValue(argv, &idx);
+        } else if (std.mem.eql(u8, flag, "--target-pvc-uid")) {
+            options.binding.target_pvc_uid = try artifactValue(argv, &idx);
         } else if (std.mem.eql(u8, flag, "--retain-generations")) {
             options.retain_generations = std.math.cast(usize, try parseU64(try artifactValue(argv, &idx))) orelse return error.InvalidSeedRetention;
             if (options.retain_generations == 0) return error.InvalidSeedRetention;
@@ -1374,12 +1410,25 @@ test "ha cmd parses offline seed activation target and identity" {
         "6",
         "--minimum-checkpoint-lsn",
         "10",
+        "--topology-id",
+        "topology-a",
+        "--topology-generation",
+        "3",
+        "--node-id",
+        "standby-a",
+        "--target-pvc-name",
+        "standby-a-data",
+        "--target-pvc-uid",
+        "pvc-uid-1",
     });
     try std.testing.expectEqual(ArtifactAction.activate, options.action);
     try std.testing.expectEqualStrings("/target/.antfly-ha/staging", options.staging_root.?);
     try std.testing.expectEqualStrings("/target", options.target_root.?);
     try std.testing.expectEqual(@as(u64, 100), options.identity.cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), options.minimum_checkpoint_lsn);
+    try std.testing.expectEqualStrings("topology-a", options.binding.topology_id.?);
+    try std.testing.expectEqual(@as(u64, 3), options.binding.topology_generation.?);
+    try std.testing.expectEqualStrings("pvc-uid-1", options.binding.target_pvc_uid.?);
 }
 
 test "ha cmd parses remote admin URL before command" {

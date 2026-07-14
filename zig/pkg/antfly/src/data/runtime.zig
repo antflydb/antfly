@@ -16187,6 +16187,7 @@ test "data server wires configured HA executors into API server" {
     {
         var db = try antfly.db.DB.open(alloc, replica_db_path, .{
             .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .identity_namespace = .{ .table_id = 20, .shard_id = 1, .range_id = 1 },
             .start_index_workers = false,
         });
         defer db.close();
@@ -16287,7 +16288,6 @@ test "data server wires configured HA executors into API server" {
         .body = capture_body,
     });
     defer capture_resp.deinit(alloc);
-    if (capture_resp.status != 200) std.debug.print("HA seed capture failed status={d} body={s}\n", .{ capture_resp.status, capture_resp.body });
     try std.testing.expectEqual(@as(u16, 200), capture_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
@@ -16391,24 +16391,49 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expectEqual(@as(u16, 200), capture_retry.status);
     try std.testing.expect(std.mem.indexOf(u8, capture_retry.body, "\"state\":\"already_applied\"") != null);
 
+    server.ha_cfg.seed_snapshot_provider = null;
+    var default_capture = try DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-default-provider",
+        "seed-default-provider-4",
+    );
+    defer default_capture.deinit(alloc);
+    const default_topology_path = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "TOPOLOGY.json" });
+    defer alloc.free(default_topology_path);
+    try std.Io.Dir.accessAbsolute(io_impl.io(), default_topology_path, .{});
+    const default_raft_wal = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "replicas/group-1/raft/wal-000001" });
+    defer alloc.free(default_raft_wal);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_impl.io(), default_raft_wal, .{}));
+
     // Contract: maintenance, bulk/structural activity, or an unsupported
     // snapshot provider must fail closed before backup_start burns a slot.
+    var active_group_operation = server.write_source.beginGroupRefreshActivity("docs", 1);
+    try std.testing.expectError(error.HASeedSnapshotRuntimeBusy, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-structural-busy",
+        "seed-standby-structural-busy-5",
+    ));
+    active_group_operation.deinit();
+
     server.lsm_maintenance_active.store(true, .release);
     defer server.lsm_maintenance_active.store(false, .release);
     try std.testing.expectError(error.HASeedSnapshotRuntimeBusy, DataServer.captureHASeedCallback(
         &server,
         alloc,
         "standby-busy",
-        "seed-standby-busy-4",
+        "seed-standby-busy-6",
     ));
     server.lsm_maintenance_active.store(false, .release);
 
+    server.ha_cfg.seed_snapshot_provider = seed_snapshot_provider.iface();
     seed_snapshot_provider.unsupported = true;
     try std.testing.expectError(error.HASeedSnapshotUnsupportedBackend, DataServer.captureHASeedCallback(
         &server,
         alloc,
         "standby-unsupported",
-        "seed-standby-unsupported-5",
+        "seed-standby-unsupported-7",
     ));
 
     var internal_resp = try server.http_server.?.handle(.{

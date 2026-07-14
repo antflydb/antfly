@@ -451,6 +451,39 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	return args.String()
 }
 
+func swarmHAStartupArgs(cluster *antflyv1.AntflyCluster) string {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
+		cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return ""
+	}
+	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
+	var args strings.Builder
+	appendArg := func(name, value string) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(shellQuoteArg(strings.TrimSpace(value)))
+	}
+	appendArg("--ha-startup-target-root", path.Join("/antflydb", haSeedActivationRelativeRoot))
+	appendArg("--ha-startup-topology-id", receipt.TopologyID)
+	appendArg("--ha-startup-topology-generation", strconv.FormatInt(receipt.TopologyGeneration, 10))
+	appendArg("--ha-startup-generation", receipt.Generation)
+	appendArg("--ha-startup-target-pvc-name", receipt.TargetPVCName)
+	appendArg("--ha-startup-target-pvc-uid", receipt.TargetPVCUID)
+	if receipt.ManifestSHA256 != "" {
+		appendArg("--ha-startup-manifest-sha256", receipt.ManifestSHA256)
+	}
+	if receipt.AggregateSHA256 != "" {
+		appendArg("--ha-startup-aggregate-sha256", receipt.AggregateSHA256)
+	}
+	if receipt.SeedReceiptSHA256 != "" {
+		appendArg("--ha-startup-seed-receipt-sha256", receipt.SeedReceiptSHA256)
+	}
+	return args.String()
+}
+
 func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncPolicy) {
 	if policy == nil || policy.Mode == "" || policy.Mode == antflyv1.HADurabilityModeAsync {
 		return
@@ -2769,13 +2802,14 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 exec /antfly swarm --id %d --config /config/config.json \
   --host 0.0.0.0 \
   --port %d \
-  --health-port %d%s%s
+  --health-port %d%s%s%s
 							`,
 								swarm.NodeID,
 								swarm.MetadataAPI.Port,
 								swarm.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
 								swarmHAArgs(cluster.Spec.HighAvailability),
+								swarmHAStartupArgs(cluster),
 							),
 						},
 						Resources:    r.buildResourceRequirements(swarm.Resources),

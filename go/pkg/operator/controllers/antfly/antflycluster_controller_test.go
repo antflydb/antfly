@@ -10592,7 +10592,8 @@ func TestReconcileSwarmStatefulSetStartupGateRequiresExactObservedReceipt(t *tes
 		ActivationReceipt: &antflyv1.HASeedActivationReceiptStatus{
 			TopologyID: "test-swarm", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
 			Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
-			ManifestSHA256: digest, GenerationPath: "generations/prod-standby-a-10",
+			ManifestSHA256: digest, AggregateSHA256: strings.Repeat("b", 64), SeedReceiptSHA256: strings.Repeat("c", 64),
+			GenerationPath: "generations/prod-standby-a-10",
 		},
 	}}
 	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
@@ -10600,6 +10601,14 @@ func TestReconcileSwarmStatefulSetStartupGateRequiresExactObservedReceipt(t *tes
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 	g.Expect(sts.Spec.Template.Annotations).To(HaveKey("antfly.io/ha-startup-receipt-hash"))
 	container := sts.Spec.Template.Spec.Containers[0]
+	runtimeArgs := container.Args[0]
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-root '/antflydb/.antfly-ha/active'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-topology-id 'test-swarm'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-topology-generation '3'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-generation 'prod-standby-a-10'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-pvc-name 'standby-a-data'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-pvc-uid 'pvc-uid-1'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-seed-receipt-sha256 '` + strings.Repeat("c", 64) + `'`))
 	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
 		Name: "ha-seed-generation", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/generations/prod-standby-a-10",
 	}))
