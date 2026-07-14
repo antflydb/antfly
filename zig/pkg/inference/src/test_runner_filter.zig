@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var filters: std.ArrayList([]const u8) = .empty;
     defer filters.deinit(allocator);
+    var fail_on_skip = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -46,6 +47,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 @panic("unable to parse --seed command line argument");
         } else if (std.mem.startsWith(u8, arg, "--cache-dir=")) {
             continue;
+        } else if (std.mem.eql(u8, arg, "--fail-on-skip")) {
+            fail_on_skip = true;
         } else if (std.mem.eql(u8, arg, "--test-filter")) {
             i += 1;
             if (i >= args.len) @panic("missing value after --test-filter");
@@ -113,7 +116,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("No tests matched runtime filters.\n", .{});
         std.process.exit(1);
     }
-    if (fail_count == 0 and leak_count == 0) {
+    if (fail_count == 0 and leak_count == 0 and (!fail_on_skip or skip_count == 0)) {
         std.debug.print("{d} selected; {d} passed; {d} skipped.\n", .{ selected_count, ok_count, skip_count });
         return;
     }

@@ -5550,13 +5550,16 @@ export interface components {
              *     to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
              *
              *     The semantic_search string is automatically embedded using the configured embedding model
-             *     for the specified indexes. Use `embedding_template` for multimodal queries.
+             *     for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for
+             *     multimodal queries.
              * @example artificial intelligence and machine learning applications
              */
             semantic_search?: string;
             /**
              * @description Optional Handlebars template for multimodal embedding of the semantic_search query.
              *     The template has access to `this` which contains the semantic_search string value.
+             *
+             *     UTF-8 template input is limited to 64 KiB.
              *
              *     Use this when you want to embed multimodal content (images, PDFs, etc.) instead of
              *     just text. The template is rendered using dotprompt with access to remote content helpers.
@@ -5713,7 +5716,8 @@ export interface components {
              * @description Optional query execution deadline in milliseconds. The server applies this as a
              *     cooperative deadline across query planning, search execution, aggregation reruns,
              *     sorting, and response post-processing. If the deadline expires before the query
-             *     completes, the HTTP API returns 504.
+             *     completes, the HTTP API returns 504. When omitted, semantic query embedding planning
+             *     and provider I/O use a 30-second default deadline.
              * @example 5000
              */
             timeout_ms?: number;
@@ -10552,8 +10556,10 @@ export interface components {
             retrieved_ids?: string[];
         };
         InferenceError: {
-            /** @description Error message */
+            /** @description Stable machine-readable error code when available; legacy responses may contain a human-readable error string. */
             error: string;
+            /** @description Optional human-readable detail for the error. */
+            message?: string;
         };
         InferencePredictRequest: {
             /** @description Predictor name from the model catalog. */
@@ -11229,6 +11235,14 @@ export interface components {
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
              */
             cache_compaction_ratio?: number;
+            /**
+             * @description inference-native prompt prefix cache namespace key. Requests with the same key can
+             *     reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+             *     requests without a key are never cached.
+             */
+            prompt_cache_key?: string;
+            /** @description inference-native prompt prefix cache control. False bypasses prompt cache for this request. */
+            prompt_cache?: boolean;
             backend?: components["schemas"]["InferenceModelBackend"];
             /**
              * @description inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
@@ -11348,6 +11362,8 @@ export interface components {
             completion_tokens: number;
             /** @description Total tokens used (prompt + completion) */
             total_tokens: number;
+            /** @description Prompt tokens served from inference-native prefix KV cache */
+            cached_prompt_tokens?: number;
         };
         /** @description Streaming generation chunk (SSE event data) */
         InferenceGenerateChunk: {
@@ -11448,6 +11464,42 @@ export interface components {
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
         };
+        /** @description Native generator prompt KV cache configuration. */
+        InferencePromptCacheConfig: {
+            /**
+             * @description Enable inference-native prompt KV cache reuse for generator requests.
+             * @default false
+             */
+            enabled?: boolean;
+            /**
+             * @description Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+             *     full KV blocks under prompt_cache_key with O(1) block lookup and is the
+             *     scalable production mode. `simple` keeps the linear-scan retained-prefix
+             *     cache and is only suitable for small caches or debugging.
+             * @default block_hash
+             * @enum {string}
+             */
+            mode?: "simple" | "block_hash";
+            /**
+             * @description Node-wide target for live prompt-cache entries. The runtime divides it
+             *     across participating model caches and evicts using estimated metadata
+             *     and logical host/device KV bytes. Backend allocators may retain reusable
+             *     capacity, so this is not a hard cap on process or accelerator memory.
+             * @default 512
+             */
+            max_bytes_mb?: number;
+            /**
+             * @description Minimum prompt length eligible for prompt KV caching.
+             * @default 64
+             */
+            min_tokens?: number;
+            /**
+             * @description Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+             *     hit, so only entries left unused for this duration expire.
+             * @default 300000
+             */
+            ttl_ms?: number;
+        };
         InferenceConfig: {
             /**
              * Format: uri
@@ -11482,11 +11534,12 @@ export interface components {
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
             /**
-             * @description How long to keep models loaded in memory after last use (Ollama-compatible).
-             *     Models are automatically unloaded after this duration of inactivity.
-             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
-             *     Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
-             *     where all models are loaded at startup and never unloaded.
+             * @description Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that
+             *     support idle eviction may unload a model after this duration of inactivity.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+             *     Defaults to "5m". Set to "0" to keep loaded models resident without idle
+             *     eviction. For compatibility, some runtimes also eagerly load discovered
+             *     models in this mode. Use `preload` when startup loading must be deterministic.
              * @default 5m
              * @example 5m
              */
@@ -11500,14 +11553,18 @@ export interface components {
              */
             max_loaded_models?: number;
             /**
-             * @description Number of concurrent inference pipelines per model. Each pipeline loads
-             *     a copy of the model, so higher values use more memory but allow more
-             *     concurrent requests. Note: pool_size multiplies per-model memory
-             *     independently of max_loaded_models.
+             * @description Number of reusable inference execution slots per model. Some runtimes realize
+             *     each slot as a complete pipeline, increasing both possible concurrency and
+             *     per-model memory; others pool lightweight backend providers, so memory and
+             *     throughput effects are backend-dependent. Generation and backends with shared
+             *     runtime state may remain serialized even when this is greater than one. Model
+             *     residency is controlled separately by `max_loaded_models`.
              * @default 1
              * @example 1
              */
             pool_size?: number;
+            /** @description Native generator prompt KV cache settings. */
+            prompt_cache?: components["schemas"]["InferencePromptCacheConfig"];
             /**
              * @description Backend priority order for model loading with optional device specifiers.
              *     Format: `backend` or `backend:device` where device defaults to `auto`.
@@ -11582,16 +11639,17 @@ export interface components {
              */
             max_memory_mb?: number;
             /**
-             * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
-             *     Models not in this map use the default strategy based on keep_alive:
-             *     - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-             *     - If keep_alive="0": eager loading (load at startup, never unload)
+             * @description Per-model loading strategy overrides for runtimes that support them. Maps model
+             *     names to their loading strategy. Models not in this map follow `keep_alive`:
+             *     positive durations permit idle eviction, while "0" keeps a model resident after
+             *     it is loaded. Some compatibility runtimes also eagerly load models for "0".
              *
              *     When a model has strategy "eager" in this map:
              *     - It is loaded at startup through the same startup warmup path
              *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
              *
-             *     This allows mixing eager and lazy models in the same pool.
+             *     Strategy support varies by runtime. Use `preload` for portable, deterministic
+             *     startup loading.
              * @example {
              *       "BAAI/bge-small-en-v1.5": "eager",
              *       "mirth/chonky-mmbert-small-multilingual-1": "lazy"
@@ -15359,6 +15417,17 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            503: {
+                headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
         };
     };
     chunkText: {
@@ -15452,6 +15521,17 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            503: {
+                headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
         };
     };
     rerankPrompts: {
@@ -15503,9 +15583,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reranking service unavailable (no models configured) */
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -15567,9 +15649,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -15618,9 +15702,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable */
+            /** @description Service unavailable because request queue capacity is exhausted. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -15682,9 +15768,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -15742,9 +15830,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -15802,9 +15892,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reader service unavailable (no models configured) */
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -15862,9 +15954,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Transcription service unavailable (no models configured) */
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -15922,9 +16016,11 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Extraction service unavailable (no models configured) */
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
             503: {
                 headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16014,6 +16110,17 @@ export interface operations {
             /** @description Internal server error */
             500: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Service unavailable because request capacity is exhausted or max_loaded_models has no idle model to evict. Model-capacity responses use error code MODEL_CAPACITY_REACHED. */
+            503: {
+                headers: {
+                    /** @description Present only for capacity or queue exhaustion; recommended delay in seconds before retrying. */
+                    "Retry-After"?: string;
                     [name: string]: unknown;
                 };
                 content: {

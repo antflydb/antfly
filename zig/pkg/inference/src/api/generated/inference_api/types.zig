@@ -170,11 +170,11 @@ pub const Config = struct {
     content_security: ?ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?Credentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    /// Idle-eviction policy for loaded models (Ollama-compatible). Runtimes that support idle eviction may unload a model after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to keep loaded models resident without idle eviction. For compatibility, some runtimes also eagerly load discovered models in this mode. Use `preload` when startup loading must be deterministic.
     keep_alive: ?[]const u8 = null,
     /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
     max_loaded_models: ?i64 = null,
-    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
+    /// Number of reusable inference execution slots per model. Some runtimes realize each slot as a complete pipeline, increasing both possible concurrency and per-model memory; others pool lightweight backend providers, so memory and throughput effects are backend-dependent. Generation and backends with shared runtime state may remain serialized even when this is greater than one. Model residency is controlled separately by `max_loaded_models`.
     pool_size: ?i64 = null,
     /// Native generator prompt KV cache settings.
     prompt_cache: ?PromptCacheConfig = null,
@@ -190,7 +190,7 @@ pub const Config = struct {
     preload: ?[]const ModelRef = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    /// Per-model loading strategy overrides for runtimes that support them. Maps model names to their loading strategy. Models not in this map follow `keep_alive`: positive durations permit idle eviction, while "0" keeps a model resident after it is loaded. Some compatibility runtimes also eagerly load models for "0". When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) Strategy support varies by runtime. Use `preload` for portable, deterministic startup loading.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
@@ -411,8 +411,10 @@ pub const EmbeddingUsage = struct {
 };
 
 pub const Error = struct {
-    /// Error message
+    /// Stable machine-readable error code when available; legacy responses may contain a human-readable error string.
     @"error": []const u8,
+    /// Optional human-readable detail for the error.
+    message: ?[]const u8 = null,
 };
 
 pub const ExtractFieldValue = struct {

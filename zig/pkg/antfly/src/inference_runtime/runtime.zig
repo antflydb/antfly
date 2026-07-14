@@ -246,7 +246,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     });
     defer node.deinit();
 
-    try node.warmConfiguredGenerators(alloc, io);
+    try node.warmConfiguredGeneratorsWithIo(alloc, io);
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
 }
@@ -290,7 +290,7 @@ pub fn spawnServerProcess(
 fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    node.warmConfiguredGenerators(alloc, io_impl.io()) catch |err| {
+    node.warmConfiguredGeneratorsWithIo(alloc, io_impl.io()) catch |err| {
         std.debug.print("inference warmup error: {}\n", .{err});
         return;
     };

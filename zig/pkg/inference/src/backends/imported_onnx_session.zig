@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 const ml = @import("ml");
 const onnx_graph = @import("onnx_graph");
 const c_file = @import("../util/c_file.zig");
@@ -259,6 +260,18 @@ const BackendContext = union(enum) {
         };
     }
 
+    fn attachIo(self: *BackendContext, io: std.Io) void {
+        switch (self.*) {
+            .native => |*ctx| if (comptime build_options.enable_native) {
+                ctx.compute.io = io;
+            } else unreachable,
+            .metal_hosted => |*ctx| if (comptime build_options.enable_metal) {
+                ctx.compute.io = io;
+            } else unreachable,
+            .wasm => {},
+        }
+    }
+
     fn importHostTensor(self: *BackendContext, allocator: std.mem.Allocator, tensor: *const Tensor) !ops_mod.CT {
         return switch (self.*) {
             .native => |*ctx| if (comptime build_options.enable_native)
@@ -349,6 +362,8 @@ pub const SharedBackendContext = struct {
     allocator: std.mem.Allocator,
     ctx: BackendContext,
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    io: ?std.Io,
+    run_lock: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !*SharedBackendContext {
         const shared = try allocator.create(SharedBackendContext);
@@ -356,6 +371,7 @@ pub const SharedBackendContext = struct {
         shared.* = .{
             .allocator = allocator,
             .ctx = try BackendContext.init(allocator, requested, io),
+            .io = io,
         };
         return shared;
     }
@@ -377,6 +393,29 @@ pub const SharedBackendContext = struct {
 
     pub fn backendType(self: *const SharedBackendContext) BackendType {
         return self.ctx.backendType();
+    }
+
+    /// Rebind the cooperative runtime after the owning server reaches a
+    /// quiescent point. This keeps both the run mutex and linalg dispatch from
+    /// retaining an Io whose Threaded owner has already been deinitialized.
+    pub fn attachIo(self: *SharedBackendContext, io: std.Io) void {
+        self.ctx.attachIo(io);
+        self.io = io;
+    }
+
+    fn lockRun(self: *SharedBackendContext) std.Io {
+        if (self.io) |io| {
+            self.run_lock.lockUncancelable(io);
+            return io;
+        }
+        // No-Io direct callers run on OS threads, so a short sleep/yield loop
+        // is safe and avoids pretending an unavailable cooperative runtime.
+        while (!self.run_lock.tryLock()) platform.time.yieldBriefly();
+        return std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn unlockRun(self: *SharedBackendContext, io: std.Io) void {
+        self.run_lock.unlock(io);
     }
 
     fn importHostTensor(self: *SharedBackendContext, allocator: std.mem.Allocator, tensor: *const Tensor) !ops_mod.CT {
@@ -448,6 +487,19 @@ test "shared backend context retains exact compute backend identity" {
     try std.testing.expectEqual(first.ptr, second.ptr);
     try std.testing.expectEqual(first.vtable, second.vtable);
     try std.testing.expectEqual(BackendType.native, shared.backendType());
+}
+
+test "shared backend context reattaches cooperative io" {
+    const shared = try SharedBackendContext.init(std.testing.allocator, .native, null);
+    defer shared.release();
+
+    shared.attachIo(std.testing.io);
+
+    try std.testing.expect(shared.io != null);
+    switch (shared.ctx) {
+        .native => |ctx| try std.testing.expect(ctx.compute.io != null),
+        else => unreachable,
+    }
 }
 
 fn metalShaderValidationEnabledForTest() bool {
@@ -857,6 +909,15 @@ pub fn createSessionWithOptions(
         self.shared_backend_ctx.release();
     }
 
+    // Optional multimodal/projection sessions import their static tensors into
+    // the main session's mutable compute backend. Serialize that entire setup
+    // with inference on the shared context, including error cleanup.
+    const initialization_lock_io = if (options.shared_backend_ctx != null)
+        self.shared_backend_ctx.lockRun()
+    else
+        null;
+    defer if (initialization_lock_io) |lock_io| self.shared_backend_ctx.unlockRun(lock_io);
+
     self.cb = self.shared_backend_ctx.computeBackend();
     self.runtime = try graph_runtime_mod.Runtime.init(
         allocator,
@@ -973,7 +1034,9 @@ fn logImportedGraphBindings(graph: *const Graph, input_node_ids: []const NodeId,
 
 fn run(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
-    var resident_outputs = try runResidentImpl(self, inputs, null, allocator);
+    const lock_io = self.shared_backend_ctx.lockRun();
+    defer self.shared_backend_ctx.unlockRun(lock_io);
+    var resident_outputs = try runResidentImplUnlocked(self, inputs, null, allocator);
     defer resident_outputs.deinit();
 
     const outputs = try allocator.alloc(Tensor, resident_outputs.outputs.len);
@@ -1016,6 +1079,20 @@ fn runResidentImpl(
     resident_inputs: ?[]const ResidentInput,
     allocator: std.mem.Allocator,
 ) !ResidentOutputs {
+    const lock_io = self.shared_backend_ctx.lockRun();
+    defer self.shared_backend_ctx.unlockRun(lock_io);
+    return try runResidentImplUnlocked(self, host_inputs, resident_inputs, allocator);
+}
+
+fn runResidentImplUnlocked(
+    self: *ImportedOnnxSession,
+    host_inputs: ?[]const Tensor,
+    resident_inputs: ?[]const ResidentInput,
+    allocator: std.mem.Allocator,
+) !ResidentOutputs {
+    // Imported submodels may share one backend context and one mutable Metal
+    // runtime. Callers serialize import and execution across that context;
+    // the host `run` path also keeps conversion/export inside the same guard.
     const input_len = if (host_inputs) |inputs| inputs.len else if (resident_inputs) |inputs| inputs.len else 0;
     if (input_len != self.input_info.len) return error.InputArityMismatch;
 

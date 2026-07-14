@@ -88,6 +88,9 @@ pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
+    /// Maximum overlapping compute backends per model session. Metal uses
+    /// this to bound its warm provider pool and backpressure excess work.
+    pool_size: usize = 1,
     /// Optional Io runtime threaded into compute backends so parallel GEMM
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
@@ -106,6 +109,10 @@ pub const SessionManager = struct {
             .preferred_backends = configuredPreferredBackends(),
             .io = io,
         };
+    }
+
+    pub fn setPoolSize(self: *SessionManager, pool_size: usize) void {
+        self.pool_size = @max(pool_size, 1);
     }
 
     pub fn loadModel(self: *SessionManager, model_path: []const u8) !Session {
@@ -193,6 +200,7 @@ pub const SessionManager = struct {
             // received options.io), attach the SessionManager's Io now so
             // matmul work composes with the caller's runtime.  attachIo
             // is a no-op on Sessions whose vtable isn't arch_vtable.
+            session_factory.attachMetalProviderPoolSize(session, self.pool_size);
             if (self.io) |io_handle| session_factory.attachIo(session, io_handle);
             // Same lifecycle for graph-runtime strategy: today only the
             // gliner branch consults it (other architectures don't have
@@ -285,6 +293,15 @@ test "onnx backend availability follows linked onnx runtime" {
 test "preferred backend override keeps fallback backends" {
     try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .metal, .native }, preferredBackendsForOverride(.onnx));
     try std.testing.expectEqualSlices(BackendType, &.{ .native, .onnx, .metal }, preferredBackendsForOverride(.native));
+}
+
+test "session manager normalizes provider pool size" {
+    var manager = SessionManager.init(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manager.pool_size);
+    manager.setPoolSize(0);
+    try std.testing.expectEqual(@as(usize, 1), manager.pool_size);
+    manager.setPoolSize(4);
+    try std.testing.expectEqual(@as(usize, 4), manager.pool_size);
 }
 
 test "explicit graph runtime is independent from onnx runtime backend availability" {

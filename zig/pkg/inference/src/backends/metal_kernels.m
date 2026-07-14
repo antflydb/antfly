@@ -59,6 +59,11 @@
 #define TERMITE_METAL_OPERATOR_COUNTER_COUNT 16
 #define TERMITE_METAL_QUANT_DISPATCH_COUNTER_COUNT 4
 
+static uint64_t termite_metal_embedding_cache_hits_total = 0;
+static uint64_t termite_metal_embedding_cache_misses_total = 0;
+static uint64_t termite_metal_embedding_cache_evictions_total = 0;
+static uint64_t termite_metal_embedding_cache_bypasses_total = 0;
+
 #define TERMITE_METAL_PLAN_OP_UNKNOWN 0u
 #define TERMITE_METAL_PLAN_OP_DECODE_ATTENTION_PRE_NORM 1u
 #define TERMITE_METAL_PLAN_OP_DECODE_Q_OR_QKV_LINEAR 2u
@@ -659,6 +664,10 @@ typedef struct termite_metal_decode_runtime {
     uintptr_t generic_embedding_source_id;
     size_t generic_embedding_source_offset;
     size_t generic_embedding_cache_next;
+    uint64_t generic_embedding_cache_hits;
+    uint64_t generic_embedding_cache_misses;
+    uint64_t generic_embedding_cache_evictions;
+    uint64_t generic_embedding_cache_bypasses;
     size_t scratch_capacity;
     size_t host_staging_capacity;
     size_t active_frame_host_staging_capacity;
@@ -937,6 +946,10 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t managed_bytes;
     uint64_t embedding_logical_bytes;
     uint64_t embedding_bytes;
+    uint64_t embedding_cache_hits;
+    uint64_t embedding_cache_misses;
+    uint64_t embedding_cache_evictions;
+    uint64_t embedding_cache_bypasses;
     uint64_t norm_bytes;
     uint64_t dense_linear_bytes;
     uint64_t dense_linear_buffer_count;
@@ -1060,6 +1073,13 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t q6_k_linear_reduce_f16_input;
     uint64_t rms_norm_add_sumsq;
 } termite_metal_decode_runtime_memory_stats;
+
+typedef struct termite_metal_embedding_cache_process_stats {
+    uint64_t hits_total;
+    uint64_t misses_total;
+    uint64_t evictions_total;
+    uint64_t bypasses_total;
+} termite_metal_embedding_cache_process_stats;
 
 static NSUInteger termite_metal_thread_width(id<MTLComputePipelineState> pipeline, size_t dim);
 static NSUInteger termite_metal_threadgroup_memory_16(NSUInteger bytes);
@@ -14401,9 +14421,13 @@ static bool termite_metal_decode_runtime_select_embedding_cache(
             runtime->generic_embedding_dim = entry->dim;
             runtime->generic_embedding_source_id = entry->source_id;
             runtime->generic_embedding_source_offset = entry->source_offset;
+            runtime->generic_embedding_cache_hits += 1;
+            __atomic_fetch_add(&termite_metal_embedding_cache_hits_total, 1, __ATOMIC_RELAXED);
             return true;
         }
     }
+    runtime->generic_embedding_cache_misses += 1;
+    __atomic_fetch_add(&termite_metal_embedding_cache_misses_total, 1, __ATOMIC_RELAXED);
     return false;
 }
 
@@ -14456,6 +14480,10 @@ static void termite_metal_decode_runtime_store_embedding_cache(
     }
 
     termite_metal_embedding_table_cache_entry *entry = &runtime->generic_embedding_cache[slot];
+    if (entry->buffer != nil) {
+        runtime->generic_embedding_cache_evictions += 1;
+        __atomic_fetch_add(&termite_metal_embedding_cache_evictions_total, 1, __ATOMIC_RELAXED);
+    }
     entry->buffer = buffer;
     entry->buffer_offset = buffer_offset;
     entry->bytes = bytes;
@@ -14554,19 +14582,19 @@ int termite_metal_decode_runtime_prepare_embedding_table_bf16_no_copy_region(
     }
 }
 
-int termite_metal_decode_runtime_prepare_embedding_table_device(
+int termite_metal_decode_runtime_prepare_embedding_table_device_keyed(
     termite_metal_decode_runtime *runtime,
     void *src_handle,
     size_t src_offset,
+    uintptr_t source_id,
     size_t rows,
     size_t dim
 ) {
     if (runtime == NULL || src_handle == NULL) return -1;
     if (runtime->device == nil || runtime->queue == nil) return -2;
     if (rows == 0 || dim == 0) return -3;
-    const uintptr_t source_id = (uintptr_t)src_handle;
     const size_t bytes = rows * dim * sizeof(float);
-    if (termite_metal_decode_runtime_select_embedding_cache(runtime, source_id, src_offset, rows, dim, bytes)) return 0;
+    if (termite_metal_decode_runtime_select_embedding_cache(runtime, source_id, 0, rows, dim, bytes)) return 0;
     @autoreleasepool {
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)src_handle;
         if (src_offset + bytes > src.length) return -4;
@@ -14583,7 +14611,7 @@ int termite_metal_decode_runtime_prepare_embedding_table_device(
         [blit copyFromBuffer:src sourceOffset:src_offset toBuffer:dst destinationOffset:0 size:bytes];
         [blit endEncoding];
         if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8) != 0) return -8;
-        termite_metal_decode_runtime_store_embedding_cache(runtime, dst, 0, source_id, src_offset, rows, dim, bytes);
+        termite_metal_decode_runtime_store_embedding_cache(runtime, dst, 0, source_id, 0, rows, dim, bytes);
         return 0;
     }
 }
@@ -14774,6 +14802,8 @@ int termite_metal_decode_runtime_embedding_lookup_direct_device(
     if (runtime == NULL || weight_handle == NULL || ids == NULL || output_handle == NULL) return -1;
     if (runtime->embedding_lookup_pipeline == nil) return -2;
     if (total == 0 || dim == 0 || rows == 0) return -3;
+    runtime->generic_embedding_cache_bypasses += 1;
+    __atomic_fetch_add(&termite_metal_embedding_cache_bypasses_total, 1, __ATOMIC_RELAXED);
     @autoreleasepool {
         id<MTLBuffer> weight_buffer = (__bridge id<MTLBuffer>)weight_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
@@ -15674,9 +15704,15 @@ int termite_metal_decode_runtime_embedding_lookup(
     size_t dim,
     float *output
 ) {
-    const int prep_rc = termite_metal_decode_runtime_prepare_embedding_table(runtime, weight, rows, dim);
-    if (prep_rc != 0) return prep_rc;
-    return termite_metal_decode_runtime_embedding_lookup_prepared(runtime, ids, total, dim, output);
+    if (runtime == NULL || weight == NULL || ids == NULL || output == NULL) return -1;
+    if (rows == 0 || total == 0 || dim == 0) return -2;
+    runtime->generic_embedding_cache_bypasses += 1;
+    __atomic_fetch_add(&termite_metal_embedding_cache_bypasses_total, 1, __ATOMIC_RELAXED);
+    for (size_t i = 0; i < total; i++) {
+        if (ids[i] >= rows) return -3;
+        memcpy(output + i * dim, weight + (size_t)ids[i] * dim, dim * sizeof(float));
+    }
+    return 0;
 }
 
 int termite_metal_decode_runtime_apply_rope(
@@ -37563,6 +37599,15 @@ uint64_t termite_metal_decode_runtime_last_frame_gpu_nanos(termite_metal_decode_
     return runtime->last_frame_gpu_nanos;
 }
 
+int termite_metal_embedding_cache_process_snapshot(termite_metal_embedding_cache_process_stats *snapshot) {
+    if (snapshot == NULL) return -1;
+    snapshot->hits_total = __atomic_load_n(&termite_metal_embedding_cache_hits_total, __ATOMIC_RELAXED);
+    snapshot->misses_total = __atomic_load_n(&termite_metal_embedding_cache_misses_total, __ATOMIC_RELAXED);
+    snapshot->evictions_total = __atomic_load_n(&termite_metal_embedding_cache_evictions_total, __ATOMIC_RELAXED);
+    snapshot->bypasses_total = __atomic_load_n(&termite_metal_embedding_cache_bypasses_total, __ATOMIC_RELAXED);
+    return 0;
+}
+
 int termite_metal_decode_runtime_memory_snapshot(
     termite_metal_decode_runtime *runtime,
     termite_metal_decode_runtime_memory_stats *snapshot
@@ -37579,6 +37624,10 @@ int termite_metal_decode_runtime_memory_snapshot(
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->generic_embedding_cache[slot].buffer, &snapshot->embedding_bytes);
         snapshot->embedding_logical_bytes += (uint64_t)runtime->generic_embedding_cache[slot].bytes;
     }
+    snapshot->embedding_cache_hits = runtime->generic_embedding_cache_hits;
+    snapshot->embedding_cache_misses = runtime->generic_embedding_cache_misses;
+    snapshot->embedding_cache_evictions = runtime->generic_embedding_cache_evictions;
+    snapshot->embedding_cache_bypasses = runtime->generic_embedding_cache_bypasses;
 
     for (size_t slot = 0; slot < TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY; ++slot) {
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->layer_norm_weight_buffers[slot], &snapshot->norm_bytes);

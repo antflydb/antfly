@@ -911,10 +911,13 @@ pub fn runFromIterator(
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
+        antfly_node_cfg.keep_alive_ms = cfg.inference.keep_alive_ms;
+        antfly_node_cfg.max_loaded_models = cfg.inference.max_loaded_models;
+        antfly_node_cfg.pool_size = cfg.inference.pool_size;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
-    try antfly_node.warmConfiguredModels(alloc, init.io);
+    try antfly_node.warmConfiguredModelsWithIo(alloc, init.io);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,

@@ -130,6 +130,9 @@ pub const Config = struct {
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
         query_embedding_cache: QueryEmbeddingCacheConfig = .{},
+        keep_alive_ms: u64 = 300_000,
+        max_loaded_models: usize = 0,
+        pool_size: usize = 1,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -393,6 +396,18 @@ pub const Config = struct {
             try queryEmbeddingCacheFromOpenApi(inference.query_embedding_cache)
         else
             Config.InferenceConfig.QueryEmbeddingCacheConfig{};
+        const inference_keep_alive_ms = if (validated.value.inference) |inference|
+            try parseGoDurationMs(inference.keep_alive orelse "5m")
+        else
+            300_000;
+        const inference_max_loaded_models = if (validated.value.inference) |inference|
+            try nonNegativeUsize(inference.max_loaded_models orelse 0)
+        else
+            0;
+        const inference_pool_size = if (validated.value.inference) |inference|
+            try positiveUsize(inference.pool_size orelse 1)
+        else
+            1;
         return .{
             .registry = registry,
             .transcribers = transcribers,
@@ -426,6 +441,9 @@ pub const Config = struct {
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
                 .query_embedding_cache = query_embedding_cache,
+                .keep_alive_ms = inference_keep_alive_ms,
+                .max_loaded_models = inference_max_loaded_models,
+                .pool_size = inference_pool_size,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -1029,6 +1047,73 @@ fn queryEmbeddingCacheFromOpenApi(
     };
 }
 
+fn nonNegativeUsize(value: i64) !usize {
+    if (value < 0) return error.InvalidConfig;
+    return std.math.cast(usize, value) orelse error.InvalidConfig;
+}
+
+fn positiveUsize(value: i64) !usize {
+    if (value <= 0) return error.InvalidConfig;
+    return std.math.cast(usize, value) orelse error.InvalidConfig;
+}
+
+fn parseGoDurationMs(value: []const u8) !u64 {
+    if (std.mem.eql(u8, value, "0")) return 0;
+    if (value.len == 0) return error.InvalidConfig;
+
+    var total_ns: u128 = 0;
+    var offset: usize = 0;
+    while (offset < value.len) {
+        const whole_start = offset;
+        while (offset < value.len and std.ascii.isDigit(value[offset])) : (offset += 1) {}
+        if (offset == whole_start) return error.InvalidConfig;
+        const whole = std.fmt.parseInt(u128, value[whole_start..offset], 10) catch return error.InvalidConfig;
+
+        var fraction: u128 = 0;
+        var fraction_scale: u128 = 1;
+        if (offset < value.len and value[offset] == '.') {
+            offset += 1;
+            const fraction_start = offset;
+            while (offset < value.len and std.ascii.isDigit(value[offset])) : (offset += 1) {
+                if (fraction_scale > std.math.maxInt(u128) / 10) return error.InvalidConfig;
+                fraction_scale *= 10;
+            }
+            if (offset == fraction_start) return error.InvalidConfig;
+            fraction = std.fmt.parseInt(u128, value[fraction_start..offset], 10) catch return error.InvalidConfig;
+        }
+
+        const unit_ns: u128 = if (std.mem.startsWith(u8, value[offset..], "ms")) unit: {
+            offset += 2;
+            break :unit std.time.ns_per_ms;
+        } else if (std.mem.startsWith(u8, value[offset..], "us")) unit: {
+            offset += 2;
+            break :unit std.time.ns_per_us;
+        } else if (std.mem.startsWith(u8, value[offset..], "ns")) unit: {
+            offset += 2;
+            break :unit 1;
+        } else if (std.mem.startsWith(u8, value[offset..], "h")) unit: {
+            offset += 1;
+            break :unit std.time.ns_per_hour;
+        } else if (std.mem.startsWith(u8, value[offset..], "m")) unit: {
+            offset += 1;
+            break :unit std.time.ns_per_min;
+        } else if (std.mem.startsWith(u8, value[offset..], "s")) unit: {
+            offset += 1;
+            break :unit std.time.ns_per_s;
+        } else return error.InvalidConfig;
+
+        const whole_ns = std.math.mul(u128, whole, unit_ns) catch return error.InvalidConfig;
+        const fraction_ns = std.math.mul(u128, fraction, unit_ns) catch return error.InvalidConfig;
+        total_ns = std.math.add(u128, total_ns, whole_ns) catch return error.InvalidConfig;
+        total_ns = std.math.add(u128, total_ns, fraction_ns / fraction_scale) catch return error.InvalidConfig;
+    }
+
+    if (total_ns == 0) return error.InvalidConfig;
+    const rounded_numerator = std.math.add(u128, total_ns, std.time.ns_per_ms - 1) catch return error.InvalidConfig;
+    const rounded_ms = rounded_numerator / std.time.ns_per_ms;
+    return std.math.cast(u64, rounded_ms) orelse error.InvalidConfig;
+}
+
 fn parseInferencePreloadModels(
     alloc: std.mem.Allocator,
     raw_inference: ?std.json.Value,
@@ -1239,6 +1324,9 @@ test "common config extracts antfly settings" {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
+        \\    "keep_alive": "1h30m",
+        \\    "max_loaded_models": 3,
+        \\    "pool_size": 2,
         \\    "query_embedding_cache": {
         \\      "enabled": false,
         \\      "max_bytes_mb": 128,
@@ -1270,6 +1358,9 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expectEqual(@as(u64, 5_400_000), cfg.inference.keep_alive_ms);
+    try std.testing.expectEqual(@as(usize, 3), cfg.inference.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 2), cfg.inference.pool_size);
     try std.testing.expect(!cfg.inference.query_embedding_cache.enabled);
     try std.testing.expectEqual(@as(usize, 128), cfg.inference.query_embedding_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(u64, 45_000), cfg.inference.query_embedding_cache.ttl_ms);
@@ -1285,6 +1376,16 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);
     try std.testing.expectEqualStrings("antfly-key", cfg.inference.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("antfly-secret", cfg.inference.s3_credentials.?.secret_access_key.?);
+}
+
+test "common config parses documented model keep-alive durations" {
+    try std.testing.expectEqual(@as(u64, 0), try parseGoDurationMs("0"));
+    try std.testing.expectEqual(@as(u64, 300_000), try parseGoDurationMs("5m"));
+    try std.testing.expectEqual(@as(u64, 5_400_000), try parseGoDurationMs("1h30m"));
+    try std.testing.expectEqual(@as(u64, 1_500), try parseGoDurationMs("1.5s"));
+    try std.testing.expectError(error.InvalidConfig, parseGoDurationMs("forever"));
+    try std.testing.expectError(error.InvalidConfig, nonNegativeUsize(-1));
+    try std.testing.expectError(error.InvalidConfig, positiveUsize(0));
 }
 
 test "common config parses inference preload" {

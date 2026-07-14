@@ -187,6 +187,10 @@ pub const Metrics = struct {
         self.queue_depth.set(@intCast(depth));
     }
 
+    pub fn setModelsLoaded(self: *Metrics, count: usize) void {
+        self.models_loaded.set(@intCast(count));
+    }
+
     pub fn setQueueState(self: *Metrics, active_units: usize, capacity: usize, active_requests: usize) void {
         self.queue_depth.set(@intCast(active_units));
         self.queue_capacity.set(@intCast(capacity));
