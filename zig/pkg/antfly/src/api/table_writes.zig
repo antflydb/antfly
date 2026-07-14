@@ -6494,7 +6494,7 @@ pub const ProvisionedTableWriteSource = struct {
             group_id,
             self.backend_runtime,
             self.ha_write_gate,
-            self.ha_async_mirror,
+            null,
         );
         defer db.close();
         return try captureHASeedDbSnapshot(alloc, &db, path, snapshot_token, destination_root);
