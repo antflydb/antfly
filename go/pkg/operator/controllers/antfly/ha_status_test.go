@@ -1100,6 +1100,59 @@ func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
 	}
 }
 
+func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *testing.T) {
+	initial := uint64(5)
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 9}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a",
+	}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name:       "standby-a",
+		InitialLSN: &initial,
+		AdminURL:   "http://standby-a-ha.default.svc:8081",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location:         "s3://ha-seeds/cluster-a",
+			GenerationPrefix: "base",
+			StagingRoot:      "/target/.antfly-ha/staging",
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{
+				ClaimName: "standby-a-data",
+				MountPath: "/target",
+			},
+		},
+	}}
+
+	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
+	actions := cluster.Status.HAStatus.PlannedActions
+	wantKinds := []string{
+		string(haActionCreateSlot),
+		string(haActionSeedStandby),
+		"CaptureSeedArtifact",
+		string(haActionFinishStandbySeed),
+		string(haActionPublishSeedArtifact),
+		string(haActionRestoreSeedArtifact),
+		"ActivateSeedArtifact",
+		string(haActionBootstrapStandbySeed),
+		string(haActionPruneSeedArtifacts),
+	}
+	gotKinds := make([]string, len(actions))
+	for i := range actions {
+		gotKinds[i] = actions[i].Kind
+	}
+	if !reflect.DeepEqual(gotKinds, wantKinds) {
+		t.Fatalf("SEED_CAPTURE_MISSING: runtime-owned seed workflow requires %v without caller-provided manifest/content paths, got %v (%#v)", wantKinds, gotKinds, actions)
+	}
+	if actions[2].Executor != string(haActionExecutorAdminAPI) ||
+		actions[2].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("SEED_CAPTURE_NOT_RUNTIME_OWNED: capture must execute in the mounted primary runtime, got %#v", actions[2])
+	}
+	if actions[6].Executor != string(haActionExecutorCLIJob) ||
+		actions[6].SeedArtifactGeneration != "base-standby-a-10" {
+		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[6])
+	}
+}
+
 func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	undesired := false
 	cluster := haCluster()
