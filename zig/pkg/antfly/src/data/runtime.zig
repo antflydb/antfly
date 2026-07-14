@@ -16241,6 +16241,9 @@ test "data server wires configured HA executors into API server" {
     try primary.createSlot("standby-a", 0);
     _ = try primary.append(.{ .payload = "one" });
     _ = try primary.append(.{ .payload = "two" });
+    // Keep the metrics fixture independent of backup-log growth: this slot is
+    // the one unhealthy streaming standby whose reseed signal we exercise.
+    try primary.markSlotReseedRequired("standby-a");
 
     var seed_snapshot_provider = TestHASeedSnapshotProvider{ .db_path = replica_db_path };
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
@@ -16254,7 +16257,7 @@ test "data server wires configured HA executors into API server" {
             .admin_bearer_token = "runtime-secret-token",
             .seed_capture_root = seed_capture_root,
             .seed_snapshot_provider = seed_snapshot_provider.iface(),
-            .primary_retention_policy = .{ .max_lag_lsn = 1 },
+            .primary_retention_policy = .{},
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
@@ -16383,6 +16386,7 @@ test "data server wires configured HA executors into API server" {
     const captured_slot = primary.slot("standby-capture") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, captured_slot.lifecycle);
     try std.testing.expect(!captured_slot.active);
+    try std.testing.expect(!captured_slot.reseed_required);
 
     var capture_retry = try server.http_server.?.handle(.{
         .method = .POST,
@@ -16409,6 +16413,9 @@ test "data server wires configured HA executors into API server" {
     const default_raft_wal = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "replicas/group-1/raft/wal-000001" });
     defer alloc.free(default_raft_wal);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_impl.io(), default_raft_wal, .{}));
+    const default_captured_slot = primary.slot("standby-default-provider") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, default_captured_slot.lifecycle);
+    try std.testing.expect(!default_captured_slot.reseed_required);
 
     // Contract: maintenance, bulk/structural activity, or an unsupported
     // snapshot provider must fail closed before backup_start burns a slot.
