@@ -144,7 +144,18 @@ pub const State = struct {
         }
         if (after_generation_check) |hook| hook(self);
 
-        const decision = switch (self.currentRole()) {
+        // Snapshot the role before validating the generation a second time.
+        // A successful validation therefore linearizes against publishPrimary's
+        // generation increment: a role observed across a promotion boundary can
+        // never authorize a write through the stale pinned generation.
+        const role = self.currentRole();
+        if (expected_generation) |expected| {
+            if (expected != self.currentGeneration()) {
+                return error.HAPromotedStandbyRequiresPrimaryOpen;
+            }
+        }
+
+        const decision = switch (role) {
             .disabled => return,
             .standby => return error.HAReadOnlyStandby,
             .transitioning => return error.HAPromotedStandbyRequiresPrimaryOpen,
@@ -249,6 +260,16 @@ test "storage.ha public gate state rejects a pinned write when promotion changes
         error.HAPromotedStandbyRequiresPrimaryOpen,
         state.checkWriteWithHook(pinned_generation, PromotionInterleave.afterGenerationCheck),
     );
+}
+
+test "storage.ha public gate state admits a pinned write across a stable authorization snapshot" {
+    var state = State{};
+    const pinned_generation = state.currentGeneration();
+
+    try state.checkWrite(pinned_generation);
+    try state.checkWriteWithHook(pinned_generation, struct {
+        fn stable(_: *const State) void {}
+    }.stable);
 }
 
 test "storage.ha public gate state never clears an observed primary fence" {

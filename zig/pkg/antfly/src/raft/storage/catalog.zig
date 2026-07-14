@@ -15,7 +15,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fs_paths = @import("../../common/fs_paths.zig");
+const platform_sync = @import("antfly_platform").sync;
 const raft_engine = @import("raft_engine");
+
+var catalog_tmp_nonce: std.atomic.Value(u64) = .init(0);
 
 const TestPersistFailureBoundary = enum {
     before_publish,
@@ -271,6 +274,7 @@ pub const FileReplicaCatalog = struct {
     io_impl: std.Io.Threaded,
     path: []const u8,
     records: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
     test_persist_failure_boundary: if (builtin.is_test) ?TestPersistFailureBoundary else void = if (builtin.is_test) null else {},
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
@@ -309,32 +313,71 @@ pub const FileReplicaCatalog = struct {
 
     fn upsertReplica(ptr: *anyopaque, record: ReplicaRecord) !void {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        platform_sync.lockYieldingIo(&self.mutex, self.io());
+        defer self.mutex.unlock();
+
         if (self.records.getPtr(record.group_id)) |existing| {
             if (eqlReplicaRecord(existing.*, record)) return;
         }
-        const owned = try record.clone(self.alloc);
-        errdefer {
-            var cleanup = owned;
-            cleanup.deinit(self.alloc);
-        }
+        var owned = try record.clone(self.alloc);
         if (self.records.getPtr(record.group_id)) |existing| {
-            existing.deinit(self.alloc);
+            var previous = existing.*;
             existing.* = owned;
-        } else {
-            try self.records.put(self.alloc, record.group_id, owned);
+            var published = false;
+            self.persist(&published) catch |err| {
+                if (published) {
+                    previous.deinit(self.alloc);
+                } else {
+                    owned = existing.*;
+                    existing.* = previous;
+                    owned.deinit(self.alloc);
+                }
+                return err;
+            };
+            previous.deinit(self.alloc);
+            return;
         }
-        try self.persist();
+
+        self.records.put(self.alloc, record.group_id, owned) catch |err| {
+            owned.deinit(self.alloc);
+            return err;
+        };
+        var published = false;
+        self.persist(&published) catch |err| {
+            if (!published) {
+                var rejected = self.records.fetchRemove(record.group_id).?.value;
+                rejected.deinit(self.alloc);
+            }
+            return err;
+        };
     }
 
     fn removeReplica(ptr: *anyopaque, group_id: u64) !bool {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
-        const removed = self.records.remove(group_id);
-        if (removed) try self.persist();
-        return removed;
+        platform_sync.lockYieldingIo(&self.mutex, self.io());
+        defer self.mutex.unlock();
+
+        const removed = self.records.fetchRemove(group_id) orelse return false;
+        var published = false;
+        self.persist(&published) catch |err| {
+            if (published) {
+                var committed_removed = removed.value;
+                committed_removed.deinit(self.alloc);
+            } else {
+                self.records.putAssumeCapacity(removed.key, removed.value);
+            }
+            return err;
+        };
+        var committed_removed = removed.value;
+        committed_removed.deinit(self.alloc);
+        return true;
     }
 
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicaRecord {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        platform_sync.lockYieldingIo(&self.mutex, self.io());
+        defer self.mutex.unlock();
+
         var out = try alloc.alloc(ReplicaRecord, self.records.count());
         var i: usize = 0;
         errdefer freeReplicaRecords(alloc, out[0..i]);
@@ -413,12 +456,18 @@ pub const FileReplicaCatalog = struct {
         }
     }
 
-    fn persist(self: *FileReplicaCatalog) !void {
+    fn persist(self: *FileReplicaCatalog, published: *bool) !void {
+        published.* = false;
         const parent_dir = std.fs.path.dirname(self.path);
         if (parent_dir) |dir| try fs_paths.createDirPathPortable(self.io(), dir);
 
         const records = try self.listOwned(self.alloc);
         defer freeReplicaRecords(self.alloc, records);
+        std.mem.sort(ReplicaRecord, records, {}, struct {
+            fn lessThan(_: void, left: ReplicaRecord, right: ReplicaRecord) bool {
+                return left.group_id < right.group_id;
+            }
+        }.lessThan);
         var encoded = std.ArrayListUnmanaged(u8).empty;
         defer encoded.deinit(self.alloc);
         for (records) |record| {
@@ -457,19 +506,43 @@ pub const FileReplicaCatalog = struct {
             try encoded.appendSlice(self.alloc, line);
         }
 
-        // Keep the existing in-place persistence behavior visible to the crash
-        // regression below. The production fix must move this failure boundary
-        // to an adjacent, fully-synced temporary file immediately before atomic
-        // rename, leaving the previously published catalog untouched.
-        var file = try std.Io.Dir.cwd().createFile(self.io(), self.path, .{ .truncate = true });
-        defer file.close(self.io());
-        if (builtin.is_test and self.test_persist_failure_boundary == .before_publish) {
-            return error.TestCatalogPersistBeforePublish;
+        const tmp_path = try std.fmt.allocPrint(self.alloc, "{s}.tmp-{x}-{d}", .{
+            self.path,
+            @intFromPtr(self),
+            catalog_tmp_nonce.fetchAdd(1, .monotonic),
+        });
+        defer self.alloc.free(tmp_path);
+        var temp_exists = true;
+        defer if (temp_exists) deleteFilePortable(self.io(), tmp_path);
+
+        {
+            var file = try fs_paths.createFilePortable(self.io(), tmp_path, .{ .truncate = true });
+            defer file.close(self.io());
+            var writer_buffer: [4096]u8 = undefined;
+            var writer = file.writer(self.io(), &writer_buffer);
+            try writer.interface.writeAll(encoded.items);
+            try writer.end();
+            try file.sync(self.io());
         }
-        var writer_buffer: [4096]u8 = undefined;
-        var writer = file.writer(self.io(), &writer_buffer);
-        try writer.interface.writeAll(encoded.items);
-        try writer.flush();
+
+        // This deterministic boundary models a crash after the replacement is
+        // durable but before it is published. The old catalog must remain the
+        // only visible snapshot, and the caller must roll back its live map.
+        if (builtin.is_test and self.test_persist_failure_boundary == .before_publish)
+            return error.TestCatalogPersistBeforePublish;
+
+        if (std.fs.path.isAbsolute(self.path))
+            try std.Io.Dir.renameAbsolute(tmp_path, self.path, self.io())
+        else
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), self.path, self.io());
+        temp_exists = false;
+        published.* = true;
+
+        // Once rename succeeds, the new snapshot is the committed in-process
+        // state. Syncing the containing directory makes that name replacement
+        // crash-durable on platforms that expose directory fsync.
+        const sync_parent = parent_dir orelse if (std.fs.path.isAbsolute(self.path)) "/" else ".";
+        try fs_paths.syncDirPortable(self.io(), sync_parent);
     }
 
     fn io(self: *FileReplicaCatalog) std.Io {
@@ -488,6 +561,13 @@ pub const FileReplicaCatalog = struct {
         return out;
     }
 };
+
+fn deleteFilePortable(io: std.Io, path: []const u8) void {
+    if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
 
 test "raft replica catalog storage module compiles" {
     _ = ReplicaBootstrapMode;
@@ -586,6 +666,12 @@ test "raft.storage file replica catalog crash before atomic publish preserves pr
                 .metadata_version = 2,
             }),
         );
+
+        const live_records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer freeReplicaRecords(std.testing.allocator, live_records);
+        try std.testing.expectEqual(@as(usize, 1), live_records.len);
+        try std.testing.expectEqual(@as(u64, 21), live_records[0].group_id);
+        try std.testing.expectEqual(@as(u64, 1), live_records[0].metadata_version);
     }
 
     var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
@@ -593,12 +679,52 @@ test "raft.storage file replica catalog crash before atomic publish preserves pr
     const records = try reopened.catalog().listReplicas(std.testing.allocator);
     defer freeReplicaRecords(std.testing.allocator, records);
 
-    // RED: the current in-place truncate destroys the last good snapshot before
-    // the replacement is durable. Atomic temp+fsync+rename persistence keeps the
-    // group-21 catalog visible and never exposes group 22 after this crash.
+    // Atomic temp+fsync+rename persistence keeps the group-21 catalog visible
+    // and never exposes group 22 after this crash boundary.
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expectEqual(@as(u64, 21), records[0].group_id);
     try std.testing.expectEqual(@as(u64, 1), records[0].metadata_version);
+}
+
+test "raft.storage file replica catalog rolls back failed replacement and removal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-rollback.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer replica_catalog.deinit();
+    try replica_catalog.catalog().upsertReplica(.{
+        .group_id = 31,
+        .replica_id = 4,
+        .local_node_id = 6,
+        .metadata_version = 1,
+    });
+
+    replica_catalog.test_persist_failure_boundary = .before_publish;
+    try std.testing.expectError(
+        error.TestCatalogPersistBeforePublish,
+        replica_catalog.catalog().upsertReplica(.{
+            .group_id = 31,
+            .replica_id = 4,
+            .local_node_id = 6,
+            .metadata_version = 2,
+        }),
+    );
+    try std.testing.expectError(
+        error.TestCatalogPersistBeforePublish,
+        replica_catalog.catalog().removeReplica(31),
+    );
+
+    const live_records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, live_records);
+    try std.testing.expectEqual(@as(usize, 1), live_records.len);
+    try std.testing.expectEqual(@as(u64, 31), live_records[0].group_id);
+    try std.testing.expectEqual(@as(u64, 1), live_records[0].metadata_version);
+
+    replica_catalog.test_persist_failure_boundary = null;
+    try std.testing.expect(try replica_catalog.catalog().removeReplica(31));
 }
 
 test "file replica catalog persists backup restore bootstrap records across reopen" {
