@@ -72,6 +72,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         pub fn renderPagePngAlloc(_: Allocator, _: []const u8, _: usize, _: u16, _: u64) ![]u8 {
             return error.PdfRenderingUnavailable;
         }
+
+        pub fn renderParsedPagePngAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64) ![]u8 {
+            return error.PdfRenderingUnavailable;
+        }
     }
 else
     @import("antfly_pdf");
@@ -110,6 +114,23 @@ pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentCo
 pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
     return try pdf.renderPagePngAlloc(alloc, pdf_bytes, page_number, dpi, max_pixels);
 }
+
+pub const PdfRenderSession = struct {
+    parsed: pdf.reader.Reader,
+
+    pub fn init(alloc: Allocator, pdf_bytes: []const u8) !PdfRenderSession {
+        return .{ .parsed = try pdf.reader.Reader.init(alloc, pdf_bytes) };
+    }
+
+    pub fn deinit(self: *PdfRenderSession) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+
+    pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+        return try pdf.renderParsedPagePngAlloc(alloc, &self.parsed, page_number, dpi, max_pixels);
+    }
+};
 
 pub fn ocrPagePartsJsonAlloc(alloc: Allocator, config: Config, route_type: []const u8, source_content_type: []const u8, unit: Unit, png: []const u8) ![]u8 {
     const encoded_len = std.base64.standard.Encoder.calcSize(png.len);
@@ -664,6 +685,9 @@ fn parseOptionalProducerConfigJsonAlloc(
             enabled.* = boolField(producer_object, "enabled") orelse true;
             const config_value = producer_object.get("config") orelse .null;
             if (config_value == .null) return "";
+            if (config_value != .object) return error.InvalidDocumentExtractionConfig;
+            const provider = config_value.object.get("provider") orelse return error.InvalidDocumentExtractionConfig;
+            if (provider != .string or provider.string.len == 0) return error.InvalidDocumentExtractionConfig;
             return try std.json.Stringify.valueAlloc(alloc, config_value, .{});
         },
         else => return error.InvalidDocumentExtractionConfig,
@@ -1120,12 +1144,11 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     var cursor: usize = 0;
     while (page_num <= page_count) : (page_num += 1) {
         const force_ocr = ocr_mode == .always;
-        const text = if (force_ocr) try alloc.alloc(u8, 0) else try parsed.extractPageTextAlloc(page_num);
+        // `.always` forces the OCR attempt, but the merger still needs the
+        // embedded candidate in order to retain whichever text is better.
+        const text = try parsed.extractPageTextAlloc(page_num);
         errdefer alloc.free(text);
-        const text_regions: []TextRegion = if (force_ocr)
-            @constCast(&.{})
-        else
-            try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        const text_regions: []TextRegion = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
@@ -1187,12 +1210,11 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
     var cursor: usize = 0;
     while (page_num <= page_count) : (page_num += 1) {
         const force_ocr = ocr_mode == .always;
-        var text = if (force_ocr) try alloc.alloc(u8, 0) else try parsed.extractPageTextAlloc(page_num);
+        // Keep embedded text even in forced mode so OCR is not a blind
+        // replacement for usable born-digital content.
+        var text = try parsed.extractPageTextAlloc(page_num);
         errdefer alloc.free(text);
-        var text_regions: []TextRegion = if (force_ocr)
-            @constCast(&.{})
-        else
-            try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        var text_regions: []TextRegion = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_text_len = text.len;
         const page_box = parsed.extractPageBox(page_num) catch null;
@@ -3236,6 +3258,16 @@ test "OCR options parse configurable thresholds resolution and layout prompt" {
     try std.testing.expectEqual(@as(u64, 123456), config.ocr_max_rendered_pixels);
     try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_content_chars);
     try std.testing.expectEqualStrings("Preserve tables", config.ocr_prompt);
+}
+
+test "generated text provider config is validated while parsing extraction config" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"config":{"model":"missing-provider"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"config":"not-an-object"}}
+    ));
 }
 
 test "OCR page request carries PNG media page metadata and layout prompt" {

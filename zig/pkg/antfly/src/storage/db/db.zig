@@ -18192,12 +18192,18 @@ fn completeDocumentExtractionGeneratedText(
 ) !void {
     const active_runtime = runtime orelse return;
     const producer = active_runtime.config.asset_producer orelse return;
+    var pdf_session: ?document_extraction_mod.PdfRenderSession = if (std.mem.eql(u8, extraction.route_type, "pdf"))
+        try document_extraction_mod.PdfRenderSession.init(alloc, source_bytes)
+    else
+        null;
+    defer if (pdf_session) |*session| session.deinit();
     for (extraction.units) |*unit| {
         if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
             unit.ocr_attempted = true;
             unit.ocr_render_dpi = if (std.mem.eql(u8, extraction.route_type, "pdf")) config.ocr_render_dpi else null;
             const rendered = if (std.mem.eql(u8, extraction.route_type, "pdf"))
-                document_extraction_mod.renderPdfPagePngAlloc(alloc, source_bytes, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels) catch |err| {
+                pdf_session.?.renderPagePngAlloc(alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels) catch |err| {
+                    if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
                     try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
                     continue;
                 }
@@ -18216,6 +18222,7 @@ fn completeDocumentExtractionGeneratedText(
                 .source_parts_json = parts_json,
                 .content_type = "text/plain",
             }) catch |err| {
+                if (enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
                 try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, err);
                 continue;
             };

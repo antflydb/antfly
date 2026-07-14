@@ -448,7 +448,7 @@ fn transientEmbedRetryDecision(runtime: *EnrichmentRuntime, attempt: u32) Transi
     return .retry_inline;
 }
 
-fn isRetryableEnrichmentError(err: anyerror) bool {
+pub fn isRetryableEnrichmentError(err: anyerror) bool {
     return switch (err) {
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
@@ -465,7 +465,9 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         error.SendFailed,
         error.RecvFailed,
         error.ResourceBudgetExceeded,
+        error.OutOfMemory,
         error.GenerateBatchTransientFailure,
+        error.ReadTransientFailure,
         => true,
         else => false,
     };
@@ -2736,8 +2738,8 @@ fn completeRuntimeDocumentExtractionGeneratedText(
     extraction: *document_extraction_mod.Result,
 ) !void {
     const producer = runtime.config.asset_producer orelse return;
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr, null);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript, null);
 }
 
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
@@ -2751,6 +2753,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     source_content_type: []const u8,
     units: []document_extraction_mod.Unit,
     kind: RuntimeGeneratedUnitTextKind,
+    pdf_session_override: ?*document_extraction_mod.PdfRenderSession,
 ) !void {
     const enabled = switch (kind) {
         .ocr => config.ocr_enabled,
@@ -2786,6 +2789,13 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     }
 
     var batch_bytes: usize = 0;
+    var owned_pdf_session: ?document_extraction_mod.PdfRenderSession = null;
+    defer if (owned_pdf_session) |*session| session.deinit();
+    var pdf_session = pdf_session_override;
+    if (pdf_session == null and kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
+        owned_pdf_session = try document_extraction_mod.PdfRenderSession.init(runtime.alloc, source_bytes);
+        pdf_session = &owned_pdf_session.?;
+    }
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
         var rendered: ?[]u8 = null;
@@ -2794,10 +2804,21 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
-                rendered = document_extraction_mod.renderPdfPagePngAlloc(runtime.alloc, source_bytes, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels) catch |err| {
+                rendered = pdf_session.?.renderPagePngAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels) catch |err| {
+                    if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
                     try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, err);
                     continue;
                 };
+            }
+        }
+        // Avoid allocating the base64 and JSON copies when the encoded PNG
+        // alone cannot fit the configured request budget. The exact request
+        // size is checked again after serialization below.
+        if (rendered) |png| {
+            const encoded_len = std.base64.standard.Encoder.calcSize(png.len);
+            if (encoded_len >= batch_policy.max_bytes or config_json.len >= batch_policy.max_bytes - encoded_len) {
+                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
+                continue;
             }
         }
         const parts_json = if (rendered) |png|
@@ -2814,6 +2835,12 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             .content_type = "text/plain",
         };
         const request_bytes = runtimeGeneratedTextRequestBytes(request);
+        if (request_bytes > batch_policy.max_bytes) {
+            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
+            runtime.alloc.free(parts_json);
+            owns_parts_json = false;
+            continue;
+        }
         if (requests.items.len > 0 and (requests.items.len >= batch_policy.max_items or batch_bytes + request_bytes > batch_policy.max_bytes)) {
             try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality);
             requests.clearRetainingCapacity();
@@ -3250,11 +3277,12 @@ const RuntimeGeneratedUnitCacheEntry = struct {
 
 const RuntimeGeneratedUnitCache = struct {
     entries: std.ArrayListUnmanaged(RuntimeGeneratedUnitCacheEntry) = .empty,
+    indexes: std.StringHashMapUnmanaged(usize) = .empty,
     bytes: usize = 0,
 
     fn putClone(self: *@This(), alloc: Allocator, unit: document_extraction_mod.Unit) !void {
-        for (self.entries.items) |*entry| {
-            if (!std.mem.eql(u8, entry.unit_id, unit.unit_id)) continue;
+        if (self.indexes.get(unit.unit_id)) |index| {
+            const entry = &self.entries.items[index];
             var cloned = try cloneDocumentExtractionUnit(alloc, unit);
             errdefer cloned.deinit(alloc);
             self.bytes = self.bytes -| runtimeGeneratedUnitCacheEntryBytes(entry.*);
@@ -3271,17 +3299,20 @@ const RuntimeGeneratedUnitCache = struct {
             .unit_id = unit_id,
             .unit = cloned,
         });
+        errdefer {
+            _ = self.entries.pop().?;
+        }
+        try self.indexes.put(alloc, unit_id, self.entries.items.len - 1);
         self.bytes = addUsizeSaturating(self.bytes, unit_id.len + runtimeDocumentExtractionUnitOwnedBytes(cloned));
     }
 
     fn get(self: *const @This(), unit_id: []const u8) ?*const document_extraction_mod.Unit {
-        for (self.entries.items) |*entry| {
-            if (std.mem.eql(u8, entry.unit_id, unit_id)) return &entry.unit;
-        }
-        return null;
+        const index = self.indexes.get(unit_id) orelse return null;
+        return &self.entries.items[index].unit;
     }
 
     fn deinit(self: *@This(), alloc: Allocator) void {
+        self.indexes.deinit(alloc);
         for (self.entries.items) |*entry| entry.deinit(alloc);
         self.entries.deinit(alloc);
         self.* = .{};
@@ -3421,6 +3452,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     pending_generated_units: std.ArrayListUnmanaged(document_extraction_mod.Unit) = .empty,
     pending_generated_kind: ?RuntimeGeneratedUnitTextKind = null,
     pending_generated_bytes: usize = 0,
+    pdf_render_session: ?document_extraction_mod.PdfRenderSession = null,
     resolved_char_cursor: usize = 0,
 
     fn sink(self: *@This()) document_extraction_mod.UnitSink {
@@ -3433,6 +3465,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     }
 
     fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.pdf_render_session) |*session| session.deinit();
         self.info.deinit(alloc);
         self.clearPendingGeneratedUnits(alloc);
         self.pending_generated_units.deinit(alloc);
@@ -3485,6 +3518,9 @@ const RuntimeDocumentExtractionCollectContext = struct {
         if (self.pending_generated_units.items.len == 0) return;
         const producer = self.runtime.config.asset_producer orelse return error.MissingAssetProducer;
         const kind = self.pending_generated_kind orelse return error.InvalidAssetProducerResponse;
+        if (self.pdf_render_session == null and kind == .ocr and std.mem.eql(u8, self.info.route_type, "pdf")) {
+            self.pdf_render_session = try document_extraction_mod.PdfRenderSession.init(self.runtime.alloc, self.source_bytes);
+        }
         try completeRuntimeDocumentExtractionGeneratedTextBatch(
             self.runtime,
             producer,
@@ -3496,6 +3532,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
             self.info.content_type,
             self.pending_generated_units.items,
             kind,
+            if (self.pdf_render_session) |*session| session else null,
         );
         for (self.pending_generated_units.items) |*unit| {
             unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
@@ -8941,6 +8978,7 @@ test "document extraction generated OCR batches honor execution item cap" {
         "application/pdf",
         units[0..],
         .ocr,
+        null,
     );
 
     try std.testing.expectEqual(@as(usize, 2), fake.batch_count);
@@ -9145,6 +9183,7 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         "application/pdf",
         units[0..],
         .ocr,
+        null,
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
@@ -9242,6 +9281,7 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
         "application/pdf",
         units[0..],
         .ocr,
+        null,
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
