@@ -573,6 +573,24 @@ const (
 	HARuntimeRoleStandby HARuntimeRole = "Standby"
 )
 
+// HAStartupGatePolicy selects the fail-closed runtime startup policy.
+type HAStartupGatePolicy string
+
+const (
+	// HAStartupGatePolicyRequireActivatedSeed keeps the runtime offline until the
+	// operator has observed an exact, durable target-volume activation receipt.
+	HAStartupGatePolicyRequireActivatedSeed HAStartupGatePolicy = "RequireActivatedSeed"
+)
+
+// HAReceiptMatchPolicy selects how startup receipt evidence is compared.
+type HAReceiptMatchPolicy string
+
+const (
+	// HAReceiptMatchPolicyExact requires every configured identity and optional
+	// digest/PVC UID field to match exactly.
+	HAReceiptMatchPolicyExact HAReceiptMatchPolicy = "Exact"
+)
+
 // HighAvailabilitySpec configures hot-standby HA for an AntflyCluster.
 type HighAvailabilitySpec struct {
 	// Mode selects whether hot standby is managed.
@@ -668,6 +686,13 @@ type HASeedArtifactSpec struct {
 	// +kubebuilder:validation:Pattern=`^(s3://|gs://|file://).+`
 	Location string `json:"location"`
 
+	// Generation is the exact immutable generation shared by capture, publish,
+	// restore, activation, startup gating, and restart. Production startup gates
+	// require this field; it is never recomputed from mutable observed LSN state.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:-]+$`
+	// +optional
+	Generation string `json:"generation,omitempty"`
+
 	// GenerationPrefix is prepended to the deterministic generation selected by
 	// the operator. It must be a safe HA identifier and defaults to "seed".
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:-]+$`
@@ -742,6 +767,11 @@ type HARuntimeSpec struct {
 	// +optional
 	SeedCaptureRoot string `json:"seedCaptureRoot,omitempty"`
 
+	// StartupGate keeps a standby runtime at zero replicas until the operator has
+	// observed an exact activation receipt on its deterministic target PVC.
+	// +optional
+	StartupGate *HAStartupGateSpec `json:"startupGate,omitempty"`
+
 	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
 	// When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
 	// Populate it with adminTokenSecretRef or spec.swarm.envFrom for Antfly runtime pods and CLI fallback Jobs.
@@ -763,6 +793,51 @@ type HARuntimeSpec struct {
 	// Standby configures standby-side durable HA state and optional continuous pull source.
 	// +optional
 	Standby *HAStandbyRuntimeSpec `json:"standby,omitempty"`
+}
+
+// HAStartupGateSpec declares the exact receipt required before a runtime may
+// start. runtimeEligible is a declarative suspension fence: false always keeps
+// replicas at zero, while true remains subject to policy-specific verification.
+type HAStartupGateSpec struct {
+	// Policy currently supports only RequireActivatedSeed.
+	// +kubebuilder:validation:Enum=RequireActivatedSeed
+	Policy HAStartupGatePolicy `json:"policy"`
+
+	// RuntimeEligible is necessary but never sufficient for startup. False always
+	// forces replicas to zero, including during declarative role handoff. True is
+	// honored only after the operator-observed policy evidence matches.
+	// +optional
+	RuntimeEligible bool `json:"runtimeEligible,omitempty"`
+
+	// ReceiptMatchPolicy currently supports only Exact.
+	// +kubebuilder:validation:Enum=Exact
+	ReceiptMatchPolicy HAReceiptMatchPolicy `json:"receiptMatchPolicy"`
+
+	// RequiredReceipt binds the one target volume generation this runtime may open.
+	RequiredReceipt HARequiredSeedActivationReceipt `json:"requiredReceipt"`
+}
+
+// HARequiredSeedActivationReceipt is the desired exact startup identity.
+type HARequiredSeedActivationReceipt struct {
+	TopologyID string `json:"topologyID"`
+	// TopologyGeneration optionally rejects a receipt from an older replacement
+	// topology generation. When non-zero it is matched exactly.
+	// +optional
+	TopologyGeneration int64  `json:"topologyGeneration,omitempty"`
+	NodeID             string `json:"nodeID"`
+	SlotName           string `json:"slotName"`
+	Generation         string `json:"generation"`
+	TargetPVCName      string `json:"targetPVCName"`
+
+	// Optional exact evidence. When configured, omission or mismatch fails closed.
+	// +optional
+	ManifestSHA256 string `json:"manifestSHA256,omitempty"`
+	// +optional
+	AggregateSHA256 string `json:"aggregateSHA256,omitempty"`
+	// +optional
+	SeedReceiptSHA256 string `json:"seedReceiptSHA256,omitempty"`
+	// +optional
+	TargetPVCUID string `json:"targetPVCUID,omitempty"`
 }
 
 // HAPrimaryRuntimeSpec configures primary-side HA WAL and replication slot state.
@@ -1678,6 +1753,42 @@ type HAStatus struct {
 	// LastPromotion records the last completed promotion.
 	// +optional
 	LastPromotion *HAPromotionStatus `json:"lastPromotion,omitempty"`
+
+	// StartupGate is operator-observed state. In particular, activationReceipt
+	// never appears in spec and cannot be self-asserted by a caller.
+	// +optional
+	StartupGate *HAStartupGateStatus `json:"startupGate,omitempty"`
+}
+
+// HAStartupGateStatus reports whether the exact activated target is eligible.
+type HAStartupGateStatus struct {
+	RuntimeEligible bool   `json:"runtimeEligible"`
+	Reason          string `json:"reason,omitempty"`
+	// +optional
+	ActivationReceipt *HASeedActivationReceiptStatus `json:"activationReceipt,omitempty"`
+}
+
+// HASeedActivationReceiptStatus is operator-observed evidence from the
+// activation Job and the Kubernetes PVC object it wrote.
+type HASeedActivationReceiptStatus struct {
+	TopologyID         string `json:"topologyID"`
+	TopologyGeneration int64  `json:"topologyGeneration,omitempty"`
+	NodeID             string `json:"nodeID"`
+	SlotName           string `json:"slotName"`
+	Generation         string `json:"generation"`
+	TargetPVCName      string `json:"targetPVCName"`
+	TargetPVCUID       string `json:"targetPVCUID,omitempty"`
+	ClusterID          uint64 `json:"clusterID,omitempty"`
+	ShardID            uint64 `json:"shardID,omitempty"`
+	TableID            uint64 `json:"tableID,omitempty"`
+	TimelineID         uint64 `json:"timelineID,omitempty"`
+	Epoch              uint64 `json:"epoch,omitempty"`
+	BackupLSN          uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN      uint64 `json:"checkpointLSN,omitempty"`
+	ManifestSHA256     string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256    string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256  string `json:"seedReceiptSHA256,omitempty"`
+	GenerationPath     string `json:"generationPath,omitempty"`
 }
 
 // HAStandbyStatus reports one hot standby slot.
@@ -1886,25 +1997,30 @@ type HAPlannedActionStatus struct {
 
 // HASeedArtifactReceiptStatus summarizes a durable portable seed receipt.
 type HASeedArtifactReceiptStatus struct {
-	FormatVersion     int32  `json:"formatVersion"`
-	Generation        string `json:"generation"`
-	SlotName          string `json:"slotName"`
-	ClusterID         uint64 `json:"clusterID,omitempty"`
-	ShardID           uint64 `json:"shardID,omitempty"`
-	TableID           uint64 `json:"tableID,omitempty"`
-	TimelineID        uint64 `json:"timelineID,omitempty"`
-	Epoch             uint64 `json:"epoch,omitempty"`
-	ManifestID        string `json:"manifestID,omitempty"`
-	BackupLSN         uint64 `json:"backupLSN,omitempty"`
-	CheckpointLSN     uint64 `json:"checkpointLSN,omitempty"`
-	ManifestSHA256    string `json:"manifestSHA256,omitempty"`
-	AggregateSHA256   string `json:"aggregateSHA256,omitempty"`
-	SeedReceiptSHA256 string `json:"seedReceiptSHA256,omitempty"`
-	GenerationPath    string `json:"generationPath,omitempty"`
-	TotalBytes        uint64 `json:"totalBytes,omitempty"`
-	FileCount         int32  `json:"fileCount,omitempty"`
-	RetainedCount     int32  `json:"retainedCount,omitempty"`
-	DeletedCount      int32  `json:"deletedCount,omitempty"`
+	FormatVersion      int32  `json:"formatVersion"`
+	Generation         string `json:"generation"`
+	SlotName           string `json:"slotName"`
+	ClusterID          uint64 `json:"clusterID,omitempty"`
+	ShardID            uint64 `json:"shardID,omitempty"`
+	TableID            uint64 `json:"tableID,omitempty"`
+	TimelineID         uint64 `json:"timelineID,omitempty"`
+	Epoch              uint64 `json:"epoch,omitempty"`
+	ManifestID         string `json:"manifestID,omitempty"`
+	BackupLSN          uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN      uint64 `json:"checkpointLSN,omitempty"`
+	ManifestSHA256     string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256    string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256  string `json:"seedReceiptSHA256,omitempty"`
+	GenerationPath     string `json:"generationPath,omitempty"`
+	TotalBytes         uint64 `json:"totalBytes,omitempty"`
+	FileCount          int32  `json:"fileCount,omitempty"`
+	RetainedCount      int32  `json:"retainedCount,omitempty"`
+	DeletedCount       int32  `json:"deletedCount,omitempty"`
+	TopologyID         string `json:"topologyID,omitempty"`
+	TopologyGeneration int64  `json:"topologyGeneration,omitempty"`
+	NodeID             string `json:"nodeID,omitempty"`
+	TargetPVCName      string `json:"targetPVCName,omitempty"`
+	TargetPVCUID       string `json:"targetPVCUID,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.

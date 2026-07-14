@@ -1226,6 +1226,33 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 	}
 }
 
+func TestPlanHAUsesExplicitExactSeedArtifactGenerationAcrossChangingLSN(t *testing.T) {
+	standby := antflyv1.HAStandbySpec{
+		Name: "standby-a",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location: "s3://ha-seeds/cluster-a", Generation: "release-2026-07-14-a",
+			StagingRoot: "/target/.antfly-ha/staging",
+			SourcePVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+		},
+	}
+	first := haSeedCompletionActions(standby, "standby-a", 10, "seed", haActionCreateSlot)
+	second := haSeedCompletionActions(standby, "standby-a", 999, "seed", haActionCreateSlot)
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatalf("expected explicit-generation seed actions, got first=%#v second=%#v", first, second)
+	}
+	for _, actions := range [][]haPlannedAction{first, second} {
+		for _, action := range actions {
+			if action.Kind == haActionFinishStandbySeed {
+				continue
+			}
+			if action.SeedArtifactGeneration != "release-2026-07-14-a" {
+				t.Fatalf("EXACT_GENERATION_RECOMPUTED: action %s used %q", action.Kind, action.SeedArtifactGeneration)
+			}
+		}
+	}
+}
+
 func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	undesired := false
 	cluster := haCluster()

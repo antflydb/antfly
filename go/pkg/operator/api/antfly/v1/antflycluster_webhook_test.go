@@ -1964,6 +1964,94 @@ func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
+			StartupGate: &HAStartupGateSpec{
+				Policy:             HAStartupGatePolicyRequireActivatedSeed,
+				RuntimeEligible:    false,
+				ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
+				RequiredReceipt: HARequiredSeedActivationReceipt{
+					TopologyID: "test-swarm-cluster", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
+					ManifestSHA256: strings.Repeat("a", 64),
+				},
+			},
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", Generation: "prod-standby-a-10",
+				StagingRoot: "/target/.antfly-ha/staging",
+				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected exact activated-seed startup gate to be valid: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:     HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-b"},
+			StartupGate: &HAStartupGateSpec{
+				Policy: HAStartupGatePolicy("Unsafe"), RuntimeEligible: true,
+				ReceiptMatchPolicy: HAReceiptMatchPolicy("Prefix"),
+				RequiredReceipt: HARequiredSeedActivationReceipt{
+					TopologyID: "other-topology", TopologyGeneration: -1, NodeID: "standby-b", SlotName: "standby-a",
+					Generation: "wrong-generation", TargetPVCName: "wrong-pvc",
+					ManifestSHA256: "not-a-digest", TargetPVCUID: " padded ",
+				},
+			},
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", Generation: "prod-standby-a-10",
+				StagingRoot: "/target/.antfly-ha/staging",
+				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected unbound startup gate to be rejected")
+	}
+	for _, want := range []string{
+		"startupGate.policy must be RequireActivatedSeed",
+		"startupGate.receiptMatchPolicy must be Exact",
+		"requiredReceipt.topologyID must match metadata.name",
+		"requiredReceipt.topologyGeneration must not be negative",
+		"requiredReceipt.nodeID must match runtime.nodeID",
+		"requiredReceipt.slotName must match runtime.standby.slotName",
+		"requiredReceipt.generation must match seedArtifact.generation",
+		"requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName",
+		"requiredReceipt.manifestSHA256 must be a lowercase SHA-256 digest",
+		"requiredReceipt.targetPVCUID must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected startup gate validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsUnsafeSeedArtifact(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

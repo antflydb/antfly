@@ -1729,6 +1729,53 @@ spec:
                           upstreamURL:
                             type: string
                         type: object
+                      startupGate:
+                        properties:
+                          policy:
+                            enum:
+                            - RequireActivatedSeed
+                            type: string
+                          receiptMatchPolicy:
+                            enum:
+                            - Exact
+                            type: string
+                          requiredReceipt:
+                            properties:
+                              aggregateSHA256:
+                                type: string
+                              generation:
+                                type: string
+                              manifestSHA256:
+                                type: string
+                              nodeID:
+                                type: string
+                              seedReceiptSHA256:
+                                type: string
+                              slotName:
+                                type: string
+                              targetPVCName:
+                                type: string
+                              targetPVCUID:
+                                type: string
+                              topologyGeneration:
+                                format: int64
+                                type: integer
+                              topologyID:
+                                type: string
+                            required:
+                            - generation
+                            - nodeID
+                            - slotName
+                            - targetPVCName
+                            - topologyID
+                            type: object
+                          runtimeEligible:
+                            type: boolean
+                        required:
+                        - policy
+                        - receiptMatchPolicy
+                        - requiredReceipt
+                        type: object
                     required:
                     - nodeID
                     - role
@@ -1762,6 +1809,9 @@ spec:
                                   type: string
                               type: object
                               x-kubernetes-map-type: atomic
+                            generation:
+                              pattern: ^[A-Za-z0-9_.:-]+$
+                              type: string
                             generationPrefix:
                               pattern: ^[A-Za-z0-9_.:-]+$
                               type: string
@@ -4646,6 +4696,8 @@ spec:
                               type: string
                             manifestSHA256:
                               type: string
+                            nodeID:
+                              type: string
                             retainedCount:
                               format: int32
                               type: integer
@@ -4659,9 +4711,18 @@ spec:
                             tableID:
                               format: int64
                               type: integer
+                            targetPVCName:
+                              type: string
+                            targetPVCUID:
+                              type: string
                             timelineID:
                               format: int64
                               type: integer
+                            topologyGeneration:
+                              format: int64
+                              type: integer
+                            topologyID:
+                              type: string
                             totalBytes:
                               format: int64
                               type: integer
@@ -4809,6 +4870,68 @@ spec:
                           type: integer
                       type: object
                     type: array
+                  startupGate:
+                    properties:
+                      activationReceipt:
+                        properties:
+                          aggregateSHA256:
+                            type: string
+                          backupLSN:
+                            format: int64
+                            type: integer
+                          checkpointLSN:
+                            format: int64
+                            type: integer
+                          clusterID:
+                            format: int64
+                            type: integer
+                          epoch:
+                            format: int64
+                            type: integer
+                          generation:
+                            type: string
+                          generationPath:
+                            type: string
+                          manifestSHA256:
+                            type: string
+                          nodeID:
+                            type: string
+                          seedReceiptSHA256:
+                            type: string
+                          shardID:
+                            format: int64
+                            type: integer
+                          slotName:
+                            type: string
+                          tableID:
+                            format: int64
+                            type: integer
+                          targetPVCName:
+                            type: string
+                          targetPVCUID:
+                            type: string
+                          timelineID:
+                            format: int64
+                            type: integer
+                          topologyGeneration:
+                            format: int64
+                            type: integer
+                          topologyID:
+                            type: string
+                        required:
+                        - generation
+                        - nodeID
+                        - slotName
+                        - targetPVCName
+                        - topologyID
+                        type: object
+                      reason:
+                        type: string
+                      runtimeEligible:
+                        type: boolean
+                    required:
+                    - runtimeEligible
+                    type: object
                   sync:
                     properties:
                       action:

@@ -28,6 +28,7 @@ var (
 	// haIdentifierPattern matches HA node IDs and slot names accepted by the Zig
 	// HA runtime validators.
 	haIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+	haSHA256Pattern     = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // ValidateCreate validates the cluster configuration when creating a new cluster.
@@ -1266,6 +1267,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		errors = append(errors, "spec.highAvailability.runtime is only supported when spec.mode=Swarm")
 	}
 	errors = append(errors, validateHARuntime(ha)...)
+	errors = append(errors, r.validateHAStartupGate(ha)...)
 	errors = append(errors, r.validateHARuntimeAdminTokenSource(ha)...)
 
 	if identity := ha.Identity; identity != nil {
@@ -1401,6 +1403,13 @@ func validateHASeedArtifact(artifact *HASeedArtifactSpec, fieldPath string) []st
 			errors = append(errors, fmt.Sprintf("%s.generationPrefix must be a valid HA identifier without surrounding whitespace", fieldPath))
 		}
 	}
+	if generation := strings.TrimSpace(artifact.Generation); generation != "" {
+		if generation != artifact.Generation || !validHAIdentifier(generation) {
+			errors = append(errors, fmt.Sprintf("%s.generation must be a valid exact HA identifier without surrounding whitespace", fieldPath))
+		}
+	} else if artifact.Generation != "" {
+		errors = append(errors, fmt.Sprintf("%s.generation must not be whitespace", fieldPath))
+	}
 	errors = append(errors, validateHAOptionalPath(artifact.StagingRoot, fieldPath+".stagingRoot")...)
 	if strings.TrimSpace(artifact.StagingRoot) == "" {
 		errors = append(errors, fmt.Sprintf("%s.stagingRoot is required", fieldPath))
@@ -1420,6 +1429,96 @@ func validateHASeedArtifact(artifact *HASeedArtifactSpec, fieldPath string) []st
 	}
 	errors = append(errors, validateHASeedPVC(artifact.SourcePVC, fieldPath+".sourcePVC")...)
 	errors = append(errors, validateHASeedPVC(artifact.TargetPVC, fieldPath+".targetPVC")...)
+	return errors
+}
+
+func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string {
+	if ha == nil || ha.Runtime == nil || ha.Runtime.StartupGate == nil {
+		return nil
+	}
+	gate := ha.Runtime.StartupGate
+	required := gate.RequiredReceipt
+	fieldPath := "spec.highAvailability.runtime.startupGate"
+	var errors []string
+	if gate.Policy != HAStartupGatePolicyRequireActivatedSeed {
+		errors = append(errors, fieldPath+".policy must be RequireActivatedSeed")
+	}
+	if gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact {
+		errors = append(errors, fieldPath+".receiptMatchPolicy must be Exact")
+	}
+	if ha.Runtime.Role != HARuntimeRoleStandby {
+		errors = append(errors, fieldPath+".policy RequireActivatedSeed requires runtime.role Standby")
+	}
+
+	validateID := func(value, name string) {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			errors = append(errors, fieldPath+".requiredReceipt."+name+" is required")
+		} else if value != trimmed || !validHAIdentifier(trimmed) {
+			errors = append(errors, fieldPath+".requiredReceipt."+name+" must be a valid HA identifier without surrounding whitespace")
+		}
+	}
+	validateID(required.TopologyID, "topologyID")
+	validateID(required.NodeID, "nodeID")
+	validateID(required.SlotName, "slotName")
+	validateID(required.Generation, "generation")
+	if strings.TrimSpace(required.TopologyID) != strings.TrimSpace(r.Name) {
+		errors = append(errors, fieldPath+".requiredReceipt.topologyID must match metadata.name")
+	}
+	if required.TopologyGeneration < 0 {
+		errors = append(errors, fieldPath+".requiredReceipt.topologyGeneration must not be negative")
+	}
+	if strings.TrimSpace(required.NodeID) != strings.TrimSpace(ha.Runtime.NodeID) {
+		errors = append(errors, fieldPath+".requiredReceipt.nodeID must match runtime.nodeID")
+	}
+	if ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName) {
+		errors = append(errors, fieldPath+".requiredReceipt.slotName must match runtime.standby.slotName")
+	}
+
+	targetPVCName := strings.TrimSpace(required.TargetPVCName)
+	if targetPVCName == "" {
+		errors = append(errors, fieldPath+".requiredReceipt.targetPVCName is required")
+	} else if required.TargetPVCName != targetPVCName {
+		errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must not have leading or trailing whitespace")
+	} else if nameErrs := utilvalidation.IsDNS1123Subdomain(targetPVCName); len(nameErrs) > 0 {
+		errors = append(errors, fmt.Sprintf("%s.requiredReceipt.targetPVCName %q is invalid: %s", fieldPath, targetPVCName, strings.Join(nameErrs, "; ")))
+	}
+
+	var artifact *HASeedArtifactSpec
+	for i := range ha.Standbys {
+		standby := &ha.Standbys[i]
+		slotName := strings.TrimSpace(standby.SlotName)
+		if slotName == "" {
+			slotName = strings.TrimSpace(standby.Name)
+		}
+		if slotName == strings.TrimSpace(required.SlotName) {
+			artifact = standby.SeedArtifact
+			break
+		}
+	}
+	if artifact == nil {
+		errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
+	} else {
+		if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
+			errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+		}
+		if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+			errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+		}
+	}
+
+	for name, value := range map[string]string{
+		"manifestSHA256":    required.ManifestSHA256,
+		"aggregateSHA256":   required.AggregateSHA256,
+		"seedReceiptSHA256": required.SeedReceiptSHA256,
+	} {
+		if value != "" && !haSHA256Pattern.MatchString(value) {
+			errors = append(errors, fieldPath+".requiredReceipt."+name+" must be a lowercase SHA-256 digest")
+		}
+	}
+	if required.TargetPVCUID != "" && required.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) {
+		errors = append(errors, fieldPath+".requiredReceipt.targetPVCUID must not have leading or trailing whitespace")
+	}
 	return errors
 }
 

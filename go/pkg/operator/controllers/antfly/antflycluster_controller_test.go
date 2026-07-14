@@ -3521,6 +3521,81 @@ func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials
 	g.Expect(activateJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
 }
 
+func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := startupGatedSwarmControllerCluster(false)
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
+	}}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build(),
+		Scheme: s,
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a",
+		SeedArtifactGeneration: "prod-standby-a-10",
+		AdminCommand:           []string{"artifact", "activate", "--generation", "prod-standby-a-10"},
+	}
+
+	bound, ready, err := reconciler.haActivationJobAction(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeTrue())
+	g.Expect(action.AdminCommand).NotTo(ContainElement("--target-pvc-uid"))
+	g.Expect(bound.AdminCommand).To(ContainElements(
+		"--topology-id", "test-swarm", "--topology-generation", "3",
+		"--node-id", "standby-a", "--target-pvc-name", "standby-a-data",
+		"--target-pvc-uid", "pvc-uid-1",
+	))
+	g.Expect(haAdminActionHash(bound)).NotTo(Equal(haAdminActionHash(action)))
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "replacement-pvc"
+	_, ready, err = reconciler.haActivationJobAction(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ready).To(BeFalse())
+}
+
+func TestActivationReceiptCurrentTargetRejectsReplacementPVCAndTopologyGeneration(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := startupGatedSwarmControllerCluster(true)
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-2"),
+	}}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build(),
+		Scheme: s,
+	}
+	digest := strings.Repeat("a", 64)
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a",
+		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			TopologyID: "test-swarm", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+			Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-2",
+			ManifestSHA256: digest, GenerationPath: "generations/prod-standby-a-10",
+		},
+	}
+
+	current, err := reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(current).To(BeTrue())
+
+	action.SeedArtifactReceipt.TargetPVCUID = "pvc-uid-1"
+	current, err = reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(current).To(BeFalse())
+	action.SeedArtifactReceipt.TargetPVCUID = "pvc-uid-2"
+	action.SeedArtifactReceipt.TopologyGeneration = 2
+	current, err = reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(current).To(BeFalse())
+}
+
 func TestExecuteActivateSeededSlotUsesExactTargetActivationReceipt(t *testing.T) {
 	g := NewWithT(t)
 	digest := strings.Repeat("a", 64)
@@ -6055,11 +6130,13 @@ func TestParseHASeedArtifactReceiptRequiresMatchingTypedEvidence(t *testing.T) {
 		SeedArtifactGeneration: "seed-standby-a-10",
 		AdminJobPhase:          haAdminJobPhaseSucceeded,
 	}
-	activation := fmt.Sprintf(`{"format_version":1,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"seed_receipt_sha256":"%s","manifest_sha256":"%s","aggregate_sha256":"%s","generation_path":"generations/seed-standby-a-10"}`, strings.Repeat("c", 64), strings.Repeat("a", 64), strings.Repeat("b", 64))
+	activation := fmt.Sprintf(`{"format_version":1,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"seed_receipt_sha256":"%s","manifest_sha256":"%s","aggregate_sha256":"%s","generation_path":"generations/seed-standby-a-10","topology_id":"test-swarm","topology_generation":3,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-1"}`, strings.Repeat("c", 64), strings.Repeat("a", 64), strings.Repeat("b", 64))
 	activationReceipt := parseHASeedArtifactReceipt(activation, activateAction)
 	g.Expect(activationReceipt).NotTo(BeNil())
 	g.Expect(activationReceipt.CheckpointLSN).To(Equal(uint64(12)))
 	g.Expect(activationReceipt.GenerationPath).To(Equal("generations/seed-standby-a-10"))
+	g.Expect(activationReceipt.TopologyGeneration).To(Equal(int64(3)))
+	g.Expect(activationReceipt.TargetPVCUID).To(Equal("pvc-uid-1"))
 	activateAction.SeedArtifactReceipt = activationReceipt
 	g.Expect(haAdminActionSucceededWithEvidence(activateAction)).To(BeTrue())
 }
@@ -10418,6 +10495,194 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			},
 		},
 	}))
+}
+
+func TestReconcileSwarmStatefulSetStartupGatePrecreatesTargetPVCAndStaysSuspended(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedSwarmControllerCluster(false)
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	pvc := &corev1.PersistentVolumeClaim{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "standby-a-data", Namespace: "default"}, pvc)).To(Succeed())
+	g.Expect(metav1.IsControlledBy(pvc, cluster)).To(BeTrue())
+
+	sts := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(sts.Spec.Replicas).NotTo(BeNil())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+	g.Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
+	var storageClaimName string
+	for _, volume := range sts.Spec.Template.Spec.Volumes {
+		if volume.Name == "swarm-storage" && volume.PersistentVolumeClaim != nil {
+			storageClaimName = volume.PersistentVolumeClaim.ClaimName
+		}
+	}
+	g.Expect(storageClaimName).To(Equal("standby-a-data"))
+}
+
+func TestReconcileSwarmStatefulSetStartupGateSuspendsLegacyControllerBeforeClaimHandoff(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedSwarmControllerCluster(false)
+	one := int32(1)
+	legacy := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-swarm-swarm", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &one,
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+				ObjectMeta: metav1.ObjectMeta{Name: "swarm-storage"},
+			}},
+		},
+		Status: appsv1.StatefulSetStatus{Replicas: 1, CurrentReplicas: 1, ReadyReplicas: 1},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, legacy).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	observed := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: legacy.Name, Namespace: legacy.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Spec.Replicas).NotTo(BeNil())
+	g.Expect(*observed.Spec.Replicas).To(Equal(int32(0)))
+	g.Expect(observed.Spec.PersistentVolumeClaimRetentionPolicy).NotTo(BeNil())
+	g.Expect(observed.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+	g.Expect(observed.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+	g.Expect(observed.Spec.VolumeClaimTemplates).To(HaveLen(1))
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "standby-a-data", Namespace: "default"}, pvc)).To(Succeed())
+}
+
+func TestReconcileSwarmStatefulSetStartupGateRequiresExactObservedReceipt(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedSwarmControllerCluster(true)
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1")},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	sts := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+
+	digest := strings.Repeat("a", 64)
+	cluster.Status.HAStatus = &antflyv1.HAStatus{StartupGate: &antflyv1.HAStartupGateStatus{
+		RuntimeEligible: true,
+		ActivationReceipt: &antflyv1.HASeedActivationReceiptStatus{
+			TopologyID: "test-swarm", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+			Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
+			ManifestSHA256: digest, GenerationPath: "generations/prod-standby-a-10",
+		},
+	}}
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
+	g.Expect(sts.Spec.Template.Annotations).To(HaveKey("antfly.io/ha-startup-receipt-hash"))
+	container := sts.Spec.Template.Spec.Containers[0]
+	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+		Name: "ha-seed-generation", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/generations/prod-standby-a-10",
+	}))
+
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID = "stale-pvc-uid"
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID = "pvc-uid-1"
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TopologyGeneration = 2
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+}
+
+func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedSwarmControllerCluster(true)
+	digest := strings.Repeat("a", 64)
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{{
+		Kind: string(haActionActivateSeedArtifact), StandbyName: "standby-a", SlotName: "standby-a",
+		TargetLSN: 10, SeedArtifactGeneration: "prod-standby-a-10", AdminJobName: "activation-job", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 1, Generation: "prod-standby-a-10", SlotName: "standby-a",
+			TopologyID: "test-swarm", TopologyGeneration: 3, NodeID: "standby-a", TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
+			ClusterID: 100, TimelineID: 1, Epoch: 1, ManifestID: "prod-standby-a-10",
+			BackupLSN: 10, CheckpointLSN: 10, ManifestSHA256: digest, AggregateSHA256: strings.Repeat("b", 64),
+			SeedReceiptSHA256: strings.Repeat("c", 64), GenerationPath: "generations/prod-standby-a-10",
+		},
+	}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
+	}}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	reconciler.updateHAStartupGateStatus(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.StartupGate).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID).To(Equal("pvc-uid-1"))
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt.ManifestSHA256).To(Equal(digest))
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	reconciler.updateHAStartupGateStatus(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.StartupGate.Reason).To(Equal("DeclarativelySuspended"))
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
+}
+
+func startupGatedSwarmControllerCluster(runtimeEligible bool) *antflyv1.AntflyCluster {
+	cluster := baseSwarmControllerCluster()
+	digest := strings.Repeat("a", 64)
+	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
+		Mode:     antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role: antflyv1.HARuntimeRoleStandby, NodeID: "standby-a",
+			Standby: &antflyv1.HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
+			StartupGate: &antflyv1.HAStartupGateSpec{
+				Policy:             antflyv1.HAStartupGatePolicyRequireActivatedSeed,
+				RuntimeEligible:    runtimeEligible,
+				ReceiptMatchPolicy: antflyv1.HAReceiptMatchPolicyExact,
+				RequiredReceipt: antflyv1.HARequiredSeedActivationReceipt{
+					TopologyID: "test-swarm", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", ManifestSHA256: digest,
+				},
+			},
+		},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name: "standby-a",
+			SeedArtifact: &antflyv1.HASeedArtifactSpec{
+				Location: "s3://ha-seeds/test-swarm", Generation: "prod-standby-a-10",
+				StagingRoot: "/target/.antfly-ha/staging",
+				TargetPVC:   &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			},
+		}},
+	}
+	return cluster
 }
 
 func TestSwarmHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {

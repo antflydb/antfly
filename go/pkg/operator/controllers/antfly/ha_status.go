@@ -1944,11 +1944,14 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 			(runtimeOwned && artifact.SourcePVC == nil) {
 			return nil
 		}
-		prefix := strings.TrimSpace(artifact.GenerationPrefix)
-		if prefix == "" {
-			prefix = "seed"
+		generation := strings.TrimSpace(artifact.Generation)
+		if generation == "" {
+			prefix := strings.TrimSpace(artifact.GenerationPrefix)
+			if prefix == "" {
+				prefix = "seed"
+			}
+			generation = fmt.Sprintf("%s-%s-%d", prefix, slotName, targetLSN)
 		}
-		generation := fmt.Sprintf("%s-%s-%d", prefix, slotName, targetLSN)
 		retention := artifact.RetainGenerations
 		if retention == 0 {
 			retention = 2
