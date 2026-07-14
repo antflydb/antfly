@@ -10527,6 +10527,75 @@ func TestReconcileSwarmStatefulSetStartupGatePrecreatesTargetPVCAndStaysSuspende
 	g.Expect(storageClaimName).To(Equal("standby-a-data"))
 }
 
+func TestReconcileSwarmStatefulSetSuspendPolicyAlwaysHoldsZeroWithoutActivationPVC(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedSwarmControllerCluster(false)
+	cluster.Spec.HighAvailability.Runtime.StartupGate = &antflyv1.HAStartupGateSpec{
+		Policy: antflyv1.HAStartupGatePolicy("Suspend"), RuntimeEligible: false,
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	sts := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(sts.Spec.Replicas).NotTo(BeNil())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+	pvc := &corev1.PersistentVolumeClaim{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "standby-a-data", Namespace: "default"}, pvc)).To(MatchError(ContainSubstring("not found")))
+	reconciler.updateHAStartupGateStatus(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.StartupGate).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.StartupGate.Reason).To(Equal("PolicySuspended"))
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).To(BeNil())
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true // malformed/bypassed admission still fails closed
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+}
+
+func TestReconcileSwarmStatefulSetSuspendPolicyPreservesExistingStorageTopology(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedSwarmControllerCluster(false)
+	cluster.Spec.HighAvailability.Runtime.StartupGate = &antflyv1.HAStartupGateSpec{
+		Policy: antflyv1.HAStartupGatePolicySuspend, RuntimeEligible: false,
+	}
+	one := int32(1)
+	existing := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-swarm-swarm", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &one,
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "swarm-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "activated-generation-pvc"}},
+			}}}},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, existing).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	observed := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Spec.Replicas).NotTo(BeNil())
+	g.Expect(*observed.Spec.Replicas).To(Equal(int32(0)))
+	g.Expect(observed.Spec.VolumeClaimTemplates).To(BeEmpty())
+	g.Expect(observed.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+		Name: "swarm-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "activated-generation-pvc"}},
+	}))
+}
+
 func TestReconcileSwarmStatefulSetStartupGateSuspendsLegacyControllerBeforeClaimHandoff(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
@@ -10676,7 +10745,7 @@ func startupGatedSwarmControllerCluster(runtimeEligible bool) *antflyv1.AntflyCl
 				Policy:             antflyv1.HAStartupGatePolicyRequireActivatedSeed,
 				RuntimeEligible:    runtimeEligible,
 				ReceiptMatchPolicy: antflyv1.HAReceiptMatchPolicyExact,
-				RequiredReceipt: antflyv1.HARequiredSeedActivationReceipt{
+				RequiredReceipt: &antflyv1.HARequiredSeedActivationReceipt{
 					TopologyID: "test-swarm", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
 					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", ManifestSHA256: digest,
 				},

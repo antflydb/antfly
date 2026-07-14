@@ -1992,7 +1992,7 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 				Policy:             HAStartupGatePolicyRequireActivatedSeed,
 				RuntimeEligible:    false,
 				ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
-				RequiredReceipt: HARequiredSeedActivationReceipt{
+				RequiredReceipt: &HARequiredSeedActivationReceipt{
 					TopologyID: "test-swarm-cluster", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
 					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
 					ManifestSHA256: strings.Repeat("a", 64),
@@ -2027,7 +2027,7 @@ func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRunt
 			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
 			StartupGate: &HAStartupGateSpec{
 				Policy: HAStartupGatePolicyRequireActivatedSeed, RuntimeEligible: false, ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
-				RequiredReceipt: HARequiredSeedActivationReceipt{
+				RequiredReceipt: &HARequiredSeedActivationReceipt{
 					TopologyID: "antflydb", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
 					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
 				},
@@ -2051,6 +2051,41 @@ func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRunt
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsExplicitSuspendStartupGate(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:     HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 2, Epoch: 2, CurrentPrimaryID: "primary-b"},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "former-primary-a",
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary-b.default.svc:8080", SlotName: "former-primary-a"},
+			StartupGate: &HAStartupGateSpec{
+				Policy:          HAStartupGatePolicy("Suspend"),
+				RuntimeEligible: false,
+			},
+		},
+		Standbys: []HAStandbySpec{{Name: "former-primary-a"}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected fail-closed Suspend startup gate without activation evidence to be valid: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "Suspend requires runtimeEligible=false") {
+		t.Fatalf("expected Suspend with runtimeEligible=true to be rejected: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt = &HARequiredSeedActivationReceipt{TopologyID: "must-not-be-used"}
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "requiredReceipt must be omitted for Suspend") {
+		t.Fatalf("expected Suspend with activation evidence to be rejected: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt = nil
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRolePrimary
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "requires runtime.role Standby") {
+		t.Fatalf("expected Suspend on a primary runtime to be rejected: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
@@ -2062,7 +2097,7 @@ func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) 
 			StartupGate: &HAStartupGateSpec{
 				Policy: HAStartupGatePolicy("Unsafe"), RuntimeEligible: true,
 				ReceiptMatchPolicy: HAReceiptMatchPolicy("Prefix"),
-				RequiredReceipt: HARequiredSeedActivationReceipt{
+				RequiredReceipt: &HARequiredSeedActivationReceipt{
 					TopologyID: "other-topology", TopologyGeneration: -1, NodeID: "standby-b", SlotName: "standby-a",
 					Generation: "wrong-generation", TargetPVCName: "wrong-pvc",
 					ManifestSHA256: "not-a-digest", TargetPVCUID: " padded ",
@@ -2085,7 +2120,7 @@ func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) 
 		t.Fatal("expected unbound startup gate to be rejected")
 	}
 	for _, want := range []string{
-		"startupGate.policy must be RequireActivatedSeed",
+		"startupGate.policy must be Suspend or RequireActivatedSeed",
 		"startupGate.receiptMatchPolicy must be Exact",
 		"requiredReceipt.topologyID must match metadata.name",
 		"requiredReceipt.topologyGeneration must not be negative",

@@ -1733,6 +1733,7 @@ spec:
                         properties:
                           policy:
                             enum:
+                            - Suspend
                             - RequireActivatedSeed
                             type: string
                           receiptMatchPolicy:
@@ -1773,8 +1774,6 @@ spec:
                             type: boolean
                         required:
                         - policy
-                        - receiptMatchPolicy
-                        - requiredReceipt
                         - runtimeEligible
                         type: object
                     required:

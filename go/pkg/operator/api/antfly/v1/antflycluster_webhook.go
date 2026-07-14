@@ -1439,18 +1439,34 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 		return nil
 	}
 	gate := ha.Runtime.StartupGate
-	required := gate.RequiredReceipt
 	fieldPath := "spec.highAvailability.runtime.startupGate"
 	var errors []string
+	if ha.Runtime.Role != HARuntimeRoleStandby {
+		errors = append(errors, fieldPath+" requires runtime.role Standby")
+	}
+	if gate.Policy == HAStartupGatePolicySuspend {
+		if gate.RuntimeEligible {
+			errors = append(errors, fieldPath+".policy Suspend requires runtimeEligible=false")
+		}
+		if gate.ReceiptMatchPolicy != "" {
+			errors = append(errors, fieldPath+".receiptMatchPolicy must be omitted for Suspend")
+		}
+		if gate.RequiredReceipt != nil {
+			errors = append(errors, fieldPath+".requiredReceipt must be omitted for Suspend")
+		}
+		return errors
+	}
 	if gate.Policy != HAStartupGatePolicyRequireActivatedSeed {
-		errors = append(errors, fieldPath+".policy must be RequireActivatedSeed")
+		errors = append(errors, fieldPath+".policy must be Suspend or RequireActivatedSeed")
 	}
 	if gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact {
-		errors = append(errors, fieldPath+".receiptMatchPolicy must be Exact")
+		errors = append(errors, fieldPath+".receiptMatchPolicy must be Exact for RequireActivatedSeed")
 	}
-	if ha.Runtime.Role != HARuntimeRoleStandby {
-		errors = append(errors, fieldPath+".policy RequireActivatedSeed requires runtime.role Standby")
+	if gate.RequiredReceipt == nil {
+		errors = append(errors, fieldPath+".requiredReceipt is required for RequireActivatedSeed")
+		return errors
 	}
+	required := *gate.RequiredReceipt
 
 	validateID := func(value, name string) {
 		trimmed := strings.TrimSpace(value)

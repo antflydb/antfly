@@ -189,7 +189,7 @@ func haRuntimeStartupGate(cluster *antflyv1.AntflyCluster) *antflyv1.HAStartupGa
 
 func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Context, cluster *antflyv1.AntflyCluster, storageSize string) (*corev1.PersistentVolumeClaim, error) {
 	gate := haRuntimeStartupGate(cluster)
-	if gate == nil {
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.RequiredReceipt == nil {
 		return nil, nil
 	}
 	name := strings.TrimSpace(gate.RequiredReceipt.TargetPVCName)
@@ -285,15 +285,38 @@ func (r *AntflyClusterReconciler) reconcileLegacySwarmStatefulSetStartupGate(ctx
 	return true, r.Delete(ctx, existing)
 }
 
+// Suspend is a pure availability hold. Preserve the existing storage and pod
+// template verbatim so a former primary cannot encounter an immutable
+// StatefulSet/PVC handoff while it is being fenced and repaired.
+func (r *AntflyClusterReconciler) reconcileSuspendedSwarmStatefulSet(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	existing := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: cluster.Name + "-swarm", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, existing); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 {
+		zero := int32(0)
+		existing.Spec.Replicas = &zero
+		return true, r.Update(ctx, existing)
+	}
+	return true, nil
+}
+
 func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) (bool, string) {
 	gate := haRuntimeStartupGate(cluster)
 	if gate == nil {
 		return true, "NotConfigured"
 	}
+	if gate.Policy == antflyv1.HAStartupGatePolicySuspend {
+		return false, "PolicySuspended"
+	}
 	if !gate.RuntimeEligible {
 		return false, "DeclarativelySuspended"
 	}
-	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact {
+	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
 		return false, "UnsupportedPolicy"
 	}
 	if pvc == nil || strings.TrimSpace(string(pvc.UID)) == "" {
@@ -303,7 +326,7 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
 		return false, "ActivationReceiptNotObserved"
 	}
-	required := gate.RequiredReceipt
+	required := *gate.RequiredReceipt
 	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
 	if receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
 		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
@@ -2647,21 +2670,33 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 	}
 	storageSize := chooseSwarmStorageSize(cluster)
 	startupGate := haRuntimeStartupGate(cluster)
+	activatedSeedGate := startupGate != nil && startupGate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && startupGate.RequiredReceipt != nil
 	var startupPVC *corev1.PersistentVolumeClaim
 	if startupGate != nil {
-		var err error
-		startupPVC, err = r.reconcileHAStartupTargetPVC(ctx, cluster, storageSize)
-		if err != nil {
-			return err
+		if activatedSeedGate {
+			var err error
+			startupPVC, err = r.reconcileHAStartupTargetPVC(ctx, cluster, storageSize)
+			if err != nil {
+				return err
+			}
 		}
 		eligible, _ := haStartupGateRuntimeEligible(cluster, startupPVC)
 		if !eligible {
 			replicas = 0
 		}
-		if migrated, err := r.reconcileLegacySwarmStatefulSetStartupGate(ctx, cluster); err != nil {
-			return err
-		} else if migrated {
-			return nil
+		if startupGate.Policy == antflyv1.HAStartupGatePolicySuspend {
+			if held, err := r.reconcileSuspendedSwarmStatefulSet(ctx, cluster); err != nil {
+				return err
+			} else if held {
+				return nil
+			}
+		}
+		if activatedSeedGate {
+			if migrated, err := r.reconcileLegacySwarmStatefulSetStartupGate(ctx, cluster); err != nil {
+				return err
+			} else if migrated {
+				return nil
+			}
 		}
 	}
 
@@ -2691,7 +2726,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 			},
 		},
 	}
-	if startupGate != nil {
+	if activatedSeedGate {
 		volumeClaimTemplates = nil
 	}
 	statefulSet := &appsv1.StatefulSet{
@@ -2718,7 +2753,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 		statefulSet.Spec.Replicas = &replicas
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
 		podAnnotations := r.buildPodAnnotations(ctx, cache, cluster, envFromSources)
-		if startupGate != nil {
+		if activatedSeedGate {
 			podAnnotations = maps.Clone(podAnnotations)
 			if podAnnotations == nil {
 				podAnnotations = map[string]string{}
@@ -2739,8 +2774,8 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 				}},
 			},
 		}
-		if startupGate != nil {
-			required := startupGate.RequiredReceipt
+		if activatedSeedGate {
+			required := *startupGate.RequiredReceipt
 			volumes = append(volumes,
 				corev1.Volume{Name: "swarm-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
 				corev1.Volume{Name: haSeedGenerationVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
@@ -3952,11 +3987,23 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 	if cluster.Status.HAStatus == nil {
 		cluster.Status.HAStatus = &antflyv1.HAStatus{}
 	}
+	if gate.Policy == antflyv1.HAStartupGatePolicySuspend {
+		cluster.Status.HAStatus.StartupGate = &antflyv1.HAStartupGateStatus{
+			RuntimeEligible: false,
+			Reason:          "PolicySuspended",
+		}
+		return
+	}
 	status := &antflyv1.HAStartupGateStatus{Reason: "ActivationReceiptNotObserved"}
 	cluster.Status.HAStatus.StartupGate = status
+	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.RequiredReceipt == nil {
+		status.Reason = "UnsupportedPolicy"
+		return
+	}
+	required := *gate.RequiredReceipt
 
 	pvc := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, types.NamespacedName{Name: gate.RequiredReceipt.TargetPVCName, Namespace: cluster.Namespace}, pvc); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: required.TargetPVCName, Namespace: cluster.Namespace}, pvc); err != nil {
 		status.Reason = "TargetPVCNotObserved"
 		return
 	}
@@ -3968,8 +4015,8 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 	for i := range cluster.Status.HAStatus.PlannedActions {
 		action := cluster.Status.HAStatus.PlannedActions[i]
 		if haActionKind(action.Kind) != haActionActivateSeedArtifact ||
-			strings.TrimSpace(action.SlotName) != strings.TrimSpace(gate.RequiredReceipt.SlotName) ||
-			strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(gate.RequiredReceipt.Generation) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+			strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) ||
 			!haAdminActionSucceededWithEvidence(action) {
 			continue
 		}
@@ -4124,13 +4171,16 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 	}
 	gate := haRuntimeStartupGate(cluster)
 	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
-		gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact ||
-		strings.TrimSpace(action.SlotName) != strings.TrimSpace(gate.RequiredReceipt.SlotName) ||
-		strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(gate.RequiredReceipt.Generation) {
+		gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
+		return action, true, nil
+	}
+	required := *gate.RequiredReceipt
+	if strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+		strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
 		return action, true, nil
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Name: gate.RequiredReceipt.TargetPVCName, Namespace: cluster.Namespace}, pvc)
+	err := r.Get(ctx, types.NamespacedName{Name: required.TargetPVCName, Namespace: cluster.Namespace}, pvc)
 	if errors.IsNotFound(err) {
 		return action, false, nil
 	}
@@ -4138,14 +4188,14 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 		return action, false, err
 	}
 	pvcUID := strings.TrimSpace(string(pvc.UID))
-	if pvcUID == "" || (gate.RequiredReceipt.TargetPVCUID != "" && gate.RequiredReceipt.TargetPVCUID != pvcUID) {
+	if pvcUID == "" || (required.TargetPVCUID != "" && required.TargetPVCUID != pvcUID) {
 		return action, false, nil
 	}
 	action.AdminCommand = append(append([]string{}, action.AdminCommand...),
-		"--topology-id", gate.RequiredReceipt.TopologyID,
-		"--topology-generation", strconv.FormatInt(gate.RequiredReceipt.TopologyGeneration, 10),
-		"--node-id", gate.RequiredReceipt.NodeID,
-		"--target-pvc-name", gate.RequiredReceipt.TargetPVCName,
+		"--topology-id", required.TopologyID,
+		"--topology-generation", strconv.FormatInt(required.TopologyGeneration, 10),
+		"--node-id", required.NodeID,
+		"--target-pvc-name", required.TargetPVCName,
 		"--target-pvc-uid", pvcUID,
 	)
 	return action, true, nil
@@ -4153,11 +4203,15 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 
 func (r *AntflyClusterReconciler) haActivationReceiptMatchesCurrentTarget(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (bool, error) {
 	gate := haRuntimeStartupGate(cluster)
-	if gate == nil {
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed {
 		return true, nil
 	}
+	if gate.RequiredReceipt == nil {
+		return false, nil
+	}
+	required := *gate.RequiredReceipt
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Name: gate.RequiredReceipt.TargetPVCName, Namespace: cluster.Namespace}, pvc)
+	err := r.Get(ctx, types.NamespacedName{Name: required.TargetPVCName, Namespace: cluster.Namespace}, pvc)
 	if errors.IsNotFound(err) {
 		return false, nil
 	}
@@ -4165,7 +4219,6 @@ func (r *AntflyClusterReconciler) haActivationReceiptMatchesCurrentTarget(ctx co
 		return false, err
 	}
 	receipt := action.SeedArtifactReceipt
-	required := gate.RequiredReceipt
 	if receipt == nil || strings.TrimSpace(string(pvc.UID)) == "" ||
 		receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
 		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||

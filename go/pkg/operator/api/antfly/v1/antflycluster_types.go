@@ -577,6 +577,9 @@ const (
 type HAStartupGatePolicy string
 
 const (
+	// HAStartupGatePolicySuspend is an explicit declarative hold used while a
+	// demoted/former-primary runtime awaits exact rewind or reseed repair.
+	HAStartupGatePolicySuspend HAStartupGatePolicy = "Suspend"
 	// HAStartupGatePolicyRequireActivatedSeed keeps the runtime offline until the
 	// operator has observed an exact, durable target-volume activation receipt.
 	HAStartupGatePolicyRequireActivatedSeed HAStartupGatePolicy = "RequireActivatedSeed"
@@ -799,8 +802,8 @@ type HARuntimeSpec struct {
 // start. runtimeEligible is a declarative suspension fence: false always keeps
 // replicas at zero, while true remains subject to policy-specific verification.
 type HAStartupGateSpec struct {
-	// Policy currently supports only RequireActivatedSeed.
-	// +kubebuilder:validation:Enum=RequireActivatedSeed
+	// Policy selects either an unconditional Suspend hold or exact activated-seed startup.
+	// +kubebuilder:validation:Enum=Suspend;RequireActivatedSeed
 	Policy HAStartupGatePolicy `json:"policy"`
 
 	// RuntimeEligible is necessary but never sufficient for startup. False always
@@ -808,12 +811,15 @@ type HAStartupGateSpec struct {
 	// honored only after the operator-observed policy evidence matches.
 	RuntimeEligible bool `json:"runtimeEligible"`
 
-	// ReceiptMatchPolicy currently supports only Exact.
+	// ReceiptMatchPolicy must be Exact for RequireActivatedSeed and omitted for Suspend.
 	// +kubebuilder:validation:Enum=Exact
-	ReceiptMatchPolicy HAReceiptMatchPolicy `json:"receiptMatchPolicy"`
+	// +optional
+	ReceiptMatchPolicy HAReceiptMatchPolicy `json:"receiptMatchPolicy,omitempty"`
 
 	// RequiredReceipt binds the one target volume generation this runtime may open.
-	RequiredReceipt HARequiredSeedActivationReceipt `json:"requiredReceipt"`
+	// It is required for RequireActivatedSeed and forbidden for Suspend.
+	// +optional
+	RequiredReceipt *HARequiredSeedActivationReceipt `json:"requiredReceipt,omitempty"`
 }
 
 // HARequiredSeedActivationReceipt is the desired exact startup identity.
