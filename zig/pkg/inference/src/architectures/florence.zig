@@ -184,12 +184,14 @@ pub fn encoderForwardTensor(
         if (profile) logFlorenceProfile("vision_total", vision_start);
         if (debug_cuda_session) std.log.info("florence: device vision encoder done seq={d}", .{image_tensor.seq_len});
         defer cb.free(image_tensor.features);
+        if (debugStatsEnabled()) logDebugStatsTensor(cb, allocator, "vision_features(device)", image_tensor.features);
 
         const total_seq = image_tensor.seq_len + prompt_seq_len;
         const embeddings_start = nowNs();
         const hidden = try applyEncoderImagePromptEmbeddingsTensor(cb, allocator, image_tensor, config, batch, prompt_input_ids, prompt_seq_len);
         if (profile) logFlorenceProfile("encoder_embeddings", embeddings_start);
         if (debug_cuda_session) std.log.info("florence: encoder embeddings done total_seq={d}", .{total_seq});
+        if (debugStatsEnabled()) logDebugStatsTensor(cb, allocator, "post_embeddings(device)", hidden);
 
         return runTextEncoderLayersTensor(cb, allocator, config, hidden, batch, total_seq);
     }
@@ -198,6 +200,7 @@ pub fn encoderForwardTensor(
     if (profile) logFlorenceProfile("vision_total", vision_start);
     if (debug_cuda_session) std.log.info("florence: vision encoder done seq={d}", .{image.seq_len});
     defer allocator.free(image.features);
+    if (debugStatsEnabled()) logDebugStatsF32("vision_features(host)", image.features);
 
     const d_model: usize = config.d_model;
     const total_seq = image.seq_len + prompt_seq_len;
@@ -229,6 +232,7 @@ pub fn encoderForwardTensor(
     const hidden = try applyEncoderEmbeddings(cb, allocator, merged, config, batch, total_seq);
     if (profile) logFlorenceProfile("encoder_embeddings", embeddings_start);
     if (debug_cuda_session) std.log.info("florence: encoder embeddings done total_seq={d}", .{total_seq});
+    if (debugStatsEnabled()) logDebugStatsTensor(cb, allocator, "post_embeddings(host)", hidden);
     allocator.free(merged);
 
     return runTextEncoderLayersTensor(cb, allocator, config, hidden, batch, total_seq);
@@ -261,6 +265,11 @@ fn runTextEncoderLayersTensor(
         if (profile) logFlorenceProfileStep("text_encoder_layer", layer, layer_start);
         cb.free(hidden);
         hidden = next;
+        if (debugStatsEnabled()) {
+            var label_buf: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "text_encoder_layer_{d}", .{layer}) catch "text_encoder_layer";
+            logDebugStatsTensor(cb, allocator, label, hidden);
+        }
         if (debug_cuda_session) std.log.info("florence: text encoder layer done {d}", .{layer});
     }
 
@@ -2095,6 +2104,9 @@ fn encoderBlock(
     const ffn_dim = config.encoder_ffn_dim;
     const total = batch * seq_len;
 
+    const profile = readProfileEnabled();
+
+    const qkv_start = nowNs();
     const q_weights = try encoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
     const k_weights = try encoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
     const v_weights = try encoderLinearWeights(cb, layer, "self_attn.v_proj", buf);
@@ -2102,18 +2114,26 @@ fn encoderBlock(
     defer cb.free(qkv.first);
     defer cb.free(qkv.second);
     defer cb.free(qkv.third);
+    if (profile) logFlorenceProfileStep("enc_qkv_linear", layer, qkv_start);
 
+    const attn_start = nowNs();
     const attn = try cb.scaledDotProductAttention(qkv.first, qkv.second, qkv.third, attention_mask, null, batch, seq_len, num_heads, head_dim);
     defer cb.free(attn);
+    if (profile) logFlorenceProfileStep("enc_sdpa", layer, attn_start);
+    const proj_start = nowNs();
     const proj = try encoderLinearProj(cb, attn, layer, "self_attn.out_proj", total, d_model, d_model, buf);
     defer cb.free(proj);
     const attn_res = try cb.add(hidden, proj);
+    if (profile) logFlorenceProfileStep("enc_out_proj_add", layer, proj_start);
 
+    const ln0_start = nowNs();
     const ln0_w = try encoderLayerWeight(cb, layer, "self_attn_layer_norm.weight", buf);
     const ln0_b = try encoderLayerWeight(cb, layer, "self_attn_layer_norm.bias", buf);
     const attn_normed = try cb.layerNorm(attn_res, ln0_w, ln0_b, d_model, 1e-5);
     cb.free(attn_res);
+    if (profile) logFlorenceProfileStep("enc_ln0", layer, ln0_start);
 
+    const fc1_start = nowNs();
     const fc1_weights = try encoderLinearWeights(cb, layer, "fc1", buf);
     const activated = if (try cb.linearGelu(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim)) |fused|
         fused
@@ -2123,7 +2143,9 @@ fn encoderBlock(
         break :blk try cb.gelu(fc1);
     };
     defer cb.free(activated);
+    if (profile) logFlorenceProfileStep("enc_fc1_gelu", layer, fc1_start);
 
+    const fc2_start = nowNs();
     const fc2_weights = try encoderLinearWeights(cb, layer, "fc2", buf);
     const ffn_res = if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, attn_normed, total, ffn_dim, d_model)) |fused|
         fused
@@ -2133,6 +2155,7 @@ fn encoderBlock(
         break :blk try cb.add(attn_normed, fc2);
     };
     cb.free(attn_normed);
+    if (profile) logFlorenceProfileStep("enc_fc2_add", layer, fc2_start);
 
     const ln1_w = try encoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
     const ln1_b = try encoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
@@ -3179,6 +3202,38 @@ fn transposeMatrix(allocator: std.mem.Allocator, input: []const f32, rows: usize
 
 fn readProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn debugStatsEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DEBUG_STATS");
+}
+
+fn logDebugStatsF32(label: []const u8, values: []const f32) void {
+    if (values.len == 0) {
+        std.log.info("florence-debug {s}: empty", .{label});
+        return;
+    }
+    var sum: f64 = 0;
+    var absmax: f32 = 0;
+    for (values) |v| {
+        sum += v;
+        const a = @abs(v);
+        if (a > absmax) absmax = a;
+    }
+    const mean = sum / @as(f64, @floatFromInt(values.len));
+    const n_first = @min(values.len, 4);
+    std.log.info("florence-debug {s}: n={d} mean={d:.6} absmax={d:.4} first={any}", .{
+        label, values.len, mean, absmax, values[0..n_first],
+    });
+}
+
+fn logDebugStatsTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, label: []const u8, tensor: CT) void {
+    const host = cb.toFloat32(tensor, allocator) catch |err| {
+        std.log.info("florence-debug {s}: download failed ({t})", .{ label, err });
+        return;
+    };
+    defer allocator.free(host);
+    logDebugStatsF32(label, host);
 }
 
 fn logFlorenceProfile(phase: []const u8, start_ns: u64) void {

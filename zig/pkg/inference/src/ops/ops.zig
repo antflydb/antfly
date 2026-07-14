@@ -3116,6 +3116,12 @@ pub const ComputeBackend = struct {
     }
 
     pub fn fromFloat32Shape(self: *const ComputeBackend, data: []const f32, shape: []const i32) !CT {
+        var elem_count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0) return error.InvalidShape;
+            elem_count = std.math.mul(usize, elem_count, @intCast(dim)) catch return error.InvalidShape;
+        }
+        if (elem_count != data.len) return error.InvalidShape;
         return self.vtable.fromFloat32Shape(self.ptr, data, shape);
     }
 

@@ -118,13 +118,17 @@ test {
     _ = native_rerank;
     _ = native_transcribe;
     _ = native_read;
+    _ = @import("readers/reader.zig");
     _ = native_recognize;
     _ = native_extract;
     _ = compare_generate;
     _ = native_smoke;
     _ = cuda_info;
     _ = cuda_microbench;
-    _ = native_compute;
+    _ = native_compute.native;
+    if (build_options.enable_metal) {
+        _ = native_compute.metal;
+    }
     if (build_options.enable_cuda) {
         _ = native_compute.cuda;
         _ = @import("ops/cuda/kernels.zig");

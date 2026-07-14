@@ -2272,6 +2272,9 @@ pub const IndexManager = struct {
     }
 
     pub fn checkpointLsmWalForManagedIndex(self: *IndexManager, index_ref: ManagedIndexRef) !void {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
         switch (index_ref.kind) {
             .full_text => {
                 const entry = self.textIndex(index_ref.name) orelse return error.IndexNotFound;
