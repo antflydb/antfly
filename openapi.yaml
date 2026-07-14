@@ -20315,6 +20315,7 @@ components:
             requests without a key are never cached.
         prompt_cache:
           type: boolean
+          x-go-type-skip-optional-pointer: false
           description: >
             inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         backend:

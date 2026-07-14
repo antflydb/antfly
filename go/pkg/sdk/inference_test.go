@@ -614,6 +614,37 @@ func TestClient_Rerank_ServiceUnavailable(t *testing.T) {
 	assert.Contains(t, err.Error(), "service unavailable")
 }
 
+func TestClient_ServiceUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "MODEL_CAPACITY_REACHED"})
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"embed", func() error { _, err := client.Embed(ctx, "model", []string{"text"}); return err }},
+		{"embed multimodal", func() error { _, err := client.EmbedMultimodal(ctx, "model", nil); return err }},
+		{"embed JSON", func() error { _, err := client.EmbedJSON(ctx, "model", []string{"text"}); return err }},
+		{"chunk", func() error { _, err := client.Chunk(ctx, "text", ChunkConfig{}); return err }},
+		{"chunk media", func() error { _, err := client.ChunkMedia(ctx, nil, "audio/wav", MediaChunkConfig{}); return err }},
+		{"sparse embed", func() error { _, err := client.SparseEmbed(ctx, "model", []string{"text"}); return err }},
+		{"sparse embed JSON", func() error { _, err := client.SparseEmbedJSON(ctx, "model", []string{"text"}); return err }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.EqualError(t, test.call(), "service unavailable: MODEL_CAPACITY_REACHED")
+		})
+	}
+}
+
 func TestClient_ListModels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/ai/v1/models", r.URL.Path)
