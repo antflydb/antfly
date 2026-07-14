@@ -1125,6 +1125,17 @@ components:
           description: |
             List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
+        prompt_cache_key:
+          type: string
+          maxLength: 256
+          description: |
+            inference-native prompt prefix cache namespace key. Requests with the same key can
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+            requests without a key are never cached.
+        prompt_cache:
+          type: boolean
+          description: |
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         tool_choice:
           $ref: "#/components/schemas/ToolChoice"
           description: Controls how the model uses tools
@@ -1307,6 +1318,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
 
     GenerateChunk:
       type: object
@@ -1433,6 +1447,73 @@ components:
         quantization:
           $ref: "#/components/schemas/ModelQuantization"
 
+    PromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: |
+            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+            full KV blocks under prompt_cache_key with O(1) block lookup and is the
+            scalable production mode. `simple` keeps the linear-scan retained-prefix
+            cache and is only suitable for small caches or debugging.
+          enum: [simple, block_hash]
+          default: block_hash
+        max_bytes_mb:
+          type: integer
+          description: |
+            Node-wide target for live prompt-cache entries. The runtime divides it
+            across participating model caches and evicts using estimated metadata
+            and logical host/device KV bytes. Backend allocators may retain reusable
+            capacity, so this is not a hard cap on process or accelerator memory.
+          default: 512
+        min_tokens:
+          type: integer
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          description: |
+            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+            hit, so only entries left unused for this duration expire.
+          default: 300000
+    QueryEmbeddingCacheConfig:
+      type: object
+      description: |
+        Process-local cache for dense query embeddings. Cache lookup and
+        singleflight happen before provider pacing and local inference queueing.
+        Entries are isolated by the server-derived security domain and effective
+        embedding operation. Templated and multimodal queries bypass retention
+        and singleflight but share the max_inflight provider admission bound.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
+        max_bytes_mb:
+          type: integer
+          minimum: 0
+          maximum: 1048576
+          default: 64
+          description: Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
+        ttl_ms:
+          type: integer
+          minimum: 0
+          maximum: 86400000
+          default: 300000
+          description: Idle expiration in milliseconds. Cache hits refresh the expiry time.
+        max_inflight:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 16
+          description: Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached. The conservative default bounds transient memory before provider responses are decoded; raise it only after measuring provider and node capacity.
+
     Config:
       type: object
       required:
@@ -1472,6 +1553,8 @@ components:
         s3_credentials:
           $ref: "../shared/s3.yaml#/components/schemas/Credentials"
           description: "S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail."
+        query_embedding_cache:
+          $ref: "#/components/schemas/QueryEmbeddingCacheConfig"
         keep_alive:
           type: string
           description: |
@@ -1499,6 +1582,9 @@ components:
             independently of max_loaded_models.
           default: 1
           example: 1
+        prompt_cache:
+          $ref: "#/components/schemas/PromptCacheConfig"
+          description: Native generator prompt KV cache settings.
         backend_priority:
           type: array
           items:

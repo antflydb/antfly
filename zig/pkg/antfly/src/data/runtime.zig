@@ -397,6 +397,24 @@ pub const HealthSource = struct {
         );
         try health_metrics.appendPromMetric(writer, "antfly_data_api_requests_total", "counter", "Requests handled by the local API server process", api_request_stats.request_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_first_request_elapsed_ms", "gauge", "Milliseconds from API server initialization until the first handled request", api_request_stats.first_request_elapsed_ms);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_misses_total", "counter", "Query embedding cache producer misses", api_request_stats.query_embedding_cache.misses);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_coalesced_waiters_total", "counter", "Query embedding requests coalesced behind an in-flight producer", api_request_stats.query_embedding_cache.coalesced_waiters);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_producers_total", "counter", "Query embedding producer computations", api_request_stats.query_embedding_cache.producer_computations);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_uncached_computations_total", "counter", "Uncached query embedding computations admitted through the shared provider bound", api_request_stats.query_embedding_cache.uncached_computations);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_producer_compute_ns_total", "counter", "Nanoseconds spent computing admitted query embeddings", api_request_stats.query_embedding_cache.producer_compute_ns_total);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight_rejections_total", "counter", "Query embedding computations rejected by the in-flight admission limit", api_request_stats.query_embedding_cache.inflight_rejections);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_waiter_timeouts_total", "counter", "Coalesced query embedding waiters that reached their request deadline", api_request_stats.query_embedding_cache.waiter_timeouts);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight", "gauge", "Distinct query embedding computations currently in flight", api_request_stats.query_embedding_cache.inflight);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight_limit", "gauge", "Maximum distinct query embedding computations allowed in flight", api_request_stats.query_embedding_cache.max_inflight);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_evictions_total", "counter", "Query embedding cache LRU evictions", api_request_stats.query_embedding_cache.evictions);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_expirations_total", "counter", "Expired query embedding cache entries", api_request_stats.query_embedding_cache.expirations);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_bytes", "gauge", "Shared inference cache bytes in use", api_request_stats.inference_cache_budget.used_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_limit_bytes", "gauge", "Shared inference cache byte limit", api_request_stats.inference_cache_budget.max_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_rejected_reservations_total", "counter", "Shared inference cache reservations rejected by the hard limit", api_request_stats.inference_cache_budget.rejected_reservations);
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_tables", "gauge", "Tables currently represented in the cached local runtime-status snapshot", runtime_summary.table_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_groups", "gauge", "Local provisioned groups represented in the cached local runtime-status snapshot", runtime_summary.group_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_indexes", "gauge", "Indexes represented in the cached local runtime-status snapshot", runtime_summary.index_count);
@@ -1043,6 +1061,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.lite_native_page_cache,
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.lite_docstore_snapshot_cache,
+        resource_manager_mod.Slice.inference_prompt_cache,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
@@ -15496,6 +15515,17 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_indexes 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_requests_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_uncached_computations_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_producer_compute_ns_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_rejections_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_waiter_timeouts_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_started_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_completed_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_failed_total 1") != null);

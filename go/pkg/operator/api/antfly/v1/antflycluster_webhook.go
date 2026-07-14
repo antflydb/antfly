@@ -1186,6 +1186,27 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if strings.TrimSpace(standby.SeedContentRoot) != "" && strings.TrimSpace(standby.SeedManifestPath) == "" {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedContentRoot is set", i))
 		}
+		if artifact := standby.SeedArtifact; artifact != nil {
+			fieldPath := fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact", i)
+			errors = append(errors, validateHASeedArtifact(artifact, fieldPath)...)
+			if strings.TrimSpace(standby.SeedManifestPath) == "" {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedArtifact is set", i))
+			}
+			if strings.TrimSpace(standby.SeedContentRoot) == "" {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot is required when seedArtifact is set", i))
+			}
+			if artifact.SourcePVC != nil {
+				if !haPathWithinMount(standby.SeedManifestPath, artifact.SourcePVC.MountPath) {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath must be within seedArtifact.sourcePVC.mountPath", i))
+				}
+				if !haPathWithinMount(standby.SeedContentRoot, artifact.SourcePVC.MountPath) {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot must be within seedArtifact.sourcePVC.mountPath", i))
+				}
+			}
+			if artifact.TargetPVC != nil && !haPathWithinMount(artifact.StagingRoot, artifact.TargetPVC.MountPath) {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.stagingRoot must be within targetPVC.mountPath", i))
+			}
+		}
 		if standby.DropSlotOnRemoval && standbyDesiredBySpec(standby) {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].dropSlotOnRemoval requires desired=false", i))
 		}
@@ -1344,6 +1365,78 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		return fmt.Errorf("high availability validation failed:\n  - %s", strings.Join(errors, "\n  - "))
 	}
 	return nil
+}
+
+func validateHASeedArtifact(artifact *HASeedArtifactSpec, fieldPath string) []string {
+	if artifact == nil {
+		return nil
+	}
+	var errors []string
+	location := strings.TrimSpace(artifact.Location)
+	if location == "" {
+		errors = append(errors, fmt.Sprintf("%s.location is required", fieldPath))
+	} else if location != artifact.Location || containsASCIIWhitespace(location) {
+		errors = append(errors, fmt.Sprintf("%s.location must not contain leading, trailing, or embedded whitespace", fieldPath))
+	} else if parsed, err := url.Parse(location); err != nil || parsed.Scheme == "" ||
+		(parsed.Scheme != "s3" && parsed.Scheme != "gs" && parsed.Scheme != "file") {
+		errors = append(errors, fmt.Sprintf("%s.location must be an s3://, gs://, or file:// URI", fieldPath))
+	}
+	if prefix := strings.TrimSpace(artifact.GenerationPrefix); prefix != "" {
+		if prefix != artifact.GenerationPrefix || !validHAIdentifier(prefix) {
+			errors = append(errors, fmt.Sprintf("%s.generationPrefix must be a valid HA identifier without surrounding whitespace", fieldPath))
+		}
+	}
+	errors = append(errors, validateHAOptionalPath(artifact.StagingRoot, fieldPath+".stagingRoot")...)
+	if strings.TrimSpace(artifact.StagingRoot) == "" {
+		errors = append(errors, fmt.Sprintf("%s.stagingRoot is required", fieldPath))
+	}
+	if artifact.RetainGenerations < 0 {
+		errors = append(errors, fmt.Sprintf("%s.retainGenerations must not be negative", fieldPath))
+	}
+	if ref := artifact.CredentialsSecretRef; ref != nil {
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("%s.credentialsSecretRef.name is required", fieldPath))
+		} else if name != ref.Name {
+			errors = append(errors, fmt.Sprintf("%s.credentialsSecretRef.name must not have leading or trailing whitespace", fieldPath))
+		} else if nameErrs := utilvalidation.IsDNS1123Subdomain(name); len(nameErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s.credentialsSecretRef.name %q is invalid: %s", fieldPath, name, strings.Join(nameErrs, "; ")))
+		}
+	}
+	errors = append(errors, validateHASeedPVC(artifact.SourcePVC, fieldPath+".sourcePVC")...)
+	errors = append(errors, validateHASeedPVC(artifact.TargetPVC, fieldPath+".targetPVC")...)
+	return errors
+}
+
+func validateHASeedPVC(pvc *HASeedArtifactPVCSpec, fieldPath string) []string {
+	if pvc == nil {
+		return nil
+	}
+	var errors []string
+	claimName := strings.TrimSpace(pvc.ClaimName)
+	if claimName == "" {
+		errors = append(errors, fieldPath+".claimName is required")
+	} else if claimName != pvc.ClaimName {
+		errors = append(errors, fieldPath+".claimName must not have leading or trailing whitespace")
+	} else if nameErrs := utilvalidation.IsDNS1123Subdomain(claimName); len(nameErrs) > 0 {
+		errors = append(errors, fmt.Sprintf("%s.claimName %q is invalid: %s", fieldPath, claimName, strings.Join(nameErrs, "; ")))
+	}
+	if !filepath.IsAbs(pvc.MountPath) || filepath.Clean(pvc.MountPath) != pvc.MountPath {
+		errors = append(errors, fieldPath+".mountPath must be an absolute normalized path")
+	}
+	return errors
+}
+
+func haPathWithinMount(value, mountPath string) bool {
+	value = strings.TrimSpace(value)
+	mountPath = filepath.Clean(strings.TrimSpace(mountPath))
+	if value == "" || mountPath == "" || !filepath.IsAbs(value) || !filepath.IsAbs(mountPath) {
+		return false
+	}
+	if mountPath == string(filepath.Separator) {
+		return true
+	}
+	return value == mountPath || strings.HasPrefix(value, mountPath+string(filepath.Separator))
 }
 
 func validateHAAdminURL(raw string, fieldPath string) []string {

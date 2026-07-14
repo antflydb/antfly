@@ -1912,6 +1912,67 @@ func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStand
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsPortableSeedArtifact(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:             "standby-a",
+			SeedManifestPath: "/antflydb/seed/manifest.afha",
+			SeedContentRoot:  "/antflydb/seed/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location:             "s3://ha-seeds/cluster-a",
+				GenerationPrefix:     "prod",
+				StagingRoot:          "/antflydb/seed/staging",
+				CredentialsSecretRef: &corev1.LocalObjectReference{Name: "ha-seed-credentials"},
+				RetainGenerations:    2,
+				SourcePVC:            &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb/seed"},
+				TargetPVC:            &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/antflydb/seed"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected portable seed artifact configuration to be valid, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsUnsafeSeedArtifact(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location:             "http://not-object-storage/seed",
+				GenerationPrefix:     "bad prefix",
+				StagingRoot:          "relative/staging",
+				CredentialsSecretRef: &corev1.LocalObjectReference{Name: " Bad Secret "},
+				TargetPVC:            &HASeedArtifactPVCSpec{ClaimName: " Bad Claim ", MountPath: "relative"},
+			},
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected unsafe portable seed artifact configuration to be rejected")
+	}
+	for _, want := range []string{
+		"seedArtifact.location must be an s3://, gs://, or file:// URI",
+		"seedArtifact.generationPrefix must be a valid HA identifier",
+		"seedArtifact.stagingRoot must be an absolute normalized path",
+		"seedArtifact.credentialsSecretRef.name must not have leading or trailing whitespace",
+		"seedArtifact.targetPVC.claimName must not have leading or trailing whitespace",
+		"seedArtifact.targetPVC.mountPath must be an absolute normalized path",
+		"seedManifestPath is required when seedArtifact is set",
+		"seedContentRoot is required when seedArtifact is set",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected portable seed validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsAdminExecutionWithoutIdentity(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

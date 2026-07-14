@@ -23,6 +23,7 @@ pub const SequenceId = u32;
 pub const SequenceState = struct {
     id: SequenceId,
     pool_id: block.KvPoolId,
+    active: bool = true,
     block_table: block_table.SequenceBlockTable = .{},
     reserved_tail_blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty,
     /// When true, this sequence holds compacted KV cache and sliding window
@@ -39,6 +40,7 @@ pub const KvManager = struct {
     allocator: std.mem.Allocator,
     pools: std.ArrayListUnmanaged(storage_mod.KvStorage) = .empty,
     sequences: std.ArrayListUnmanaged(SequenceState) = .empty,
+    free_sequence_indices: std.ArrayListUnmanaged(usize) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) KvManager {
         return .{ .allocator = allocator };
@@ -50,6 +52,7 @@ pub const KvManager = struct {
         }
         for (self.sequences.items) |*seq_state| seq_state.deinit(self.allocator);
         self.sequences.deinit(self.allocator);
+        self.free_sequence_indices.deinit(self.allocator);
         for (self.pools.items) |*storage| storage.deinit(self.allocator);
         self.pools.deinit(self.allocator);
     }
@@ -78,6 +81,17 @@ pub const KvManager = struct {
 
     pub fn attachSequence(self: *KvManager, pool_id: block.KvPoolId) !SequenceId {
         if (pool_id >= self.pools.items.len) return error.InvalidPoolId;
+        if (self.recycledSequenceIndex()) |idx| {
+            const id: SequenceId = @intCast(idx + 1);
+            const seq_state = &self.sequences.items[idx];
+            seq_state.id = id;
+            seq_state.pool_id = pool_id;
+            seq_state.active = true;
+            seq_state.compacted = false;
+            seq_state.block_table.reset();
+            seq_state.reserved_tail_blocks.clearRetainingCapacity();
+            return id;
+        }
         const id: SequenceId = @intCast(self.sequences.items.len + 1);
         try self.sequences.append(self.allocator, .{
             .id = id,
@@ -105,6 +119,51 @@ pub const KvManager = struct {
         sequence_state.block_table.markSharedPrefix(@intCast(shared_blocks));
         if (shared_blocks > 0) sequence_state.block_table.tail_tokens = page_size;
         return sequence_id;
+    }
+
+    pub fn attachSequenceWithRetainedBlocks(self: *KvManager, pool_id: block.KvPoolId, block_ids: []const block.KvBlockId, token_count: usize) !SequenceId {
+        const storage = self.getPoolMut(pool_id) orelse return error.InvalidPoolId;
+        const page_size = storage.config.page_size_tokens;
+        if (page_size == 0) return error.InvalidPoolId;
+        if (token_count > block_ids.len * page_size) return error.InvalidKvShape;
+        if (token_count % page_size != 0) return error.InvalidKvShape;
+
+        const sequence_id = try self.attachSequence(pool_id);
+        errdefer self.releaseSequence(sequence_id) catch {};
+        const sequence_state = try self.sequenceMut(sequence_id);
+
+        for (block_ids) |block_id| {
+            try storage.retain(block_id);
+            try sequence_state.block_table.appendExisting(self.allocator, block_id);
+        }
+        sequence_state.block_table.markSharedPrefix(@intCast(block_ids.len));
+        if (block_ids.len > 0) sequence_state.block_table.tail_tokens = page_size;
+        return sequence_id;
+    }
+
+    pub fn retainSequencePrefixBlocks(self: *KvManager, sequence_id: SequenceId, token_count: usize, out: *std.ArrayListUnmanaged(block.KvBlockId)) !void {
+        const sequence_state = try self.sequenceState(sequence_id);
+        const storage = self.getPoolMut(sequence_state.pool_id) orelse return error.InvalidPoolId;
+        const page_size = storage.config.page_size_tokens;
+        if (page_size == 0) return error.InvalidPoolId;
+        if (token_count % page_size != 0) return error.InvalidKvShape;
+        if (token_count > sequence_state.block_table.tokenCount(page_size)) return error.KvCapacityTooSmall;
+        const block_count = token_count / page_size;
+
+        out.clearRetainingCapacity();
+        errdefer {
+            for (out.items) |block_id| _ = storage.releaseRef(self.allocator, block_id) catch {};
+            out.clearRetainingCapacity();
+        }
+        for (sequence_state.block_table.blocks.items[0..block_count]) |block_id| {
+            try storage.retain(block_id);
+            try out.append(self.allocator, block_id);
+        }
+    }
+
+    pub fn releaseRetainedBlocks(self: *KvManager, pool_id: block.KvPoolId, block_ids: []const block.KvBlockId) void {
+        const storage = self.getPoolMut(pool_id) orelse return;
+        for (block_ids) |block_id| _ = storage.releaseRef(self.allocator, block_id) catch {};
     }
 
     pub fn reserveTailBlock(self: *KvManager, sequence_id: SequenceId) !block.KvBlockId {
@@ -182,6 +241,7 @@ pub const KvManager = struct {
         const idx = sequenceIndex(sequence_id) orelse return null;
         if (idx >= self.sequences.items.len) return null;
         const seq_state = &self.sequences.items[idx];
+        if (!seq_state.active) return null;
         const storage = self.getPool(seq_state.pool_id) orelse return null;
         return seq_state.block_table.tokenCount(storage.config.page_size_tokens);
     }
@@ -438,18 +498,21 @@ pub const KvManager = struct {
     pub fn sequenceMut(self: *KvManager, sequence_id: SequenceId) !*SequenceState {
         const idx = sequenceIndex(sequence_id) orelse return error.InvalidSequenceId;
         if (idx >= self.sequences.items.len) return error.InvalidSequenceId;
+        if (!self.sequences.items[idx].active) return error.InvalidSequenceId;
         return &self.sequences.items[idx];
     }
 
     fn sequenceState(self: *const KvManager, sequence_id: SequenceId) !*const SequenceState {
         const idx = sequenceIndex(sequence_id) orelse return error.InvalidSequenceId;
         if (idx >= self.sequences.items.len) return error.InvalidSequenceId;
+        if (!self.sequences.items[idx].active) return error.InvalidSequenceId;
         return &self.sequences.items[idx];
     }
 
     fn releaseSequenceByIndex(self: *KvManager, idx: usize) !void {
         if (idx >= self.sequences.items.len) return error.InvalidSequenceId;
         const seq_state = &self.sequences.items[idx];
+        if (!seq_state.active) return;
         const storage = self.getPoolMut(seq_state.pool_id) orelse return error.InvalidPoolId;
         for (seq_state.block_table.blocks.items) |block_id| {
             _ = try storage.releaseRef(self.allocator, block_id);
@@ -459,6 +522,20 @@ pub const KvManager = struct {
         }
         seq_state.block_table.reset();
         seq_state.reserved_tail_blocks.clearRetainingCapacity();
+        seq_state.compacted = false;
+        seq_state.active = false;
+        self.free_sequence_indices.append(self.allocator, idx) catch {};
+    }
+
+    fn recycledSequenceIndex(self: *KvManager) ?usize {
+        while (self.free_sequence_indices.pop()) |idx| {
+            if (idx < self.sequences.items.len and !self.sequences.items[idx].active) return idx;
+        }
+        // ponytail: fallback scan covers OOM while recording a released slot; keep a real freelist if this ever profiles hot.
+        for (self.sequences.items, 0..) |seq_state, idx| {
+            if (!seq_state.active) return idx;
+        }
+        return null;
     }
 };
 
@@ -669,6 +746,58 @@ test "manager releases shared prefix blocks by refcount" {
     try manager.releaseSequence(source_id);
     try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(0).?.refcount);
     try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(1).?.refcount);
+}
+
+test "manager can attach sequence with retained blocks" {
+    const allocator = std.testing.allocator;
+    var manager = KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    const source_id = try manager.attachSequence(pool_id);
+    try manager.appendTokens(source_id, 4);
+
+    var blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer blocks.deinit(allocator);
+    try manager.retainSequencePrefixBlocks(source_id, 4, &blocks);
+    defer manager.releaseRetainedBlocks(pool_id, blocks.items);
+
+    const derived_id = try manager.attachSequenceWithRetainedBlocks(pool_id, blocks.items, 4);
+    const pool = manager.getPool(pool_id).?;
+    try std.testing.expectEqual(@as(u32, 3), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 3), pool.blockInfo(1).?.refcount);
+
+    try manager.releaseSequence(derived_id);
+    try std.testing.expectEqual(@as(u32, 2), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 2), pool.blockInfo(1).?.refcount);
+}
+
+test "manager reuses released sequence slots" {
+    const allocator = std.testing.allocator;
+    var manager = KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    const first = try manager.attachSequence(pool_id);
+    try manager.appendTokens(first, 2);
+    try manager.releaseSequence(first);
+
+    const second = try manager.attachSequence(pool_id);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(@as(usize, 1), manager.sequences.items.len);
+    try std.testing.expectEqual(@as(?usize, 0), manager.tokenCount(second));
 }
 
 test "manager trims sequence to sliding window in whole blocks" {

@@ -3464,6 +3464,56 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	}))
 }
 
+func TestBuildHAAdminJobRunsPortableArtifactWithoutAdminURLAndInjectsCredentials(t *testing.T) {
+	g := NewWithT(t)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{Standbys: []antflyv1.HAStandbySpec{{
+				Name: "standby-a",
+				SeedArtifact: &antflyv1.HASeedArtifactSpec{
+					Location:             "s3://ha-seeds/cluster-a",
+					StagingRoot:          "/target/staging",
+					CredentialsSecretRef: &corev1.LocalObjectReference{Name: "ha-seed-credentials"},
+					SourcePVC:            &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+					TargetPVC:            &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+				},
+			}}},
+		},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionPublishSeedArtifact),
+		Executor:    string(haActionExecutorCLIJob),
+		StandbyName: "standby-a",
+		SlotName:    "standby-a",
+		AdminCommand: []string{
+			"artifact", "publish", "--location", "s3://ha-seeds/cluster-a",
+		},
+	}
+	job := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, action)
+	container := job.Spec.Template.Spec.Containers[0]
+	g.Expect(container.Args).To(Equal([]string{
+		"ha", "artifact", "publish", "--location", "s3://ha-seeds/cluster-a",
+	}))
+	g.Expect(container.Args).NotTo(ContainElement("--ha-url"))
+	g.Expect(container.EnvFrom).To(HaveLen(1))
+	g.Expect(container.EnvFrom[0].SecretRef).NotTo(BeNil())
+	g.Expect(container.EnvFrom[0].SecretRef.Name).To(Equal("ha-seed-credentials"))
+	g.Expect(container.VolumeMounts).To(Equal([]corev1.VolumeMount{{Name: "ha-seed-source", MountPath: "/source", ReadOnly: true}}))
+	g.Expect(job.Spec.Template.Spec.Volumes).To(HaveLen(1))
+	g.Expect(job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("primary-data"))
+	g.Expect(haPlannedActionRequiresAdminTarget(action)).To(BeTrue())
+	g.Expect(haPlannedActionRequiresAdminURL(action)).To(BeFalse())
+
+	restoreAction := action
+	restoreAction.Kind = string(haActionRestoreSeedArtifact)
+	restoreJob := buildHAAdminJob(cluster, &antflyv1.HAAdminSpec{}, restoreAction)
+	g.Expect(restoreJob.Spec.Template.Spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{{Name: "ha-seed-target", MountPath: "/target"}}))
+	g.Expect(restoreJob.Spec.Template.Spec.Volumes).To(HaveLen(1))
+	g.Expect(restoreJob.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("standby-data"))
+}
+
 func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	g := NewWithT(t)
 
@@ -5800,6 +5850,39 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(rejoin.FormerLastLSN).To(Equal(uint64(12)))
 	g.Expect(rejoin.RetainedFromLSN).To(Equal(uint64(8)))
 	g.Expect(rejoin.DataLossDiscarded).To(BeFalse())
+}
+
+func TestParseHASeedArtifactReceiptRequiresMatchingTypedEvidence(t *testing.T) {
+	g := NewWithT(t)
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:                   string(haActionRestoreSeedArtifact),
+		SlotName:               "standby-a",
+		TargetLSN:              10,
+		SeedArtifactGeneration: "seed-standby-a-10",
+		AdminJobPhase:          haAdminJobPhaseSucceeded,
+	}
+	body := fmt.Sprintf(`{"format_version":1,"generation":"seed-standby-a-10","slot_name":"standby-a","cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":6,"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":12,"manifest_sha256":"%s","aggregate_sha256":"%s","total_bytes":42,"files":[{"path":"catalog/manifest"}]}`, strings.Repeat("a", 64), strings.Repeat("b", 64))
+	receipt := parseHASeedArtifactReceipt(body, action)
+	g.Expect(receipt).NotTo(BeNil())
+	g.Expect(receipt.Generation).To(Equal("seed-standby-a-10"))
+	g.Expect(receipt.FileCount).To(Equal(int32(1)))
+	action.SeedArtifactReceipt = receipt
+	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
+
+	wrongGeneration := strings.Replace(body, "seed-standby-a-10", "seed-standby-a-9", 1)
+	g.Expect(parseHASeedArtifactReceipt(wrongGeneration, action)).To(BeNil())
+
+	pruneAction := antflyv1.HAPlannedActionStatus{
+		Kind:                          string(haActionPruneSeedArtifacts),
+		SlotName:                      "standby-a",
+		SeedArtifactGeneration:        "seed-standby-a-10",
+		SeedArtifactRetainGenerations: 2,
+		AdminJobPhase:                 haAdminJobPhaseSucceeded,
+	}
+	pruneReceipt := parseHASeedArtifactReceipt(`{"format_version":1,"slot_name":"standby-a","current_generation":"seed-standby-a-10","retained_generations":2,"deleted_generations":1}`, pruneAction)
+	g.Expect(pruneReceipt).NotTo(BeNil())
+	pruneAction.SeedArtifactReceipt = pruneReceipt
+	g.Expect(haAdminActionSucceededWithEvidence(pruneAction)).To(BeTrue())
 }
 
 func TestCompletedSlotAdminJobResultSatisfiesReceiptEvidence(t *testing.T) {

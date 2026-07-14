@@ -1025,6 +1025,81 @@ func TestPlanHAPlansSeedFinishAndBootstrapWhenManifestPathConfigured(t *testing.
 	}
 }
 
+func TestPlanHAPlansPortablePublishRestoreAndVerifiedBootstrap(t *testing.T) {
+	initial := uint64(5)
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 9}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a",
+	}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name:             "standby-a",
+		InitialLSN:       &initial,
+		AdminURL:         "http://standby-a-ha.default.svc:8081",
+		SeedManifestPath: "/source/seed/manifest.afha",
+		SeedContentRoot:  "/source/seed/content",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location:         "s3://ha-seeds/cluster-a",
+			GenerationPrefix: "base",
+			StagingRoot:      "/target/seed/staging",
+		},
+	}}
+
+	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
+	actions := cluster.Status.HAStatus.PlannedActions
+	if len(actions) != 7 {
+		t.Fatalf("expected create, begin, finish, publish, restore, bootstrap, prune actions, got %#v", actions)
+	}
+	publish := actions[3]
+	if publish.Kind != string(haActionPublishSeedArtifact) ||
+		publish.DependsOn != string(haActionFinishStandbySeed) ||
+		publish.Phase != string(haActionPhaseSeed) ||
+		publish.Executor != string(haActionExecutorCLIJob) ||
+		publish.AdminURL != "" ||
+		publish.SeedArtifactGeneration != "base-standby-a-10" ||
+		publish.SeedArtifactLocation != "s3://ha-seeds/cluster-a" ||
+		!reflect.DeepEqual(publish.AdminCommand, []string{
+			"artifact", "publish",
+			"--location", "s3://ha-seeds/cluster-a",
+			"--generation", "base-standby-a-10",
+			"--slot", "standby-a",
+			"--manifest", "/source/seed/manifest.afha",
+			"--content-root", "/source/seed/content",
+		}) {
+		t.Fatalf("unexpected portable publish action: %#v", publish)
+	}
+	restore := actions[4]
+	if restore.Kind != string(haActionRestoreSeedArtifact) ||
+		restore.DependsOn != string(haActionPublishSeedArtifact) ||
+		restore.Executor != string(haActionExecutorCLIJob) ||
+		restore.AdminURL != "" ||
+		restore.SeedContentRoot != "/target/seed/staging" ||
+		!strings.Contains(strings.Join(restore.AdminCommand, " "), "--minimum-checkpoint-lsn 10") {
+		t.Fatalf("unexpected portable restore action: %#v", restore)
+	}
+	bootstrap := actions[5]
+	if bootstrap.Kind != string(haActionBootstrapStandbySeed) ||
+		bootstrap.DependsOn != string(haActionRestoreSeedArtifact) ||
+		bootstrap.SeedManifestPath != "/target/seed/staging/.antfly-ha-seed-manifest.afha" ||
+		bootstrap.SeedContentRoot != "/target/seed/staging" {
+		t.Fatalf("bootstrap must consume only verified restored staging: %#v", bootstrap)
+	}
+	prune := actions[6]
+	if prune.Kind != string(haActionPruneSeedArtifacts) ||
+		prune.DependsOn != string(haActionBootstrapStandbySeed) ||
+		prune.SeedArtifactRetainGenerations != 2 ||
+		!reflect.DeepEqual(prune.AdminCommand, []string{
+			"artifact", "prune",
+			"--location", "s3://ha-seeds/cluster-a",
+			"--generation", "base-standby-a-10",
+			"--slot", "standby-a",
+			"--retain-generations", "2",
+		}) {
+		t.Fatalf("unexpected post-bootstrap prune action: %#v", prune)
+	}
+}
+
 func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	undesired := false
 	cluster := haCluster()

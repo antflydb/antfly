@@ -1751,6 +1751,52 @@ spec:
                           additionalProperties:
                             type: string
                           type: object
+                        seedArtifact:
+                          properties:
+                            credentialsSecretRef:
+                              properties:
+                                name:
+                                  default: ""
+                                  type: string
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            generationPrefix:
+                              pattern: ^[A-Za-z0-9_.:-]+$
+                              type: string
+                            location:
+                              pattern: ^(s3://|gs://|file://).+
+                              type: string
+                            retainGenerations:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            sourcePVC:
+                              properties:
+                                claimName:
+                                  type: string
+                                mountPath:
+                                  type: string
+                              required:
+                              - claimName
+                              - mountPath
+                              type: object
+                            stagingRoot:
+                              pattern: ^/.*
+                              type: string
+                            targetPVC:
+                              properties:
+                                claimName:
+                                  type: string
+                                mountPath:
+                                  type: string
+                              required:
+                              - claimName
+                              - mountPath
+                              type: object
+                          required:
+                          - location
+                          - stagingRoot
+                          type: object
                         seedContentRoot:
                           type: string
                         seedManifestPath:
@@ -4522,6 +4568,66 @@ spec:
                           type: string
                         routeTo:
                           type: string
+                        seedArtifactGeneration:
+                          type: string
+                        seedArtifactLocation:
+                          type: string
+                        seedArtifactReceipt:
+                          properties:
+                            aggregateSHA256:
+                              type: string
+                            backupLSN:
+                              format: int64
+                              type: integer
+                            checkpointLSN:
+                              format: int64
+                              type: integer
+                            clusterID:
+                              format: int64
+                              type: integer
+                            deletedCount:
+                              format: int32
+                              type: integer
+                            epoch:
+                              format: int64
+                              type: integer
+                            fileCount:
+                              format: int32
+                              type: integer
+                            formatVersion:
+                              format: int32
+                              type: integer
+                            generation:
+                              type: string
+                            manifestID:
+                              type: string
+                            manifestSHA256:
+                              type: string
+                            retainedCount:
+                              format: int32
+                              type: integer
+                            shardID:
+                              format: int64
+                              type: integer
+                            slotName:
+                              type: string
+                            tableID:
+                              format: int64
+                              type: integer
+                            timelineID:
+                              format: int64
+                              type: integer
+                            totalBytes:
+                              format: int64
+                              type: integer
+                          required:
+                          - formatVersion
+                          - generation
+                          - slotName
+                          type: object
+                        seedArtifactRetainGenerations:
+                          format: int32
+                          type: integer
                         seedContentRoot:
                           type: string
                         seedManifestPath:

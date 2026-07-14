@@ -272,14 +272,21 @@ pub fn verifyFileContents(view: ManifestView, contents: []const FileContent) !vo
 
 fn validateFiles(files: []const FileEntry) !void {
     for (files, 0..) |file, idx| {
-        if (file.path.len == 0) return error.InvalidManifestPath;
+        try validatePath(file.path);
         if (file.path.len > std.math.maxInt(u32)) return error.ManifestPathTooLong;
-        if (std.fs.path.isAbsolute(file.path)) return error.InvalidManifestPath;
-        if (std.mem.indexOf(u8, file.path, "..") != null) return error.InvalidManifestPath;
         for (files[0..idx]) |prior| {
             if (std.mem.eql(u8, prior.path, file.path)) return error.DuplicateManifestPath;
         }
     }
+}
+
+/// Validate a manifest-relative path before joining it to a local staging root
+/// or an object-store generation prefix.
+pub fn validatePath(path: []const u8) !void {
+    if (path.len == 0) return error.InvalidManifestPath;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidManifestPath;
+    if (std.fs.path.isAbsolute(path)) return error.InvalidManifestPath;
+    if (std.mem.indexOf(u8, path, "..") != null) return error.InvalidManifestPath;
 }
 
 fn findContent(contents: []const FileContent, path: []const u8) ?FileContent {
