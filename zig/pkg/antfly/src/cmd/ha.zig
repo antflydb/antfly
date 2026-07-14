@@ -1431,6 +1431,47 @@ test "ha cmd parses offline seed activation target and identity" {
     try std.testing.expectEqualStrings("pvc-uid-1", options.binding.target_pvc_uid.?);
 }
 
+test "ha cmd parses lifecycle-gated source and target generation gc actions" {
+    const alloc = std.testing.allocator;
+    var source = try parseArtifactArgs(alloc, &.{
+        "gc-source",
+        "--location",
+        "s3://ha-seeds/cluster-a",
+        "--generation",
+        "seed-standby-a-42",
+        "--slot",
+        "standby-a",
+        "--capture-root",
+        "/source/.antfly-ha/captures",
+        "--retain-generations",
+        "2",
+        "--protect-generation",
+        "seed-standby-a-41",
+        "--protect-generation",
+        "seed-standby-a-40",
+    });
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(ArtifactAction.gc_source, source.action);
+    try std.testing.expectEqualStrings("/source/.antfly-ha/captures", source.capture_root.?);
+    try std.testing.expectEqual(@as(usize, 2), source.protected_generations.len);
+
+    var target = try parseArtifactArgs(alloc, &.{
+        "gc-target",
+        "--target-root",
+        "/target",
+        "--slot-activation-receipt",
+        "/checkpoint/seeded-slot-activation.json",
+        "--retain-generations",
+        "2",
+        "--protect-generation",
+        "seed-standby-a-41",
+    });
+    defer target.deinit(alloc);
+    try std.testing.expectEqual(ArtifactAction.gc_target, target.action);
+    try std.testing.expectEqualStrings("/checkpoint/seeded-slot-activation.json", target.slot_activation_receipt_path.?);
+    try std.testing.expectEqual(@as(usize, 1), target.protected_generations.len);
+}
+
 test "ha cmd parses remote admin URL before command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{

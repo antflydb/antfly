@@ -4518,6 +4518,21 @@ pub fn build(b: *std.Build) void {
     const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
+    // cmd/ha.zig is imported by the top-level CLI, but Zig does not discover
+    // tests recursively through imports. Keep its parser/dispatch tests in the
+    // HA gate explicitly so lifecycle commands cannot ship uncompiled.
+    const ha_cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd/ha.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ha_cli_test_mod.addImport("antfly-zig", lib_mod);
+    const ha_cli_tests = b.addTest(.{
+        .root_module = ha_cli_test_mod,
+    });
+    const run_ha_cli_tests = b.addRunArtifact(ha_cli_tests);
+    ha_test_step.dependOn(&run_ha_cli_tests.step);
+
     const lib_storage_progress_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &lib_storage_default_filters),
