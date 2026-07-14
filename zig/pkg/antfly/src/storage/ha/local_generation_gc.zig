@@ -5,7 +5,415 @@
 // the License at https://www.antfly.io/licensing/ELv2-license.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
+const validation = @import("validation.zig");
+
+pub const marker_name = ".antfly-ha-local-gc-eligible.json";
+pub const generations_dir_name = "generations";
+const tombstone_prefix = ".gc-";
+const schema_version: u16 = 1;
+
+/// Local deletion authority is deliberately split by lifecycle boundary. A
+/// remote artifact prune is never evidence that either local scope is safe.
+pub const Scope = enum {
+    source_capture,
+    target_activation,
+};
+
+pub const MarkRequest = struct {
+    root: []const u8,
+    scope: Scope,
+    generation: []const u8,
+    slot_name: []const u8,
+    checkpoint_lsn: u64,
+    /// The already-durable lifecycle receipt. Only its digest is retained in
+    /// the eligibility marker; callers must validate the typed receipt first.
+    checkpoint_bytes: []const u8,
+    max_checkpoint_bytes: usize = 1024 * 1024,
+};
+
+pub const PruneRequest = struct {
+    root: []const u8,
+    scope: Scope,
+    slot_name: []const u8,
+    current_generation: []const u8,
+    protected_generations: []const []const u8 = &.{},
+    retain_generations: usize = 2,
+    max_entries: usize = 10_000,
+    max_marker_bytes: usize = 1024 * 1024,
+};
+
+pub const PruneResult = struct {
+    result_json: []u8,
+    deleted_generations: usize,
+    retained_generations: usize,
+    resumed_tombstones: usize,
+    skipped_ineligible: usize,
+
+    pub fn deinit(self: *PruneResult, alloc: Allocator) void {
+        alloc.free(self.result_json);
+        self.* = undefined;
+    }
+};
+
+const PruneOptions = struct {
+    /// Test-only crash boundary after the durable rename and before deletion.
+    fail_after_tombstones: ?usize = null,
+};
+
+const EligibilityMarker = struct {
+    schema_version: u16 = schema_version,
+    scope: Scope,
+    generation: []const u8,
+    slot_name: []const u8,
+    checkpoint_lsn: u64,
+    checkpoint_sha256: []const u8,
+};
+
+const Candidate = struct {
+    generation: []u8,
+    checkpoint_lsn: u64,
+    checkpoint_sha256: []u8,
+
+    fn deinit(self: *Candidate, alloc: Allocator) void {
+        alloc.free(self.generation);
+        alloc.free(self.checkpoint_sha256);
+        self.* = undefined;
+    }
+};
+
+const Tombstone = struct {
+    name: []u8,
+
+    fn deinit(self: *Tombstone, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const OwnedMarker = struct {
+    scope: Scope,
+    slot_name: []u8,
+    checkpoint_lsn: u64,
+    checkpoint_sha256: []u8,
+
+    fn deinit(self: *OwnedMarker, alloc: Allocator) void {
+        alloc.free(self.slot_name);
+        alloc.free(self.checkpoint_sha256);
+        self.* = undefined;
+    }
+};
+
+const PruneReceipt = struct {
+    schema_version: u16 = schema_version,
+    action_kind: []const u8 = "gc_local_seed_generations",
+    scope: Scope,
+    slot_name: []const u8,
+    current_generation: []const u8,
+    checkpoint_sha256: []const u8,
+    retained_generations: usize,
+    protected_generations: usize,
+    deleted_generations: usize,
+    resumed_tombstones: usize,
+    skipped_ineligible: usize,
+};
+
+/// Records a typed lifecycle checkpoint as immutable local deletion authority.
+///
+/// This primitive intentionally does not infer safety from directory age or
+/// remote prune state. Source callers must first verify a durable v2 artifact
+/// COMPLETE receipt; target callers must first verify the durable slot
+/// activation receipt against ACTIVE.json.
+pub fn markEligible(alloc: Allocator, request: MarkRequest) !void {
+    try validateRootAndIdentity(request.root, request.slot_name, request.generation);
+    if (request.checkpoint_lsn == 0) return error.InvalidLocalGCCheckpoint;
+    if (request.checkpoint_bytes.len == 0 or request.checkpoint_bytes.len > request.max_checkpoint_bytes)
+        return error.InvalidLocalGCCheckpoint;
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const generation_root = try generationPath(alloc, request.root, request.generation);
+    defer alloc.free(generation_root);
+    const generation_stat = std.Io.Dir.cwd().statFile(io, generation_root, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.LocalGCGenerationNotFound,
+        else => return err,
+    };
+    if (generation_stat.kind != .directory) return error.UnsafeLocalGCGeneration;
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(request.checkpoint_bytes, &digest, .{});
+    var digest_hex: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&digest_hex, &digest);
+    const marker_json = try std.json.Stringify.valueAlloc(alloc, EligibilityMarker{
+        .scope = request.scope,
+        .generation = request.generation,
+        .slot_name = request.slot_name,
+        .checkpoint_lsn = request.checkpoint_lsn,
+        .checkpoint_sha256 = &digest_hex,
+    }, .{});
+    defer alloc.free(marker_json);
+
+    const marker_path = try std.fs.path.join(alloc, &.{ generation_root, marker_name });
+    defer alloc.free(marker_path);
+    _ = try writeImmutableFile(io, alloc, marker_path, marker_json);
+}
+
+pub fn prune(alloc: Allocator, request: PruneRequest) !PruneResult {
+    return pruneWithOptions(alloc, request, .{});
+}
+
+fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptions) !PruneResult {
+    try validateRootAndIdentity(request.root, request.slot_name, request.current_generation);
+    if (request.retain_generations == 0) return error.InvalidLocalGCRetention;
+    if (request.max_entries == 0 or request.max_marker_bytes == 0) return error.InvalidLocalGCLimit;
+    if (request.protected_generations.len > request.max_entries) return error.TooManyLocalGCEntries;
+    for (request.protected_generations, 0..) |generation, index| {
+        if (!validation.isIdentifier(generation)) return error.InvalidSeedGeneration;
+        for (request.protected_generations[0..index]) |prior| {
+            if (std.mem.eql(u8, prior, generation)) return error.DuplicateProtectedGeneration;
+        }
+    }
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const generations_root = try std.fs.path.join(alloc, &.{ request.root, generations_dir_name });
+    defer alloc.free(generations_root);
+
+    var dir = std.Io.Dir.cwd().openDir(io, generations_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.CurrentGenerationNotEligible,
+        error.NotDir => return error.UnsafeLocalGCRoot,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var candidates = std.ArrayListUnmanaged(Candidate).empty;
+    defer {
+        for (candidates.items) |*candidate| candidate.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+    var tombstones = std.ArrayListUnmanaged(Tombstone).empty;
+    defer {
+        for (tombstones.items) |*tombstone| tombstone.deinit(alloc);
+        tombstones.deinit(alloc);
+    }
+
+    var entry_count: usize = 0;
+    var skipped_ineligible: usize = 0;
+    var found_current = false;
+    var iterator = dir.iterateAssumeFirstIteration();
+    while (try iterator.next(io)) |entry| {
+        entry_count += 1;
+        if (entry_count > request.max_entries) return error.TooManyLocalGCEntries;
+        if (entry.kind != .directory) {
+            skipped_ineligible += 1;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, entry.name, tombstone_prefix)) {
+            const generation = entry.name[tombstone_prefix.len..];
+            if (!validation.isIdentifier(generation)) return error.InvalidLocalGCTombstone;
+            var marker = try readAndValidateMarker(alloc, io, generations_root, entry.name, generation, request.max_marker_bytes);
+            defer marker.deinit(alloc);
+            if (marker.scope != request.scope or !std.mem.eql(u8, marker.slot_name, request.slot_name)) continue;
+            const name = try alloc.dupe(u8, entry.name);
+            errdefer alloc.free(name);
+            try tombstones.append(alloc, .{
+                .name = name,
+            });
+            continue;
+        }
+        if (!validation.isIdentifier(entry.name)) {
+            skipped_ineligible += 1;
+            continue;
+        }
+
+        var marker = readAndValidateMarker(alloc, io, generations_root, entry.name, entry.name, request.max_marker_bytes) catch |err| switch (err) {
+            error.FileNotFound => {
+                skipped_ineligible += 1;
+                continue;
+            },
+            else => return err,
+        };
+        defer marker.deinit(alloc);
+        if (marker.scope != request.scope or !std.mem.eql(u8, marker.slot_name, request.slot_name)) {
+            skipped_ineligible += 1;
+            continue;
+        }
+        const generation = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(generation);
+        const checkpoint_sha256 = try alloc.dupe(u8, marker.checkpoint_sha256);
+        errdefer alloc.free(checkpoint_sha256);
+        try candidates.append(alloc, .{
+            .generation = generation,
+            .checkpoint_lsn = marker.checkpoint_lsn,
+            .checkpoint_sha256 = checkpoint_sha256,
+        });
+        if (std.mem.eql(u8, entry.name, request.current_generation)) found_current = true;
+    }
+    if (!found_current) return error.CurrentGenerationNotEligible;
+
+    std.mem.sort(Candidate, candidates.items, {}, newerCandidate);
+
+    var resumed_tombstones: usize = 0;
+    for (tombstones.items) |tombstone| {
+        const path = try std.fs.path.join(alloc, &.{ generations_root, tombstone.name });
+        defer alloc.free(path);
+        try std.Io.Dir.cwd().deleteTree(io, path);
+        try fs_paths.syncDirPortable(io, generations_root);
+        resumed_tombstones += 1;
+    }
+
+    var deleted_generations: usize = 0;
+    var tombstones_created: usize = 0;
+    for (candidates.items, 0..) |candidate, index| {
+        if (index < request.retain_generations or
+            std.mem.eql(u8, candidate.generation, request.current_generation) or
+            isProtected(request.protected_generations, candidate.generation))
+        {
+            continue;
+        }
+
+        const source_path = try std.fs.path.join(alloc, &.{ generations_root, candidate.generation });
+        defer alloc.free(source_path);
+        const tombstone_name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ tombstone_prefix, candidate.generation });
+        defer alloc.free(tombstone_name);
+        const tombstone_path = try std.fs.path.join(alloc, &.{ generations_root, tombstone_name });
+        defer alloc.free(tombstone_path);
+
+        std.Io.Dir.rename(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), tombstone_path, io) catch |err| switch (err) {
+            error.FileNotFound => return error.LocalGCConcurrentMutation,
+            error.DirNotEmpty => return error.LocalGCTombstoneConflict,
+            else => return err,
+        };
+        try fs_paths.syncDirPortable(io, generations_root);
+        tombstones_created += 1;
+        if (options.fail_after_tombstones) |limit| {
+            if (tombstones_created >= limit) return error.InjectedLocalGCFailure;
+        }
+
+        try std.Io.Dir.cwd().deleteTree(io, tombstone_path);
+        try fs_paths.syncDirPortable(io, generations_root);
+        deleted_generations += 1;
+    }
+
+    const retained_generations = candidates.items.len - deleted_generations;
+    const current_checkpoint_sha256 = for (candidates.items) |candidate| {
+        if (std.mem.eql(u8, candidate.generation, request.current_generation)) break candidate.checkpoint_sha256;
+    } else unreachable;
+    const result_json = try std.json.Stringify.valueAlloc(alloc, PruneReceipt{
+        .scope = request.scope,
+        .slot_name = request.slot_name,
+        .current_generation = request.current_generation,
+        .checkpoint_sha256 = current_checkpoint_sha256,
+        .retained_generations = retained_generations,
+        .protected_generations = request.protected_generations.len,
+        .deleted_generations = deleted_generations,
+        .resumed_tombstones = resumed_tombstones,
+        .skipped_ineligible = skipped_ineligible,
+    }, .{});
+    return .{
+        .result_json = result_json,
+        .deleted_generations = deleted_generations,
+        .retained_generations = retained_generations,
+        .resumed_tombstones = resumed_tombstones,
+        .skipped_ineligible = skipped_ineligible,
+    };
+}
+
+fn validateRootAndIdentity(root: []const u8, slot_name: []const u8, generation: []const u8) !void {
+    if (!validation.isAbsoluteNormalizedPath(root)) return error.InvalidLocalGCRoot;
+    if (!validation.isIdentifier(slot_name)) return error.InvalidSlotName;
+    if (!validation.isIdentifier(generation)) return error.InvalidSeedGeneration;
+}
+
+fn readAndValidateMarker(
+    alloc: Allocator,
+    io: std.Io,
+    generations_root: []const u8,
+    directory_name: []const u8,
+    expected_generation: []const u8,
+    max_bytes: usize,
+) !OwnedMarker {
+    const marker_path = try std.fs.path.join(alloc, &.{ generations_root, directory_name, marker_name });
+    defer alloc.free(marker_path);
+    const stat = std.Io.Dir.cwd().statFile(io, marker_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    if (stat.kind != .file or stat.size > max_bytes) return error.InvalidLocalGCMarker;
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(max_bytes)) catch return error.InvalidLocalGCMarker;
+    defer alloc.free(raw);
+    var parsed = std.json.parseFromSlice(EligibilityMarker, alloc, raw, .{ .ignore_unknown_fields = false }) catch
+        return error.InvalidLocalGCMarker;
+    defer parsed.deinit();
+    const marker = parsed.value;
+    if (marker.schema_version != schema_version or
+        !validation.isIdentifier(marker.generation) or
+        !validation.isIdentifier(marker.slot_name) or
+        !std.mem.eql(u8, marker.generation, expected_generation) or
+        marker.checkpoint_lsn == 0 or
+        marker.checkpoint_sha256.len != Sha256.digest_length * 2 or
+        !isLowerHex(marker.checkpoint_sha256))
+    {
+        return error.InvalidLocalGCMarker;
+    }
+    const slot_name = try alloc.dupe(u8, marker.slot_name);
+    errdefer alloc.free(slot_name);
+    const checkpoint_sha256 = try alloc.dupe(u8, marker.checkpoint_sha256);
+    return .{
+        .scope = marker.scope,
+        .slot_name = slot_name,
+        .checkpoint_lsn = marker.checkpoint_lsn,
+        .checkpoint_sha256 = checkpoint_sha256,
+    };
+}
+
+fn writeImmutableFile(io: std.Io, alloc: Allocator, path: []const u8, body: []const u8) !bool {
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .make_path = false, .replace = false });
+    defer atomic_file.deinit(io);
+    try atomic_file.file.writeStreamingAll(io, body);
+    try atomic_file.file.sync(io);
+    atomic_file.link(io) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            const existing = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(@max(body.len +| 1, 1024 * 1024))) catch
+                return error.LocalGCEligibilityConflict;
+            defer alloc.free(existing);
+            if (!std.mem.eql(u8, existing, body)) return error.LocalGCEligibilityConflict;
+            return false;
+        },
+        else => return err,
+    };
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse return error.InvalidLocalGCRoot);
+    return true;
+}
+
+fn isProtected(protected: []const []const u8, generation: []const u8) bool {
+    for (protected) |item| if (std.mem.eql(u8, item, generation)) return true;
+    return false;
+}
+
+fn newerCandidate(_: void, a: Candidate, b: Candidate) bool {
+    if (a.checkpoint_lsn != b.checkpoint_lsn) return a.checkpoint_lsn > b.checkpoint_lsn;
+    return std.mem.order(u8, a.generation, b.generation) == .gt;
+}
+
+fn isLowerHex(value: []const u8) bool {
+    for (value) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
+    return true;
+}
+
+fn encodeHex(out: []u8, bytes: []const u8) void {
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, i| {
+        out[i * 2] = alphabet[byte >> 4];
+        out[i * 2 + 1] = alphabet[byte & 0x0f];
+    }
+}
 
 fn writeTestFile(path: []const u8, body: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(std.testing.io, parent);
