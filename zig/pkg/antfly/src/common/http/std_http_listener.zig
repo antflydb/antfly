@@ -339,47 +339,45 @@ pub const StdHttpListener = struct {
         const timeout_ms = self.cfg.header_read_timeout_ms;
         if (timeout_ms == 0) return try server.receiveHead();
 
-        const ReceiveResult = anyerror!std.http.Server.Request;
-        const TimeoutResult = anyerror!void;
-        const SelectResult = union(enum) {
-            receive: ReceiveResult,
-            timeout: TimeoutResult,
+        const RaceState = enum(u8) {
+            pending,
+            receive_complete,
+            timed_out,
         };
 
         const Task = struct {
-            fn receiveTask(srv: *std.http.Server) ReceiveResult {
-                return srv.receiveHead();
-            }
-
-            fn timeoutTask(task_io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
-                return timeout.sleep(task_io);
+            fn timeoutTask(
+                task_io: std.Io,
+                timeout: std.Io.Timeout,
+                state: *std.atomic.Value(RaceState),
+                active_stream: *const std.Io.net.Stream,
+            ) std.Io.Cancelable!void {
+                try timeout.sleep(task_io);
+                if (state.cmpxchgStrong(.pending, .timed_out, .acq_rel, .acquire) == null) {
+                    active_stream.shutdown(task_io, .both) catch {};
+                }
             }
         };
 
-        var select_buffer: [2]SelectResult = undefined;
-        var select = std.Io.Select(SelectResult).init(io, &select_buffer);
-        try select.concurrent(.receive, Task.receiveTask, .{server});
-        select.async(.timeout, Task.timeoutTask, .{
+        var state = std.atomic.Value(RaceState).init(.pending);
+        var timeout_group: std.Io.Group = .init;
+        try timeout_group.concurrent(io, Task.timeoutTask, .{
             io,
             std.Io.Timeout{ .duration = .{
                 .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
                 .clock = .awake,
             } },
+            &state,
+            stream,
         });
+        defer timeout_group.cancel(io);
 
-        const first = try select.await();
-        switch (first) {
-            .receive => |receive_result| {
-                select.cancelDiscard();
-                return try receive_result;
-            },
-            .timeout => |timeout_result| {
-                try timeout_result;
-                stream.shutdown(io, .both) catch {};
-                while (select.cancel()) |_| {}
-                return error.Timeout;
-            },
+        const receive_result = server.receiveHead();
+        if (state.cmpxchgStrong(.pending, .receive_complete, .acq_rel, .acquire) != null) {
+            _ = receive_result catch {};
+            return error.Timeout;
         }
+        return try receive_result;
     }
 
     fn registerActiveStream(self: *StdHttpListener, stream: *const std.Io.net.Stream) !void {
@@ -656,55 +654,46 @@ pub const StdHttpListener = struct {
         const timeout_ms = self.cfg.body_read_timeout_ms;
         if (timeout_ms == 0 or stream == null) return try body_reader.allocRemaining(self.alloc, .limited(self.cfg.max_request_bytes));
 
-        const ReadResult = anyerror![]u8;
-        const TimeoutResult = anyerror!void;
-        const SelectResult = union(enum) {
-            read: ReadResult,
-            timeout: TimeoutResult,
+        const RaceState = enum(u8) {
+            pending,
+            read_complete,
+            timed_out,
         };
 
         const Task = struct {
-            fn readTask(listener: *StdHttpListener, reader: *std.Io.Reader) ReadResult {
-                return reader.allocRemaining(listener.alloc, .limited(listener.cfg.max_request_bytes));
-            }
-
-            fn timeoutTask(task_io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
-                return timeout.sleep(task_io);
+            fn timeoutTask(
+                task_io: std.Io,
+                timeout: std.Io.Timeout,
+                state: *std.atomic.Value(RaceState),
+                active_stream: *const std.Io.net.Stream,
+            ) std.Io.Cancelable!void {
+                try timeout.sleep(task_io);
+                if (state.cmpxchgStrong(.pending, .timed_out, .acq_rel, .acquire) == null) {
+                    active_stream.shutdown(task_io, .both) catch {};
+                }
             }
         };
 
         const io = self.io_impl.io();
-        var select_buffer: [2]SelectResult = undefined;
-        var select = std.Io.Select(SelectResult).init(io, &select_buffer);
-        try select.concurrent(.read, Task.readTask, .{ self, body_reader });
-        select.async(.timeout, Task.timeoutTask, .{
+        var state = std.atomic.Value(RaceState).init(.pending);
+        var timeout_group: std.Io.Group = .init;
+        try timeout_group.concurrent(io, Task.timeoutTask, .{
             io,
             std.Io.Timeout{ .duration = .{
                 .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
                 .clock = .awake,
             } },
+            &state,
+            stream.?,
         });
+        defer timeout_group.cancel(io);
 
-        const first = try select.await();
-        switch (first) {
-            .read => |read_result| {
-                select.cancelDiscard();
-                return try read_result;
-            },
-            .timeout => |timeout_result| {
-                try timeout_result;
-                if (stream) |active_stream| active_stream.shutdown(io, .both) catch {};
-                while (select.cancel()) |result| switch (result) {
-                    .read => |read_result| {
-                        if (read_result) |body| {
-                            self.alloc.free(body);
-                        } else |_| {}
-                    },
-                    .timeout => |cancel_timeout| cancel_timeout catch {},
-                };
-                return error.Timeout;
-            },
+        const read_result = body_reader.allocRemaining(self.alloc, .limited(self.cfg.max_request_bytes));
+        if (state.cmpxchgStrong(.pending, .read_complete, .acq_rel, .acquire) != null) {
+            if (read_result) |body| self.alloc.free(body) else |_| {}
+            return error.Timeout;
         }
+        return try read_result;
     }
 
     fn mapMethod(method: std.http.Method) ?common.Method {
@@ -1251,6 +1240,63 @@ test "std http listener saturated connection slots queue instead of resetting" {
     try std.testing.expect(slow_completed);
     try std.testing.expect(!slow_req.failed.load(.acquire));
     try std.testing.expectEqual(@as(u16, 200), slow_req.status.load(.acquire));
+}
+
+test "std http listener responds before header timeout without async capacity" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const App = struct {
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "text/plain; charset=utf-8"),
+                .body = try alloc.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    var app = App{};
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    defer executor.deinit();
+    const request_executor = executor.executor();
+
+    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+        .serve_in_connection_threads = true,
+        .header_read_timeout_ms = 1_000,
+        .body_read_timeout_ms = 1_000,
+    }, app.executor());
+    defer listener.deinit();
+    listener.io_impl.setAsyncLimit(.nothing);
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    for (0..32) |_| {
+        var response = try request_executor.execute(std.testing.allocator, .{
+            .method = .GET,
+            .uri = base_uri,
+            .timeout_ms = 250,
+        });
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+
+        var body_response = try request_executor.execute(std.testing.allocator, .{
+            .method = .POST,
+            .uri = base_uri,
+            .body = "ping",
+            .timeout_ms = 250,
+        });
+        defer body_response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 200), body_response.status);
+    }
 }
 
 test "std http listener header timeout releases accepted idle connection slot" {
