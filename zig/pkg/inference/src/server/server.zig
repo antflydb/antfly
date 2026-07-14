@@ -217,7 +217,7 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
-const default_read_max_tokens: usize = 256;
+const default_read_queue_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 
@@ -1295,10 +1295,10 @@ pub const Node = struct {
         defer parsed_inputs.deinit();
         const required_units = if (parsed_inputs.images.items.len > 0) blk: {
             if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
-            const max_tokens = parsed_inputs.max_tokens orelse default_read_max_tokens;
-            if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
-            parsed_inputs.max_tokens = max_tokens;
-            break :blk estimateReadQueueUnits(parsed_inputs.images.items.len, max_tokens);
+            if (parsed_inputs.max_tokens) |max_tokens| {
+                if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
+            }
+            break :blk estimateReadQueueUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens);
         } else 1;
         if (required_units > queue_units) {
             self.releaseSlotUnits(queue_units);
@@ -5250,7 +5250,7 @@ pub const Node = struct {
         else
             null;
         const queue_units = if (has_images)
-            estimateReadQueueUnits(images.len, max_tokens.?)
+            estimateReadQueueUnits(images.len, max_tokens)
         else
             1;
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
@@ -6729,10 +6729,10 @@ test "read batch downloaded byte accounting enforces aggregate cap" {
     try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
 }
 
-test "read max tokens applies default and rejects unsafe signed values" {
-    try std.testing.expectEqual(default_read_max_tokens, try validateReadMaxTokens(null));
-    try std.testing.expectEqual(@as(usize, 1), try validateReadMaxTokens(1));
-    try std.testing.expectEqual(max_read_tokens, try validateReadMaxTokens(@intCast(max_read_tokens)));
+test "read max tokens preserves omission and rejects unsafe signed values" {
+    try std.testing.expectEqual(@as(?usize, null), try validateReadMaxTokens(null));
+    try std.testing.expectEqual(@as(?usize, 1), try validateReadMaxTokens(1));
+    try std.testing.expectEqual(@as(?usize, max_read_tokens), try validateReadMaxTokens(@intCast(max_read_tokens)));
     try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(-1));
     try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(0));
     try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(@intCast(max_read_tokens + 1)));
@@ -6740,9 +6740,9 @@ test "read max tokens applies default and rejects unsafe signed values" {
 }
 
 test "read queue units scale with image batch and decode length" {
-    try std.testing.expectEqual(@as(usize, 1), estimateReadQueueUnits(1, default_read_max_tokens));
-    try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, default_read_max_tokens));
-    try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_max_tokens + 1));
+    try std.testing.expectEqual(@as(usize, 1), estimateReadQueueUnits(1, null));
+    try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, null));
+    try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_queue_max_tokens + 1));
     try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
 }
 
@@ -8736,14 +8736,15 @@ fn readBatchMaxBytes() usize {
     return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_BYTES") orelse default_max_read_batch_bytes);
 }
 
-fn validateReadMaxTokens(value: ?i64) !usize {
-    const requested = value orelse default_read_max_tokens;
+fn validateReadMaxTokens(value: ?i64) !?usize {
+    const requested = value orelse return null;
     if (requested < 1 or requested > @as(i64, @intCast(max_read_tokens))) return error.InvalidMaxTokens;
     return @intCast(requested);
 }
 
-fn estimateReadQueueUnits(image_count: usize, max_tokens: usize) usize {
-    const token_units = 1 + ((@max(max_tokens, 1) - 1) / default_read_max_tokens);
+fn estimateReadQueueUnits(image_count: usize, max_tokens: ?usize) usize {
+    const estimated_max_tokens = max_tokens orelse default_read_queue_max_tokens;
+    const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / default_read_queue_max_tokens);
     return std.math.mul(usize, @max(image_count, 1), token_units) catch std.math.maxInt(usize);
 }
 

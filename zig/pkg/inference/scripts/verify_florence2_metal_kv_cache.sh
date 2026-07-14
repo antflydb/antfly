@@ -108,7 +108,14 @@ if [[ -z "$model_dir" || ! -d "$model_dir" ]]; then
   echo "missing Florence-2 model directory; set ANTFLY_FLORENCE2_MODEL_DIR" >&2
   exit 1
 fi
-if [[ -z "$(find "$model_dir" -maxdepth 1 -type f -name '*.gguf' -print -quit 2>/dev/null)" ]]; then
+has_gguf=0
+for gguf_file in "$model_dir"/*.gguf; do
+  if [[ -f "$gguf_file" ]]; then
+    has_gguf=1
+    break
+  fi
+done
+if (( ! has_gguf )); then
   echo "missing Florence-2 GGUF weights in $model_dir" >&2
   exit 1
 fi
