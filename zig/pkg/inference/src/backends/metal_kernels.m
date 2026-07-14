@@ -4153,37 +4153,26 @@ static NSString *termite_metal_shader_source(void) {
            "    if (p.kind == 1u) value = round(value); else if (p.kind == 2u) value = value != 0.0f ? 1.0f : 0.0f;\n"
            "    output[gid] = value;\n"
            "}\n"
-           "kernel void termite_sdpa_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.batch * p.num_heads * p.seq_len * p.head_dim; if (gid >= total || p.seq_len == 0u || p.head_dim == 0u) return;\n"
-           "    uint d = gid % p.head_dim; uint tmp = gid / p.head_dim; uint h; uint qi; uint b;\n"
-           "    if (p.layout == 1u) { h = tmp % p.num_heads; tmp /= p.num_heads; qi = tmp % p.seq_len; b = tmp / p.seq_len; }\n"
-           "    else { qi = tmp % p.seq_len; uint bh0 = tmp / p.seq_len; b = bh0 / p.num_heads; h = bh0 - b * p.num_heads; }\n"
-           "    uint hidden = p.num_heads * p.head_dim; uint bh = b * p.num_heads + h;\n"
-           "    uint q_base = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * p.head_dim : (bh * p.seq_len + qi) * p.head_dim;\n"
-           "    float scale = rsqrt(float(p.head_dim)); float best = -3.402823466e+38f;\n"
+           "kernel void termite_sdpa_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    const uint NT = 256u; const float neg_inf = -3.402823466e+38f; uint row = tg.x; uint qi = row % p.seq_len; uint tmp = row / p.seq_len; uint h = tmp % p.num_heads; uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
+           "    uint hidden = p.num_heads * p.head_dim; uint bh = b * p.num_heads + h; uint q_base = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * p.head_dim : (bh * p.seq_len + qi) * p.head_dim; float scale = rsqrt(float(p.head_dim)); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.seq_len; float best = neg_inf;\n"
            "    for (uint ki = 0u; ki < p.seq_len; ++ki) {\n"
-           "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
-           "        uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
-           "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
-           "        score *= scale;\n"
-           "        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        best = max(best, score);\n"
+           "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float dot = 0.0f;\n"
+           "        if (allowed) for (uint d = uint(tid); d < p.head_dim; d += NT) dot += q[q_base + d] * k[k_base + d];\n"
+           "        partials[tid] = dot; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "        float score = allowed ? partials[0] * scale : neg_inf;\n"
+           "        if (allowed && p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];\n"
+           "        else if (allowed && p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki];\n"
+           "        else if (allowed && p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki];\n"
+           "        if (tid == 0u) scores[ki] = score; best = max(best, score); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
-           "    float sum = 0.0f; float accum = 0.0f;\n"
-           "    for (uint ki = 0u; ki < p.seq_len; ++ki) {\n"
-           "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
-           "        uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
-           "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
-           "        score *= scale;\n"
-           "        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim;\n"
-           "        float w = exp(score - best); sum += w; accum += w * v[v_base + d];\n"
-           "    }\n"
-           "    output[gid] = sum > 0.0f ? accum / sum : 0.0f;\n"
+           "    float local_sum = 0.0f;\n"
+           "    for (uint ki = uint(tid); ki < p.seq_len; ki += NT) { float score = scores[ki]; float weight = score > neg_inf ? exp(score - best) : 0.0f; scores[ki] = weight; local_sum += weight; }\n"
+           "    partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f; for (uint ki = uint(tid); ki < p.seq_len; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint d = uint(tid); d < p.head_dim; d += NT) { float value = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; value += scores[ki] * v[v_base + d]; } output[q_base + d] = value; }\n"
            "}\n"
            "kernel void termite_florence_window_pack_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_florence_window_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.window_count * p.window_area * p.dim; if (gid >= total || p.dim == 0u || p.window_size == 0u) return;\n"
@@ -25451,6 +25440,9 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             if (bias_offset + bias_heads * seq_len * seq_len * sizeof(float) > bias_buffer.length) return -12;
         }
         if (has_mask != 0u && mask_offset + batch * seq_len * sizeof(float) > mask_buffer.length) return -13;
+        const NSUInteger thread_width = 256u;
+        const NSUInteger scratch_bytes = termite_metal_threadgroup_memory_16((seq_len + thread_width) * sizeof(float));
+        if (runtime->sdpa_f32_pipeline.maxTotalThreadsPerThreadgroup < thread_width || scratch_bytes > runtime->device.maxThreadgroupMemoryLength) return -18;
         termite_metal_sdpa_f32_params params = {
             .batch = (uint32_t)batch,
             .seq_len = (uint32_t)seq_len,
@@ -25490,8 +25482,9 @@ int termite_metal_decode_runtime_sdpa_f32_device(
         [encoder setBuffer:mask_buffer offset:mask_offset atIndex:4];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:5];
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_pipeline, total), 1, 1)];
+        [encoder setThreadgroupMemoryLength:scratch_bytes atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * seq_len, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
     }

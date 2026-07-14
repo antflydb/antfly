@@ -5239,7 +5239,7 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
             .bias_a = getData(bias),
             .output_a = output,
         })) {
-            return self.makeBuf(output, true);
+            return makeLinearNoBiasResult(self, output, rows, out_dim);
         }
         if (getData(weight).len == 0) {
             std.log.err(
@@ -6057,6 +6057,39 @@ fn whereSelectConsumeFalseOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: C
     return on_false;
 }
 
+/// Repack token-major [batch*seq, num_heads*head_dim] into head-major
+/// [batch*num_heads, seq, head_dim].
+fn packTokenMajorHeads(allocator: std.mem.Allocator, src: []const f32, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) ![]f32 {
+    const hidden = num_heads * head_dim;
+    const out = try allocator.alloc(f32, batch * seq_len * hidden);
+    for (0..batch) |b| {
+        for (0..seq_len) |s| {
+            const src_row = (b * seq_len + s) * hidden;
+            for (0..num_heads) |h| {
+                const dst = ((b * num_heads + h) * seq_len + s) * head_dim;
+                @memcpy(out[dst..][0..head_dim], src[src_row + h * head_dim ..][0..head_dim]);
+            }
+        }
+    }
+    return out;
+}
+
+/// Inverse of packTokenMajorHeads.
+fn unpackHeadMajorTokens(allocator: std.mem.Allocator, src: []const f32, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) ![]f32 {
+    const hidden = num_heads * head_dim;
+    const out = try allocator.alloc(f32, batch * seq_len * hidden);
+    for (0..batch) |b| {
+        for (0..seq_len) |s| {
+            const dst_row = (b * seq_len + s) * hidden;
+            for (0..num_heads) |h| {
+                const src_off = ((b * num_heads + h) * seq_len + s) * head_dim;
+                @memcpy(out[dst_row + h * head_dim ..][0..head_dim], src[src_off..][0..head_dim]);
+            }
+        }
+    }
+    return out;
+}
+
 fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const Q = getData(q_ct);
@@ -6106,6 +6139,38 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     const bh = effective_batch * num_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
+    // Mirror the Metal runtime's layout contract (decoderRuntimeSdpaF32Device):
+    // a stored 2D shape of [batch*seq, num_heads*head_dim] means Q/K/V come
+    // token-major straight from the QKV linears. The kernels below index
+    // head-major [batch*heads, seq, head_dim], so pack token-major inputs and
+    // unpack the output; 3D/4D (or absent) shapes are already head-major.
+    const hidden_dim = num_heads * head_dim;
+    const expected_len = effective_batch * effective_seq_len * hidden_dim;
+    const token_shape = [_]i64{ @intCast(effective_batch * effective_seq_len), @intCast(hidden_dim) };
+    const q_token_major = if (tensorStoredShape(q_ct)) |shape| std.mem.eql(i64, shape, &token_shape) else false;
+    const k_token_major = if (tensorStoredShape(k_ct)) |shape| std.mem.eql(i64, shape, &token_shape) else false;
+    const v_token_major = if (tensorStoredShape(v_ct)) |shape| std.mem.eql(i64, shape, &token_shape) else false;
+    if (num_heads > 1 and (q_token_major != k_token_major or q_token_major != v_token_major)) {
+        return error.InvalidInputShape;
+    }
+    const token_major = num_heads > 1 and Q.len == expected_len and K.len == expected_len and V.len == expected_len and q_token_major;
+    var q_data: []const f32 = Q;
+    var k_data: []const f32 = K;
+    var v_data: []const f32 = V;
+    var packed_qkv: ?[3][]f32 = null;
+    defer if (packed_qkv) |bufs| for (bufs) |packed_buf| self.allocator.free(packed_buf);
+    if (token_major) {
+        const q_packed = try packTokenMajorHeads(self.allocator, Q, effective_batch, effective_seq_len, num_heads, head_dim);
+        errdefer self.allocator.free(q_packed);
+        const k_packed = try packTokenMajorHeads(self.allocator, K, effective_batch, effective_seq_len, num_heads, head_dim);
+        errdefer self.allocator.free(k_packed);
+        const v_packed = try packTokenMajorHeads(self.allocator, V, effective_batch, effective_seq_len, num_heads, head_dim);
+        packed_qkv = .{ q_packed, k_packed, v_packed };
+        q_data = q_packed;
+        k_data = k_packed;
+        v_data = v_packed;
+    }
+
     // Flash path: tile Q/K/V and run streaming softmax instead of materializing
     // the [seq, seq] score matrix.  Benchmarked to win at every shape tested
     // (1.13x at seq=32, 1.4x at seq=1500), so we apply it broadly.  Bench at
@@ -6121,9 +6186,9 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     if (flash_eligible) {
         const flash_output = try linalg.flashAttentionHost(
             self.allocator,
-            Q,
-            K,
-            V,
+            q_data,
+            k_data,
+            v_data,
             bias,
             mask,
             effective_batch,
@@ -6133,6 +6198,17 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
         );
         var raw_flash_output: ?[]f32 = flash_output;
         errdefer if (raw_flash_output) |raw| self.allocator.free(raw);
+        if (token_major) {
+            const unpacked = try unpackHeadMajorTokens(self.allocator, flash_output, effective_batch, effective_seq_len, num_heads, head_dim);
+            self.allocator.free(flash_output);
+            raw_flash_output = null;
+            var raw_unpacked: ?[]f32 = unpacked;
+            errdefer if (raw_unpacked) |raw| self.allocator.free(raw);
+            const result = try self.makeBuf(unpacked, true);
+            raw_unpacked = null;
+            errdefer freeTensor(self, result);
+            return self.withLogicalShape(result, &token_shape);
+        }
         const result = try self.makeBuf(flash_output, true);
         raw_flash_output = null;
         errdefer freeTensor(self, result);
@@ -6166,9 +6242,9 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
         const b = bh_idx / num_heads;
         const h = bh_idx % num_heads;
         for (0..effective_seq_len) |qi| {
-            const q_ptr = Q[(bh_idx * effective_seq_len + qi) * head_dim ..].ptr;
+            const q_ptr = q_data[(bh_idx * effective_seq_len + qi) * head_dim ..].ptr;
             for (0..effective_seq_len) |ki| {
-                const k_ptr = K[(bh_idx * effective_seq_len + ki) * head_dim ..].ptr;
+                const k_ptr = k_data[(bh_idx * effective_seq_len + ki) * head_dim ..].ptr;
                 scores[qi * effective_seq_len + ki] = linalg.dot(q_ptr[0..head_dim], k_ptr[0..head_dim]) * scale;
             }
         }
@@ -6207,10 +6283,22 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
             for (0..effective_seq_len) |vi| {
                 const w = scores[qi * effective_seq_len + vi];
                 if (w == 0.0) continue;
-                const v_ptr = V[(bh_idx * effective_seq_len + vi) * head_dim ..].ptr;
+                const v_ptr = v_data[(bh_idx * effective_seq_len + vi) * head_dim ..].ptr;
                 linalg.axpy(w, v_ptr[0..head_dim], out_ptr[0..head_dim]);
             }
         }
+    }
+
+    if (token_major) {
+        const unpacked = try unpackHeadMajorTokens(self.allocator, output, effective_batch, effective_seq_len, num_heads, head_dim);
+        self.allocator.free(output);
+        raw_output = null;
+        var raw_unpacked: ?[]f32 = unpacked;
+        errdefer if (raw_unpacked) |raw| self.allocator.free(raw);
+        const result = try self.makeBuf(unpacked, true);
+        raw_unpacked = null;
+        errdefer freeTensor(self, result);
+        return self.withLogicalShape(result, &token_shape);
     }
 
     const result = try self.makeBuf(output, true);
@@ -6360,10 +6448,10 @@ fn linearNoBiasPairOp(
     const weight_buf_b = toBuf(weight_b);
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
-            const first_output = try self.allocator.alloc(f32, rows * out_dim);
-            errdefer self.allocator.free(first_output);
-            const second_output = try self.allocator.alloc(f32, rows * out_dim);
-            errdefer self.allocator.free(second_output);
+            var first_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
+            errdefer if (first_output) |output| self.allocator.free(output);
+            var second_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
+            errdefer if (second_output) |output| self.allocator.free(output);
             if (try dispatchQuantizedLinear(.{
                 .compute = self,
                 .kind = .pair_no_bias,
@@ -6375,16 +6463,20 @@ fn linearNoBiasPairOp(
                 .storage_b = storage_b,
                 .name_a = weight_buf_a.name,
                 .name_b = weight_buf_b.name,
-                .output_a = first_output,
-                .output_b = second_output,
+                .output_a = first_output.?,
+                .output_b = second_output.?,
             })) {
-                return .{
-                    .first = try self.makeBuf(first_output, true),
-                    .second = try self.makeBuf(second_output, true),
-                };
+                const first = try makeLinearNoBiasResult(self, first_output.?, rows, out_dim);
+                first_output = null;
+                errdefer freeTensor(ctx, first);
+                const second = try makeLinearNoBiasResult(self, second_output.?, rows, out_dim);
+                second_output = null;
+                return .{ .first = first, .second = second };
             }
-            self.allocator.free(first_output);
-            self.allocator.free(second_output);
+            self.allocator.free(first_output.?);
+            first_output = null;
+            self.allocator.free(second_output.?);
+            second_output = null;
         }
     }
 
@@ -6637,10 +6729,10 @@ fn linearPairOp(
             });
 
             if (used_quant_pair) {
-                const first = try self.makeBuf(first_raw.?, true);
+                const first = try makeLinearNoBiasResult(self, first_raw.?, rows, out_dim);
                 first_raw = null;
                 errdefer freeTensor(ctx, first);
-                const second = try self.makeBuf(second_raw.?, true);
+                const second = try makeLinearNoBiasResult(self, second_raw.?, rows, out_dim);
                 second_raw = null;
                 return .{ .first = first, .second = second };
             }
@@ -6711,13 +6803,13 @@ fn linearTripleOp(
                 });
 
                 if (used_quant_triple) {
-                    const first = try self.makeBuf(first_raw.?, true);
+                    const first = try makeLinearNoBiasResult(self, first_raw.?, rows, out_dim);
                     first_raw = null;
                     errdefer freeTensor(ctx, first);
-                    const second = try self.makeBuf(second_raw.?, true);
+                    const second = try makeLinearNoBiasResult(self, second_raw.?, rows, out_dim);
                     second_raw = null;
                     errdefer freeTensor(ctx, second);
-                    const third = try self.makeBuf(third_raw.?, true);
+                    const third = try makeLinearNoBiasResult(self, third_raw.?, rows, out_dim);
                     third_raw = null;
                     return .{ .first = first, .second = second, .third = third };
                 }
@@ -34528,11 +34620,24 @@ fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
 
 fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    if (groups == 0 or in_channels % groups != 0 or out_channels % groups != 0) return error.InvalidInputShape;
+    if (batch == 0 or in_channels == 0 or out_channels == 0 or height == 0 or width == 0 or kernel_h == 0 or kernel_w == 0 or stride_h == 0 or stride_w == 0 or groups == 0 or in_channels % groups != 0 or out_channels % groups != 0) return error.InvalidInputShape;
 
-    const out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
-    const out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
-    const output_elems = try std.math.mul(usize, batch * out_channels, out_h * out_w);
+    const padded_h = std.math.add(usize, height, std.math.mul(usize, padding_h, 2) catch return error.InvalidInputShape) catch return error.InvalidInputShape;
+    const padded_w = std.math.add(usize, width, std.math.mul(usize, padding_w, 2) catch return error.InvalidInputShape) catch return error.InvalidInputShape;
+    if (kernel_h > padded_h or kernel_w > padded_w) return error.InvalidInputShape;
+
+    const input_data = getData(input);
+    const weight_data = getData(weight);
+    const bias_data = getData(bias);
+    const input_elems = std.math.mul(usize, std.math.mul(usize, batch, in_channels) catch return error.InvalidInputShape, std.math.mul(usize, height, width) catch return error.InvalidInputShape) catch return error.InvalidInputShape;
+    const kernel_elems = std.math.mul(usize, kernel_h, kernel_w) catch return error.InvalidInputShape;
+    const weight_elems = std.math.mul(usize, std.math.mul(usize, out_channels, in_channels / groups) catch return error.InvalidInputShape, kernel_elems) catch return error.InvalidInputShape;
+    if (input_data.len != input_elems or weight_data.len != weight_elems or bias_data.len != out_channels) return error.InvalidInputShape;
+
+    const out_h = (padded_h - kernel_h) / stride_h + 1;
+    const out_w = (padded_w - kernel_w) / stride_w + 1;
+    const output_area = std.math.mul(usize, out_h, out_w) catch return error.InvalidInputShape;
+    const output_elems = std.math.mul(usize, std.math.mul(usize, batch, out_channels) catch return error.InvalidInputShape, output_area) catch return error.InvalidInputShape;
     const conv_temp_limit_elems: usize = 64 * 1024 * 1024;
     if (output_elems > conv_temp_limit_elems) {
         std.log.warn("conv2d refusing oversized output batch={d} in_channels={d} out_channels={d} height={d} width={d} kernel={d}x{d} stride={d}x{d} padding={d}x{d} groups={d} out={d}x{d} output_elems={d}", .{
@@ -34557,12 +34662,9 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     const output = try self.allocator.alloc(f32, output_elems);
     errdefer self.allocator.free(output);
 
-    const input_data = getData(input);
-    const weight_data = getData(weight);
-    const bias_data = getData(bias);
     if (groups == 1) {
-        const rows = out_h * out_w;
-        const k_dim = in_channels * kernel_h * kernel_w;
+        const rows = output_area;
+        const k_dim = std.math.mul(usize, in_channels, kernel_elems) catch return error.InvalidInputShape;
         const cols_elems = try std.math.mul(usize, rows, k_dim);
         if (cols_elems > conv_temp_limit_elems) {
             std.log.warn("conv2d refusing oversized im2col rows={d} k_dim={d} cols_elems={d} batch={d} in_channels={d} out_channels={d} height={d} width={d} kernel={d}x{d} stride={d}x{d} padding={d}x{d}", .{
@@ -34634,7 +34736,7 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     }
 
     if (groups == in_channels and groups == out_channels) {
-        const kernel_size = kernel_h * kernel_w;
+        const kernel_size = kernel_elems;
         for (0..batch) |b| {
             for (0..out_channels) |c| {
                 const weight_channel = weight_data[c * kernel_size ..][0..kernel_size];
@@ -34670,8 +34772,8 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
 
     const in_per_group = in_channels / groups;
     const out_per_group = out_channels / groups;
-    const rows = out_h * out_w;
-    const k_dim = in_per_group * kernel_h * kernel_w;
+    const rows = output_area;
+    const k_dim = std.math.mul(usize, in_per_group, kernel_elems) catch return error.InvalidInputShape;
     const cols_elems = try std.math.mul(usize, rows, k_dim);
     if (cols_elems > conv_temp_limit_elems) {
         std.log.warn("conv2d refusing oversized grouped im2col rows={d} k_dim={d} cols_elems={d} batch={d} in_channels={d} out_channels={d} height={d} width={d} kernel={d}x{d} stride={d}x{d} padding={d}x{d} groups={d}", .{
@@ -39427,6 +39529,97 @@ test "ComputeBackend linearTriple matches three biased linears" {
     try std.testing.expectEqualSlices(f32, getData(separate_a), getData(triple.first));
     try std.testing.expectEqualSlices(f32, getData(separate_b), getData(triple.second));
     try std.testing.expectEqualSlices(f32, getData(separate_c), getData(triple.third));
+}
+
+test "quantized linearTriple propagates token-major shape into sdpa" {
+    const allocator = std.testing.allocator;
+    const batch: usize = 1;
+    const seq_len: usize = 3;
+    const rows = batch * seq_len;
+    const num_heads: usize = 2;
+    const head_dim: usize = 2;
+    const hidden = num_heads * head_dim;
+    const in_dim: usize = 256;
+    const tensor_type: gguf_tensor_types.TensorType = .{ .known = .Q4_K };
+    const weight_shape = [_]i64{ hidden, in_dim };
+
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer deinitPrefetchQueue(&weight_store);
+    const cb = compute.computeBackend();
+
+    const input_data = try allocator.alloc(f32, rows * in_dim);
+    fillNativeQuantDispatchValues(input_data, 3, 0.01);
+    const input = try compute.makeBuf(input_data, true);
+    defer cb.free(input);
+
+    const weight_a_data = try allocator.alloc(f32, hidden * in_dim);
+    defer allocator.free(weight_a_data);
+    const weight_b_data = try allocator.alloc(f32, hidden * in_dim);
+    defer allocator.free(weight_b_data);
+    const weight_c_data = try allocator.alloc(f32, hidden * in_dim);
+    defer allocator.free(weight_c_data);
+    fillNativeQuantDispatchValues(weight_a_data, 7, 0.008);
+    fillNativeQuantDispatchValues(weight_b_data, 11, 0.007);
+    fillNativeQuantDispatchValues(weight_c_data, 13, 0.006);
+
+    var storage_a = QuantizedStorage{
+        .tensor_type = tensor_type,
+        .raw_bytes = try quant_codec.quantizeQ4_KFromF32(allocator, weight_a_data),
+        .shape = try allocator.dupe(i64, &weight_shape),
+        .raw_owned = true,
+        .allocator = allocator,
+    };
+    defer storage_a.deinit();
+    var storage_b = QuantizedStorage{
+        .tensor_type = tensor_type,
+        .raw_bytes = try quant_codec.quantizeQ4_KFromF32(allocator, weight_b_data),
+        .shape = try allocator.dupe(i64, &weight_shape),
+        .raw_owned = true,
+        .allocator = allocator,
+    };
+    defer storage_b.deinit();
+    var storage_c = QuantizedStorage{
+        .tensor_type = tensor_type,
+        .raw_bytes = try quant_codec.quantizeQ4_KFromF32(allocator, weight_c_data),
+        .shape = try allocator.dupe(i64, &weight_shape),
+        .raw_owned = true,
+        .allocator = allocator,
+    };
+    defer storage_c.deinit();
+    try prepareNativeQuantizedStorage(&storage_a);
+    try prepareNativeQuantizedStorage(&storage_b);
+    try prepareNativeQuantizedStorage(&storage_c);
+
+    const weight_a = try compute.makeBufWithEntry(empty_f32[0..], false, "q_proj.weight", null, &storage_a, null);
+    defer cb.free(weight_a);
+    const weight_b = try compute.makeBufWithEntry(empty_f32[0..], false, "k_proj.weight", null, &storage_b, null);
+    defer cb.free(weight_b);
+    const weight_c = try compute.makeBufWithEntry(empty_f32[0..], false, "v_proj.weight", null, &storage_c, null);
+    defer cb.free(weight_c);
+
+    var bias_data = [_]f32{0.0} ** hidden;
+    const bias_a = try compute.makeBuf(&bias_data, false);
+    defer cb.free(bias_a);
+    const bias_b = try compute.makeBuf(&bias_data, false);
+    defer cb.free(bias_b);
+    const bias_c = try compute.makeBuf(&bias_data, false);
+    defer cb.free(bias_c);
+
+    const triple = try cb.linearTriple(input, weight_a, bias_a, weight_b, bias_b, weight_c, bias_c, rows, in_dim, hidden);
+    defer cb.free(triple.first);
+    defer cb.free(triple.second);
+    defer cb.free(triple.third);
+    const token_shape = [_]i64{ rows, hidden };
+    try std.testing.expectEqualSlices(i64, &token_shape, tensorStoredShape(triple.first).?);
+    try std.testing.expectEqualSlices(i64, &token_shape, tensorStoredShape(triple.second).?);
+    try std.testing.expectEqualSlices(i64, &token_shape, tensorStoredShape(triple.third).?);
+
+    const mask = [_]i64{1} ** seq_len;
+    const attended = try cb.scaledDotProductAttention(triple.first, triple.second, triple.third, &mask, null, batch, seq_len, num_heads, head_dim);
+    defer cb.free(attended);
+    try std.testing.expectEqualSlices(i64, &token_shape, tensorStoredShape(attended).?);
+    for (getData(attended)) |value| try std.testing.expect(std.math.isFinite(value));
 }
 
 test "ComputeBackend linearPair matches two biased linears" {
@@ -46140,6 +46333,94 @@ fn referenceCrossSeqMajorAttention(
     return ref;
 }
 
+test "packTokenMajorHeads reorders per-token head slices" {
+    const allocator = std.testing.allocator;
+    // 1 batch, 2 tokens, 2 heads, head_dim 2: token-major rows are
+    // [t0h0a, t0h0b, t0h1a, t0h1b], [t1h0a, ...].
+    const tok = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const packed_hm = try packTokenMajorHeads(allocator, &tok, 1, 2, 2, 2);
+    defer allocator.free(packed_hm);
+    // head-major: h0 rows for both tokens first, then h1 rows.
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 5, 6, 3, 4, 7, 8 }, packed_hm);
+    const roundtrip = try unpackHeadMajorTokens(allocator, packed_hm, 1, 2, 2, 2);
+    defer allocator.free(roundtrip);
+    try std.testing.expectEqualSlices(f32, &tok, roundtrip);
+}
+
+test "sdpa token-major 2d layout matches head-major reference" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+
+    // seq 40 exercises the flash path, seq 8 the legacy materialized path.
+    for ([_]usize{ 40, 8 }) |seq_len| {
+        const batch: usize = 1;
+        const num_heads: usize = 3;
+        const head_dim: usize = 4;
+        const hidden = num_heads * head_dim;
+        const total = batch * seq_len * hidden;
+
+        const q_tok = try allocator.alloc(f32, total);
+        defer allocator.free(q_tok);
+        const k_tok = try allocator.alloc(f32, total);
+        defer allocator.free(k_tok);
+        const v_tok = try allocator.alloc(f32, total);
+        defer allocator.free(v_tok);
+        for (0..total) |i| {
+            q_tok[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 23)) - 11)) * 0.07;
+            k_tok[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 19)) - 9)) * 0.09;
+            v_tok[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 17)) - 8)) * 0.11;
+        }
+        const mask = try allocator.alloc(i64, batch * seq_len);
+        defer allocator.free(mask);
+        @memset(mask, 1);
+
+        const token_shape = [_]i64{ @intCast(batch * seq_len), @intCast(hidden) };
+        const q_ct = try compute.withLogicalShape(try compute.makeBuf(q_tok, false), &token_shape);
+        defer freeTensor(&compute, q_ct);
+        const k_ct = try compute.withLogicalShape(try compute.makeBuf(k_tok, false), &token_shape);
+        defer freeTensor(&compute, k_ct);
+        const v_ct = try compute.withLogicalShape(try compute.makeBuf(v_tok, false), &token_shape);
+        defer freeTensor(&compute, v_ct);
+
+        const out_ct = try cb.scaledDotProductAttention(q_ct, k_ct, v_ct, mask, null, batch, seq_len, num_heads, head_dim);
+        defer freeTensor(&compute, out_ct);
+
+        const q_hm = try packTokenMajorHeads(allocator, q_tok, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(q_hm);
+        const k_hm = try packTokenMajorHeads(allocator, k_tok, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(k_hm);
+        const v_hm = try packTokenMajorHeads(allocator, v_tok, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(v_hm);
+        const ref_hm = try referenceBidirectionalHeadMajorAttention(allocator, q_hm, k_hm, v_hm, null, mask, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(ref_hm);
+        const ref_tok = try unpackHeadMajorTokens(allocator, ref_hm, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(ref_tok);
+
+        try expectApproxEqSlice(ref_tok, getData(out_ct), 1e-4);
+    }
+}
+
+test "sdpa rejects mixed token-major and head-major layouts" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    var data = [_]f32{0} ** 8;
+    const q_ct = try compute.withLogicalShape(try compute.makeBuf(&data, false), &.{ 2, 4 });
+    defer freeTensor(&compute, q_ct);
+    const k_ct = try compute.withLogicalShape(try compute.makeBuf(&data, false), &.{ 1, 2, 2, 2 });
+    defer freeTensor(&compute, k_ct);
+    const v_ct = try compute.withLogicalShape(try compute.makeBuf(&data, false), &.{ 2, 4 });
+    defer freeTensor(&compute, v_ct);
+
+    try std.testing.expectError(
+        error.InvalidInputShape,
+        sdpaOp(&compute, q_ct, k_ct, v_ct, &.{ 1, 1 }, null, 1, 2, 2, 2),
+    );
+}
+
 test "ComputeBackend scaledDotProductAttention call site exercises flash layout" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -46761,6 +47042,30 @@ test "native conv ops preserve runtime logical shape" {
     const conv2_shape = try cb.tensorShape(conv2_out, allocator);
     defer allocator.free(conv2_shape);
     try std.testing.expectEqualSlices(i64, &.{ 2, 1, 2, 2 }, conv2_shape);
+}
+
+test "native rejects mismatched shaped buffers before conv2d" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const cb = compute.computeBackend();
+
+    try std.testing.expectError(error.InvalidShape, cb.fromFloat32Shape(&.{1}, &.{2}));
+
+    var input_data = [_]f32{1};
+    var weight_data = [_]f32{1};
+    var bias_data = [_]f32{0};
+    const input = try compute.makeBuf(&input_data, false);
+    defer cb.free(input);
+    const weight = try compute.makeBuf(&weight_data, false);
+    defer cb.free(weight);
+    const bias = try compute.makeBuf(&bias_data, false);
+    defer cb.free(bias);
+
+    try std.testing.expectError(
+        error.InvalidInputShape,
+        cb.conv2d(input, weight, bias, 1, 1, 1, 2, 2, 1, 1, 1, 1, 0, 0, 1),
+    );
 }
 
 test "argmax reduces axis with keepdims" {

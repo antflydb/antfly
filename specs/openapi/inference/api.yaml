@@ -1983,6 +1983,8 @@ components:
           description: |
             Maximum tokens for the read stage when `images` are provided.
             Ignored for text-only extraction requests.
+          minimum: 1
+          maximum: 1024
           default: 256
         schema:
           type: object
@@ -2123,6 +2125,8 @@ components:
         max_tokens:
           type: integer
           description: Maximum tokens to generate
+          minimum: 1
+          maximum: 1024
           default: 256
           example: 256
     TextRegion:
