@@ -178,6 +178,17 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      # ARC exposes the node CPU count instead of the pod quota. Bound both
+      # zig build's process fan-out and std.Io.Threaded pool sizing to the same
+      # budget used by zig-full so teardown remains reliable under contention.
+      - name: Compute CPU bound for unit tests
+        if: needs.changes.outputs.zig_tests == 'true'
+        id: cpus
+        run: |
+          jobs=$(nproc)
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         env:
@@ -283,7 +294,7 @@ jobs:
 
           (
             set +e
-            make zig-unit-test 2>&1 | tee -a "$unit_log"
+            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test 2>&1 | tee -a "$unit_log"
             exit "${PIPESTATUS[0]}"
           ) &
           unit_pid="$!"
