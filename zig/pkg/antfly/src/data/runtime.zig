@@ -87,6 +87,33 @@ fn indexRepairSchedulerRetryDelayMs(identity: u64, failure_count: u32) u64 {
     return nominal - nominal / 10 + jitter;
 }
 
+fn indexRepairSchedulerBackoffBlocks(
+    dirty: bool,
+    scheduler_not_before_ms: u64,
+    fallback_not_before_ms: u64,
+    now_ms: u64,
+) bool {
+    // Allocation and queue-snapshot failures affect the executor itself and
+    // block every class of work. Fallback discovery is independent: an exact
+    // durable-intent wake must bypass its metadata-route backoff.
+    if (scheduler_not_before_ms != 0 and now_ms < scheduler_not_before_ms) return true;
+    return !dirty and fallback_not_before_ms != 0 and now_ms < fallback_not_before_ms;
+}
+
+fn indexRepairFallbackDue(
+    last_fallback_at_ms: u64,
+    discovery_interval_ms: u64,
+    fallback_not_before_ms: u64,
+    now_ms: u64,
+) bool {
+    if (fallback_not_before_ms != 0 and now_ms < fallback_not_before_ms) return false;
+    return now_ms -| last_fallback_at_ms >= discovery_interval_ms;
+}
+
+fn indexRepairFallbackFailureBlocksPass(exact_candidate_count: usize) bool {
+    return exact_candidate_count == 0;
+}
+
 const IndexRepairFallbackWindow = struct {
     start: usize = 0,
     count: usize = 0,
@@ -146,6 +173,16 @@ test "index repair scan periodically rediscovers debt after a lost wake" {
     try std.testing.expect(!indexRepairScanDue(false, 100, 20_000, 30_000));
     try std.testing.expect(indexRepairScanDue(false, 100, 30_100, 30_000));
     try std.testing.expect(indexRepairScanDue(true, 100, 5_100, 30_000));
+}
+
+test "index repair fallback backoff never blocks an exact durable wake" {
+    try std.testing.expect(indexRepairSchedulerBackoffBlocks(false, 0, 10_000, 5_000));
+    try std.testing.expect(!indexRepairSchedulerBackoffBlocks(true, 0, 10_000, 5_000));
+    try std.testing.expect(indexRepairSchedulerBackoffBlocks(true, 10_000, 0, 5_000));
+    try std.testing.expect(!indexRepairFallbackDue(0, 1_000, 10_000, 5_000));
+    try std.testing.expect(indexRepairFallbackDue(0, 1_000, 10_000, 10_000));
+    try std.testing.expect(indexRepairFallbackFailureBlocksPass(0));
+    try std.testing.expect(!indexRepairFallbackFailureBlocksPass(1));
 }
 
 test "index repair lost-wakeup fallback stays bounded at large group counts" {
@@ -2703,6 +2740,8 @@ pub const DataServer = struct {
     provisioned_index_repair_not_before_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_scheduler_failure_count: std.atomic.Value(u32) = .init(0),
     provisioned_index_repair_scheduler_not_before_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_fallback_failure_count: std.atomic.Value(u32) = .init(0),
+    provisioned_index_repair_fallback_not_before_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_last_groups_inspected: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_last_duration_ns: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_fallback_groups_scanned: std.atomic.Value(u64) = .init(0),
@@ -6787,6 +6826,17 @@ pub const DataServer = struct {
         self.provisioned_index_repair_scheduler_not_before_ms.store(0, .release);
     }
 
+    fn recordProvisionedIndexRepairFallbackFailure(self: *DataServer, now_ms: u64) void {
+        const failure_count = self.provisioned_index_repair_fallback_failure_count.fetchAdd(1, .acq_rel) +| 1;
+        const retry_at_ms = now_ms +| indexRepairSchedulerRetryDelayMs(0x46414c4c4241434b, failure_count);
+        self.provisioned_index_repair_fallback_not_before_ms.store(retry_at_ms, .release);
+    }
+
+    fn clearProvisionedIndexRepairFallbackFailure(self: *DataServer) void {
+        self.provisioned_index_repair_fallback_failure_count.store(0, .release);
+        self.provisioned_index_repair_fallback_not_before_ms.store(0, .release);
+    }
+
     fn enqueueProvisionedIndexRepair(self: *DataServer, group_id: u64) !void {
         try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0);
     }
@@ -7358,16 +7408,28 @@ pub const DataServer = struct {
         // Reconciliation uses a compact node-local routing index. Refreshing
         // that index may clone metadata once per epoch, but steady-state repair
         // passes never clone or free the cluster-wide administrative snapshot.
-        const fallback_due = now_ms -| self.provisioned_index_repair_last_fallback_at_ms.load(.monotonic) >=
-            self.provisioned_index_repair_discovery_interval_ms;
+        var fallback_due = indexRepairFallbackDue(
+            self.provisioned_index_repair_last_fallback_at_ms.load(.monotonic),
+            self.provisioned_index_repair_discovery_interval_ms,
+            self.provisioned_index_repair_fallback_not_before_ms.load(.acquire),
+            now_ms,
+        );
         if (fallback_due) {
             self.refreshProvisionedIndexRepairRoutes() catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
+                self.recordProvisionedIndexRepairFallbackFailure(now_ms);
                 std.log.warn("provisioned index repair route refresh failed err={s}", .{@errorName(err)});
-                return;
+                fallback_due = false;
+                // Exact durable-intent notifications already carry their
+                // table/group route and do not depend on the fallback index.
+                // Preserve their single admitted slot even while metadata
+                // discovery is unhealthy.
+                if (indexRepairFallbackFailureBlocksPass(schedule_candidates.items.len)) return;
             };
-            self.provisioned_index_repair_last_fallback_at_ms.store(now_ms, .monotonic);
+            if (fallback_due) {
+                self.clearProvisionedIndexRepairFallbackFailure();
+                self.provisioned_index_repair_last_fallback_at_ms.store(now_ms, .monotonic);
+            }
         }
         const routes = self.provisioned_index_repair_routes.routes.items;
         if (fallback_due and routes.len == 0) {
@@ -7809,7 +7871,8 @@ pub const DataServer = struct {
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         const scheduler_not_before_ms = self.provisioned_index_repair_scheduler_not_before_ms.load(.acquire);
-        if (scheduler_not_before_ms != 0 and now_ms < scheduler_not_before_ms) return;
+        const fallback_not_before_ms = self.provisioned_index_repair_fallback_not_before_ms.load(.acquire);
+        if (indexRepairSchedulerBackoffBlocks(dirty, scheduler_not_before_ms, fallback_not_before_ms, now_ms)) return;
         const not_before_ms = self.provisioned_index_repair_not_before_ms.load(.monotonic);
         if (dirty and not_before_ms != 0 and now_ms < not_before_ms) return;
         const last_run_at_ms = self.provisioned_index_repair_last_run_at_ms.load(.monotonic);

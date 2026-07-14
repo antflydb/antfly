@@ -1193,11 +1193,15 @@ deadline in the durable intent. Failures outside that state machine, such as a
 DB-open, routing, or allocation failure, use deterministic jittered exponential
 backoff from 30 seconds through 10 minutes in the node-local monotonic clock.
 Group-specific failures park only that group and preserve any later durable
-deadline already observed; node-wide scheduler failures park the maintenance
-owner without rewriting every queue entry. A successful pass clears node-wide
+deadline already observed. Executor-wide allocation and queue-snapshot failures
+park the maintenance owner without rewriting every queue entry. Fallback-route
+refresh has a separate deadline: its failure suppresses only lost-wakeup
+discovery and never blocks an exact durable-intent notification that already
+carries its table/group route. A successful pass clears the corresponding
 failure state, and an explicit durable wake clears stale per-group scheduler
-backoff. Consequently an unhealthy group cannot turn the five-second executor
-poll into a hot retry loop or delay unrelated runnable groups.
+backoff. Consequently an unhealthy group or metadata fallback cannot turn the
+five-second executor poll into a hot retry loop or delay unrelated runnable
+groups.
 
 Lost-wakeup reconciliation uses a compact node-local routing index rebuilt only
 when the metadata epoch changes. Steady-state passes neither clone nor free the

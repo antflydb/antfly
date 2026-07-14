@@ -3372,6 +3372,8 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh worker backs off retryable metadata failures",
         "data runtime data changes mark provisioned startup catch-up dirty",
         "data runtime repair debt hook targets the affected group queue",
+        "data runtime repair failures preserve durable backoff and increase retry delay",
+        "index repair fallback backoff never blocks an exact durable wake",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
@@ -4904,9 +4906,13 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_filesystem_capacity_tests = b.addRunArtifact(filesystem_capacity_tests);
+    // Keep the filesystem probe in the default resource-budget lane instead of
+    // adding another concurrently runnable unit-test process. The default unit
+    // graph is intentionally broad, and an extra process here can turn short
+    // listener/storage timing tests into load-dependent failures.
+    run_resource_budget_tests.step.dependOn(&run_filesystem_capacity_tests.step);
     const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
     resource_budget_test_step.dependOn(&run_resource_budget_tests.step);
-    resource_budget_test_step.dependOn(&run_filesystem_capacity_tests.step);
 
     const dense_index_lifecycle_regression_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4951,6 +4957,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "data runtime repair debt hook targets the affected group queue",
             "data runtime repair failures preserve durable backoff and increase retry delay",
+            "index repair fallback backoff never blocks an exact durable wake",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
