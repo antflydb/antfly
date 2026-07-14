@@ -60,5 +60,6 @@ test "filesystem capacity probe reports the test volume" {
     const observation = try probe.observe();
     try std.testing.expect(observation.capacity_bytes.? > 0);
     try std.testing.expect(observation.available_bytes.? <= observation.capacity_bytes.?);
-    try std.testing.expect(!observation.stale(platform.time.monotonicNs()));
+    try std.testing.expect(observation.observed_at_ns > 0);
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), observation.valid_for_ns);
 }

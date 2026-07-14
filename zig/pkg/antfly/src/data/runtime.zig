@@ -53,6 +53,8 @@ const provisioned_index_repair_fallback_min_groups_per_scan: usize = 16;
 const provisioned_index_repair_fallback_max_groups_per_scan: usize = 256;
 const provisioned_index_repair_fallback_rotation_target_ms: u64 = 30 * std.time.ms_per_min;
 const provisioned_index_repair_queued_groups_per_scan: usize = 32;
+const provisioned_index_repair_retry_min_ms: u64 = 30 * std.time.ms_per_s;
+const provisioned_index_repair_retry_max_ms: u64 = 10 * std.time.ms_per_min;
 
 /// Durable repair intents use realtime deadlines so they survive restart.
 /// The in-memory scheduler uses monotonic time so wall-clock adjustments cannot
@@ -65,6 +67,24 @@ fn indexRepairMonotonicDeadlineMs(
 ) u64 {
     if (realtime_deadline_ms == 0 or realtime_deadline_ms <= realtime_now_ms) return 0;
     return monotonic_now_ms +| (realtime_deadline_ms - realtime_now_ms);
+}
+
+/// Node-local failures that happen outside the durable DB state machine still
+/// need bounded retry. Durable intent deadlines remain authoritative when they
+/// exist; this delay prevents open/routing/allocation failures from turning the
+/// five-second maintenance poll into a hot retry loop.
+fn indexRepairSchedulerRetryDelayMs(identity: u64, failure_count: u32) u64 {
+    const exponent: u6 = @intCast(@min(failure_count -| 1, 20));
+    const nominal = @min(
+        provisioned_index_repair_retry_max_ms,
+        provisioned_index_repair_retry_min_ms *| (@as(u64, 1) << exponent),
+    );
+    const spread = @max(@as(u64, 1), nominal / 5);
+    var seed: [16]u8 = undefined;
+    std.mem.writeInt(u64, seed[0..8], identity, .little);
+    std.mem.writeInt(u64, seed[8..16], failure_count, .little);
+    const jitter = std.hash.Wyhash.hash(0x4944585254525942, &seed) % spread;
+    return nominal - nominal / 10 + jitter;
 }
 
 const IndexRepairFallbackWindow = struct {
@@ -206,6 +226,7 @@ test "index repair queue retains debt while leadership is temporarily unknown" {
 const IndexRepairQueueEntry = struct {
     first_seen_ms: u64,
     next_retry_at_ms: u64 = 0,
+    transient_failure_count: u32 = 0,
     table_name: ?[]u8 = null,
     previous_group_id: ?u64 = null,
     next_group_id: ?u64 = null,
@@ -2680,6 +2701,8 @@ pub const DataServer = struct {
     provisioned_index_repair_queue_depth: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_oldest_age_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_not_before_ms: std.atomic.Value(u64) = .init(0),
+    provisioned_index_repair_scheduler_failure_count: std.atomic.Value(u32) = .init(0),
+    provisioned_index_repair_scheduler_not_before_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_last_groups_inspected: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_last_duration_ns: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_fallback_groups_scanned: std.atomic.Value(u64) = .init(0),
@@ -6704,9 +6727,64 @@ pub const DataServer = struct {
             gop.value_ptr.table_name = owned_table_name;
             owned_table_name = null;
         }
+        gop.value_ptr.transient_failure_count = 0;
         gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
         self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
         self.provisioned_index_repair_dirty.store(true, .release);
+    }
+
+    fn deferProvisionedIndexRepairAfterFailureForTable(
+        self: *DataServer,
+        table_name: []const u8,
+        group_id: u64,
+    ) !u64 {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        var owned_table_name: ?[]u8 = try self.alloc.dupe(u8, table_name);
+        defer if (owned_table_name) |name| self.alloc.free(name);
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const gop = try self.provisioned_index_repair_group_ages.getOrPut(self.alloc, group_id);
+        if (!gop.found_existing) {
+            const previous = self.provisioned_index_repair_queue_tail;
+            gop.value_ptr.* = .{
+                .first_seen_ms = now_ms,
+                .previous_group_id = previous,
+                .table_name = owned_table_name,
+            };
+            owned_table_name = null;
+            if (previous) |tail| {
+                self.provisioned_index_repair_group_ages.getPtr(tail).?.next_group_id = group_id;
+            } else {
+                self.provisioned_index_repair_queue_head = group_id;
+            }
+            self.provisioned_index_repair_queue_tail = group_id;
+            if (self.provisioned_index_repair_queue_cursor == null) {
+                self.provisioned_index_repair_queue_cursor = group_id;
+            }
+        } else if (gop.value_ptr.table_name == null) {
+            gop.value_ptr.table_name = owned_table_name;
+            owned_table_name = null;
+        }
+        const entry = gop.value_ptr;
+        entry.transient_failure_count +|= 1;
+        const retry_at_ms = now_ms +| indexRepairSchedulerRetryDelayMs(group_id, entry.transient_failure_count);
+        // Preserve a later durable deadline if one was already observed.
+        entry.next_retry_at_ms = @max(entry.next_retry_at_ms, retry_at_ms);
+        self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+        self.provisioned_index_repair_dirty.store(true, .release);
+        return entry.next_retry_at_ms;
+    }
+
+    fn recordProvisionedIndexRepairSchedulerFailure(self: *DataServer, now_ms: u64) void {
+        const failure_count = self.provisioned_index_repair_scheduler_failure_count.fetchAdd(1, .acq_rel) +| 1;
+        const retry_at_ms = now_ms +| indexRepairSchedulerRetryDelayMs(0, failure_count);
+        self.provisioned_index_repair_scheduler_not_before_ms.store(retry_at_ms, .release);
+        self.provisioned_index_repair_dirty.store(true, .release);
+    }
+
+    fn clearProvisionedIndexRepairSchedulerFailure(self: *DataServer) void {
+        self.provisioned_index_repair_scheduler_failure_count.store(0, .release);
+        self.provisioned_index_repair_scheduler_not_before_ms.store(0, .release);
     }
 
     fn enqueueProvisionedIndexRepair(self: *DataServer, group_id: u64) !void {
@@ -7199,7 +7277,7 @@ pub const DataServer = struct {
                 self.alloc.dupe(u8, table_name) catch |err| {
                     self.provisioned_index_repair_queue_mutex.unlock();
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                    self.provisioned_index_repair_dirty.store(true, .release);
+                    self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     std.log.warn("provisioned index repair route snapshot failed err={s}", .{@errorName(err)});
                     return;
                 }
@@ -7213,7 +7291,7 @@ pub const DataServer = struct {
                 if (queued_table_name) |table_name| self.alloc.free(table_name);
                 self.provisioned_index_repair_queue_mutex.unlock();
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                self.provisioned_index_repair_dirty.store(true, .release);
+                self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                 std.log.warn("provisioned index repair queue snapshot failed err={s}", .{@errorName(err)});
                 return;
             };
@@ -7266,7 +7344,7 @@ pub const DataServer = struct {
                 .cursor_distance = 0,
             }) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                self.provisioned_index_repair_dirty.store(true, .release);
+                self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                 std.log.warn("provisioned index repair candidate allocation failed err={s}", .{@errorName(err)});
                 return;
             };
@@ -7285,7 +7363,7 @@ pub const DataServer = struct {
         if (fallback_due) {
             self.refreshProvisionedIndexRepairRoutes() catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                self.provisioned_index_repair_dirty.store(true, .release);
+                self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                 std.log.warn("provisioned index repair route refresh failed err={s}", .{@errorName(err)});
                 return;
             };
@@ -7341,7 +7419,7 @@ pub const DataServer = struct {
                     .cursor_distance = distance,
                 }) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                    self.provisioned_index_repair_dirty.store(true, .release);
+                    self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     std.log.warn("provisioned index repair fallback allocation failed err={s}", .{@errorName(err)});
                     return;
                 };
@@ -7392,8 +7470,18 @@ pub const DataServer = struct {
             }) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                 found_pending = true;
-                self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch {};
-                std.log.warn("provisioned index repair group pass failed group={} table={s} err={s}", .{ group_id, table_name, @errorName(err) });
+                const retry_at_ms = self.deferProvisionedIndexRepairAfterFailureForTable(table_name, group_id) catch |queue_err| {
+                    self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
+                    std.log.warn(
+                        "provisioned index repair failure backoff could not be queued group={} table={s} err={s}",
+                        .{ group_id, table_name, @errorName(queue_err) },
+                    );
+                    return;
+                };
+                std.log.warn(
+                    "provisioned index repair group pass failed group={} table={s} retry_at_monotonic_ms={} err={s}",
+                    .{ group_id, table_name, retry_at_ms, @errorName(err) },
+                );
                 continue;
             };
             found_pending = found_pending or result.index_repair_pending;
@@ -7434,6 +7522,7 @@ pub const DataServer = struct {
             }
         }
         self.provisioned_index_repair_last_groups_inspected.store(groups_inspected, .monotonic);
+        self.clearProvisionedIndexRepairSchedulerFailure();
 
         // An attempt consumes the single node admission slot, so rescan later
         // even when that group completed; another durable intent may exist in
@@ -7719,6 +7808,8 @@ pub const DataServer = struct {
         if (self.provisioned_index_repair_active.load(.acquire)) return;
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        const scheduler_not_before_ms = self.provisioned_index_repair_scheduler_not_before_ms.load(.acquire);
+        if (scheduler_not_before_ms != 0 and now_ms < scheduler_not_before_ms) return;
         const not_before_ms = self.provisioned_index_repair_not_before_ms.load(.monotonic);
         if (dirty and not_before_ms != 0 and now_ms < not_before_ms) return;
         const last_run_at_ms = self.provisioned_index_repair_last_run_at_ms.load(.monotonic);
@@ -16061,6 +16152,44 @@ test "data runtime translates durable repair retry deadlines to monotonic time" 
         std.math.maxInt(u64),
         indexRepairMonotonicDeadlineMs(std.math.maxInt(u64), 0, std.math.maxInt(u64) - 1),
     );
+}
+
+test "data runtime repair failures preserve durable backoff and increase retry delay" {
+    const first_delay = indexRepairSchedulerRetryDelayMs(7001, 1);
+    const second_delay = indexRepairSchedulerRetryDelayMs(7001, 2);
+    const capped_delay = indexRepairSchedulerRetryDelayMs(7001, 32);
+    try std.testing.expect(first_delay >= provisioned_index_repair_retry_min_ms * 9 / 10);
+    try std.testing.expect(first_delay < provisioned_index_repair_retry_min_ms * 11 / 10);
+    try std.testing.expect(second_delay > first_delay);
+    try std.testing.expect(capped_delay >= provisioned_index_repair_retry_max_ms * 9 / 10);
+    try std.testing.expect(capped_delay < provisioned_index_repair_retry_max_ms * 11 / 10);
+
+    const alloc = std.testing.allocator;
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.provisioned_index_repair_group_ages.deinit(alloc);
+
+    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    const entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
+    entry.next_retry_at_ms = std.math.maxInt(u64);
+    const retry_at_ms = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001);
+    try std.testing.expectEqual(std.math.maxInt(u64), retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 1), entry.transient_failure_count);
+
+    // An explicit/durable wake replaces node-local failure state rather than
+    // leaving a recovered group parked behind stale scheduler backoff.
+    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try std.testing.expectEqual(@as(u64, 0), entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 0), entry.transient_failure_count);
+    server.removeProvisionedIndexRepair(7001);
 }
 
 test "data runtime repair queue links and removes debt in constant time" {

@@ -1188,6 +1188,17 @@ intent therefore updates scheduling without an administrative snapshot. Metrics
 inspect at most the same bounded window; larger queues conservatively keep the
 executor runnable instead of performing a full scan.
 
+Retry has two scopes. Failures returned by the DB state machine persist their
+deadline in the durable intent. Failures outside that state machine, such as a
+DB-open, routing, or allocation failure, use deterministic jittered exponential
+backoff from 30 seconds through 10 minutes in the node-local monotonic clock.
+Group-specific failures park only that group and preserve any later durable
+deadline already observed; node-wide scheduler failures park the maintenance
+owner without rewriting every queue entry. A successful pass clears node-wide
+failure state, and an explicit durable wake clears stale per-group scheduler
+backoff. Consequently an unhealthy group cannot turn the five-second executor
+poll into a hot retry loop or delay unrelated runnable groups.
+
 Lost-wakeup reconciliation uses a compact node-local routing index rebuilt only
 when the metadata epoch changes. Steady-state passes neither clone nor free the
 cluster-wide administrative snapshot. The fallback window adapts between 16

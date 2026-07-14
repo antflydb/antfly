@@ -1719,6 +1719,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, data_runtime_test_mod, true, true);
 
+    const filesystem_capacity_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/filesystem_capacity_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, filesystem_capacity_test_mod, true, true);
+
     const data_storage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_storage_test_root.zig"),
         .target = target,
@@ -4888,8 +4895,18 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
+    const filesystem_capacity_tests = b.addTest(.{
+        .root_module = filesystem_capacity_test_mod,
+        .filters = &.{"filesystem capacity probe reports the test volume"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_filesystem_capacity_tests = b.addRunArtifact(filesystem_capacity_tests);
     const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
     resource_budget_test_step.dependOn(&run_resource_budget_tests.step);
+    resource_budget_test_step.dependOn(&run_filesystem_capacity_tests.step);
 
     const dense_index_lifecycle_regression_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4931,7 +4948,10 @@ pub fn build(b: *std.Build) void {
     const run_dense_index_repair_status_tests = b.addRunArtifact(dense_index_repair_status_tests);
     const dense_index_repair_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
-        .filters = &.{"data runtime repair debt hook targets the affected group queue"},
+        .filters = &.{
+            "data runtime repair debt hook targets the affected group queue",
+            "data runtime repair failures preserve durable backoff and increase retry delay",
+        },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
