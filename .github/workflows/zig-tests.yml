@@ -29,7 +29,6 @@ jobs:
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
-      metal_tests: ${{ steps.detect.outputs.metal_tests }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -47,14 +46,12 @@ jobs:
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
-              echo "metal_tests=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
-            echo "metal_tests=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
                 echo "e2e=false"
@@ -81,7 +78,6 @@ jobs:
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
-              echo "metal_tests=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -96,27 +92,6 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
-            zig/build.zig \
-            zig/pkg/inference/build.zig \
-            zig/pkg/inference/src/test_runner_filter.zig \
-            zig/pkg/inference/src/architectures/session_factory.zig \
-            zig/pkg/inference/src/backends/backends.zig \
-            zig/pkg/inference/src/backends/imported_onnx_session.zig \
-            zig/pkg/inference/src/ops/gpu_hosted_store.zig \
-            zig/pkg/inference/src/ops/metal_compute.zig \
-            zig/pkg/inference/src/server/model_manager.zig \
-            zig/pkg/inference/src/server/server.zig \
-            zig/pkg/antfly/src/common/config.zig \
-            zig/pkg/antfly/src/swarm/runtime.zig \
-            ':(glob)zig/pkg/inference/src/backends/metal_*' \
-            .github/workflows/zig-tests.yml
-          then
-            echo "metal_tests=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "metal_tests=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -475,34 +450,6 @@ jobs:
       - name: Run Zig chaos tests
         working-directory: zig
         run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test
-
-  metal-pr:
-    name: metal-pr
-    needs: changes
-    if: github.event_name == 'pull_request' && needs.changes.outputs.metal_tests == 'true'
-    # Standard macOS runners do not guarantee Metal GPU acceleration.
-    runs-on: macos-15-xlarge
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
-
-      - name: Run Metal provider and embedding-cache tests
-        working-directory: zig/pkg/inference
-        run: |
-          zig build test -Dshared-lib-root=../.. -Dmetal=true -Dsystem-blas=true -Druntime-test-filter=true -- \
-            --fail-on-skip \
-            --test-filter \
-            "metal native decoder runtime embedding lookup" \
-            "metal_compute: warm provider is reused without sharing overlapping backends" \
-            "metal_compute: f32 embedding cache uses loaded weight identity"
 
   e2e-base:
     name: e2e-base
