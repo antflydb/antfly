@@ -5015,6 +5015,8 @@ spec:
                             type: string
                           generationPath:
                             type: string
+                          manifestID:
+                            type: string
                           manifestSHA256:
                             type: string
                           nodeID:

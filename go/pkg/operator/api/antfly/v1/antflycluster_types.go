@@ -1868,6 +1868,7 @@ type HASeedActivationReceiptStatus struct {
 	Epoch              uint64 `json:"epoch,omitempty"`
 	BackupLSN          uint64 `json:"backupLSN,omitempty"`
 	CheckpointLSN      uint64 `json:"checkpointLSN,omitempty"`
+	ManifestID         string `json:"manifestID,omitempty"`
 	ManifestSHA256     string `json:"manifestSHA256,omitempty"`
 	AggregateSHA256    string `json:"aggregateSHA256,omitempty"`
 	SeedReceiptSHA256  string `json:"seedReceiptSHA256,omitempty"`

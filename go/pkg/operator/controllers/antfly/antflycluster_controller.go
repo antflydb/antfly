@@ -101,6 +101,19 @@ const (
 	defaultHADirectAdminReservation         = 30 * time.Second
 	defaultHADirectPrerequisiteTimeout      = 10 * time.Minute
 	haStartupGateReceiptHashAnnotation      = "antfly.io/ha-startup-receipt-hash"
+	haSeedRoleAnnotation                    = "antfly.io/ha-seed-role"
+	haTopologyIDAnnotation                  = "antfly.io/ha-topology-id"
+	haTopologyGenerationAnnotation          = "antfly.io/ha-topology-generation"
+	haNodeIDAnnotation                      = "antfly.io/ha-node-id"
+	haSlotNameAnnotation                    = "antfly.io/ha-slot-name"
+	haSeedGenerationAnnotation              = "antfly.io/ha-seed-generation"
+	haSeedManifestIDAnnotation              = "antfly.io/ha-seed-manifest-id"
+	haSeedManifestSHA256Annotation          = "antfly.io/ha-seed-manifest-sha256"
+	haSeedSourcePVCNameAnnotation           = "antfly.io/ha-seed-source-pvc-name"
+	haSeedSourcePVCUIDAnnotation            = "antfly.io/ha-seed-source-pvc-uid"
+	haSeedTargetPVCNameAnnotation           = "antfly.io/ha-seed-target-pvc-name"
+	haSeedTargetPVCUIDAnnotation            = "antfly.io/ha-seed-target-pvc-uid"
+	haSeedCheckpointLSNAnnotation           = "antfly.io/ha-seed-checkpoint-lsn"
 	haSeedGenerationVolumeName              = "ha-seed-generation"
 	haSeedLiveDataPath                      = "/antflydb/data"
 	haSeedActivationRelativeRoot            = ".antfly-ha/active"
@@ -373,6 +386,30 @@ func haStartupGateReceiptHash(cluster *antflyv1.AntflyCluster, pvc *corev1.Persi
 	}
 	sum := sha256.Sum256(raw)
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func haStandaloneRuntimeSeedIdentityAnnotations(cluster *antflyv1.AntflyCluster) map[string]string {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return nil
+	}
+	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
+	annotations := map[string]string{haSeedRoleAnnotation: "standby-runtime"}
+	setHASeedIdentityAnnotation(annotations, haTopologyIDAnnotation, receipt.TopologyID)
+	if receipt.TopologyGeneration > 0 {
+		annotations[haTopologyGenerationAnnotation] = strconv.FormatInt(receipt.TopologyGeneration, 10)
+	}
+	setHASeedIdentityAnnotation(annotations, haNodeIDAnnotation, receipt.NodeID)
+	setHASeedIdentityAnnotation(annotations, haSlotNameAnnotation, receipt.SlotName)
+	setHASeedIdentityAnnotation(annotations, haSeedGenerationAnnotation, receipt.Generation)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestIDAnnotation, receipt.ManifestID)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestSHA256Annotation, receipt.ManifestSHA256)
+	setHASeedIdentityAnnotation(annotations, haSeedTargetPVCNameAnnotation, receipt.TargetPVCName)
+	setHASeedIdentityAnnotation(annotations, haSeedTargetPVCUIDAnnotation, receipt.TargetPVCUID)
+	if receipt.CheckpointLSN > 0 {
+		annotations[haSeedCheckpointLSNAnnotation] = strconv.FormatUint(receipt.CheckpointLSN, 10)
+	}
+	return annotations
 }
 
 func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
@@ -3063,6 +3100,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			}
 			if hash := haStartupGateReceiptHash(cluster, startupPVC); hash != "" {
 				podAnnotations[haStartupGateReceiptHashAnnotation] = hash
+				maps.Copy(podAnnotations, haStandaloneRuntimeSeedIdentityAnnotations(cluster))
 			}
 		}
 		volumeMounts := []corev1.VolumeMount{
@@ -4446,6 +4484,7 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 			Epoch:              receipt.Epoch,
 			BackupLSN:          receipt.BackupLSN,
 			CheckpointLSN:      receipt.CheckpointLSN,
+			ManifestID:         receipt.ManifestID,
 			ManifestSHA256:     receipt.ManifestSHA256,
 			AggregateSHA256:    receipt.AggregateSHA256,
 			SeedReceiptSHA256:  receipt.SeedReceiptSHA256,
@@ -4914,6 +4953,12 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, clust
 		action.AdminJobPhase = haAdminJobPhasePending
 		return nil
 	}
+	// Portable source jobs discover the exact source PVC incarnation immediately
+	// before their first side effect. Freeze that identity into status before the
+	// deterministic Job hash is rendered so retries cannot silently retarget a
+	// replacement claim.
+	action.SourcePVCName = jobAction.SourcePVCName
+	action.SourcePVCUID = jobAction.SourcePVCUID
 	if haActionKind(jobAction.Kind) == haActionGCTargetSeedGenerations {
 		if err := r.ensureHASeededSlotActivationReceiptConfigMap(ctx, cluster, jobAction); err != nil {
 			return err
@@ -4942,6 +4987,11 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, clust
 	}
 	if err != nil {
 		return err
+	}
+	if haPlannedActionKindIsPortableArtifact(haActionKind(jobAction.Kind)) &&
+		(!haSeedIdentityAnnotationsEqual(existing.Annotations, job.Annotations) ||
+			!haSeedIdentityAnnotationsEqual(existing.Spec.Template.Annotations, job.Spec.Template.Annotations)) {
+		return fmt.Errorf("HA admin Job %s immutable seed identity annotations do not match the exact planned action", existing.Name)
 	}
 	action.AdminJobPhase = haAdminJobPhase(existing)
 	observedAttempts, firstAttemptAt, lastAttemptAt, err := r.observeHAAdminJobPodAttempts(ctx, existing)
@@ -5090,6 +5140,10 @@ func (r *AntflyClusterReconciler) haPortableArtifactJobAction(ctx context.Contex
 		}
 		action.TargetPVCUID = pvcUID
 	} else {
+		if (strings.TrimSpace(action.SourcePVCName) != "" && strings.TrimSpace(action.SourcePVCName) != key.Name) ||
+			(strings.TrimSpace(action.SourcePVCUID) != "" && strings.TrimSpace(action.SourcePVCUID) != pvcUID) {
+			return action, false, fmt.Errorf("HA %s source PVC identity is stale", action.Kind)
+		}
 		action.SourcePVCName = key.Name
 		action.SourcePVCUID = pvcUID
 	}
@@ -9947,6 +10001,151 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	}
 }
 
+var haSeedIdentityAnnotationKeys = [...]string{
+	haSeedRoleAnnotation,
+	haTopologyIDAnnotation,
+	haTopologyGenerationAnnotation,
+	haNodeIDAnnotation,
+	haSlotNameAnnotation,
+	haSeedGenerationAnnotation,
+	haSeedManifestIDAnnotation,
+	haSeedManifestSHA256Annotation,
+	haSeedSourcePVCNameAnnotation,
+	haSeedSourcePVCUIDAnnotation,
+	haSeedTargetPVCNameAnnotation,
+	haSeedTargetPVCUIDAnnotation,
+	haSeedCheckpointLSNAnnotation,
+}
+
+type haSeedIdentityEvidence struct {
+	manifestID     string
+	manifestSHA256 string
+	checkpointLSN  uint64
+}
+
+// haPortableSeedIdentityAnnotations freezes only evidence that is authoritative
+// before this Job is created. In particular, the Job's own eventual receipt is
+// never folded back into its identity after the immutable Pod template exists.
+func haPortableSeedIdentityAnnotations(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) map[string]string {
+	kind := haActionKind(action.Kind)
+	if !haPlannedActionKindIsPortableArtifact(kind) {
+		return nil
+	}
+	annotations := map[string]string{}
+	setHASeedIdentityAnnotation(annotations, haTopologyIDAnnotation, action.TopologyID)
+	if action.TopologyGeneration > 0 {
+		annotations[haTopologyGenerationAnnotation] = strconv.FormatInt(action.TopologyGeneration, 10)
+	}
+	setHASeedIdentityAnnotation(annotations, haNodeIDAnnotation, action.TopologyNodeID)
+	setHASeedIdentityAnnotation(annotations, haSlotNameAnnotation, action.SlotName)
+	setHASeedIdentityAnnotation(annotations, haSeedGenerationAnnotation, action.SeedArtifactGeneration)
+
+	evidence := haPortableSeedPrerequisiteEvidence(cluster, action)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestIDAnnotation, evidence.manifestID)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestSHA256Annotation, evidence.manifestSHA256)
+	if evidence.checkpointLSN > 0 {
+		annotations[haSeedCheckpointLSNAnnotation] = strconv.FormatUint(evidence.checkpointLSN, 10)
+	}
+
+	switch kind {
+	case haActionPublishSeedArtifact, haActionGCSourceSeedGenerations:
+		setHASeedIdentityAnnotation(annotations, haSeedSourcePVCNameAnnotation, action.SourcePVCName)
+		setHASeedIdentityAnnotation(annotations, haSeedSourcePVCUIDAnnotation, action.SourcePVCUID)
+	default:
+		setHASeedIdentityAnnotation(annotations, haSeedTargetPVCNameAnnotation, action.TargetPVCName)
+		setHASeedIdentityAnnotation(annotations, haSeedTargetPVCUIDAnnotation, action.TargetPVCUID)
+	}
+	if kind == haActionRestoreSeedArtifact {
+		annotations[haSeedRoleAnnotation] = "restore"
+	}
+	return annotations
+}
+
+func setHASeedIdentityAnnotation(annotations map[string]string, key, value string) {
+	if value = strings.TrimSpace(value); value != "" {
+		annotations[key] = value
+	}
+}
+
+func haPortableSeedPrerequisiteEvidence(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) haSeedIdentityEvidence {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return haSeedIdentityEvidence{}
+	}
+	for _, prerequisiteKind := range haPortableSeedEvidencePrerequisiteKinds(haActionKind(action.Kind)) {
+		for i := len(cluster.Status.HAStatus.PlannedActions) - 1; i >= 0; i-- {
+			candidate := cluster.Status.HAStatus.PlannedActions[i]
+			if haActionKind(candidate.Kind) != prerequisiteKind ||
+				!haSeedChainBindingMatchesAction(candidate, action) ||
+				!haAdminActionSucceededWithEvidence(candidate) {
+				continue
+			}
+			if receipt := candidate.SeedArtifactReceipt; receipt != nil {
+				return haSeedIdentityEvidence{
+					manifestID: strings.TrimSpace(receipt.ManifestID), manifestSHA256: strings.TrimSpace(receipt.ManifestSHA256),
+					checkpointLSN: receipt.CheckpointLSN,
+				}
+			}
+			if result := candidate.AdminResult; result != nil {
+				return haSeedIdentityEvidence{
+					manifestID: strings.TrimSpace(result.ManifestID), manifestSHA256: strings.TrimSpace(result.ManifestSHA256),
+					checkpointLSN: result.CheckpointLSN,
+				}
+			}
+		}
+	}
+	return haSeedIdentityEvidence{}
+}
+
+func haPortableSeedEvidencePrerequisiteKinds(kind haActionKind) []haActionKind {
+	switch kind {
+	case haActionPublishSeedArtifact:
+		return []haActionKind{haActionCaptureSeedArtifact, haActionFinishStandbySeed}
+	case haActionGCSourceSeedGenerations, haActionRestoreSeedArtifact:
+		return []haActionKind{haActionPublishSeedArtifact, haActionCaptureSeedArtifact, haActionFinishStandbySeed}
+	case haActionActivateSeedArtifact:
+		return []haActionKind{haActionRestoreSeedArtifact, haActionPublishSeedArtifact, haActionCaptureSeedArtifact, haActionFinishStandbySeed}
+	case haActionGCTargetSeedGenerations, haActionPruneSeedArtifacts:
+		return []haActionKind{
+			haActionActivateSeededSlot, haActionActivateSeedArtifact, haActionRestoreSeedArtifact,
+			haActionPublishSeedArtifact, haActionCaptureSeedArtifact, haActionFinishStandbySeed,
+		}
+	default:
+		return nil
+	}
+}
+
+func haSeedChainBindingMatchesAction(candidate, action antflyv1.HAPlannedActionStatus) bool {
+	if strings.TrimSpace(candidate.StandbyName) != strings.TrimSpace(action.StandbyName) ||
+		strings.TrimSpace(candidate.SlotName) != strings.TrimSpace(action.SlotName) ||
+		strings.TrimSpace(candidate.TopologyID) != strings.TrimSpace(action.TopologyID) ||
+		candidate.TopologyGeneration != action.TopologyGeneration ||
+		strings.TrimSpace(candidate.TopologyNodeID) != strings.TrimSpace(action.TopologyNodeID) ||
+		strings.TrimSpace(candidate.TargetPVCName) != strings.TrimSpace(action.TargetPVCName) ||
+		strings.TrimSpace(candidate.TargetPVCUID) != strings.TrimSpace(action.TargetPVCUID) {
+		return false
+	}
+	candidateGeneration := strings.TrimSpace(candidate.SeedArtifactGeneration)
+	if candidateGeneration != "" {
+		return candidateGeneration == strings.TrimSpace(action.SeedArtifactGeneration)
+	}
+	// Legacy caller-owned captures do not carry the portable generation on the
+	// FinishStandbySeed action. In that case the frozen manifest path is the only
+	// exact bridge into the portable publish chain; a slot name alone is not.
+	candidateManifestPath := strings.TrimSpace(candidate.SeedManifestPath)
+	return candidateManifestPath != "" && candidateManifestPath == strings.TrimSpace(action.SeedManifestPath)
+}
+
+func haSeedIdentityAnnotationsEqual(actual, desired map[string]string) bool {
+	for _, key := range haSeedIdentityAnnotationKeys {
+		actualValue, actualExists := actual[key]
+		desiredValue, desiredExists := desired[key]
+		if actualExists != desiredExists || actualValue != desiredValue {
+			return false
+		}
+	}
+	return true
+}
+
 func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
 	portableArtifactAction := haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind))
 	args := []string{"ha"}
@@ -9971,6 +10170,8 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 		"antfly.io/ha-admin-url":    action.AdminURL,
 		"antfly.io/ha-command-hash": haAdminActionHash(action),
 	}
+	seedIdentityAnnotations := haPortableSeedIdentityAnnotations(cluster, action)
+	maps.Copy(annotations, seedIdentityAnnotations)
 	if action.DependsOn != "" {
 		annotations["antfly.io/ha-action-depends-on"] = action.DependsOn
 	}
@@ -9994,7 +10195,7 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 			ActiveDeadlineSeconds: &deadlineSeconds,
 			BackoffLimit:          &backoffLimit,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: maps.Clone(seedIdentityAnnotations)},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: cluster.Spec.ServiceAccountName,
 					RestartPolicy:      corev1.RestartPolicyNever,
