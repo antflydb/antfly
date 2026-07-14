@@ -1082,10 +1082,7 @@ pub const TransientModelLease = struct {
 
     pub fn activate(self: *TransientModelLease) !void {
         if (self.state != .pending) return error.InvalidTransientModelLease;
-        self.manager.activateTransientModelLoadForRequest(self.request_id) catch |err| {
-            self.state = .released;
-            return err;
-        };
+        try self.manager.activateTransientModelLoadForRequest(self.request_id);
         self.state = .active;
     }
 
@@ -1569,8 +1566,6 @@ pub const ModelManager = struct {
             return error.InvalidTransientModelLease;
         }
         if (self.active_transient_models == std.math.maxInt(usize)) {
-            self.pending_transient_loads -= 1;
-            request.transient_leases -= 1;
             self.unlockState();
             return error.RequestUseOverflow;
         }
@@ -1590,8 +1585,6 @@ pub const ModelManager = struct {
                 );
                 evicted = self.removeCandidateLocked(selected, expired);
             } else {
-                self.pending_transient_loads -= 1;
-                request.transient_leases -= 1;
                 _ = self.load_capacity_rejections.fetchAdd(1, .monotonic);
                 self.unlockState();
                 return error.ModelCapacityReached;
@@ -2341,7 +2334,7 @@ test "model manager transient pending lease aborts cleanly" {
     try second.activate();
 }
 
-test "model manager transient activation keeps a newly protected cached model" {
+test "model manager failed transient activation holds capacity until cleanup" {
     var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
     defer manager.deinit();
     manager.configureModelLifetime(1, 0);
@@ -2360,13 +2353,25 @@ test "model manager transient activation keeps a newly protected cached model" {
     defer transient.deinit();
 
     const cached_request = try manager.beginRequest(2);
-    defer manager.endRequest(cached_request, 3);
     _ = (try manager.lookupAndTouch("cached", cached_request)).?;
 
     try std.testing.expectError(error.ModelCapacityReached, transient.activate());
-    try std.testing.expectEqual(@as(usize, 0), manager.pending_transient_loads);
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_transient_loads);
     try std.testing.expectEqual(@as(usize, 0), manager.active_transient_models);
     try std.testing.expectEqual(@as(usize, 1), manager.loadedModelCount());
+
+    manager.endRequest(cached_request, 3);
+    const competing_request = try manager.beginRequest(3);
+    defer manager.endRequest(competing_request, 4);
+    try std.testing.expectError(
+        error.ModelCapacityReached,
+        manager.beginTransientModelLoadForRequest(competing_request),
+    );
+
+    transient.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.pending_transient_loads);
+    var competing = try manager.beginTransientModelLoadForRequest(competing_request);
+    defer competing.deinit();
 }
 
 test "model manager transient activation evicts an idle cached model" {

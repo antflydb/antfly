@@ -2533,6 +2533,13 @@ pub const Node = struct {
             !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
             onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
         {
+            if (config.grammar != null) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
+                });
+            }
+
             var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
                 return modelLoadFailure(ctx, err);
             defer transient_lease.deinit();
@@ -2554,13 +2561,6 @@ pub const Node = struct {
             defer pipeline.deinit();
             transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
-
-            if (config.grammar != null) {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
-                });
-            }
 
             if (want_stream) {
                 return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
@@ -2614,6 +2614,13 @@ pub const Node = struct {
             const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
             defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
             if (ort_model_dir) |prepared_model_dir| {
+                if (config.grammar != null) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
+                    });
+                }
+
                 var transient_lease = self.model_manager.beginTransientModelLoadForRequest(request_id) catch |err|
                     return modelLoadFailure(ctx, err);
                 defer transient_lease.deinit();
@@ -2666,13 +2673,6 @@ pub const Node = struct {
                     .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
                     .prompt_override = if (prompt_override) |prompt| prompt else null,
                 };
-
-                if (config.grammar != null) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
-                    });
-                }
 
                 if (want_stream) {
                     return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
@@ -5044,7 +5044,6 @@ pub const Node = struct {
         decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         close_decoder = true;
-        transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
 
         // Parse decoder config
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
@@ -5077,6 +5076,7 @@ pub const Node = struct {
                 .max_length = dec_config.max_length,
             },
         };
+        transient_lease.activate() catch |err| return modelLoadFailure(ctx, err);
 
         const data = try ctx.allocator.alloc(api.RewriteObject, body.inputs.len);
         var filled: usize = 0;
@@ -5341,7 +5341,6 @@ pub const Node = struct {
             decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
             close_decoder = true;
-            transient_lease.?.activate() catch |err| return modelLoadFailure(ctx, err);
 
             const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
@@ -5418,6 +5417,7 @@ pub const Node = struct {
         if (!audio_mod.canDecodeWithOptions(decoded_audio.data, decode_options)) {
             return unsupportedAudioResponse(ctx, "unsupported audio input");
         }
+        if (transient_lease) |*lease| lease.activate() catch |err| return modelLoadFailure(ctx, err);
 
         var result = pipeline.transcribeWithOptions(decoded_audio.data, decode_options) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });

@@ -50,9 +50,12 @@ class InferenceConfig:
             eviction. For compatibility, some runtimes also eagerly load discovered
             models in this mode. Use `preload` when startup loading must be deterministic.
              Default: '5m'. Example: 5m.
-        max_loaded_models (int | Unset): Maximum total models loaded across all registry types (embedders, rerankers,
-            generators, chunkers, etc.). When the limit is reached, the least-recently-used
-            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+        max_loaded_models (int | Unset): Maximum steady-state number of resident logical model instances. Manager-cached
+            models and request-scoped specialized or composite pipelines share this budget.
+            A composite pipeline counts as one logical model even when it owns multiple backend
+            sessions. At capacity, one replacement may initialize while an idle cached model
+            remains available; successful activation evicts that model. If no idle model is
+            available, the request receives 503 Service Unavailable. Set to 0 for unlimited.
              Default: 10. Example: 3.
         pool_size (int | Unset): Number of reusable inference execution slots per model. Some runtimes realize
             each slot as a complete pipeline, increasing both possible concurrency and
@@ -87,12 +90,14 @@ class InferenceConfig:
             generation
             request so native/Metal weights, KV setup, and kernels use the same
             budgeted path as request-time generation. Other model kinds use the
-            best available warm path for that kind.
+            best available warm path for that kind. Specialized request-scoped pipelines
+            are capacity-bounded but may still initialize on their first request.
              Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal', 'format': 'gguf',
             'quantization': 'q4_k'}].
         max_memory_mb (int | Unset): Compatibility field for a future aggregate loaded-model memory limit. The Zig
-            runtime does not currently enforce this value; use max_loaded_models for a hard
-            residency bound. Set to 0 when unused (default).
+            runtime does not currently enforce this value; use max_loaded_models for the
+            logical-model admission and steady-state residency budget, not a byte limit. Set to
+            0 when unused (default).
              Default: 0. Example: 4096.
         model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides for runtimes
             that support them. Maps model

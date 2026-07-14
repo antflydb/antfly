@@ -11830,9 +11830,12 @@ export interface components {
              */
             keep_alive?: string;
             /**
-             * @description Maximum total models loaded across all registry types (embedders, rerankers,
-             *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
-             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             * @description Maximum steady-state number of resident logical model instances. Manager-cached
+             *     models and request-scoped specialized or composite pipelines share this budget.
+             *     A composite pipeline counts as one logical model even when it owns multiple backend
+             *     sessions. At capacity, one replacement may initialize while an idle cached model
+             *     remains available; successful activation evicts that model. If no idle model is
+             *     available, the request receives 503 Service Unavailable. Set to 0 for unlimited.
              * @default 10
              * @example 3
              */
@@ -11902,7 +11905,8 @@ export interface components {
              * @description Models to preload and warm at startup. Generators run a tiny generation
              *     request so native/Metal weights, KV setup, and kernels use the same
              *     budgeted path as request-time generation. Other model kinds use the
-             *     best available warm path for that kind.
+             *     best available warm path for that kind. Specialized request-scoped pipelines
+             *     are capacity-bounded but may still initialize on their first request.
              * @example [
              *       {
              *         "kind": "generator",
@@ -11917,8 +11921,9 @@ export interface components {
             /**
              * @deprecated
              * @description Compatibility field for a future aggregate loaded-model memory limit. The Zig
-             *     runtime does not currently enforce this value; use max_loaded_models for a hard
-             *     residency bound. Set to 0 when unused (default).
+             *     runtime does not currently enforce this value; use max_loaded_models for the
+             *     logical-model admission and steady-state residency budget, not a byte limit. Set to
+             *     0 when unused (default).
              * @default 0
              * @example 4096
              */

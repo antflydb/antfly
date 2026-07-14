@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
-	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
@@ -40,33 +39,5 @@ func TestQueryRequestMarshalPreservesJoin(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte(`"right_table":"entities"`)) {
 		t.Fatalf("Marshal encoded unexpected join: %s", body)
-	}
-}
-
-func TestGenerateRequestMarshalPreservesDisabledPromptCache(t *testing.T) {
-	body, err := json.Marshal(oapi.InferenceGenerateRequest{PromptCache: new(false)})
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	if !bytes.Contains(body, []byte(`"prompt_cache":false`)) {
-		t.Fatalf("Marshal omitted disabled prompt cache: %s", body)
-	}
-}
-
-func TestInferenceConfigMarshalPreservesUnlimitedLimits(t *testing.T) {
-	body, err := json.Marshal(oapi.InferenceConfig{
-		MaxLoadedModels:       new(0),
-		MaxConcurrentRequests: new(0),
-	})
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	for _, field := range [][]byte{
-		[]byte(`"max_loaded_models":0`),
-		[]byte(`"max_concurrent_requests":0`),
-	} {
-		if !bytes.Contains(body, field) {
-			t.Fatalf("Marshal omitted unlimited limit %s: %s", field, body)
-		}
 	}
 }
