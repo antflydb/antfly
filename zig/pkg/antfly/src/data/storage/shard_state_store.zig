@@ -90,6 +90,17 @@ pub fn replaceGroupSnapshot(
     byte_range: AppliedDataRange,
     entries: []const AppliedDataKV,
 ) !void {
+    try replaceGroupSnapshotWithMetadata(store, alloc, group_id, byte_range, entries, &.{});
+}
+
+pub fn replaceGroupSnapshotWithMetadata(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    entries: []const AppliedDataKV,
+    metadata_writes: []const docstore.KVPair,
+) !void {
     const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
     defer alloc.free(logical_prefix);
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
@@ -114,16 +125,29 @@ pub fn replaceGroupSnapshot(
         for (writes.items) |write| alloc.free(@constCast(write.key));
         writes.deinit(alloc);
     }
-    const range_key = try groupRangeKeyAlloc(alloc, group_id);
     var range_buf: [1024]u8 = undefined;
-    try writes.append(alloc, .{
-        .key = range_key,
-        .value = try range_state.encodeRange(byte_range, &range_buf),
-    });
-    for (entries) |entry| {
+    {
+        const range_key = try groupRangeKeyAlloc(alloc, group_id);
+        errdefer alloc.free(range_key);
         try writes.append(alloc, .{
-            .key = try groupDocumentStoreKeyAlloc(alloc, group_id, entry.key),
+            .key = range_key,
+            .value = try range_state.encodeRange(byte_range, &range_buf),
+        });
+    }
+    for (entries) |entry| {
+        const document_key = try groupDocumentStoreKeyAlloc(alloc, group_id, entry.key);
+        errdefer alloc.free(document_key);
+        try writes.append(alloc, .{
+            .key = document_key,
             .value = entry.value,
+        });
+    }
+    for (metadata_writes) |write| {
+        const metadata_key = try alloc.dupe(u8, write.key);
+        errdefer alloc.free(metadata_key);
+        try writes.append(alloc, .{
+            .key = metadata_key,
+            .value = write.value,
         });
     }
     try store.putBatch(writes.items, deletes);

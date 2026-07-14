@@ -4447,25 +4447,45 @@ pub const DataServer = struct {
 
     fn localBootstrapSplitDestination(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "bootstrap_split_destination")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.local_transition_mutex);
-        defer self.local_transition_mutex.unlock();
-        try self.replicateSplitBootstrap(
-            op.source_group_id,
-            op.destination_group_id,
-            op.destination_base_uri orelse return error.MissingDestinationRoute,
-        );
+        if (self.data_raft != null) {
+            lockAtomic(&self.local_transition_mutex);
+            defer self.local_transition_mutex.unlock();
+            try self.replicateSplitBootstrap(
+                op.source_group_id,
+                op.destination_group_id,
+                op.destination_base_uri orelse return error.MissingDestinationRoute,
+            );
+        } else if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .bootstrap_split_destination = op });
+        } else {
+            self.lockLocalTransition();
+            defer self.unlockLocalTransition();
+            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            defer runtime.deinit();
+            _ = try runtime.runtime().bootstrapDestination(op.source_group_id, op.destination_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn localCatchUpSplitDestination(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_split_destination")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.local_transition_mutex);
-        defer self.local_transition_mutex.unlock();
-        try self.replicateSplitCatchUp(
-            op.source_group_id,
-            op.destination_group_id,
-            op.destination_base_uri orelse return error.MissingDestinationRoute,
-        );
+        if (self.data_raft != null) {
+            lockAtomic(&self.local_transition_mutex);
+            defer self.local_transition_mutex.unlock();
+            try self.replicateSplitCatchUp(
+                op.source_group_id,
+                op.destination_group_id,
+                op.destination_base_uri orelse return error.MissingDestinationRoute,
+            );
+        } else if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .catch_up_split_destination = op });
+        } else {
+            self.lockLocalTransition();
+            defer self.unlockLocalTransition();
+            var runtime = try self.initLocalSplitRuntime(op.source_group_id, op.destination_group_id);
+            defer runtime.deinit();
+            _ = try runtime.runtime().catchUpDestination(op.source_group_id, op.destination_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
@@ -4911,6 +4931,10 @@ pub const DataServer = struct {
             antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
             return;
         }
+        // A live data-Raft store is already authoritative. Avoid reopening and
+        // rescanning its document DB, and never replace state underneath an
+        // apply that has established a durable watermark.
+        if ((try source_store.latestBatch(source_group_id)) != null) return;
 
         if (try self.tableNameForLocalGroupAlloc(source_group_id)) |table_name| {
             defer self.alloc.free(table_name);
@@ -4961,7 +4985,7 @@ pub const DataServer = struct {
                 .value = try self.alloc.dupe(u8, entry.value),
             });
         }
-        try source_store.replaceGroupSnapshot(self.alloc, source_group_id, byte_range, entries.items);
+        _ = try source_store.seedGroupSnapshotIfAbsent(self.alloc, source_group_id, byte_range, entries.items);
     }
 
     fn localAcceptMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {

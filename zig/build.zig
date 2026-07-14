@@ -3409,6 +3409,7 @@ pub fn build(b: *std.Build) void {
         "data raft apply store applies delete operations into group state",
         "data raft apply store orders independent groups through separate shards",
         "data raft apply store skips persisted split commands in overlapping replay",
+        "data raft apply store seeds pre-raft snapshots once at reserved index zero",
         "group state range scan is allocation-failure safe",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",

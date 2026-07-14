@@ -161,14 +161,52 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.groupState(&self.store, alloc, group_id);
     }
 
-    pub fn replaceGroupSnapshot(
+    /// Seeds a group that predates the data-Raft apply projection. Index zero is
+    /// reserved for this synthetic baseline so later real Raft entries retain
+    /// their original indexes. The per-group apply shard lock makes the
+    /// existence check atomic with normal apply. Snapshot data and its baseline
+    /// watermark are committed in one DocStore batch for crash-safe retry.
+    pub fn seedGroupSnapshotIfAbsent(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         group_id: u64,
         byte_range: AppliedDataRange,
         entries: []const AppliedDataKV,
-    ) !void {
-        try shard_state_store.replaceGroupSnapshot(&self.store, alloc, group_id, byte_range, entries);
+    ) !bool {
+        const encoded = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{
+            .term = 0,
+            .index = 0,
+            .entry_type = .normal,
+            .data = @constCast("snapshot_seed"),
+        }});
+        defer alloc.free(encoded);
+
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        if ((try self.ensureLoaded(shard, group_id)) != null) return false;
+        try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+
+        var key_buf: [128]u8 = undefined;
+        const key = try keyForGroup(&key_buf, group_id);
+        const value = try alloc.alloc(u8, @sizeOf(u64) + encoded.len);
+        defer alloc.free(value);
+        std.mem.writeInt(u64, value[0..8], 0, .little);
+        @memcpy(value[8..], encoded);
+        try shard_state_store.replaceGroupSnapshotWithMetadata(
+            &self.store,
+            alloc,
+            group_id,
+            byte_range,
+            entries,
+            &.{.{ .key = key, .value = value }},
+        );
+
+        var summary = try summarizeEntries(alloc, encoded);
+        summary.commit_index = 0;
+        shard.batches.putAssumeCapacity(group_id, summary);
+        return true;
     }
 
     pub fn currentRange(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
@@ -218,6 +256,16 @@ pub const RaftApplyStore = struct {
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
+        try self.writeBatchLocked(shard, group_id, commit_index, entries_bytes);
+    }
+
+    fn writeBatchLocked(
+        self: *RaftApplyStore,
+        shard: *BatchShard,
+        group_id: u64,
+        commit_index: u64,
+        entries_bytes: []const u8,
+    ) !void {
         const existing_batch = try self.ensureLoaded(shard, group_id);
         if (existing_batch) |existing| {
             if (commit_index < existing.commit_index) return error.OutOfOrderDataApplyBatch;
@@ -1090,6 +1138,60 @@ test "data raft apply store skips persisted split commands in overlapping replay
     try std.testing.expectEqual(shard_mod.SplitPhase.splitting, split_state.phase);
     try std.testing.expectEqual(@as(u64, 212), split_state.new_shard_id);
     try std.testing.expectEqualStrings("doc:m", split_state.split_key);
+}
+
+test "data raft apply store seeds pre-raft snapshots once at reserved index zero" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-seed", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    {
+        var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+        defer store.deinit();
+
+        try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+            std.testing.allocator,
+            311,
+            .{ .start = "doc:a", .end = "doc:z" },
+            &.{.{ .key = "doc:a", .value = "{\"v\":1}" }},
+        ));
+        const baseline = (try store.latestBatch(311)) orelse return error.MissingDataBatch;
+        try std.testing.expectEqual(@as(u64, 0), baseline.commit_index);
+        try std.testing.expectEqual(@as(u64, 0), baseline.last_entry_index);
+
+        try std.testing.expect(!try store.seedGroupSnapshotIfAbsent(
+            std.testing.allocator,
+            311,
+            .{ .start = "doc:m", .end = "" },
+            &.{.{ .key = "doc:replacement", .value = "{}" }},
+        ));
+    }
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const restored_baseline = (try store.latestBatch(311)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 0), restored_baseline.commit_index);
+    try std.testing.expectEqual(@as(u64, 0), restored_baseline.last_entry_index);
+
+    const real = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 1,
+        .entry_type = .normal,
+        .data = @constCast("put:doc:b={\"v\":2}"),
+    }});
+    defer std.testing.allocator.free(real);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 311,
+        .commit_index = 1,
+        .entries_bytes = real,
+    });
+
+    const state = try store.groupState(std.testing.allocator, 311);
+    defer shard_state_store.freeGroupStateEntries(std.testing.allocator, state);
+    try std.testing.expectEqual(@as(usize, 2), state.len);
+    try std.testing.expectEqualStrings("doc:a", state[0].key);
+    try std.testing.expectEqualStrings("doc:b", state[1].key);
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {

@@ -342,6 +342,24 @@ entry watermark and filters overlapping committed prefixes before producing
 effects, so a Raft applied watermark that temporarily lags another state
 machine cannot apply `prepare` twice while advancing to `start`.
 
+A source group created before data-Raft projection has no apply watermark yet.
+Its first split preparation seeds the source snapshot and a synthetic index-zero
+watermark in one DocStore batch under the per-group apply lock. Index zero is
+reserved for this baseline; real Raft indexes remain unchanged. Once any durable
+batch exists, the apply store is authoritative and split retries must never
+rescan the live document DB or replace projected state. A crash before the seed
+batch commits leaves no watermark and may retry safely; a crash after commit
+observes the watermark and reuses the existing state. This prevents repeated
+prepare attempts from opening a second writer or discarding concurrent apply
+history.
+
+Split execution dispatch follows ownership as well. A data-Raft server uses the
+replicated destination route. A server with an injected local transition runtime
+delegates to that runtime, and the non-Raft fallback creates a short-lived local
+coordinator under transition admission. Only the replicated path requires a
+destination URI; local execution must not fail merely because no remote route
+exists.
+
 Allocator ownership is part of the same lifetime contract. APIs that return
 owned storage/index buffers accept the allocator that must later free them, or
 carry their allocator in a typed owner. In particular, full-text stored-document
