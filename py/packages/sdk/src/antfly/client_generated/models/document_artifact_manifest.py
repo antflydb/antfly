@@ -43,6 +43,12 @@ class DocumentArtifactManifest:
             merge_operation_granularity (str): Granularity used when computing merge-plan operations.
             merge_operation_count (int): Number of merge operations recorded for this artifact.
             unsupported_reason (None | str | Unset): Reason extraction was skipped, when the source type is unsupported.
+            ocr_attempted_count (int | Unset): Number of pages for which OCR was attempted.
+            ocr_selected_count (int | Unset): Number of pages where OCR text was selected over embedded text.
+            ocr_retained_embedded_count (int | Unset): Number of attempted pages where embedded text remained preferable.
+            ocr_failed_count (int | Unset): Number of pages whose OCR rendering or recognition failed.
+            ocr_failed_page_numbers (list[int] | Unset): Up to 32 one-based page numbers with retryable OCR failures.
+            ocr_failed_pages_truncated (bool | Unset): Whether additional failed page numbers were omitted from the summary.
             last_error_code (None | str | Unset): Last extraction or materialization error code, when the current artifact
                 generation failed.
             last_error_message (None | str | Unset): Human-readable last extraction or materialization error summary, when
@@ -72,6 +78,12 @@ class DocumentArtifactManifest:
     merge_operation_granularity: str
     merge_operation_count: int
     unsupported_reason: None | str | Unset = UNSET
+    ocr_attempted_count: int | Unset = UNSET
+    ocr_selected_count: int | Unset = UNSET
+    ocr_retained_embedded_count: int | Unset = UNSET
+    ocr_failed_count: int | Unset = UNSET
+    ocr_failed_page_numbers: list[int] | Unset = UNSET
+    ocr_failed_pages_truncated: bool | Unset = UNSET
     last_error_code: None | str | Unset = UNSET
     last_error_message: None | str | Unset = UNSET
     manifest_json: str | Unset = UNSET
@@ -124,6 +136,20 @@ class DocumentArtifactManifest:
         else:
             unsupported_reason = self.unsupported_reason
 
+        ocr_attempted_count = self.ocr_attempted_count
+
+        ocr_selected_count = self.ocr_selected_count
+
+        ocr_retained_embedded_count = self.ocr_retained_embedded_count
+
+        ocr_failed_count = self.ocr_failed_count
+
+        ocr_failed_page_numbers: list[int] | Unset = UNSET
+        if not isinstance(self.ocr_failed_page_numbers, Unset):
+            ocr_failed_page_numbers = self.ocr_failed_page_numbers
+
+        ocr_failed_pages_truncated = self.ocr_failed_pages_truncated
+
         last_error_code: None | str | Unset
         if isinstance(self.last_error_code, Unset):
             last_error_code = UNSET
@@ -170,6 +196,18 @@ class DocumentArtifactManifest:
         )
         if unsupported_reason is not UNSET:
             field_dict["unsupported_reason"] = unsupported_reason
+        if ocr_attempted_count is not UNSET:
+            field_dict["ocr_attempted_count"] = ocr_attempted_count
+        if ocr_selected_count is not UNSET:
+            field_dict["ocr_selected_count"] = ocr_selected_count
+        if ocr_retained_embedded_count is not UNSET:
+            field_dict["ocr_retained_embedded_count"] = ocr_retained_embedded_count
+        if ocr_failed_count is not UNSET:
+            field_dict["ocr_failed_count"] = ocr_failed_count
+        if ocr_failed_page_numbers is not UNSET:
+            field_dict["ocr_failed_page_numbers"] = ocr_failed_page_numbers
+        if ocr_failed_pages_truncated is not UNSET:
+            field_dict["ocr_failed_pages_truncated"] = ocr_failed_pages_truncated
         if last_error_code is not UNSET:
             field_dict["last_error_code"] = last_error_code
         if last_error_message is not UNSET:
@@ -236,6 +274,18 @@ class DocumentArtifactManifest:
 
         unsupported_reason = _parse_unsupported_reason(d.pop("unsupported_reason", UNSET))
 
+        ocr_attempted_count = d.pop("ocr_attempted_count", UNSET)
+
+        ocr_selected_count = d.pop("ocr_selected_count", UNSET)
+
+        ocr_retained_embedded_count = d.pop("ocr_retained_embedded_count", UNSET)
+
+        ocr_failed_count = d.pop("ocr_failed_count", UNSET)
+
+        ocr_failed_page_numbers = cast(list[int], d.pop("ocr_failed_page_numbers", UNSET))
+
+        ocr_failed_pages_truncated = d.pop("ocr_failed_pages_truncated", UNSET)
+
         def _parse_last_error_code(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -285,6 +335,12 @@ class DocumentArtifactManifest:
             merge_operation_granularity=merge_operation_granularity,
             merge_operation_count=merge_operation_count,
             unsupported_reason=unsupported_reason,
+            ocr_attempted_count=ocr_attempted_count,
+            ocr_selected_count=ocr_selected_count,
+            ocr_retained_embedded_count=ocr_retained_embedded_count,
+            ocr_failed_count=ocr_failed_count,
+            ocr_failed_page_numbers=ocr_failed_page_numbers,
+            ocr_failed_pages_truncated=ocr_failed_pages_truncated,
             last_error_code=last_error_code,
             last_error_message=last_error_message,
             manifest_json=manifest_json,
