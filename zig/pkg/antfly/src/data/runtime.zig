@@ -1515,6 +1515,11 @@ pub const DataServerHAConfig = struct {
     /// Durable primary-local root for immutable runtime-owned seed generations.
     /// The admin API never accepts caller-selected source or destination paths.
     seed_capture_root: ?[]const u8 = null,
+    /// Durable activated-generation root used to expose standby activation
+    /// lifecycle receipts through the authenticated admin inventory.
+    seed_activation_root: ?[]const u8 = null,
+    /// Kubernetes pod identity attached to durable lifecycle evidence.
+    pod_uid: ?[]const u8 = null,
     /// Optional storage-specific producer for an immutable logical snapshot.
     /// DataServer still validates and packages the result; providers cannot
     /// select the published generation root or bypass the mutation barrier.
@@ -2755,6 +2760,10 @@ pub const DataServer = struct {
                 .ptr = self,
                 .run_fn = DataServer.captureHASeedCallback,
             } else null;
+            if (server.auth.lifecycle_receipts) |*receipts| {
+                receipts.node_id = promoted_node_id;
+                receipts.role = .primary;
+            }
         }
         self.ha_internal_server = null;
         self.api_server_cfg.ha_internal_executor = null;
@@ -3132,6 +3141,7 @@ pub const DataServer = struct {
         alloc: std.mem.Allocator,
         slot_name: []const u8,
         generation: []const u8,
+        binding: antfly.ha.seed_artifact.LifecycleBinding,
     ) !antfly.ha.http_admin.Server.SeedCaptureResult {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
 
@@ -3175,6 +3185,8 @@ pub const DataServer = struct {
             .generation = generation,
             .capture_root = capture_root,
             .sources = &sources,
+            .binding = binding,
+            .pod_uid = self.ha_cfg.pod_uid,
         }, &lease);
         errdefer capture.deinit(alloc);
         return .{
@@ -3192,6 +3204,13 @@ pub const DataServer = struct {
                     .seed_capture = if (ctx.primary != null and self.ha_cfg.seed_capture_root != null) .{
                         .ptr = self,
                         .run_fn = DataServer.captureHASeedCallback,
+                    } else null,
+                    .lifecycle_receipts = if (self.ha_cfg.seed_capture_root != null or self.ha_cfg.seed_activation_root != null) .{
+                        .capture_root = self.ha_cfg.seed_capture_root,
+                        .activation_root = self.ha_cfg.seed_activation_root,
+                        .node_id = if (ctx.primary != null) ctx.primary_node_id else ctx.standby_node_id,
+                        .role = if (ctx.primary != null) .primary else if (ctx.standby != null) .standby else .unknown,
+                        .pod_uid = self.ha_cfg.pod_uid,
                     } else null,
                     .primary_fence_started = .{
                         .ptr = self,
@@ -16186,6 +16205,13 @@ test "data server wires configured HA executors into API server" {
     defer alloc.free(replica_catalog_path);
     const seed_capture_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "seed-captures" });
     defer alloc.free(seed_capture_root);
+    const capture_binding = antfly.ha.seed_artifact.LifecycleBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 7,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-7",
+    };
     std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
     {
@@ -16260,6 +16286,7 @@ test "data server wires configured HA executors into API server" {
             },
             .admin_bearer_token = "runtime-secret-token",
             .seed_capture_root = seed_capture_root,
+            .pod_uid = "pod-primary-a",
             .seed_snapshot_provider = seed_snapshot_provider.iface(),
             .primary_retention_policy = .{},
         },
@@ -16287,7 +16314,7 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
 
-    const capture_body = "{\"slot_name\":\"standby-capture\",\"generation\":\"seed-standby-capture-3\"}";
+    const capture_body = "{\"slot_name\":\"standby-capture\",\"generation\":\"seed-standby-capture-3\",\"topology_id\":\"topology-a\",\"topology_generation\":7,\"node_id\":\"standby-a\",\"target_pvc_name\":\"standby-a-data\",\"target_pvc_uid\":\"pvc-uid-7\"}";
     var capture_resp = try server.http_server.?.handle(.{
         .method = .POST,
         .uri = antfly.admin.routes.ha_base_backups_capture,
@@ -16409,6 +16436,7 @@ test "data server wires configured HA executors into API server" {
         alloc,
         "standby-default-provider",
         "seed-default-provider-4",
+        capture_binding,
     );
     defer default_capture.deinit(alloc);
     const default_topology_path = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "TOPOLOGY.json" });
@@ -16429,6 +16457,7 @@ test "data server wires configured HA executors into API server" {
         alloc,
         "standby-structural-busy",
         "seed-standby-structural-busy-5",
+        capture_binding,
     ));
     active_group_operation.deinit();
 
@@ -16439,6 +16468,7 @@ test "data server wires configured HA executors into API server" {
         alloc,
         "standby-busy",
         "seed-standby-busy-6",
+        capture_binding,
     ));
     server.lsm_maintenance_active.store(false, .release);
 
@@ -16449,6 +16479,7 @@ test "data server wires configured HA executors into API server" {
         alloc,
         "standby-unsupported",
         "seed-standby-unsupported-7",
+        capture_binding,
     ));
 
     var internal_resp = try server.http_server.?.handle(.{

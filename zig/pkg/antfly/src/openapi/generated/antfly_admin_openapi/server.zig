@@ -118,6 +118,13 @@ pub const ResumeHAReplicationSlotPathParams = struct {
     slot_name: []const u8,
 };
 
+pub const GetHASeedLifecycleReceiptsParams = struct {
+    kind: []const u8,
+    /// Exclusive durable ledger cursor. Zero starts at the retained prefix.
+    after: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
 /// Parse the JSON request body for bootstrapHAStandby.
 pub fn parseBootstrapHAStandbyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyBootstrapRequest) {
     return std.json.parseFromSlice(types.StandbyBootstrapRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -163,6 +170,7 @@ pub const routes = [_]Route{
     .{ .method = "DELETE", .path = "/ha/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/pause", .operation_id = "pauseHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/resume", .operation_id = "resumeHAReplicationSlot" },
+    .{ .method = "GET", .path = "/ha/seed-lifecycle/receipts", .operation_id = "getHASeedLifecycleReceipts" },
     .{ .method = "POST", .path = "/ha/standby/bootstrap", .operation_id = "bootstrapHAStandby" },
     .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
     .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite" },
@@ -201,6 +209,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "dropHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'dropHAReplicationSlot'");
         if (!@hasDecl(Impl, "pauseHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'pauseHAReplicationSlot'");
         if (!@hasDecl(Impl, "resumeHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'resumeHAReplicationSlot'");
+        if (!@hasDecl(Impl, "getHASeedLifecycleReceipts")) @compileError("ServerRouter: Impl missing required method 'getHASeedLifecycleReceipts'");
         if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
         if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
         if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
@@ -240,6 +249,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.delete("/ha/replication-slots/:slot_name", dropHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/pause", pauseHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/resume", resumeHAReplicationSlot);
+            try server.get("/ha/seed-lifecycle/receipts", getHASeedLifecycleReceipts);
             try server.post("/ha/standby/bootstrap", bootstrapHAStandby);
             try server.get("/ha/standby/status", getHAStandbyStatus);
             try server.post("/ha/write/check", checkHAWrite);
@@ -412,6 +422,18 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.resumeHAReplicationSlot(ctx, slot_name);
         }
 
+        /// Read durable runtime-owned HA seed lifecycle receipts
+        /// GET /ha/seed-lifecycle/receipts
+        fn getHASeedLifecycleReceipts(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const query_params = GetHASeedLifecycleReceiptsParams{
+                .kind = ctx.query("kind") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: kind" }),
+                .after = ctx.query("after"),
+                .limit = ctx.query("limit"),
+            };
+            return impl.getHASeedLifecycleReceipts(ctx, query_params);
+        }
+
         /// Bootstrap this standby from a local base-backup manifest and copied files
         /// POST /ha/standby/bootstrap
         fn bootstrapHAStandby(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -462,6 +484,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn dropHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn pauseHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn resumeHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
+//   fn getHASeedLifecycleReceipts(self: *Impl, ctx: *httpx.Context, params: GetHASeedLifecycleReceiptsParams) !httpx.Response
 //   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
 //   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response

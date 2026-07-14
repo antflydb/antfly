@@ -33,6 +33,7 @@ pub const ha_base_backups = ha ++ "/base-backups";
 pub const ha_base_backups_finish = ha_base_backups ++ "/finish";
 pub const ha_base_backups_capture = ha_base_backups ++ "/capture";
 pub const ha_base_backups_activate = ha_base_backups ++ "/activate";
+pub const ha_seed_lifecycle_receipts = ha ++ "/seed-lifecycle/receipts";
 pub const ha_standby_bootstrap = ha ++ "/standby/bootstrap";
 pub const ha_fence = ha ++ "/fence";
 pub const ha_fence_current = ha_fence ++ "/current";
@@ -152,6 +153,7 @@ test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups", ha_base_backups);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/finish", ha_base_backups_finish);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/activate", ha_base_backups_activate);
+    try std.testing.expectEqualStrings("/admin/v1/ha/seed-lifecycle/receipts", ha_seed_lifecycle_receipts);
     try std.testing.expectEqualStrings("/admin/v1/ha/standby/bootstrap", ha_standby_bootstrap);
     try std.testing.expectEqualStrings("/admin/v1/ha/fence", ha_fence);
     try std.testing.expectEqualStrings("/admin/v1/ha/fence/current", ha_fence_current);
@@ -254,6 +256,9 @@ const expected_ha_routes = [_]ExpectedRoute{
     .{ .operation_id = "resumeHAReplicationSlot", .method = "PUT", .full_path = ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_resume_suffix },
     .{ .operation_id = "beginHABaseBackup", .method = "POST", .full_path = ha_base_backups },
     .{ .operation_id = "finishHABaseBackup", .method = "POST", .full_path = ha_base_backups_finish },
+    .{ .operation_id = "captureHASeedArtifact", .method = "POST", .full_path = ha_base_backups_capture },
+    .{ .operation_id = "activateHASeededSlot", .method = "POST", .full_path = ha_base_backups_activate },
+    .{ .operation_id = "getHASeedLifecycleReceipts", .method = "GET", .full_path = ha_seed_lifecycle_receipts },
     .{ .operation_id = "bootstrapHAStandby", .method = "POST", .full_path = ha_standby_bootstrap },
     .{ .operation_id = "acquireHAFence", .method = "POST", .full_path = ha_fence },
     .{ .operation_id = "getHACurrentFence", .method = "GET", .full_path = ha_fence_current },

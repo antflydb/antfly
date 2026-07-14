@@ -304,6 +304,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const location = options.location orelse return error.SeedLocationMissing;
             const manifest_path = options.manifest_path orelse return error.SeedManifestMissing;
             const content_root = options.content_root orelse return error.SeedContentRootMissing;
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             const manifest_bytes = try readArtifactFileAlloc(alloc, manifest_path, (ha.seed_artifact.Limits{}).max_manifest_bytes);
             defer alloc.free(manifest_bytes);
             var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
@@ -317,6 +318,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                 .slot_name = slot_name,
                 .manifest_bytes = manifest_bytes,
                 .content_root = content_root,
+                .binding = binding,
             });
             defer result.deinit(alloc);
             try writeArtifactResult(io, result.receipt_json);
@@ -326,6 +328,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const location = options.location orelse return error.SeedLocationMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
             var result = try ha.seed_artifact.restoreToStaging(alloc, .{
@@ -338,6 +341,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .slot_name = slot_name,
                     .identity = try options.identity.finish(),
                     .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                    .binding = binding,
                 },
                 .staging_root = staging_root,
             });
@@ -348,11 +352,13 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const generation = options.generation orelse return error.SeedGenerationMissing;
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             try ha.seed_artifact.verifyStaged(alloc, staging_root, .{
                 .generation = generation,
                 .slot_name = slot_name,
                 .identity = try options.identity.finish(),
                 .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                .binding = binding,
             }, .{});
             std.Io.File.stdout().writeStreamingAll(io, "{\"verified\":true}\n") catch {};
         },
@@ -361,6 +367,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
             const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
             var result = try ha.seed_activation.activate(alloc, .{
                 .staging_root = staging_root,
                 .target_root = target_root,
@@ -369,8 +376,10 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .slot_name = slot_name,
                     .identity = try options.identity.finish(),
                     .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                    .binding = binding,
                 },
-                .binding = try options.binding.finish(),
+                .binding = binding,
+                .pod_uid = try resolveHAPodUID(),
             });
             defer result.deinit(alloc);
             try writeArtifactResult(io, result.active_receipt_json);
@@ -541,7 +550,7 @@ fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
         .capture_root => action == .gc_source,
         .slot_activation_receipt => action == .gc_target,
         .ha_cluster_id, .ha_shard_id, .ha_table_id, .ha_timeline_id, .ha_epoch, .minimum_checkpoint_lsn => action == .restore or action == .verify or action == .activate,
-        .topology_id, .topology_generation, .node_id, .target_pvc_name, .target_pvc_uid => action == .activate,
+        .topology_id, .topology_generation, .node_id, .target_pvc_name, .target_pvc_uid => action == .publish or action == .restore or action == .verify or action == .activate,
         .retain_generations => action == .prune or action == .gc_source or action == .gc_target,
         .protect_generation => action == .gc_source or action == .gc_target,
     };
@@ -1338,6 +1347,13 @@ fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[
     const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
     if (token.len == 0) return error.HAAdminTokenMissing;
     return try alloc.dupe(u8, token);
+}
+
+fn resolveHAPodUID() !?[]const u8 {
+    const raw_z = std.c.getenv("ANTFLY_POD_UID") orelse return null;
+    const pod_uid = std.mem.trim(u8, std.mem.span(raw_z), " \t\r\n");
+    if (!ha_validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
+    return pod_uid;
 }
 
 const HAPathField = enum {

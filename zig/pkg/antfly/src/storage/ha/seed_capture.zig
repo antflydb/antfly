@@ -31,6 +31,7 @@ const Crc32 = std.hash.Crc32;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
 const backup_manifest = @import("backup_manifest.zig");
+const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const local_generation_gc = @import("local_generation_gc.zig");
 const mutation_barrier = @import("mutation_barrier.zig");
 const object_storage = @import("../object_storage.zig");
@@ -40,7 +41,8 @@ const seed_artifact = @import("seed_artifact.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
-pub const format_version: u16 = 1;
+pub const legacy_format_version: u16 = 1;
+pub const format_version: u16 = 2;
 pub const generations_dir_name = "generations";
 pub const manifest_name = "manifest.afha";
 pub const prepared_name = "PREPARED.json";
@@ -81,6 +83,8 @@ pub const CaptureRequest = struct {
     generation: []const u8,
     capture_root: []const u8,
     sources: []const Source,
+    binding: ?seed_artifact.LifecycleBinding = null,
+    pod_uid: ?[]const u8 = null,
     limits: Limits = .{},
 };
 
@@ -117,7 +121,7 @@ pub const PublishedGenerationGCRequest = struct {
 };
 
 const PreparedReceipt = struct {
-    format_version: u16 = format_version,
+    format_version: u16,
     generation: []const u8,
     slot_name: []const u8,
     cluster_id: u64,
@@ -127,10 +131,15 @@ const PreparedReceipt = struct {
     epoch: u64,
     source_plan_sha256: []const u8,
     backup_lsn: u64,
+    topology_id: []const u8 = "",
+    topology_generation: u64 = 0,
+    node_id: []const u8 = "",
+    target_pvc_name: []const u8 = "",
+    target_pvc_uid: []const u8 = "",
 };
 
 const SnapshotReceipt = struct {
-    format_version: u16 = format_version,
+    format_version: u16,
     generation: []const u8,
     slot_name: []const u8,
     cluster_id: u64,
@@ -145,10 +154,15 @@ const SnapshotReceipt = struct {
     manifest_sha256: []const u8,
     file_count: usize,
     total_bytes: u64,
+    topology_id: []const u8 = "",
+    topology_generation: u64 = 0,
+    node_id: []const u8 = "",
+    target_pvc_name: []const u8 = "",
+    target_pvc_uid: []const u8 = "",
 };
 
 pub const CaptureReceipt = struct {
-    format_version: u16 = format_version,
+    format_version: u16,
     generation: []const u8,
     slot_name: []const u8,
     cluster_id: u64,
@@ -164,6 +178,11 @@ pub const CaptureReceipt = struct {
     manifest_sha256: []const u8,
     file_count: usize,
     total_bytes: u64,
+    topology_id: []const u8 = "",
+    topology_generation: u64 = 0,
+    node_id: []const u8 = "",
+    target_pvc_name: []const u8 = "",
+    target_pvc_uid: []const u8 = "",
 
     pub fn identity(self: CaptureReceipt) standby_mod.Identity {
         return .{
@@ -177,7 +196,7 @@ pub const CaptureReceipt = struct {
 };
 
 const AbortedReceipt = struct {
-    format_version: u16 = format_version,
+    format_version: u16,
     generation: []const u8,
     slot_name: []const u8,
     source_plan_sha256: []const u8,
@@ -260,6 +279,7 @@ pub fn prunePublishedGenerations(
         .slot_name = request.slot_name,
         .identity = local.value.identity(),
         .minimum_checkpoint_lsn = local.value.checkpoint_lsn,
+        .binding = captureReceiptBinding(local.value),
     }, request.artifact_limits);
     defer verified.deinit(alloc);
     var remote = std.json.parseFromSlice(seed_artifact.Receipt, alloc, verified.receipt_json, .{ .ignore_unknown_fields = false }) catch
@@ -288,7 +308,7 @@ pub fn prunePublishedGenerations(
 }
 
 fn validatePublishedGCReceipt(receipt: CaptureReceipt, request: PublishedGenerationGCRequest) !void {
-    if (receipt.format_version != format_version or
+    if ((receipt.format_version != legacy_format_version and receipt.format_version != format_version) or
         !std.mem.eql(u8, receipt.generation, request.generation) or
         !std.mem.eql(u8, receipt.slot_name, request.slot_name) or
         !std.mem.eql(u8, receipt.manifest_id, request.generation)) return error.CaptureStateConflict;
@@ -300,6 +320,7 @@ fn validatePublishedGCReceipt(receipt: CaptureReceipt, request: PublishedGenerat
         receipt.source_plan_sha256.len != Sha256.digest_length * 2)
         return error.InvalidCaptureReceipt;
     try standby_mod.validateIdentity(receipt.identity());
+    if (captureReceiptBinding(receipt)) |binding| try validateCaptureBinding(binding);
 }
 
 fn validatePublishedGCManifest(manifest: backup_manifest.ManifestView, receipt: CaptureReceipt) !void {
@@ -314,7 +335,8 @@ fn validatePublishedGCManifest(manifest: backup_manifest.ManifestView, receipt: 
 }
 
 fn validateRemoteAgainstCapture(remote: seed_artifact.Receipt, local: CaptureReceipt) !void {
-    if (remote.format_version != seed_artifact.format_version) return error.LocalGCRequiresArtifactV2;
+    if (remote.format_version != seed_artifact.chunked_format_version and remote.format_version != seed_artifact.format_version)
+        return error.LocalGCRequiresArtifactV2;
     if (!std.mem.eql(u8, remote.generation, local.generation) or
         !std.mem.eql(u8, remote.slot_name, local.slot_name) or
         !std.mem.eql(u8, remote.manifest_id, local.manifest_id) or
@@ -324,6 +346,25 @@ fn validateRemoteAgainstCapture(remote: seed_artifact.Receipt, local: CaptureRec
         remote.files.len != local.file_count or
         remote.total_bytes != local.total_bytes) return error.ArtifactCaptureMismatch;
     try expectIdentity(local.identity(), remote.identity(), error.ArtifactCaptureMismatch);
+    if (captureReceiptBinding(local)) |binding| {
+        if (remote.format_version != seed_artifact.format_version or
+            !std.mem.eql(u8, binding.topology_id, remote.topology_id) or
+            binding.topology_generation != remote.topology_generation or
+            !std.mem.eql(u8, binding.node_id, remote.node_id) or
+            !std.mem.eql(u8, binding.target_pvc_name, remote.target_pvc_name) or
+            !std.mem.eql(u8, binding.target_pvc_uid, remote.target_pvc_uid)) return error.ArtifactCaptureMismatch;
+    }
+}
+
+fn captureReceiptBinding(receipt: CaptureReceipt) ?seed_artifact.LifecycleBinding {
+    if (receipt.format_version != format_version) return null;
+    return .{
+        .topology_id = receipt.topology_id,
+        .topology_generation = receipt.topology_generation,
+        .node_id = receipt.node_id,
+        .target_pvc_name = receipt.target_pvc_name,
+        .target_pvc_uid = receipt.target_pvc_uid,
+    };
 }
 
 /// Capture while the caller already owns the exclusive mutation lease.
@@ -444,7 +485,9 @@ fn captureHeld(alloc: Allocator, request: CaptureRequest, options: CaptureOption
     try fs_paths.createDirPathPortable(io, staging_root);
     try fs_paths.syncDirPortable(io, request.capture_root);
 
+    const binding = request.binding orelse seed_artifact.LifecycleBinding{};
     const prepared_json = try std.json.Stringify.valueAlloc(alloc, PreparedReceipt{
+        .format_version = captureReceiptFormatVersion(request),
         .generation = request.generation,
         .slot_name = request.slot_name,
         .cluster_id = request.primary.identity.cluster_id,
@@ -454,6 +497,11 @@ fn captureHeld(alloc: Allocator, request: CaptureRequest, options: CaptureOption
         .epoch = request.primary.identity.epoch,
         .source_plan_sha256 = &plan_hex,
         .backup_lsn = started.backup_lsn,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
     }, .{});
     defer alloc.free(prepared_json);
     const prepared_path = try std.fs.path.join(alloc, &.{ staging_root, prepared_name });
@@ -527,7 +575,9 @@ fn createSnapshot(
     const manifest_path = try std.fs.path.join(alloc, &.{ staging_root, manifest_name });
     defer alloc.free(manifest_path);
     _ = try writeImmutableFile(io, alloc, manifest_path, manifest_bytes, error.CaptureManifestConflict);
+    const binding = request.binding orelse seed_artifact.LifecycleBinding{};
     const snapshot_json = try std.json.Stringify.valueAlloc(alloc, SnapshotReceipt{
+        .format_version = captureReceiptFormatVersion(request),
         .generation = request.generation,
         .slot_name = request.slot_name,
         .cluster_id = request.primary.identity.cluster_id,
@@ -542,6 +592,11 @@ fn createSnapshot(
         .manifest_sha256 = &manifest_hex,
         .file_count = files.len,
         .total_bytes = total_bytes,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
     }, .{});
     defer alloc.free(snapshot_json);
     const snapshot_path = try std.fs.path.join(alloc, &.{ staging_root, snapshot_name });
@@ -574,7 +629,9 @@ fn finishDurableSnapshot(
     );
     try failAt(options, .backup_end_durable);
 
+    const binding = request.binding orelse seed_artifact.LifecycleBinding{};
     const complete_json = try std.json.Stringify.valueAlloc(alloc, CaptureReceipt{
+        .format_version = captureReceiptFormatVersion(request),
         .generation = request.generation,
         .slot_name = request.slot_name,
         .cluster_id = request.primary.identity.cluster_id,
@@ -590,6 +647,11 @@ fn finishDurableSnapshot(
         .manifest_sha256 = &snapshot.manifest_sha256,
         .file_count = snapshot.file_count,
         .total_bytes = snapshot.total_bytes,
+        .topology_id = binding.topology_id,
+        .topology_generation = binding.topology_generation,
+        .node_id = binding.node_id,
+        .target_pvc_name = binding.target_pvc_name,
+        .target_pvc_uid = binding.target_pvc_uid,
     }, .{});
     defer alloc.free(complete_json);
     const complete_path = try std.fs.path.join(alloc, &.{ staging_root, complete_name });
@@ -695,6 +757,11 @@ fn openPublished(
     );
     try verifyBackupEndAt(request.primary, alloc, parsed.value.end_record_lsn, manifest_bytes);
     try validateRetainedSlot(request, parsed.value.backup_lsn);
+    if (request.binding != null) {
+        var ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, request.capture_root, .{});
+        defer ledger.close();
+        _ = try ledger.recordCapture(complete_json, .{ .pod_uid = request.pod_uid });
+    }
 
     return .{
         .generation_root = try alloc.dupe(u8, generation_root),
@@ -872,11 +939,43 @@ fn validateRetainedSlot(request: CaptureRequest, backup_lsn: u64) !void {
         return error.CaptureSlotNotRetained;
 }
 
+fn captureReceiptFormatVersion(request: CaptureRequest) u16 {
+    return if (request.binding != null) format_version else legacy_format_version;
+}
+
+fn validateCaptureBinding(binding: seed_artifact.LifecycleBinding) !void {
+    if (!validation.isIdentifier(binding.topology_id) or binding.topology_generation == 0 or
+        !validation.isIdentifier(binding.node_id) or !validation.isIdentifier(binding.target_pvc_name) or
+        !validation.isIdentifier(binding.target_pvc_uid)) return error.InvalidCaptureBinding;
+}
+
+fn expectCaptureBinding(
+    expected: ?seed_artifact.LifecycleBinding,
+    topology_id: []const u8,
+    topology_generation: u64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
+) !void {
+    const binding = expected orelse {
+        if (topology_id.len != 0 or topology_generation != 0 or node_id.len != 0 or
+            target_pvc_name.len != 0 or target_pvc_uid.len != 0) return error.CaptureBindingMismatch;
+        return;
+    };
+    if (!std.mem.eql(u8, binding.topology_id, topology_id) or
+        binding.topology_generation != topology_generation or
+        !std.mem.eql(u8, binding.node_id, node_id) or
+        !std.mem.eql(u8, binding.target_pvc_name, target_pvc_name) or
+        !std.mem.eql(u8, binding.target_pvc_uid, target_pvc_uid)) return error.CaptureBindingMismatch;
+}
+
 fn validateRequest(request: CaptureRequest) !void {
     if (!validation.isIdentifier(request.generation)) return error.InvalidCaptureGeneration;
     if (!validation.isIdentifier(request.slot_name)) return error.InvalidSlotName;
     if (!validAbsoluteRoot(request.capture_root) or std.mem.eql(u8, request.capture_root, "/")) return error.InvalidCaptureRoot;
     if (request.sources.len == 0) return error.EmptyCapture;
+    if (request.binding) |binding| try validateCaptureBinding(binding);
+    if (request.pod_uid) |pod_uid| if (!validation.isIdentifier(pod_uid)) return error.InvalidCapturePodUID;
     try standby_mod.validateIdentity(request.primary.identity);
     for (request.sources) |source| switch (source) {
         .file => |file| {
@@ -949,12 +1048,14 @@ fn parsePrepared(alloc: Allocator, raw: []const u8, request: CaptureRequest, pla
     var parsed = std.json.parseFromSlice(PreparedReceipt, alloc, raw, .{ .ignore_unknown_fields = false }) catch return error.InvalidCaptureReceipt;
     defer parsed.deinit();
     const value = parsed.value;
-    if (value.format_version != format_version or
+    if (value.format_version != captureReceiptFormatVersion(request) or
         !std.mem.eql(u8, value.generation, request.generation) or
         !std.mem.eql(u8, value.slot_name, request.slot_name) or
         !std.mem.eql(u8, value.source_plan_sha256, plan_hex)) return error.CaptureStateConflict;
+    try expectCaptureBinding(request.binding, value.topology_id, value.topology_generation, value.node_id, value.target_pvc_name, value.target_pvc_uid);
     try expectReceiptIdentity(request.primary.identity, value.cluster_id, value.shard_id, value.table_id, value.timeline_id, value.epoch);
     return .{
+        .format_version = value.format_version,
         .generation = request.generation,
         .slot_name = request.slot_name,
         .cluster_id = value.cluster_id,
@@ -964,15 +1065,21 @@ fn parsePrepared(alloc: Allocator, raw: []const u8, request: CaptureRequest, pla
         .epoch = value.epoch,
         .source_plan_sha256 = plan_hex,
         .backup_lsn = value.backup_lsn,
+        .topology_id = value.topology_id,
+        .topology_generation = value.topology_generation,
+        .node_id = value.node_id,
+        .target_pvc_name = value.target_pvc_name,
+        .target_pvc_uid = value.target_pvc_uid,
     };
 }
 
 fn validateSnapshotReceipt(value: SnapshotReceipt, request: CaptureRequest, plan_hex: []const u8) !void {
-    if (value.format_version != format_version or
+    if (value.format_version != captureReceiptFormatVersion(request) or
         !std.mem.eql(u8, value.generation, request.generation) or
         !std.mem.eql(u8, value.slot_name, request.slot_name) or
         !std.mem.eql(u8, value.source_plan_sha256, plan_hex) or
         !std.mem.eql(u8, value.manifest_id, request.generation)) return error.CaptureStateConflict;
+    try expectCaptureBinding(request.binding, value.topology_id, value.topology_generation, value.node_id, value.target_pvc_name, value.target_pvc_uid);
     if (value.backup_lsn == 0 or value.checkpoint_lsn != value.backup_lsn) return error.CaptureCheckpointMismatch;
     if (value.file_count == 0 or value.file_count > request.limits.max_files or value.total_bytes > request.limits.max_total_bytes)
         return error.InvalidCaptureReceipt;
@@ -980,11 +1087,12 @@ fn validateSnapshotReceipt(value: SnapshotReceipt, request: CaptureRequest, plan
 }
 
 fn validateCompleteReceipt(value: CaptureReceipt, request: CaptureRequest, plan_hex: []const u8) !void {
-    if (value.format_version != format_version or
+    if (value.format_version != captureReceiptFormatVersion(request) or
         !std.mem.eql(u8, value.generation, request.generation) or
         !std.mem.eql(u8, value.slot_name, request.slot_name) or
         !std.mem.eql(u8, value.source_plan_sha256, plan_hex) or
         !std.mem.eql(u8, value.manifest_id, request.generation)) return error.CaptureStateConflict;
+    try expectCaptureBinding(request.binding, value.topology_id, value.topology_generation, value.node_id, value.target_pvc_name, value.target_pvc_uid);
     if (value.backup_lsn == 0 or value.checkpoint_lsn != value.backup_lsn or value.end_record_lsn <= value.backup_lsn)
         return error.CaptureCheckpointMismatch;
     if (value.file_count == 0 or value.file_count > request.limits.max_files or value.total_bytes > request.limits.max_total_bytes)
@@ -996,7 +1104,7 @@ fn validateAbortedReceipt(alloc: Allocator, raw: []const u8, request: CaptureReq
     var parsed = std.json.parseFromSlice(AbortedReceipt, alloc, raw, .{ .ignore_unknown_fields = false }) catch return error.InvalidCaptureReceipt;
     defer parsed.deinit();
     const value = parsed.value;
-    if (value.format_version != format_version or
+    if (value.format_version != captureReceiptFormatVersion(request) or
         !std.mem.eql(u8, value.generation, request.generation) or
         !std.mem.eql(u8, value.slot_name, request.slot_name) or
         !std.mem.eql(u8, value.source_plan_sha256, plan_hex) or
@@ -1030,6 +1138,7 @@ fn abortIncomplete(
     try std.Io.Dir.cwd().deleteTree(io, staging_root);
     try fs_paths.createDirPathPortable(io, request.capture_root);
     const body = try std.json.Stringify.valueAlloc(alloc, AbortedReceipt{
+        .format_version = captureReceiptFormatVersion(request),
         .generation = request.generation,
         .slot_name = request.slot_name,
         .source_plan_sha256 = plan_hex,
@@ -1438,7 +1547,6 @@ test "storage.ha seed capture gc requires a remotely verified v2 COMPLETE checkp
 
 test "storage.ha seed capture v2 binds COMPLETE and journals publication before success" {
     const alloc = std.testing.allocator;
-    const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -1486,11 +1594,11 @@ test "storage.ha seed capture v2 binds COMPLETE and journals publication before 
     try std.testing.expectEqualStrings(binding.target_pvc_uid, receipt.value.target_pvc_uid);
 
     var ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, capture_root, .{});
-    defer ledger.close();
     var page = try ledger.readPage(alloc, .capture, .{ .limit = 10 }, .{ .authoritative_root = capture_root });
-    defer page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), page.entries.len);
     try std.testing.expectEqualStrings(captured.receipt_json, page.entries[0].receipt_json);
+    page.deinit(alloc);
+    ledger.close();
 
     var changed_binding = binding;
     changed_binding.target_pvc_uid = "pvc-uid-other";
@@ -1501,6 +1609,8 @@ test "storage.ha seed capture v2 binds COMPLETE and journals publication before 
     var repeated = try capture(alloc, request);
     defer repeated.deinit(alloc);
     try std.testing.expect(repeated.already_captured);
+    ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, capture_root, .{});
+    defer ledger.close();
     var after_retry = try ledger.readPage(alloc, .capture, .{ .limit = 10 }, .{ .authoritative_root = capture_root });
     defer after_retry.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), after_retry.entries.len);

@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
 const backup_manifest = @import("backup_manifest.zig");
+const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const local_generation_gc = @import("local_generation_gc.zig");
 const object_storage = @import("../object_storage.zig");
 const seed_artifact = @import("seed_artifact.zig");
@@ -41,16 +42,11 @@ pub const ActivateRequest = struct {
     target_root: []const u8,
     expected: seed_artifact.ExpectedArtifact,
     binding: ?ActivationBinding = null,
+    pod_uid: ?[]const u8 = null,
     limits: seed_artifact.Limits = .{},
 };
 
-pub const ActivationBinding = struct {
-    topology_id: []const u8 = "",
-    topology_generation: u64 = 0,
-    node_id: []const u8 = "",
-    target_pvc_name: []const u8 = "",
-    target_pvc_uid: []const u8 = "",
-};
+pub const ActivationBinding = seed_artifact.LifecycleBinding;
 
 pub const StartupExpectation = struct {
     target_root: []const u8,
@@ -342,6 +338,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
         try validateActiveReceipt(alloc, existing_active, request.expected, request.binding, &seed_receipt_hex, generation_relative_path);
         try inspectGenerationsRoot(io, generations_root, request.expected.generation, installing_name);
         try validatePublishedGeneration(alloc, generation_path, request, activation_json);
+        try recordLifecycleReceipt(alloc, request, existing_active);
         const active_receipt_copy = try alloc.dupe(u8, existing_active);
         alloc.free(activation_json);
         return .{
@@ -400,6 +397,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     try failAt(options, .generation_published);
     const active_created = try writeImmutableFile(io, alloc, active_path, activation_json, error.ActiveGenerationConflict);
     try failAt(options, .active_published);
+    try recordLifecycleReceipt(alloc, request, activation_json);
 
     return .{
         .generation_path = generation_path,
@@ -415,13 +413,24 @@ fn validateRequest(request: ActivateRequest) !void {
     if (!validAbsoluteRoot(request.target_root)) return error.InvalidActivationTarget;
     if (pathsOverlap(request.staging_root, request.target_root)) return error.OverlappingActivationPaths;
     if (request.binding) |binding| try validateBinding(binding);
+    if (request.pod_uid) |pod_uid| if (!validation.isIdentifier(pod_uid)) return error.InvalidActivationPodUID;
 }
 
 fn validateBinding(binding: ActivationBinding) !void {
     if (!validation.isIdentifier(binding.topology_id)) return error.InvalidTopologyId;
+    if (binding.topology_generation == 0) return error.InvalidTopologyGeneration;
     if (!validation.isIdentifier(binding.node_id)) return error.InvalidNodeId;
     if (!validation.isIdentifier(binding.target_pvc_name)) return error.InvalidTargetPVCName;
     if (!validation.isIdentifier(binding.target_pvc_uid)) return error.InvalidTargetPVCUID;
+}
+
+fn recordLifecycleReceipt(alloc: Allocator, request: ActivateRequest, receipt_json: []const u8) !void {
+    // Legacy unbound activation remains readable for compatibility but cannot
+    // be advertised as topology authority.
+    if (request.binding == null) return;
+    var ledger = try lifecycle_receipt_ledger.Ledger.open(alloc, request.target_root, .{});
+    defer ledger.close();
+    _ = try ledger.recordActivation(receipt_json, .{ .pod_uid = request.pod_uid });
 }
 
 fn validAbsoluteRoot(path: []const u8) bool {
@@ -450,6 +459,7 @@ fn inspectTargetRoot(io: std.Io, target_root: []const u8) !void {
     while (try iterator.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, generations_dir_name) and entry.kind == .directory) continue;
         if (std.mem.eql(u8, entry.name, active_receipt_name) and entry.kind == .file) continue;
+        if (std.mem.eql(u8, entry.name, lifecycle_receipt_ledger.ledger_dir_name) and entry.kind == .directory) continue;
         return error.UnsafeActivationTarget;
     }
 }
@@ -876,7 +886,6 @@ test "storage.ha seed activation gc requires the durable seeded-slot activation 
 
 test "storage.ha seed activation binds startup evidence and revalidates installed bytes on restart" {
     const alloc = std.testing.allocator;
-    const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);

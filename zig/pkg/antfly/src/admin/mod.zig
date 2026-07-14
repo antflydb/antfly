@@ -49,6 +49,9 @@ pub const HAReplicationSlotListResponse = openapi.HAReplicationSlotListResponse;
 pub const HABaseBackupBeginResponse = openapi.HABaseBackupBeginResponse;
 pub const HABaseBackupFinishResponse = openapi.HABaseBackupFinishResponse;
 pub const HASeedArtifactCaptureResponse = openapi.HASeedArtifactCaptureResponse;
+pub const HASeedLifecycleReceiptEvent = openapi.HASeedLifecycleReceiptEvent;
+pub const HASeedLifecycleReceiptInventoryResponse = openapi.HASeedLifecycleReceiptInventoryResponse;
+pub const HARuntimeLifecycleObservation = openapi.HARuntimeLifecycleObservation;
 pub const HAStandbyBootstrapResponse = openapi.HAStandbyBootstrapResponse;
 pub const HASeededSlotActivateResponse = openapi.HASeededSlotActivateResponse;
 pub const HAFenceResponse = openapi.HAFenceResponse;
@@ -86,6 +89,9 @@ test {
     _ = HARejoinRewindResult;
     _ = HARejoinReseedResult;
     _ = HAActionReceipt;
+    _ = HASeedLifecycleReceiptEvent;
+    _ = HASeedLifecycleReceiptInventoryResponse;
+    _ = HARuntimeLifecycleObservation;
 }
 
 test "admin facade mirrors generated HA OpenAPI contract types" {

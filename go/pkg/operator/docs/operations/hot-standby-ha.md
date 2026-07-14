@@ -251,6 +251,27 @@ at a `file://` URI and distinct source and target PVCs. Delete the publish or
 restore Job/pod between attempts to exercise idempotent restart behavior; never
 use `kubectl cp`, `kubectl exec`, a hostPath bridge, or a test-only catalog.
 
+### Durable seed lifecycle evidence
+
+The runtime appends the exact topology-bound receipt to a durable local ledger
+only after capture `COMPLETE.json` or target activation `ACTIVE` is fsynced.
+Retries with the same identity and digest return the original cursor; reuse of
+that identity with different bytes fails closed. The bounded payload history
+survives runtime restart and generation garbage collection, while a compact
+identity/digest index prevents old identities from being reused after history
+truncation.
+
+Controllers read the authenticated, read-only endpoint
+`GET /admin/v1/ha/seed-lifecycle/receipts`. The required `kind` query is
+`capture` or `activation`; `after` is an exclusive durable WAL cursor and
+`limit` is between 1 and 1000. Responses include `first_cursor`, `end_cursor`,
+`next_cursor`, `history_truncated`, `gap`, and `has_more`. A `gap` means the
+requested cursor predates the retained payload prefix and must never be treated
+as proof that an action completed. Each entry carries the exact receipt JSON
+and SHA-256, topology generation, node and PVC UID binding, pod UID, timestamp,
+and whether the authoritative filesystem receipt is still retained. Runtime
+observation includes the serving node, role, pod UID, and current fenced state.
+
 ## Promotion
 
 Automatic promotion requires a machine-checkable fence. The operator should not

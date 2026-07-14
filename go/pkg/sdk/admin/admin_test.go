@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -2004,22 +2005,27 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 			State:      HAActionStateApplied,
 			NodeId:     "primary-a",
 		},
-		SlotName:         "standby-a",
-		Generation:       "seed-standby-a-7",
-		ClusterId:        1,
-		TimelineId:       4,
-		Epoch:            2,
-		ManifestId:       "seed-standby-a-7",
-		SourcePlanSha256: digest,
-		BackupLsn:        7,
-		CheckpointLsn:    7,
-		EndRecordLsn:     8,
-		ManifestSha256:   digest,
-		FileCount:        2,
-		TotalBytes:       20,
-		GenerationRoot:   "/antflydb/ha/seed-captures/generations/seed-standby-a-7",
-		ContentRoot:      "/antflydb/ha/seed-captures/generations/seed-standby-a-7/content",
-		ManifestPath:     "/antflydb/ha/seed-captures/generations/seed-standby-a-7/manifest.afha",
+		SlotName:           "standby-a",
+		Generation:         "seed-standby-a-7",
+		TopologyId:         "topology-a",
+		TopologyGeneration: 7,
+		NodeId:             "standby-a",
+		TargetPvcName:      "standby-a-data",
+		TargetPvcUid:       "pvc-uid-7",
+		ClusterId:          1,
+		TimelineId:         4,
+		Epoch:              2,
+		ManifestId:         "seed-standby-a-7",
+		SourcePlanSha256:   digest,
+		BackupLsn:          7,
+		CheckpointLsn:      7,
+		EndRecordLsn:       8,
+		ManifestSha256:     digest,
+		FileCount:          2,
+		TotalBytes:         20,
+		GenerationRoot:     "/antflydb/ha/seed-captures/generations/seed-standby-a-7",
+		ContentRoot:        "/antflydb/ha/seed-captures/generations/seed-standby-a-7/content",
+		ManifestPath:       "/antflydb/ha/seed-captures/generations/seed-standby-a-7/manifest.afha",
 	}
 	if err := ValidateHASeedArtifactCaptureResponse(capture); err != nil {
 		t.Fatalf("ValidateHASeedArtifactCaptureResponse returned error: %v", err)
@@ -2330,6 +2336,44 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	promotion.Promotion.SwitchLsn = 0
 	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "promotion result") {
 		t.Fatalf("missing promotion result error = %v, want promotion result error", err)
+	}
+}
+
+func TestValidateHASeedLifecycleReceiptInventory(t *testing.T) {
+	t.Parallel()
+	receipt := `{"format_version":2,"generation":"seed-a-7","slot_name":"standby-a","topology_id":"topology-a","topology_generation":7,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-7"}`
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(receipt)))
+	response := HASeedLifecycleReceiptInventory{
+		SchemaVersion:    1,
+		FirstCursor:      4,
+		EndCursor:        4,
+		NextCursor:       4,
+		HistoryTruncated: true,
+		Entries: []HASeedLifecycleReceiptEvent{{
+			Cursor: 4, Kind: oapi.HASeedLifecycleReceiptEventKindCapture,
+			Generation: "seed-a-7", SlotName: "standby-a", TopologyId: "topology-a", TopologyGeneration: 7,
+			NodeId: "standby-a", TargetPvcName: "standby-a-data", TargetPvcUid: "pvc-uid-7",
+			ReceiptSha256: digest, ReceiptJson: receipt, RecordedAtUnixNs: 99,
+			AuthoritativeState: oapi.HASeedLifecycleReceiptEventAuthoritativeStateRetained,
+		}},
+		Runtime: HARuntimeLifecycleObservation{
+			NodeId: "primary-a", Role: oapi.HARuntimeLifecycleObservationRolePrimary,
+			PodUid: "pod-primary-a", Fenced: false, ObservedAtUnixNs: 100,
+		},
+	}
+	if err := ValidateHASeedLifecycleReceiptInventory(response); err != nil {
+		t.Fatalf("ValidateHASeedLifecycleReceiptInventory returned error: %v", err)
+	}
+	badDigest := response
+	badDigest.Entries = append([]HASeedLifecycleReceiptEvent(nil), response.Entries...)
+	badDigest.Entries[0].ReceiptJson += " "
+	if err := ValidateHASeedLifecycleReceiptInventory(badDigest); err == nil || !strings.Contains(err.Error(), "digest") {
+		t.Fatalf("receipt digest mismatch error = %v, want digest error", err)
+	}
+	badCursor := response
+	badCursor.NextCursor = 3
+	if err := ValidateHASeedLifecycleReceiptInventory(badCursor); err == nil || !strings.Contains(err.Error(), "next_cursor") {
+		t.Fatalf("cursor mismatch error = %v, want next_cursor error", err)
 	}
 }
 

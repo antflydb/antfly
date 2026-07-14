@@ -29,18 +29,21 @@ const admin_exec = @import("admin_exec.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
+const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const owner_job_gate = @import("owner_job_gate.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const rejoin = @import("rejoin.zig");
+const seed_artifact = @import("seed_artifact.zig");
 const seed_capture = @import("seed_capture.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
 const validation = @import("validation.zig");
 const write_gate = @import("write_gate.zig");
+const wal_mod = @import("../wal.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -113,6 +116,7 @@ pub const Server = struct {
             alloc: Allocator,
             slot_name: []const u8,
             generation: []const u8,
+            binding: seed_artifact.LifecycleBinding,
         ) anyerror!SeedCaptureResult,
 
         pub fn run(
@@ -120,16 +124,27 @@ pub const Server = struct {
             alloc: Allocator,
             slot_name: []const u8,
             generation: []const u8,
+            binding: seed_artifact.LifecycleBinding,
         ) !SeedCaptureResult {
-            return self.run_fn(self.ptr, alloc, slot_name, generation);
+            return self.run_fn(self.ptr, alloc, slot_name, generation, binding);
         }
     };
 
     pub const AuthOptions = struct {
+        pub const LifecycleReceipts = struct {
+            capture_root: ?[]const u8 = null,
+            activation_root: ?[]const u8 = null,
+            wal_options: wal_mod.WalOptions = .{},
+            node_id: ?[]const u8 = null,
+            role: lifecycle_receipt_ledger.RuntimeRole = .unknown,
+            pod_uid: ?[]const u8 = null,
+        };
+
         bearer_token: ?[]const u8 = null,
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
         seed_capture: ?SeedCaptureHook = null,
+        lifecycle_receipts: ?LifecycleReceipts = null,
         primary_fence_started: ?StateChangedHook = null,
         state_changed: ?StateChangedHook = null,
     };
@@ -170,6 +185,10 @@ pub const Server = struct {
         if (req.method == .POST and std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture)) {
             defer if (self.auth.state_changed) |hook| hook.run();
             return try self.handleAdminCaptureSeedArtifact(req);
+        }
+        if (std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts)) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handleAdminLifecycleReceipts(req);
         }
         if (self.auth.state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
@@ -691,15 +710,29 @@ pub const Server = struct {
         ) catch return try textResponse(self.alloc, 400, "invalid HA seed capture request");
         defer parsed.deinit();
         if (!validation.isIdentifier(parsed.value.slot_name) or
-            !validation.isIdentifier(parsed.value.generation))
+            !validation.isIdentifier(parsed.value.generation) or
+            !validation.isIdentifier(parsed.value.topology_id) or
+            !validation.isIdentifier(parsed.value.node_id) or
+            !validation.isIdentifier(parsed.value.target_pvc_name) or
+            !validation.isIdentifier(parsed.value.target_pvc_uid))
         {
             return try textResponse(self.alloc, 400, "invalid HA seed capture identity");
         }
+        const topology_generation = positiveUint64FromJson(parsed.value.topology_generation) catch
+            return try textResponse(self.alloc, 400, "invalid HA seed capture topology generation");
+        const binding = seed_artifact.LifecycleBinding{
+            .topology_id = parsed.value.topology_id,
+            .topology_generation = topology_generation,
+            .node_id = parsed.value.node_id,
+            .target_pvc_name = parsed.value.target_pvc_name,
+            .target_pvc_uid = parsed.value.target_pvc_uid,
+        };
 
         var result = hook.run(
             self.alloc,
             parsed.value.slot_name,
             parsed.value.generation,
+            binding,
         ) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
@@ -714,6 +747,11 @@ pub const Server = struct {
         const value = receipt.value;
         if (!std.mem.eql(u8, value.slot_name, parsed.value.slot_name) or
             !std.mem.eql(u8, value.generation, parsed.value.generation) or
+            !std.mem.eql(u8, value.topology_id, binding.topology_id) or
+            value.topology_generation != binding.topology_generation or
+            !std.mem.eql(u8, value.node_id, binding.node_id) or
+            !std.mem.eql(u8, value.target_pvc_name, binding.target_pvc_name) or
+            !std.mem.eql(u8, value.target_pvc_uid, binding.target_pvc_uid) or
             !validSha256Hex(value.source_plan_sha256) or
             !validSha256Hex(value.manifest_sha256))
         {
@@ -733,6 +771,11 @@ pub const Server = struct {
             },
             .slot_name = value.slot_name,
             .generation = value.generation,
+            .topology_id = value.topology_id,
+            .topology_generation = try adminI64(value.topology_generation),
+            .node_id = value.node_id,
+            .target_pvc_name = value.target_pvc_name,
+            .target_pvc_uid = value.target_pvc_uid,
             .cluster_id = try adminI64(value.cluster_id),
             .shard_id = try adminI64(value.shard_id),
             .table_id = try adminI64(value.table_id),
@@ -750,6 +793,82 @@ pub const Server = struct {
             .content_root = result.capture.content_root,
             .manifest_path = result.capture.manifest_path,
             .already_captured = result.capture.already_captured,
+        });
+    }
+
+    fn handleAdminLifecycleReceipts(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const config = self.auth.lifecycle_receipts orelse
+            return try textResponse(self.alloc, 409, "LifecycleReceiptLedgerUnavailable");
+        const query = parseLifecycleReceiptQuery(requestQuery(req.uri)) catch
+            return try textResponse(self.alloc, 400, "invalid lifecycle receipt query");
+        const authoritative_root = switch (query.kind) {
+            .capture => config.capture_root,
+            .activation => config.activation_root,
+        } orelse return try textResponse(self.alloc, 409, "LifecycleReceiptLedgerUnavailable");
+
+        var wal_options = config.wal_options;
+        wal_options.read_only = true;
+        var ledger = lifecycle_receipt_ledger.Ledger.open(self.alloc, authoritative_root, .{
+            .wal_options = wal_options,
+        }) catch |err| return try textResponse(self.alloc, 500, @errorName(err));
+        defer ledger.close();
+
+        const fenced = if (config.node_id) |node_id| blk: {
+            const store = self.ctx.fence_store orelse break :blk false;
+            const receipt = store.currentBorrowed() orelse break :blk false;
+            break :blk std.mem.eql(u8, receipt.old_primary_id, node_id);
+        } else false;
+        var page = ledger.readPage(self.alloc, query.kind, .{
+            .after = query.after,
+            .limit = query.limit,
+        }, .{
+            .authoritative_root = authoritative_root,
+            .runtime = .{
+                .node_id = config.node_id,
+                .role = config.role,
+                .pod_uid = config.pod_uid,
+                .fenced = fenced,
+                .observed_at_unix_ns = @import("../../platform/time.zig").realtimeNs(),
+            },
+        }) catch |err| return try textResponse(self.alloc, 500, @errorName(err));
+        defer page.deinit(self.alloc);
+
+        const entries = try self.alloc.alloc(admin_api.HASeedLifecycleReceiptEvent, page.entries.len);
+        defer self.alloc.free(entries);
+        for (page.entries, 0..) |entry, index| {
+            entries[index] = .{
+                .cursor = try adminI64(entry.cursor),
+                .kind = @tagName(entry.kind),
+                .generation = entry.generation,
+                .slot_name = entry.slot_name,
+                .topology_id = entry.topology_id,
+                .topology_generation = try adminI64(entry.topology_generation),
+                .node_id = entry.node_id,
+                .target_pvc_name = entry.target_pvc_name,
+                .target_pvc_uid = entry.target_pvc_uid,
+                .receipt_sha256 = entry.receipt_sha256,
+                .receipt_json = entry.receipt_json,
+                .recorded_at_unix_ns = try adminI64(entry.recorded_at_unix_ns),
+                .pod_uid = entry.pod_uid,
+                .authoritative_state = @tagName(entry.authoritative_state),
+            };
+        }
+        return try self.handleTypedJson(admin_api.HASeedLifecycleReceiptInventoryResponse{
+            .schema_version = 1,
+            .entries = entries,
+            .first_cursor = try adminI64(page.first_cursor),
+            .end_cursor = try adminI64(page.end_cursor),
+            .next_cursor = try adminI64(page.next_cursor),
+            .history_truncated = page.history_truncated,
+            .gap = page.gap,
+            .has_more = page.has_more,
+            .runtime = .{
+                .node_id = page.runtime.node_id,
+                .role = @tagName(page.runtime.role),
+                .pod_uid = page.runtime.pod_uid,
+                .fenced = page.runtime.fenced,
+                .observed_at_unix_ns = try adminI64(page.runtime.observed_at_unix_ns),
+            },
         });
     }
 
@@ -1685,6 +1804,60 @@ fn requestQuery(uri: []const u8) []const u8 {
     return uri[query_index + 1 .. fragment_index];
 }
 
+const LifecycleReceiptQuery = struct {
+    kind: lifecycle_receipt_ledger.Kind,
+    after: u64 = 0,
+    limit: usize = 100,
+};
+
+fn parseLifecycleReceiptQuery(query: []const u8) !LifecycleReceiptQuery {
+    if (query.len == 0 or std.mem.indexOfScalar(u8, query, '%') != null) return error.InvalidLifecycleReceiptQuery;
+    var kind: ?lifecycle_receipt_ledger.Kind = null;
+    var after: ?u64 = null;
+    var limit: ?usize = null;
+    var fields = std.mem.splitScalar(u8, query, '&');
+    while (fields.next()) |field| {
+        if (field.len == 0) return error.InvalidLifecycleReceiptQuery;
+        const separator = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidLifecycleReceiptQuery;
+        if (separator == 0 or separator + 1 >= field.len or
+            std.mem.indexOfScalarPos(u8, field, separator + 1, '=') != null)
+            return error.InvalidLifecycleReceiptQuery;
+        const key = field[0..separator];
+        const value = field[separator + 1 ..];
+        if (std.mem.eql(u8, key, "kind")) {
+            if (kind != null) return error.InvalidLifecycleReceiptQuery;
+            kind = if (std.mem.eql(u8, value, "capture"))
+                .capture
+            else if (std.mem.eql(u8, value, "activation"))
+                .activation
+            else
+                return error.InvalidLifecycleReceiptQuery;
+        } else if (std.mem.eql(u8, key, "after")) {
+            if (after != null) return error.InvalidLifecycleReceiptQuery;
+            after = try parseUnsignedQueryValue(u64, value);
+        } else if (std.mem.eql(u8, key, "limit")) {
+            if (limit != null) return error.InvalidLifecycleReceiptQuery;
+            const parsed = try parseUnsignedQueryValue(usize, value);
+            if (parsed == 0 or parsed > lifecycle_receipt_ledger.max_page_limit)
+                return error.InvalidLifecycleReceiptQuery;
+            limit = parsed;
+        } else {
+            return error.InvalidLifecycleReceiptQuery;
+        }
+    }
+    return .{
+        .kind = kind orelse return error.InvalidLifecycleReceiptQuery,
+        .after = after orelse 0,
+        .limit = limit orelse 100,
+    };
+}
+
+fn parseUnsignedQueryValue(comptime T: type, value: []const u8) !T {
+    if (value.len == 0) return error.InvalidLifecycleReceiptQuery;
+    for (value) |byte| if (byte < '0' or byte > '9') return error.InvalidLifecycleReceiptQuery;
+    return std.fmt.parseInt(T, value, 10) catch return error.InvalidLifecycleReceiptQuery;
+}
+
 fn knownFixedRoute(path: []const u8) bool {
     return std.mem.eql(u8, path, Routes.health) or
         std.mem.eql(u8, path, Routes.ready) or
@@ -1701,6 +1874,7 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate) or
+        std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or

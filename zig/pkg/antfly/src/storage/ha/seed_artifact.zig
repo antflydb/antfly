@@ -21,7 +21,8 @@ const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
 pub const legacy_format_version: u16 = 1;
-pub const format_version: u16 = 2;
+pub const chunked_format_version: u16 = 2;
+pub const format_version: u16 = 3;
 pub const complete_name = "COMPLETE.json";
 pub const manifest_name = "manifest.afha";
 pub const receipt_name = ".antfly-ha-seed-receipt.json";
@@ -45,11 +46,24 @@ pub const Store = struct {
     prefix: []const u8 = "",
 };
 
+/// Controller-verified topology and target-volume authority carried through
+/// capture, portable publication, restore, and activation.
+pub const LifecycleBinding = struct {
+    topology_id: []const u8 = "",
+    topology_generation: u64 = 0,
+    node_id: []const u8 = "",
+    target_pvc_name: []const u8 = "",
+    target_pvc_uid: []const u8 = "",
+};
+
 pub const PublishRequest = struct {
     generation: []const u8,
     slot_name: []const u8,
     manifest_bytes: []const u8,
     content_root: []const u8,
+    /// Null is retained only for direct legacy-v2 callers. Production CLI and
+    /// operator workflows require this and therefore publish format v3.
+    binding: ?LifecycleBinding = null,
     limits: Limits = .{},
 };
 
@@ -58,6 +72,7 @@ pub const ExpectedArtifact = struct {
     slot_name: []const u8,
     identity: standby_mod.Identity,
     minimum_checkpoint_lsn: u64 = 0,
+    binding: ?LifecycleBinding = null,
 };
 
 pub const RestoreRequest = struct {
@@ -146,6 +161,11 @@ pub const Receipt = struct {
     aggregate_sha256: []const u8,
     total_bytes: u64,
     files: []const FileReceipt,
+    topology_id: []const u8 = "",
+    topology_generation: u64 = 0,
+    node_id: []const u8 = "",
+    target_pvc_name: []const u8 = "",
+    target_pvc_uid: []const u8 = "",
 
     pub fn identity(self: Receipt) standby_mod.Identity {
         return .{
@@ -234,12 +254,13 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
     if (request.manifest_bytes.len > request.limits.max_manifest_bytes) return error.ManifestTooLarge;
     if (request.limits.max_chunk_bytes == 0 or request.limits.max_chunk_bytes > request.limits.max_file_bytes)
         return error.InvalidArtifactChunkSize;
+    if (request.binding) |binding| try validateLifecycleBinding(binding);
 
     const complete_key = try generationKeyAlloc(alloc, store.prefix, request.generation, complete_name);
     defer alloc.free(complete_key);
     if (getOptionalObject(alloc, store, complete_key, request.limits.max_receipt_bytes)) |existing| {
         defer alloc.free(existing);
-        try validateExistingReceipt(alloc, existing, request.generation, request.slot_name, request.manifest_bytes);
+        try validateExistingReceipt(alloc, existing, request.generation, request.slot_name, request.manifest_bytes, request.binding);
         return .{ .receipt_json = try alloc.dupe(u8, existing), .already_available = true };
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -353,8 +374,9 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
     const aggregate_hex = try hexAlloc(alloc, &aggregate_digest);
     defer alloc.free(aggregate_hex);
 
+    const binding = request.binding;
     const receipt_json = try std.json.Stringify.valueAlloc(alloc, Receipt{
-        .format_version = format_version,
+        .format_version = if (binding != null) format_version else chunked_format_version,
         .generation = request.generation,
         .slot_name = request.slot_name,
         .cluster_id = manifest.identity.cluster_id,
@@ -369,6 +391,11 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
         .aggregate_sha256 = aggregate_hex,
         .total_bytes = total_bytes,
         .files = file_views,
+        .topology_id = if (binding) |value| value.topology_id else "",
+        .topology_generation = if (binding) |value| value.topology_generation else 0,
+        .node_id = if (binding) |value| value.node_id else "",
+        .target_pvc_name = if (binding) |value| value.target_pvc_name else "",
+        .target_pvc_uid = if (binding) |value| value.target_pvc_uid else "",
     }, .{});
     errdefer alloc.free(receipt_json);
     if (receipt_json.len > request.limits.max_receipt_bytes) return error.ArtifactReceiptTooLarge;
@@ -711,13 +738,20 @@ fn readOptionalLocalFileAlloc(alloc: Allocator, path: []const u8, max_bytes: usi
 }
 
 fn validateReceipt(receipt: Receipt, expected: ExpectedArtifact, limits: Limits) !void {
-    if (receipt.format_version != legacy_format_version and receipt.format_version != format_version)
+    if (receipt.format_version != legacy_format_version and receipt.format_version != chunked_format_version and receipt.format_version != format_version)
         return error.UnsupportedArtifactVersion;
     if (limits.max_chunk_bytes == 0 or limits.max_chunk_bytes > limits.max_file_bytes)
         return error.InvalidArtifactChunkSize;
     if (!std.mem.eql(u8, receipt.generation, expected.generation)) return error.WrongArtifactGeneration;
     if (!std.mem.eql(u8, receipt.slot_name, expected.slot_name)) return error.WrongArtifactSlot;
     try expectIdentity(expected.identity, receipt.identity());
+    if (receipt.format_version == format_version) {
+        const binding = expected.binding orelse return error.ArtifactBindingRequired;
+        try validateLifecycleBinding(binding);
+        try expectLifecycleBinding(binding, receipt);
+    } else if (expected.binding != null) {
+        return error.ArtifactBindingMissing;
+    }
     if (receipt.manifest_id.len == 0) return error.InvalidManifestId;
     if (receipt.backup_lsn == 0 or receipt.checkpoint_lsn < receipt.backup_lsn) return error.InvalidArtifactBoundary;
     if (receipt.checkpoint_lsn < expected.minimum_checkpoint_lsn) return error.StaleSeedArtifact;
@@ -733,7 +767,7 @@ fn validateReceipt(receipt: Receipt, expected: ExpectedArtifact, limits: Limits)
         total = try std.math.add(u64, total, file.size_bytes);
         switch (receipt.format_version) {
             legacy_format_version => if (file.chunks != null) return error.InvalidArtifactChunks,
-            format_version => {
+            chunked_format_version, format_version => {
                 const chunks = file.chunks orelse return error.InvalidArtifactChunks;
                 var chunk_total: u64 = 0;
                 for (chunks, 0..) |chunk, chunk_index| {
@@ -764,16 +798,43 @@ fn validateManifestAgainstReceipt(manifest: backup_manifest.ManifestView, receip
     }
 }
 
-fn validateExistingReceipt(alloc: Allocator, raw: []const u8, generation: []const u8, slot_name: []const u8, manifest_bytes: []const u8) !void {
+fn validateExistingReceipt(
+    alloc: Allocator,
+    raw: []const u8,
+    generation: []const u8,
+    slot_name: []const u8,
+    manifest_bytes: []const u8,
+    binding: ?LifecycleBinding,
+) !void {
     var parsed = std.json.parseFromSlice(Receipt, alloc, raw, .{}) catch return error.GenerationConflict;
     defer parsed.deinit();
-    if ((parsed.value.format_version != legacy_format_version and parsed.value.format_version != format_version) or
+    if ((parsed.value.format_version != legacy_format_version and parsed.value.format_version != chunked_format_version and parsed.value.format_version != format_version) or
         !std.mem.eql(u8, parsed.value.generation, generation) or !std.mem.eql(u8, parsed.value.slot_name, slot_name)) return error.GenerationConflict;
+    if (binding) |expected_binding| {
+        if (parsed.value.format_version != format_version) return error.GenerationConflict;
+        expectLifecycleBinding(expected_binding, parsed.value) catch return error.GenerationConflict;
+    } else if (parsed.value.format_version == format_version) return error.GenerationConflict;
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(manifest_bytes, &digest, .{});
     const hex = try hexAlloc(alloc, &digest);
     defer alloc.free(hex);
     if (!std.mem.eql(u8, parsed.value.manifest_sha256, hex)) return error.GenerationConflict;
+}
+
+fn validateLifecycleBinding(binding: LifecycleBinding) !void {
+    if (!validation.isIdentifier(binding.topology_id)) return error.InvalidArtifactTopologyId;
+    if (binding.topology_generation == 0) return error.InvalidArtifactTopologyGeneration;
+    if (!validation.isIdentifier(binding.node_id)) return error.InvalidArtifactNodeId;
+    if (!validation.isIdentifier(binding.target_pvc_name)) return error.InvalidArtifactTargetPVCName;
+    if (!validation.isIdentifier(binding.target_pvc_uid)) return error.InvalidArtifactTargetPVCUID;
+}
+
+fn expectLifecycleBinding(expected: LifecycleBinding, actual: Receipt) !void {
+    if (!std.mem.eql(u8, expected.topology_id, actual.topology_id)) return error.WrongArtifactTopology;
+    if (expected.topology_generation != actual.topology_generation) return error.WrongArtifactTopologyGeneration;
+    if (!std.mem.eql(u8, expected.node_id, actual.node_id)) return error.WrongArtifactNode;
+    if (!std.mem.eql(u8, expected.target_pvc_name, actual.target_pvc_name)) return error.WrongArtifactTargetPVCName;
+    if (!std.mem.eql(u8, expected.target_pvc_uid, actual.target_pvc_uid)) return error.WrongArtifactTargetPVCUID;
 }
 
 fn expectIdentity(expected: standby_mod.Identity, actual: standby_mod.Identity) !void {
@@ -948,7 +1009,7 @@ fn checksumRemoteArtifactFile(
                 }
             }
         },
-        format_version => {
+        chunked_format_version, format_version => {
             const chunks = receipt.chunks orelse return error.InvalidArtifactChunks;
             for (chunks, 0..) |chunk, index| {
                 if (chunk.index != index) return error.InvalidArtifactChunks;
@@ -1066,7 +1127,7 @@ fn restoreArtifactFile(
                     }
                 }
             },
-            format_version => {
+            chunked_format_version, format_version => {
                 const chunks = receipt.chunks orelse return error.InvalidArtifactChunks;
                 for (chunks, 0..) |chunk, index| {
                     if (chunk.index != index) return error.InvalidArtifactChunks;

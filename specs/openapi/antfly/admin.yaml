@@ -414,6 +414,54 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/seed-lifecycle/receipts:
+    get:
+      tags: [ha]
+      operationId: getHASeedLifecycleReceipts
+      summary: Read durable runtime-owned HA seed lifecycle receipts
+      description: |
+        Returns an authenticated, read-only cursor page from the runtime-owned
+        append-only receipt ledger. `history_truncated` and `gap` make bounded
+        retention explicit so observers can fail closed when their collection
+        window is incomplete.
+      parameters:
+        - name: kind
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [capture, activation]
+        - name: after
+          in: query
+          required: false
+          description: Exclusive durable ledger cursor. Zero starts at the retained prefix.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: uint32
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: Durable receipt page and current runtime observation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HASeedLifecycleReceiptInventoryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Durable ledger or authoritative retained receipt is corrupt.
   /ha/base-backups/activate:
     post:
       tags: [ha]
@@ -790,6 +838,11 @@ components:
       required:
         - slot_name
         - generation
+        - topology_id
+        - topology_generation
+        - node_id
+        - target_pvc_name
+        - target_pvc_uid
       additionalProperties: false
       properties:
         slot_name:
@@ -799,6 +852,154 @@ components:
           minLength: 1
           maxLength: 256
           pattern: "^[A-Za-z0-9_.:-]+$"
+        topology_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        topology_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        node_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        target_pvc_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        target_pvc_uid:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+    HARuntimeLifecycleObservation:
+      type: object
+      required: [role, fenced, observed_at_unix_ns]
+      additionalProperties: false
+      properties:
+        node_id:
+          type: string
+          nullable: true
+        role:
+          type: string
+          enum: [primary, standby, unknown]
+        pod_uid:
+          type: string
+          nullable: true
+        fenced:
+          type: boolean
+        observed_at_unix_ns:
+          type: integer
+          format: uint64
+          minimum: 1
+    HASeedLifecycleReceiptEvent:
+      type: object
+      required:
+        - cursor
+        - kind
+        - generation
+        - slot_name
+        - topology_id
+        - topology_generation
+        - node_id
+        - target_pvc_name
+        - target_pvc_uid
+        - receipt_sha256
+        - receipt_json
+        - recorded_at_unix_ns
+        - authoritative_state
+      additionalProperties: false
+      properties:
+        cursor:
+          type: integer
+          format: uint64
+          minimum: 1
+        kind:
+          type: string
+          enum: [capture, activation]
+        generation:
+          type: string
+          minLength: 1
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        topology_id:
+          type: string
+          minLength: 1
+        topology_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        node_id:
+          type: string
+          minLength: 1
+        target_pvc_name:
+          type: string
+          minLength: 1
+        target_pvc_uid:
+          type: string
+          minLength: 1
+        receipt_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        receipt_json:
+          type: string
+          minLength: 2
+        recorded_at_unix_ns:
+          type: integer
+          format: uint64
+          minimum: 1
+        pod_uid:
+          type: string
+          nullable: true
+        authoritative_state:
+          type: string
+          enum: [retained, missing]
+    HASeedLifecycleReceiptInventoryResponse:
+      type: object
+      required:
+        - schema_version
+        - entries
+        - first_cursor
+        - end_cursor
+        - next_cursor
+        - history_truncated
+        - gap
+        - has_more
+        - runtime
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/HASeedLifecycleReceiptEvent"
+        first_cursor:
+          type: integer
+          format: uint64
+          minimum: 0
+        end_cursor:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_cursor:
+          type: integer
+          format: uint64
+          minimum: 0
+        history_truncated:
+          type: boolean
+        gap:
+          type: boolean
+        has_more:
+          type: boolean
+        runtime:
+          $ref: "#/components/schemas/HARuntimeLifecycleObservation"
     HASyncPolicy:
       type: object
       required: [mode]
@@ -1387,6 +1588,11 @@ components:
         - action
         - slot_name
         - generation
+        - topology_id
+        - topology_generation
+        - node_id
+        - target_pvc_name
+        - target_pvc_uid
         - cluster_id
         - shard_id
         - table_id
@@ -1415,6 +1621,22 @@ components:
         slot_name:
           $ref: "#/components/schemas/HASlotName"
         generation:
+          type: string
+          minLength: 1
+        topology_id:
+          type: string
+          minLength: 1
+        topology_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        node_id:
+          type: string
+          minLength: 1
+        target_pvc_name:
+          type: string
+          minLength: 1
+        target_pvc_uid:
           type: string
           minLength: 1
         cluster_id:

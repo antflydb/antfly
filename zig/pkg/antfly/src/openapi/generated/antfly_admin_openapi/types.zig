@@ -342,11 +342,24 @@ pub const HARetentionSnapshot = struct {
     reseed_recommended: i64,
 };
 
+pub const HARuntimeLifecycleObservation = struct {
+    node_id: ?[]const u8 = null,
+    role: []const u8,
+    pod_uid: ?[]const u8 = null,
+    fenced: bool,
+    observed_at_unix_ns: i64,
+};
+
 pub const HASeedArtifactCaptureResponse = struct {
     schema_version: i64,
     action: HAActionReceipt,
     slot_name: HASlotName,
     generation: []const u8,
+    topology_id: []const u8,
+    topology_generation: i64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
     cluster_id: i64,
     shard_id: i64,
     table_id: i64,
@@ -364,6 +377,35 @@ pub const HASeedArtifactCaptureResponse = struct {
     content_root: []const u8,
     manifest_path: []const u8,
     already_captured: bool,
+};
+
+pub const HASeedLifecycleReceiptEvent = struct {
+    cursor: i64,
+    kind: []const u8,
+    generation: []const u8,
+    slot_name: HASlotName,
+    topology_id: []const u8,
+    topology_generation: i64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
+    receipt_sha256: []const u8,
+    receipt_json: []const u8,
+    recorded_at_unix_ns: i64,
+    pod_uid: ?[]const u8 = null,
+    authoritative_state: []const u8,
+};
+
+pub const HASeedLifecycleReceiptInventoryResponse = struct {
+    schema_version: i64,
+    entries: []const HASeedLifecycleReceiptEvent,
+    first_cursor: i64,
+    end_cursor: i64,
+    next_cursor: i64,
+    history_truncated: bool,
+    gap: bool,
+    has_more: bool,
+    runtime: HARuntimeLifecycleObservation,
 };
 
 pub const HASeededSlotActivateResponse = struct {
@@ -507,6 +549,11 @@ pub const ReplicationSlotCreateRequest = struct {
 pub const SeedArtifactCaptureRequest = struct {
     slot_name: HASlotName,
     generation: []const u8,
+    topology_id: []const u8,
+    topology_generation: i64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
 };
 
 pub const SeededSlotActivateRequest = struct {

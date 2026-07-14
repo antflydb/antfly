@@ -1042,6 +1042,8 @@ pub fn runFromIterator(
     defer if (ha_former_primary_log) |*log| log.close();
     const ha_admin_bearer_token = try resolveHAAdminBearerTokenFromCli(alloc, cli);
     defer if (ha_admin_bearer_token) |token| alloc.free(token);
+    const ha_pod_uid = try resolveHAPodUID(alloc);
+    defer if (ha_pod_uid) |pod_uid| alloc.free(pod_uid);
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -1084,6 +1086,8 @@ pub fn runFromIterator(
             .standby_owner = if (ha_standby != null) &ha_standby else null,
             .admin_bearer_token = ha_admin_bearer_token,
             .seed_capture_root = cli.ha_seed_capture_root,
+            .seed_activation_root = cli.ha_startup_target_root,
+            .pod_uid = ha_pod_uid,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,
             .primary_sync_policy = ha_sync_policy.policy,
@@ -3056,6 +3060,13 @@ fn resolveHAAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?
     return try alloc.dupe(u8, token);
 }
 
+fn resolveHAPodUID(alloc: std.mem.Allocator) !?[]u8 {
+    const raw_z = std.c.getenv("ANTFLY_POD_UID") orelse return null;
+    const pod_uid = std.mem.trim(u8, std.mem.span(raw_z), " \t\r\n");
+    if (!antfly.ha.validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
+    return try alloc.dupe(u8, pod_uid);
+}
+
 fn ensureDirPath(io: std.Io, dir_path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
 }
@@ -3504,7 +3515,7 @@ test "swarm runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/db/v1/tables"));
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
     try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
-    try std.testing.expect(isAntfarmReservedPath("/admin/v1/ha/primary/status"));
+    try std.testing.expect(isAntfarmReservedPath(antfly.admin.routes.ha_primary_status));
     try std.testing.expect(isAntfarmReservedPath("/extensions/v1/packages"));
     try std.testing.expect(!isAntfarmReservedPath("/models"));
     try std.testing.expect(hasUnsafeStaticPath("../index.html"));
