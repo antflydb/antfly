@@ -25842,7 +25842,11 @@ fn batchAdvancesManagedIndexApplyState(
     switch (index_ref.kind) {
         .dense_vector, .sparse_vector => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
-            if (!try index_manager.requiresEnrichmentReplay(index_ref.name)) return true;
+            const artifact_backed_dense = if (index_ref.kind == .dense_vector)
+                if (index_manager.denseIndex(index_ref.name)) |entry| denseIndexIsArtifactBacked(entry) else false
+            else
+                false;
+            if (!try index_manager.requiresEnrichmentReplay(index_ref.name) and !artifact_backed_dense) return true;
             if (batch.changed_artifact_keys.len > 0) return true;
             if (index_ref.kind == .dense_vector) {
                 for (batch.dense_embeddings) |embedding| {
@@ -25884,9 +25888,17 @@ fn managedIndexRecordApplicability(
             return .irrelevant;
         },
         .dense_vector => {
-            if (record.changed_doc_keys.len > 0 or
-                record.deleted_doc_keys.len > 0 or
-                record.overwritten_doc_keys.len > 0) return .relevant;
+            if (record.deleted_doc_keys.len > 0 or record.overwritten_doc_keys.len > 0) return .relevant;
+            // Artifact-backed indexes consume generated artifact records, not
+            // the source document record that scheduled enrichment. Treating
+            // that source record as perpetually applicable prevents a clean
+            // target advance after an idempotent index recreate reuses already
+            // durable artifacts. The artifact target counter and active index
+            // cardinality below remain the completeness gate.
+            if (record.changed_doc_keys.len > 0) {
+                const entry = index_manager.denseIndex(index_ref.name);
+                if (entry == null or !denseIndexIsArtifactBacked(entry.?)) return .relevant;
+            }
             if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
             return .irrelevant;
         },
@@ -49870,14 +49882,13 @@ test "db catch-up rebuilds dense coverage before vacuous target advance" {
     defer alloc.free(artifact_key);
     try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
-    try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
-    var latest_raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
-    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
-    var batch = try db.core.store.beginWriteBatch();
-    errdefer batch.abort();
-    try batch.put(latest_key[0..], latest_raw[0..]);
-    try batch.commit();
+    const source_only_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = target_sequence,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(source_only_payload);
+    try db.core.store.appendReplayOpaque(alloc, target_sequence, source_only_payload);
 
     {
         const before = try db.listDerivedReplayDebt(alloc);

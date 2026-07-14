@@ -28,6 +28,19 @@ const TransitionRetry = struct {
     retry_at_ms: u64,
 };
 
+pub const RetryClock = struct {
+    ptr: ?*anyopaque = null,
+    now_ms_fn: *const fn (?*anyopaque) u64,
+
+    pub fn real() RetryClock {
+        return .{ .now_ms_fn = realMonotonicMillis };
+    }
+
+    pub fn nowMs(self: RetryClock) u64 {
+        return self.now_ms_fn(self.ptr);
+    }
+};
+
 pub const TransitionServiceMetrics = struct {
     queued_split_transitions: usize = 0,
     queued_merge_transitions: usize = 0,
@@ -62,6 +75,7 @@ pub const TransitionStepResult = struct {
 
 pub const TransitionService = struct {
     alloc: std.mem.Allocator,
+    retry_clock: RetryClock,
     ops: union(enum) {
         runtime: transition_runtime.TransitionRuntime,
         adapter: shard_ops.ShardOperationAdapter,
@@ -75,9 +89,14 @@ pub const TransitionService = struct {
     metrics: TransitionServiceMetrics = .{},
 
     pub fn init(alloc: std.mem.Allocator, ops: anytype) TransitionService {
+        return initWithRetryClock(alloc, ops, RetryClock.real());
+    }
+
+    pub fn initWithRetryClock(alloc: std.mem.Allocator, ops: anytype, retry_clock: RetryClock) TransitionService {
         const OpsType = @TypeOf(ops);
         return .{
             .alloc = alloc,
+            .retry_clock = retry_clock,
             .ops = if (@hasField(OpsType, "ptr") and @hasField(OpsType, "vtable"))
                 .{ .adapter = .{
                     .ptr = ops.ptr,
@@ -214,13 +233,14 @@ pub const TransitionService = struct {
 
     pub fn stepPending(self: *TransitionService) !TransitionStepResult {
         var result = TransitionStepResult{};
+        const now_ms = self.retry_clock.nowMs();
         const runtime = self.metadataRuntime();
 
         for (self.pending_split.items) |*record| {
             if (record.phase == .finalized or record.phase == .rolled_back) continue;
-            if (retryPending(&self.split_retries, record.transition_id, monotonicMillis())) continue;
+            if (retryPending(&self.split_retries, record.transition_id, now_ms)) continue;
             const observation = runtime.observeSplit(record.*) catch |err| {
-                try recordRetry(self.alloc, &self.split_retries, record.transition_id, monotonicMillis());
+                try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms);
                 std.log.warn("split transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 continue;
             };
@@ -233,7 +253,7 @@ pub const TransitionService = struct {
                 else => {},
             }
             _ = metadata.TransitionDriver.stepSplitObserved(runtime, record, observation) catch |err| {
-                try recordRetry(self.alloc, &self.split_retries, record.transition_id, monotonicMillis());
+                try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms);
                 std.log.warn("split transition step failed transition_id={d} phase={s} err={s}", .{ record.transition_id, @tagName(record.phase), @errorName(err) });
                 continue;
             };
@@ -250,9 +270,9 @@ pub const TransitionService = struct {
 
         for (self.pending_merge.items) |*record| {
             if (record.phase == .finalized or record.phase == .rolled_back) continue;
-            if (retryPending(&self.merge_retries, record.transition_id, monotonicMillis())) continue;
+            if (retryPending(&self.merge_retries, record.transition_id, now_ms)) continue;
             const observation = runtime.observeMerge(record.*) catch |err| {
-                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, monotonicMillis());
+                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms);
                 std.log.warn("merge transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 continue;
             };
@@ -265,7 +285,7 @@ pub const TransitionService = struct {
                 else => {},
             }
             _ = metadata.TransitionDriver.stepMergeObserved(runtime, record, observation) catch |err| {
-                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, monotonicMillis());
+                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms);
                 std.log.warn("merge transition step failed transition_id={d} phase={s} err={s}", .{ record.transition_id, @tagName(record.phase), @errorName(err) });
                 continue;
             };
@@ -414,7 +434,7 @@ pub const TransitionService = struct {
     }
 };
 
-fn monotonicMillis() u64 {
+fn realMonotonicMillis(_: ?*anyopaque) u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 }
 
