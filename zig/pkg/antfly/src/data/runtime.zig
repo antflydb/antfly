@@ -16170,7 +16170,11 @@ test "data server wires configured HA executors into API server" {
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const capture_fixture_root = try std.fmt.allocPrint(alloc, "/private/tmp/data-runtime-ha-seed-capture-{d}", .{nonce});
+    const capture_fixture_root_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-seed-capture-{d}", .{nonce});
+    defer alloc.free(capture_fixture_root_rel);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const capture_fixture_root = try std.fs.path.resolve(alloc, &.{ cwd, capture_fixture_root_rel });
     defer alloc.free(capture_fixture_root);
     const replica_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "replicas" });
     defer alloc.free(replica_root);
