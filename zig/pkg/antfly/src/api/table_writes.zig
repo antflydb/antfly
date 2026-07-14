@@ -95,6 +95,12 @@ fn isTransientWriterOpenConflict(err: anyerror) bool {
     return err == error.LsmRootWriterAlreadyOpen or err == error.WriterLocked;
 }
 
+fn isTransientRestoreRepairError(err: anyerror) bool {
+    return isTransientWriterOpenConflict(err) or
+        err == error.ReplayDocumentNotVisible or
+        err == error.EnrichmentRetryInProgress;
+}
+
 const TestExecutionHook = struct {
     ptr: *anyopaque,
     run: *const fn (ptr: *anyopaque) void,
@@ -7218,6 +7224,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn publishRestoreRepairComplete(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.invalidateWriteCacheForTable(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
         self.clearDirtyWriteTable(table_name);
         self.notifyLocalChange(table_name, .data);
     }
@@ -7387,7 +7394,15 @@ pub const ProvisionedTableWriteSource = struct {
             while (true) {
                 if (work.source.restore_repair_shutdown.load(.acquire)) return;
                 attempts += 1;
-                const busy = try work.repairOnce(path);
+                const busy = work.repairOnce(path) catch |err| retry: {
+                    if (!isTransientRestoreRepairError(err)) return err;
+                    std.log.info("restore background catch-up transient retry table={s} group_id={d} err={s}", .{
+                        work.table_name,
+                        work.group_id,
+                        @errorName(err),
+                    });
+                    break :retry true;
+                };
                 const still_needed = try db_mod.DB.restoreRuntimeRepairNeededForPath(work.alloc, path);
                 if (!busy and !still_needed) {
                     work.source.enqueueRestoreRepairComplete(work.table_name);

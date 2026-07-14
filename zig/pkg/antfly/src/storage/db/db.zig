@@ -8451,15 +8451,28 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "rebuild_artifacts")) {
             std.log.info("restore runtime repair rebuild stored embedding artifacts path={s}", .{self.core.path});
-            _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            const rebuilt = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            std.log.info("restore runtime repair rebuilt stored embedding artifacts path={s} count={d}", .{ self.core.path, rebuilt });
             try self.updateRestoreRuntimeRepairPhase(alloc, "replay_enrichments", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "replay_enrichments")) {
             if (self.core.hasGeneratedEnrichmentTargets()) {
-                if (self.enrichment_runtime == null) return error.RestoreRepairRequiresEnrichmentRuntime;
+                const runtime = self.enrichment_runtime orelse return error.RestoreRepairRequiresEnrichmentRuntime;
                 std.log.info("restore runtime repair replay generated enrichments path={s}", .{self.core.path});
-                _ = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+                // A restored enrichment checkpoint can be equal to the first
+                // destination replay sequence even when the destination has
+                // no generated artifacts. Quiesce the worker before resetting
+                // and appending so it cannot advance the checkpoint across an
+                // empty replay window between those two operations.
+                runtime.stop();
+                errdefer runtime.start() catch |start_err| {
+                    std.log.warn("restore runtime repair enrichment restart failed path={s} err={}", .{ self.core.path, start_err });
+                };
+                try runtime.resumeFrom(0, self.core.nextDerivedSequence());
+                const generated_refs = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+                try runtime.start();
+                std.log.info("restore runtime repair replayed generated enrichments path={s} refs={d}", .{ self.core.path, generated_refs });
             }
             try self.updateRestoreRuntimeRepairPhase(alloc, "drain_async", false);
             return true;
@@ -8472,6 +8485,7 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
             std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
+            try self.core.index_manager.syncAll(true);
             try markRestoreRuntimeRepairComplete(alloc, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
@@ -10539,12 +10553,35 @@ pub const DB = struct {
     }
 
     fn runRestoreRepairDrainAsync(self: *DB) !void {
-        // Earlier repair phases synchronously rebuild restored runtime state.
-        // At this point only persisted applied-sequence watermarks need to be
-        // flushed before the final index sync/complete marker. Do not call
-        // runUntilIdle here: large portable restores can leave substantial
-        // replay, posting-maintenance, or LSM maintenance debt, and queries
-        // remain correct while that background-maintenance debt is paid down.
+        // Generated enrichment replay is asynchronous with respect to the
+        // replay append performed by the preceding repair phase. The restore
+        // completion marker is also the query-readiness barrier, so drain all
+        // replay stages to a stable sequence before publishing it. Keep
+        // posting, text-merge, artifact-metadata, and LSM maintenance outside
+        // this barrier; those can continue in the background without hiding
+        // logically restored query results.
+        if (self.enrichment_runtime) |runtime| {
+            const before = runtime.stats();
+            std.log.info("restore runtime repair enrichment drain begin path={s} applied={d} target={d} processed={d} skipped={d}", .{
+                self.core.path,
+                before.applied_sequence,
+                before.target_sequence,
+                before.processed_requests,
+                before.skip_by_hash_count,
+            });
+        }
+        try self.drainReplayStagesUntilStable();
+        if (self.enrichment_runtime) |runtime| {
+            const after = runtime.stats();
+            std.log.info("restore runtime repair enrichment drain complete path={s} applied={d} target={d} processed={d} skipped={d} errors={d}", .{
+                self.core.path,
+                after.applied_sequence,
+                after.target_sequence,
+                after.processed_requests,
+                after.skip_by_hash_count,
+                after.error_count,
+            });
+        }
         try self.flushAppliedSequencesForIdle();
     }
 
