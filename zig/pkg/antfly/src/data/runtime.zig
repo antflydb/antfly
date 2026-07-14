@@ -1557,6 +1557,64 @@ pub const HASeedSnapshotProvider = struct {
     }
 };
 
+const ha_seed_snapshot_format_version: u16 = 1;
+const ha_seed_snapshot_topology_name = "TOPOLOGY.json";
+const ha_seed_snapshot_max_topology_bytes = 16 * 1024 * 1024;
+const ha_seed_snapshot_max_store_bytes: u64 = 64 * 1024 * 1024 * 1024;
+
+const HASeedSnapshotTopologyReplica = struct {
+    group_id: u64,
+    table_id: u64,
+    table_name: []const u8,
+    snapshot_path: []const u8,
+    logical_sha256: []const u8,
+};
+
+const HASeedSnapshotTopology = struct {
+    format_version: u16 = ha_seed_snapshot_format_version,
+    generation: []const u8,
+    replicas: []const HASeedSnapshotTopologyReplica,
+};
+
+fn haSeedSnapshotFileSha256HexAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) ![]u8 {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.HASeedSnapshotUnexpectedArtifact;
+    if (stat.size > ha_seed_snapshot_max_store_bytes) return error.HASeedSnapshotStoreTooLarge;
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const read = try reader.interface.readSliceShort(&buffer);
+        if (read == 0) break;
+        total = try std.math.add(u64, total, read);
+        if (total > ha_seed_snapshot_max_store_bytes) return error.HASeedSnapshotStoreTooLarge;
+        hasher.update(buffer[0..read]);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const encoded = try alloc.alloc(u8, digest.len * 2);
+    for (digest, 0..) |byte, index| {
+        encoded[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        encoded[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return encoded;
+}
+
+fn validLowerSha256(value: []const u8) bool {
+    if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (value) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
+    }
+    return true;
+}
+
 pub const HASyncWaitConfig = struct {
     max_rounds: usize = 200,
     sleep_ns: u64 = 10 * std.time.ns_per_ms,
@@ -2857,6 +2915,218 @@ pub const DataServer = struct {
         return self.ha_public_gate_state.ownerJobsCanRun();
     }
 
+    fn defaultHASeedSnapshotProvider(self: *DataServer) HASeedSnapshotProvider {
+        return .{ .ptr = self, .prepare_fn = prepareDefaultHASeedSnapshotCallback };
+    }
+
+    fn prepareDefaultHASeedSnapshotCallback(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return try self.prepareDefaultHASeedSnapshot(alloc, request);
+    }
+
+    fn prepareDefaultHASeedSnapshot(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        const catalog_path = self.replica_catalog_path orelse return error.HASeedCaptureCatalogMissing;
+        const snapshots_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{request.capture_root});
+        defer alloc.free(snapshots_root);
+        const building_name = try std.fmt.allocPrint(alloc, ".building-{s}", .{request.generation});
+        defer alloc.free(building_name);
+        const building_root = try std.fs.path.join(alloc, &.{ snapshots_root, building_name });
+        defer alloc.free(building_root);
+        const published_root = try std.fs.path.join(alloc, &.{ snapshots_root, request.generation });
+        errdefer alloc.free(published_root);
+
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try fs_paths.createDirPathPortable(io, snapshots_root);
+        std.Io.Dir.cwd().deleteTree(io, building_root) catch {};
+        std.Io.Dir.cwd().deleteTree(io, published_root) catch {};
+        try fs_paths.createDirPathPortable(io, building_root);
+        errdefer std.Io.Dir.cwd().deleteTree(io, building_root) catch {};
+
+        var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, catalog_path);
+        defer replica_catalog.deinit();
+        const records = try replica_catalog.catalog().listReplicas(alloc);
+        defer {
+            for (records) |*record| record.deinit(alloc);
+            alloc.free(records);
+        }
+        if (records.len == 0) return error.HASeedSnapshotEmptyCatalog;
+        std.mem.sort(antfly.raft.ReplicaRecord, records, {}, struct {
+            fn lessThan(_: void, left: antfly.raft.ReplicaRecord, right: antfly.raft.ReplicaRecord) bool {
+                return left.group_id < right.group_id;
+            }
+        }.lessThan);
+
+        var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+
+        var topology_replicas = std.ArrayListUnmanaged(HASeedSnapshotTopologyReplica).empty;
+        defer {
+            for (topology_replicas.items) |replica| {
+                alloc.free(replica.snapshot_path);
+                alloc.free(replica.logical_sha256);
+            }
+            topology_replicas.deinit(alloc);
+        }
+
+        for (records, 0..) |record, index| {
+            if (index > 0 and records[index - 1].group_id == record.group_id)
+                return error.HASeedSnapshotDuplicateReplica;
+            const range = findHASeedRange(metadata_snapshot.ranges, record.group_id) orelse
+                return error.HASeedSnapshotReplicaMissingFromTopology;
+            const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
+                return error.HASeedSnapshotTableMissingFromTopology;
+            const snapshot_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{record.group_id});
+            errdefer alloc.free(snapshot_path);
+            const destination_root = try std.fs.path.join(alloc, &.{ building_root, snapshot_path });
+            defer alloc.free(destination_root);
+            const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ request.generation, record.group_id });
+            defer alloc.free(snapshot_token);
+            try self.write_source.captureHASeedReplicaSnapshot(
+                alloc,
+                table.name,
+                record.group_id,
+                snapshot_token,
+                destination_root,
+            );
+            const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
+            defer alloc.free(store_path);
+            const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
+            errdefer alloc.free(digest);
+            try topology_replicas.append(alloc, .{
+                .group_id = record.group_id,
+                .table_id = range.table_id,
+                .table_name = table.name,
+                .snapshot_path = snapshot_path,
+                .logical_sha256 = digest,
+            });
+        }
+
+        const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
+            .generation = request.generation,
+            .replicas = topology_replicas.items,
+        }, .{});
+        defer alloc.free(topology_json);
+        if (topology_json.len > ha_seed_snapshot_max_topology_bytes) return error.HASeedSnapshotTopologyTooLarge;
+        const topology_path = try std.fs.path.join(alloc, &.{ building_root, ha_seed_snapshot_topology_name });
+        defer alloc.free(topology_path);
+        const topology_temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{topology_path});
+        defer alloc.free(topology_temp_path);
+        {
+            var file = try std.Io.Dir.cwd().createFile(io, topology_temp_path, .{ .truncate = true });
+            defer file.close(io);
+            try file.writeStreamingAll(io, topology_json);
+            try file.sync(io);
+        }
+        if (std.fs.path.isAbsolute(topology_path))
+            try std.Io.Dir.renameAbsolute(topology_temp_path, topology_path, io)
+        else
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), topology_temp_path, std.Io.Dir.cwd(), topology_path, io);
+        try fs_paths.syncDirPortable(io, building_root);
+
+        if (std.fs.path.isAbsolute(published_root))
+            try std.Io.Dir.renameAbsolute(building_root, published_root, io)
+        else
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), building_root, std.Io.Dir.cwd(), published_root, io);
+        try fs_paths.syncDirPortable(io, snapshots_root);
+        return .{ .root = published_root };
+    }
+
+    fn findHASeedRange(ranges: []const antfly.metadata.RangeRecord, group_id: u64) ?antfly.metadata.RangeRecord {
+        for (ranges) |range| if (range.group_id == group_id) return range;
+        return null;
+    }
+
+    fn findHASeedTable(tables: []const antfly.metadata.TableRecord, table_id: u64) ?antfly.metadata.TableRecord {
+        for (tables) |table| if (table.table_id == table_id) return table;
+        return null;
+    }
+
+    fn validateHASeedPreparedSnapshot(
+        alloc: std.mem.Allocator,
+        capture_root: []const u8,
+        generation: []const u8,
+        prepared_root: []const u8,
+    ) !void {
+        const allowed_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{capture_root});
+        defer alloc.free(allowed_root);
+        if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
+            std.mem.eql(u8, prepared_root, allowed_root)) return error.InvalidHASeedSnapshotRoot;
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const topology_path = try std.fs.path.join(alloc, &.{ prepared_root, ha_seed_snapshot_topology_name });
+        defer alloc.free(topology_path);
+        const topology_json = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            topology_path,
+            alloc,
+            .limited(ha_seed_snapshot_max_topology_bytes),
+        );
+        defer alloc.free(topology_json);
+        var parsed = std.json.parseFromSlice(
+            HASeedSnapshotTopology,
+            alloc,
+            topology_json,
+            .{ .ignore_unknown_fields = false },
+        ) catch return error.InvalidHASeedSnapshotTopology;
+        defer parsed.deinit();
+        const topology = parsed.value;
+        if (topology.format_version != ha_seed_snapshot_format_version or
+            !std.mem.eql(u8, topology.generation, generation) or topology.replicas.len == 0)
+            return error.InvalidHASeedSnapshotTopology;
+
+        for (topology.replicas, 0..) |replica, index| {
+            if (index > 0 and topology.replicas[index - 1].group_id >= replica.group_id)
+                return error.InvalidHASeedSnapshotTopology;
+            const expected_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{replica.group_id});
+            defer alloc.free(expected_path);
+            if (!std.mem.eql(u8, replica.snapshot_path, expected_path) or
+                replica.table_id == 0 or replica.table_name.len == 0 or
+                !validLowerSha256(replica.logical_sha256))
+                return error.InvalidHASeedSnapshotTopology;
+            const store_path = try std.fs.path.join(alloc, &.{ prepared_root, replica.snapshot_path, "store.bin" });
+            defer alloc.free(store_path);
+            const actual_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
+            defer alloc.free(actual_digest);
+            if (!std.mem.eql(u8, actual_digest, replica.logical_sha256))
+                return error.HASeedSnapshotLogicalDigestMismatch;
+        }
+
+        var root = try std.Io.Dir.cwd().openDir(io, prepared_root, .{ .iterate = true });
+        defer root.close(io);
+        var walker = try root.walk(alloc);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory) {
+                if (std.mem.eql(u8, entry.path, "replicas")) continue;
+                for (topology.replicas) |replica| {
+                    if (std.mem.eql(u8, entry.path, replica.snapshot_path)) break;
+                } else return error.HASeedSnapshotUnexpectedArtifact;
+                continue;
+            }
+            if (entry.kind != .file) return error.HASeedSnapshotUnexpectedArtifact;
+            if (std.mem.eql(u8, entry.path, ha_seed_snapshot_topology_name)) continue;
+            for (topology.replicas) |replica| {
+                const store_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "store.bin" });
+                defer alloc.free(store_rel);
+                if (std.mem.eql(u8, entry.path, store_rel)) break;
+                const journal_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "change-journal.bin" });
+                defer alloc.free(journal_rel);
+                if (std.mem.eql(u8, entry.path, journal_rel)) break;
+            } else return error.HASeedSnapshotUnexpectedArtifact;
+        }
+    }
+
     fn captureHASeedCallback(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -2881,20 +3151,23 @@ pub const DataServer = struct {
         }
         const capture_root = self.ha_cfg.seed_capture_root orelse return error.HASeedCaptureRootMissing;
         const node_id = ctx.primary_node_id orelse return error.HAPrimaryNodeIdMissing;
-        const catalog_path = self.replica_catalog_path orelse return error.HASeedCaptureCatalogMissing;
+        if (self.lsm_maintenance_active.load(.acquire) or self.auto_bulk_finish_active.load(.acquire))
+            return error.HASeedSnapshotRuntimeBusy;
+        var activity_lease = try self.write_source.acquireHASeedCaptureActivityLease();
+        defer activity_lease.release();
+        const provider = self.ha_cfg.seed_snapshot_provider orelse self.defaultHASeedSnapshotProvider();
+        var prepared = try provider.prepare(alloc, .{
+            .capture_root = capture_root,
+            .generation = generation,
+        });
+        defer prepared.deinit(alloc);
+        try validateHASeedPreparedSnapshot(alloc, capture_root, generation, prepared.root);
 
-        const sources = [_]antfly.ha.seed_capture.Source{
-            .{ .tree = .{
-                .source_root = self.write_source.replica_root_dir,
-                .artifact_prefix = "replicas",
-                .kind = .artifact,
-            } },
-            .{ .file = .{
-                .source_path = catalog_path,
-                .artifact_path = "catalog.txt",
-                .kind = .metadata,
-            } },
-        };
+        const sources = [_]antfly.ha.seed_capture.Source{.{ .tree = .{
+            .source_root = prepared.root,
+            .artifact_prefix = "",
+            .kind = .artifact,
+        } }};
         var capture = try antfly.ha.seed_capture.captureWithExclusiveLease(alloc, .{
             .primary = primary,
             .barrier = &self.ha_mutation_barrier,
@@ -15770,7 +16043,9 @@ const TestHASeedSnapshotProvider = struct {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        const prepared_root = try std.fs.path.join(alloc, &.{ request.capture_root, ".test-provider", request.generation });
+        const provider_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{request.capture_root});
+        defer alloc.free(provider_root);
+        const prepared_root = try std.fs.path.join(alloc, &.{ provider_root, request.generation });
         errdefer alloc.free(prepared_root);
         std.Io.Dir.cwd().deleteTree(io, prepared_root) catch {};
         const replica_snapshot_root = try std.fs.path.join(alloc, &.{ prepared_root, "replicas/group-1" });
@@ -16012,6 +16287,7 @@ test "data server wires configured HA executors into API server" {
         .body = capture_body,
     });
     defer capture_resp.deinit(alloc);
+    if (capture_resp.status != 200) std.debug.print("HA seed capture failed status={d} body={s}\n", .{ capture_resp.status, capture_resp.body });
     try std.testing.expectEqual(@as(u16, 200), capture_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);

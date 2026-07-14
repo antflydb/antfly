@@ -3998,6 +3998,8 @@ pub const DB = struct {
     }
 
     pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         lockApply(self);
         {
             defer self.core.unlockApply();
@@ -4010,6 +4012,8 @@ pub const DB = struct {
     }
 
     pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         lockApply(self);
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
@@ -4019,6 +4023,8 @@ pub const DB = struct {
     }
 
     pub fn abortBulkIngestSession(self: *DB) void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         lockApply(self);
         {
             defer self.core.unlockApply();
@@ -4260,6 +4266,12 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        return try self.runLsmMaintenanceStepWithHAMutationHeld();
+    }
+
+    fn runLsmMaintenanceStepWithHAMutationHeld(self: *DB) !bool {
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -4280,6 +4292,8 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -4298,6 +4312,8 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -4308,6 +4324,8 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -4330,6 +4348,8 @@ pub const DB = struct {
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         var steps: usize = 0;
         while (steps < max_steps) : (steps += 1) {
             var progressed = false;
@@ -4339,7 +4359,7 @@ pub const DB = struct {
             if (!progressed) {
                 const wake_due = if (self.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
                 if (!wake_due) break;
-                if (!try self.runLsmMaintenanceStep()) break;
+                if (!try self.runLsmMaintenanceStepWithHAMutationHeld()) break;
             }
         }
         return steps;

@@ -6409,6 +6409,114 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
+    /// Holds the table-activity admission mutex for the full HA snapshot.
+    /// Existing activity fails closed; new structural/group operations cannot
+    /// begin after the preflight while the global mutation barrier is held.
+    pub const HASeedCaptureActivityLease = struct {
+        source: *ProvisionedTableWriteSource,
+        active: bool = true,
+
+        pub fn release(self: *@This()) void {
+            if (!self.active) return;
+            self.source.table_activity_mutex.unlock(self.source.table_activity_threaded.io());
+            self.active = false;
+        }
+    };
+
+    pub fn acquireHASeedCaptureActivityLease(self: *ProvisionedTableWriteSource) !HASeedCaptureActivityLease {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        errdefer self.table_activity_mutex.unlock(io);
+
+        for (self.active_table_activities.items) |activity| {
+            if (activity.table_request_active > 0 or activity.operation_active or activity.structural_active)
+                return error.HASeedSnapshotRuntimeBusy;
+        }
+        if (self.startup_catch_up_active.load(.acquire)) return error.HASeedSnapshotRuntimeBusy;
+
+        lockAtomic(&self.local_db_mutex);
+        defer self.local_db_mutex.unlock();
+        if (writerCacheHasHASeedBlockingActivity(self.write_cache) or
+            writerCacheHasHASeedBlockingActivity(self.startup_write_cache))
+            return error.HASeedSnapshotRuntimeBusy;
+
+        return .{ .source = self };
+    }
+
+    fn writerCacheHasHASeedBlockingActivity(cache: ?*ProvisionedTableWriteCache) bool {
+        const value = cache orelse return false;
+        if (value.active_bulk_ingest_sessions.items.len > 0) return true;
+        for (value.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open or
+                entry.auto_bulk_ingest_finish_requested) return true;
+        }
+        return false;
+    }
+
+    /// Exports one managed replica through DB's logical snapshot primitive.
+    /// Live backend files are never copied. Ephemeral backends are rejected so
+    /// callers cannot mistake process-local state for a restartable seed.
+    pub fn captureHASeedReplicaSnapshot(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        snapshot_token: []const u8,
+        destination_root: []const u8,
+    ) !void {
+        var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
+        defer probe.deinit();
+        switch (probe) {
+            .unknown => return error.HASeedSnapshotRuntimeBusy,
+            .leased => |*cached| return try captureHASeedDbSnapshot(
+                alloc,
+                cached.db,
+                cached.db.core.path,
+                snapshot_token,
+                destination_root,
+            ),
+            .absent => {},
+        }
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        _ = Io.Dir.cwd().statFile(io_impl.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.HASeedSnapshotReplicaMissing,
+            else => return err,
+        };
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
+            alloc,
+            path,
+            self.catalog,
+            table_name,
+            group_id,
+            self.backend_runtime,
+            self.ha_write_gate,
+            self.ha_async_mirror,
+        );
+        defer db.close();
+        return try captureHASeedDbSnapshot(alloc, &db, path, snapshot_token, destination_root);
+    }
+
+    fn captureHASeedDbSnapshot(
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        db_path: []const u8,
+        snapshot_token: []const u8,
+        destination_root: []const u8,
+    ) !void {
+        switch (db.primary_backend) {
+            .lmdb, .lsm => {},
+            .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
+        }
+        _ = try db.snapshot(snapshot_token);
+        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
+        defer alloc.free(snapshot_root);
+        try backups_api.copyDirectoryRecursive(alloc, snapshot_root, destination_root);
+    }
+
     fn hasActiveBulkIngestSessionForTableBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
