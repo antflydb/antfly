@@ -561,6 +561,12 @@ def test_artifact_backed_embedding_table_provisions_atomically(
         stateful_api.get_index(table_name, "document_vectors")["config"]["type"]
         == "embeddings"
     )
+    table_status = stateful_api.get_table(table_name)
+    assert all(
+        isinstance(enrichment, dict)
+        for index_name in ("document_text", "document_vectors")
+        for enrichment in table_status["indexes"][index_name]["enrichments"]
+    )
 
     doc_key = "atomic-doc"
     batch = stateful_api.batch_write(
