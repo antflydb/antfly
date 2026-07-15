@@ -108,6 +108,45 @@
     },
     "decision": "codec_retained_as_portable_foundation_but_did_not_close_end_to_end_term_gap_in_isolation"
   },
+  "rejected_v36_payload_aligned_impacts": {
+    "documents": 5032105,
+    "segments": 10,
+    "index_bytes": 3254674194,
+    "tantivy_index_bytes": 3251494143,
+    "index_cpu_ns": 381745204000,
+    "index_peak_rss_bytes": 1912881152,
+    "cpu_per_query_ns": {
+      "term": 128701,
+      "union": 624533,
+      "intersection": 313220,
+      "phrase": 494000
+    },
+    "term_alpha_work": {
+      "payload_blocks_skipped": 6,
+      "candidates_scored": 15459,
+      "v35_document_ranges_skipped": 4067,
+      "v35_candidates_scored": 2179
+    },
+    "correctness": "5_of_5_exact_queries_passed",
+    "decision": "rejected_sparse_terms_lost_document_local_pruning_despite_near_exact_size_parity"
+  },
+  "rejected_v37_adaptive_impact_palette": {
+    "documents": 5032105,
+    "segments": 10,
+    "index_bytes": 3409090313,
+    "bytes_saved_vs_v35": 278776,
+    "index_cpu_ns": 403491594000,
+    "index_peak_rss_bytes": 1976352768,
+    "cpu_per_query_ns": {
+      "term": 85844,
+      "union": 268741,
+      "intersection": 211750,
+      "phrase": 540682
+    },
+    "pruning_counters_match_v35": true,
+    "correctness": "5_of_5_exact_queries_passed",
+    "decision": "rejected_bound_pairs_were_too_high_entropy_for_material_palette_compression_and_term_cpu_regressed"
+  },
   "correctness": {
     "strict_query_results_unchanged": true,
     "diagnostic_work_counters_unchanged": true,

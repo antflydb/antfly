@@ -74,8 +74,9 @@ const platform_time = @import("../platform/time.zig");
 //        repeated (frequency ceiling, minimum norm) pairs through a per-term
 //        palette; v36 remains a measured, rejected branch-only experiment
 //
-// Writers emit v37. The production reader accepts v23, the exact format shipped
-// by origin/main when this migration began, and v37. Versions v24-v36 were
+// Writers emit v35. The production reader accepts v23, the exact format shipped
+// by origin/main when this migration began, and v35. Versions v24-v34 plus the
+// measured/rejected v36-v37 experiments are
 // development-only experiments on this branch and are deliberately not part of
 // the compatibility contract.
 
@@ -94,7 +95,7 @@ const wire_version_packed_impact_frequency: u8 = 34;
 const wire_version_vertical_bp128: u8 = 35;
 const wire_version_payload_aligned_impacts: u8 = 36;
 const wire_version_impact_palette: u8 = 37;
-const wire_version_current: u8 = wire_version_impact_palette;
+const wire_version_current: u8 = wire_version_vertical_bp128;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_header_size: usize = 4;
 const postings_skip_record_size_v23: usize = 8;
@@ -1943,7 +1944,7 @@ const PostingAccumulator = struct {
         const doc_freq: u32 = @intCast(self.doc_ids.items.len);
         if (doc_freq == 0) return error.InvalidData;
         if (config.chunk_size == 0) return error.InvalidData;
-        const posting_count_blocks = config.postings_layout == .posting_count_v37;
+        const posting_count_blocks = config.postings_layout == .posting_count_v35;
         const separate_impact_ranges = usesSeparateImpactRanges(config.wireVersion());
         const payload_aligned_impacts = usesPayloadAlignedImpacts(config.wireVersion());
 
@@ -2800,7 +2801,18 @@ pub const BlockMaxInfo = struct {
     palette_bits: u8 = 0,
 
     fn palettePairAt(self: BlockMaxInfo, ordinal: usize) u16 {
-        const palette_id = readPackedU32At(self.palette_ids, ordinal, self.palette_bits) catch return 0;
+        const palette_id: u8 = if (self.palette_bits == 0)
+            0
+        else blk: {
+            const bit_position = ordinal * @as(usize, self.palette_bits);
+            const byte_index = bit_position >> 3;
+            if (byte_index >= self.palette_ids.len) return 0;
+            const bit_shift: u4 = @intCast(bit_position & 7);
+            const window = @as(u16, self.palette_ids[byte_index]) |
+                (if (byte_index + 1 < self.palette_ids.len) @as(u16, self.palette_ids[byte_index + 1]) << 8 else 0);
+            const mask: u16 = (@as(u16, 1) << @intCast(self.palette_bits)) - 1;
+            break :blk @intCast((window >> bit_shift) & mask);
+        };
         const offset = @as(usize, palette_id) * 2;
         if (offset + 2 > self.palette.len) return 0;
         return (@as(u16, self.palette[offset]) << 8) | self.palette[offset + 1];
@@ -2883,6 +2895,12 @@ pub const BlockMaxInfo = struct {
 
     fn maxImpactAtOrdinalWithIdf(self: BlockMaxInfo, ordinal: usize, avg_dl: f32, idf: f32, config: BM25Config) f32 {
         if (ordinal >= self.chunkCount()) return 0;
+        if (self.palette.len > 0) {
+            const pair = self.palettePairAt(ordinal);
+            const max_freq = impactMaxFreqFromPackedId(@truncate(pair >> 8));
+            if (max_freq == 0) return 0;
+            return bm25ScoreWithIdf(max_freq, fieldNormFromId(@truncate(pair)), avg_dl, idf, config);
+        }
         const offset = if (self.packed_impact_frequency) ordinal else ordinal * self.recordSize();
         const max_freq = self.maxFreqAt(offset);
         const min_norm = self.minNormAt(offset);
@@ -4396,15 +4414,15 @@ const PostingsLayout = enum {
     /// Branch-only v27 writer retained solely to construct compatibility and
     /// layout regression fixtures. Production readers reject its output.
     legacy_fixture_v27,
-    /// v37: portable vertical BP128 payloads with selectively useful document
-    /// range bounds and adaptive pair-palette compression.
-    posting_count_v37,
+    /// v35: portable vertical BP128 payloads with selective document-range
+    /// bounds and compact five-bit frequency ceilings.
+    posting_count_v35,
 };
 
 pub const IndexConfig = struct {
     /// Documents per v27 range or postings per v28 block.
     chunk_size: u32 = 128,
-    postings_layout: PostingsLayout = .posting_count_v37,
+    postings_layout: PostingsLayout = .posting_count_v35,
     /// Build a per-segment term bloom filter that lets readers reject absent
     /// terms before walking the FST. Defaults on for current segments and is
     /// auto-skipped when the term count falls below `bloom_min_terms`.
@@ -4416,14 +4434,14 @@ pub const IndexConfig = struct {
     pub fn wireVersion(self: IndexConfig) u8 {
         return switch (self.postings_layout) {
             .legacy_fixture_v27 => wire_version_chunk_framed_positions,
-            .posting_count_v37 => wire_version_impact_palette,
+            .posting_count_v35 => wire_version_vertical_bp128,
         };
     }
 
     pub fn postingsLayoutName(self: IndexConfig) []const u8 {
         return switch (self.postings_layout) {
             .legacy_fixture_v27 => "legacy_fixture_doc_range",
-            .posting_count_v37 => "fixed_posting_count_palette_impact_ranges_contiguous_positions_inline_single_doc_two_column_meta_constant_frequency_vertical_bp128",
+            .posting_count_v35 => "fixed_posting_count_sparse_impacts_contiguous_positions_inline_single_doc_two_column_meta_constant_frequency_five_bit_impact_frequency_vertical_bp128",
         };
     }
 };
@@ -5621,7 +5639,7 @@ test "v37 adaptive impact palette preserves conservative bound pairs" {
         else
             try appendImpactRecord(alloc, &scratch.impact_block_max, 5, 15);
     }
-    try encodeImpactMetadata(alloc, &scratch, 128, wire_version_current);
+    try encodeImpactMetadata(alloc, &scratch, 128, wire_version_impact_palette);
     try std.testing.expect(scratch.impact_uses_palette);
     try std.testing.expectEqual(@as(u8, 2), scratch.impact_encoded.items[0]);
     try std.testing.expectEqual(@as(u8, 1), scratch.impact_encoded.items[1]);
@@ -5630,7 +5648,7 @@ test "v37 adaptive impact palette preserves conservative bound pairs" {
         .chunk_size = impact_range_doc_count,
         .chunk_meta_data = &.{},
         .chunk_meta_count = 128,
-        .version = wire_version_current,
+        .version = wire_version_impact_palette,
         .packed_impact_frequency = true,
         .palette = scratch.impact_encoded.items[2..6],
         .palette_ids = scratch.impact_encoded.items[6..],
@@ -5642,7 +5660,7 @@ test "v37 adaptive impact palette preserves conservative bound pairs" {
     try std.testing.expectEqual(@as(u32, 15), bm.minNormAt(1));
 }
 
-test "v37 one posting block retains one global impact bound" {
+test "current one posting block retains one global impact bound" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
@@ -6090,7 +6108,7 @@ test "PostingsIterator deferred positional seek decodes only accepted candidates
     try std.testing.expect(try iter.advanceToDeferredPositions(9) == null);
 }
 
-test "production reader rejects branch-only v24-v36 formats" {
+test "production reader rejects branch-only v24-v34 formats" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 4 });
     defer builder.deinit();

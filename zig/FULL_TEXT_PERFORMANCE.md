@@ -1566,7 +1566,7 @@ The next term work therefore targets blocks, not individual values:
    only if the SIMD decoder remains dominant. A v35 format is acceptable when
    the end-to-end CPU win survives its disk, page-touch, and merge-cost impact.
    Production compatibility remains origin/main v23 plus the new current
-   writer format; development-only v24-v36 formats need not become a permanent
+   writer format; development-only v24-v34 and rejected v36-v37 formats need not become a permanent
    compatibility chain.
 4. Replace repeated block-max BM25 arithmetic with a snapshot/field-scoped
    lookup over the existing five-bit frequency bucket and eight-bit norm ID.
@@ -1605,15 +1605,20 @@ payload blocks and scored 15,459 candidates versus v35's 4,067 pruned ranges
 and 2,179 scored candidates. Term/union/intersection CPU regressed to
 128.7/624.5/313.2 us despite phrase improving to 494.0 us.
 
-v37 therefore restores the selective 1,024-document bounds and their adaptive
+v37 tested restoring the selective 1,024-document bounds and their adaptive
 range IDs, but compresses repeated exact `(five-bit frequency ceiling,
 eight-bit minimum norm)` pairs through a per-term palette. A palette is used
 only when it is smaller than the direct 13-bit columns; fewer than eight records
 bypass palette construction, and more than 64 distinct pairs fall back to the
 direct representation. Palette lookup is allocation-free and O(1) on the query
 path. This preserves v35 pruning coordinates while attacking their measured
-storage rather than trading them away. The focused suite explicitly covers
-palette and direct behavior and passes 52 tests with zero failures or leaks.
+storage rather than trading them away. It restored the v35 work counters
+exactly, but produced a 3,409,090,313-byte index--only 278,776 bytes below v35--
+and raised term CPU from 64.4 to 85.8 us. The bound-pair distribution is too
+high-entropy for a per-term palette, so v37 is rejected. Production remains on
+v35 while the next storage design is developed from measured range data. The
+focused suite explicitly covers the experimental palette/direct behavior and
+passes 53 tests with zero failures or leaks.
 
 Phrase needs a separate positional fast path after those shared wins:
 
@@ -2170,7 +2175,7 @@ Postings and block-max changes affect persistent compatibility. All experiments
 must retain version dispatch for formats that have actually shipped. At the
 start of this work, `origin/main` both writes and accepts exactly inverted-index
 wire format v23. The production upgrade contract is therefore v23 to the
-accepted v37 layout. Intermediate v24-v36 formats created only during this
+accepted v35 layout. Intermediate v24-v34 plus rejected v36-v37 formats created only during this
 branch's experiments are not release contracts: the production reader rejects
 them rather than carrying their codecs indefinitely. Benchmark artifacts that
 use those formats may be inspected with the corresponding historical binary or
