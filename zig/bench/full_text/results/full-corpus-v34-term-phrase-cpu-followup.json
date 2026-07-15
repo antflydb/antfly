@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "status": "profiled_rejected_scalar_prototypes_next_work_scoped",
-  "comparison_boundary": "reused_settled_v34_full_corpus_index",
+  "status": "precomputed_bm25_bounded_bound_table_packed_phrase_stream_and_portable_vector_prefix_sum_accepted",
+  "comparison_boundary": "reused_settled_v35_full_corpus_index",
   "source_index": {
     "documents": 5032105,
-    "wire_version": 34,
+    "wire_version": 35,
     "segments": 10,
-    "bytes": 3406622680
+    "bytes": 3409369089
   },
   "accepted_starting_point": {
     "evidence": "full-corpus-v34-direct-scoring-advance.json",
@@ -27,6 +27,16 @@
       "execute_scored_phrase_filter_exclusive": 704,
       "skip_position_record": 388,
       "decode_packed_u32": 332
+    },
+    "post_bm25_term_top_of_stack_samples": {
+      "load_chunk": 1705,
+      "search_internal_exclusive": 1124,
+      "next_scoring": 944,
+      "read_compact_chunk_meta_at_checkpoint": 764,
+      "advance_to": 665,
+      "current_block_max_impact_with_scorer": 587,
+      "live_doc_collect": 490,
+      "portable_vertical_bp128_decode": 397
     }
   },
   "rejected_prototypes": {
@@ -147,6 +157,179 @@
     "correctness": "5_of_5_exact_queries_passed",
     "decision": "rejected_bound_pairs_were_too_high_entropy_for_material_palette_compression_and_term_cpu_regressed"
   },
+  "accepted_precomputed_bm25_term_scorer": {
+    "persisted_format_changed": false,
+    "implementation": "retain_idf_times_k1_plus_one_k1_times_one_minus_b_and_k1_times_b_over_avg_field_length_per_wand_term",
+    "baseline_cpu_per_query_ns": {
+      "term_runs": [65826, 65776],
+      "term_mean": 65801,
+      "union_mean": 228938,
+      "intersection_mean": 185434.5,
+      "phrase_mean": 528534
+    },
+    "candidate_cpu_per_query_ns": {
+      "term_runs": [62971, 63538],
+      "term_mean": 63254.5,
+      "union_mean": 224885.5,
+      "intersection_mean": 185646.5,
+      "phrase_mean": 534899
+    },
+    "change_percent": {
+      "term": -3.87,
+      "union": -1.77,
+      "intersection": 0.114,
+      "phrase": 1.204
+    },
+    "correctness": "5_of_5_strict_queries_match_archived_tantivy_with_1e-5_absolute_and_relative_score_tolerance",
+    "work_counters_unchanged": true,
+    "decision": "accepted_repeatable_term_and_union_cpu_reduction_with_no_disk_or_rss_cost"
+  },
+  "accepted_snapshot_bm25_bound_table": {
+    "persisted_format_changed": false,
+    "implementation": "snapshot_scoped_idf_independent_32_by_256_packed_frequency_norm_table_with_prebiased_conservative_values",
+    "cache_policy": {
+      "key": "exact_float_bits_of_avg_field_length_k1_and_b",
+      "maximum_tables_per_snapshot": 4,
+      "maximum_value_bytes_per_snapshot": 131072,
+      "overflow_behavior": "scalar_bound_fallback",
+      "legacy_v23_behavior": "scalar_bound_fallback"
+    },
+    "precomputed_scorer_baseline_cpu_per_query_ns": {
+      "term_mean": 63254.5,
+      "union_mean": 224885.5,
+      "intersection_mean": 185646.5,
+      "phrase_mean": 534899
+    },
+    "candidate_cpu_per_query_ns": {
+      "term_runs": [56109, 56014],
+      "term_mean": 56061.5,
+      "union_runs": [219285, 209827],
+      "union_mean": 214556,
+      "intersection_mean": 185361,
+      "phrase_mean": 517872
+    },
+    "change_percent_vs_precomputed_scorer": {
+      "term": -11.37,
+      "union": -4.59,
+      "intersection": -0.154,
+      "phrase": -3.18
+    },
+    "term_cpu_ratio_to_archived_tantivy": 1.4005,
+    "conservative_bound_validation": "all_8192_packed_frequency_norm_pairs_checked_at_six_idfs_after_one_time_eight_ulp_prebias",
+    "work_counter_note": "upward_rounding_scored_17_more_alpha_and_6_more_gamma_cutoff_candidates_while_remaining_conservative",
+    "correctness": "5_of_5_strict_queries_match_archived_tantivy_with_1e-5_absolute_and_relative_score_tolerance",
+    "query_peak_rss_bytes": 23347200,
+    "decision": "accepted_repeatable_term_and_union_cpu_reduction_with_bounded_snapshot_memory_and_scalar_fallback"
+  },
+  "rejected_bulk_position_group_advance": {
+    "persisted_format_changed": false,
+    "baseline_cpu_per_query_ns": {
+      "term": 66192,
+      "union": 225862,
+      "intersection": 184003,
+      "phrase": 556929
+    },
+    "candidate_cpu_per_query_ns": {
+      "term": 65563,
+      "union": 228604,
+      "intersection": 185130,
+      "phrase": 573291
+    },
+    "phrase_change_percent": 2.938,
+    "correctness": "5_of_5_queries_passed_and_phrase_work_counters_unchanged",
+    "decision": "rejected_complete_group_branch_and_cursor_updates_cost_more_than_per_document_skip_on_the_measured_candidate_pattern"
+  },
+  "rejected_decoded_two_term_position_merge": {
+    "persisted_format_changed": false,
+    "baseline_phrase_cpu_per_query_ns": 517872,
+    "candidate_phrase_cpu_per_query_ns": 517442,
+    "phrase_change_percent": -0.083,
+    "correctness": "5_of_5_queries_passed_and_phrase_work_counters_unchanged",
+    "decision": "rejected_statistically_flat_after_replacing_generic_array_search_with_a_monotonic_two_array_merge"
+  },
+  "rejected_hybrid_doc_block_lower_bound": {
+    "persisted_format_changed": false,
+    "baseline_phrase_cpu_per_query_ns": 517872,
+    "candidate_phrase_cpu_per_query_ns": 599483,
+    "phrase_change_percent": 15.759,
+    "correctness": "5_of_5_queries_passed_and_phrase_work_counters_unchanged",
+    "decision": "rejected_branch_and_binary_search_overhead_regressed_the_measured_candidate_distribution"
+  },
+  "accepted_packed_two_term_phrase_stream": {
+    "persisted_format_changed": false,
+    "implementation": "zero_copy_bounded_views_over_grouped_position_bits_with_two_monotonic_cumulative_delta_cursors",
+    "fallbacks": "generic_n_term_slop_legacy_v23_and_noncontiguous_position_layouts_keep_the_materialized_array_verifier",
+    "baseline_phrase_cpu_per_query_ns": 517872,
+    "candidate_cpu_per_query_ns": {
+      "phrase_runs": [
+        425670,
+        423973
+      ],
+      "phrase_mean": 424821.5,
+      "term_mean": 55155,
+      "union_mean": 206952,
+      "intersection_mean": 182077.5
+    },
+    "phrase_change_percent": -17.968,
+    "phrase_cpu_ratio_to_archived_tantivy": 1.2317,
+    "query_peak_rss_bytes": 23281664,
+    "correctness": "two_independent_runs_each_strictly_match_all_5_archived_tantivy_queries",
+    "work_counters": {
+      "phrase_candidates": 3571,
+      "phrase_position_records_decoded": 7142,
+      "phrase_matches": 525
+    },
+    "decision": "accepted_repeatable_phrase_cpu_reduction_with_no_disk_growth_materialization_or_work_amplification"
+  },
+  "accepted_portable_vector_document_prefix_sum": {
+    "persisted_format_changed": false,
+    "implementation": "fuse_vertical_bp128_document_delta_decode_with_portable_vector_four_lane_inclusive_scan_and_cross_vector_carry",
+    "vector_primitive": "@Vector(4,u32)",
+    "platform_specific_intrinsics": false,
+    "fallback": "legacy_v23_and_non_vertical_or_partial_blocks_keep_the_scalar_prefix_sum",
+    "packed_phrase_baseline_cpu_per_query_ns": {
+      "term": 55155,
+      "union": 206952,
+      "intersection": 182077.5,
+      "phrase": 424821.5
+    },
+    "candidate_cpu_per_query_ns": {
+      "term_runs": [
+        47337,
+        48183
+      ],
+      "term_mean": 47760,
+      "union_runs": [
+        191882,
+        189918
+      ],
+      "union_mean": 190900,
+      "intersection_runs": [
+        159832,
+        163232
+      ],
+      "intersection_mean": 161532,
+      "phrase_runs": [
+        391034,
+        410231
+      ],
+      "phrase_mean": 400632.5
+    },
+    "change_percent": {
+      "term": -13.408,
+      "union": -7.756,
+      "intersection": -11.284,
+      "phrase": -5.694
+    },
+    "cpu_ratio_to_archived_tantivy": {
+      "term": 1.1932,
+      "phrase": 1.1616
+    },
+    "query_peak_rss_bytes": 23642112,
+    "correctness": "two_independent_runs_each_strictly_match_all_5_archived_tantivy_queries_with_unchanged_work_counters",
+    "validation": "all_0_through_32_bit_widths_match_scalar_wrapping_prefix_sums_and_the_focused_release_suite_passes_58_of_58",
+    "decision": "accepted_repeatable_all_class_cpu_reduction_without_disk_format_or_material_memory_cost"
+  },
   "correctness": {
     "strict_query_results_unchanged": true,
     "diagnostic_work_counters_unchanged": true,
@@ -155,10 +338,7 @@
     "phrase_matches": 525
   },
   "next_implementation_order": [
-    "replace_sparse_1024_doc_impact_ranges_with_payload_aligned_block_max_bounds",
-    "bulk_position_group_cursor_advance",
-    "hybrid_doc_block_lower_bound",
-    "packed_two_term_phrase_intersection",
+    "develop_sparse_impact_metadata_without_losing_v35_document_local_pruning",
     "evaluate_sparse_position_group_offsets_only_if_profiles_still_require_them"
   ]
 }

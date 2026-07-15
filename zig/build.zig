@@ -6358,10 +6358,10 @@ pub fn build(b: *std.Build) void {
             "phrase filter with slop",
             "PostingsIterator positional seek decodes only selected records",
             "PostingsIterator deferred positional seek decodes only accepted candidates",
-            "production reader rejects branch-only v24-v34 formats",
+            "PostingsIterator streams deferred grouped positions without scratch arrays",
+            "production reader rejects branch-only v24-v37 formats",
             "v12 positions are bit-packed smaller than raw u32",
             "v12 reads back positions with wide packed deltas",
-            "v37 adaptive impact palette preserves conservative bound pairs",
             "current one posting block retains one global impact bound",
             "v29 impact frequency escape remains a conservative upper bound",
             "v29 adaptive impact IDs use runs and round-trip",
@@ -6372,10 +6372,15 @@ pub fn build(b: *std.Build) void {
             "v33 constant-frequency blocks omit packed frequency payload",
             "v34 five-bit impact frequencies are conservative upper bounds",
             "v35 full posting blocks use portable vertical BP128 for docs and frequencies",
+            "portable vertical BP128 round-trips every bit width",
+            "portable vertical BP128 fuses document delta prefix sums",
             "PostingsIterator advanceTo uses sparse skip data for long postings",
             "current reader reopens origin-main v23 postings and block-max layout",
             "index-only stored fields preserve ordinals key ranges and merges",
             "v25 field norms match Tantivy quantization",
+            "BM25 term scorer retains query-invariant arithmetic",
+            "BM25 bound table matches packed impact and norm domains",
+            "snapshot BM25 bound table cache is reused and bounded",
             "v25 norm table uses one byte per document and reads legacy packed norms",
             "v22 term dictionary block values compact one-hit terms and delta postings offsets",
             "v23 term dictionary stores front-coded blocks indexed by block ceiling",
@@ -6436,6 +6441,21 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_search_benchmark_bitpack_bench.addArgs(args);
     const search_bench_bitpack_step = b.step("search-bench-bitpack-bench", "Benchmark portable Zig vector BP128 against horizontal bit packing");
     search_bench_bitpack_step.dependOn(&run_search_benchmark_bitpack_bench.step);
+
+    const search_impact_layout_analyze_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_impact_layout_analyze.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_impact_layout_analyze_mod.addImport("antfly-zig", lib_mod);
+    const search_impact_layout_analyze = b.addExecutable(.{
+        .name = "search_impact_layout_analyze",
+        .root_module = search_impact_layout_analyze_mod,
+    });
+    const run_search_impact_layout_analyze = b.addRunArtifact(search_impact_layout_analyze);
+    if (b.args) |args| run_search_impact_layout_analyze.addArgs(args);
+    const search_impact_layout_analyze_step = b.step("search-impact-layout-analyze", "Project exact adaptive impact-column density for segment files");
+    search_impact_layout_analyze_step.dependOn(&run_search_impact_layout_analyze.step);
 
     const wand_skip_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/wand_skip_bench.zig"),

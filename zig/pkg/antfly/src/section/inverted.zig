@@ -73,10 +73,12 @@ const platform_time = @import("../platform/time.zig");
 //   v37: restores the selective 1,024-document bounds and adaptively encodes
 //        repeated (frequency ceiling, minimum norm) pairs through a per-term
 //        palette; v36 remains a measured, rejected branch-only experiment
+//   v38: v35 query structures + a compact postings header that derives block
+//        count, compact-metadata length, and skip length; single-block terms
+//        also omit redundant impact count and range-ID length fields
 //
-// Writers emit v35. The production reader accepts v23, the exact format shipped
-// by origin/main when this migration began, and v35. Versions v24-v34 plus the
-// measured/rejected v36-v37 experiments are
+// Writers emit v38. The production reader accepts v23, the exact format shipped
+// by origin/main when this migration began, and v38. Versions v24-v37 are
 // development-only experiments on this branch and are deliberately not part of
 // the compatibility contract.
 
@@ -94,8 +96,8 @@ const wire_version_constant_block_frequency: u8 = 33;
 const wire_version_packed_impact_frequency: u8 = 34;
 const wire_version_vertical_bp128: u8 = 35;
 const wire_version_payload_aligned_impacts: u8 = 36;
-const wire_version_impact_palette: u8 = 37;
-const wire_version_current: u8 = wire_version_vertical_bp128;
+const wire_version_compact_postings_header: u8 = 38;
+const wire_version_current: u8 = wire_version_compact_postings_header;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_header_size: usize = 4;
 const postings_skip_record_size_v23: usize = 8;
@@ -164,8 +166,6 @@ fn appendImpactRecord(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), max_fr
     }));
 }
 
-const impact_palette_max_entries: usize = 64;
-
 fn encodeImpactMetadata(
     alloc: Allocator,
     scratch: *PostingSerializeScratch,
@@ -181,52 +181,7 @@ fn encodeImpactMetadata(
         scratch.doc_deltas.appendAssumeCapacity(impactMaxFreqToPackedId(scratch.impact_block_max.items[ordinal * 2]));
     }
 
-    // Tiny lists cannot repay the three-byte palette header and dictionary.
-    // Bypass hashing entirely on the overwhelmingly common short path.
-    if (usesImpactPalette(version) and count >= 8) {
-        scratch.impact_palette_pairs.clearRetainingCapacity();
-        scratch.impact_palette_ids.clearRetainingCapacity();
-        scratch.impact_palette_map.clearRetainingCapacity();
-        try scratch.impact_palette_ids.ensureTotalCapacity(alloc, count);
-        var palette_possible = true;
-        for (0..count) |ordinal| {
-            const packed_freq: u8 = @intCast(scratch.doc_deltas.items[ordinal]);
-            const norm_id = scratch.impact_block_max.items[ordinal * 2 + 1];
-            const pair = (@as(u16, packed_freq) << 8) | norm_id;
-            var palette_id = scratch.impact_palette_map.get(pair);
-            if (palette_id == null) {
-                if (scratch.impact_palette_pairs.items.len == impact_palette_max_entries) {
-                    palette_possible = false;
-                    break;
-                }
-                const new_id: u8 = @intCast(scratch.impact_palette_pairs.items.len);
-                try scratch.impact_palette_pairs.append(alloc, pair);
-                try scratch.impact_palette_map.put(alloc, pair, new_id);
-                palette_id = new_id;
-            }
-            scratch.impact_palette_ids.appendAssumeCapacity(palette_id.?);
-        }
-
-        if (palette_possible) {
-            const palette_bits = maxBitWidth(scratch.impact_palette_ids.items);
-            const palette_len = 2 + scratch.impact_palette_pairs.items.len * 2 +
-                packedU32ByteLen(count, palette_bits);
-            const direct_len = packedU32ByteLen(count, 5) + count;
-            if (palette_len < direct_len) {
-                scratch.impact_uses_palette = true;
-                try scratch.impact_encoded.appendSlice(alloc, &.{
-                    @intCast(scratch.impact_palette_pairs.items.len),
-                    palette_bits,
-                });
-                for (scratch.impact_palette_pairs.items) |pair| {
-                    try scratch.impact_encoded.appendSlice(alloc, &.{ @truncate(pair >> 8), @truncate(pair) });
-                }
-                _ = try appendPackedU32(alloc, &scratch.impact_encoded, scratch.impact_palette_ids.items, palette_bits);
-                return;
-            }
-        }
-    }
-
+    _ = version;
     _ = try appendPackedU32(alloc, &scratch.impact_encoded, scratch.doc_deltas.items, 5);
     for (0..count) |ordinal| try scratch.impact_encoded.append(alloc, scratch.impact_block_max.items[ordinal * 2 + 1]);
 }
@@ -377,8 +332,8 @@ fn usesPayloadAlignedImpacts(version: u8) bool {
     return version == wire_version_payload_aligned_impacts;
 }
 
-fn usesImpactPalette(version: u8) bool {
-    return version >= wire_version_impact_palette;
+fn usesCompactPostingsHeader(version: u8) bool {
+    return version >= wire_version_compact_postings_header;
 }
 
 fn metadataChunkSize(version: u8, chunk_size: u32) u32 {
@@ -1234,10 +1189,6 @@ const PostingSerializeScratch = struct {
     impact_block_max: std.ArrayListUnmanaged(u8) = .empty,
     impact_ids: std.ArrayListUnmanaged(u8) = .empty,
     impact_encoded: std.ArrayListUnmanaged(u8) = .empty,
-    impact_palette_pairs: std.ArrayListUnmanaged(u16) = .empty,
-    impact_palette_ids: std.ArrayListUnmanaged(u32) = .empty,
-    impact_palette_map: std.AutoHashMapUnmanaged(u16, u8) = .empty,
-    impact_uses_palette: bool = false,
 
     fn reset(self: *PostingSerializeScratch) void {
         self.chunks.clearRetainingCapacity();
@@ -1260,10 +1211,6 @@ const PostingSerializeScratch = struct {
         self.impact_block_max.clearRetainingCapacity();
         self.impact_ids.clearRetainingCapacity();
         self.impact_encoded.clearRetainingCapacity();
-        self.impact_palette_pairs.clearRetainingCapacity();
-        self.impact_palette_ids.clearRetainingCapacity();
-        self.impact_palette_map.clearRetainingCapacity();
-        self.impact_uses_palette = false;
     }
 
     fn deinit(self: *PostingSerializeScratch, alloc: Allocator) void {
@@ -1287,9 +1234,6 @@ const PostingSerializeScratch = struct {
         self.impact_block_max.deinit(alloc);
         self.impact_ids.deinit(alloc);
         self.impact_encoded.deinit(alloc);
-        self.impact_palette_pairs.deinit(alloc);
-        self.impact_palette_ids.deinit(alloc);
-        self.impact_palette_map.deinit(alloc);
     }
 };
 
@@ -2148,29 +2092,36 @@ const PostingAccumulator = struct {
             scratch.impact_encoded.items.len
         else
             scratch.impact_block_max.items.len;
-        const encoded_impact_count = if (usesImpactPalette(config.wireVersion()))
-            (impact_count << 1) | @intFromBool(scratch.impact_uses_palette)
-        else
-            impact_count;
-        const header_len =
+        const compact_postings_header = usesCompactPostingsHeader(config.wireVersion());
+        const header_len = if (compact_postings_header)
             varintU32Size(doc_freq) +
-            varintU32Size(stored_chunks) +
-            varintU32Size(chunk_meta_len) +
-            varintU32Size(payload_len) +
-            varintU32Size(positions_len) +
-            varintU32Size(skip_len) +
-            (if (separate_impact_ranges) varintU32Size(encoded_impact_count) + varintU32Size(impact_ids_len) else 0);
+                varintU32Size(payload_len) +
+                varintU32Size(positions_len) +
+                (if (separate_impact_ranges and doc_freq > config.chunk_size)
+                    varintU32Size(impact_count) + varintU32Size(impact_ids_len)
+                else
+                    0)
+        else
+            varintU32Size(doc_freq) +
+                varintU32Size(stored_chunks) +
+                varintU32Size(chunk_meta_len) +
+                varintU32Size(payload_len) +
+                varintU32Size(positions_len) +
+                varintU32Size(skip_len) +
+                (if (separate_impact_ranges) varintU32Size(impact_count) + varintU32Size(impact_ids_len) else 0);
         const total_len = header_len + scratch.block_max.items.len + scratch.chunk_meta.items.len + scratch.payload.items.len + scratch.positions.items.len + scratch.skip.items.len + impact_meta_len + scratch.impact_ids.items.len;
         try out.ensureUnusedCapacity(alloc, total_len);
 
         try writeVarintU32(alloc, out, doc_freq);
-        try writeVarintU32(alloc, out, stored_chunks);
-        try writeVarintU32(alloc, out, chunk_meta_len);
+        if (!compact_postings_header) {
+            try writeVarintU32(alloc, out, stored_chunks);
+            try writeVarintU32(alloc, out, chunk_meta_len);
+        }
         try writeVarintU32(alloc, out, payload_len);
         try writeVarintU32(alloc, out, positions_len);
-        try writeVarintU32(alloc, out, skip_len);
-        if (separate_impact_ranges) {
-            try writeVarintU32(alloc, out, encoded_impact_count);
+        if (!compact_postings_header) try writeVarintU32(alloc, out, skip_len);
+        if (separate_impact_ranges and (!compact_postings_header or doc_freq > config.chunk_size)) {
+            try writeVarintU32(alloc, out, impact_count);
             try writeVarintU32(alloc, out, impact_ids_len);
         }
 
@@ -2289,7 +2240,14 @@ pub const InvertedIndexReader = struct {
         bloom_bytes: u64 = 0,
         postings_bytes: u64 = 0,
         postings_header_bytes: u64 = 0,
+        projected_compact_postings_header_bytes: u64 = 0,
         block_max_bytes: u64 = 0,
+        impact_record_count: u64 = 0,
+        impact_range_id_bytes: u64 = 0,
+        projected_adaptive_impact_bytes: u64 = 0,
+        projected_adaptive_impact_terms: u64 = 0,
+        projected_raw_impact_terms: u64 = 0,
+        projected_impact_descriptor_header_delta: i64 = 0,
         chunk_meta_bytes: u64 = 0,
         postings_payload_bytes: u64 = 0,
         positions_bytes: u64 = 0,
@@ -2350,12 +2308,38 @@ pub const InvertedIndexReader = struct {
                     stats.projected_posting_count_blocks_128 +|= (@as(u64, postings.doc_freq) + 127) / 128;
                     stats.projected_posting_count_blocks_256 +|= (@as(u64, postings.doc_freq) + 255) / 256;
                     stats.postings_header_bytes +|= @intCast(postings.header_len);
+                    if (postings.inline_single_doc) {
+                        stats.projected_compact_postings_header_bytes +|= @intCast(postings.header_len);
+                    } else {
+                        const positions_len = if (postings.positions_data) |positions| positions.len else 0;
+                        var projected_header = varintU32Size(postings.doc_freq) +
+                            varintU32Size(@intCast(postings.payload_data.len)) +
+                            varintU32Size(@intCast(positions_len));
+                        if (postings.doc_freq > simd_bitpack.block_values) {
+                            const projection = if (postings.block_max) |block_max_info| block_max_info.adaptiveColumnProjection() else BlockMaxInfo.AdaptiveColumnProjection{};
+                            const descriptor = (@as(u64, projection.records) << 1) | @intFromBool(projection.use_adaptive);
+                            if (descriptor <= std.math.maxInt(u32)) projected_header += varintU32Size(@intCast(descriptor));
+                            const impact_ids_len = if (postings.impact_chunk_ids_data) |ids| ids.len else 0;
+                            projected_header += varintU32Size(@intCast(impact_ids_len));
+                        }
+                        stats.projected_compact_postings_header_bytes +|= @intCast(projected_header);
+                    }
                     if (postings.inline_single_doc and postings.inline_has_locs) {
                         stats.positions_bytes +|= @as(u64, @intCast(postings.inline_positions_data.len)) + 1;
                     }
                     if (postings.block_max) |block_max_info| {
                         stats.block_max_bytes +|= @intCast(block_max_info.meta.len);
+                        const projection = block_max_info.adaptiveColumnProjection();
+                        stats.impact_record_count +|= projection.records;
+                        stats.projected_adaptive_impact_bytes +|= projection.selected_bytes;
+                        stats.projected_impact_descriptor_header_delta += projection.descriptor_header_delta;
+                        if (projection.use_adaptive) {
+                            stats.projected_adaptive_impact_terms +|= 1;
+                        } else {
+                            stats.projected_raw_impact_terms +|= 1;
+                        }
                     }
+                    if (postings.impact_chunk_ids_data) |ids| stats.impact_range_id_bytes +|= @intCast(ids.len);
                     stats.chunk_meta_bytes +|= @intCast(postings.chunk_meta_data.len);
                     stats.postings_payload_bytes +|= @intCast(postings.payload_data.len);
                     if (postings.positions_data) |positions_data| {
@@ -2562,28 +2546,47 @@ pub const InvertedIndexReader = struct {
                 .inline_positions_data = positions_data,
             };
         }
-        const stored_chunks = readVarintU32(self.data, &cursor) catch unreachable;
-        const chunk_meta_len = readVarintU32(self.data, &cursor) catch unreachable;
+        const compact_postings_header = usesCompactPostingsHeader(self.version);
+        const stored_chunks = if (compact_postings_header)
+            1 + (doc_freq - 1) / self.chunk_size
+        else
+            readVarintU32(self.data, &cursor) catch unreachable;
+        const stored_chunk_meta_len = if (compact_postings_header)
+            null
+        else
+            readVarintU32(self.data, &cursor) catch unreachable;
         const stored_payload_len = if (self.version >= wire_version_checkpoints)
             readVarintU32(self.data, &cursor) catch unreachable
         else
             null;
         const positions_len = readVarintU32(self.data, &cursor) catch unreachable;
-        const skip_len = readVarintU32(self.data, &cursor) catch unreachable;
-        const encoded_impact_count = if (usesSeparateImpactRanges(self.version))
+        const skip_len: u32 = if (compact_postings_header)
+            if (stored_chunks < postings_skip_min_chunks)
+                0
+            else
+                @intCast(((stored_chunks - 1) / postings_skip_stride_chunks) * postings_skip_record_size_v24)
+        else
+            readVarintU32(self.data, &cursor) catch unreachable;
+        const has_explicit_impact_lengths = usesSeparateImpactRanges(self.version) and
+            (!compact_postings_header or doc_freq > self.chunk_size);
+        const impact_count = if (has_explicit_impact_lengths)
+            readVarintU32(self.data, &cursor) catch unreachable
+        else if (usesSeparateImpactRanges(self.version))
+            @as(u32, 1)
+        else
+            @as(u32, 0);
+        const impact_ids_len = if (has_explicit_impact_lengths)
             readVarintU32(self.data, &cursor) catch unreachable
         else
-            0;
-        const impact_uses_palette = usesImpactPalette(self.version) and (encoded_impact_count & 1) != 0;
-        const impact_count = if (usesImpactPalette(self.version)) encoded_impact_count >> 1 else encoded_impact_count;
-        const impact_ids_len = if (usesSeparateImpactRanges(self.version))
-            readVarintU32(self.data, &cursor) catch unreachable
-        else
-            0;
+            @as(u32, 0);
         const header_len = cursor - base;
         const block_max_start = cursor;
         const block_max_len = if (usesSeparateImpactRanges(self.version)) 0 else @as(usize, stored_chunks) * blockMaxRecordSize(self.version);
         const chunk_meta_start = block_max_start + block_max_len;
+        const chunk_meta_len: u32 = if (stored_chunk_meta_len) |length|
+            length
+        else
+            @intCast((compactChunkMetaLayout(self.data[chunk_meta_start..], stored_chunks, self.version) catch unreachable).total_len);
         const payload_start = chunk_meta_start + @as(usize, chunk_meta_len);
         const chunk_meta_data = self.data[chunk_meta_start..][0..chunk_meta_len];
         const payload_len: usize = if (stored_payload_len) |length|
@@ -2597,30 +2600,15 @@ pub const InvertedIndexReader = struct {
         const positions_start = payload_start + payload_len;
         const skip_start = positions_start + positions_len;
         const impact_block_max_start = skip_start + skip_len;
-        const impact_block_max_len = if (impact_uses_palette) blk: {
-            const palette_count = self.data[impact_block_max_start];
-            const palette_bits = self.data[impact_block_max_start + 1];
-            break :blk 2 + @as(usize, palette_count) * 2 + packedU32ByteLen(impact_count, palette_bits);
-        } else if (usesPackedImpactFrequency(self.version))
+        const impact_block_max_len = if (usesPackedImpactFrequency(self.version))
             packedU32ByteLen(impact_count, 5) + @as(usize, impact_count)
         else
             @as(usize, impact_count) * blockMaxRecordSize(self.version);
         const impact_ids_start = impact_block_max_start + impact_block_max_len;
         const after_postings = impact_ids_start + impact_ids_len;
 
-        var impact_meta = self.data[impact_block_max_start..][0..impact_block_max_len];
-        var impact_palette: []const u8 = &.{};
-        var impact_palette_ids: []const u8 = &.{};
-        var impact_palette_bits: u8 = 0;
+        const impact_meta = self.data[impact_block_max_start..][0..impact_block_max_len];
         const packed_impact_frequency = usesPackedImpactFrequency(self.version);
-        if (impact_uses_palette) {
-            const palette_count = impact_meta[0];
-            impact_palette_bits = impact_meta[1];
-            const palette_len = @as(usize, palette_count) * 2;
-            impact_palette = impact_meta[2..][0..palette_len];
-            impact_palette_ids = impact_meta[2 + palette_len ..];
-            impact_meta = &.{};
-        }
 
         const scoring_block_max: ?BlockMaxInfo = if (usesSeparateImpactRanges(self.version))
             if (impact_count > 0) .{
@@ -2634,9 +2622,6 @@ pub const InvertedIndexReader = struct {
                 .version = self.version,
                 .range_ids = impact_ids_len > 0,
                 .packed_impact_frequency = packed_impact_frequency,
-                .palette = impact_palette,
-                .palette_ids = impact_palette_ids,
-                .palette_bits = impact_palette_bits,
             } else null
         else
             .{
@@ -2796,26 +2781,68 @@ pub const BlockMaxInfo = struct {
     version: u8,
     range_ids: bool = false,
     packed_impact_frequency: bool = false,
-    palette: []const u8 = &.{},
-    palette_ids: []const u8 = &.{},
-    palette_bits: u8 = 0,
 
-    fn palettePairAt(self: BlockMaxInfo, ordinal: usize) u16 {
-        const palette_id: u8 = if (self.palette_bits == 0)
-            0
-        else blk: {
-            const bit_position = ordinal * @as(usize, self.palette_bits);
-            const byte_index = bit_position >> 3;
-            if (byte_index >= self.palette_ids.len) return 0;
-            const bit_shift: u4 = @intCast(bit_position & 7);
-            const window = @as(u16, self.palette_ids[byte_index]) |
-                (if (byte_index + 1 < self.palette_ids.len) @as(u16, self.palette_ids[byte_index + 1]) << 8 else 0);
-            const mask: u16 = (@as(u16, 1) << @intCast(self.palette_bits)) - 1;
-            break :blk @intCast((window >> bit_shift) & mask);
+    pub const AdaptiveColumnProjection = struct {
+        records: u64 = 0,
+        current_bytes: u64 = 0,
+        selected_bytes: u64 = 0,
+        descriptor_header_delta: i64 = 0,
+        frequency_bits: u8 = 5,
+        norm_bits: u8 = 8,
+        use_adaptive: bool = false,
+    };
+
+    /// Project an exact per-term column-range encoding. This is read-only
+    /// format-design instrumentation: it preserves every existing frequency
+    /// bucket and norm ID, unlike the rejected global low-DF bound collapse.
+    pub fn adaptiveColumnProjection(self: BlockMaxInfo) AdaptiveColumnProjection {
+        const count = self.chunkCount();
+        var projection = AdaptiveColumnProjection{
+            .records = @intCast(count),
+            .current_bytes = @intCast(self.meta.len),
+            .selected_bytes = @intCast(self.meta.len),
         };
-        const offset = @as(usize, palette_id) * 2;
-        if (offset + 2 > self.palette.len) return 0;
-        return (@as(u16, self.palette[offset]) << 8) | self.palette[offset + 1];
+        if (!self.packed_impact_frequency or count == 0) return projection;
+
+        const frequency_bytes = packedU32ByteLen(count, 5);
+        if (self.meta.len != frequency_bytes + count) return projection;
+        var min_frequency: u8 = 31;
+        var max_frequency: u8 = 0;
+        var min_norm: u8 = std.math.maxInt(u8);
+        var max_norm: u8 = 0;
+        for (0..count) |ordinal| {
+            const bit_position = ordinal * 5;
+            const byte_index = bit_position >> 3;
+            const bit_shift: u4 = @intCast(bit_position & 7);
+            const window = @as(u16, self.meta[byte_index]) |
+                (if (byte_index + 1 < frequency_bytes) @as(u16, self.meta[byte_index + 1]) << 8 else 0);
+            const frequency: u8 = @as(u5, @truncate(window >> bit_shift));
+            const norm = self.meta[frequency_bytes + ordinal];
+            min_frequency = @min(min_frequency, frequency);
+            max_frequency = @max(max_frequency, frequency);
+            min_norm = @min(min_norm, norm);
+            max_norm = @max(max_norm, norm);
+        }
+
+        const frequency_bits = bitWidthU32(max_frequency - min_frequency);
+        const norm_bits = bitWidthU32(max_norm - min_norm);
+        const adaptive_bytes = 1 +
+            @as(usize, @intFromBool(frequency_bits < 5)) +
+            @as(usize, @intFromBool(norm_bits < 8)) +
+            packedU32ByteLen(count, frequency_bits) +
+            packedU32ByteLen(count, norm_bits);
+        projection.frequency_bits = frequency_bits;
+        projection.norm_bits = norm_bits;
+        projection.use_adaptive = adaptive_bytes < self.meta.len;
+        if (projection.use_adaptive) projection.selected_bytes = @intCast(adaptive_bytes);
+
+        const old_descriptor_bytes = varintU32Size(@intCast(count));
+        const encoded_descriptor = (@as(u64, count) << 1) | @intFromBool(projection.use_adaptive);
+        if (encoded_descriptor <= std.math.maxInt(u32)) {
+            const new_descriptor_bytes = varintU32Size(@intCast(encoded_descriptor));
+            projection.descriptor_header_delta = @as(i64, @intCast(new_descriptor_bytes)) - @as(i64, @intCast(old_descriptor_bytes));
+        }
+        return projection;
     }
 
     fn recordSize(self: BlockMaxInfo) usize {
@@ -2823,7 +2850,6 @@ pub const BlockMaxInfo = struct {
     }
 
     fn minNormAt(self: BlockMaxInfo, offset: usize) u32 {
-        if (self.palette.len > 0) return fieldNormFromId(@truncate(self.palettePairAt(offset)));
         if (self.packed_impact_frequency) {
             const freq_bytes = packedU32ByteLen(self.chunk_meta_count, 5);
             return fieldNormFromId(self.meta[freq_bytes + offset]);
@@ -2837,7 +2863,6 @@ pub const BlockMaxInfo = struct {
     }
 
     fn maxFreqAt(self: BlockMaxInfo, offset: usize) u16 {
-        if (self.palette.len > 0) return impactMaxFreqFromPackedId(@truncate(self.palettePairAt(offset) >> 8));
         if (self.packed_impact_frequency) {
             const freq_bytes = packedU32ByteLen(self.chunk_meta_count, 5);
             const bit_position = offset * 5;
@@ -2894,19 +2919,42 @@ pub const BlockMaxInfo = struct {
     }
 
     fn maxImpactAtOrdinalWithIdf(self: BlockMaxInfo, ordinal: usize, avg_dl: f32, idf: f32, config: BM25Config) f32 {
+        return self.maxImpactAtOrdinalWithScorer(ordinal, BM25TermScorer.init(avg_dl, idf, config));
+    }
+
+    fn maxImpactAtOrdinalWithScorer(self: BlockMaxInfo, ordinal: usize, scorer: BM25TermScorer) f32 {
         if (ordinal >= self.chunkCount()) return 0;
-        if (self.palette.len > 0) {
-            const pair = self.palettePairAt(ordinal);
-            const max_freq = impactMaxFreqFromPackedId(@truncate(pair >> 8));
-            if (max_freq == 0) return 0;
-            return bm25ScoreWithIdf(max_freq, fieldNormFromId(@truncate(pair)), avg_dl, idf, config);
-        }
         const offset = if (self.packed_impact_frequency) ordinal else ordinal * self.recordSize();
         const max_freq = self.maxFreqAt(offset);
         const min_norm = self.minNormAt(offset);
         if (max_freq == 0) return 0;
         // Use min_norm as doc_len (shortest doc → highest TF component)
-        return bm25ScoreWithIdf(max_freq, min_norm, avg_dl, idf, config);
+        return scorer.score(max_freq, min_norm);
+    }
+
+    fn maxImpactAtOrdinalWithBoundTable(
+        self: BlockMaxInfo,
+        ordinal: usize,
+        scorer: BM25TermScorer,
+        idf: f32,
+        table: ?*const BM25BoundTable,
+    ) f32 {
+        if (ordinal >= self.chunkCount()) return 0;
+        if (self.packed_impact_frequency) {
+            if (table) |bound_table| {
+                const freq_bytes = packedU32ByteLen(self.chunk_meta_count, 5);
+                const bit_position = ordinal * 5;
+                const byte_index = bit_position >> 3;
+                if (byte_index >= freq_bytes or freq_bytes + ordinal >= self.meta.len) return scorer.maxScore();
+                const bit_shift: u4 = @intCast(bit_position & 7);
+                const window = @as(u16, self.meta[byte_index]) |
+                    (if (byte_index + 1 < freq_bytes) @as(u16, self.meta[byte_index + 1]) << 8 else 0);
+                const packed_freq_id: u5 = @truncate(window >> bit_shift);
+                const norm_id = self.meta[freq_bytes + ordinal];
+                return bound_table.score(packed_freq_id, norm_id, idf);
+            }
+        }
+        return self.maxImpactAtOrdinalWithScorer(ordinal, scorer);
     }
 
     /// Conservative maximum impact over every stored chunk in this postings
@@ -2986,6 +3034,65 @@ pub const TermPostings = struct {
         errdefer iter.deinit();
         try iter.decodeImpactChunkIds();
         return iter;
+    }
+};
+
+pub const PackedPositionView = struct {
+    data: []const u8,
+    start_index: usize,
+    count: usize,
+    bits: u8,
+
+    pub fn cursor(self: PackedPositionView) !PackedPositionCursor {
+        if (self.bits > 32) return error.InvalidData;
+        const start_bit = std.math.mul(usize, self.start_index, self.bits) catch return error.InvalidData;
+        const value_bits = std.math.mul(usize, self.count, self.bits) catch return error.InvalidData;
+        const end_bit = std.math.add(usize, start_bit, value_bits) catch return error.InvalidData;
+        if ((std.math.add(usize, end_bit, 7) catch return error.InvalidData) / 8 > self.data.len) return error.InvalidData;
+
+        var result_cursor = PackedPositionCursor{
+            .data = self.data,
+            .remaining = self.count,
+            .bits = self.bits,
+            .byte_index = start_bit / 8,
+        };
+        const initial_skip: u3 = @intCast(start_bit % 8);
+        if (self.bits != 0 and initial_skip != 0) {
+            result_cursor.reservoir = @as(u64, self.data[result_cursor.byte_index]) >> initial_skip;
+            result_cursor.reservoir_bits = 8 - @as(u8, initial_skip);
+            result_cursor.byte_index += 1;
+        }
+        return result_cursor;
+    }
+};
+
+pub const PackedPositionCursor = struct {
+    data: []const u8,
+    remaining: usize,
+    bits: u8,
+    byte_index: usize,
+    reservoir: u64 = 0,
+    reservoir_bits: u8 = 0,
+    previous: u32 = 0,
+
+    pub inline fn next(self: *PackedPositionCursor) !?u32 {
+        if (self.remaining == 0) return null;
+        var delta: u32 = 0;
+        if (self.bits != 0) {
+            while (self.reservoir_bits < self.bits) {
+                if (self.byte_index >= self.data.len) return error.InvalidData;
+                self.reservoir |= @as(u64, self.data[self.byte_index]) << @intCast(self.reservoir_bits);
+                self.reservoir_bits += 8;
+                self.byte_index += 1;
+            }
+            const mask: u64 = if (self.bits == 32) std.math.maxInt(u32) else (@as(u64, 1) << @intCast(self.bits)) - 1;
+            delta = @intCast(self.reservoir & mask);
+            self.reservoir >>= @intCast(self.bits);
+            self.reservoir_bits -= self.bits;
+        }
+        self.previous +%= delta;
+        self.remaining -= 1;
+        return self.previous;
     }
 };
 
@@ -3120,6 +3227,7 @@ pub const PostingsIterator = struct {
         const data = self.impact_chunk_ids_data orelse return error.InvalidData;
         if (data.len == 0) return error.InvalidData;
         const count: usize = self.impact_chunk_count;
+
         try self.impact_chunk_ids.ensureTotalCapacity(self.alloc, count);
         self.impact_chunk_ids.items.len = count;
 
@@ -3414,11 +3522,11 @@ pub const PostingsIterator = struct {
             if (count == 0) return error.InvalidData;
             if (vertical_docs) {
                 const block: *[simd_bitpack.block_values]u32 = self.doc_values.items[0..simd_bitpack.block_values];
-                _ = simd_bitpack.decodeBlock(chunk_data[pos..][0..doc_len], block, doc_bits) catch return error.InvalidData;
+                _ = simd_bitpack.decodeBlockPrefixSum(chunk_data[pos..][0..doc_len], block, doc_bits, doc_id) catch return error.InvalidData;
             } else {
                 try decodePackedU32Into(chunk_data[pos..][0..doc_len], self.doc_values.items[1..], doc_bits);
+                self.doc_values.items[0] = doc_id;
             }
-            self.doc_values.items[0] = doc_id;
         } else {
             try decodePackedU32Into(chunk_data[pos..][0..doc_len], self.doc_values.items, doc_bits);
         }
@@ -3432,7 +3540,7 @@ pub const PostingsIterator = struct {
             try decodePackedU32Into(chunk_data[pos..][0..freq_len], self.freq_values.items, freq_bits);
         }
 
-        if (self.doc_values.items.len > 0) {
+        if (self.doc_values.items.len > 0 and !vertical_docs) {
             if (!usesPostingCountBlocks(self.version)) self.doc_values.items[0] +%= meta.chunk_id * self.chunk_size;
             for (1..self.doc_values.items.len) |i| {
                 self.doc_values.items[i] +%= self.doc_values.items[i - 1];
@@ -3779,6 +3887,35 @@ pub const PostingsIterator = struct {
         return try self.takeCurrentWithPositions();
     }
 
+    pub fn canTakeDeferredPackedPositions(self: *const PostingsIterator) bool {
+        return !self.is_one_hit and self.positions_data != null and usesContiguousPositionGroups(self.version);
+    }
+
+    /// Consume a deferred v30+ positional record as a zero-copy packed view.
+    /// The caller may stream its delta values after this iterator advances;
+    /// the view references immutable segment bytes rather than iterator scratch.
+    pub fn takeDeferredPackedPositions(self: *PostingsIterator) !PackedPositionView {
+        if (!self.deferred_position_pending or !self.canTakeDeferredPackedPositions()) return error.InvalidData;
+        if (self.chunk_doc_pos >= self.freq_values.items.len) return error.InvalidData;
+        self.deferred_position_pending = false;
+        const doc_pos = self.chunk_doc_pos;
+        const doc_id = self.doc_values.items[doc_pos];
+        const decoded = decodeFreqHasLocs(self.freq_values.items[doc_pos]);
+        const bits = try self.ensurePositionGroup(doc_pos);
+        const count: usize = if (decoded.has_locs) @intCast(decoded.freq) else 0;
+        const view = PackedPositionView{
+            .data = self.positions_data.?[self.positions_group_data_start..self.positions_chunk_end],
+            .start_index = self.positions_group_value_offset,
+            .count = count,
+            .bits = bits,
+        };
+        try self.advanceContiguousPositionRecord(doc_pos, count);
+        self.chunk_doc_pos += 1;
+        self.position_records_decoded +|= 1;
+        self.noteReturnedDoc(doc_id);
+        return view;
+    }
+
     pub fn decodedPositionRecords(self: *const PostingsIterator) u64 {
         return self.position_records_decoded;
     }
@@ -3926,6 +4063,21 @@ pub const PostingsIterator = struct {
         return block_max.maxImpactAtOrdinalWithIdf(self.current_chunk_index, avg_dl, idf, config);
     }
 
+    pub fn currentBlockMaxImpactWithScorer(
+        self: *const PostingsIterator,
+        block_max: BlockMaxInfo,
+        scorer: BM25TermScorer,
+        idf: f32,
+        bound_table: ?*const BM25BoundTable,
+    ) f32 {
+        if (block_max.range_ids) {
+            const cursor = self.currentBlockCursor() orelse return 0;
+            return block_max.maxImpactAtOrdinalWithBoundTable(cursor.ordinal, scorer, idf, bound_table);
+        }
+        if (self.current_chunk_index == std.math.maxInt(usize)) return 0;
+        return block_max.maxImpactAtOrdinalWithBoundTable(self.current_chunk_index, scorer, idf, bound_table);
+    }
+
     pub const CompetitiveBlockAdvance = struct {
         hit: ?Hit,
         chunks_skipped: u32,
@@ -4012,6 +4164,17 @@ pub const PostingsIterator = struct {
         return block_max.maxImpactAtOrdinalWithIdf(cursor.ordinal, avg_dl, idf, config);
     }
 
+    pub fn blockCursorImpactWithScorer(
+        _: *const PostingsIterator,
+        block_max: BlockMaxInfo,
+        cursor: BlockCursor,
+        scorer: BM25TermScorer,
+        idf: f32,
+        bound_table: ?*const BM25BoundTable,
+    ) f32 {
+        return block_max.maxImpactAtOrdinalWithBoundTable(cursor.ordinal, scorer, idf, bound_table);
+    }
+
     pub fn loadBlockCursor(self: *PostingsIterator, cursor: BlockCursor) !?Hit {
         if (self.impact_chunk_ids.items.len > 0) return self.advanceTo(cursor.min_doc);
         try self.loadChunk(cursor.ordinal);
@@ -4030,12 +4193,31 @@ pub const PostingsIterator = struct {
         config: BM25Config,
         allow_equal_prune: bool,
     ) !CompetitiveBlockAdvance {
+        return self.advanceToCompetitiveBlockWithScorer(
+            block_max,
+            threshold,
+            BM25TermScorer.init(avg_dl, idf, config),
+            idf,
+            null,
+            allow_equal_prune,
+        );
+    }
+
+    pub fn advanceToCompetitiveBlockWithScorer(
+        self: *PostingsIterator,
+        block_max: BlockMaxInfo,
+        threshold: f32,
+        scorer: BM25TermScorer,
+        idf: f32,
+        bound_table: ?*const BM25BoundTable,
+        allow_equal_prune: bool,
+    ) !CompetitiveBlockAdvance {
         if (self.impact_chunk_ids.items.len > 0) {
             const current = self.currentBlockCursor() orelse return .{ .hit = null, .chunks_skipped = 0 };
             var ordinal = current.ordinal + 1;
             var skipped: u32 = 1;
             while (ordinal < block_max.chunkCount()) : (ordinal += 1) {
-                const bound = block_max.maxImpactAtOrdinalWithIdf(ordinal, avg_dl, idf, config);
+                const bound = block_max.maxImpactAtOrdinalWithBoundTable(ordinal, scorer, idf, bound_table);
                 if (bound > threshold or (!allow_equal_prune and bound == threshold)) {
                     const target = self.impact_chunk_ids.items[ordinal] * impact_range_doc_count;
                     return .{ .hit = try self.advanceTo(target), .chunks_skipped = skipped };
@@ -4050,7 +4232,7 @@ pub const PostingsIterator = struct {
         var ordinal = self.current_chunk_index + 1;
         var skipped: u32 = 1; // remainder of the current non-competitive chunk
         while (ordinal < block_max.chunkCount()) : (ordinal += 1) {
-            const bound = block_max.maxImpactAtOrdinalWithIdf(ordinal, avg_dl, idf, config);
+            const bound = block_max.maxImpactAtOrdinalWithBoundTable(ordinal, scorer, idf, bound_table);
             if (bound > threshold or (!allow_equal_prune and bound == threshold)) {
                 try self.loadChunk(ordinal);
                 return .{ .hit = try self.next(), .chunks_skipped = skipped };
@@ -4117,6 +4299,67 @@ pub const PostingsIterator = struct {
 pub const BM25Config = struct {
     k1: f32 = 1.2,
     b: f32 = 0.75,
+};
+
+/// Query-term BM25 constants shared by document scoring and conservative
+/// block ceilings. Average field length, IDF, k1, and b are invariant for the
+/// lifetime of one WAND term state; retaining their products avoids rebuilding
+/// the same expression for every scored posting and every rejected block.
+pub const BM25TermScorer = struct {
+    numerator_scale: f32,
+    norm_offset: f32,
+    norm_length_scale: f32,
+
+    pub fn init(avg_doc_len: f32, idf: f32, config: BM25Config) BM25TermScorer {
+        return .{
+            .numerator_scale = idf * (config.k1 + 1.0),
+            .norm_offset = config.k1 * (1.0 - config.b),
+            .norm_length_scale = config.k1 * config.b / avg_doc_len,
+        };
+    }
+
+    pub inline fn score(self: BM25TermScorer, freq: u32, doc_len: u32) f32 {
+        const f: f32 = @floatFromInt(freq);
+        const dl: f32 = @floatFromInt(doc_len);
+        return self.numerator_scale * f / (f + self.norm_offset + self.norm_length_scale * dl);
+    }
+
+    pub inline fn maxScore(self: BM25TermScorer) f32 {
+        return self.numerator_scale;
+    }
+};
+
+pub const bm25_bound_table_frequency_count: usize = 32;
+pub const bm25_bound_table_norm_count: usize = 256;
+
+/// IDF-independent BM25 TF ceilings for the current five-bit impact frequency
+/// and one-byte norm domains. A snapshot may retain a bounded number of these
+/// tables for distinct `(avg_field_length, k1, b)` configurations.
+pub const BM25BoundTable = struct {
+    values: [bm25_bound_table_frequency_count * bm25_bound_table_norm_count]f32,
+
+    pub fn init(avg_doc_len: f32, config: BM25Config) BM25BoundTable {
+        var table: BM25BoundTable = undefined;
+        const scorer = BM25TermScorer.init(avg_doc_len, 1.0, config);
+        for (0..bm25_bound_table_frequency_count) |freq_id| {
+            const freq = impactMaxFreqFromPackedId(@intCast(freq_id));
+            for (0..bm25_bound_table_norm_count) |norm_id| {
+                const value = scorer.score(
+                    freq,
+                    fieldNormFromId(@intCast(norm_id)),
+                );
+                // Pre-bias the IDF-independent component upward so the query
+                // hot path remains one indexed load and one multiply.
+                table.values[freq_id * bm25_bound_table_norm_count + norm_id] =
+                    std.math.nextAfter(f32, value * 1.000001, std.math.inf(f32));
+            }
+        }
+        return table;
+    }
+
+    pub inline fn score(self: *const BM25BoundTable, packed_freq_id: u5, norm_id: u8, idf: f32) f32 {
+        return idf * self.values[@as(usize, packed_freq_id) * bm25_bound_table_norm_count + norm_id];
+    }
 };
 
 pub fn bm25Idf(doc_count: u32, doc_freq: u32) f32 {
@@ -4434,7 +4677,7 @@ pub const IndexConfig = struct {
     pub fn wireVersion(self: IndexConfig) u8 {
         return switch (self.postings_layout) {
             .legacy_fixture_v27 => wire_version_chunk_framed_positions,
-            .posting_count_v35 => wire_version_vertical_bp128,
+            .posting_count_v35 => wire_version_current,
         };
     }
 
@@ -5256,6 +5499,53 @@ test "BM25 scoring" {
     try std.testing.expect(score < 4.0);
 }
 
+test "BM25 term scorer retains query-invariant arithmetic" {
+    const avg_doc_len: f32 = 150.0;
+    const idf = bm25Idf(100, 10);
+    const config = BM25Config{};
+    const scorer = BM25TermScorer.init(avg_doc_len, idf, config);
+
+    for ([_]u32{ 1, 2, 3, 7, 31, 65_535 }) |freq| {
+        for ([_]u32{ 1, 40, 200, 1_048, 1_000_000 }) |doc_len| {
+            const reference = bm25ScoreWithIdf(freq, doc_len, avg_doc_len, idf, config);
+            try std.testing.expectApproxEqRel(reference, scorer.score(freq, doc_len), 2e-6);
+        }
+    }
+    try std.testing.expectEqual(idf * (config.k1 + 1.0), scorer.maxScore());
+}
+
+test "BM25 bound table matches packed impact and norm domains" {
+    const avg_doc_len: f32 = 137.5;
+    const idf: f32 = 2.25;
+    const config = BM25Config{};
+    const table = BM25BoundTable.init(avg_doc_len, config);
+    const unit_scorer = BM25TermScorer.init(avg_doc_len, 1.0, config);
+
+    for ([_]u5{ 0, 1, 11, 18, 30, 31 }) |freq_id| {
+        for ([_]u8{ 0, 1, 40, 88, 127, 255 }) |norm_id| {
+            const expected = idf * unit_scorer.score(
+                impactMaxFreqFromPackedId(freq_id),
+                fieldNormFromId(norm_id),
+            );
+            try std.testing.expect(table.score(freq_id, norm_id, idf) >= expected);
+        }
+    }
+
+    for ([_]f32{ 0.01, 0.5, 1.0, 2.25, 10.0, 25.0 }) |test_idf| {
+        const direct = BM25TermScorer.init(avg_doc_len, test_idf, config);
+        for (0..bm25_bound_table_frequency_count) |freq_id| {
+            for (0..bm25_bound_table_norm_count) |norm_id| {
+                const expected = direct.score(
+                    impactMaxFreqFromPackedId(@intCast(freq_id)),
+                    fieldNormFromId(@intCast(norm_id)),
+                );
+                const bound = table.score(@intCast(freq_id), @intCast(norm_id), test_idf);
+                try std.testing.expect(bound >= expected);
+            }
+        }
+    }
+}
+
 test "v25 field norms match Tantivy quantization" {
     try std.testing.expectEqual(@as(u32, 40), fieldNormFromId(40));
     try std.testing.expectEqual(@as(u32, 42), fieldNormFromId(41));
@@ -5627,37 +5917,6 @@ test "freqHasLocs encoding round-trip" {
     // freq=0
     const v3 = encodeFreqHasLocs(0, false);
     try std.testing.expectEqual(@as(u64, 0), v3);
-}
-
-test "v37 adaptive impact palette preserves conservative bound pairs" {
-    const alloc = std.testing.allocator;
-    var scratch = PostingSerializeScratch{};
-    defer scratch.deinit(alloc);
-    for (0..128) |ordinal| {
-        if (ordinal & 1 == 0)
-            try appendImpactRecord(alloc, &scratch.impact_block_max, 3, 10)
-        else
-            try appendImpactRecord(alloc, &scratch.impact_block_max, 5, 15);
-    }
-    try encodeImpactMetadata(alloc, &scratch, 128, wire_version_impact_palette);
-    try std.testing.expect(scratch.impact_uses_palette);
-    try std.testing.expectEqual(@as(u8, 2), scratch.impact_encoded.items[0]);
-    try std.testing.expectEqual(@as(u8, 1), scratch.impact_encoded.items[1]);
-    const bm = BlockMaxInfo{
-        .meta = &.{},
-        .chunk_size = impact_range_doc_count,
-        .chunk_meta_data = &.{},
-        .chunk_meta_count = 128,
-        .version = wire_version_impact_palette,
-        .packed_impact_frequency = true,
-        .palette = scratch.impact_encoded.items[2..6],
-        .palette_ids = scratch.impact_encoded.items[6..],
-        .palette_bits = 1,
-    };
-    try std.testing.expectEqual(@as(u16, 3), bm.maxFreqAt(0));
-    try std.testing.expectEqual(@as(u32, 10), bm.minNormAt(0));
-    try std.testing.expectEqual(@as(u16, 5), bm.maxFreqAt(1));
-    try std.testing.expectEqual(@as(u32, 15), bm.minNormAt(1));
 }
 
 test "current one posting block retains one global impact bound" {
@@ -6108,7 +6367,45 @@ test "PostingsIterator deferred positional seek decodes only accepted candidates
     try std.testing.expect(try iter.advanceToDeferredPositions(9) == null);
 }
 
-test "production reader rejects branch-only v24-v34 formats" {
+test "PostingsIterator streams deferred grouped positions without scratch arrays" {
+    const alloc = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 8 });
+    defer builder.deinit();
+
+    for (0..8) |doc| {
+        const positions = [_]u32{ @intCast(doc), @intCast(doc + 10) };
+        try builder.addDocument(@intCast(doc), &.{.{
+            .term = "term",
+            .freq = 2,
+            .norm = 20,
+            .positions = &positions,
+        }});
+    }
+    const section = try builder.build();
+    defer alloc.free(section);
+    var reader = try InvertedIndexReader.init(alloc, section);
+    const lookup = reader.lookup("term") orelse return error.TestExpectedEqual;
+    var iter = try lookup.iterator(alloc);
+    defer iter.deinit();
+
+    const candidate = (try iter.advanceToDeferredPositions(5)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 5), candidate.doc_id);
+    const packed_view = try iter.takeDeferredPackedPositions();
+    var cursor = try packed_view.cursor();
+    try std.testing.expectEqual(@as(?u32, 5), try cursor.next());
+    try std.testing.expectEqual(@as(?u32, 15), try cursor.next());
+    try std.testing.expectEqual(@as(?u32, null), try cursor.next());
+    try std.testing.expectEqual(@as(u64, 1), iter.decodedPositionRecords());
+
+    const next_candidate = (try iter.advanceToDeferredPositions(7)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 7), next_candidate.doc_id);
+    const next_packed = try iter.takeDeferredPackedPositions();
+    var next_cursor = try next_packed.cursor();
+    try std.testing.expectEqual(@as(?u32, 7), try next_cursor.next());
+    try std.testing.expectEqual(@as(?u32, 17), try next_cursor.next());
+}
+
+test "production reader rejects branch-only v24-v37 formats" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 4 });
     defer builder.deinit();

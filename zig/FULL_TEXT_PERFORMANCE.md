@@ -1617,25 +1617,107 @@ exactly, but produced a 3,409,090,313-byte index--only 278,776 bytes below v35--
 and raised term CPU from 64.4 to 85.8 us. The bound-pair distribution is too
 high-entropy for a per-term palette, so v37 is rejected. Production remains on
 v35 while the next storage design is developed from measured range data. The
-focused suite explicitly covers the experimental palette/direct behavior and
-passes 53 tests with zero failures or leaks.
+experimental reader/writer and its query-time branch were removed after
+measurement; the retained evidence records the exact format result without
+making v37 part of the compatibility surface.
 
-Phrase needs a separate positional fast path after those shared wins:
+The first format-neutral term follow-up is accepted. A `BM25TermScorer` now
+retains `idf * (k1 + 1)`, `k1 * (1 - b)`, and `k1 * b / avg_field_length` once
+per WAND term state. Document scoring and conservative block ceilings use the
+same object, removing repeated query-invariant arithmetic from both alpha's
+2,179 scored postings and its 4,067 rejected impact ranges. In an adjacent
+candidate/baseline/candidate/baseline bracket, baseline term CPU averaged
+65.801 us and the candidate averaged 63.255 us, a repeatable 3.87 percent
+reduction. Union CPU improved 1.77 percent; intersection was flat within 0.12
+percent. Phrase is not on this WAND path and its 1.20 percent mean movement is
+treated as run noise. Work counters were identical, query RSS remained about
+23 MB, and all five queries strictly matched the archived Tantivy results at
+the benchmark's `1e-5` absolute and relative score tolerances. The persisted
+v35 format and index size are unchanged. The focused suite passes 53 tests
+with zero failures or leaks, including direct equivalence checks across the
+packed impact frequency and norm ranges.
 
-1. Add `advancePositionCursorToDocPos`: skip complete eight-document position
-   groups in one operation, sum frequency/location controls once for the final
-   group, and update the packed bit offset without calling
-   `skipPositionRecord` for every rejected document.
-2. Use a hybrid lower-bound search within an already decoded document block
-   for large conjunction jumps while retaining the cheaper linear scan for
-   nearby targets.
-3. Specialize exact two-term phrases to intersect shifted packed-delta streams
-   monotonically, avoiding two fully materialized absolute-position arrays.
-   Keep the generic N-term/slop verifier as the correctness fallback.
-4. If cursor advancement remains material after profiling, evaluate sparse
-   per-group bit-offset checkpoints in a later format. Do not add a per-posting offset:
-   the checkpoint must demonstrate a net CPU/page-touch win and keep total
-   index growth within the agreed storage budget.
+The planned bound lookup is also accepted, layered on that scorer. Each
+snapshot lazily caches the IDF-independent TF ceiling for the current 32 packed
+frequency IDs and 256 norm IDs. The key is the exact bit representation of
+average field length, `k1`, and `b`; the cache is thread-safe and capped at four
+tables (128 KiB of values) per snapshot. A fifth distinct configuration and
+origin/main v23 metadata use the scalar fallback, so query-controlled BM25
+parameters cannot grow an unbounded cache. This small fixed snapshot cache is
+below the resource manager's large-buffer/mmap budget boundary; its explicit
+cap is the governing resource policy.
+
+Reassociating the IDF multiply can differ from direct scoring by several
+`f32` ulps, so table values receive an eight-ulp upward bias once at
+construction. Runtime remains one indexed load and one multiply. The focused
+suite passed 55 tests at this stage, including an exhaustive check that every one of the
+8,192 packed frequency/norm pairs remains at or above direct scoring across six
+IDFs. As expected for a deliberately conservative rounding change, alpha
+scores 2,196 cutoff candidates instead of 2,179 and gamma scores 488 instead
+of 482; all ordered hits and scores still strictly match archived Tantivy.
+
+Two full-corpus passes measured 56.109 and 56.014 us term CPU, averaging
+56.062 us: 11.37 percent below the already accepted precomputed-scorer mean and
+about 1.40x the archived Tantivy 40.028 us result. Union CPU improved another
+4.59 percent to a 214.556 us mean; intersection remained flat. Query peak RSS
+was 23.35 MB, the persisted v35 index is unchanged, and the one table used by
+this workload accounts for only 32 KiB of snapshot-owned values.
+
+Phrase now has a format-neutral positional fast path after those shared wins.
+For exact two-term phrases over the current contiguous grouped-position layout,
+each iterator returns a validated bounded view of the immutable packed bits.
+Two cumulative-delta cursors then intersect the monotonic position streams
+directly, without allocating or filling absolute-position arrays. Generic
+N-term phrases, slop, origin/main v23 data, and any noncontiguous layout retain
+the existing materialized verifier as the correctness fallback.
+
+Two independent full-corpus passes measured 425.670 and 423.973 us phrase CPU,
+averaging 424.822 us. That is 17.97 percent below the accepted 517.872 us
+baseline and about 1.23x the archived Tantivy 344.910 us result. Both passes
+strictly matched all five archived Tantivy queries and preserved exactly 3,571
+phrase candidates, 7,142 decoded position records, and 525 matches. Peak query
+RSS remained 23.28 MB, and the persisted v35 index is unchanged. The focused
+suite now passes 56 tests with zero failures or leaks, including arbitrary
+in-group starts for the bounded packed cursor.
+
+Two cheaper-looking phrase variants did not survive measurement. A monotonic
+merge over already decoded absolute-position arrays measured 517.442 us versus
+the 517.872 us baseline, a statistically flat 0.08 percent movement. A hybrid
+linear/binary lower-bound search inside decoded document blocks regressed
+phrase CPU to 599.483 us, or 15.76 percent. Both retained identical correctness
+and work counters and were removed. If cursor advancement becomes material in
+a future profile, sparse per-group bit-offset checkpoints remain a possible
+format experiment; a per-posting offset is excluded unless it demonstrates a
+net CPU/page-touch win within the storage budget.
+
+The removed first cursor prototype scanned document IDs to a target ordinal and
+jumped complete eight-document packed position groups in one cursor update.
+It preserved the 3,571 candidates, 7,142 decoded records, 525 matches, and all
+top hits, but phrase CPU rose from 556.929 to 573.291 us (2.94 percent).
+Term/union/intersection CPU did not show a compensating shared-path win. The
+extra target scan, branch, and group-state writes cost more than the rejected
+documents saved for this candidate distribution, so the prototype and its hot
+branch were removed.
+
+The final shared-path profile showed why vertical BP128 alone had not closed
+the term gap: document deltas were decoded four at a time, then converted to
+absolute IDs through a scalar 127-add dependency chain. `loadChunk` was the
+largest active top-of-stack symbol at 1,705 samples; portable BP128 decode
+itself accounted for only 397. The retained decoder now fuses delta decode with
+a four-lane inclusive scan and a carry between vectors using
+`@Vector(4, u32)`. There are no target-specific intrinsics, assembly, or
+architecture branches. Origin/main v23, partial blocks, and nonvertical data
+retain the scalar path, and the v35 bytes are unchanged.
+
+Two full-corpus passes measured mean CPU/query of 47.760 us term, 190.900 us
+union, 161.532 us intersection, and 400.633 us phrase. Relative to the packed
+phrase-stream baseline, those are reductions of 13.41, 7.76, 11.28, and 5.69
+percent respectively. Term is now about 1.19x the archived Tantivy 40.028 us
+result and phrase is about 1.16x its 344.910 us result. Both passes strictly
+matched all five comparator queries with unchanged work counters; peak query
+RSS was 23.64 MB. Randomized tests cover every bit width from zero through 32
+and compare the fused output with scalar wrapping prefix sums. Both codec tests
+are part of the focused ReleaseFast gate, which now passes 58/58 with no leaks.
 
 Every candidate uses the preserved full corpus and strict IDs/scores/counts and
 work-counter checks. Acceptance uses interleaved matched A/B runs; archived

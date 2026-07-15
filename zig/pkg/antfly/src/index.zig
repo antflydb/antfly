@@ -281,6 +281,15 @@ const TermDocFreqCache = std.HashMapUnmanaged(
     std.hash_map.default_max_load_percentage,
 );
 
+const BM25BoundTableKey = struct {
+    avg_doc_len_bits: u32,
+    k1_bits: u32,
+    b_bits: u32,
+};
+
+const BM25BoundTableCache = std.AutoHashMapUnmanaged(BM25BoundTableKey, *inverted.BM25BoundTable);
+const max_bm25_bound_tables_per_snapshot: usize = 4;
+
 /// Immutable, ref-counted snapshot of the index state.
 ///
 /// Snapshots obtained via `acquireSnapshot()` must be released via `release()`.
@@ -302,6 +311,8 @@ pub const IndexSnapshot = struct {
     term_doc_freq_cache: TermDocFreqCache,
     term_doc_freq_cache_hits: u64,
     term_doc_freq_cache_misses: u64,
+    bm25_bound_table_cache_mu: std.atomic.Mutex,
+    bm25_bound_table_cache: BM25BoundTableCache,
     /// Increment reference count. Returns self for chaining.
     pub fn retain(self: *IndexSnapshot) *IndexSnapshot {
         _ = @atomicRmw(u32, &self.ref_count, .Add, 1, .monotonic);
@@ -338,8 +349,41 @@ pub const IndexSnapshot = struct {
             while (cache_it.next()) |key| alloc.free(key.storage);
             self.term_doc_freq_cache.deinit(alloc);
         }
+        {
+            const cache_mu = &self.bm25_bound_table_cache_mu;
+            while (!cache_mu.tryLock()) spinOrYield();
+            defer cache_mu.unlock();
+            var table_it = self.bm25_bound_table_cache.valueIterator();
+            while (table_it.next()) |table| alloc.destroy(table.*);
+            self.bm25_bound_table_cache.deinit(alloc);
+        }
         self.global_total_field_len.deinit(alloc);
         alloc.destroy(self);
+    }
+
+    fn bm25BoundTable(
+        self: *const IndexSnapshot,
+        avg_doc_len: f32,
+        config: inverted.BM25Config,
+    ) !?*const inverted.BM25BoundTable {
+        const key = BM25BoundTableKey{
+            .avg_doc_len_bits = @bitCast(avg_doc_len),
+            .k1_bits = @bitCast(config.k1),
+            .b_bits = @bitCast(config.b),
+        };
+        const mutable = @constCast(self);
+        const cache_mu = &mutable.bm25_bound_table_cache_mu;
+        while (!cache_mu.tryLock()) spinOrYield();
+        defer cache_mu.unlock();
+
+        if (mutable.bm25_bound_table_cache.get(key)) |table| return table;
+        if (mutable.bm25_bound_table_cache.count() >= max_bm25_bound_tables_per_snapshot) return null;
+
+        const table = try self.alloc.create(inverted.BM25BoundTable);
+        errdefer self.alloc.destroy(table);
+        table.* = inverted.BM25BoundTable.init(avg_doc_len, config);
+        try mutable.bm25_bound_table_cache.put(self.alloc, key, table);
+        return table;
     }
 
     /// Search across all segments for the given terms in a field.
@@ -415,6 +459,7 @@ pub const IndexSnapshot = struct {
         const global_doc_count = if (override) |stats| stats.global_doc_count else self.global_doc_count;
         if (global_doc_count == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
         const avg_dl = if (override) |stats| stats.avgDocLen() else self.avgDocLen(field);
+        const bound_table = try self.bm25BoundTable(avg_dl, bm25_config);
         var term_doc_freq_stack: [16]u32 = undefined;
         const term_doc_freqs = if (terms.len <= term_doc_freq_stack.len)
             term_doc_freq_stack[0..terms.len]
@@ -507,6 +552,7 @@ pub const IndexSnapshot = struct {
             {
                 var wand = scorer_mod.WANDScorer.init(alloc, k, global_doc_count, avg_dl, bm25_config);
                 defer wand.deinit();
+                if (bound_table) |table| wand.setBoundTable(table);
                 var added_terms: usize = 0;
 
                 for (terms, 0..) |term, term_idx| {
@@ -848,6 +894,8 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache = .empty,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
         };
         return .{
             .alloc = alloc,
@@ -970,6 +1018,8 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache = .empty,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
         };
         self.next_epoch += 1;
 
@@ -1108,6 +1158,8 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache = .empty,
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
         };
         self.next_epoch += 1;
 
@@ -1498,6 +1550,24 @@ test "multi-segment search" {
     try std.testing.expectEqual(@as(usize, 3), results.hits.len);
     try std.testing.expect(results.hits[0].score >= results.hits[1].score);
     try std.testing.expect(results.hits[1].score >= results.hits[2].score);
+}
+
+test "snapshot BM25 bound table cache is reused and bounded" {
+    const alloc = std.testing.allocator;
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    const snap = writer.snapshot();
+
+    const first = (try snap.bm25BoundTable(100.0, .{})) orelse return error.TestExpectedEqual;
+    const same = (try snap.bm25BoundTable(100.0, .{})) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(first, same);
+
+    for (1..max_bm25_bound_tables_per_snapshot) |i| {
+        const config = inverted.BM25Config{ .k1 = 1.2 + @as(f32, @floatFromInt(i)) * 0.1 };
+        try std.testing.expect((try snap.bm25BoundTable(100.0, config)) != null);
+    }
+    try std.testing.expect((try snap.bm25BoundTable(100.0, .{ .k1 = 9.0 })) == null);
+    try std.testing.expectEqual(max_bm25_bound_tables_per_snapshot, snap.bm25_bound_table_cache.count());
 }
 
 test "multi-segment search merges per-segment top-k globally" {

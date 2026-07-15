@@ -195,6 +195,7 @@ const TermState = struct {
     iter: inverted.PostingsIterator,
     current: ?inverted.PostingsIterator.Hit,
     idf: f32,
+    bm25_scorer: inverted.BM25TermScorer,
     doc_freq: u32,
     block_max: ?inverted.BlockMaxInfo,
     chunk_size: u32,
@@ -235,6 +236,7 @@ pub const WANDScorer = struct {
     global_doc_count: u32,
     global_avg_dl: f32,
     bm25_config: inverted.BM25Config,
+    bound_table: ?*const inverted.BM25BoundTable = null,
     /// Diagnostics — populated during `execute*`. Useful for benchmarking
     /// where the WAND inner loop spends time. `next_in_score` is the count
     /// of `iter.next()` calls made when fully scoring a pivot doc;
@@ -261,6 +263,10 @@ pub const WANDScorer = struct {
     pub fn deinit(self: *WANDScorer) void {
         for (self.terms.items) |*t| t.iter.deinit();
         self.terms.deinit(self.alloc);
+    }
+
+    pub fn setBoundTable(self: *WANDScorer, table: *const inverted.BM25BoundTable) void {
+        self.bound_table = table;
     }
 
     pub fn decodedChunkMetadataHeapBytes(self: *const WANDScorer) usize {
@@ -296,6 +302,7 @@ pub const WANDScorer = struct {
             .iter = iter_owned,
             .current = null,
             .idf = idf,
+            .bm25_scorer = inverted.BM25TermScorer.init(self.global_avg_dl, idf, self.bm25_config),
             .doc_freq = effective_doc_freq,
             .block_max = block_max,
             .chunk_size = chunk_size,
@@ -366,7 +373,7 @@ pub const WANDScorer = struct {
             self.next_in_score += 1;
             try collector.collect(.{
                 .doc_id = hit.doc_id,
-                .score = term.idf * tfScore(hit.freq, hit.norm, self.global_avg_dl, self.bm25_config),
+                .score = term.bm25_scorer.score(hit.freq, hit.norm),
             });
 
             if (hit.doc_id == std.math.maxInt(u32)) {
@@ -376,22 +383,22 @@ pub const WANDScorer = struct {
             }
 
             const threshold = collector.minCompetitiveScore();
-            const current_bound = term.iter.currentBlockMaxImpactWithIdf(
+            const current_bound = term.iter.currentBlockMaxImpactWithScorer(
                 block_max,
-                self.global_avg_dl,
+                term.bm25_scorer,
                 term.idf,
-                self.bm25_config,
+                self.bound_table,
             );
             const worst_doc_id = collector.worstCompetitiveDocId();
             const ordered_tie_is_worse = current_bound == threshold and
                 worst_doc_id != null and hit.doc_id >= worst_doc_id.?;
             if (current_bound < threshold or ordered_tie_is_worse) {
-                const advanced = try term.iter.advanceToCompetitiveBlock(
+                const advanced = try term.iter.advanceToCompetitiveBlockWithScorer(
                     block_max,
                     threshold,
-                    self.global_avg_dl,
+                    term.bm25_scorer,
                     term.idf,
-                    self.bm25_config,
+                    self.bound_table,
                     true,
                 );
                 self.next_in_advance += 1;
@@ -428,7 +435,7 @@ pub const WANDScorer = struct {
                 if (t.exhausted) continue;
                 if (t.current.?.doc_id == min_doc.?) {
                     const hit = t.current.?;
-                    score += t.idf * tfScore(hit.freq, hit.norm, self.global_avg_dl, self.bm25_config);
+                    score += t.bm25_scorer.score(hit.freq, hit.norm);
                     t.current = try t.iter.nextScoring();
                     if (t.current) |*h| {
                         h.doc_id += t.doc_offset;
@@ -517,7 +524,7 @@ pub const WANDScorer = struct {
                     if (t.exhausted) continue;
                     if (t.current.?.doc_id == pivot_doc) {
                         const hit = t.current.?;
-                        score += t.idf * tfScore(hit.freq, hit.norm, self.global_avg_dl, self.bm25_config);
+                        score += t.bm25_scorer.score(hit.freq, hit.norm);
                         self.next_in_score += 1;
                     }
                 }
@@ -594,12 +601,12 @@ pub const WANDScorer = struct {
             for (self.terms.items) |*term| {
                 const cursor = term.block_cursor orelse continue;
                 if (cursor.chunk_id != chunk_id) continue;
-                bound += term.iter.blockCursorImpactWithIdf(
+                bound += term.iter.blockCursorImpactWithScorer(
                     term.block_max.?,
                     cursor,
-                    self.global_avg_dl,
+                    term.bm25_scorer,
                     term.idf,
-                    self.bm25_config,
+                    self.bound_table,
                 );
             }
             const chunk_start_u64 = @as(u64, front.doc_offset) + @as(u64, chunk_id) * @as(u64, front.chunk_size);
@@ -686,12 +693,12 @@ pub const WANDScorer = struct {
             for (self.terms.items) |*term| {
                 const cursor = term.block_cursor orelse continue;
                 if (cursor.min_doc > end) continue;
-                bound += term.iter.blockCursorImpactWithIdf(
+                bound += term.iter.blockCursorImpactWithScorer(
                     term.block_max.?,
                     cursor,
-                    self.global_avg_dl,
+                    term.bm25_scorer,
                     term.idf,
-                    self.bm25_config,
+                    self.bound_table,
                 );
             }
             const earliest_global = @as(u64, offset) + scan_floor;
@@ -746,8 +753,8 @@ pub const WANDScorer = struct {
     /// Global maximum possible impact for a term. Pivot selection must not use
     /// only the current block's maximum: a later block can have a higher
     /// impact, so doing so could terminate before a competitive later hit.
-    fn termMaxImpact(self: *const WANDScorer, t: *const TermState) f32 {
-        return t.idf * (self.bm25_config.k1 + 1.0);
+    fn termMaxImpact(_: *const WANDScorer, t: *const TermState) f32 {
+        return t.bm25_scorer.maxScore();
     }
 
     /// Advance a term iterator to the first doc whose ID (with offset
@@ -807,11 +814,11 @@ pub const WANDScorer = struct {
             // every same-chunk re-advance.
             if (!allow_equal_prune and chunk_idx == t.skip_check_chunk and threshold <= t.skip_check_threshold) return;
 
-            const my_max = t.iter.currentBlockMaxImpactWithIdf(
+            const my_max = t.iter.currentBlockMaxImpactWithScorer(
                 t.block_max.?,
-                self.global_avg_dl,
+                t.bm25_scorer,
                 t.idf,
-                self.bm25_config,
+                self.bound_table,
             );
             if (my_max > threshold or (!allow_equal_prune and my_max == threshold)) {
                 // Chunk passes solo. Cache the verdict — only the solo case
@@ -848,13 +855,6 @@ pub const WANDScorer = struct {
         }
     }
 };
-
-/// TF component of BM25 (without IDF).
-fn tfScore(freq: u32, doc_len: u32, avg_dl: f32, config: inverted.BM25Config) f32 {
-    const f: f32 = @floatFromInt(freq);
-    const dl: f32 = @floatFromInt(doc_len);
-    return (f * (config.k1 + 1.0)) / (f + config.k1 * (1.0 - config.b + config.b * dl / avg_dl));
-}
 
 // ============================================================================
 // Tests

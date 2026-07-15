@@ -919,11 +919,21 @@ fn executeScoredPhraseFilter(
             // positions only for this shared candidate; documents skipped
             // while realigning advanced over their position records without
             // unpacking the deltas.
-            for (states) |*state| {
-                state.current = try state.iter.decodeDeferredPositions();
-                if (request.diagnostics) |diag| diag.phrase_position_records_decoded +|= 1;
-            }
-            const phrase_frequency = exactPhraseFrequency(states);
+            const use_packed_two_term = states.len == 2 and
+                states[0].iter.canTakeDeferredPackedPositions() and
+                states[1].iter.canTakeDeferredPackedPositions();
+            const phrase_frequency = if (use_packed_two_term) blk: {
+                const first = try states[0].iter.takeDeferredPackedPositions();
+                const second = try states[1].iter.takeDeferredPackedPositions();
+                if (request.diagnostics) |diag| diag.phrase_position_records_decoded +|= 2;
+                break :blk try exactTwoTermPackedPhraseFrequency(first, second);
+            } else blk: {
+                for (states) |*state| {
+                    state.current = try state.iter.decodeDeferredPositions();
+                    if (request.diagnostics) |diag| diag.phrase_position_records_decoded +|= 1;
+                }
+                break :blk exactPhraseFrequency(states);
+            };
             const deleted = if (segment.shared.deleted) |deleted_docs| deleted_docs.contains(local_doc_id) else false;
             if (phrase_frequency > 0 and !deleted) {
                 const score = inverted.bm25ScoreWithIdf(
@@ -959,6 +969,30 @@ fn exactPhraseFrequency(states: anytype) u32 {
             }
         }
         if (matches) frequency +|= 1;
+    }
+    return frequency;
+}
+
+fn exactTwoTermPackedPhraseFrequency(
+    first: inverted.PackedPositionView,
+    second: inverted.PackedPositionView,
+) !u32 {
+    var first_cursor = try first.cursor();
+    var second_cursor = try second.cursor();
+    var first_position = try first_cursor.next();
+    var second_position = try second_cursor.next();
+    var frequency: u32 = 0;
+    while (first_position != null and second_position != null) {
+        const expected = first_position.? +| 1;
+        if (second_position.? < expected) {
+            second_position = try second_cursor.next();
+        } else if (second_position.? > expected) {
+            first_position = try first_cursor.next();
+        } else {
+            frequency +|= 1;
+            first_position = try first_cursor.next();
+            second_position = try second_cursor.next();
+        }
     }
     return frequency;
 }

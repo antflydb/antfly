@@ -112,6 +112,45 @@ pub fn decodeBlock(src: []const u8, values: *[block_values]u32, bits: u8) !usize
     return needed;
 }
 
+/// Decode a block of document deltas and turn it into absolute document IDs.
+/// `previous` is the first absolute document ID; the encoded block's first
+/// lane is the format-mandated zero placeholder. The inclusive scan uses only
+/// portable Zig vectors so LLVM can select the target's normal SIMD lowering.
+pub fn decodeBlockPrefixSum(src: []const u8, values: *[block_values]u32, bits: u8, previous: u32) !usize {
+    const needed = try encodedLen(bits);
+    if (src.len < needed) return error.Truncated;
+
+    const zero: U32x4 = @splat(0);
+    const shift_one: @Vector(lanes, i32) = .{ -1, 0, 1, 2 };
+    const shift_two: @Vector(lanes, i32) = .{ -1, -2, 0, 1 };
+    const mask: U32x4 = @splat(valueMask(bits));
+    var carry = previous;
+    for (0..groups) |group| {
+        const bit_position = group * @as(usize, bits);
+        const word_index = bit_position / 32;
+        const shift: u5 = @intCast(bit_position % 32);
+        var value: U32x4 = if (bits == 0)
+            zero
+        else
+            loadWordVector(src, word_index) >> @as(@Vector(lanes, u5), @splat(shift));
+        if (bits != 0 and @as(u8, shift) + bits > 32) {
+            const left_shift: u5 = @intCast(32 - @as(u8, shift));
+            value |= loadWordVector(src, word_index + 1) << @as(@Vector(lanes, u5), @splat(left_shift));
+        }
+        value &= mask;
+        // The first encoded lane is padding because the first absolute doc ID
+        // is stored separately. Preserve the old decoder's behavior of
+        // ignoring it even if malformed input sets those bits.
+        if (group == 0) value[0] = 0;
+        value +%= @shuffle(u32, value, zero, shift_one);
+        value +%= @shuffle(u32, value, zero, shift_two);
+        value +%= @as(U32x4, @splat(carry));
+        values[group * lanes ..][0..lanes].* = value;
+        carry = value[lanes - 1];
+    }
+    return needed;
+}
+
 /// Scalar reference decoder for the same vertical representation.
 pub fn decodeBlockScalar(src: []const u8, values: *[block_values]u32, bits: u8) !usize {
     const needed = try encodedLen(bits);
@@ -158,6 +197,36 @@ test "portable vertical BP128 round-trips every bit width" {
         try std.testing.expectEqual(encoded_len, try decodeBlockScalar(encoded[0..encoded_len], &scalar_output, bits));
         try std.testing.expectEqualSlices(u32, &input, &vector_output);
         try std.testing.expectEqualSlices(u32, &input, &scalar_output);
+    }
+}
+
+test "portable vertical BP128 fuses document delta prefix sums" {
+    var random = std.Random.DefaultPrng.init(0x5052_4546_4958_5355);
+    const rng = random.random();
+    var encoded: [32 * 16]u8 = undefined;
+    var deltas: [block_values]u32 = undefined;
+    var decoded: [block_values]u32 = undefined;
+
+    for (0..33) |bits_usize| {
+        const bits: u8 = @intCast(bits_usize);
+        const mask = valueMask(bits);
+        deltas[0] = 0;
+        for (deltas[1..]) |*delta| delta.* = rng.int(u32) & mask;
+        const encoded_len = try encodeBlock(&encoded, &deltas, bits);
+        const first = rng.int(u32);
+        _ = try decodeBlockPrefixSum(encoded[0..encoded_len], &decoded, bits, first);
+
+        var expected = first;
+        for (deltas, decoded) |delta, actual| {
+            expected +%= delta;
+            try std.testing.expectEqual(expected, actual);
+        }
+
+        if (bits > 0) {
+            encoded[0] |= 1;
+            _ = try decodeBlockPrefixSum(encoded[0..encoded_len], &decoded, bits, first);
+            try std.testing.expectEqual(first, decoded[0]);
+        }
     }
 }
 
