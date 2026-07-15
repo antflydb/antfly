@@ -166,7 +166,8 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 }
 
 // NewArtifactIndexSources builds the shared artifact-only source shape used by
-// full-text, embeddings, and graph indexes.
+// full-text and embeddings indexes. Graph indexes use GraphIndexSource because
+// their path and format are source-specific.
 func NewArtifactIndexSources(artifacts ...string) ([]ArtifactIndexSource, error) {
 	sources := make([]ArtifactIndexSource, 0, len(artifacts))
 	seen := make(map[string]struct{}, len(artifacts))
