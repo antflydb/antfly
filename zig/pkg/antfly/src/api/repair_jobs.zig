@@ -112,6 +112,11 @@ pub const Store = struct {
     pending_cancel_jobs: std.AutoHashMapUnmanaged(u64, PendingCancelEntry) = .empty,
     pending_cancel_head: ?u64 = null,
     pending_cancel_tail: ?u64 = null,
+    /// Process-local round-robin cursor. Durable job state remains the source
+    /// of truth; rebuilding the FIFO after restart may reset this cursor
+    /// without losing work. Advancing it after every inspection prevents a
+    /// backed-off head window from starving later runnable cancellations.
+    pending_cancel_scan_cursor: ?u64 = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: StoreConfig) Store {
         return .{
@@ -147,6 +152,7 @@ pub const Store = struct {
 
     fn removePendingCancelLocked(self: *Store, job_id: u64) void {
         const removed = self.pending_cancel_jobs.get(job_id) orelse return;
+        const removed_scan_cursor = self.pending_cancel_scan_cursor == job_id;
         if (removed.previous_job_id) |previous| {
             self.pending_cancel_jobs.getPtr(previous).?.next_job_id = removed.next_job_id;
         } else {
@@ -158,29 +164,51 @@ pub const Store = struct {
             self.pending_cancel_tail = removed.previous_job_id;
         }
         _ = self.pending_cancel_jobs.remove(job_id);
+        if (removed_scan_cursor) {
+            self.pending_cancel_scan_cursor = removed.next_job_id orelse self.pending_cancel_head;
+        }
+        if (self.pending_cancel_jobs.count() == 0) self.pending_cancel_scan_cursor = null;
     }
 
-    /// Returns the oldest queued durable cancellation without consuming it.
-    /// `beginAdvance` removes the entry atomically with the queued-to-running
-    /// transition, so supervisor and explicit advances may race safely.
+    /// Returns the next runnable durable cancellation without consuming it.
+    /// Inspection is round-robin within the bounded FIFO window; `beginAdvance`
+    /// removes the entry atomically with the queued-to-running transition, so
+    /// supervisor and explicit advances may race safely.
     pub fn nextPendingDurableCancelAlloc(self: *Store, alloc: std.mem.Allocator) !?[]u8 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const now_ms = nowMillis();
-        var job_id_opt = self.pending_cancel_head;
+        if (self.pending_cancel_jobs.count() == 0) {
+            self.pending_cancel_scan_cursor = null;
+            return null;
+        }
+        var job_id_opt = if (self.pending_cancel_scan_cursor) |cursor|
+            if (self.pending_cancel_jobs.contains(cursor)) cursor else self.pending_cancel_head
+        else
+            self.pending_cancel_head;
         var inspected: usize = 0;
         const inspect_limit = @min(self.pending_cancel_jobs.count(), pending_cancel_scan_limit);
-        while (job_id_opt) |job_id| : (inspected += 1) {
+        while (job_id_opt) |job_id| {
             if (inspected >= inspect_limit) break;
-            const next_job_id = if (self.pending_cancel_jobs.get(job_id)) |entry| entry.next_job_id else null;
+            inspected += 1;
+            const next_job_id = if (self.pending_cancel_jobs.get(job_id)) |entry|
+                entry.next_job_id orelse self.pending_cancel_head
+            else
+                self.pending_cancel_head;
             const encoded = (try self.loadJobLocked(job_id)) orelse {
                 self.removePendingCancelLocked(job_id);
-                job_id_opt = next_job_id orelse self.pending_cancel_head;
+                job_id_opt = if (next_job_id) |next|
+                    if (self.pending_cancel_jobs.contains(next)) next else self.pending_cancel_head
+                else
+                    self.pending_cancel_head;
                 continue;
             };
             var parsed = std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
                 self.removePendingCancelLocked(job_id);
-                job_id_opt = next_job_id orelse self.pending_cancel_head;
+                job_id_opt = if (next_job_id) |next|
+                    if (self.pending_cancel_jobs.contains(next)) next else self.pending_cancel_head
+                else
+                    self.pending_cancel_head;
                 continue;
             };
             defer parsed.deinit();
@@ -188,9 +216,13 @@ pub const Store = struct {
                 !std.mem.eql(u8, parsed.value.phase, phaseString(.queued)))
             {
                 self.removePendingCancelLocked(job_id);
-                job_id_opt = next_job_id orelse self.pending_cancel_head;
+                job_id_opt = if (next_job_id) |next|
+                    if (self.pending_cancel_jobs.contains(next)) next else self.pending_cancel_head
+                else
+                    self.pending_cancel_head;
                 continue;
             }
+            self.pending_cancel_scan_cursor = next_job_id;
             if (parsed.value.next_retry_at_millis > now_ms) {
                 job_id_opt = next_job_id;
                 continue;
@@ -1125,6 +1157,66 @@ test "durable cancellation retries transient failures with backoff" {
     const early = try store.beginAdvance(alloc, parsed_queued.value);
     defer alloc.free(early.encoded);
     try std.testing.expect(!early.started);
+}
+
+test "durable cancellation scan rotates past a backed off head window" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    var runnable_job_id: u64 = 0;
+    for (0..pending_cancel_scan_limit + 1) |idx| {
+        const started = try store.startJob(alloc, "docs", .{
+            .target = "index",
+            .index = "semantic",
+        });
+        defer alloc.free(started);
+        var parsed_started = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+        defer parsed_started.deinit();
+
+        const cancelling = try store.requestCancel(alloc, parsed_started.value);
+        defer alloc.free(cancelling);
+        var parsed_cancelling = try std.json.parseFromSlice(JobState, alloc, cancelling, .{ .ignore_unknown_fields = true });
+        defer parsed_cancelling.deinit();
+        if (idx == pending_cancel_scan_limit) {
+            runnable_job_id = parsed_cancelling.value.job_id;
+            continue;
+        }
+
+        const current = parsed_cancelling.value;
+        const delayed = try encodeState(alloc, .{
+            .job_id = current.job_id,
+            .attempt_id = current.attempt_id,
+            .table_name = current.table_name,
+            .phase = current.phase,
+            .repair_status = current.repair_status,
+            .target = current.target,
+            .kind = current.kind,
+            .index = current.index,
+            .cursor = current.cursor,
+            .limit = current.limit,
+            .force = current.force,
+            .result = current.result,
+            .last_error = current.last_error,
+            .cancel_requested = current.cancel_requested,
+            .next_retry_at_millis = std.math.maxInt(u64),
+            .created_at_millis = current.created_at_millis,
+            .last_updated_at_millis = current.last_updated_at_millis,
+            .expires_at_millis = current.expires_at_millis,
+        });
+        defer alloc.free(delayed);
+        try store.storeEncodedForTest(current.job_id, delayed);
+    }
+
+    // The first bounded inspection sees only delayed work and leaves its
+    // cursor immediately after that window. The next inspection must select
+    // the runnable tail instead of rescanning the same head entries.
+    try std.testing.expect((try store.nextPendingDurableCancelAlloc(alloc)) == null);
+    const pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+    defer alloc.free(pending);
+    var parsed_pending = try std.json.parseFromSlice(JobState, alloc, pending, .{ .ignore_unknown_fields = true });
+    defer parsed_pending.deinit();
+    try std.testing.expectEqual(runnable_job_id, parsed_pending.value.job_id);
 }
 
 test "named index repair cancellation remains nonterminal until durable controls finish" {

@@ -70,6 +70,10 @@ Implemented in the current tree:
   and ordinary writes do not wake the repair scanner
 - a validated replacement is activated atomically while any prior healthy
   generation remains available
+- artifact-backed dense coverage is an exact cardinality invariant at snapshot,
+  replay advancement, and final fenced activation boundaries. A deficit may be
+  filled in place; a surplus forces a reset or rejects shadow activation because
+  replaying live artifacts cannot remove an unknown stale vector
 - activation durably records and retains the previous root until the new clean
   checkpoint is published; a missing or corrupt pointer-selected generation
   fails closed and rolls back to that retained predecessor when one is valid
@@ -1484,8 +1488,10 @@ Operator actions follow these rules:
   process restart without scanning the complete job store
 - a transient cancellation pass failure preserves `cancel_requested`, cursor,
   and accumulated results, then enters durable exponential backoff. The FIFO
-  inspects a bounded window so one delayed cancellation does not head-of-line
-  block unrelated due work
+  inspects a bounded window from a process-local round-robin cursor, advancing
+  the cursor after every inspected entry. One delayed head window therefore
+  cannot block unrelated due work; restart may reset the cursor because the
+  durable FIFO and job records remain the source of truth
 
 These actions are idempotent and scoped by `repair_id`. A stale action for an
 old repair cannot pause, resume, cancel, or delete its replacement.

@@ -9877,7 +9877,9 @@ pub const DB = struct {
             }
             if (!cooperative_dense_build) {
                 if (expected_snapshot_coverage) |expected| {
-                    if (built_entry.index.stats().active_count < expected) return error.RepairSourceCoverageIncomplete;
+                    if (!denseCoverageMatchesTarget(built_entry.index.stats().active_count, expected)) {
+                        return error.RepairSourceCoverageIncomplete;
+                    }
                 }
             }
         }
@@ -10122,7 +10124,9 @@ pub const DB = struct {
             if (denseIndexIsArtifactBacked(dense_entry)) {
                 const expected = (try DB.loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse
                     return error.RepairSourceCoverageIncomplete;
-                if (dense_entry.index.stats().active_count < expected) return error.RepairSourceCoverageIncomplete;
+                if (!denseCoverageMatchesTarget(dense_entry.index.stats().active_count, expected)) {
+                    return error.RepairSourceCoverageIncomplete;
+                }
             }
         }
         try checkArtifactRepairCancelled(options);
@@ -14190,12 +14194,18 @@ pub const DB = struct {
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
             const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-            const already_repaired = !candidate.force_reset and
-                entry.index.stats().active_count >= artifact_target_count and
+            const active_count = entry.index.stats().active_count;
+            // Missing vectors can be filled in place. Surplus vectors cannot:
+            // replaying the authoritative artifacts only upserts live keys and
+            // would leave stale keys searchable. Reset that active generation
+            // before rebuilding so exact coverage can be re-established.
+            const force_reset = candidate.force_reset or active_count > artifact_target_count;
+            const already_repaired = !force_reset and
+                denseCoverageMatchesTarget(active_count, artifact_target_count) and
                 candidate.applied_sequence >= candidate.target_sequence;
 
             if (candidate.persisted_resume) |buf| {
-                if (artifact_target_count == 0 and !candidate.force_reset) {
+                if (artifact_target_count == 0 and !force_reset) {
                     try rebuild_state.clear();
                     continue;
                 }
@@ -14205,20 +14215,21 @@ pub const DB = struct {
                 }
                 try targets.append(alloc, .{
                     .dense_index_idx = dense_index_idx,
-                    .resume_from = try alloc.dupe(u8, buf),
+                    // A reset invalidates every cursor into the prior build.
+                    .resume_from = if (force_reset) null else try alloc.dupe(u8, buf),
                     .artifact_target_count = artifact_target_count,
-                    .force_reset = candidate.force_reset,
+                    .force_reset = force_reset,
                 });
                 continue;
             }
 
-            if (artifact_target_count == 0 and !candidate.force_reset) continue;
-            if (!candidate.force_reset and entry.index.stats().active_count >= artifact_target_count) continue;
+            if (artifact_target_count == 0 and !force_reset) continue;
+            if (!force_reset and denseCoverageMatchesTarget(active_count, artifact_target_count)) continue;
 
             try targets.append(alloc, .{
                 .dense_index_idx = dense_index_idx,
                 .artifact_target_count = artifact_target_count,
-                .force_reset = candidate.force_reset,
+                .force_reset = force_reset,
             });
         }
 
@@ -14264,7 +14275,8 @@ pub const DB = struct {
                 },
                 applied_sequence,
             );
-            const repaired = entry.index.stats().active_count >= target.artifact_target_count and applied_sequence >= target_sequence;
+            const repaired = denseCoverageMatchesTarget(entry.index.stats().active_count, target.artifact_target_count) and
+                applied_sequence >= target_sequence;
             if (repaired) {
                 try rebuild_state.clear();
                 const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
@@ -32731,18 +32743,26 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         );
         return false;
     };
-    if (expected_doc_count == 0) return true;
-    if (entry.index.stats().active_count >= expected_doc_count) return true;
+    const active_count = entry.index.stats().active_count;
+    if (denseCoverageMatchesTarget(active_count, expected_doc_count)) return true;
 
     const now_ns = monotonicTimeNs();
     if (!shouldRunTargetAdvanceRepair(ctx, index_ref.name, now_ns)) return false;
     try noteTargetAdvanceRepairRun(ctx, index_ref.name, now_ns);
 
     std.log.warn(
-        "dense replay target advance blocked by coverage gap index={s} indexed={} expected_docs={}",
-        .{ index_ref.name, entry.index.stats().active_count, expected_doc_count },
+        "dense replay target advance blocked by coverage mismatch index={s} indexed={} expected_docs={}",
+        .{ index_ref.name, active_count, expected_doc_count },
     );
 
+    // Replaying artifacts can fill a deficit, but it cannot delete a vector
+    // whose source artifact no longer exists. Leave surplus reconstruction to
+    // the rebuild planner: it owns the reset lifecycle and invalidates any
+    // persisted scan cursor. Closing the active HBC handle from this ordinary
+    // replay path would race published searches despite the apply fence.
+    if (active_count > expected_doc_count) {
+        return false;
+    }
     _ = rebuildDenseIndexForTargetCoverageContext(ctx, index_ref.name, 2048) catch |err| {
         std.log.warn(
             "dense replay target advance repair deferred index={s} err={s}",
@@ -32751,11 +32771,15 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         return false;
     };
     const repaired_entry = ctx.index_manager.denseIndex(index_ref.name) orelse return true;
-    return repaired_entry.index.stats().active_count >= expected_doc_count;
+    return denseCoverageMatchesTarget(repaired_entry.index.stats().active_count, expected_doc_count);
 }
 
 fn denseIndexIsArtifactBacked(entry: anytype) bool {
     return entry.external or entry.chunk_name != null or entry.embedding_name != null;
+}
+
+fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
+    return active_count == expected_count;
 }
 
 fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {
@@ -56553,6 +56577,162 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
     try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
+test "db dense artifact coverage resets and removes surplus vectors" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dense_idx"),
+    );
+
+    // Inject an index-only vector to model a stale key left by an interrupted
+    // or defective replay. There is intentionally no matching source artifact
+    // and therefore no target-counter increment.
+    var ghost_vector = [_]f32{ 0, 1, 0 };
+    try db.core.index_manager.denseIndex("dense_idx").?.index.insert(0xdead_beef, &ghost_vector);
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
+    );
+    try std.testing.expect(try db.hasPendingDenseArtifactRebuild(alloc));
+
+    try std.testing.expect((try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc)) > 0);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
+    );
+    try std.testing.expect(!try db.hasPendingDenseArtifactRebuild(alloc));
+
+    var result = try db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0 }, .k = 2 } },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    // The zero-target case must also reset a surplus, including after a crash
+    // left a scan cursor belonging to the prior generation.
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dense_idx"),
+    );
+    try db.core.index_manager.denseIndex("dense_idx").?.index.insert(0xbeef_dead, &ghost_vector);
+    const rebuild_state_path = try db.denseIndexRebuildStatePathAlloc(alloc, "dense_idx");
+    defer alloc.free(rebuild_state_path);
+    const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_state_path);
+    try rebuild_state.update("stale-generation-cursor");
+    try std.testing.expect(try db.hasPendingDenseArtifactRebuild(alloc));
+    _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
+    );
+    try std.testing.expect(!try db.hasPendingDenseArtifactRebuild(alloc));
+}
+
+test "db dense shadow activation rejects surplus candidate coverage" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const active_pointer_before = try db.core.index_manager.captureActiveIndexRootPointer("dense_idx");
+    defer if (active_pointer_before) |pointer| alloc.free(pointer);
+
+    var queued = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "dense_idx",
+        .limit = 1,
+        .force = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer queued.deinit(alloc);
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse
+        return error.TestUnexpectedResult;
+
+    const CoverageHook = struct {
+        fn afterSnapshot(_: *anyopaque, hooked_db: *DB, index_name: []const u8, _: u64) !void {
+            const key = try DB.denseArtifactTargetCounterKeyAlloc(hooked_db.alloc, index_name);
+            defer hooked_db.alloc.free(key);
+            var reduced: [8]u8 = undefined;
+            std.mem.writeInt(u64, &reduced, 1, .little);
+            try hooked_db.core.store.put(key, &reduced);
+        }
+    };
+    var hook_context: u8 = 0;
+    db.shadow_index_repair_hook = .{
+        .ptr = &hook_context,
+        .after_snapshot_build = CoverageHook.afterSnapshot,
+    };
+    const outcome = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    db.shadow_index_repair_hook = null;
+    try std.testing.expect(outcome.attempted);
+    try std.testing.expect(outcome.terminal);
+    try std.testing.expect(!outcome.repaired);
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+
+    // Restore the deliberately altered source metadata. The failed candidate
+    // must not have replaced the previous healthy two-vector generation.
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
+    defer alloc.free(counter_key);
+    var restored: [8]u8 = undefined;
+    std.mem.writeInt(u64, &restored, 2, .little);
+    try db.core.store.put(counter_key, &restored);
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
+    );
+    const active_pointer_after = try db.core.index_manager.captureActiveIndexRootPointer("dense_idx");
+    defer if (active_pointer_after) |pointer| alloc.free(pointer);
+    try std.testing.expectEqual(active_pointer_before == null, active_pointer_after == null);
+    if (active_pointer_before) |before| {
+        try std.testing.expectEqualStrings(before, active_pointer_after.?);
+    }
 }
 
 test "db repair activation admission is time and sequence bounded" {
